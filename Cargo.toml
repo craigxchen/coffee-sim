@@ -1,0 +1,20 @@
+[package]
+name = "coffee_sim_core"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "coffee_sim_core"
+crate-type = ["cdylib"]
+path = "rust/src/lib.rs"
+
+[dependencies]
+pyo3 = { version = "0.22", features = ["extension-module"] }
+numpy = "0.22"
+ndarray = "0.16"
+ndarray-rand = "0.15"
+rand = "0.8"
+rand_distr = "0.4"
+rayon = "1.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
