@@ -7,4 +7,30 @@ wheels/
 *.egg-info
 
 # Virtual environments
-.venv
+.venv/
+
+# Rust build artifacts
+target/
+
+# pytest
+.pytest_cache/
+
+# Generated images
+*.png
+*.gif
+*.mp4
+
+# OS files
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# maturin / PyO3 build output
+*.so
+*.dylib
+*.dll
+*.pyd
