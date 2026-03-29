@@ -1,0 +1,13 @@
+[package]
+name = "coffee-sim-core"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = ["parallel"]
+parallel = ["rayon"]
+
+[dependencies]
+rand = "0.8"
+rand_distr = "0.4"
+rayon = { version = "1.10", optional = true }
