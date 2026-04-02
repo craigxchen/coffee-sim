@@ -51,8 +51,8 @@ def main():
     print(f"  Cup TDS: {result.cup_tds[-1]:.4f}%")
     print(f"  Water collected: {result.total_water_collected_g[-1]:.1f}g")
 
-    plot_timeseries(result, save_path="espresso_timeseries.png")
-    print("Saved espresso_timeseries.png")
+    plot_timeseries(result, save_path="figures/espresso_timeseries.png")
+    print("Saved figures/espresso_timeseries.png")
 
     if result.concentration_field is not None:
         plot_cross_section(
@@ -60,9 +60,9 @@ def main():
             title="Espresso Concentration (Y-Z slice)",
             slice_axis=0,
             cmap="hot",
-            save_path="espresso_concentration.png",
+            save_path="figures/espresso_concentration.png",
         )
-        print("Saved espresso_concentration.png")
+        print("Saved figures/espresso_concentration.png")
 
 
 if __name__ == "__main__":

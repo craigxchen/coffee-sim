@@ -170,9 +170,10 @@ class Simulation:
                 remaining = params.water_mass_g - total_water_poured_g
                 total_water_poured_g += min(params.pour_rate_ml_s * dt, remaining)
 
-            # 3. CO₂ impedance (bloom)
-            self.extraction.sync_co2_to_grid(self.grid)
-            self.grid.apply_co2_impedance()
+            # 3. CO₂ impedance (bloom phase only, every 10 steps for performance)
+            if t < params.bloom_time_s and step_count % 10 == 0:
+                self.extraction.sync_co2_to_grid(self.grid)
+                self.grid.apply_co2_impedance()
 
             # 4. Compute top pressure with pour pattern
             bed_area_m2 = (nx * params.grid_dx) ** 2 * 0.5

@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Coffee Sim | 3D Pourover</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main class="layout">
+      <section class="sidebar">
+        <p class="eyebrow">Coffee Sim / 3D Preview</p>
+        <h1>V60 Pourover</h1>
+        <p class="lede">
+          GPU SPH fluid simulation with a V60 cone boundary. Drag to orbit, scroll to zoom.
+        </p>
+        <div class="controls">
+          <button id="toggle">Pause</button>
+          <button id="reset">Reset</button>
+        </div>
+        <dl class="stats">
+          <div>
+            <dt>Particles</dt>
+            <dd id="particles">0</dd>
+          </div>
+          <div>
+            <dt>FPS</dt>
+            <dd id="fps">0</dd>
+          </div>
+        </dl>
+      </section>
+      <section class="viewer">
+        <canvas id="sim-canvas"></canvas>
+      </section>
+    </main>
+    <script type="module" src="./main.js"></script>
+  </body>
+</html>

@@ -16,7 +16,7 @@ target/
 .pytest_cache/
 
 # Generated images
-*.png
+figures/
 *.gif
 *.mp4
 
@@ -34,3 +34,16 @@ target/
 *.dylib
 *.dll
 *.pyd
+
+# Calibration raw data (large, not redistributed)
+calibration/dataset/*.json
+!calibration/dataset/.gitkeep
+
+# wasm-pack build output
+pkg/
+
+# Claude Code
+.claude/
+
+# Lock files (uv)
+uv.lock

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Example: Compare pourover vs espresso and run grind size sensitivity sweep."""
 
+import os
 import sys
 sys.path.insert(0, ".")
 
@@ -64,8 +65,9 @@ def compare_methods():
 
     plt.suptitle("Pourover vs Espresso Comparison", fontsize=14)
     plt.tight_layout()
-    plt.savefig("comparison.png", dpi=150, bbox_inches="tight")
-    print("Saved comparison.png")
+    os.makedirs("figures", exist_ok=True)
+    plt.savefig("figures/comparison.png", dpi=150, bbox_inches="tight")
+    print("Saved figures/comparison.png")
 
 
 def grind_sensitivity():
@@ -104,8 +106,9 @@ def grind_sensitivity():
 
     plt.suptitle("Grind Size Sensitivity Analysis", fontsize=14)
     plt.tight_layout()
-    plt.savefig("grind_sensitivity.png", dpi=150, bbox_inches="tight")
-    print("Saved grind_sensitivity.png")
+    os.makedirs("figures", exist_ok=True)
+    plt.savefig("figures/grind_sensitivity.png", dpi=150, bbox_inches="tight")
+    print("Saved figures/grind_sensitivity.png")
 
 
 if __name__ == "__main__":
