@@ -1,5 +1,7 @@
 """Visualization module for coffee extraction simulation results."""
 
+import os
+
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
@@ -7,6 +9,12 @@ from matplotlib.patches import Rectangle
 from matplotlib.animation import FuncAnimation
 
 from .sim import SimulationResult
+
+
+def _ensure_parent(path: str):
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
 
 
 def plot_timeseries(result: SimulationResult, save_path: str | None = None):
@@ -53,6 +61,7 @@ def plot_timeseries(result: SimulationResult, save_path: str | None = None):
 
     plt.tight_layout()
     if save_path:
+        _ensure_parent(save_path)
         plt.savefig(save_path, dpi=150, bbox_inches="tight")
     else:
         plt.show()
@@ -99,6 +108,7 @@ def plot_cross_section(
 
     plt.tight_layout()
     if save_path:
+        _ensure_parent(save_path)
         plt.savefig(save_path, dpi=150, bbox_inches="tight")
     else:
         plt.show()
@@ -123,6 +133,7 @@ def plot_extraction_uniformity(result: SimulationResult, save_path: str | None =
 
     plt.tight_layout()
     if save_path:
+        _ensure_parent(save_path)
         plt.savefig(save_path, dpi=150, bbox_inches="tight")
     else:
         plt.show()
@@ -174,6 +185,7 @@ def plot_brewing_chart(
 
     plt.tight_layout()
     if save_path:
+        _ensure_parent(save_path)
         plt.savefig(save_path, dpi=150, bbox_inches="tight")
     else:
         plt.show()
@@ -221,6 +233,7 @@ def plot_3d_volume(
     plotter.add_title(title)
 
     if save_path:
+        _ensure_parent(save_path)
         plotter.screenshot(save_path)
     else:
         plotter.show()
@@ -276,6 +289,7 @@ def animate_cross_section(
         return [im]
 
     anim = FuncAnimation(fig, _update, frames=len(slices), interval=200, blit=True)
+    _ensure_parent(save_path)
     anim.save(save_path, writer="pillow")
     plt.close()
     print(f"Animation saved to {save_path}")

@@ -50,8 +50,8 @@ def main():
     print(f"  Average TDS (instantaneous): {average_tds(result):.4f}%")
     print(f"  Extraction uniformity (std): {extraction_uniformity(result):.2f}%")
 
-    plot_timeseries(result, save_path="v60_timeseries.png")
-    print("Saved v60_timeseries.png")
+    plot_timeseries(result, save_path="figures/v60_timeseries.png")
+    print("Saved figures/v60_timeseries.png")
 
     if result.concentration_field is not None:
         plot_cross_section(
@@ -59,20 +59,20 @@ def main():
             title="Concentration Field (Y-Z slice)",
             slice_axis=0,
             cmap="hot",
-            save_path="v60_concentration.png",
+            save_path="figures/v60_concentration.png",
         )
-        print("Saved v60_concentration.png")
+        print("Saved figures/v60_concentration.png")
 
-    plot_extraction_uniformity(result, save_path="v60_uniformity.png")
-    print("Saved v60_uniformity.png")
+    plot_extraction_uniformity(result, save_path="figures/v60_uniformity.png")
+    print("Saved figures/v60_uniformity.png")
 
     if result.cup_tds:
         plot_brewing_chart(
             tds=result.cup_tds[-1],
             ey=result.extraction_yield[-1],
-            save_path="v60_brewing_chart.png",
+            save_path="figures/v60_brewing_chart.png",
         )
-        print("Saved v60_brewing_chart.png")
+        print("Saved figures/v60_brewing_chart.png")
 
 
 if __name__ == "__main__":
