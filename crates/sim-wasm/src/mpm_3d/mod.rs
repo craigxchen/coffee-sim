@@ -8,7 +8,7 @@ pub(crate) mod bed;
 
 use state::{MpmBuffers, MpmUniforms, FP_SCALE, MAX_VELOCITY, NUM_THREADS, SDF_RES};
 use pipelines::MpmPipelines;
-use inflow::{InflowState, SpoutSettings, PARTICLES_PER_ML};
+use inflow::{InflowState, SpoutSettings, MASS_UNITS_PER_ML};
 use bed::{BedConfig, BedInit};
 
 const TARGET_BED_RETENTION_ML: f32 = 42.0;
@@ -50,16 +50,16 @@ impl MpmSettings {
     pub fn default_v60() -> Self {
         let bounds_size = Vec3::new(14.0, 20.0, 14.0);
         // Ensure uniform cell spacing: derive gy from dx = bounds_x / gx
-        let gx = 64u32;
+        let gx = 80u32;
         let dx = bounds_size.x / gx as f32;
         let gy = (bounds_size.y / dx).ceil() as u32;
-        let gz = 64u32;
+        let gz = 80u32;
         let grid_dims = [gx, gy, gz];
 
         Self {
             bounds_size,
             grid_dims,
-            max_particles: 80_000,
+            max_particles: 220_000,
             substeps: 3,
             gravity: -10.0,
             bulk_modulus: 420.0,
@@ -167,7 +167,7 @@ impl MpmSim3D {
                 &self.buffers,
                 &self.settings.spout,
                 sub_dt,
-                1.0, // particle_mass
+                MASS_UNITS_PER_ML / inflow::PARTICLES_PER_ML,
                 self.num_water,
                 self.num_bed,
                 self.settings.max_particles,
@@ -294,7 +294,7 @@ impl MpmSim3D {
         let inv_dx = 1.0 / dx;
         let particle_vol = dx * dx * dx * 0.25;
         let bed_capacity_per_particle = if self.num_bed > 0 {
-            TARGET_BED_RETENTION_ML * PARTICLES_PER_ML / self.num_bed as f32
+            TARGET_BED_RETENTION_ML * MASS_UNITS_PER_ML / self.num_bed as f32
         } else {
             0.7
         };

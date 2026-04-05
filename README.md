@@ -34,7 +34,6 @@ What is still in progress:
 coffee-sim/
 ├── crates/
 │   ├── sim-core/          # Shared Rust simulation/math code
-│   ├── sim-python/        # Python bindings / validation hooks
 │   └── sim-wasm/          # Browser-facing WASM app
 │       ├── src/
 │       │   ├── lib.rs
@@ -47,10 +46,6 @@ coffee-sim/
 │       │       ├── inflow.rs
 │       │       └── bed.rs
 │       └── www-3d/
-├── examples/
-├── python/
-├── tests/
-├── validation/
 └── PLAN.md
 ```
 

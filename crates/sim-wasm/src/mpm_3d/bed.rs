@@ -26,7 +26,7 @@ impl Default for BedConfig {
             bot_y: -2.25,
             top_radius: 2.65,
             bot_radius: 0.95,
-            num_particles: 5_000,
+            num_particles: 12_000,
             initial_porosity: 0.4,
             initial_permeability: 1.0,
             extractable_mass: 0.15,
