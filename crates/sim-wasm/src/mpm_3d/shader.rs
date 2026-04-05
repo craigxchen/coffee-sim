@@ -59,17 +59,14 @@ fn gx() -> u32 { return u.grid_dims.x; }
 fn gy() -> u32 { return u.grid_dims.y; }
 fn gz() -> u32 { return u.grid_dims.z; }
 fn total_cells() -> u32 { return u.grid_dims.w; }
-fn num_water() -> u32 { return u.counts.x; }
 fn num_bed() -> u32 { return u.counts.y; }
 fn num_particles() -> u32 { return u.counts.x + u.counts.y; }
-fn max_particles() -> u32 { return u.counts.z; }
 fn dt() -> f32 { return u.sim_params.x; }
 fn gravity() -> f32 { return u.sim_params.y; }
 fn dx() -> f32 { return u.sim_params.z; }
 fn inv_dx() -> f32 { return u.sim_params.w; }
 fn bulk_K() -> f32 { return u.fluid_params.x; }
 fn viscosity() -> f32 { return u.fluid_params.y; }
-fn p_mass() -> f32 { return u.fluid_params.z; }
 fn p_vol() -> f32 { return u.fluid_params.w; }
 fn fp_scale() -> f32 { return u.fp_params.x; }
 fn inv_fp_scale() -> f32 { return u.fp_params.y; }

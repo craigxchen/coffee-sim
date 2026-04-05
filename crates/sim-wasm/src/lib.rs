@@ -1,5 +1,3 @@
-mod sdf;
-
 #[cfg(target_arch = "wasm32")]
 pub(crate) mod mpm_3d;
 #[cfg(target_arch = "wasm32")]

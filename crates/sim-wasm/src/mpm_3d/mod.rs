@@ -5,7 +5,6 @@ mod pipelines;
 mod shader;
 pub(crate) mod inflow;
 pub(crate) mod bed;
-mod debug;
 
 use state::{MpmBuffers, MpmUniforms, FP_SCALE, MAX_VELOCITY, NUM_THREADS, SDF_RES};
 use pipelines::MpmPipelines;

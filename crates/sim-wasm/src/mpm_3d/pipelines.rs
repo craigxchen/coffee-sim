@@ -4,7 +4,6 @@ use super::shader::MPM_COMPUTE_SHADER;
 use super::state::MpmBuffers;
 
 pub(crate) struct MpmPipelines {
-    pub bind_group_layout: wgpu::BindGroupLayout,
     pub bind_group: wgpu::BindGroup,
     pub clear_grid: wgpu::ComputePipeline,
     pub p2g: wgpu::ComputePipeline,
@@ -135,7 +134,6 @@ impl MpmPipelines {
         };
 
         Self {
-            bind_group_layout,
             bind_group,
             clear_grid: make("clear_grid"),
             p2g: make("p2g"),
