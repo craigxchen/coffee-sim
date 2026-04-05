@@ -68,7 +68,11 @@ impl InflowState {
 
     pub fn update(&mut self, spout: &SpoutSettings) {
         self.flow_rate = flow_rate_from_angle(self.kettle_angle_deg, spout);
-        self.exit_speed = exit_speed_from_flow_rate(self.flow_rate, spout.nozzle_radius);
+        self.exit_speed = exit_speed_from_flow_rate(
+            self.flow_rate,
+            spout.nozzle_radius,
+            spout.max_exit_speed,
+        );
     }
 
     pub fn emit_particles(
@@ -180,7 +184,7 @@ fn flow_rate_from_angle(angle_deg: f32, spout: &SpoutSettings) -> f32 {
     s * spout.max_flow_rate_ml_s
 }
 
-fn exit_speed_from_flow_rate(flow_rate: f32, nozzle_radius: f32) -> f32 {
+fn exit_speed_from_flow_rate(flow_rate: f32, nozzle_radius: f32, max_exit_speed: f32) -> f32 {
     if flow_rate < 1e-6 {
         return 0.0;
     }
@@ -188,5 +192,5 @@ fn exit_speed_from_flow_rate(flow_rate: f32, nozzle_radius: f32) -> f32 {
     // flow_rate is mL/s = cm^3/s, area in sim units^2
     // Approximate: speed = flow_rate_factor / area
     // Keep it simple: scale so max flow gives reasonable speed
-    (flow_rate / area).min(22.0)
+    (flow_rate / area).min(max_exit_speed)
 }
