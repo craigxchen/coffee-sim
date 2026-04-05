@@ -3,8 +3,12 @@ import init, { WasmSim3D } from "./pkg/coffee_sim_wasm.js";
 const canvas = document.getElementById("sim-canvas");
 const toggleButton = document.getElementById("toggle");
 const resetButton = document.getElementById("reset");
+const kettleAngleInput = document.getElementById("kettle-angle");
+const kettleAngleValue = document.getElementById("kettle-angle-value");
 const particleLabel = document.getElementById("particles");
 const fpsLabel = document.getElementById("fps");
+const flowRateLabel = document.getElementById("flow-rate");
+const jetSpeedLabel = document.getElementById("jet-speed");
 
 let app;
 let paused = false;
@@ -16,6 +20,7 @@ let lastClientY = 0;
 
 await init();
 app = await WasmSim3D.create(canvas);
+app.setKettleAngle(Number(kettleAngleInput.value));
 resizeCanvas();
 syncUi();
 requestAnimationFrame(animate);
@@ -29,7 +34,13 @@ toggleButton.addEventListener("click", () => {
 
 resetButton.addEventListener("click", () => {
   app.reset();
+  app.setKettleAngle(Number(kettleAngleInput.value));
   lastFrameTime = 0;
+  syncUi();
+});
+
+kettleAngleInput.addEventListener("input", () => {
+  app.setKettleAngle(Number(kettleAngleInput.value));
   syncUi();
 });
 
@@ -96,4 +107,7 @@ function updateFps(frameTime) {
 
 function syncUi() {
   particleLabel.textContent = new Intl.NumberFormat().format(app.particleCount());
+  kettleAngleValue.textContent = `${Math.round(app.kettleAngle())}\u00b0`;
+  flowRateLabel.textContent = `${app.flowRate().toFixed(1)} mL/s`;
+  jetSpeedLabel.textContent = `${app.exitSpeed().toFixed(1)} u/s`;
 }
