@@ -1,3 +1,3 @@
 [workspace]
-members = ["crates/sim-core", "crates/sim-python", "crates/sim-wasm"]
+members = ["crates/sim-core", "crates/sim-wasm"]
 resolver = "2"

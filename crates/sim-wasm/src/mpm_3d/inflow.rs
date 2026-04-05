@@ -2,7 +2,8 @@ use coffee_sim_core::sph::Vec3;
 
 use super::state::MpmBuffers;
 
-pub(crate) const PARTICLES_PER_ML: f32 = 80.0;
+pub(crate) const MASS_UNITS_PER_ML: f32 = 80.0;
+pub(crate) const PARTICLES_PER_ML: f32 = 160.0;
 
 #[derive(Clone, Copy)]
 pub(crate) struct SpoutSettings {
