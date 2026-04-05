@@ -8,7 +8,7 @@ use web_sys::HtmlCanvasElement;
 
 use coffee_sim_core::sph::Vec3;
 
-use crate::gpu_sim_3d::{CoffeeGpuSim3D, Obstacle, SimSettings3D};
+use crate::mpm_3d::{MpmSim3D, MpmSettings, Obstacle};
 
 const EPSILON: f32 = 1e-6;
 
@@ -39,8 +39,10 @@ struct ParticleVertexOutput {
 
 @vertex
 fn vs_main(input: ParticleVertexInput) -> ParticleVertexOutput {
-    let offset = uniforms.camera_right.xyz * input.local.x * uniforms.params.x
-        + uniforms.camera_up.xyz * input.local.y * uniforms.params.x;
+    let water_radius = uniforms.params.x * mix(1.18, 0.96, clamp(input.colour_t * 0.7, 0.0, 1.0));
+    let radius = select(water_radius, uniforms.params.x * 0.52, input.colour_t < 0.0);
+    let offset = uniforms.camera_right.xyz * input.local.x * radius
+        + uniforms.camera_up.xyz * input.local.y * radius;
     let world = input.world_position + offset;
 
     var output: ParticleVertexOutput;
@@ -51,6 +53,12 @@ fn vs_main(input: ParticleVertexInput) -> ParticleVertexOutput {
 }
 
 fn palette(colour_t: f32) -> vec3<f32> {
+    if (colour_t < 0.0) {
+        let wetness = clamp(-colour_t - 1.0, 0.0, 1.0);
+        let dry = vec3<f32>(0.34, 0.24, 0.12);
+        let wet = vec3<f32>(0.17, 0.11, 0.06);
+        return mix(dry, wet, wetness);
+    }
     let base = vec3<f32>(0.07, 0.20, 0.47);
     let mid = vec3<f32>(0.10, 0.47, 0.74);
     let crest = vec3<f32>(0.87, 0.95, 0.98);
@@ -143,12 +151,13 @@ pub(crate) struct OrbitCamera {
 
 impl OrbitCamera {
     pub(crate) fn new(bounds: Vec3) -> Self {
-        let extent = bounds.x.max(bounds.y).max(bounds.z);
+        // Frame the actual pourover apparatus, not the full simulation box.
+        let focus_extent = bounds.x.max(bounds.z).max(bounds.y * 0.45);
         Self {
-            yaw: -1.02,
-            pitch: 0.36,
-            radius: extent * 1.3,
-            target: Vec3::ZERO,
+            yaw: -0.66,
+            pitch: 0.5,
+            radius: focus_extent * 0.62,
+            target: Vec3::new(0.0, -1.2, 0.0),
         }
     }
 
@@ -158,9 +167,9 @@ impl OrbitCamera {
     }
 
     pub(crate) fn zoom(&mut self, delta: f32, bounds: Vec3) {
-        let extent = bounds.x.max(bounds.y).max(bounds.z);
-        let min_radius = extent * 0.35;
-        let max_radius = extent * 3.0;
+        let focus_extent = bounds.x.max(bounds.z).max(bounds.y * 0.45);
+        let min_radius = focus_extent * 0.28;
+        let max_radius = focus_extent * 2.4;
         self.radius = (self.radius * (1.0 + delta * 0.0015)).clamp(min_radius, max_radius);
     }
 
@@ -196,7 +205,7 @@ pub(crate) struct Renderer {
 impl Renderer {
     pub(crate) async fn new(
         canvas: HtmlCanvasElement,
-        settings: &SimSettings3D,
+        settings: &MpmSettings,
     ) -> Result<Self, JsValue> {
         let width = canvas.width().max(1);
         let height = canvas.height().max(1);
@@ -240,20 +249,19 @@ impl Renderer {
             mapped_at_creation: false,
         });
 
-        let bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("particle 3d bind group layout"),
-                entries: &[wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                }],
-            });
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("particle 3d bind group layout"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
 
         let particle_3d_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("particle 3d bind group"),
@@ -291,137 +299,138 @@ impl Renderer {
             source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(CONE_SHADER)),
         });
 
-        let pipeline_layout =
-            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("particle 3d pipeline layout"),
-                bind_group_layouts: &[Some(&bind_group_layout)],
-                immediate_size: 0,
-            });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("particle 3d pipeline layout"),
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: 0,
+        });
 
         // Particle 3D render pipeline
-        let particle_3d_pipeline =
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("particle 3d pipeline"),
-                layout: Some(&pipeline_layout),
-                vertex: wgpu::VertexState {
-                    module: &particle_3d_shader,
-                    entry_point: Some("vs_main"),
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                    buffers: &[
-                        wgpu::VertexBufferLayout {
-                            array_stride: size_of::<QuadVertex>() as u64,
-                            step_mode: wgpu::VertexStepMode::Vertex,
-                            attributes: &[wgpu::VertexAttribute {
-                                offset: 0,
-                                shader_location: 0,
-                                format: wgpu::VertexFormat::Float32x2,
-                            }],
-                        },
-                        wgpu::VertexBufferLayout {
-                            array_stride: (size_of::<f32>() * 4) as u64,
-                            step_mode: wgpu::VertexStepMode::Instance,
-                            attributes: &[
-                                wgpu::VertexAttribute {
-                                    offset: 0,
-                                    shader_location: 1,
-                                    format: wgpu::VertexFormat::Float32x3,
-                                },
-                                wgpu::VertexAttribute {
-                                    offset: 12,
-                                    shader_location: 2,
-                                    format: wgpu::VertexFormat::Float32,
-                                },
-                            ],
-                        },
-                    ],
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &particle_3d_shader,
-                    entry_point: Some("fs_main"),
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: config.format,
-                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                }),
-                primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::TriangleList,
-                    strip_index_format: None,
-                    front_face: wgpu::FrontFace::Ccw,
-                    cull_mode: None,
-                    unclipped_depth: false,
-                    polygon_mode: wgpu::PolygonMode::Fill,
-                    conservative: false,
-                },
-                depth_stencil: Some(wgpu::DepthStencilState {
-                    format: wgpu::TextureFormat::Depth24Plus,
-                    depth_write_enabled: Some(true),
-                    depth_compare: Some(wgpu::CompareFunction::Less),
-                    stencil: wgpu::StencilState::default(),
-                    bias: wgpu::DepthBiasState::default(),
-                }),
-                multisample: wgpu::MultisampleState::default(),
-                multiview_mask: None,
-                cache: None,
-            });
-
-        // Cone wireframe pipeline
-        let cone_pipeline =
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("cone pipeline"),
-                layout: Some(&pipeline_layout),
-                vertex: wgpu::VertexState {
-                    module: &cone_shader,
-                    entry_point: Some("vs_main"),
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                    buffers: &[wgpu::VertexBufferLayout {
-                        array_stride: (size_of::<f32>() * 3) as u64,
+        let particle_3d_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("particle 3d pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &particle_3d_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                buffers: &[
+                    wgpu::VertexBufferLayout {
+                        array_stride: size_of::<QuadVertex>() as u64,
                         step_mode: wgpu::VertexStepMode::Vertex,
                         attributes: &[wgpu::VertexAttribute {
                             offset: 0,
                             shader_location: 0,
-                            format: wgpu::VertexFormat::Float32x3,
+                            format: wgpu::VertexFormat::Float32x2,
                         }],
+                    },
+                    wgpu::VertexBufferLayout {
+                        array_stride: (size_of::<f32>() * 4) as u64,
+                        step_mode: wgpu::VertexStepMode::Instance,
+                        attributes: &[
+                            wgpu::VertexAttribute {
+                                offset: 0,
+                                shader_location: 1,
+                                format: wgpu::VertexFormat::Float32x3,
+                            },
+                            wgpu::VertexAttribute {
+                                offset: 12,
+                                shader_location: 2,
+                                format: wgpu::VertexFormat::Float32,
+                            },
+                        ],
+                    },
+                ],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &particle_3d_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                unclipped_depth: false,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth24Plus,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Less),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        // Cone wireframe pipeline
+        let cone_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("cone pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &cone_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: (size_of::<f32>() * 3) as u64,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &[wgpu::VertexAttribute {
+                        offset: 0,
+                        shader_location: 0,
+                        format: wgpu::VertexFormat::Float32x3,
                     }],
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &cone_shader,
-                    entry_point: Some("fs_main"),
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: config.format,
-                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                }),
-                primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::LineList,
-                    strip_index_format: None,
-                    front_face: wgpu::FrontFace::Ccw,
-                    cull_mode: None,
-                    unclipped_depth: false,
-                    polygon_mode: wgpu::PolygonMode::Fill,
-                    conservative: false,
-                },
-                depth_stencil: Some(wgpu::DepthStencilState {
-                    format: wgpu::TextureFormat::Depth24Plus,
-                    depth_write_enabled: Some(true),
-                    depth_compare: Some(wgpu::CompareFunction::Less),
-                    stencil: wgpu::StencilState::default(),
-                    bias: wgpu::DepthBiasState::default(),
-                }),
-                multisample: wgpu::MultisampleState::default(),
-                multiview_mask: None,
-                cache: None,
-            });
+                }],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &cone_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::LineList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                unclipped_depth: false,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth24Plus,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Less),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
 
         // Quad vertex buffer (billboard)
         let quad_vertices = [
-            QuadVertex { local: [-1.0, -1.0] },
+            QuadVertex {
+                local: [-1.0, -1.0],
+            },
             QuadVertex { local: [1.0, -1.0] },
             QuadVertex { local: [1.0, 1.0] },
-            QuadVertex { local: [-1.0, -1.0] },
+            QuadVertex {
+                local: [-1.0, -1.0],
+            },
             QuadVertex { local: [1.0, 1.0] },
             QuadVertex { local: [-1.0, 1.0] },
         ];
@@ -480,23 +489,21 @@ impl Renderer {
         self.config.width = width;
         self.config.height = height;
         self.surface.configure(&self.device, &self.config);
-        let (depth_texture, depth_view) =
-            create_depth_resources(&self.device, width, height);
+        let (depth_texture, depth_view) = create_depth_resources(&self.device, width, height);
         self.depth_texture = depth_texture;
         self.depth_view = depth_view;
     }
 
     pub(crate) fn render_3d(
         &mut self,
-        simulation: &CoffeeGpuSim3D,
+        simulation: &MpmSim3D,
         camera: OrbitCamera,
     ) -> Result<(), JsValue> {
         if self.config.width == 0 || self.config.height == 0 {
             return Ok(());
         }
 
-        let aspect =
-            (self.config.width.max(1) as f32) / (self.config.height.max(1) as f32);
+        let aspect = (self.config.width.max(1) as f32) / (self.config.height.max(1) as f32);
         let eye = camera.eye();
         let target = camera.target;
         let world_up = Vec3::new(0.0, 1.0, 0.0);
@@ -536,14 +543,14 @@ impl Renderer {
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame)
             | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
-            wgpu::CurrentSurfaceTexture::Timeout
-            | wgpu::CurrentSurfaceTexture::Occluded => return Ok(()),
+            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
+                return Ok(())
+            }
             wgpu::CurrentSurfaceTexture::Outdated => {
                 self.surface.configure(&self.device, &self.config);
                 return Ok(());
             }
-            wgpu::CurrentSurfaceTexture::Lost
-            | wgpu::CurrentSurfaceTexture::Validation => {
+            wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Validation => {
                 return Err(JsValue::from_str("Surface texture lost."));
             }
         };
@@ -611,14 +618,20 @@ impl Renderer {
     }
 }
 
-fn build_wireframe(settings: &SimSettings3D) -> Vec<[f32; 3]> {
+fn build_wireframe(settings: &MpmSettings) -> Vec<[f32; 3]> {
     let segments = 32;
     let verticals = 16;
     let mut verts = Vec::new();
 
     for obs in &settings.obstacles {
         match obs {
-            Obstacle::TruncatedCone { center, top_radius, bot_radius, top_y, bot_y } => {
+            Obstacle::TruncatedCone {
+                center,
+                top_radius,
+                bot_radius,
+                top_y,
+                bot_y,
+            } => {
                 let rings = 8;
                 for ring in 0..=rings {
                     let t = ring as f32 / rings as f32;
@@ -628,11 +641,24 @@ fn build_wireframe(settings: &SimSettings3D) -> Vec<[f32; 3]> {
                 }
                 for i in 0..verticals {
                     let a = 2.0 * PI * i as f32 / verticals as f32;
-                    verts.push([center.x + top_radius * a.cos(), center.y + top_y, center.z + top_radius * a.sin()]);
-                    verts.push([center.x + bot_radius * a.cos(), center.y + bot_y, center.z + bot_radius * a.sin()]);
+                    verts.push([
+                        center.x + top_radius * a.cos(),
+                        center.y + top_y,
+                        center.z + top_radius * a.sin(),
+                    ]);
+                    verts.push([
+                        center.x + bot_radius * a.cos(),
+                        center.y + bot_y,
+                        center.z + bot_radius * a.sin(),
+                    ]);
                 }
             }
-            Obstacle::Cylinder { center, radius, top_y, bot_y } => {
+            Obstacle::Cylinder {
+                center,
+                radius,
+                top_y,
+                bot_y,
+            } => {
                 let rings = 4;
                 for ring in 0..=rings {
                     let t = ring as f32 / rings as f32;
@@ -641,13 +667,22 @@ fn build_wireframe(settings: &SimSettings3D) -> Vec<[f32; 3]> {
                 }
                 for i in 0..verticals {
                     let a = 2.0 * PI * i as f32 / verticals as f32;
-                    verts.push([center.x + radius * a.cos(), center.y + top_y, center.z + radius * a.sin()]);
-                    verts.push([center.x + radius * a.cos(), center.y + bot_y, center.z + radius * a.sin()]);
+                    verts.push([
+                        center.x + radius * a.cos(),
+                        center.y + top_y,
+                        center.z + radius * a.sin(),
+                    ]);
+                    verts.push([
+                        center.x + radius * a.cos(),
+                        center.y + bot_y,
+                        center.z + radius * a.sin(),
+                    ]);
                 }
             }
         }
     }
 
+    push_spout_wireframe(&mut verts, settings);
     verts
 }
 
@@ -658,6 +693,52 @@ fn push_ring(verts: &mut Vec<[f32; 3]>, cx: f32, y: f32, cz: f32, r: f32, segmen
         verts.push([cx + r * a0.cos(), y, cz + r * a0.sin()]);
         verts.push([cx + r * a1.cos(), y, cz + r * a1.sin()]);
     }
+}
+
+fn push_spout_wireframe(verts: &mut Vec<[f32; 3]>, settings: &MpmSettings) {
+    let spout = settings.spout;
+    let direction = spout.direction.normalized();
+    let base = spout.origin - direction * spout.stem_length;
+    let (basis_a, basis_b) = spout_basis(direction);
+    let ring_segments = 12;
+
+    for i in 0..ring_segments {
+        let a0 = 2.0 * PI * i as f32 / ring_segments as f32;
+        let a1 = 2.0 * PI * ((i + 1) % ring_segments) as f32 / ring_segments as f32;
+        let base0 = base
+            + basis_a * (spout.stem_radius * a0.cos())
+            + basis_b * (spout.stem_radius * a0.sin());
+        let base1 = base
+            + basis_a * (spout.stem_radius * a1.cos())
+            + basis_b * (spout.stem_radius * a1.sin());
+        let tip0 = spout.origin
+            + basis_a * (spout.nozzle_radius * a0.cos())
+            + basis_b * (spout.nozzle_radius * a0.sin());
+        let tip1 = spout.origin
+            + basis_a * (spout.nozzle_radius * a1.cos())
+            + basis_b * (spout.nozzle_radius * a1.sin());
+
+        verts.push([base0.x, base0.y, base0.z]);
+        verts.push([base1.x, base1.y, base1.z]);
+        verts.push([tip0.x, tip0.y, tip0.z]);
+        verts.push([tip1.x, tip1.y, tip1.z]);
+        verts.push([base0.x, base0.y, base0.z]);
+        verts.push([tip0.x, tip0.y, tip0.z]);
+    }
+
+    verts.push([base.x, base.y, base.z]);
+    verts.push([spout.origin.x, spout.origin.y, spout.origin.z]);
+}
+
+fn spout_basis(direction: Vec3) -> (Vec3, Vec3) {
+    let helper = if direction.y.abs() < 0.95 {
+        Vec3::new(0.0, 1.0, 0.0)
+    } else {
+        Vec3::new(1.0, 0.0, 0.0)
+    };
+    let a = direction.cross(helper).normalized();
+    let b = direction.cross(a).normalized();
+    (a, b)
 }
 
 fn create_depth_resources(
