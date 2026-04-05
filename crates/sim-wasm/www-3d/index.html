@@ -9,14 +9,22 @@
   <body>
     <main class="layout">
       <section class="sidebar">
-        <p class="eyebrow">Coffee Sim / 3D Preview</p>
+        <p class="eyebrow">Coffee Sim / MPM</p>
         <h1>V60 Pourover</h1>
         <p class="lede">
-          GPU SPH fluid simulation with a V60 cone boundary. Drag to orbit, scroll to zoom.
+          GPU MPM fluid simulation with a V60 cone boundary and porous coffee bed.
+          Drag to orbit, scroll to zoom, and adjust kettle angle to change the stream.
         </p>
         <div class="controls">
           <button id="toggle">Pause</button>
           <button id="reset">Reset</button>
+        </div>
+        <div class="control-panel">
+          <label class="slider-field" for="kettle-angle">
+            <span>Kettle Angle</span>
+            <output id="kettle-angle-value">0°</output>
+          </label>
+          <input id="kettle-angle" type="range" min="0" max="70" step="1" value="36" />
         </div>
         <dl class="stats">
           <div>
@@ -26,6 +34,14 @@
           <div>
             <dt>FPS</dt>
             <dd id="fps">0</dd>
+          </div>
+          <div>
+            <dt>Flow</dt>
+            <dd id="flow-rate">0.0 mL/s</dd>
+          </div>
+          <div>
+            <dt>Jet Speed</dt>
+            <dd id="jet-speed">0.0 u/s</dd>
           </div>
         </dl>
       </section>

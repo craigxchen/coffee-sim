@@ -60,6 +60,32 @@ h1 {
   gap: 8px;
 }
 
+.control-panel {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  border-radius: 14px;
+  background: rgba(195, 215, 219, 0.05);
+  border: 1px solid var(--panel-border);
+}
+
+.slider-field {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
+  color: var(--muted);
+  font-size: 0.82rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+input[type="range"] {
+  width: 100%;
+  margin: 0;
+  accent-color: var(--accent);
+}
+
 button {
   flex: 1;
   padding: 10px 14px;
