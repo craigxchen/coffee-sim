@@ -129,6 +129,7 @@ dependencies = [
  "coffee-sim-core",
  "console_error_panic_hook",
  "js-sys",
+ "naga",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",

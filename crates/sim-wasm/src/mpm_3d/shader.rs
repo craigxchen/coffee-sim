@@ -452,6 +452,8 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>) {
     var new_C0 = vec3<f32>(0.0);
     var new_C1 = vec3<f32>(0.0);
     var new_C2 = vec3<f32>(0.0);
+    var supported_weight = 0.0;
+    var local_grid_mass = 0.0;
 
     let B = 4.0 * inv_dx() * inv_dx();
     let cell_dx = dx();
@@ -469,14 +471,64 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>) {
                 let ci = cell_index(u32(cell.x), u32(cell.y), u32(cell.z));
                 let grid_v = grid_vel[ci].xyz;
                 let dpos = (vec3<f32>(offset) - fx) * cell_dx;
+                let grid_mass = grid_vel[ci].w;
 
-                new_v += w * grid_v;
-                // APIC: C = B * sum(w * v * dpos^T)
-                new_C0 += w * B * grid_v * dpos.x;
-                new_C1 += w * B * grid_v * dpos.y;
-                new_C2 += w * B * grid_v * dpos.z;
+                if grid_mass > 1e-6 {
+                    new_v += w * grid_v;
+                    // APIC: C = B * sum(w * v * dpos^T)
+                    new_C0 += w * B * grid_v * dpos.x;
+                    new_C1 += w * B * grid_v * dpos.y;
+                    new_C2 += w * B * grid_v * dpos.z;
+                    supported_weight += w;
+                    local_grid_mass += w * grid_mass;
+                }
             }
         }
+    }
+
+    // Sparse jets suffer strong PIC-style dissipation because empty stencil nodes
+    // contribute zero velocity. When support is weak, preserve more of the
+    // particle's previous ballistic motion instead of letting the stream stall.
+    let support_ratio = clamp(supported_weight, 0.0, 1.0);
+    if supported_weight > 1e-6 {
+        let inv_supported = 1.0 / supported_weight;
+        new_v *= inv_supported;
+        new_C0 *= inv_supported;
+        new_C1 *= inv_supported;
+        new_C2 *= inv_supported;
+    }
+    if support_ratio < 0.999 {
+        let ballistic_v = vec3<f32>(p.vel.x, p.vel.y + gravity() * dt(), p.vel.z);
+        let preserve = clamp((1.0 - support_ratio) * 1.15, 0.0, 0.95);
+        new_v = mix(new_v, ballistic_v, preserve);
+        let affine_damp = 1.0 - preserve * 0.75;
+        new_C0 *= affine_damp;
+        new_C1 *= affine_damp;
+        new_C2 *= affine_damp;
+    }
+
+    // Even with full stencil support, a thin free stream below the dripper can be
+    // severely under-dense. PIC/APIC transfer then numerically diffuses momentum.
+    // Preserve more ballistic motion when the particle is airborne and local mass
+    // support is low compared with a compact fluid region.
+    let home_cell = world_to_cell(xp);
+    var bed_near = false;
+    if home_cell.x >= 0 && home_cell.y >= 0 && home_cell.z >= 0
+        && u32(home_cell.x) < gx() && u32(home_cell.y) < gy() && u32(home_cell.z) < gz() {
+        let home_idx = cell_index(u32(home_cell.x), u32(home_cell.y), u32(home_cell.z));
+        bed_near = bed_lookup[home_idx] >= 0;
+    }
+    let airborne = !bed_near && sample_sdf(xp) > contact_offset() * 2.0;
+    if airborne {
+        let dense_mass = nominal_mass() * 4.0;
+        let density_ratio = clamp(local_grid_mass / max(dense_mass, 1e-6), 0.0, 1.0);
+        let ballistic_v = vec3<f32>(p.vel.x, p.vel.y + gravity() * dt(), p.vel.z);
+        let preserve = clamp((1.0 - density_ratio) * 0.72, 0.0, 0.88);
+        new_v = mix(new_v, ballistic_v, preserve);
+        let affine_damp = 1.0 - preserve * 0.65;
+        new_C0 *= affine_damp;
+        new_C1 *= affine_damp;
+        new_C2 *= affine_damp;
     }
 
     // Extra dissipation and volume recovery in the carafe help the under-
