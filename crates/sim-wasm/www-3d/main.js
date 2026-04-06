@@ -15,6 +15,12 @@ const particleLabel = document.getElementById("particles");
 const fpsLabel = document.getElementById("fps");
 const flowRateLabel = document.getElementById("flow-rate");
 const jetSpeedLabel = document.getElementById("jet-speed");
+const pooledDepthLabel = document.getElementById("pooled-depth");
+const outflowRateLabel = document.getElementById("outflow-rate");
+const surfaceWaterLabel = document.getElementById("surface-water");
+const avgShLabel = document.getElementById("avg-sh");
+const avgKeffLabel = document.getElementById("avg-keff");
+const avgSigmaLabel = document.getElementById("avg-sigma");
 
 let app;
 let paused = false;
@@ -23,6 +29,7 @@ let fpsWindow = [];
 let dragging = false;
 let lastClientX = 0;
 let lastClientY = 0;
+let latestFrameSeconds = 1 / 60;
 
 await init();
 app = await WasmSim3D.create(canvas);
@@ -110,6 +117,7 @@ function animate(timestamp) {
   if (!lastFrameTime) lastFrameTime = timestamp;
 
   const frameTime = Math.min((timestamp - lastFrameTime) / 1000, 0.05);
+  latestFrameSeconds = frameTime;
   lastFrameTime = timestamp;
 
   if (!paused) {
@@ -152,4 +160,11 @@ function syncUi() {
   spoutZValue.textContent = app.spoutZ().toFixed(1);
   flowRateLabel.textContent = `${app.flowRate().toFixed(1)} mL/s`;
   jetSpeedLabel.textContent = `${app.exitSpeed().toFixed(1)} u/s`;
+  pooledDepthLabel.textContent = app.debugMetric(6).toFixed(2);
+  const outflowRate = latestFrameSeconds > 0 ? app.debugMetric(4) / latestFrameSeconds : 0;
+  outflowRateLabel.textContent = `${outflowRate.toFixed(2)}`;
+  surfaceWaterLabel.textContent = Math.round(app.debugMetric(5)).toString();
+  avgShLabel.textContent = app.debugMetric(8).toFixed(2);
+  avgKeffLabel.textContent = app.debugMetric(11).toFixed(2);
+  avgSigmaLabel.textContent = app.debugMetric(12).toFixed(2);
 }

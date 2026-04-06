@@ -1,4 +1,6 @@
-#[cfg(target_arch = "wasm32")]
+#![cfg_attr(test, allow(dead_code))]
+
+#[cfg(any(target_arch = "wasm32", test))]
 pub(crate) mod mpm_3d;
 #[cfg(target_arch = "wasm32")]
 mod renderer;
@@ -119,5 +121,10 @@ impl WasmSim3D {
     #[wasm_bindgen(js_name = particleCount)]
     pub fn particle_count(&self) -> usize {
         self.sim.particle_count()
+    }
+
+    #[wasm_bindgen(js_name = debugMetric)]
+    pub fn debug_metric(&self, _index: usize) -> f32 {
+        0.0
     }
 }

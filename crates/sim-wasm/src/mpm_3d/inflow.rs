@@ -230,3 +230,71 @@ fn flow_rate_from_speed(
     let volumetric_flow = discharge_coeff * area * exit_speed;
     (volumetric_flow * volume_to_ml).min(max_flow_rate_ml_s)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn effective_head_is_zero_below_activation_and_monotonic() {
+        let spout = SpoutSettings::default();
+
+        assert_eq!(effective_head_from_angle(0.0, &spout), 0.0);
+        assert_eq!(
+            effective_head_from_angle(spout.activation_angle_deg, &spout),
+            0.0
+        );
+
+        let low = effective_head_from_angle(16.0, &spout);
+        let mid = effective_head_from_angle(30.0, &spout);
+        let high = effective_head_from_angle(48.0, &spout);
+
+        assert!(low > 0.0);
+        assert!(mid > low);
+        assert!(high > mid);
+        assert!(
+            (effective_head_from_angle(spout.full_flow_angle_deg, &spout) - spout.head_at_full_angle)
+                .abs()
+                < 1e-6
+        );
+    }
+
+    #[test]
+    fn exit_speed_from_head_is_monotonic_and_capped() {
+        let low = exit_speed_from_head(0.25, 22.0);
+        let mid = exit_speed_from_head(2.0, 22.0);
+        let high = exit_speed_from_head(40.0, 22.0);
+
+        assert!(low > 0.0);
+        assert!(mid > low);
+        assert!(high >= mid);
+        assert!(high <= 22.0);
+        assert_eq!(exit_speed_from_head(0.0, 22.0), 0.0);
+    }
+
+    #[test]
+    fn flow_rate_from_speed_is_monotonic_and_capped() {
+        let nozzle_radius = SpoutSettings::default().nozzle_radius;
+        let low = flow_rate_from_speed(4.0, nozzle_radius, 0.92, 5.4, 11.5);
+        let mid = flow_rate_from_speed(10.0, nozzle_radius, 0.92, 5.4, 11.5);
+        let high = flow_rate_from_speed(40.0, nozzle_radius, 0.92, 5.4, 11.5);
+
+        assert!(low > 0.0);
+        assert!(mid > low);
+        assert!(high >= mid);
+        assert!(high <= 11.5);
+        assert_eq!(flow_rate_from_speed(0.0, nozzle_radius, 0.92, 5.4, 11.5), 0.0);
+    }
+
+    #[test]
+    fn inflow_update_produces_consistent_head_speed_and_flow() {
+        let spout = SpoutSettings::default();
+        let mut inflow = InflowState::new(42.0);
+        inflow.update(&spout);
+
+        assert!(inflow.exit_speed() > 0.0);
+        assert!(inflow.flow_rate() > 0.0);
+        assert!(inflow.exit_speed() <= spout.max_exit_speed);
+        assert!(inflow.flow_rate() <= spout.max_flow_rate_ml_s);
+    }
+}
