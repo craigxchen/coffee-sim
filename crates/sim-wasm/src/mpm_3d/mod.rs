@@ -60,10 +60,10 @@ impl MpmSettings {
             bounds_size,
             grid_dims,
             max_particles: 220_000,
-            substeps: 3,
+            substeps: 5,
             gravity: -10.0,
-            bulk_modulus: 420.0,
-            viscosity: 0.05,
+            bulk_modulus: 900.0,
+            viscosity: 0.12,
             render_radius: dx * 0.7,
             obstacles: vec![
                 Obstacle::TruncatedCone {
@@ -262,8 +262,20 @@ impl MpmSim3D {
         self.inflow.set_angle(angle_deg);
     }
 
+    pub fn set_spout_position(&mut self, x: f32, y: f32, z: f32) {
+        self.settings.spout.origin = Vec3::new(x, y, z);
+    }
+
+    pub fn set_spout_target(&mut self, x: f32, y: f32, z: f32) {
+        self.settings.spout.aim_at(Vec3::new(x, y, z));
+    }
+
     pub fn kettle_angle(&self) -> f32 {
         self.inflow.angle()
+    }
+
+    pub fn spout_position(&self) -> Vec3 {
+        self.settings.spout.origin
     }
 
     pub fn flow_rate_ml_s(&self) -> f32 {
@@ -292,6 +304,7 @@ impl MpmSim3D {
         let bs = self.settings.bounds_size;
         let dx = bs.x / gx as f32;
         let inv_dx = 1.0 / dx;
+        let initial_particle_mass = MASS_UNITS_PER_ML / inflow::PARTICLES_PER_ML;
         let particle_vol = dx * dx * dx * 0.25;
         let bed_capacity_per_particle = if self.num_bed > 0 {
             TARGET_BED_RETENTION_ML * MASS_UNITS_PER_ML / self.num_bed as f32
@@ -310,7 +323,12 @@ impl MpmSim3D {
             sim_params: [dt, self.settings.gravity, dx, inv_dx],
             grid_origin: [-bs.x * 0.5, -bs.y * 0.5, -bs.z * 0.5, 0.0],
             bounds_max: [bs.x * 0.5, bs.y * 0.5, bs.z * 0.5, 0.0],
-            fluid_params: [self.settings.bulk_modulus, self.settings.viscosity, 1.0, particle_vol],
+            fluid_params: [
+                self.settings.bulk_modulus,
+                self.settings.viscosity,
+                initial_particle_mass,
+                particle_vol,
+            ],
             fp_params: [FP_SCALE, 1.0 / FP_SCALE, MAX_VELOCITY, 0.0],
             inflow_origin: [
                 self.settings.spout.origin.x,
@@ -329,7 +347,7 @@ impl MpmSim3D {
             // Tie bed retention to an overall retained-water target so the bed
             // wets realistically without swallowing most of the brew.
             bed_params: [34.0, 8.0, bed_capacity_per_particle, 0.0],
-            extraction_params: [0.01, 18.0, 7.0, 14.0],
+            extraction_params: [0.01, 11.0, 8.5, 15.0],
             time_params: [self.total_time, dt, 0.0, 0.0],
         };
 

@@ -58,9 +58,34 @@ impl WasmSim3D {
         self.sim.set_kettle_angle(angle_deg);
     }
 
+    #[wasm_bindgen(js_name = setSpoutPosition)]
+    pub fn set_spout_position(&mut self, x: f32, y: f32, z: f32) {
+        self.sim.set_spout_position(x, y, z);
+    }
+
+    #[wasm_bindgen(js_name = setSpoutTarget)]
+    pub fn set_spout_target(&mut self, x: f32, y: f32, z: f32) {
+        self.sim.set_spout_target(x, y, z);
+    }
+
     #[wasm_bindgen(js_name = kettleAngle)]
     pub fn kettle_angle(&self) -> f32 {
         self.sim.kettle_angle()
+    }
+
+    #[wasm_bindgen(js_name = spoutX)]
+    pub fn spout_x(&self) -> f32 {
+        self.sim.spout_position().x
+    }
+
+    #[wasm_bindgen(js_name = spoutY)]
+    pub fn spout_y(&self) -> f32 {
+        self.sim.spout_position().y
+    }
+
+    #[wasm_bindgen(js_name = spoutZ)]
+    pub fn spout_z(&self) -> f32 {
+        self.sim.spout_position().z
     }
 
     #[wasm_bindgen(js_name = flowRate)]

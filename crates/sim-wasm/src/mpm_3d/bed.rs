@@ -102,7 +102,7 @@ pub(crate) fn init_bed_particles(
                 // Particle: pos(x,y,z,J=1), vel(0,0,0,mass=1)
                 particles.push([x, y, z, 1.0, 0.0, 0.0, 0.0, 1.0]);
                 // Phase=1.0 means bed particle.
-                affines.push([0.0, 0.0, 0.0, 1.0, x, y, z, 0.0, 0.0, 0.0, 0.0, 0.0]);
+                affines.push([0.0, 0.0, 0.0, 1.0, x, y, z, 0.0, y, 0.0, 0.0, 0.0]);
                 // BedExtract: bed(pore_water, porosity, permeability, compaction),
                 //             extract(extractable, dissolved, temp, saturation)
                 bed_extracts.push([
