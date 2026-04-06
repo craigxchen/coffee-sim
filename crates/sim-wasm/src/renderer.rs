@@ -39,8 +39,8 @@ struct ParticleVertexOutput {
 
 @vertex
 fn vs_main(input: ParticleVertexInput) -> ParticleVertexOutput {
-    let water_radius = uniforms.params.x * mix(1.18, 0.96, clamp(input.colour_t * 0.7, 0.0, 1.0));
-    let radius = select(water_radius, uniforms.params.x * 0.52, input.colour_t < 0.0);
+    let water_radius = uniforms.params.x * mix(0.58, 0.40, clamp(input.colour_t * 0.7, 0.0, 1.0));
+    let radius = select(water_radius, uniforms.params.x * 0.62, input.colour_t < 0.0);
     let offset = uniforms.camera_right.xyz * input.local.x * radius
         + uniforms.camera_up.xyz * input.local.y * radius;
     let world = input.world_position + offset;

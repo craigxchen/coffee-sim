@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Coffee Sim | Demo Loop</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main class="demo-layout">
+      <canvas id="sim-canvas"></canvas>
+      <section class="demo-overlay">
+        <p class="eyebrow">Coffee Sim / Demo</p>
+        <h1>Version 0 Circular Pour</h1>
+        <p class="lede">
+          Autoplay capture scene. Drag to orbit, scroll to zoom, or let the preset
+          loop run for recording.
+        </p>
+        <div class="chips">
+          <span class="chip" id="preset-name">Circular Bloom</span>
+          <span class="chip" id="elapsed">0.0s</span>
+          <span class="chip" id="flow-rate">0.0 mL/s</span>
+        </div>
+        <div class="controls">
+          <button id="toggle">Pause</button>
+          <button id="reset">Restart</button>
+        </div>
+      </section>
+    </main>
+    <script type="module" src="./main.js"></script>
+  </body>
+</html>

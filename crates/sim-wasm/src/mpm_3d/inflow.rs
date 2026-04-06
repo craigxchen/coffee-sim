@@ -13,6 +13,10 @@ pub(crate) struct SpoutSettings {
     pub stem_radius: f32,
     pub activation_angle_deg: f32,
     pub full_flow_angle_deg: f32,
+    pub head_at_activation: f32,
+    pub head_at_full_angle: f32,
+    pub discharge_coeff: f32,
+    pub volume_to_ml: f32,
     pub max_flow_rate_ml_s: f32,
     pub max_exit_speed: f32,
     pub stem_length: f32,
@@ -21,15 +25,32 @@ pub(crate) struct SpoutSettings {
 impl Default for SpoutSettings {
     fn default() -> Self {
         Self {
-            origin: Vec3::new(-6.0, 6.6, 2.2),
-            direction: Vec3::new(0.71, -0.66, -0.24).normalized(),
+            origin: Vec3::new(-3.4, 7.3, 0.9),
+            direction: Vec3::new(0.36, -0.92, -0.12).normalized(),
             nozzle_radius: 0.18,
             stem_radius: 0.24,
             activation_angle_deg: 8.0,
             full_flow_angle_deg: 56.0,
+            head_at_activation: 0.04,
+            head_at_full_angle: 24.0,
+            discharge_coeff: 0.92,
+            volume_to_ml: 5.4,
             max_flow_rate_ml_s: 11.5,
             max_exit_speed: 22.0,
             stem_length: 1.9,
+        }
+    }
+}
+
+impl SpoutSettings {
+    pub fn aim_at(&mut self, target: Vec3) {
+        let delta = Vec3::new(
+            target.x - self.origin.x,
+            target.y - self.origin.y,
+            target.z - self.origin.z,
+        );
+        if delta.length() > 1e-5 {
+            self.direction = delta.normalized();
         }
     }
 }
@@ -68,11 +89,14 @@ impl InflowState {
     }
 
     pub fn update(&mut self, spout: &SpoutSettings) {
-        self.flow_rate = flow_rate_from_angle(self.kettle_angle_deg, spout);
-        self.exit_speed = exit_speed_from_flow_rate(
-            self.flow_rate,
+        let head = effective_head_from_angle(self.kettle_angle_deg, spout);
+        self.exit_speed = exit_speed_from_head(head, spout.max_exit_speed);
+        self.flow_rate = flow_rate_from_speed(
+            self.exit_speed,
             spout.nozzle_radius,
-            spout.max_exit_speed,
+            spout.discharge_coeff,
+            spout.volume_to_ml,
+            spout.max_flow_rate_ml_s,
         );
     }
 
@@ -171,27 +195,38 @@ impl InflowState {
     }
 }
 
-fn flow_rate_from_angle(angle_deg: f32, spout: &SpoutSettings) -> f32 {
+fn effective_head_from_angle(angle_deg: f32, spout: &SpoutSettings) -> f32 {
     if angle_deg <= spout.activation_angle_deg {
         return 0.0;
     }
     if angle_deg >= spout.full_flow_angle_deg {
-        return spout.max_flow_rate_ml_s;
+        return spout.head_at_full_angle;
     }
     let t = (angle_deg - spout.activation_angle_deg)
         / (spout.full_flow_angle_deg - spout.activation_angle_deg);
-    // Smooth ramp (smoothstep)
     let s = t * t * (3.0 - 2.0 * t);
-    s * spout.max_flow_rate_ml_s
+    spout.head_at_activation + s * (spout.head_at_full_angle - spout.head_at_activation)
 }
 
-fn exit_speed_from_flow_rate(flow_rate: f32, nozzle_radius: f32, max_exit_speed: f32) -> f32 {
-    if flow_rate < 1e-6 {
+fn exit_speed_from_head(head: f32, max_exit_speed: f32) -> f32 {
+    if head < 1e-6 {
+        return 0.0;
+    }
+    let speed = (2.0 * 10.0 * head).sqrt();
+    speed.min(max_exit_speed)
+}
+
+fn flow_rate_from_speed(
+    exit_speed: f32,
+    nozzle_radius: f32,
+    discharge_coeff: f32,
+    volume_to_ml: f32,
+    max_flow_rate_ml_s: f32,
+) -> f32 {
+    if exit_speed < 1e-6 {
         return 0.0;
     }
     let area = std::f32::consts::PI * nozzle_radius * nozzle_radius;
-    // flow_rate is mL/s = cm^3/s, area in sim units^2
-    // Approximate: speed = flow_rate_factor / area
-    // Keep it simple: scale so max flow gives reasonable speed
-    (flow_rate / area).min(max_exit_speed)
+    let volumetric_flow = discharge_coeff * area * exit_speed;
+    (volumetric_flow * volume_to_ml).min(max_flow_rate_ml_s)
 }

@@ -5,6 +5,12 @@ const toggleButton = document.getElementById("toggle");
 const resetButton = document.getElementById("reset");
 const kettleAngleInput = document.getElementById("kettle-angle");
 const kettleAngleValue = document.getElementById("kettle-angle-value");
+const spoutXInput = document.getElementById("spout-x");
+const spoutXValue = document.getElementById("spout-x-value");
+const spoutYInput = document.getElementById("spout-y");
+const spoutYValue = document.getElementById("spout-y-value");
+const spoutZInput = document.getElementById("spout-z");
+const spoutZValue = document.getElementById("spout-z-value");
 const particleLabel = document.getElementById("particles");
 const fpsLabel = document.getElementById("fps");
 const flowRateLabel = document.getElementById("flow-rate");
@@ -20,7 +26,9 @@ let lastClientY = 0;
 
 await init();
 app = await WasmSim3D.create(canvas);
+syncControlDefaultsFromSim();
 app.setKettleAngle(Number(kettleAngleInput.value));
+applySpoutControls();
 resizeCanvas();
 syncUi();
 requestAnimationFrame(animate);
@@ -35,12 +43,28 @@ toggleButton.addEventListener("click", () => {
 resetButton.addEventListener("click", () => {
   app.reset();
   app.setKettleAngle(Number(kettleAngleInput.value));
+  applySpoutControls();
   lastFrameTime = 0;
   syncUi();
 });
 
 kettleAngleInput.addEventListener("input", () => {
   app.setKettleAngle(Number(kettleAngleInput.value));
+  syncUi();
+});
+
+spoutXInput.addEventListener("input", () => {
+  applySpoutControls();
+  syncUi();
+});
+
+spoutYInput.addEventListener("input", () => {
+  applySpoutControls();
+  syncUi();
+});
+
+spoutZInput.addEventListener("input", () => {
+  applySpoutControls();
   syncUi();
 });
 
@@ -105,9 +129,27 @@ function updateFps(frameTime) {
   fpsLabel.textContent = avg > 0 ? Math.round(1 / avg).toString() : "0";
 }
 
+function syncControlDefaultsFromSim() {
+  kettleAngleInput.value = app.kettleAngle().toFixed(0);
+  spoutXInput.value = app.spoutX().toFixed(1);
+  spoutYInput.value = app.spoutY().toFixed(1);
+  spoutZInput.value = app.spoutZ().toFixed(1);
+}
+
+function applySpoutControls() {
+  app.setSpoutPosition(
+    Number(spoutXInput.value),
+    Number(spoutYInput.value),
+    Number(spoutZInput.value),
+  );
+}
+
 function syncUi() {
   particleLabel.textContent = new Intl.NumberFormat().format(app.particleCount());
   kettleAngleValue.textContent = `${Math.round(app.kettleAngle())}\u00b0`;
+  spoutXValue.textContent = app.spoutX().toFixed(1);
+  spoutYValue.textContent = app.spoutY().toFixed(1);
+  spoutZValue.textContent = app.spoutZ().toFixed(1);
   flowRateLabel.textContent = `${app.flowRate().toFixed(1)} mL/s`;
   jetSpeedLabel.textContent = `${app.exitSpeed().toFixed(1)} u/s`;
 }
