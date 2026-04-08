@@ -155,25 +155,6 @@ fn predicted_bed_sink_mass(cell: u32, cell_mass: f32) -> f32 {
     return min(predicted, cell_remaining_capacity);
 }
 
-fn quadratic_kernel_weights(fx: vec3<f32>) -> array<vec3<f32>, 3> {
-    var w: array<vec3<f32>, 3>;
-    w[0] = 0.5 * (vec3<f32>(1.5) - fx) * (vec3<f32>(1.5) - fx);
-    w[1] = vec3<f32>(0.75) - (fx - vec3<f32>(1.0)) * (fx - vec3<f32>(1.0));
-    w[2] = 0.5 * (fx - vec3<f32>(0.5)) * (fx - vec3<f32>(0.5));
-    return w;
-}
-
-fn particle_home_cell_weight(grid_pos: vec3<f32>, home_cell: vec3<i32>) -> f32 {
-    let base = vec3<i32>(floor(grid_pos - vec3<f32>(0.5)));
-    let fx = grid_pos - vec3<f32>(base);
-    let weights = quadratic_kernel_weights(fx);
-    let offset = home_cell - base;
-    if offset.x < 0 || offset.x > 2 || offset.y < 0 || offset.y > 2 || offset.z < 0 || offset.z > 2 {
-        return 0.0;
-    }
-    return weights[u32(offset.x)].x * weights[u32(offset.y)].y * weights[u32(offset.z)].z;
-}
-
 fn world_to_cell(position: vec3<f32>) -> vec3<i32> {
     let grid_pos = (position - u.grid_origin.xyz) * inv_dx();
     return vec3<i32>(floor(grid_pos));
@@ -945,69 +926,6 @@ fn bed_coupling(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 
 // ── commit_bed_storage ──
-
-@compute @workgroup_size(64)
-fn apply_bed_sink_particles(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let pid = gid.x;
-    if pid >= num_particles() { return; }
-    if !projection_enabled() { return; }
-
-    let phase = affine[pid].col0.w;
-    if phase >= 0.5 {
-        return;
-    }
-
-    let mass_p = particles[pid].vel.w;
-    if mass_p <= inactive_mass_threshold() {
-        return;
-    }
-
-    let pos = particles[pid].pos.xyz;
-    let cell = world_to_cell(pos);
-    if cell.x < 0 || cell.y < 0 || cell.z < 0 { return; }
-    if u32(cell.x) >= gx() || u32(cell.y) >= gy() || u32(cell.z) >= gz() { return; }
-
-    let ci = cell_index(u32(cell.x), u32(cell.y), u32(cell.z));
-    if cell_kind_load(ci) != CELL_BED_COUPLED {
-        return;
-    }
-
-    let bed_idx = bed_lookup[ci];
-    if bed_idx < 0 || u32(bed_idx) >= num_bed() {
-        return;
-    }
-
-    let cell_mass = grid_vel[ci].w;
-    if cell_mass <= 1e-6 {
-        return;
-    }
-
-    let grid_pos = (pos - u.grid_origin.xyz) * inv_dx();
-    let home_weight = particle_home_cell_weight(grid_pos, cell);
-    if home_weight <= 1e-6 {
-        return;
-    }
-
-    let sink_mass = predicted_bed_sink_mass(ci, cell_mass);
-    if sink_mass <= 1e-6 {
-        return;
-    }
-
-    let particle_share = home_weight * mass_p / max(cell_mass, 1e-6);
-    var particle_sink = sink_mass * particle_share;
-    particle_sink = min(particle_sink, mass_p);
-    if particle_sink <= 1e-6 {
-        return;
-    }
-
-    let remaining = mass_p - particle_sink;
-    if remaining <= inactive_mass_threshold() {
-        particles[pid].vel = vec4<f32>(vec3<f32>(0.0), 0.0);
-    } else {
-        particles[pid].vel = vec4<f32>(particles[pid].vel.xyz, remaining);
-    }
-    atomicAdd(&bed_delta[u32(bed_idx)], i32(particle_sink * fp_scale()));
-}
 
 @compute @workgroup_size(64)
 fn commit_bed_storage(@builtin(global_invocation_id) gid: vec3<u32>) {
