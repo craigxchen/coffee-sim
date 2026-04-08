@@ -51,11 +51,7 @@ pub(crate) struct MpmBuffers {
 }
 
 impl MpmBuffers {
-    pub fn new(
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        settings: &MpmSettings,
-    ) -> Self {
+    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, settings: &MpmSettings) -> Self {
         let max_p = settings.max_particles as usize;
         let [gx, gy, gz] = settings.grid_dims;
         let total_cells = (gx * gy * gz) as usize;

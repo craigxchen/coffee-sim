@@ -6,7 +6,7 @@ pub(crate) mod mpm_3d;
 mod renderer;
 
 #[cfg(target_arch = "wasm32")]
-use mpm_3d::{MpmSim3D, MpmSettings};
+use mpm_3d::{MpmSettings, MpmSim3D};
 #[cfg(target_arch = "wasm32")]
 use renderer::{OrbitCamera, Renderer};
 #[cfg(target_arch = "wasm32")]
@@ -35,18 +35,28 @@ impl WasmSim3D {
         let renderer = Renderer::new(canvas, &settings).await?;
         let sim = MpmSim3D::new(renderer.device(), renderer.queue(), settings);
         let camera = OrbitCamera::new(sim.settings().bounds_size);
-
-        Ok(Self {
-            sim,
-            renderer,
-            camera,
-        })
+        Ok(Self { sim, renderer, camera })
     }
 
     pub fn reset(&mut self) {
         self.sim
             .reset(self.renderer.queue(), self.renderer.device());
         self.camera = OrbitCamera::new(self.sim.settings().bounds_size);
+    }
+
+    #[wasm_bindgen(js_name = loadDefaultScene)]
+    pub fn load_default_scene(&mut self) {
+        self.rebuild_with_settings(MpmSettings::default_v60());
+    }
+
+    #[wasm_bindgen(js_name = loadBenchmarkFreeStream)]
+    pub fn load_benchmark_free_stream(&mut self) {
+        self.rebuild_with_settings(MpmSettings::benchmark_free_stream());
+    }
+
+    #[wasm_bindgen(js_name = loadBenchmarkCenterPour)]
+    pub fn load_benchmark_center_pour(&mut self) {
+        self.rebuild_with_settings(MpmSettings::benchmark_center_pour());
     }
 
     #[wasm_bindgen(js_name = stepFrame)]
@@ -123,8 +133,77 @@ impl WasmSim3D {
         self.sim.particle_count()
     }
 
-    #[wasm_bindgen(js_name = debugMetric)]
-    pub fn debug_metric(&self, _index: usize) -> f32 {
-        0.0
+    #[wasm_bindgen(js_name = waterSlotsUsed)]
+    pub fn water_slots_used(&self) -> u32 {
+        self.sim.water_slots_used()
+    }
+
+    #[wasm_bindgen(js_name = bedParticleCount)]
+    pub fn bed_particle_count(&self) -> u32 {
+        self.sim.bed_particle_count()
+    }
+
+    #[wasm_bindgen(js_name = maxParticles)]
+    pub fn max_particles(&self) -> u32 {
+        self.sim.max_particles()
+    }
+
+    #[wasm_bindgen(js_name = simTime)]
+    pub fn sim_time(&self) -> f32 {
+        self.sim.total_time()
+    }
+
+    #[wasm_bindgen(js_name = frameEmittedMass)]
+    pub fn frame_emitted_mass(&self) -> f32 {
+        self.sim.frame_emitted_mass()
+    }
+
+    #[wasm_bindgen(js_name = totalEmittedMass)]
+    pub fn total_emitted_mass(&self) -> f32 {
+        self.sim.total_emitted_mass()
+    }
+
+    #[wasm_bindgen(js_name = frameDroppedParticles)]
+    pub fn frame_dropped_particles(&self) -> u32 {
+        self.sim.frame_dropped_particles()
+    }
+
+    #[wasm_bindgen(js_name = totalDroppedParticles)]
+    pub fn total_dropped_particles(&self) -> u32 {
+        self.sim.total_dropped_particles()
+    }
+
+    #[wasm_bindgen(js_name = hasBed)]
+    pub fn has_bed(&self) -> bool {
+        self.sim.settings().bed.is_some()
+    }
+
+    #[wasm_bindgen(js_name = setTempSparseBallisticEnabled)]
+    pub fn set_temp_sparse_ballistic_enabled(&mut self, enabled: bool) {
+        self.sim.set_temp_sparse_ballistic_enabled(enabled);
+    }
+
+    #[wasm_bindgen(js_name = setPressureProjectionEnabled)]
+    pub fn set_pressure_projection_enabled(&mut self, enabled: bool) {
+        self.sim.set_pressure_projection_enabled(enabled);
+    }
+
+    #[wasm_bindgen(js_name = pressureProjectionEnabled)]
+    pub fn pressure_projection_enabled(&self) -> bool {
+        self.sim.pressure_projection_enabled()
+    }
+
+    #[wasm_bindgen(js_name = tempSparseBallisticEnabled)]
+    pub fn temp_sparse_ballistic_enabled(&self) -> bool {
+        self.sim.temp_sparse_ballistic_enabled()
+    }
+
+}
+
+#[cfg(target_arch = "wasm32")]
+impl WasmSim3D {
+    fn rebuild_with_settings(&mut self, settings: MpmSettings) {
+        self.sim = MpmSim3D::new(self.renderer.device(), self.renderer.queue(), settings);
+        self.camera = OrbitCamera::new(self.sim.settings().bounds_size);
     }
 }

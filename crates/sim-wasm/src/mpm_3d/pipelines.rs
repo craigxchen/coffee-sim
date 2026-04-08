@@ -8,6 +8,10 @@ pub(crate) struct MpmPipelines {
     pub clear_grid: wgpu::ComputePipeline,
     pub p2g: wgpu::ComputePipeline,
     pub grid_update: wgpu::ComputePipeline,
+    pub classify_cells: wgpu::ComputePipeline,
+    pub pressure_rbgs_red: wgpu::ComputePipeline,
+    pub pressure_rbgs_black: wgpu::ComputePipeline,
+    pub project_pressure: wgpu::ComputePipeline,
     pub boundary_project: wgpu::ComputePipeline,
     pub g2p: wgpu::ComputePipeline,
     pub bed_coupling: wgpu::ComputePipeline,
@@ -18,49 +22,48 @@ pub(crate) struct MpmPipelines {
 
 impl MpmPipelines {
     pub fn new(device: &wgpu::Device, buffers: &MpmBuffers) -> Self {
-        let bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("mpm bind group layout"),
-                entries: &[
-                    // 0: uniform
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("mpm bind group layout"),
+            entries: &[
+                // 0: uniform
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
                     },
-                    // 1: particles
-                    storage_entry(1),
-                    // 2: affine
-                    storage_entry(2),
-                    // 3: grid atomics
-                    storage_entry(3),
-                    // 4: grid_vel
-                    storage_entry(4),
-                    // 5: sdf texture
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 5,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                            view_dimension: wgpu::TextureViewDimension::D3,
-                            multisampled: false,
-                        },
-                        count: None,
+                    count: None,
+                },
+                // 1: particles
+                storage_entry(1),
+                // 2: affine
+                storage_entry(2),
+                // 3: grid atomics
+                storage_entry(3),
+                // 4: grid_vel
+                storage_entry(4),
+                // 5: sdf texture
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D3,
+                        multisampled: false,
                     },
-                    // 6: render_data
-                    storage_entry(6),
-                    // 7: bed_extract
-                    storage_entry(7),
-                    // 8: bed_lookup
-                    read_only_storage_entry(8),
-                    // 9: bed_delta
-                    storage_entry(9),
-                ],
+                    count: None,
+                },
+                // 6: render_data
+                storage_entry(6),
+                // 7: bed_extract
+                storage_entry(7),
+                // 8: bed_lookup
+                read_only_storage_entry(8),
+                // 9: bed_delta
+                storage_entry(9),
+            ],
             });
 
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -115,12 +118,11 @@ impl MpmPipelines {
             source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(MPM_COMPUTE_SHADER)),
         });
 
-        let pipeline_layout =
-            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("mpm pipeline layout"),
-                bind_group_layouts: &[Some(&bind_group_layout)],
-                immediate_size: 0,
-            });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("mpm pipeline layout"),
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: 0,
+        });
 
         let make = |entry: &str| -> wgpu::ComputePipeline {
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -138,6 +140,10 @@ impl MpmPipelines {
             clear_grid: make("clear_grid"),
             p2g: make("p2g"),
             grid_update: make("grid_update"),
+            classify_cells: make("classify_cells"),
+            pressure_rbgs_red: make("pressure_rbgs_red"),
+            pressure_rbgs_black: make("pressure_rbgs_black"),
+            project_pressure: make("project_pressure"),
             boundary_project: make("boundary_project"),
             g2p: make("g2p"),
             bed_coupling: make("bed_coupling"),

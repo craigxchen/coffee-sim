@@ -62,6 +62,11 @@ pub(crate) struct InflowState {
     accumulator: f32,
 }
 
+pub(crate) struct EmissionResult {
+    pub emitted: u32,
+    pub dropped: u32,
+}
+
 impl InflowState {
     pub fn new(angle_deg: f32) -> Self {
         Self {
@@ -110,19 +115,26 @@ impl InflowState {
         current_water: u32,
         current_bed: u32,
         max_particles: u32,
-    ) -> u32 {
+    ) -> EmissionResult {
         self.update(spout);
 
         if self.flow_rate < 1e-6 {
             self.accumulator = 0.0;
-            return 0;
+            return EmissionResult {
+                emitted: 0,
+                dropped: 0,
+            };
         }
 
         let particles_per_sec = self.flow_rate * PARTICLES_PER_ML;
         self.accumulator += particles_per_sec * dt;
-        let count = self.accumulator as u32;
+        let requested = self.accumulator as u32;
+        let count = requested;
         if count == 0 {
-            return 0;
+            return EmissionResult {
+                emitted: 0,
+                dropped: 0,
+            };
         }
         self.accumulator -= count as f32;
 
@@ -130,7 +142,10 @@ impl InflowState {
         let available = max_particles.saturating_sub(total);
         let count = count.min(available);
         if count == 0 {
-            return 0;
+            return EmissionResult {
+                emitted: 0,
+                dropped: requested,
+            };
         }
 
         // Build tangent basis for the nozzle disk
@@ -191,7 +206,10 @@ impl InflowState {
             bytemuck::cast_slice(&affine_data),
         );
 
-        count
+        EmissionResult {
+            emitted: count,
+            dropped: requested.saturating_sub(count),
+        }
     }
 }
 
@@ -253,7 +271,8 @@ mod tests {
         assert!(mid > low);
         assert!(high > mid);
         assert!(
-            (effective_head_from_angle(spout.full_flow_angle_deg, &spout) - spout.head_at_full_angle)
+            (effective_head_from_angle(spout.full_flow_angle_deg, &spout)
+                - spout.head_at_full_angle)
                 .abs()
                 < 1e-6
         );
@@ -283,7 +302,10 @@ mod tests {
         assert!(mid > low);
         assert!(high >= mid);
         assert!(high <= 11.5);
-        assert_eq!(flow_rate_from_speed(0.0, nozzle_radius, 0.92, 5.4, 11.5), 0.0);
+        assert_eq!(
+            flow_rate_from_speed(0.0, nozzle_radius, 0.92, 5.4, 11.5),
+            0.0
+        );
     }
 
     #[test]
