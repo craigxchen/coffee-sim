@@ -20,11 +20,38 @@
           <button id="reset">Reset</button>
         </div>
         <div class="control-panel">
+          <div class="slider-field">
+            <span>Benchmark Scenes</span>
+          </div>
+          <div class="controls">
+            <button id="scene-default">Default</button>
+            <button id="scene-free-stream">Free Stream</button>
+            <button id="scene-center-pour">Center Pour</button>
+          </div>
+        </div>
+        <div class="control-panel">
           <label class="slider-field" for="kettle-angle">
             <span>Kettle Angle</span>
             <output id="kettle-angle-value">0°</output>
           </label>
           <input id="kettle-angle" type="range" min="0" max="70" step="1" value="36" />
+        </div>
+        <div class="control-panel">
+          <label class="slider-field" for="spout-x">
+            <span>Spout X</span>
+            <output id="spout-x-value">0.0</output>
+          </label>
+          <input id="spout-x" type="range" min="-5.5" max="-1.8" step="0.1" value="-3.4" />
+          <label class="slider-field" for="spout-y">
+            <span>Spout Height</span>
+            <output id="spout-y-value">0.0</output>
+          </label>
+          <input id="spout-y" type="range" min="5.8" max="8.4" step="0.1" value="7.3" />
+          <label class="slider-field" for="spout-z">
+            <span>Spout Z</span>
+            <output id="spout-z-value">0.0</output>
+          </label>
+          <input id="spout-z" type="range" min="-1.6" max="2.2" step="0.1" value="0.9" />
         </div>
         <dl class="stats">
           <div>
@@ -44,6 +71,65 @@
             <dd id="jet-speed">0.0 u/s</dd>
           </div>
         </dl>
+        <dl class="stats">
+          <div>
+            <dt>Scene</dt>
+            <dd id="scene-mode">Default</dd>
+          </div>
+          <div>
+            <dt>Step Mode</dt>
+            <dd id="step-mode">Real Time</dd>
+          </div>
+          <div>
+            <dt>Sim Time</dt>
+            <dd id="sim-time">0.0s</dd>
+          </div>
+          <div>
+            <dt>Frame Emit</dt>
+            <dd id="frame-emitted-mass">0.00</dd>
+          </div>
+          <div>
+            <dt>Total Emit</dt>
+            <dd id="total-emitted-mass">0.00</dd>
+          </div>
+          <div>
+            <dt>Frame Dropped</dt>
+            <dd id="frame-dropped-emission">0</dd>
+          </div>
+          <div>
+            <dt>Total Dropped</dt>
+            <dd id="total-dropped-emission">0</dd>
+          </div>
+          <div>
+            <dt>Water Slots</dt>
+            <dd id="water-slots">0</dd>
+          </div>
+          <div>
+            <dt>Bed Particles</dt>
+            <dd id="bed-particles">0</dd>
+          </div>
+          <div>
+            <dt>Capacity Used</dt>
+            <dd id="capacity-used">0.0%</dd>
+          </div>
+          <div>
+            <dt>Bed Enabled</dt>
+            <dd id="bed-enabled">Yes</dd>
+          </div>
+        </dl>
+        <div class="control-panel">
+          <label class="slider-field">
+            <span>Temporary Heuristics</span>
+          </label>
+          <label class="slider-field" for="toggle-pressure-projection">
+            <span>Pressure Projection</span>
+            <input id="toggle-pressure-projection" type="checkbox" checked />
+          </label>
+          <label class="slider-field" for="toggle-sparse-ballistic">
+            <span>Sparse Ballistic Preserve</span>
+            <input id="toggle-sparse-ballistic" type="checkbox" checked />
+          </label>
+        </div>
       </section>
       <section class="viewer">
         <canvas id="sim-canvas"></canvas>

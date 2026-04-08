@@ -1,24 +1,11 @@
-# Python-generated files
+# Local Python / test caches
 __pycache__/
 *.py[oc]
-build/
-dist/
-wheels/
-*.egg-info
-
-# Virtual environments
 .venv/
+.pytest_cache/
 
 # Rust build artifacts
 target/
-
-# pytest
-.pytest_cache/
-
-# Generated images
-figures/
-*.gif
-*.mp4
 
 # OS files
 .DS_Store
@@ -29,21 +16,8 @@ figures/
 *.swp
 *.swo
 
-# maturin / PyO3 build output
-*.so
-*.dylib
-*.dll
-*.pyd
-
-# Calibration raw data (large, not redistributed)
-calibration/dataset/*.json
-!calibration/dataset/.gitkeep
-
 # wasm-pack build output
 pkg/
 
 # Claude Code
 .claude/
-
-# Lock files (uv)
-uv.lock

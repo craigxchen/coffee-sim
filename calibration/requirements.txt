@@ -1,4 +1,0 @@
-aiohttp>=3.9
-numpy>=1.26
-scipy>=1.12
-matplotlib>=3.8

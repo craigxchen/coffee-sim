@@ -13,7 +13,6 @@ pub(crate) const FP_SCALE: f32 = 1048576.0;
 pub(crate) const MAX_VELOCITY: f32 = 30.0;
 pub(crate) const NUM_THREADS: u32 = 64;
 pub(crate) const SDF_RES: u32 = 128;
-pub(crate) const CARAFE_CAPACITY_ML: f32 = 500.0;
 
 const SDF_NO_CONSTRAINT: f32 = 999.0;
 const WALL_THICKNESS: f32 = 0.4;
@@ -43,21 +42,17 @@ pub(crate) struct MpmBuffers {
     pub grid: wgpu::Buffer,
     pub grid_vel: wgpu::Buffer,
     pub bed_lookup: wgpu::Buffer,
+    pub bed_support_count: wgpu::Buffer,
     pub bed_delta: wgpu::Buffer,
-    pub sdf_texture: wgpu::Texture,
+    pub _sdf_texture: wgpu::Texture,
     pub sdf_view: wgpu::TextureView,
     pub render_data: wgpu::Buffer,
     pub bed_extract: wgpu::Buffer,
     pub uniform_buffer: wgpu::Buffer,
-    pub max_particles: u32,
 }
 
 impl MpmBuffers {
-    pub fn new(
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        settings: &MpmSettings,
-    ) -> Self {
+    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, settings: &MpmSettings) -> Self {
         let max_p = settings.max_particles as usize;
         let [gx, gy, gz] = settings.grid_dims;
         let total_cells = (gx * gy * gz) as usize;
@@ -65,7 +60,9 @@ impl MpmBuffers {
         let particles = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("mpm particles"),
             size: (max_p * 32) as u64, // 2 x vec4
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
 
@@ -97,6 +94,13 @@ impl MpmBuffers {
             mapped_at_creation: false,
         });
 
+        let bed_support_count = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("mpm bed support count"),
+            size: (max_p * size_of::<u32>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         let bed_delta = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("mpm bed delta"),
             size: (max_p * size_of::<i32>()) as u64,
@@ -117,7 +121,9 @@ impl MpmBuffers {
         let bed_extract = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("mpm bed_extract"),
             size: (max_p * 32) as u64, // 2 x vec4
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
 
@@ -137,13 +143,13 @@ impl MpmBuffers {
             grid,
             grid_vel,
             bed_lookup,
+            bed_support_count,
             bed_delta,
-            sdf_texture,
+            _sdf_texture: sdf_texture,
             sdf_view,
             render_data,
             bed_extract,
             uniform_buffer,
-            max_particles: settings.max_particles,
         }
     }
 }
