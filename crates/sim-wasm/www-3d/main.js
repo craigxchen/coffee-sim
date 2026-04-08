@@ -53,6 +53,17 @@ let lastClientX = 0;
 let lastClientY = 0;
 let fixedStepSeconds = null;
 let currentSceneMode = "Default";
+const heldKeys = new Set();
+const PAN_SPEED = 6.0;
+const PAN_CODES = new Set([
+  "KeyW",
+  "KeyA",
+  "KeyS",
+  "KeyD",
+  "Space",
+  "ShiftLeft",
+  "ShiftRight",
+]);
 
 await init();
 app = await WasmSim3D.create(canvas);
@@ -174,6 +185,20 @@ canvas.addEventListener(
   { passive: false },
 );
 
+window.addEventListener("keydown", (e) => {
+  if (!PAN_CODES.has(e.code)) return;
+  if (e.code === "Space") e.preventDefault();
+  heldKeys.add(e.code);
+});
+
+window.addEventListener("keyup", (e) => {
+  heldKeys.delete(e.code);
+});
+
+window.addEventListener("blur", () => {
+  heldKeys.clear();
+});
+
 function resizeCanvas() {
   const dpr = window.devicePixelRatio || 1;
   const rect = canvas.getBoundingClientRect();
@@ -188,6 +213,8 @@ function animate(timestamp) {
   const wallFrameTime = Math.min((timestamp - lastFrameTime) / 1000, 0.05);
   const frameTime = fixedStepSeconds ?? wallFrameTime;
   lastFrameTime = timestamp;
+
+  applyKeyboardPan(frameTime);
 
   if (!paused) {
     app.stepFrame(frameTime);
@@ -205,6 +232,22 @@ function maybeRefreshMetrics() {
   // The shader-side metrics counters still run, they just aren't plumbed
   // to the HUD. Leaving this helper wired up so the call site doesn't
   // drift when we turn the readback back on.
+}
+
+function applyKeyboardPan(dt) {
+  if (heldKeys.size === 0) return;
+  let right = 0;
+  let up = 0;
+  let forward = 0;
+  if (heldKeys.has("KeyD")) right += 1;
+  if (heldKeys.has("KeyA")) right -= 1;
+  if (heldKeys.has("KeyW")) forward += 1;
+  if (heldKeys.has("KeyS")) forward -= 1;
+  if (heldKeys.has("Space")) up += 1;
+  if (heldKeys.has("ShiftLeft") || heldKeys.has("ShiftRight")) up -= 1;
+  if (right === 0 && up === 0 && forward === 0) return;
+  const step = PAN_SPEED * dt;
+  app.panCamera(right * step, up * step, forward * step);
 }
 
 function updateFps(frameTime) {

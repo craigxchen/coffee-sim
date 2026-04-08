@@ -128,6 +128,12 @@ impl WasmSim3D {
         self.camera.zoom(delta, self.sim.settings().bounds_size);
     }
 
+    #[wasm_bindgen(js_name = panCamera)]
+    pub fn pan_camera(&mut self, right: f32, up: f32, forward: f32) {
+        self.camera
+            .pan(right, up, forward, self.sim.settings().bounds_size);
+    }
+
     #[wasm_bindgen(js_name = particleCount)]
     pub fn particle_count(&self) -> usize {
         self.sim.particle_count()
