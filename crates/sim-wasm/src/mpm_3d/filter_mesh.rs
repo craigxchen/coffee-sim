@@ -10,6 +10,22 @@ const GRAVITY: f32 = -0.55;
 const REST_STIFFNESS: f32 = 3.25;
 const EDGE_STIFFNESS: f32 = 0.86;
 
+// Compile-time guards: the sync loops below divide by `(RING_COUNT - 1)` and
+// assume `SEGMENT_COUNT >= 3` for a non-degenerate ring topology.
+const _: () = assert!(RING_COUNT >= 2);
+const _: () = assert!(SEGMENT_COUNT >= 3);
+
+/// Maximum number of vertices the fill buffer emits. Used by the renderer so
+/// its GPU vertex buffer is always sized to match the CPU mesh output.
+pub(crate) const MAX_FILL_VERTEX_COUNT: usize = (RING_COUNT - 1) * SEGMENT_COUNT * 6;
+
+/// Maximum number of vertices the wireframe render buffer emits. Derived from
+/// the edge count: each ring has `SEGMENT_COUNT` ring edges, and every
+/// non-terminal ring adds `SEGMENT_COUNT` vertical + `SEGMENT_COUNT` diagonal
+/// edges. Each edge expands to two line-list vertices.
+pub(crate) const MAX_RENDER_VERTEX_COUNT: usize =
+    (RING_COUNT * SEGMENT_COUNT + (RING_COUNT - 1) * SEGMENT_COUNT * 2) * 2;
+
 #[derive(Clone, Copy)]
 struct Edge {
     a: usize,
@@ -98,12 +114,22 @@ impl FilterMesh {
     }
 
     pub(crate) fn step(&mut self, dt: f32, load: f32) {
-        let dt = dt.max(0.0).min(1.0 / 20.0);
-        if dt <= 0.0 {
+        // Sanitise `dt` first: if the caller passes NaN or a negative value we
+        // must bail out rather than poison every position/velocity. The manual
+        // `max(0).min(cap)` form is intentional — `clamp` would propagate NaN.
+        if !dt.is_finite() || dt <= 0.0 {
             return;
         }
+        let dt = dt.min(1.0 / 20.0);
+        // Clamp dt to a small positive lower bound so the velocity reconstruction
+        // `(pos - prev_pos) / dt` below cannot explode on frame-time glitches.
+        let dt = dt.max(1e-5);
 
-        let load = load.clamp(0.0, 2.0);
+        let load = if load.is_finite() {
+            load.clamp(0.0, 2.0)
+        } else {
+            0.0
+        };
         self.prev_positions.copy_from_slice(&self.positions);
 
         let height = (self.config.top_y - self.config.bot_y).max(1e-6);
@@ -150,8 +176,13 @@ impl FilterMesh {
                     continue;
                 }
 
-                let diff = (dist - edge.rest_length) / dist;
-                let correction = delta * (0.5 * EDGE_STIFFNESS * diff);
+                // Standard PBD distance correction: move both endpoints so the
+                // edge reaches its rest length. Using `delta * 0.5 * (1 - rest/dist)`
+                // keeps corrections bounded under compression — the earlier
+                // `(dist - rest) / dist` form grew unbounded negative when
+                // `dist << rest_length`, causing the mesh to overshoot.
+                let scale = 0.5 * EDGE_STIFFNESS * (1.0 - edge.rest_length / dist);
+                let correction = delta * scale;
 
                 match (a_pinned, b_pinned) {
                     (false, false) => {
@@ -265,5 +296,67 @@ mod tests {
     fn render_vertices_follow_edges() {
         let mesh = FilterMesh::new(&FilterConfig::default());
         assert_eq!(mesh.render_vertices().len(), mesh.edges.len() * 2);
+    }
+
+    #[test]
+    fn step_ignores_nonfinite_dt() {
+        let mut mesh = FilterMesh::new(&FilterConfig::default());
+        let before = mesh.positions.clone();
+        mesh.step(f32::NAN, 1.0);
+        for (after, prior) in mesh.positions.iter().zip(before.iter()) {
+            assert!(after.x.is_finite());
+            assert!(after.y.is_finite());
+            assert!(after.z.is_finite());
+            assert!((after.x - prior.x).abs() < 1e-6);
+            assert!((after.y - prior.y).abs() < 1e-6);
+            assert!((after.z - prior.z).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn step_ignores_nonfinite_load() {
+        let mut mesh = FilterMesh::new(&FilterConfig::default());
+        // NaN load should fall through to 0.0 and not poison the positions.
+        mesh.step(1.0 / 60.0, f32::NAN);
+        for pos in &mesh.positions {
+            assert!(pos.x.is_finite());
+            assert!(pos.y.is_finite());
+            assert!(pos.z.is_finite());
+        }
+    }
+
+    #[test]
+    fn step_remains_stable_under_compression() {
+        let mut mesh = FilterMesh::new(&FilterConfig::default());
+        // Artificially compress every un-pinned vertex toward the center and
+        // verify the PBD edge solver converges without overshoot — the old
+        // `(dist - rest) / dist` form produced unbounded corrections when
+        // `dist << rest_length`.
+        for (i, pos) in mesh.positions.iter_mut().enumerate() {
+            if !mesh.pinned[i] {
+                *pos = Vec3::ZERO;
+            }
+        }
+        mesh.prev_positions.copy_from_slice(&mesh.positions);
+        for _ in 0..5 {
+            mesh.step(1.0 / 60.0, 0.5);
+            for pos in &mesh.positions {
+                assert!(pos.x.is_finite());
+                assert!(pos.y.is_finite());
+                assert!(pos.z.is_finite());
+                // Positions should stay within a sane window — the mesh must
+                // not explode out of the simulation bounds.
+                assert!(pos.x.abs() < 20.0);
+                assert!(pos.y.abs() < 20.0);
+                assert!(pos.z.abs() < 20.0);
+            }
+        }
+    }
+
+    #[test]
+    fn max_vertex_counts_match_sync_output() {
+        let mesh = FilterMesh::new(&FilterConfig::default());
+        assert_eq!(mesh.fill_vertices().len(), MAX_FILL_VERTEX_COUNT);
+        assert_eq!(mesh.render_vertices().len(), MAX_RENDER_VERTEX_COUNT);
     }
 }

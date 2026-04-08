@@ -8,7 +8,9 @@ use web_sys::HtmlCanvasElement;
 
 use coffee_sim_core::sph::Vec3;
 
-use crate::mpm_3d::{MpmSettings, MpmSim3D, Obstacle};
+use crate::mpm_3d::{
+    MpmSettings, MpmSim3D, Obstacle, MAX_FILL_VERTEX_COUNT, MAX_RENDER_VERTEX_COUNT,
+};
 
 const EPSILON: f32 = 1e-6;
 
@@ -524,29 +526,26 @@ impl Renderer {
         });
         queue.write_buffer(&cone_vertex_buffer, 0, bytemuck::cast_slice(&cone_verts));
 
-        let filter_fill_verts = build_filter_fill(settings);
-        let filter_fill_vertex_count = filter_fill_verts.len() as u32;
+        // Size the filter buffers from the CPU-mesh capacity constants so they
+        // are guaranteed large enough for any `FilterMesh::sync_render_vertices`
+        // output — `build_filter_fill` / `build_filter_wireframe` used to
+        // duplicate the ring/segment counts here, which silently broke if the
+        // `filter_mesh` constants drifted.
+        let filter_fill_vertex_count = 0u32;
         let filter_fill_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("filter fill vertex buffer"),
-            size: (filter_fill_verts.len() * size_of::<[f32; 3]>()).max(16) as u64,
+            size: (MAX_FILL_VERTEX_COUNT * size_of::<[f32; 3]>()).max(16) as u64,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        queue.write_buffer(
-            &filter_fill_vertex_buffer,
-            0,
-            bytemuck::cast_slice(&filter_fill_verts),
-        );
 
-        let filter_verts = build_filter_wireframe(settings);
-        let filter_vertex_count = filter_verts.len() as u32;
+        let filter_vertex_count = 0u32;
         let filter_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("filter vertex buffer"),
-            size: (filter_verts.len() * size_of::<[f32; 3]>()).max(16) as u64,
+            size: (MAX_RENDER_VERTEX_COUNT * size_of::<[f32; 3]>()).max(16) as u64,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        queue.write_buffer(&filter_vertex_buffer, 0, bytemuck::cast_slice(&filter_verts));
 
         let (depth_texture, depth_view) = create_depth_resources(&device, width, height);
 
@@ -653,21 +652,27 @@ impl Renderer {
         );
 
         if let Some(filter_vertices) = simulation.filter_fill_vertices() {
+            // Safety clamp: the GPU buffer is sized for `MAX_FILL_VERTEX_COUNT`
+            // at construction time. If the mesh ever produces more vertices
+            // than that (constants drifted), truncate rather than hit a driver
+            // validation error during `write_buffer`.
+            let count = filter_vertices.len().min(MAX_FILL_VERTEX_COUNT);
             self.queue.write_buffer(
                 &self.filter_fill_vertex_buffer,
                 0,
-                bytemuck::cast_slice(filter_vertices),
+                bytemuck::cast_slice(&filter_vertices[..count]),
             );
-            self.filter_fill_vertex_count = filter_vertices.len() as u32;
+            self.filter_fill_vertex_count = count as u32;
         }
 
         if let Some(filter_vertices) = simulation.filter_render_vertices() {
+            let count = filter_vertices.len().min(MAX_RENDER_VERTEX_COUNT);
             self.queue.write_buffer(
                 &self.filter_vertex_buffer,
                 0,
-                bytemuck::cast_slice(filter_vertices),
+                bytemuck::cast_slice(&filter_vertices[..count]),
             );
-            self.filter_vertex_count = filter_vertices.len() as u32;
+            self.filter_vertex_count = count as u32;
         }
 
         let frame = match self.surface.get_current_texture() {
@@ -827,99 +832,6 @@ fn build_wireframe(settings: &MpmSettings) -> Vec<[f32; 3]> {
     }
 
     push_spout_wireframe(&mut verts, settings);
-    verts
-}
-
-fn build_filter_fill(settings: &MpmSettings) -> Vec<[f32; 3]> {
-    let Some(filter) = settings.filter.as_ref() else {
-        return Vec::new();
-    };
-
-    let segments = 40;
-    let rings = 18;
-    let mut verts = Vec::with_capacity(segments * rings * 6);
-
-    for ring in 0..rings {
-        let t0 = ring as f32 / rings as f32;
-        let t1 = (ring + 1) as f32 / rings as f32;
-        let y0 = filter.bot_y + (filter.top_y - filter.bot_y) * t0;
-        let y1 = filter.bot_y + (filter.top_y - filter.bot_y) * t1;
-        let r0 = filter.radius_at_y(y0);
-        let r1 = filter.radius_at_y(y1);
-
-        for seg in 0..segments {
-            let a0 = 2.0 * PI * seg as f32 / segments as f32;
-            let a1 = 2.0 * PI * (seg + 1) as f32 / segments as f32;
-
-            let p00 = [
-                filter.center.x + r0 * a0.cos(),
-                y0,
-                filter.center.z + r0 * a0.sin(),
-            ];
-            let p01 = [
-                filter.center.x + r0 * a1.cos(),
-                y0,
-                filter.center.z + r0 * a1.sin(),
-            ];
-            let p10 = [
-                filter.center.x + r1 * a0.cos(),
-                y1,
-                filter.center.z + r1 * a0.sin(),
-            ];
-            let p11 = [
-                filter.center.x + r1 * a1.cos(),
-                y1,
-                filter.center.z + r1 * a1.sin(),
-            ];
-
-            verts.extend_from_slice(&[p00, p10, p11, p00, p11, p01]);
-        }
-    }
-
-    verts
-}
-
-fn build_filter_wireframe(settings: &MpmSettings) -> Vec<[f32; 3]> {
-    let Some(filter) = settings.filter.as_ref() else {
-        return Vec::new();
-    };
-
-    let mut verts = Vec::new();
-    let rings = 10;
-    let segments = 32;
-
-    let mut ring_positions = Vec::with_capacity(rings * segments);
-    for ring in 0..rings {
-        let ring_t = ring as f32 / (rings - 1) as f32;
-        let y = filter.bot_y + (filter.top_y - filter.bot_y) * ring_t;
-        let radius = filter.radius_at_y(y);
-        for seg in 0..segments {
-            let angle = 2.0 * PI * seg as f32 / segments as f32;
-            ring_positions.push([
-                filter.center.x + radius * angle.cos(),
-                y,
-                filter.center.z + radius * angle.sin(),
-            ]);
-        }
-    }
-
-    for ring in 0..rings {
-        for seg in 0..segments {
-            let a = ring * segments + seg;
-            let next_seg = ring * segments + (seg + 1) % segments;
-            verts.push(ring_positions[a]);
-            verts.push(ring_positions[next_seg]);
-
-            if ring + 1 < rings {
-                let below = (ring + 1) * segments + seg;
-                let diag = (ring + 1) * segments + (seg + 1) % segments;
-                verts.push(ring_positions[a]);
-                verts.push(ring_positions[below]);
-                verts.push(ring_positions[a]);
-                verts.push(ring_positions[diag]);
-            }
-        }
-    }
     verts
 }
 

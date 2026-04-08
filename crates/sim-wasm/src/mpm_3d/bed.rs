@@ -38,20 +38,56 @@ impl Default for BedConfig {
 
 impl BedConfig {
     pub(crate) fn seated_in_filter(filter: &FilterConfig) -> Self {
-        let mut bed = Self::default();
-        bed.center = filter.center;
+        let mut bed = BedConfig {
+            center: filter.center,
+            ..Self::default()
+        };
 
-        let top_abs = (bed.center.y + bed.top_y).clamp(filter.bot_y + 0.6, filter.top_y - 0.35);
-        let bot_abs = (bed.center.y + bed.bot_y).clamp(filter.bot_y + 0.4, top_abs - 1.4);
+        // `filter.bot_y`/`top_y` are stored relative to `filter.center.y`
+        // (see `FilterMesh::new`), so convert the filter interior to absolute
+        // coordinates before clamping the bed against it.
+        let filter_bot_abs = filter.center.y + filter.bot_y;
+        let filter_top_abs = filter.center.y + filter.top_y;
+
+        // `f32::clamp` panics when `min > max`, so fall back to `(min + max) * 0.5`
+        // whenever the filter is too narrow to host the bed with the requested margins.
+        let (top_min, top_max) = order_bounds(filter_bot_abs + 0.6, filter_top_abs - 0.35);
+        let top_abs = (bed.center.y + bed.top_y).clamp(top_min, top_max);
+
+        let (bot_min, bot_max) = order_bounds(filter_bot_abs + 0.4, top_abs - 1.4);
+        let bot_abs = (bed.center.y + bed.bot_y).clamp(bot_min, bot_max);
 
         bed.top_y = top_abs - bed.center.y;
         bed.bot_y = bot_abs - bed.center.y;
-        bed.top_radius = (filter.inner_radius_at_y(top_abs) - 0.18)
-            .clamp(filter.opening_radius() + 0.8, filter.top_radius - filter.thickness - 0.1);
-        bed.bot_radius = (filter.inner_radius_at_y(bot_abs) - 0.12)
-            .clamp(filter.opening_radius() + 0.32, bed.top_radius - 0.25);
+
+        // `inner_radius_at_y` expects the `y` argument in the same frame as
+        // `filter.top_y`/`filter.bot_y` (relative to `filter.center.y`), not in
+        // absolute world coordinates.
+        let top_local = top_abs - filter.center.y;
+        let bot_local = bot_abs - filter.center.y;
+
+        let (top_r_min, top_r_max) = order_bounds(
+            filter.opening_radius() + 0.8,
+            filter.top_radius - filter.thickness - 0.1,
+        );
+        bed.top_radius =
+            (filter.inner_radius_at_y(top_local) - 0.18).clamp(top_r_min, top_r_max);
+
+        let (bot_r_min, bot_r_max) =
+            order_bounds(filter.opening_radius() + 0.32, bed.top_radius - 0.25);
+        bed.bot_radius =
+            (filter.inner_radius_at_y(bot_local) - 0.12).clamp(bot_r_min, bot_r_max);
 
         bed
+    }
+}
+
+fn order_bounds(min: f32, max: f32) -> (f32, f32) {
+    if min <= max {
+        (min, max)
+    } else {
+        let mid = (min + max) * 0.5;
+        (mid, mid)
     }
 }
 
@@ -358,12 +394,64 @@ mod tests {
         let filter = FilterConfig::default();
         let bed = BedConfig::seated_in_filter(&filter);
 
+        let filter_bot_abs = filter.center.y + filter.bot_y;
+        let filter_top_abs = filter.center.y + filter.top_y;
+
         let top_abs = bed.center.y + bed.top_y;
         let bot_abs = bed.center.y + bed.bot_y;
 
-        assert!(bed.top_radius < filter.inner_radius_at_y(top_abs));
-        assert!(bed.bot_radius < filter.inner_radius_at_y(bot_abs));
-        assert!(bot_abs > filter.bot_y);
-        assert!(top_abs < filter.top_y);
+        // `radius_at_y` expects the input in the same frame as `filter.top_y`/
+        // `filter.bot_y` — i.e. relative to `filter.center.y`. Convert the
+        // absolute bed top/bot into that frame before sampling the inner cone.
+        let bed_top_local = top_abs - filter.center.y;
+        let bed_bot_local = bot_abs - filter.center.y;
+        assert!(bed.top_radius < filter.inner_radius_at_y(bed_top_local));
+        assert!(bed.bot_radius < filter.inner_radius_at_y(bed_bot_local));
+        assert!(bot_abs > filter_bot_abs);
+        assert!(top_abs < filter_top_abs);
+    }
+
+    #[test]
+    fn seated_in_filter_does_not_panic_on_narrow_filter() {
+        // Pathologically narrow filter that cannot actually host a bed:
+        // - vertical range is 0.2 (< 0.95), which previously caused the first
+        //   clamp to panic with `min > max`.
+        // - top radius is below the minimum the second clamp expects.
+        let narrow = FilterConfig {
+            top_y: 0.1,
+            bot_y: -0.1,
+            top_radius: 0.3,
+            bot_radius: 0.2,
+            thickness: 0.02,
+            hole_radius: 0.05,
+            ..FilterConfig::default()
+        };
+        let bed = BedConfig::seated_in_filter(&narrow);
+        assert!(bed.top_y.is_finite());
+        assert!(bed.bot_y.is_finite());
+        assert!(bed.top_radius.is_finite());
+        assert!(bed.bot_radius.is_finite());
+    }
+
+    #[test]
+    fn seated_in_filter_uses_filter_center_offset() {
+        // A filter whose center is offset vertically must still place the bed
+        // above the filter apex in absolute coordinates. The earlier
+        // implementation clamped against `filter.bot_y`/`top_y` as if they
+        // were world coordinates even though `FilterMesh::new` treats them as
+        // relative to `filter.center.y`.
+        let filter = FilterConfig {
+            center: Vec3::new(0.0, 2.0, 0.0),
+            ..FilterConfig::default()
+        };
+        let bed = BedConfig::seated_in_filter(&filter);
+
+        let bed_top_abs = bed.center.y + bed.top_y;
+        let bed_bot_abs = bed.center.y + bed.bot_y;
+        let filter_top_abs = filter.center.y + filter.top_y;
+        let filter_bot_abs = filter.center.y + filter.bot_y;
+
+        assert!(bed_top_abs <= filter_top_abs - 0.3);
+        assert!(bed_bot_abs >= filter_bot_abs + 0.3);
     }
 }
