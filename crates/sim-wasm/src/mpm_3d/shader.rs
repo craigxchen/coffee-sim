@@ -922,10 +922,10 @@ fn bed_coupling(@builtin(global_invocation_id) gid: vec3<u32>) {
     atomicAdd(&bed_delta[u32(bed_idx)], i32(absorbed * fp_scale()));
 }
 
-// ── commit_bed_storage ──
+// ── extraction_advect ──
 
 @compute @workgroup_size(64)
-fn commit_bed_storage(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn extraction_advect(@builtin(global_invocation_id) gid: vec3<u32>) {
     let bid = gid.x;
     if bid >= num_bed() { return; }
 
@@ -935,18 +935,6 @@ fn commit_bed_storage(@builtin(global_invocation_id) gid: vec3<u32>) {
         be.bed.x = min(be.bed.x + absorbed, max_saturation());
         be.extract.w = be.bed.x / max(max_saturation(), 1e-6);
     }
-
-    bed_extract[bid] = be;
-}
-
-// ── extraction_advect ──
-
-@compute @workgroup_size(64)
-fn extraction_advect(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let bid = gid.x;
-    if bid >= num_bed() { return; }
-
-    var be = bed_extract[bid];
     let sat = be.extract.w;
 
     if sat > 0.01 {
