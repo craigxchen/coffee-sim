@@ -508,7 +508,7 @@ impl ParticleSim {
             let dist = wall.signed_distance(pos);
             if dist < 0.0 {
                 // Penetrating — push back along normal
-                pos = pos + wall.normal * (-dist + 0.001);
+                pos += wall.normal * (-dist + 0.001);
                 // Reflect velocity component along normal
                 let vn = vel.dot(wall.normal);
                 if vn < 0.0 {
