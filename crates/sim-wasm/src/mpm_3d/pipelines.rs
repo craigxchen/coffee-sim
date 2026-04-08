@@ -63,10 +63,8 @@ impl MpmPipelines {
                 read_only_storage_entry(8),
                 // 9: bed_delta
                 storage_entry(9),
-                // 10: bed_support_count
-                read_only_storage_entry(10),
             ],
-        });
+            });
 
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("mpm bind group"),
@@ -111,10 +109,6 @@ impl MpmPipelines {
                 wgpu::BindGroupEntry {
                     binding: 9,
                     resource: buffers.bed_delta.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 10,
-                    resource: buffers.bed_support_count.as_entire_binding(),
                 },
             ],
         });
