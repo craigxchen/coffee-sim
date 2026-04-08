@@ -912,6 +912,10 @@ fn bed_coupling(@builtin(global_invocation_id) gid: vec3<u32>) {
         particles[pid].vel.w,
     );
 
+    if projection_enabled() {
+        return;
+    }
+
     let capacity = max(max_saturation() - be.bed.x, 0.0);
     if capacity <= 1e-6 {
         return;
