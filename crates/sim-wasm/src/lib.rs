@@ -198,6 +198,42 @@ impl WasmSim3D {
         self.sim.temp_sparse_ballistic_enabled()
     }
 
+    #[wasm_bindgen(js_name = refreshMetrics)]
+    pub async fn refresh_metrics(&mut self) -> Result<(), JsValue> {
+        // Clone the internal Arc-backed `wgpu::Device` / `wgpu::Queue` so we
+        // can hold them across the await point without overlapping
+        // `&mut self.sim`. The clones are cheap — just `Arc::clone` under
+        // the hood.
+        let device = self.renderer.device().clone();
+        let queue = self.renderer.queue().clone();
+        self.sim.refresh_metrics(&device, &queue).await
+    }
+
+    #[wasm_bindgen(js_name = maxAbsDivergence)]
+    pub fn max_abs_divergence(&self) -> f32 {
+        self.sim.latest_metrics().max_abs_div
+    }
+
+    #[wasm_bindgen(js_name = fluidCellCount)]
+    pub fn fluid_cell_count(&self) -> u32 {
+        self.sim.latest_metrics().fluid_cells
+    }
+
+    #[wasm_bindgen(js_name = divClampFires)]
+    pub fn div_clamp_fires(&self) -> u32 {
+        self.sim.latest_metrics().div_clamp_fires
+    }
+
+    #[wasm_bindgen(js_name = pressureClampFires)]
+    pub fn pressure_clamp_fires(&self) -> u32 {
+        self.sim.latest_metrics().pressure_clamp_fires
+    }
+
+    #[wasm_bindgen(js_name = massOverflowFires)]
+    pub fn mass_overflow_fires(&self) -> u32 {
+        self.sim.latest_metrics().mass_overflow_fires
+    }
+
 }
 
 #[cfg(target_arch = "wasm32")]
