@@ -175,6 +175,26 @@ impl OrbitCamera {
         self.radius = (self.radius * (1.0 + delta * 0.0015)).clamp(min_radius, max_radius);
     }
 
+    pub(crate) fn pan(&mut self, right: f32, up: f32, forward: f32, bounds: Vec3) {
+        let sin_yaw = self.yaw.sin();
+        let cos_yaw = self.yaw.cos();
+        let right_vec = Vec3::new(cos_yaw, 0.0, -sin_yaw);
+        let forward_vec = Vec3::new(-sin_yaw, 0.0, -cos_yaw);
+        let up_vec = Vec3::new(0.0, 1.0, 0.0);
+
+        let delta = right_vec * right + up_vec * up + forward_vec * forward;
+        let new_target = self.target + delta;
+
+        let x_limit = bounds.x * 1.5;
+        let y_limit = bounds.y;
+        let z_limit = bounds.z * 1.5;
+        self.target = Vec3::new(
+            new_target.x.clamp(-x_limit, x_limit),
+            new_target.y.clamp(-y_limit, y_limit),
+            new_target.z.clamp(-z_limit, z_limit),
+        );
+    }
+
     fn eye(self) -> Vec3 {
         let cos_pitch = self.pitch.cos();
         self.target
@@ -951,4 +971,20 @@ fn look_at(eye: Vec3, target: Vec3, up: Vec3) -> [[f32; 4]; 4] {
 
 fn js_error(error: impl ToString) -> JsValue {
     JsValue::from_str(&error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pan_translates_target() {
+        let bounds = Vec3::new(14.0, 20.0, 14.0);
+        let mut camera = OrbitCamera::new(bounds);
+        let original = camera.target;
+        camera.pan(1.0, 2.0, 3.0, bounds);
+        let delta = camera.target - original;
+        assert!(delta.length() > 0.0);
+        assert!((camera.target.y - (original.y + 2.0)).abs() < 1e-5);
+    }
 }
