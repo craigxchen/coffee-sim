@@ -601,26 +601,6 @@ mod tests {
         }
     }
 
-    fn mirrored_bed_sink_mass(
-        cell_mass: f32,
-        bed_pore_water: f32,
-        bed_support_count: u32,
-        absorption_rate: f32,
-        dt: f32,
-        max_saturation: f32,
-    ) -> f32 {
-        let remaining_capacity = (max_saturation - bed_pore_water).max(0.0);
-        if remaining_capacity <= 1e-6 || cell_mass <= 1e-6 {
-            return 0.0;
-        }
-        let support_count = bed_support_count.max(1);
-        let cell_remaining_capacity = remaining_capacity / support_count as f32;
-        let saturation = bed_pore_water / max_saturation.max(1e-6);
-        let abs_rate = absorption_rate * (1.0 - saturation) * dt;
-        let predicted = cell_mass * abs_rate.clamp(0.0, 1.0).min(0.25);
-        predicted.min(cell_remaining_capacity)
-    }
-
     #[test]
     fn dispatch_size_zero_count_returns_zero() {
         assert_eq!(dispatch_size(0, 64), 0);
@@ -683,46 +663,6 @@ mod tests {
         // gy is sized to cover the full vertical extent
         let height_covered = s.grid_dims[1] as f32 * dx;
         assert!(height_covered >= s.bounds_size.y - dx);
-    }
-
-    #[test]
-    fn mirrored_bed_sink_is_zero_when_cell_mass_or_capacity_is_zero() {
-        assert_eq!(mirrored_bed_sink_mass(0.0, 0.0, 1, 8.0, 1.0 / 60.0, 0.28), 0.0);
-        assert_eq!(mirrored_bed_sink_mass(1.0, 0.28, 1, 8.0, 1.0 / 60.0, 0.28), 0.0);
-    }
-
-    #[test]
-    fn mirrored_bed_sink_grows_with_cell_mass() {
-        let small = mirrored_bed_sink_mass(0.25, 0.0, 1, 8.0, 1.0 / 60.0, 0.28);
-        let large = mirrored_bed_sink_mass(0.75, 0.0, 1, 8.0, 1.0 / 60.0, 0.28);
-        assert!(large > small);
-    }
-
-    #[test]
-    fn mirrored_bed_sink_shrinks_with_support_count() {
-        let single = mirrored_bed_sink_mass(1.0, 0.0, 1, 8.0, 1.0 / 60.0, 0.28);
-        let split = mirrored_bed_sink_mass(1.0, 0.0, 4, 8.0, 1.0 / 60.0, 0.28);
-        assert!(split < single);
-    }
-
-    #[test]
-    fn mirrored_bed_sink_total_respects_remaining_capacity() {
-        let max_saturation = 0.28;
-        let bed_pore_water = 0.21;
-        let support_count = 4;
-        let mut total = 0.0;
-        for _ in 0..support_count {
-            total += mirrored_bed_sink_mass(
-                1.0,
-                bed_pore_water,
-                support_count,
-                8.0,
-                1.0 / 60.0,
-                max_saturation,
-            );
-        }
-        let remaining_capacity = max_saturation - bed_pore_water;
-        assert!(total <= remaining_capacity + 1e-6);
     }
 
     #[test]

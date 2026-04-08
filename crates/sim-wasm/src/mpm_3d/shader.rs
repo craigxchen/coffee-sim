@@ -102,7 +102,6 @@ fn scratch_residual_idx(cell: u32) -> u32 { return grid_mom_y_idx(cell); }
 fn scratch_kind_idx(cell: u32) -> u32 { return grid_mom_z_idx(cell); }
 fn occupancy_mass_threshold() -> f32 { return nominal_mass(); }
 fn reference_cell_water_mass() -> f32 { return nominal_mass() * 4.0; }
-fn max_absorption_fraction_per_step() -> f32 { return 0.25; }
 
 const CELL_AIR: i32 = 0;
 const CELL_SURFACE_FLUID: i32 = 1;
@@ -144,15 +143,13 @@ fn predicted_bed_sink_mass(cell: u32, cell_mass: f32) -> f32 {
     let be = bed_extract[u32(bed_idx)];
     let saturation = be.extract.w;
     let remaining_capacity = max(max_saturation() - be.bed.x, 0.0);
-    if remaining_capacity <= 1e-6 || cell_mass <= 1e-6 {
+    if remaining_capacity <= 1e-6 {
         return 0.0;
     }
 
-    let support_count = max(bed_support_count[u32(bed_idx)], 1u);
-    let cell_remaining_capacity = remaining_capacity / f32(support_count);
     let abs_rate = absorption_rate() * (1.0 - saturation) * dt();
-    let predicted = cell_mass * min(clamp(abs_rate, 0.0, 1.0), max_absorption_fraction_per_step());
-    return min(predicted, cell_remaining_capacity);
+    let predicted = cell_mass * clamp(abs_rate, 0.0, 0.25);
+    return min(predicted, remaining_capacity);
 }
 
 fn world_to_cell(position: vec3<f32>) -> vec3<i32> {
