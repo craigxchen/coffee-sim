@@ -47,10 +47,12 @@ impl WasmSim {
     #[wasm_bindgen(constructor)]
     pub fn new(recipe: usize) -> WasmSim {
         let recipe_index = recipe.min(RECIPE_COUNT.saturating_sub(1));
-        let mut settings = SimSettings::default();
-        settings.max_particles = 12_000;
-        settings.iterations_per_frame = 4;
-        settings.bounds_size = Vec2::new(18.0, 16.0);
+        let settings = SimSettings {
+            max_particles: 12_000,
+            iterations_per_frame: 4,
+            bounds_size: Vec2::new(18.0, 16.0),
+            ..SimSettings::default()
+        };
 
         let pour = recipe_script(recipe_index);
         let mut sim = ParticleSim::new(settings);
@@ -68,7 +70,7 @@ impl WasmSim {
         let (_, _, rate, emit_x, emit_velocity) = sample_stream(&self.pour, t);
 
         let emit = if rate > 0.0 {
-            (rate as f32 * PARTICLES_PER_ML * frame_time).ceil() as usize
+            (rate * PARTICLES_PER_ML * frame_time).ceil() as usize
         } else {
             0
         };
@@ -272,6 +274,12 @@ impl WasmSim3D {
     #[wasm_bindgen(js_name = zoomCamera)]
     pub fn zoom_camera(&mut self, delta: f32) {
         self.camera.zoom(delta, self.sim.settings().bounds_size);
+    }
+
+    #[wasm_bindgen(js_name = panCamera)]
+    pub fn pan_camera(&mut self, right: f32, up: f32, forward: f32) {
+        self.camera
+            .pan(right, up, forward, self.sim.settings().bounds_size);
     }
 
     #[wasm_bindgen(js_name = particleCount)]
