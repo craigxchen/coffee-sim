@@ -17,6 +17,7 @@ struct MpmUniforms {
     bed_params: vec4<f32>,
     extraction_params: vec4<f32>,
     time_params: vec4<f32>,
+    clamp_params: vec4<f32>,
 };
 
 struct Particle {
@@ -50,9 +51,16 @@ struct ContactResult {
 @group(0) @binding(5) var sdf_texture: texture_3d<f32>;
 @group(0) @binding(6) var<storage, read_write> render_data: array<vec4<f32>>;
 @group(0) @binding(7) var<storage, read_write> bed_extract: array<BedExtract>;
-@group(0) @binding(8) var<storage, read> bed_lookup: array<i32>;
+@group(0) @binding(8) var<storage, read_write> bed_lookup: array<atomic<i32>>;
 @group(0) @binding(9) var<storage, read_write> bed_delta: array<atomic<i32>>;
-@group(0) @binding(10) var<storage, read> bed_support_count: array<u32>;
+@group(0) @binding(10) var<storage, read_write> metrics: array<atomic<u32>>;
+
+// Metrics slot layout — keep in sync with `METRICS_SLOT_COUNT` in state.rs.
+const METRIC_MAX_ABS_DIV_IDX: u32 = 0u;
+const METRIC_FLUID_CELLS_IDX: u32 = 1u;
+const METRIC_DIV_CLAMP_FIRES_IDX: u32 = 2u;
+const METRIC_PRESSURE_CLAMP_FIRES_IDX: u32 = 3u;
+const METRIC_MASS_OVERFLOW_FIRES_IDX: u32 = 4u;
 
 // ── Helpers ──
 
@@ -87,6 +95,10 @@ fn bed_damping() -> f32 { return u.extraction_params.z; }
 fn bed_impact() -> f32 { return u.extraction_params.w; }
 fn inactive_mass_threshold() -> f32 { return nominal_mass() * 0.10; }
 fn temp_sparse_ballistic_enabled() -> bool { return u.time_params.z > 0.5; }
+fn div_clamp_limit() -> f32 { return u.clamp_params.x; }
+fn pressure_clamp_limit() -> f32 { return u.clamp_params.y; }
+fn metrics_div_fp_scale() -> f32 { return u.clamp_params.z; }
+fn metrics_div_inv_fp_scale() -> f32 { return u.clamp_params.w; }
 
 fn cell_index(ix: u32, iy: u32, iz: u32) -> u32 {
     return iz * gx() * gy() + iy * gx() + ix;
@@ -98,7 +110,10 @@ fn grid_mom_y_idx(cell: u32) -> u32 { return 2u * total_cells() + cell; }
 fn grid_mom_z_idx(cell: u32) -> u32 { return 3u * total_cells() + cell; }
 fn scratch_pressure_idx(cell: u32) -> u32 { return grid_mass_idx(cell); }
 fn scratch_div_idx(cell: u32) -> u32 { return grid_mom_x_idx(cell); }
-fn scratch_residual_idx(cell: u32) -> u32 { return grid_mom_y_idx(cell); }
+// Slot 2 (`grid_mom_y_idx`) is reused only as the mass/momentum accumulator
+// during `p2g`; projection no longer keeps a per-cell residual so no scratch
+// alias is defined for it. Add one back if/when an iterative residual probe
+// needs the slot during the projection pass.
 fn scratch_kind_idx(cell: u32) -> u32 { return grid_mom_z_idx(cell); }
 fn occupancy_mass_threshold() -> f32 { return nominal_mass(); }
 
@@ -116,7 +131,11 @@ fn pressure_load(cell: u32) -> f32 {
 }
 
 fn pressure_store(cell: u32, value: f32) {
-    let clamped = clamp(value, -2048.0, 2048.0);
+    let limit = pressure_clamp_limit();
+    let clamped = clamp(value, -limit, limit);
+    if clamped != value {
+        atomicAdd(&metrics[METRIC_PRESSURE_CLAMP_FIRES_IDX], 1u);
+    }
     atomicStore(&grid[scratch_pressure_idx(cell)], i32(clamped * fp_scale()));
 }
 
@@ -125,8 +144,16 @@ fn divergence_load(cell: u32) -> f32 {
 }
 
 fn divergence_store(cell: u32, value: f32) {
-    let clamped = clamp(value, -2048.0, 2048.0);
+    let limit = div_clamp_limit();
+    let clamped = clamp(value, -limit, limit);
+    if clamped != value {
+        atomicAdd(&metrics[METRIC_DIV_CLAMP_FIRES_IDX], 1u);
+    }
     atomicStore(&grid[scratch_div_idx(cell)], i32(clamped * fp_scale()));
+}
+
+fn bed_lookup_load(cell: u32) -> i32 {
+    return atomicLoad(&bed_lookup[cell]);
 }
 
 fn is_fluid_kind(kind: i32) -> bool {
@@ -360,10 +387,25 @@ fn p2g(@builtin(global_invocation_id) gid: vec3<u32>) {
                 ));
 
                 let ci = cell_index(u32(cell.x), u32(cell.y), u32(cell.z));
-                atomicAdd(&grid[grid_mass_idx(ci)], i32(mass_contrib * fp));
-                atomicAdd(&grid[grid_mom_x_idx(ci)], i32(mom.x * fp));
-                atomicAdd(&grid[grid_mom_y_idx(ci)], i32(mom.y * fp));
-                atomicAdd(&grid[grid_mom_z_idx(ci)], i32(mom.z * fp));
+                // Overflow probe: each per-cell per-axis term must stay below
+                // `i32::MAX`. The tightest channel in practice is momentum,
+                // which is mass_contrib * v_cap scaled by FP. We log any single
+                // contribution that comes within ~50% of the int limit so
+                // accumulation headroom stays visible from the HUD once the
+                // readback path is re-enabled.
+                let limit_m = 1.0e9;
+                let mass_fp = mass_contrib * fp;
+                let mom_x_fp = mom.x * fp;
+                let mom_y_fp = mom.y * fp;
+                let mom_z_fp = mom.z * fp;
+                if abs(mass_fp) > limit_m || abs(mom_x_fp) > limit_m
+                    || abs(mom_y_fp) > limit_m || abs(mom_z_fp) > limit_m {
+                    atomicAdd(&metrics[METRIC_MASS_OVERFLOW_FIRES_IDX], 1u);
+                }
+                atomicAdd(&grid[grid_mass_idx(ci)], i32(mass_fp));
+                atomicAdd(&grid[grid_mom_x_idx(ci)], i32(mom_x_fp));
+                atomicAdd(&grid[grid_mom_y_idx(ci)], i32(mom_y_fp));
+                atomicAdd(&grid[grid_mom_z_idx(ci)], i32(mom_z_fp));
             }
         }
     }
@@ -409,7 +451,6 @@ fn classify_cells(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     let mass = grid_vel[idx].w;
     pressure_store(idx, 0.0);
-    atomicStore(&grid[scratch_residual_idx(idx)], 0);
 
     if mass <= occupancy_mass_threshold() {
         atomicStore(&grid[scratch_kind_idx(idx)], CELL_AIR);
@@ -417,7 +458,7 @@ fn classify_cells(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
 
-    if bed_lookup[idx] >= 0 {
+    if bed_lookup_load(idx) >= 0 {
         atomicStore(&grid[scratch_kind_idx(idx)], CELL_BED_COUPLED);
     } else {
         let iz_val = idx / (gx() * gy());
@@ -494,6 +535,14 @@ fn classify_cells(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     let div = 0.5 * inv_dx() * ((vxp - vxm) + (vyp - vym) + (vzp - vzm));
     divergence_store(idx, div);
+
+    // Observability: track the worst-case cell divergence and the fluid-cell
+    // footprint of the active substep. `atomicMax` on u32 gives the peak FP
+    // encoding; the HUD decodes via `METRICS_DIV_FP_SCALE`.
+    let abs_div = abs(div);
+    let fp_div = u32(clamp(abs_div * metrics_div_fp_scale(), 0.0, f32(0x7fffffffu)));
+    atomicMax(&metrics[METRIC_MAX_ABS_DIV_IDX], fp_div);
+    atomicAdd(&metrics[METRIC_FLUID_CELLS_IDX], 1u);
 }
 
 // ── pressure_rbgs ──
@@ -782,7 +831,7 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>) {
     if home_cell.x >= 0 && home_cell.y >= 0 && home_cell.z >= 0
         && u32(home_cell.x) < gx() && u32(home_cell.y) < gy() && u32(home_cell.z) < gz() {
         let home_idx = cell_index(u32(home_cell.x), u32(home_cell.y), u32(home_cell.z));
-        bed_near = bed_lookup[home_idx] >= 0;
+        bed_near = bed_lookup_load(home_idx) >= 0;
     }
     let airborne = !bed_near && sample_sdf(xp) > contact_offset() * 2.0;
     if temp_sparse_ballistic_enabled() && airborne {
@@ -850,7 +899,7 @@ fn bed_coupling(@builtin(global_invocation_id) gid: vec3<u32>) {
     if u32(cell.x) >= gx() || u32(cell.y) >= gy() || u32(cell.z) >= gz() { return; }
 
     let ci = cell_index(u32(cell.x), u32(cell.y), u32(cell.z));
-    let bed_idx = bed_lookup[ci];
+    let bed_idx = bed_lookup_load(ci);
     if bed_idx < 0 || u32(bed_idx) >= num_bed() {
         return;
     }
@@ -1061,6 +1110,64 @@ fn prepare_render(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     render_data[pid] = vec4<f32>(p.pos.xyz, color_t);
+}
+
+// ── metrics_clear ──
+
+const METRICS_SLOT_COUNT: u32 = 8u;
+
+@compute @workgroup_size(8)
+fn metrics_clear(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if idx >= METRICS_SLOT_COUNT { return; }
+    atomicStore(&metrics[idx], 0u);
+}
+
+// ── bed_lookup_clear ──
+
+@compute @workgroup_size(64)
+fn bed_lookup_clear(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if idx >= total_cells() { return; }
+    atomicStore(&bed_lookup[idx], -1);
+}
+
+// ── bed_lookup_scatter ──
+//
+// Each bed particle stamps its id into a 3x3x3 cell neighborhood around its
+// center using `atomicMax`. The highest bed id wins deterministically, which
+// matches the CPU-side `build_cell_lookup` ordering and keeps the lookup
+// current as bed particles deform from their rest positions.
+@compute @workgroup_size(64)
+fn bed_lookup_scatter(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let bid = gid.x;
+    if bid >= num_bed() { return; }
+
+    // Bed particles occupy the leading slots in the particle array (bed
+    // first, water appended). The bed array has length `num_bed` and starts
+    // at index 0.
+    let pid = bid;
+    let phase = affine[pid].col0.w;
+    if phase < 0.5 {
+        // Defensive: bed particle should always have phase >= 0.5.
+        return;
+    }
+
+    let pos = particles[pid].pos.xyz;
+    let cell = world_to_cell(pos);
+    let id = i32(bid);
+
+    for (var di = -1; di <= 1; di++) {
+        for (var dj = -1; dj <= 1; dj++) {
+            for (var dk = -1; dk <= 1; dk++) {
+                let c = cell + vec3<i32>(di, dj, dk);
+                if c.x < 0 || c.y < 0 || c.z < 0 { continue; }
+                if u32(c.x) >= gx() || u32(c.y) >= gy() || u32(c.z) >= gz() { continue; }
+                let ci = cell_index(u32(c.x), u32(c.y), u32(c.z));
+                atomicMax(&bed_lookup[ci], id);
+            }
+        }
+    }
 }
 "#;
 

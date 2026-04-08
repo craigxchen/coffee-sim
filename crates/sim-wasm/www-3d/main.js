@@ -29,8 +29,20 @@ const waterSlotsLabel = document.getElementById("water-slots");
 const bedParticlesLabel = document.getElementById("bed-particles");
 const capacityUsedLabel = document.getElementById("capacity-used");
 const bedEnabledLabel = document.getElementById("bed-enabled");
+const maxAbsDivLabel = document.getElementById("max-abs-div");
+const fluidCellsLabel = document.getElementById("fluid-cells");
+const divClampFiresLabel = document.getElementById("div-clamp-fires");
+const pressureClampFiresLabel = document.getElementById("pressure-clamp-fires");
+const massOverflowFiresLabel = document.getElementById("mass-overflow-fires");
 const pressureProjectionToggle = document.getElementById("toggle-pressure-projection");
 const sparseBallisticToggle = document.getElementById("toggle-sparse-ballistic");
+
+// Throttle metrics readback — the staging-buffer map/unmap is cheap but still
+// costs a JS microtask. Refreshing every ~10 frames keeps the HUD responsive
+// without pinning the event loop.
+const METRICS_REFRESH_INTERVAL = 10;
+let metricsFrameCounter = 0;
+let metricsRefreshInFlight = false;
 
 let app;
 let paused = false;
@@ -183,8 +195,16 @@ function animate(timestamp) {
 
   app.render();
   updateFps(frameTime);
+  maybeRefreshMetrics();
   syncUi();
   requestAnimationFrame(animate);
+}
+
+function maybeRefreshMetrics() {
+  // Readback disabled — see the TODO on `refresh_metrics` in mod.rs.
+  // The shader-side metrics counters still run, they just aren't plumbed
+  // to the HUD. Leaving this helper wired up so the call site doesn't
+  // drift when we turn the readback back on.
 }
 
 function updateFps(frameTime) {
@@ -239,4 +259,9 @@ function syncUi() {
     ? `${((usedParticles / maxParticles) * 100).toFixed(1)}%`
     : "0.0%";
   bedEnabledLabel.textContent = app.hasBed() ? "Yes" : "No";
+  maxAbsDivLabel.textContent = app.maxAbsDivergence().toFixed(3);
+  fluidCellsLabel.textContent = new Intl.NumberFormat().format(app.fluidCellCount());
+  divClampFiresLabel.textContent = new Intl.NumberFormat().format(app.divClampFires());
+  pressureClampFiresLabel.textContent = new Intl.NumberFormat().format(app.pressureClampFires());
+  massOverflowFiresLabel.textContent = new Intl.NumberFormat().format(app.massOverflowFires());
 }
