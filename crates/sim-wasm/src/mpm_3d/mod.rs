@@ -255,23 +255,17 @@ impl MpmSim3D {
                     pass.dispatch_workgroups(particle_wg, 1, 1);
                 }
 
-                // 3. extraction_advect
-                if bed_wg > 0 {
-                    pass.set_pipeline(&self.pipelines.extraction_advect);
-                    pass.dispatch_workgroups(bed_wg, 1, 1);
-                }
-
-                // 4. p2g
+                // 3. p2g
                 if particle_wg > 0 {
                     pass.set_pipeline(&self.pipelines.p2g);
                     pass.dispatch_workgroups(particle_wg, 1, 1);
                 }
 
-                // 5. grid_update
+                // 4. grid_update
                 pass.set_pipeline(&self.pipelines.grid_update);
                 pass.dispatch_workgroups(cell_wg, 1, 1);
 
-                // 6. boundary_project
+                // 5. boundary_project
                 pass.set_pipeline(&self.pipelines.boundary_project);
                 pass.dispatch_workgroups(cell_wg, 1, 1);
 
@@ -292,19 +286,31 @@ impl MpmSim3D {
                     pass.dispatch_workgroups(cell_wg, 1, 1);
                 }
 
-                // 7. g2p
+                // 6. commit_bed_storage
+                if bed_wg > 0 {
+                    pass.set_pipeline(&self.pipelines.commit_bed_storage);
+                    pass.dispatch_workgroups(bed_wg, 1, 1);
+                }
+
+                // 7. extraction_advect
+                if bed_wg > 0 {
+                    pass.set_pipeline(&self.pipelines.extraction_advect);
+                    pass.dispatch_workgroups(bed_wg, 1, 1);
+                }
+
+                // 8. g2p
                 if particle_wg > 0 {
                     pass.set_pipeline(&self.pipelines.g2p);
                     pass.dispatch_workgroups(particle_wg, 1, 1);
                 }
 
-                // 8. bed_dynamics
+                // 9. bed_dynamics
                 if bed_wg > 0 {
                     pass.set_pipeline(&self.pipelines.bed_dynamics);
                     pass.dispatch_workgroups(bed_wg, 1, 1);
                 }
 
-                // 9. prepare_render
+                // 10. prepare_render
                 if particle_wg > 0 {
                     pass.set_pipeline(&self.pipelines.prepare_render);
                     pass.dispatch_workgroups(particle_wg, 1, 1);
