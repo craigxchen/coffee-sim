@@ -3,14 +3,17 @@ use coffee_sim_core::sph::Vec3;
 mod state;
 mod pipelines;
 mod shader;
+mod filter;
+mod filter_mesh;
 pub(crate) mod inflow;
 pub(crate) mod bed;
+pub(crate) use filter::FilterConfig;
 
 use state::{MpmBuffers, MpmUniforms, FP_SCALE, MAX_VELOCITY, NUM_THREADS, SDF_RES};
 use pipelines::MpmPipelines;
 use inflow::{InflowState, SpoutSettings, MASS_UNITS_PER_ML};
 use bed::{BedConfig, BedInit};
-
+use filter_mesh::FilterMesh;
 const TARGET_BED_RETENTION_ML: f32 = 42.0;
 
 #[derive(Clone, Debug)]
@@ -43,6 +46,7 @@ pub(crate) struct MpmSettings {
     pub obstacles: Vec<Obstacle>,
     pub spout: SpoutSettings,
     pub initial_kettle_angle_deg: f32,
+    pub filter: Option<FilterConfig>,
     pub bed: Option<BedConfig>,
 }
 
@@ -55,6 +59,8 @@ impl MpmSettings {
         let gy = (bounds_size.y / dx).ceil() as u32;
         let gz = 80u32;
         let grid_dims = [gx, gy, gz];
+        let filter = FilterConfig::default();
+        let bed = BedConfig::seated_in_filter(&filter);
 
         Self {
             bounds_size,
@@ -82,7 +88,8 @@ impl MpmSettings {
             ],
             spout: SpoutSettings::default(),
             initial_kettle_angle_deg: 36.0,
-            bed: Some(BedConfig::default()),
+            filter: Some(filter),
+            bed: Some(bed),
         }
     }
 }
@@ -92,6 +99,7 @@ pub(crate) struct MpmSim3D {
     buffers: MpmBuffers,
     pipelines: MpmPipelines,
     inflow: InflowState,
+    filter_mesh: Option<FilterMesh>,
     num_water: u32,
     num_bed: u32,
     total_time: f32,
@@ -106,12 +114,14 @@ impl MpmSim3D {
         let buffers = MpmBuffers::new(device, queue, &settings);
         let pipelines = MpmPipelines::new(device, &buffers);
         let inflow = InflowState::new(settings.initial_kettle_angle_deg);
+        let filter_mesh = settings.filter.as_ref().map(FilterMesh::new);
 
         let mut sim = Self {
             settings,
             buffers,
             pipelines,
             inflow,
+            filter_mesh,
             num_water: 0,
             num_bed: 0,
             total_time: 0.0,
@@ -246,6 +256,21 @@ impl MpmSim3D {
             }
             queue.submit(Some(encoder.finish()));
 
+            if let Some(mesh) = &mut self.filter_mesh {
+                let bed_factor = if self.num_bed > 0 {
+                    (self.num_bed as f32 / 12_000.0).clamp(0.0, 2.0)
+                } else {
+                    0.0
+                };
+                let water_factor = if self.settings.max_particles > 0 {
+                    (self.num_water as f32 / self.settings.max_particles as f32).clamp(0.0, 2.0)
+                } else {
+                    0.0
+                };
+                let load = (0.28 + bed_factor * 0.22 + water_factor * 0.18).clamp(0.12, 0.90);
+                mesh.step(sub_dt, load);
+            }
+
             self.total_time += sub_dt;
         }
     }
@@ -292,6 +317,14 @@ impl MpmSim3D {
 
     pub fn render_buffer(&self) -> &wgpu::Buffer {
         &self.buffers.render_data
+    }
+
+    pub fn filter_render_vertices(&self) -> Option<&[[f32; 3]]> {
+        self.filter_mesh.as_ref().map(|mesh| mesh.render_vertices())
+    }
+
+    pub fn filter_fill_vertices(&self) -> Option<&[[f32; 3]]> {
+        self.filter_mesh.as_ref().map(|mesh| mesh.fill_vertices())
     }
 
     pub fn settings(&self) -> &MpmSettings {
