@@ -13,6 +13,20 @@ use state::{MpmBuffers, MpmUniforms, FP_SCALE, MAX_VELOCITY, NUM_THREADS, SDF_RE
 
 const TARGET_BED_RETENTION_ML: f32 = 42.0;
 
+/// Device limits required by the MPM compute pipeline.
+///
+/// The MPM bind group holds 9 storage buffers (particles, affine, grid,
+/// grid_vel, render_data, bed_extract, bed_lookup, bed_delta,
+/// bed_support_count), which is one over the WebGPU spec default of 8. Any
+/// `request_device` site that uses this pipeline must use these limits, and
+/// `mpm_pipelines_fit_within_required_limits` pins the invariant.
+pub(crate) fn required_limits() -> wgpu::Limits {
+    wgpu::Limits {
+        max_storage_buffers_per_shader_stage: 10,
+        ..wgpu::Limits::default()
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) enum Obstacle {
     TruncatedCone {
@@ -512,20 +526,30 @@ mod tests {
         bed_held_mass: f32,
     }
 
-    fn create_test_device() -> Option<(wgpu::Device, wgpu::Queue)> {
+    fn request_adapter() -> Option<wgpu::Adapter> {
         let instance = wgpu::Instance::default();
-        let adapter =
-            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
-                .ok()?;
+        pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).ok()
+    }
+
+    fn create_device_with_limits(
+        adapter: &wgpu::Adapter,
+        limits: wgpu::Limits,
+        label: &'static str,
+    ) -> Option<(wgpu::Device, wgpu::Queue)> {
         pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: Some("coffee-sim test device"),
+            label: Some(label),
             required_features: wgpu::Features::empty(),
-            required_limits: wgpu::Limits::default(),
+            required_limits: limits,
             memory_hints: wgpu::MemoryHints::Performance,
             trace: wgpu::Trace::default(),
             experimental_features: wgpu::ExperimentalFeatures::disabled(),
         }))
         .ok()
+    }
+
+    fn create_test_device() -> Option<(wgpu::Device, wgpu::Queue)> {
+        let adapter = request_adapter()?;
+        create_device_with_limits(&adapter, required_limits(), "coffee-sim test device")
     }
 
     fn readback_mass_snapshot(
@@ -657,6 +681,62 @@ mod tests {
         // gy is sized to cover the full vertical extent
         let height_covered = s.grid_dims[1] as f32 * dx;
         assert!(height_covered >= s.bounds_size.y - dx);
+    }
+
+    #[test]
+    fn mpm_pipelines_fit_within_required_limits() {
+        // Construct the full sim (buffers + bind group layout + pipelines)
+        // against the limits the app actually requests. If the bind group
+        // layout ever exceeds `required_limits()`, this test fails with the
+        // validation error instead of the sim silently failing at startup in
+        // the browser.
+        let Some(adapter) = request_adapter() else {
+            eprintln!("skipping: no GPU adapter available");
+            return;
+        };
+        let Some((device, queue)) =
+            create_device_with_limits(&adapter, required_limits(), "required-limits device")
+        else {
+            eprintln!("skipping: adapter does not support required limits");
+            return;
+        };
+
+        let error_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let _sim = MpmSim3D::new(&device, &queue, MpmSettings::default_v60());
+        let error = pollster::block_on(error_scope.pop());
+        assert!(
+            error.is_none(),
+            "MpmSim3D::new produced a validation error under required_limits(): {error:?}",
+        );
+    }
+
+    #[test]
+    fn mpm_pipelines_exceed_spec_default_limits() {
+        // Canary for `required_limits()`: building the sim at the WebGPU spec
+        // default (`max_storage_buffers_per_shader_stage = 8`) must fail. If
+        // the bind group layout ever drops to 8 or fewer storage buffers, this
+        // test will flip and `required_limits()` becomes unnecessary — revisit
+        // both together. Run under an error scope so the validation error is
+        // captured instead of aborting the test process.
+        let Some(adapter) = request_adapter() else {
+            eprintln!("skipping: no GPU adapter available");
+            return;
+        };
+        let Some((device, queue)) =
+            create_device_with_limits(&adapter, wgpu::Limits::default(), "spec-default device")
+        else {
+            eprintln!("skipping: adapter does not support spec default limits");
+            return;
+        };
+
+        let error_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let _sim = MpmSim3D::new(&device, &queue, MpmSettings::default_v60());
+        let error = pollster::block_on(error_scope.pop());
+        assert!(
+            error.is_some(),
+            "expected a validation error when constructing MpmSim3D at spec-default limits, but \
+             pipeline creation succeeded — `required_limits()` may no longer be necessary",
+        );
     }
 
     #[test]
