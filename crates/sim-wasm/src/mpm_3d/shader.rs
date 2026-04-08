@@ -531,18 +531,25 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>) {
         new_C2 *= affine_damp;
     }
 
-    // Extra dissipation and volume recovery in the carafe help the under-
-    // resolved pool settle into a rising body of water instead of collapsing
-    // into a thin, self-overlapping particle column.
-    let in_carafe = xp.y < -3.6 && sample_sdf(xp) > 0.0;
+    // Only apply the cup-pooling treatment in the lower portion of the carafe.
+    // The upper cup should behave much more like free fall so the outlet stream
+    // does not visibly brake before it reaches the pooled water.
+    let cup_fill_y = -5.2;
+    let in_carafe = xp.y < cup_fill_y && sample_sdf(xp) > 0.0;
     if in_carafe {
-        let depth = clamp((-3.6 - xp.y) / 4.4, 0.0, 1.0);
-        let lateral = clamp(1.0 - (6.0 + depth * 5.0) * dt(), 0.78, 1.0);
-        let vertical = clamp(1.0 - (9.0 + depth * 8.0) * dt(), 0.68, 1.0);
+        let depth = clamp((cup_fill_y - xp.y) / 2.8, 0.0, 1.0);
+        let cup_age = clamp(affine[pid].col1.w + dt() * (0.35 + depth * 0.75), 0.0, 1.0);
+        affine[pid].col1.w = cup_age;
+
+        let settle = max(depth, cup_age);
+        let lateral = clamp(1.0 - (1.8 + settle * 3.0) * dt(), 0.86, 1.0);
+        let vertical = clamp(1.0 - (2.8 + settle * 5.0) * dt(), 0.80, 1.0);
         new_v = vec3<f32>(new_v.x * lateral, new_v.y * vertical, new_v.z * lateral);
-        new_C0 *= 1.0 - clamp(viscosity() * dt() * (1.6 + depth), 0.0, 0.38);
-        new_C1 *= 1.0 - clamp(viscosity() * dt() * (1.9 + depth), 0.0, 0.42);
-        new_C2 *= 1.0 - clamp(viscosity() * dt() * (1.6 + depth), 0.0, 0.38);
+        new_C0 *= 1.0 - clamp(viscosity() * dt() * (1.0 + settle), 0.0, 0.30);
+        new_C1 *= 1.0 - clamp(viscosity() * dt() * (1.2 + settle), 0.0, 0.34);
+        new_C2 *= 1.0 - clamp(viscosity() * dt() * (1.0 + settle), 0.0, 0.30);
+    } else {
+        affine[pid].col1.w = max(affine[pid].col1.w - dt() * 0.6, 0.0);
     }
 
     // Update J (fluid volume ratio)
@@ -550,8 +557,8 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>) {
     var J_new = J_old * (1.0 + dt() * trace_C);
     J_new = clamp(J_new, 0.1, 10.0);
     if in_carafe {
-        let depth = clamp((-3.6 - xp.y) / 4.4, 0.0, 1.0);
-        let recover = clamp((0.14 + depth * 0.2) * bulk_K() * dt() / 900.0, 0.0, 0.32);
+        let depth = clamp((cup_fill_y - xp.y) / 2.8, 0.0, 1.0);
+        let recover = clamp((0.08 + depth * 0.12) * bulk_K() * dt() / 900.0, 0.0, 0.18);
         J_new = mix(J_new, 1.0, recover);
     }
 
