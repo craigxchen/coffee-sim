@@ -284,6 +284,11 @@ impl MpmSim3D {
                     pass.dispatch_workgroups(cell_wg, 1, 1);
                     pass.set_pipeline(&self.pipelines.boundary_project);
                     pass.dispatch_workgroups(cell_wg, 1, 1);
+
+                    if particle_wg > 0 {
+                        pass.set_pipeline(&self.pipelines.apply_bed_sink_particles);
+                        pass.dispatch_workgroups(particle_wg, 1, 1);
+                    }
                 }
 
                 // 6. commit_bed_storage
