@@ -9,6 +9,8 @@ mod shader;
 mod state;
 
 pub(crate) use filter::FilterConfig;
+#[cfg(target_arch = "wasm32")]
+pub(crate) use filter_mesh::{MAX_FILL_VERTEX_COUNT, MAX_RENDER_VERTEX_COUNT};
 
 use bed::{BedConfig, BedInit};
 use filter_mesh::FilterMesh;
@@ -338,22 +340,26 @@ impl MpmSim3D {
             }
             queue.submit(Some(encoder.finish()));
 
-            if let Some(mesh) = &mut self.filter_mesh {
-                let bed_factor = if self.num_bed > 0 {
-                    (self.num_bed as f32 / 12_000.0).clamp(0.0, 2.0)
-                } else {
-                    0.0
-                };
-                let water_factor = if self.settings.max_particles > 0 {
-                    (self.num_water as f32 / self.settings.max_particles as f32).clamp(0.0, 2.0)
-                } else {
-                    0.0
-                };
-                let load = (0.28 + bed_factor * 0.22 + water_factor * 0.18).clamp(0.12, 0.90);
-                mesh.step(sub_dt, load);
-            }
-
             self.total_time += sub_dt;
+        }
+
+        // The filter mesh is a CPU-side cloth scaffold with no fluid coupling,
+        // so stepping it once per frame at the full `dt` is enough — there is
+        // no benefit to running it per-substep and it would otherwise scale
+        // CPU cost linearly with `substeps`.
+        if let Some(mesh) = &mut self.filter_mesh {
+            let bed_factor = if self.num_bed > 0 {
+                (self.num_bed as f32 / 12_000.0).clamp(0.0, 2.0)
+            } else {
+                0.0
+            };
+            let water_factor = if self.settings.max_particles > 0 {
+                (self.num_water as f32 / self.settings.max_particles as f32).clamp(0.0, 2.0)
+            } else {
+                0.0
+            };
+            let load = (0.28 + bed_factor * 0.22 + water_factor * 0.18).clamp(0.12, 0.90);
+            mesh.step(dt, load);
         }
     }
 
@@ -366,6 +372,9 @@ impl MpmSim3D {
         self.total_emitted_mass = 0.0;
         self.total_dropped_particles = 0;
         self.inflow = InflowState::new(self.settings.initial_kettle_angle_deg);
+        // Rebuild the CPU filter mesh so its deformation state does not leak
+        // across resets — the GPU solver state is wiped via `init_bed` below.
+        self.filter_mesh = self.settings.filter.as_ref().map(FilterMesh::new);
         self.init_bed(queue);
     }
 
