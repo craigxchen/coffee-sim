@@ -2,6 +2,8 @@ use std::collections::HashMap;
 
 use coffee_sim_core::sph::Vec3;
 
+use super::FilterConfig;
+
 #[derive(Clone)]
 pub(crate) struct BedConfig {
     pub center: Vec3,
@@ -31,6 +33,25 @@ impl Default for BedConfig {
             initial_permeability: 1.0,
             extractable_mass: 0.15,
         }
+    }
+}
+
+impl BedConfig {
+    pub(crate) fn seated_in_filter(filter: &FilterConfig) -> Self {
+        let mut bed = Self::default();
+        bed.center = filter.center;
+
+        let top_abs = (bed.center.y + bed.top_y).clamp(filter.bot_y + 0.6, filter.top_y - 0.35);
+        let bot_abs = (bed.center.y + bed.bot_y).clamp(filter.bot_y + 0.4, top_abs - 1.4);
+
+        bed.top_y = top_abs - bed.center.y;
+        bed.bot_y = bot_abs - bed.center.y;
+        bed.top_radius = (filter.inner_radius_at_y(top_abs) - 0.18)
+            .clamp(filter.opening_radius() + 0.8, filter.top_radius - filter.thickness - 0.1);
+        bed.bot_radius = (filter.inner_radius_at_y(bot_abs) - 0.12)
+            .clamp(filter.opening_radius() + 0.32, bed.top_radius - 0.25);
+
+        bed
     }
 }
 
@@ -330,5 +351,19 @@ mod tests {
             }
         }
         assert_eq!(init.bed_support_count, recomputed);
+    }
+
+    #[test]
+    fn default_bed_sits_inside_filter_interior() {
+        let filter = FilterConfig::default();
+        let bed = BedConfig::seated_in_filter(&filter);
+
+        let top_abs = bed.center.y + bed.top_y;
+        let bot_abs = bed.center.y + bed.bot_y;
+
+        assert!(bed.top_radius < filter.inner_radius_at_y(top_abs));
+        assert!(bed.bot_radius < filter.inner_radius_at_y(bot_abs));
+        assert!(bot_abs > filter.bot_y);
+        assert!(top_abs < filter.top_y);
     }
 }
