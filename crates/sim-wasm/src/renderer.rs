@@ -190,14 +190,21 @@ pub(crate) struct Renderer {
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     particle_3d_pipeline: wgpu::RenderPipeline,
+    filter_fill_pipeline: wgpu::RenderPipeline,
     cone_pipeline: wgpu::RenderPipeline,
     particle_3d_uniform_buffer: wgpu::Buffer,
     particle_3d_bind_group: wgpu::BindGroup,
     cone_uniform_buffer: wgpu::Buffer,
     cone_bind_group: wgpu::BindGroup,
+    filter_uniform_buffer: wgpu::Buffer,
+    filter_bind_group: wgpu::BindGroup,
     quad_vertex_buffer: wgpu::Buffer,
     cone_vertex_buffer: wgpu::Buffer,
     cone_vertex_count: u32,
+    filter_fill_vertex_buffer: wgpu::Buffer,
+    filter_fill_vertex_count: u32,
+    filter_vertex_buffer: wgpu::Buffer,
+    filter_vertex_count: u32,
     depth_texture: wgpu::Texture,
     depth_view: wgpu::TextureView,
 }
@@ -289,6 +296,22 @@ impl Renderer {
             }],
         });
 
+        let filter_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("filter uniforms"),
+            size: size_of::<ConeUniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let filter_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("filter bind group"),
+            layout: &bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: filter_uniform_buffer.as_entire_binding(),
+            }],
+        });
+
         // Shaders
         let particle_3d_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("particle 3d shader"),
@@ -364,6 +387,54 @@ impl Renderer {
                 format: wgpu::TextureFormat::Depth24Plus,
                 depth_write_enabled: Some(true),
                 depth_compare: Some(wgpu::CompareFunction::Less),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        let filter_fill_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("filter fill pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &cone_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: (size_of::<f32>() * 3) as u64,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &[wgpu::VertexAttribute {
+                        offset: 0,
+                        shader_location: 0,
+                        format: wgpu::VertexFormat::Float32x3,
+                    }],
+                }],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &cone_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                unclipped_depth: false,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth24Plus,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
@@ -453,6 +524,30 @@ impl Renderer {
         });
         queue.write_buffer(&cone_vertex_buffer, 0, bytemuck::cast_slice(&cone_verts));
 
+        let filter_fill_verts = build_filter_fill(settings);
+        let filter_fill_vertex_count = filter_fill_verts.len() as u32;
+        let filter_fill_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("filter fill vertex buffer"),
+            size: (filter_fill_verts.len() * size_of::<[f32; 3]>()).max(16) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(
+            &filter_fill_vertex_buffer,
+            0,
+            bytemuck::cast_slice(&filter_fill_verts),
+        );
+
+        let filter_verts = build_filter_wireframe(settings);
+        let filter_vertex_count = filter_verts.len() as u32;
+        let filter_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("filter vertex buffer"),
+            size: (filter_verts.len() * size_of::<[f32; 3]>()).max(16) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&filter_vertex_buffer, 0, bytemuck::cast_slice(&filter_verts));
+
         let (depth_texture, depth_view) = create_depth_resources(&device, width, height);
 
         Ok(Self {
@@ -461,14 +556,21 @@ impl Renderer {
             queue,
             config,
             particle_3d_pipeline,
+            filter_fill_pipeline,
             cone_pipeline,
             particle_3d_uniform_buffer,
             particle_3d_bind_group,
             cone_uniform_buffer,
             cone_bind_group,
+            filter_uniform_buffer,
+            filter_bind_group,
             quad_vertex_buffer,
             cone_vertex_buffer,
             cone_vertex_count,
+            filter_fill_vertex_buffer,
+            filter_fill_vertex_count,
+            filter_vertex_buffer,
+            filter_vertex_count,
             depth_texture,
             depth_view,
         })
@@ -540,6 +642,34 @@ impl Renderer {
             bytemuck::bytes_of(&cone_uniforms),
         );
 
+        let filter_uniforms = ConeUniforms {
+            view_proj,
+            color: [0.98, 0.96, 0.90, 0.24],
+        };
+        self.queue.write_buffer(
+            &self.filter_uniform_buffer,
+            0,
+            bytemuck::bytes_of(&filter_uniforms),
+        );
+
+        if let Some(filter_vertices) = simulation.filter_fill_vertices() {
+            self.queue.write_buffer(
+                &self.filter_fill_vertex_buffer,
+                0,
+                bytemuck::cast_slice(filter_vertices),
+            );
+            self.filter_fill_vertex_count = filter_vertices.len() as u32;
+        }
+
+        if let Some(filter_vertices) = simulation.filter_render_vertices() {
+            self.queue.write_buffer(
+                &self.filter_vertex_buffer,
+                0,
+                bytemuck::cast_slice(filter_vertices),
+            );
+            self.filter_vertex_count = filter_vertices.len() as u32;
+        }
+
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame)
             | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
@@ -594,12 +724,26 @@ impl Renderer {
                 multiview_mask: None,
             });
 
+            if self.filter_fill_vertex_count > 0 {
+                pass.set_pipeline(&self.filter_fill_pipeline);
+                pass.set_bind_group(0, &self.filter_bind_group, &[]);
+                pass.set_vertex_buffer(0, self.filter_fill_vertex_buffer.slice(..));
+                pass.draw(0..self.filter_fill_vertex_count, 0..1);
+            }
+
             // Draw cone wireframe
             if self.cone_vertex_count > 0 {
                 pass.set_pipeline(&self.cone_pipeline);
                 pass.set_bind_group(0, &self.cone_bind_group, &[]);
                 pass.set_vertex_buffer(0, self.cone_vertex_buffer.slice(..));
                 pass.draw(0..self.cone_vertex_count, 0..1);
+            }
+
+            if self.filter_vertex_count > 0 {
+                pass.set_pipeline(&self.cone_pipeline);
+                pass.set_bind_group(0, &self.filter_bind_group, &[]);
+                pass.set_vertex_buffer(0, self.filter_vertex_buffer.slice(..));
+                pass.draw(0..self.filter_vertex_count, 0..1);
             }
 
             // Draw particles
@@ -683,6 +827,99 @@ fn build_wireframe(settings: &MpmSettings) -> Vec<[f32; 3]> {
     }
 
     push_spout_wireframe(&mut verts, settings);
+    verts
+}
+
+fn build_filter_fill(settings: &MpmSettings) -> Vec<[f32; 3]> {
+    let Some(filter) = settings.filter.as_ref() else {
+        return Vec::new();
+    };
+
+    let segments = 40;
+    let rings = 18;
+    let mut verts = Vec::with_capacity(segments * rings * 6);
+
+    for ring in 0..rings {
+        let t0 = ring as f32 / rings as f32;
+        let t1 = (ring + 1) as f32 / rings as f32;
+        let y0 = filter.bot_y + (filter.top_y - filter.bot_y) * t0;
+        let y1 = filter.bot_y + (filter.top_y - filter.bot_y) * t1;
+        let r0 = filter.radius_at_y(y0);
+        let r1 = filter.radius_at_y(y1);
+
+        for seg in 0..segments {
+            let a0 = 2.0 * PI * seg as f32 / segments as f32;
+            let a1 = 2.0 * PI * (seg + 1) as f32 / segments as f32;
+
+            let p00 = [
+                filter.center.x + r0 * a0.cos(),
+                y0,
+                filter.center.z + r0 * a0.sin(),
+            ];
+            let p01 = [
+                filter.center.x + r0 * a1.cos(),
+                y0,
+                filter.center.z + r0 * a1.sin(),
+            ];
+            let p10 = [
+                filter.center.x + r1 * a0.cos(),
+                y1,
+                filter.center.z + r1 * a0.sin(),
+            ];
+            let p11 = [
+                filter.center.x + r1 * a1.cos(),
+                y1,
+                filter.center.z + r1 * a1.sin(),
+            ];
+
+            verts.extend_from_slice(&[p00, p10, p11, p00, p11, p01]);
+        }
+    }
+
+    verts
+}
+
+fn build_filter_wireframe(settings: &MpmSettings) -> Vec<[f32; 3]> {
+    let Some(filter) = settings.filter.as_ref() else {
+        return Vec::new();
+    };
+
+    let mut verts = Vec::new();
+    let rings = 10;
+    let segments = 32;
+
+    let mut ring_positions = Vec::with_capacity(rings * segments);
+    for ring in 0..rings {
+        let ring_t = ring as f32 / (rings - 1) as f32;
+        let y = filter.bot_y + (filter.top_y - filter.bot_y) * ring_t;
+        let radius = filter.radius_at_y(y);
+        for seg in 0..segments {
+            let angle = 2.0 * PI * seg as f32 / segments as f32;
+            ring_positions.push([
+                filter.center.x + radius * angle.cos(),
+                y,
+                filter.center.z + radius * angle.sin(),
+            ]);
+        }
+    }
+
+    for ring in 0..rings {
+        for seg in 0..segments {
+            let a = ring * segments + seg;
+            let next_seg = ring * segments + (seg + 1) % segments;
+            verts.push(ring_positions[a]);
+            verts.push(ring_positions[next_seg]);
+
+            if ring + 1 < rings {
+                let below = (ring + 1) * segments + seg;
+                let diag = (ring + 1) * segments + (seg + 1) % segments;
+                verts.push(ring_positions[a]);
+                verts.push(ring_positions[below]);
+                verts.push(ring_positions[a]);
+                verts.push(ring_positions[diag]);
+            }
+        }
+    }
     verts
 }
 
