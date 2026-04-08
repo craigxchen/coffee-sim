@@ -2,6 +2,8 @@ use std::collections::HashMap;
 
 use coffee_sim_core::sph::Vec3;
 
+use super::FilterConfig;
+
 #[derive(Clone)]
 pub(crate) struct BedConfig {
     pub center: Vec3,
@@ -26,11 +28,30 @@ impl Default for BedConfig {
             bot_y: -2.25,
             top_radius: 2.65,
             bot_radius: 0.95,
-            num_particles: 5_000,
+            num_particles: 12_000,
             initial_porosity: 0.4,
             initial_permeability: 1.0,
             extractable_mass: 0.15,
         }
+    }
+}
+
+impl BedConfig {
+    pub(crate) fn seated_in_filter(filter: &FilterConfig) -> Self {
+        let mut bed = Self::default();
+        bed.center = filter.center;
+
+        let top_abs = (bed.center.y + bed.top_y).clamp(filter.bot_y + 0.6, filter.top_y - 0.35);
+        let bot_abs = (bed.center.y + bed.bot_y).clamp(filter.bot_y + 0.4, top_abs - 1.4);
+
+        bed.top_y = top_abs - bed.center.y;
+        bed.bot_y = bot_abs - bed.center.y;
+        bed.top_radius = (filter.inner_radius_at_y(top_abs) - 0.18)
+            .clamp(filter.opening_radius() + 0.8, filter.top_radius - filter.thickness - 0.1);
+        bed.bot_radius = (filter.inner_radius_at_y(bot_abs) - 0.12)
+            .clamp(filter.opening_radius() + 0.32, bed.top_radius - 0.25);
+
+        bed
     }
 }
 
@@ -39,6 +60,7 @@ pub(crate) struct BedInit {
     pub affines: Vec<[f32; 12]>,
     pub bed_extracts: Vec<[f32; 8]>,
     pub cell_lookup: Vec<i32>,
+    pub bed_support_count: Vec<u32>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -60,6 +82,7 @@ pub(crate) fn init_bed_particles(
             affines: vec![],
             bed_extracts: vec![],
             cell_lookup: vec![-1; (grid_dims[0] * grid_dims[1] * grid_dims[2]) as usize],
+            bed_support_count: vec![],
         };
     }
 
@@ -102,7 +125,7 @@ pub(crate) fn init_bed_particles(
                 // Particle: pos(x,y,z,J=1), vel(0,0,0,mass=1)
                 particles.push([x, y, z, 1.0, 0.0, 0.0, 0.0, 1.0]);
                 // Phase=1.0 means bed particle.
-                affines.push([0.0, 0.0, 0.0, 1.0, x, y, z, 0.0, 0.0, 0.0, 0.0, 0.0]);
+                affines.push([0.0, 0.0, 0.0, 1.0, x, y, z, 0.0, y, 0.0, 0.0, 0.0]);
                 // BedExtract: bed(pore_water, porosity, permeability, compaction),
                 //             extract(extractable, dissolved, temp, saturation)
                 bed_extracts.push([
@@ -137,13 +160,28 @@ pub(crate) fn init_bed_particles(
         grid_dims,
         bounds_size,
     );
+    let bed_support_count = build_support_counts(&cell_lookup, particles.len());
 
     BedInit {
         particles,
         affines,
         bed_extracts,
         cell_lookup,
+        bed_support_count,
     }
+}
+
+fn build_support_counts(cell_lookup: &[i32], num_particles: usize) -> Vec<u32> {
+    let mut counts = vec![0_u32; num_particles];
+    for &entry in cell_lookup {
+        if entry >= 0 {
+            let idx = entry as usize;
+            if idx < counts.len() {
+                counts[idx] += 1;
+            }
+        }
+    }
+    counts
 }
 
 fn build_cell_lookup(
@@ -225,4 +263,107 @@ fn build_cell_lookup(
     }
 
     lookup
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn small_config() -> BedConfig {
+        BedConfig {
+            num_particles: 200,
+            ..BedConfig::default()
+        }
+    }
+
+    #[test]
+    fn empty_bed_when_height_collapses() {
+        let mut cfg = small_config();
+        cfg.top_y = 0.0;
+        cfg.bot_y = 0.0;
+        let init = init_bed_particles(&cfg, [16, 16, 16], Vec3::new(8.0, 8.0, 8.0));
+        assert!(init.particles.is_empty());
+        assert!(init.affines.is_empty());
+        assert!(init.bed_extracts.is_empty());
+        assert_eq!(init.cell_lookup.len(), 16 * 16 * 16);
+        assert!(init.bed_support_count.is_empty());
+        assert!(init.cell_lookup.iter().all(|v| *v == -1));
+    }
+
+    #[test]
+    fn produces_at_most_target_particles() {
+        let cfg = small_config();
+        let init = init_bed_particles(&cfg, [32, 32, 32], Vec3::new(14.0, 20.0, 14.0));
+        assert!(init.particles.len() <= cfg.num_particles as usize);
+        assert_eq!(init.particles.len(), init.affines.len());
+        assert_eq!(init.particles.len(), init.bed_extracts.len());
+        assert_eq!(init.particles.len(), init.bed_support_count.len());
+    }
+
+    #[test]
+    fn bed_particles_carry_water_phase_marker() {
+        let cfg = small_config();
+        let init = init_bed_particles(&cfg, [32, 32, 32], Vec3::new(14.0, 20.0, 14.0));
+        for affine in &init.affines {
+            // affine[3] is the phase slot (col0.w); bed particles must be 1.0
+            assert_eq!(affine[3], 1.0);
+        }
+    }
+
+    #[test]
+    fn bed_extracts_initialised_within_bounds() {
+        let cfg = small_config();
+        let init = init_bed_particles(&cfg, [32, 32, 32], Vec3::new(14.0, 20.0, 14.0));
+        for extract in &init.bed_extracts {
+            // bed: pore_water, porosity, permeability, compaction
+            assert_eq!(extract[0], 0.0);
+            assert!((extract[1] - cfg.initial_porosity).abs() < 1e-6);
+            assert!((extract[2] - cfg.initial_permeability).abs() < 1e-6);
+            assert_eq!(extract[3], 0.0);
+            // extract: extractable, dissolved, temp, saturation
+            assert!((extract[4] - cfg.extractable_mass).abs() < 1e-6);
+            assert_eq!(extract[5], 0.0);
+            assert_eq!(extract[7], 0.0);
+        }
+    }
+
+    #[test]
+    fn cell_lookup_only_indexes_existing_particles() {
+        let cfg = small_config();
+        let init = init_bed_particles(&cfg, [32, 32, 32], Vec3::new(14.0, 20.0, 14.0));
+        let n = init.particles.len() as i32;
+        for value in &init.cell_lookup {
+            assert!(*value < n, "lookup {} >= particle count {}", value, n);
+            assert!(*value >= -1);
+        }
+        let any_indexed = init.cell_lookup.iter().any(|v| *v >= 0);
+        assert!(any_indexed, "expected at least one bed-occupied cell");
+    }
+
+    #[test]
+    fn bed_support_count_matches_lookup_fanout() {
+        let cfg = small_config();
+        let init = init_bed_particles(&cfg, [32, 32, 32], Vec3::new(14.0, 20.0, 14.0));
+        let mut recomputed = vec![0_u32; init.particles.len()];
+        for &entry in &init.cell_lookup {
+            if entry >= 0 {
+                recomputed[entry as usize] += 1;
+            }
+        }
+        assert_eq!(init.bed_support_count, recomputed);
+    }
+
+    #[test]
+    fn default_bed_sits_inside_filter_interior() {
+        let filter = FilterConfig::default();
+        let bed = BedConfig::seated_in_filter(&filter);
+
+        let top_abs = bed.center.y + bed.top_y;
+        let bot_abs = bed.center.y + bed.bot_y;
+
+        assert!(bed.top_radius < filter.inner_radius_at_y(top_abs));
+        assert!(bed.bot_radius < filter.inner_radius_at_y(bot_abs));
+        assert!(bot_abs > filter.bot_y);
+        assert!(top_abs < filter.top_y);
+    }
 }
