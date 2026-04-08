@@ -8,7 +8,7 @@ use web_sys::HtmlCanvasElement;
 
 use coffee_sim_core::sph::Vec3;
 
-use crate::mpm_3d::{MpmSim3D, MpmSettings, Obstacle};
+use crate::mpm_3d::{MpmSettings, MpmSim3D, Obstacle};
 
 const EPSILON: f32 = 1e-6;
 

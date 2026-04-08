@@ -79,11 +79,13 @@ fn contact_offset() -> f32 { return u.sdf_params.w; }
 fn drag_coeff() -> f32 { return u.bed_params.x; }
 fn absorption_rate() -> f32 { return u.bed_params.y; }
 fn max_saturation() -> f32 { return u.bed_params.z; }
+fn projection_enabled() -> bool { return u.bed_params.w > 0.5; }
 fn extraction_rate() -> f32 { return u.extraction_params.x; }
 fn bed_spring() -> f32 { return u.extraction_params.y; }
 fn bed_damping() -> f32 { return u.extraction_params.z; }
 fn bed_impact() -> f32 { return u.extraction_params.w; }
 fn inactive_mass_threshold() -> f32 { return nominal_mass() * 0.10; }
+fn temp_sparse_ballistic_enabled() -> bool { return u.time_params.z > 0.5; }
 
 fn cell_index(ix: u32, iy: u32, iz: u32) -> u32 {
     return iz * gx() * gy() + iy * gx() + ix;
@@ -93,6 +95,42 @@ fn grid_mass_idx(cell: u32) -> u32 { return cell; }
 fn grid_mom_x_idx(cell: u32) -> u32 { return total_cells() + cell; }
 fn grid_mom_y_idx(cell: u32) -> u32 { return 2u * total_cells() + cell; }
 fn grid_mom_z_idx(cell: u32) -> u32 { return 3u * total_cells() + cell; }
+fn scratch_pressure_idx(cell: u32) -> u32 { return grid_mass_idx(cell); }
+fn scratch_div_idx(cell: u32) -> u32 { return grid_mom_x_idx(cell); }
+fn scratch_residual_idx(cell: u32) -> u32 { return grid_mom_y_idx(cell); }
+fn scratch_kind_idx(cell: u32) -> u32 { return grid_mom_z_idx(cell); }
+fn occupancy_mass_threshold() -> f32 { return nominal_mass(); }
+
+const CELL_AIR: i32 = 0;
+const CELL_SURFACE_FLUID: i32 = 1;
+const CELL_INTERIOR_FLUID: i32 = 2;
+const CELL_BED_COUPLED: i32 = 3;
+
+fn cell_kind_load(cell: u32) -> i32 {
+    return atomicLoad(&grid[scratch_kind_idx(cell)]);
+}
+
+fn pressure_load(cell: u32) -> f32 {
+    return f32(atomicLoad(&grid[scratch_pressure_idx(cell)])) * inv_fp_scale();
+}
+
+fn pressure_store(cell: u32, value: f32) {
+    let clamped = clamp(value, -2048.0, 2048.0);
+    atomicStore(&grid[scratch_pressure_idx(cell)], i32(clamped * fp_scale()));
+}
+
+fn divergence_load(cell: u32) -> f32 {
+    return f32(atomicLoad(&grid[scratch_div_idx(cell)])) * inv_fp_scale();
+}
+
+fn divergence_store(cell: u32, value: f32) {
+    let clamped = clamp(value, -2048.0, 2048.0);
+    atomicStore(&grid[scratch_div_idx(cell)], i32(clamped * fp_scale()));
+}
+
+fn is_fluid_kind(kind: i32) -> bool {
+    return kind == CELL_INTERIOR_FLUID || kind == CELL_BED_COUPLED;
+}
 
 fn world_to_cell(position: vec3<f32>) -> vec3<i32> {
     let grid_pos = (position - u.grid_origin.xyz) * inv_dx();
@@ -285,7 +323,10 @@ fn p2g(@builtin(global_invocation_id) gid: vec3<u32>) {
     wz[1] = 0.75 - (fx.z - 1.0) * (fx.z - 1.0);
     wz[2] = 0.5 * (fx.z - 0.5) * (fx.z - 0.5);
 
-    let stress = -dt() * 4.0 * inv_dx() * inv_dx() * p_vol() * bulk_K() * (J - 1.0);
+    var stress = 0.0;
+    if !projection_enabled() {
+        stress = -dt() * 4.0 * inv_dx() * inv_dx() * p_vol() * bulk_K() * (J - 1.0);
+    }
 
     // Affine = stress*I + mass_p*C
     let C0 = a.col0.xyz;
@@ -356,6 +397,229 @@ fn grid_update(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     grid_vel[idx] = vec4<f32>(v, mass);
+}
+
+// ── classify_cells ──
+
+@compute @workgroup_size(64)
+fn classify_cells(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if idx >= total_cells() { return; }
+
+    let mass = grid_vel[idx].w;
+    pressure_store(idx, 0.0);
+    atomicStore(&grid[scratch_residual_idx(idx)], 0);
+
+    if mass <= occupancy_mass_threshold() {
+        atomicStore(&grid[scratch_kind_idx(idx)], CELL_AIR);
+        divergence_store(idx, 0.0);
+        return;
+    }
+
+    if bed_lookup[idx] >= 0 {
+        atomicStore(&grid[scratch_kind_idx(idx)], CELL_BED_COUPLED);
+    } else {
+        let iz_val = idx / (gx() * gy());
+        let rem = idx % (gx() * gy());
+        let iy_val = rem / gx();
+        let ix_val = rem % gx();
+
+        let offsets = array<vec3<i32>, 6>(
+            vec3<i32>(-1, 0, 0),
+            vec3<i32>(1, 0, 0),
+            vec3<i32>(0, -1, 0),
+            vec3<i32>(0, 1, 0),
+            vec3<i32>(0, 0, -1),
+            vec3<i32>(0, 0, 1),
+        );
+
+        var has_air_neighbor = false;
+        for (var n = 0u; n < 6u; n++) {
+            let neighbor = vec3<i32>(i32(ix_val), i32(iy_val), i32(iz_val)) + offsets[n];
+            if neighbor.x < 0 || neighbor.y < 0 || neighbor.z < 0
+                || u32(neighbor.x) >= gx() || u32(neighbor.y) >= gy() || u32(neighbor.z) >= gz() {
+                has_air_neighbor = true;
+                break;
+            }
+
+            let neighbor_idx = cell_index(u32(neighbor.x), u32(neighbor.y), u32(neighbor.z));
+            if grid_vel[neighbor_idx].w <= occupancy_mass_threshold() {
+                has_air_neighbor = true;
+                break;
+            }
+        }
+
+        atomicStore(
+            &grid[scratch_kind_idx(idx)],
+            select(CELL_INTERIOR_FLUID, CELL_SURFACE_FLUID, has_air_neighbor),
+        );
+    }
+
+    let kind = cell_kind_load(idx);
+    if !is_fluid_kind(kind) {
+        divergence_store(idx, 0.0);
+        return;
+    }
+
+    let iz_val = idx / (gx() * gy());
+    let rem = idx % (gx() * gy());
+    let iy_val = rem / gx();
+    let ix_val = rem % gx();
+
+    var vxm = 0.0;
+    var vxp = 0.0;
+    var vym = 0.0;
+    var vyp = 0.0;
+    var vzm = 0.0;
+    var vzp = 0.0;
+    if ix_val > 0u {
+        vxm = grid_vel[cell_index(ix_val - 1u, iy_val, iz_val)].x;
+    }
+    if ix_val + 1u < gx() {
+        vxp = grid_vel[cell_index(ix_val + 1u, iy_val, iz_val)].x;
+    }
+    if iy_val > 0u {
+        vym = grid_vel[cell_index(ix_val, iy_val - 1u, iz_val)].y;
+    }
+    if iy_val + 1u < gy() {
+        vyp = grid_vel[cell_index(ix_val, iy_val + 1u, iz_val)].y;
+    }
+    if iz_val > 0u {
+        vzm = grid_vel[cell_index(ix_val, iy_val, iz_val - 1u)].z;
+    }
+    if iz_val + 1u < gz() {
+        vzp = grid_vel[cell_index(ix_val, iy_val, iz_val + 1u)].z;
+    }
+
+    let div = 0.5 * inv_dx() * ((vxp - vxm) + (vyp - vym) + (vzp - vzm));
+    divergence_store(idx, div);
+}
+
+// ── pressure_rbgs ──
+
+fn pressure_update(idx: u32, target_parity: u32) {
+    let iz_val = idx / (gx() * gy());
+    let rem = idx % (gx() * gy());
+    let iy_val = rem / gx();
+    let ix_val = rem % gx();
+    if ((ix_val + iy_val + iz_val) & 1u) != target_parity {
+        return;
+    }
+
+    let kind = cell_kind_load(idx);
+    if !is_fluid_kind(kind) {
+        pressure_store(idx, 0.0);
+        return;
+    }
+
+    var neighbor_count = 0.0;
+    var pressure_sum = 0.0;
+    let offsets = array<vec3<i32>, 6>(
+        vec3<i32>(-1, 0, 0),
+        vec3<i32>(1, 0, 0),
+        vec3<i32>(0, -1, 0),
+        vec3<i32>(0, 1, 0),
+        vec3<i32>(0, 0, -1),
+        vec3<i32>(0, 0, 1),
+    );
+
+    for (var n = 0u; n < 6u; n++) {
+        let neighbor = vec3<i32>(i32(ix_val), i32(iy_val), i32(iz_val)) + offsets[n];
+        if neighbor.x < 0 || neighbor.y < 0 || neighbor.z < 0
+            || u32(neighbor.x) >= gx() || u32(neighbor.y) >= gy() || u32(neighbor.z) >= gz() {
+            continue;
+        }
+
+        neighbor_count += 1.0;
+        let neighbor_idx = cell_index(u32(neighbor.x), u32(neighbor.y), u32(neighbor.z));
+        let neighbor_kind = cell_kind_load(neighbor_idx);
+        if is_fluid_kind(neighbor_kind) {
+            pressure_sum += pressure_load(neighbor_idx);
+        }
+    }
+
+    if neighbor_count <= 0.0 {
+        pressure_store(idx, 0.0);
+        return;
+    }
+
+    let rhs = divergence_load(idx) / max(dt(), 1e-6);
+    let p_new = (pressure_sum - dx() * dx() * rhs) / neighbor_count;
+    pressure_store(idx, p_new);
+}
+
+@compute @workgroup_size(64)
+fn pressure_rbgs_red(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if idx >= total_cells() { return; }
+    pressure_update(idx, 0u);
+}
+
+@compute @workgroup_size(64)
+fn pressure_rbgs_black(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if idx >= total_cells() { return; }
+    pressure_update(idx, 1u);
+}
+
+// ── project_pressure ──
+
+@compute @workgroup_size(64)
+fn project_pressure(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if idx >= total_cells() { return; }
+
+    let gv = grid_vel[idx];
+    if gv.w < 1e-6 { return; }
+
+    let kind = cell_kind_load(idx);
+    if !is_fluid_kind(kind) {
+        return;
+    }
+
+    let iz_val = idx / (gx() * gy());
+    let rem = idx % (gx() * gy());
+    let iy_val = rem / gx();
+    let ix_val = rem % gx();
+
+    let p_here = pressure_load(idx);
+    var p_xm = p_here;
+    var p_xp = p_here;
+    var p_ym = p_here;
+    var p_yp = p_here;
+    var p_zm = p_here;
+    var p_zp = p_here;
+    if ix_val > 0u {
+        p_xm = pressure_load(cell_index(ix_val - 1u, iy_val, iz_val));
+    }
+    if ix_val + 1u < gx() {
+        p_xp = pressure_load(cell_index(ix_val + 1u, iy_val, iz_val));
+    }
+    if iy_val > 0u {
+        p_ym = pressure_load(cell_index(ix_val, iy_val - 1u, iz_val));
+    }
+    if iy_val + 1u < gy() {
+        p_yp = pressure_load(cell_index(ix_val, iy_val + 1u, iz_val));
+    }
+    if iz_val > 0u {
+        p_zm = pressure_load(cell_index(ix_val, iy_val, iz_val - 1u));
+    }
+    if iz_val + 1u < gz() {
+        p_zp = pressure_load(cell_index(ix_val, iy_val, iz_val + 1u));
+    }
+
+    let grad_p = 0.5 * inv_dx() * vec3<f32>(
+        p_xp - p_xm,
+        p_yp - p_ym,
+        p_zp - p_zm,
+    );
+
+    var v = gv.xyz - dt() * grad_p;
+    let speed = length(v);
+    if speed > vel_cap() {
+        v = v * (vel_cap() / speed);
+    }
+    grid_vel[idx] = vec4<f32>(v, gv.w);
 }
 
 // ── boundary_project ──
@@ -497,7 +761,8 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>) {
         new_C1 *= inv_supported;
         new_C2 *= inv_supported;
     }
-    if support_ratio < 0.999 {
+    let in_cup_volume = xp.y < -3.5 && dot(xp.xz, xp.xz) < (3.0 + contact_offset()) * (3.0 + contact_offset());
+    if temp_sparse_ballistic_enabled() && support_ratio < 0.999 {
         let ballistic_v = vec3<f32>(p.vel.x, p.vel.y + gravity() * dt(), p.vel.z);
         let preserve = clamp((1.0 - support_ratio) * 1.15, 0.0, 0.95);
         new_v = mix(new_v, ballistic_v, preserve);
@@ -519,7 +784,7 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>) {
         bed_near = bed_lookup[home_idx] >= 0;
     }
     let airborne = !bed_near && sample_sdf(xp) > contact_offset() * 2.0;
-    if airborne {
+    if temp_sparse_ballistic_enabled() && airborne {
         let dense_mass = nominal_mass() * 4.0;
         let density_ratio = clamp(local_grid_mass / max(dense_mass, 1e-6), 0.0, 1.0);
         let ballistic_v = vec3<f32>(p.vel.x, p.vel.y + gravity() * dt(), p.vel.z);
@@ -531,28 +796,12 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>) {
         new_C2 *= affine_damp;
     }
 
-    // Extra dissipation and volume recovery in the carafe help the under-
-    // resolved pool settle into a rising body of water instead of collapsing
-    // into a thin, self-overlapping particle column.
-    let in_carafe = xp.y < -3.6 && sample_sdf(xp) > 0.0;
-    if in_carafe {
-        let depth = clamp((-3.6 - xp.y) / 4.4, 0.0, 1.0);
-        let lateral = clamp(1.0 - (6.0 + depth * 5.0) * dt(), 0.78, 1.0);
-        let vertical = clamp(1.0 - (9.0 + depth * 8.0) * dt(), 0.68, 1.0);
-        new_v = vec3<f32>(new_v.x * lateral, new_v.y * vertical, new_v.z * lateral);
-        new_C0 *= 1.0 - clamp(viscosity() * dt() * (1.6 + depth), 0.0, 0.38);
-        new_C1 *= 1.0 - clamp(viscosity() * dt() * (1.9 + depth), 0.0, 0.42);
-        new_C2 *= 1.0 - clamp(viscosity() * dt() * (1.6 + depth), 0.0, 0.38);
-    }
-
-    // Update J (fluid volume ratio)
-    let trace_C = new_C0.x + new_C1.y + new_C2.z;
-    var J_new = J_old * (1.0 + dt() * trace_C);
-    J_new = clamp(J_new, 0.1, 10.0);
-    if in_carafe {
-        let depth = clamp((-3.6 - xp.y) / 4.4, 0.0, 1.0);
-        let recover = clamp((0.14 + depth * 0.2) * bulk_K() * dt() / 900.0, 0.0, 0.32);
-        J_new = mix(J_new, 1.0, recover);
+    // Under pressure projection, J no longer drives the water stress path.
+    var J_new = 1.0;
+    if !projection_enabled() {
+        let trace_C = new_C0.x + new_C1.y + new_C2.z;
+        J_new = J_old * (1.0 + dt() * trace_C);
+        J_new = clamp(J_new, 0.1, 10.0);
     }
 
     // Advect
@@ -612,7 +861,7 @@ fn bed_coupling(@builtin(global_invocation_id) gid: vec3<u32>) {
     let drag = drag_coeff() * (1.0 - permeability * 0.1) * dt();
     let v = particles[pid].vel.xyz;
     particles[pid].vel = vec4<f32>(
-        v * (1.0 - clamp(drag, 0.0, 0.95)),
+        v / (1.0 + max(drag, 0.0)),
         particles[pid].vel.w,
     );
 
@@ -812,5 +1061,16 @@ fn prepare_render(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     render_data[pid] = vec4<f32>(p.pos.xyz, color_t);
 }
-
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::MPM_COMPUTE_SHADER;
+
+    #[test]
+    fn shader_parses_with_naga() {
+        let module = naga::front::wgsl::parse_str(MPM_COMPUTE_SHADER)
+            .expect("mpm compute shader should parse");
+        assert!(!module.entry_points.is_empty());
+    }
+}

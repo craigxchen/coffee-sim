@@ -1,15 +1,15 @@
 use coffee_sim_core::sph::Vec3;
 
-mod state;
+pub(crate) mod bed;
+pub(crate) mod inflow;
 mod pipelines;
 mod shader;
-pub(crate) mod inflow;
-pub(crate) mod bed;
+mod state;
 
-use state::{MpmBuffers, MpmUniforms, FP_SCALE, MAX_VELOCITY, NUM_THREADS, SDF_RES};
-use pipelines::MpmPipelines;
-use inflow::{InflowState, SpoutSettings, MASS_UNITS_PER_ML};
 use bed::{BedConfig, BedInit};
+use inflow::{EmissionResult, InflowState, SpoutSettings, MASS_UNITS_PER_ML};
+use pipelines::MpmPipelines;
+use state::{MpmBuffers, MpmUniforms, FP_SCALE, MAX_VELOCITY, NUM_THREADS, SDF_RES};
 
 const TARGET_BED_RETENTION_ML: f32 = 42.0;
 
@@ -44,6 +44,8 @@ pub(crate) struct MpmSettings {
     pub spout: SpoutSettings,
     pub initial_kettle_angle_deg: f32,
     pub bed: Option<BedConfig>,
+    pub enable_pressure_projection: bool,
+    pub enable_temp_sparse_ballistic: bool,
 }
 
 impl MpmSettings {
@@ -83,7 +85,26 @@ impl MpmSettings {
             spout: SpoutSettings::default(),
             initial_kettle_angle_deg: 36.0,
             bed: Some(BedConfig::default()),
+            enable_pressure_projection: true,
+            enable_temp_sparse_ballistic: true,
         }
+    }
+
+    pub fn benchmark_free_stream() -> Self {
+        let mut settings = Self::default_v60();
+        settings.bed = None;
+        settings.spout.origin = Vec3::new(0.0, 6.8, 0.0);
+        settings.spout.aim_at(Vec3::new(0.0, -6.8, 0.0));
+        settings.initial_kettle_angle_deg = 28.0;
+        settings
+    }
+
+    pub fn benchmark_center_pour() -> Self {
+        let mut settings = Self::default_v60();
+        settings.spout.origin = Vec3::new(0.0, 7.1, 0.0);
+        settings.spout.aim_at(Vec3::new(0.0, 0.4, 0.0));
+        settings.initial_kettle_angle_deg = 36.0;
+        settings
     }
 }
 
@@ -95,14 +116,14 @@ pub(crate) struct MpmSim3D {
     num_water: u32,
     num_bed: u32,
     total_time: f32,
+    frame_emitted_mass: f32,
+    frame_dropped_particles: u32,
+    total_emitted_mass: f32,
+    total_dropped_particles: u32,
 }
 
 impl MpmSim3D {
-    pub fn new(
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        settings: MpmSettings,
-    ) -> Self {
+    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, settings: MpmSettings) -> Self {
         let buffers = MpmBuffers::new(device, queue, &settings);
         let pipelines = MpmPipelines::new(device, &buffers);
         let inflow = InflowState::new(settings.initial_kettle_angle_deg);
@@ -115,6 +136,10 @@ impl MpmSim3D {
             num_water: 0,
             num_bed: 0,
             total_time: 0.0,
+            frame_emitted_mass: 0.0,
+            frame_dropped_particles: 0,
+            total_emitted_mass: 0.0,
+            total_dropped_particles: 0,
         };
 
         sim.init_bed(queue);
@@ -144,25 +169,34 @@ impl MpmSim3D {
         // particles appended after them.
         queue.write_buffer(&self.buffers.particles, 0, bytemuck::cast_slice(&particles));
         queue.write_buffer(&self.buffers.affine, 0, bytemuck::cast_slice(&affines));
-        queue.write_buffer(&self.buffers.bed_extract, 0, bytemuck::cast_slice(&bed_extracts));
-        queue.write_buffer(&self.buffers.bed_lookup, 0, bytemuck::cast_slice(&cell_lookup));
+        queue.write_buffer(
+            &self.buffers.bed_extract,
+            0,
+            bytemuck::cast_slice(&bed_extracts),
+        );
+        queue.write_buffer(
+            &self.buffers.bed_lookup,
+            0,
+            bytemuck::cast_slice(&cell_lookup),
+        );
         let zero_delta = vec![0_i32; self.settings.max_particles as usize];
-        queue.write_buffer(&self.buffers.bed_delta, 0, bytemuck::cast_slice(&zero_delta));
+        queue.write_buffer(
+            &self.buffers.bed_delta,
+            0,
+            bytemuck::cast_slice(&zero_delta),
+        );
     }
 
-    pub fn step_frame(
-        &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        dt: f32,
-    ) {
+    pub fn step_frame(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, dt: f32) {
         let dt = dt.min(1.0 / 30.0);
         let substeps = self.settings.substeps.max(1);
         let sub_dt = dt / substeps as f32;
+        self.frame_emitted_mass = 0.0;
+        self.frame_dropped_particles = 0;
 
         for _ in 0..substeps {
             // Emit new particles
-            let emitted = self.inflow.emit_particles(
+            let EmissionResult { emitted, dropped } = self.inflow.emit_particles(
                 queue,
                 &self.buffers,
                 &self.settings.spout,
@@ -172,6 +206,12 @@ impl MpmSim3D {
                 self.num_bed,
                 self.settings.max_particles,
             );
+            self.frame_emitted_mass +=
+                emitted as f32 * (MASS_UNITS_PER_ML / inflow::PARTICLES_PER_ML);
+            self.frame_dropped_particles += dropped;
+            self.total_emitted_mass +=
+                emitted as f32 * (MASS_UNITS_PER_ML / inflow::PARTICLES_PER_ML);
+            self.total_dropped_particles += dropped;
             self.num_water += emitted;
 
             // Update uniforms
@@ -226,6 +266,23 @@ impl MpmSim3D {
                 pass.set_pipeline(&self.pipelines.boundary_project);
                 pass.dispatch_workgroups(cell_wg, 1, 1);
 
+                if self.settings.enable_pressure_projection {
+                    pass.set_pipeline(&self.pipelines.classify_cells);
+                    pass.dispatch_workgroups(cell_wg, 1, 1);
+
+                    for _ in 0..8 {
+                        pass.set_pipeline(&self.pipelines.pressure_rbgs_red);
+                        pass.dispatch_workgroups(cell_wg, 1, 1);
+                        pass.set_pipeline(&self.pipelines.pressure_rbgs_black);
+                        pass.dispatch_workgroups(cell_wg, 1, 1);
+                    }
+
+                    pass.set_pipeline(&self.pipelines.project_pressure);
+                    pass.dispatch_workgroups(cell_wg, 1, 1);
+                    pass.set_pipeline(&self.pipelines.boundary_project);
+                    pass.dispatch_workgroups(cell_wg, 1, 1);
+                }
+
                 // 7. g2p
                 if particle_wg > 0 {
                     pass.set_pipeline(&self.pipelines.g2p);
@@ -254,6 +311,10 @@ impl MpmSim3D {
         self.num_water = 0;
         self.num_bed = 0;
         self.total_time = 0.0;
+        self.frame_emitted_mass = 0.0;
+        self.frame_dropped_particles = 0;
+        self.total_emitted_mass = 0.0;
+        self.total_dropped_particles = 0;
         self.inflow = InflowState::new(self.settings.initial_kettle_angle_deg);
         self.init_bed(queue);
     }
@@ -290,12 +351,60 @@ impl MpmSim3D {
         (self.num_water + self.num_bed) as usize
     }
 
+    pub fn water_slots_used(&self) -> u32 {
+        self.num_water
+    }
+
+    pub fn bed_particle_count(&self) -> u32 {
+        self.num_bed
+    }
+
+    pub fn max_particles(&self) -> u32 {
+        self.settings.max_particles
+    }
+
+    pub fn total_time(&self) -> f32 {
+        self.total_time
+    }
+
+    pub fn set_temp_sparse_ballistic_enabled(&mut self, enabled: bool) {
+        self.settings.enable_temp_sparse_ballistic = enabled;
+    }
+
+    pub fn set_pressure_projection_enabled(&mut self, enabled: bool) {
+        self.settings.enable_pressure_projection = enabled;
+    }
+
+    pub fn pressure_projection_enabled(&self) -> bool {
+        self.settings.enable_pressure_projection
+    }
+
+    pub fn temp_sparse_ballistic_enabled(&self) -> bool {
+        self.settings.enable_temp_sparse_ballistic
+    }
+
     pub fn render_buffer(&self) -> &wgpu::Buffer {
         &self.buffers.render_data
     }
 
     pub fn settings(&self) -> &MpmSettings {
         &self.settings
+    }
+
+    pub fn frame_emitted_mass(&self) -> f32 {
+        self.frame_emitted_mass
+    }
+
+    pub fn frame_dropped_particles(&self) -> u32 {
+        self.frame_dropped_particles
+    }
+
+    pub fn total_emitted_mass(&self) -> f32 {
+        self.total_emitted_mass
+    }
+
+    pub fn total_dropped_particles(&self) -> u32 {
+        self.total_dropped_particles
     }
 
     fn write_uniforms(&self, queue: &wgpu::Queue, dt: f32) {
@@ -346,9 +455,27 @@ impl MpmSim3D {
             sdf_params: [SDF_RES as f32, 0.3, 0.0, 0.05],
             // Tie bed retention to an overall retained-water target so the bed
             // wets realistically without swallowing most of the brew.
-            bed_params: [34.0, 8.0, bed_capacity_per_particle, 0.0],
+            bed_params: [
+                34.0,
+                8.0,
+                bed_capacity_per_particle,
+                if self.settings.enable_pressure_projection {
+                    1.0
+                } else {
+                    0.0
+                },
+            ],
             extraction_params: [0.01, 11.0, 8.5, 15.0],
-            time_params: [self.total_time, dt, 0.0, 0.0],
+            time_params: [
+                self.total_time,
+                dt,
+                if self.settings.enable_temp_sparse_ballistic {
+                    1.0
+                } else {
+                    0.0
+                },
+                0.0,
+            ],
         };
 
         queue.write_buffer(

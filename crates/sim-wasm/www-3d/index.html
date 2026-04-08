@@ -20,6 +20,16 @@
           <button id="reset">Reset</button>
         </div>
         <div class="control-panel">
+          <div class="slider-field">
+            <span>Benchmark Scenes</span>
+          </div>
+          <div class="controls">
+            <button id="scene-default">Default</button>
+            <button id="scene-free-stream">Free Stream</button>
+            <button id="scene-center-pour">Center Pour</button>
+          </div>
+        </div>
+        <div class="control-panel">
           <label class="slider-field" for="kettle-angle">
             <span>Kettle Angle</span>
             <output id="kettle-angle-value">0°</output>
@@ -63,30 +73,64 @@
         </dl>
         <dl class="stats">
           <div>
-            <dt>Pooled Depth</dt>
-            <dd id="pooled-depth">0.00</dd>
+            <dt>Scene</dt>
+            <dd id="scene-mode">Default</dd>
           </div>
           <div>
-            <dt>Outflow</dt>
-            <dd id="outflow-rate">0.00</dd>
+            <dt>Step Mode</dt>
+            <dd id="step-mode">Real Time</dd>
           </div>
           <div>
-            <dt>Surface Water</dt>
-            <dd id="surface-water">0</dd>
+            <dt>Sim Time</dt>
+            <dd id="sim-time">0.0s</dd>
           </div>
           <div>
-            <dt>Avg s_h</dt>
-            <dd id="avg-sh">0.00</dd>
+            <dt>Frame Emit</dt>
+            <dd id="frame-emitted-mass">0.00</dd>
           </div>
           <div>
-            <dt>Avg k_eff</dt>
-            <dd id="avg-keff">0.00</dd>
+            <dt>Total Emit</dt>
+            <dd id="total-emitted-mass">0.00</dd>
           </div>
           <div>
-            <dt>Avg sigma_c</dt>
-            <dd id="avg-sigma">0.00</dd>
+            <dt>Frame Dropped</dt>
+            <dd id="frame-dropped-emission">0</dd>
+          </div>
+          <div>
+            <dt>Total Dropped</dt>
+            <dd id="total-dropped-emission">0</dd>
+          </div>
+          <div>
+            <dt>Water Slots</dt>
+            <dd id="water-slots">0</dd>
+          </div>
+          <div>
+            <dt>Bed Particles</dt>
+            <dd id="bed-particles">0</dd>
+          </div>
+          <div>
+            <dt>Capacity Used</dt>
+            <dd id="capacity-used">0.0%</dd>
+          </div>
+          <div>
+            <dt>Bed Enabled</dt>
+            <dd id="bed-enabled">Yes</dd>
           </div>
         </dl>
+        <div class="control-panel">
+          <label class="slider-field">
+            <span>Temporary Heuristics</span>
+          </label>
+          <label class="slider-field" for="toggle-pressure-projection">
+            <span>Pressure Projection</span>
+            <input id="toggle-pressure-projection" type="checkbox" checked />
+          </label>
+          <label class="slider-field" for="toggle-sparse-ballistic">
+            <span>Sparse Ballistic Preserve</span>
+            <input id="toggle-sparse-ballistic" type="checkbox" checked />
+          </label>
+        </div>
+        <div class="control-panel">
       </section>
       <section class="viewer">
         <canvas id="sim-canvas"></canvas>

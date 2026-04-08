@@ -3,6 +3,9 @@ import init, { WasmSim3D } from "./pkg/coffee_sim_wasm.js";
 const canvas = document.getElementById("sim-canvas");
 const toggleButton = document.getElementById("toggle");
 const resetButton = document.getElementById("reset");
+const sceneDefaultButton = document.getElementById("scene-default");
+const sceneFreeStreamButton = document.getElementById("scene-free-stream");
+const sceneCenterPourButton = document.getElementById("scene-center-pour");
 const kettleAngleInput = document.getElementById("kettle-angle");
 const kettleAngleValue = document.getElementById("kettle-angle-value");
 const spoutXInput = document.getElementById("spout-x");
@@ -15,12 +18,19 @@ const particleLabel = document.getElementById("particles");
 const fpsLabel = document.getElementById("fps");
 const flowRateLabel = document.getElementById("flow-rate");
 const jetSpeedLabel = document.getElementById("jet-speed");
-const pooledDepthLabel = document.getElementById("pooled-depth");
-const outflowRateLabel = document.getElementById("outflow-rate");
-const surfaceWaterLabel = document.getElementById("surface-water");
-const avgShLabel = document.getElementById("avg-sh");
-const avgKeffLabel = document.getElementById("avg-keff");
-const avgSigmaLabel = document.getElementById("avg-sigma");
+const sceneModeLabel = document.getElementById("scene-mode");
+const stepModeLabel = document.getElementById("step-mode");
+const simTimeLabel = document.getElementById("sim-time");
+const frameEmittedMassLabel = document.getElementById("frame-emitted-mass");
+const totalEmittedMassLabel = document.getElementById("total-emitted-mass");
+const frameDroppedEmissionLabel = document.getElementById("frame-dropped-emission");
+const totalDroppedEmissionLabel = document.getElementById("total-dropped-emission");
+const waterSlotsLabel = document.getElementById("water-slots");
+const bedParticlesLabel = document.getElementById("bed-particles");
+const capacityUsedLabel = document.getElementById("capacity-used");
+const bedEnabledLabel = document.getElementById("bed-enabled");
+const pressureProjectionToggle = document.getElementById("toggle-pressure-projection");
+const sparseBallisticToggle = document.getElementById("toggle-sparse-ballistic");
 
 let app;
 let paused = false;
@@ -30,6 +40,8 @@ let dragging = false;
 let lastClientX = 0;
 let lastClientY = 0;
 let latestFrameSeconds = 1 / 60;
+let fixedStepSeconds = null;
+let currentSceneMode = "Default";
 
 await init();
 app = await WasmSim3D.create(canvas);
@@ -55,6 +67,42 @@ resetButton.addEventListener("click", () => {
   syncUi();
 });
 
+sceneDefaultButton.addEventListener("click", () => {
+  app.loadDefaultScene();
+  syncControlDefaultsFromSim();
+  applyHeuristicControls();
+  fixedStepSeconds = null;
+  currentSceneMode = "Default";
+  paused = false;
+  toggleButton.textContent = "Pause";
+  lastFrameTime = 0;
+  syncUi();
+});
+
+sceneFreeStreamButton.addEventListener("click", () => {
+  app.loadBenchmarkFreeStream();
+  syncControlDefaultsFromSim();
+  applyHeuristicControls();
+  fixedStepSeconds = 1 / 60;
+  currentSceneMode = "Free Stream";
+  paused = false;
+  toggleButton.textContent = "Pause";
+  lastFrameTime = 0;
+  syncUi();
+});
+
+sceneCenterPourButton.addEventListener("click", () => {
+  app.loadBenchmarkCenterPour();
+  syncControlDefaultsFromSim();
+  applyHeuristicControls();
+  fixedStepSeconds = 1 / 60;
+  currentSceneMode = "Center Pour";
+  paused = false;
+  toggleButton.textContent = "Pause";
+  lastFrameTime = 0;
+  syncUi();
+});
+
 kettleAngleInput.addEventListener("input", () => {
   app.setKettleAngle(Number(kettleAngleInput.value));
   syncUi();
@@ -72,6 +120,16 @@ spoutYInput.addEventListener("input", () => {
 
 spoutZInput.addEventListener("input", () => {
   applySpoutControls();
+  syncUi();
+});
+
+pressureProjectionToggle.addEventListener("change", () => {
+  app.setPressureProjectionEnabled(pressureProjectionToggle.checked);
+  syncUi();
+});
+
+sparseBallisticToggle.addEventListener("change", () => {
+  app.setTempSparseBallisticEnabled(sparseBallisticToggle.checked);
   syncUi();
 });
 
@@ -116,7 +174,8 @@ function resizeCanvas() {
 function animate(timestamp) {
   if (!lastFrameTime) lastFrameTime = timestamp;
 
-  const frameTime = Math.min((timestamp - lastFrameTime) / 1000, 0.05);
+  const wallFrameTime = Math.min((timestamp - lastFrameTime) / 1000, 0.05);
+  const frameTime = fixedStepSeconds ?? wallFrameTime;
   latestFrameSeconds = frameTime;
   lastFrameTime = timestamp;
 
@@ -142,6 +201,8 @@ function syncControlDefaultsFromSim() {
   spoutXInput.value = app.spoutX().toFixed(1);
   spoutYInput.value = app.spoutY().toFixed(1);
   spoutZInput.value = app.spoutZ().toFixed(1);
+  pressureProjectionToggle.checked = app.pressureProjectionEnabled();
+  sparseBallisticToggle.checked = app.tempSparseBallisticEnabled();
 }
 
 function applySpoutControls() {
@@ -152,6 +213,11 @@ function applySpoutControls() {
   );
 }
 
+function applyHeuristicControls() {
+  app.setPressureProjectionEnabled(pressureProjectionToggle.checked);
+  app.setTempSparseBallisticEnabled(sparseBallisticToggle.checked);
+}
+
 function syncUi() {
   particleLabel.textContent = new Intl.NumberFormat().format(app.particleCount());
   kettleAngleValue.textContent = `${Math.round(app.kettleAngle())}\u00b0`;
@@ -160,11 +226,19 @@ function syncUi() {
   spoutZValue.textContent = app.spoutZ().toFixed(1);
   flowRateLabel.textContent = `${app.flowRate().toFixed(1)} mL/s`;
   jetSpeedLabel.textContent = `${app.exitSpeed().toFixed(1)} u/s`;
-  pooledDepthLabel.textContent = app.debugMetric(6).toFixed(2);
-  const outflowRate = latestFrameSeconds > 0 ? app.debugMetric(4) / latestFrameSeconds : 0;
-  outflowRateLabel.textContent = `${outflowRate.toFixed(2)}`;
-  surfaceWaterLabel.textContent = Math.round(app.debugMetric(5)).toString();
-  avgShLabel.textContent = app.debugMetric(8).toFixed(2);
-  avgKeffLabel.textContent = app.debugMetric(11).toFixed(2);
-  avgSigmaLabel.textContent = app.debugMetric(12).toFixed(2);
+  sceneModeLabel.textContent = currentSceneMode;
+  stepModeLabel.textContent = fixedStepSeconds ? "Fixed 60 Hz" : "Real Time";
+  simTimeLabel.textContent = `${app.simTime().toFixed(1)}s`;
+  frameEmittedMassLabel.textContent = app.frameEmittedMass().toFixed(2);
+  totalEmittedMassLabel.textContent = app.totalEmittedMass().toFixed(2);
+  frameDroppedEmissionLabel.textContent = new Intl.NumberFormat().format(app.frameDroppedParticles());
+  totalDroppedEmissionLabel.textContent = new Intl.NumberFormat().format(app.totalDroppedParticles());
+  waterSlotsLabel.textContent = new Intl.NumberFormat().format(app.waterSlotsUsed());
+  bedParticlesLabel.textContent = new Intl.NumberFormat().format(app.bedParticleCount());
+  const maxParticles = app.maxParticles();
+  const usedParticles = app.particleCount();
+  capacityUsedLabel.textContent = maxParticles > 0
+    ? `${((usedParticles / maxParticles) * 100).toFixed(1)}%`
+    : "0.0%";
+  bedEnabledLabel.textContent = app.hasBed() ? "Yes" : "No";
 }
