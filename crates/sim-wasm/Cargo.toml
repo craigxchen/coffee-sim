@@ -18,4 +18,3 @@ js-sys = "0.3"
 
 [dev-dependencies]
 naga = { version = "29.0.1", features = ["wgsl-in"] }
-pollster = "0.4"

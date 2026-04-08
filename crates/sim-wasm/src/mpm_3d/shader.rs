@@ -52,7 +52,6 @@ struct ContactResult {
 @group(0) @binding(7) var<storage, read_write> bed_extract: array<BedExtract>;
 @group(0) @binding(8) var<storage, read> bed_lookup: array<i32>;
 @group(0) @binding(9) var<storage, read_write> bed_delta: array<atomic<i32>>;
-@group(0) @binding(10) var<storage, read> bed_support_count: array<u32>;
 
 // ── Helpers ──
 
@@ -101,7 +100,6 @@ fn scratch_div_idx(cell: u32) -> u32 { return grid_mom_x_idx(cell); }
 fn scratch_residual_idx(cell: u32) -> u32 { return grid_mom_y_idx(cell); }
 fn scratch_kind_idx(cell: u32) -> u32 { return grid_mom_z_idx(cell); }
 fn occupancy_mass_threshold() -> f32 { return nominal_mass(); }
-fn reference_cell_water_mass() -> f32 { return nominal_mass() * 4.0; }
 
 const CELL_AIR: i32 = 0;
 const CELL_SURFACE_FLUID: i32 = 1;
@@ -132,24 +130,6 @@ fn divergence_store(cell: u32, value: f32) {
 
 fn is_fluid_kind(kind: i32) -> bool {
     return kind == CELL_INTERIOR_FLUID || kind == CELL_BED_COUPLED;
-}
-
-fn predicted_bed_sink_mass(cell: u32, cell_mass: f32) -> f32 {
-    let bed_idx = bed_lookup[cell];
-    if bed_idx < 0 || u32(bed_idx) >= num_bed() {
-        return 0.0;
-    }
-
-    let be = bed_extract[u32(bed_idx)];
-    let saturation = be.extract.w;
-    let remaining_capacity = max(max_saturation() - be.bed.x, 0.0);
-    if remaining_capacity <= 1e-6 {
-        return 0.0;
-    }
-
-    let abs_rate = absorption_rate() * (1.0 - saturation) * dt();
-    let predicted = cell_mass * clamp(abs_rate, 0.0, 0.25);
-    return min(predicted, remaining_capacity);
 }
 
 fn world_to_cell(position: vec3<f32>) -> vec3<i32> {
@@ -511,12 +491,7 @@ fn classify_cells(@builtin(global_invocation_id) gid: vec3<u32>) {
         vzp = grid_vel[cell_index(ix_val, iy_val, iz_val + 1u)].z;
     }
 
-    var div = 0.5 * inv_dx() * ((vxp - vxm) + (vyp - vym) + (vzp - vzm));
-    if kind == CELL_BED_COUPLED {
-        let sink_mass = predicted_bed_sink_mass(idx, mass);
-        let sink_div = sink_mass / max(reference_cell_water_mass() * max(dt(), 1e-6), 1e-6);
-        div -= sink_div;
-    }
+    let div = 0.5 * inv_dx() * ((vxp - vxm) + (vyp - vym) + (vzp - vzm));
     divergence_store(idx, div);
 }
 

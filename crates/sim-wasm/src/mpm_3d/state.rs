@@ -42,7 +42,6 @@ pub(crate) struct MpmBuffers {
     pub grid: wgpu::Buffer,
     pub grid_vel: wgpu::Buffer,
     pub bed_lookup: wgpu::Buffer,
-    pub bed_support_count: wgpu::Buffer,
     pub bed_delta: wgpu::Buffer,
     pub _sdf_texture: wgpu::Texture,
     pub sdf_view: wgpu::TextureView,
@@ -60,9 +59,7 @@ impl MpmBuffers {
         let particles = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("mpm particles"),
             size: (max_p * 32) as u64, // 2 x vec4
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
 
@@ -94,13 +91,6 @@ impl MpmBuffers {
             mapped_at_creation: false,
         });
 
-        let bed_support_count = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("mpm bed support count"),
-            size: (max_p * size_of::<u32>()) as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
         let bed_delta = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("mpm bed delta"),
             size: (max_p * size_of::<i32>()) as u64,
@@ -121,9 +111,7 @@ impl MpmBuffers {
         let bed_extract = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("mpm bed_extract"),
             size: (max_p * 32) as u64, // 2 x vec4
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
 
@@ -143,7 +131,6 @@ impl MpmBuffers {
             grid,
             grid_vel,
             bed_lookup,
-            bed_support_count,
             bed_delta,
             _sdf_texture: sdf_texture,
             sdf_view,
