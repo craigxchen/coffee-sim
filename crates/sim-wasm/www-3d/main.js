@@ -39,7 +39,6 @@ let fpsWindow = [];
 let dragging = false;
 let lastClientX = 0;
 let lastClientY = 0;
-let latestFrameSeconds = 1 / 60;
 let fixedStepSeconds = null;
 let currentSceneMode = "Default";
 
@@ -176,7 +175,6 @@ function animate(timestamp) {
 
   const wallFrameTime = Math.min((timestamp - lastFrameTime) / 1000, 0.05);
   const frameTime = fixedStepSeconds ?? wallFrameTime;
-  latestFrameSeconds = frameTime;
   lastFrameTime = timestamp;
 
   if (!paused) {
