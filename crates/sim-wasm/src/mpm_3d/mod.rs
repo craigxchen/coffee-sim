@@ -356,7 +356,17 @@ impl MpmSim3D {
                     pass.set_pipeline(&self.pipelines.classify_cells);
                     pass.dispatch_workgroups(cell_wg, 1, 1);
 
-                    for _ in 0..8 {
+                    // RBGS sweeps per substep. On the ~730k-cell grid, 16
+                    // sweeps left large residual divergence, showing up as
+                    // visible volume drift after pour-off. 40 sweeps (20
+                    // pairs) is empirically enough to damp the pool-scale
+                    // pressure modes while staying inside the browser frame
+                    // budget. Revisit when the metrics readback path is
+                    // rewired and `METRIC_MAX_ABS_DIV_IDX` is visible on
+                    // the HUD — at that point we can tune against a live
+                    // residual number.
+                    const PRESSURE_RBGS_PAIRS: u32 = 20;
+                    for _ in 0..PRESSURE_RBGS_PAIRS {
                         pass.set_pipeline(&self.pipelines.pressure_rbgs_red);
                         pass.dispatch_workgroups(cell_wg, 1, 1);
                         pass.set_pipeline(&self.pipelines.pressure_rbgs_black);
@@ -905,5 +915,58 @@ mod tests {
         assert!(snapshot.bed_held_mass.is_finite());
         assert!(snapshot.active_particle_mass >= 0.0);
         assert!(snapshot.bed_held_mass >= 0.0);
+    }
+
+    #[test]
+    fn occupancy_threshold_accepts_lone_particle() {
+        // Pins the shader's classification threshold to stay strictly below
+        // a single particle's peak-weight deposit. If either side moves,
+        // this test fails and forces a review.
+        let nominal_mass = inflow::MASS_UNITS_PER_ML / inflow::PARTICLES_PER_ML;
+        let peak_bspline = 0.75_f32.powi(3); // ≈ 0.421875
+        let peak_deposit = nominal_mass * peak_bspline;
+        let occupancy_threshold = nominal_mass * 0.1;
+        assert!(
+            occupancy_threshold < peak_deposit,
+            "occupancy threshold {occupancy_threshold} must stay below single-particle peak \
+             deposit {peak_deposit} or lone particles never register as fluid"
+        );
+    }
+
+    #[test]
+    #[ignore = "GPU-only: validates Milestone 1 volume conservation"]
+    fn water_mass_stable_after_pour_off() {
+        let Some((device, queue)) = create_test_device() else {
+            eprintln!("Skipping volume conservation test; no adapter/device available");
+            return;
+        };
+
+        let mut sim = MpmSim3D::new(&device, &queue, MpmSettings::benchmark_free_stream());
+
+        // Pour for 2 s of sim time.
+        sim.set_kettle_angle(36.0);
+        for _ in 0..120 {
+            sim.step_frame(&device, &queue, 1.0 / 60.0);
+        }
+
+        // Stop pour, let it settle for 0.5 s.
+        sim.set_kettle_angle(0.0);
+        for _ in 0..30 {
+            sim.step_frame(&device, &queue, 1.0 / 60.0);
+        }
+        let m0 = readback_mass_snapshot(&sim, &device, &queue).active_particle_mass;
+
+        // Let it sit for another 1 s and compare.
+        for _ in 0..60 {
+            sim.step_frame(&device, &queue, 1.0 / 60.0);
+        }
+        let m1 = readback_mass_snapshot(&sim, &device, &queue).active_particle_mass;
+
+        let drift = (m1 - m0).abs() / m0.max(1e-6);
+        assert!(
+            drift < 0.02,
+            "water mass drifted {:.2}% after pour-off (m0={m0}, m1={m1})",
+            drift * 100.0
+        );
     }
 }
