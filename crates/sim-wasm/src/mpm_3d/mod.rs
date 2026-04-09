@@ -7,6 +7,8 @@ pub(crate) mod bed;
 pub(crate) mod inflow;
 mod filter;
 mod filter_mesh;
+#[cfg(test)]
+mod physics_tests;
 mod pipelines;
 mod shader;
 mod state;
@@ -639,108 +641,6 @@ fn dispatch_size(count: u32, threads: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::mpsc;
-
-    use bytemuck::cast_slice;
-
-    #[derive(Debug)]
-    struct MassSnapshot {
-        active_particle_mass: f32,
-        bed_held_mass: f32,
-    }
-
-    fn request_adapter() -> Option<wgpu::Adapter> {
-        let instance = wgpu::Instance::default();
-        pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).ok()
-    }
-
-    fn create_device_with_limits(
-        adapter: &wgpu::Adapter,
-        limits: wgpu::Limits,
-        label: &'static str,
-    ) -> Option<(wgpu::Device, wgpu::Queue)> {
-        pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: Some(label),
-            required_features: wgpu::Features::empty(),
-            required_limits: limits,
-            memory_hints: wgpu::MemoryHints::Performance,
-            trace: wgpu::Trace::default(),
-            experimental_features: wgpu::ExperimentalFeatures::disabled(),
-        }))
-        .ok()
-    }
-
-    fn create_test_device() -> Option<(wgpu::Device, wgpu::Queue)> {
-        let adapter = request_adapter()?;
-        create_device_with_limits(&adapter, required_limits(), "coffee-sim test device")
-    }
-
-    fn readback_mass_snapshot(
-        sim: &MpmSim3D,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-    ) -> MassSnapshot {
-        let particle_count = (sim.num_water + sim.num_bed) as usize;
-        let particle_size = (particle_count * 32).max(4) as u64;
-        let bed_size = (sim.num_bed as usize * 32).max(4) as u64;
-
-        let particle_staging = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("particle mass staging"),
-            size: particle_size,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-        let bed_staging = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("bed mass staging"),
-            size: bed_size,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("mass readback"),
-        });
-        encoder.copy_buffer_to_buffer(&sim.buffers.particles, 0, &particle_staging, 0, particle_size);
-        encoder.copy_buffer_to_buffer(&sim.buffers.bed_extract, 0, &bed_staging, 0, bed_size);
-        queue.submit(Some(encoder.finish()));
-
-        let particle_slice = particle_staging.slice(..);
-        let bed_slice = bed_staging.slice(..);
-        let (tx, rx) = mpsc::channel();
-        let tx_particles = tx.clone();
-        particle_slice.map_async(wgpu::MapMode::Read, move |result| {
-            tx_particles.send(result).expect("particle map callback");
-        });
-        bed_slice.map_async(wgpu::MapMode::Read, move |result| {
-            tx.send(result).expect("bed map callback");
-        });
-        let _ = device.poll(wgpu::PollType::wait_indefinitely());
-        rx.recv().expect("particle map recv").expect("particle map");
-        rx.recv().expect("bed map recv").expect("bed map");
-
-        let particle_view = particle_slice.get_mapped_range();
-        let particle_f32 = cast_slice::<u8, f32>(&particle_view);
-        let mut active_particle_mass = 0.0;
-        for i in 0..particle_count {
-            active_particle_mass += particle_f32[i * 8 + 7];
-        }
-        drop(particle_view);
-        particle_staging.unmap();
-
-        let bed_view = bed_slice.get_mapped_range();
-        let bed_f32 = cast_slice::<u8, f32>(&bed_view);
-        let mut bed_held_mass = 0.0;
-        for i in 0..sim.num_bed as usize {
-            bed_held_mass += bed_f32[i * 8];
-        }
-        drop(bed_view);
-        bed_staging.unmap();
-
-        MassSnapshot {
-            active_particle_mass,
-            bed_held_mass,
-        }
-    }
 
     #[test]
     fn dispatch_size_zero_count_returns_zero() {
@@ -758,9 +658,6 @@ mod tests {
 
     #[test]
     fn default_v60_shader_constants_in_sync() {
-        // The shader's resolve_scene_obstacles hardcodes the V60 cone and carafe
-        // dimensions. Keep the Rust-side defaults in lockstep so the sim and
-        // collision geometry stay aligned.
         let s = MpmSettings::default_v60();
         let cone = s
             .obstacles
@@ -799,184 +696,21 @@ mod tests {
         let s = MpmSettings::default_v60();
         let dx = s.bounds_size.x / s.grid_dims[0] as f32;
         let dz = s.bounds_size.z / s.grid_dims[2] as f32;
-        // dx and dz must agree because P2G/G2P assume uniform spacing
         assert!((dx - dz).abs() < 1e-5);
-        // gy is sized to cover the full vertical extent
         let height_covered = s.grid_dims[1] as f32 * dx;
         assert!(height_covered >= s.bounds_size.y - dx);
     }
 
     #[test]
-    fn mpm_pipelines_fit_within_required_limits() {
-        // Construct the full sim (buffers + bind group layout + pipelines)
-        // against the limits the app actually requests. If the bind group
-        // layout ever exceeds `required_limits()`, this test fails with the
-        // validation error instead of the sim silently failing at startup in
-        // the browser.
-        let Some(adapter) = request_adapter() else {
-            eprintln!("skipping: no GPU adapter available");
-            return;
-        };
-        let Some((device, queue)) =
-            create_device_with_limits(&adapter, required_limits(), "required-limits device")
-        else {
-            eprintln!("skipping: adapter does not support required limits");
-            return;
-        };
-
-        let error_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
-        let _sim = MpmSim3D::new(&device, &queue, MpmSettings::default_v60());
-        let error = pollster::block_on(error_scope.pop());
-        assert!(
-            error.is_none(),
-            "MpmSim3D::new produced a validation error under required_limits(): {error:?}",
-        );
-    }
-
-    #[test]
-    fn mpm_pipelines_exceed_spec_default_limits() {
-        // Canary for `required_limits()`: building the sim at the WebGPU spec
-        // default (`max_storage_buffers_per_shader_stage = 8`) must fail. If
-        // the bind group layout ever drops to 8 or fewer storage buffers, this
-        // test will flip and `required_limits()` becomes unnecessary — revisit
-        // both together. Run under an error scope so the validation error is
-        // captured instead of aborting the test process.
-        let Some(adapter) = request_adapter() else {
-            eprintln!("skipping: no GPU adapter available");
-            return;
-        };
-        let Some((device, queue)) =
-            create_device_with_limits(&adapter, wgpu::Limits::default(), "spec-default device")
-        else {
-            eprintln!("skipping: adapter does not support spec default limits");
-            return;
-        };
-
-        let error_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
-        let _sim = MpmSim3D::new(&device, &queue, MpmSettings::default_v60());
-        let error = pollster::block_on(error_scope.pop());
-        assert!(
-            error.is_some(),
-            "expected a validation error when constructing MpmSim3D at spec-default limits, but \
-             pipeline creation succeeded — `required_limits()` may no longer be necessary",
-        );
-    }
-
-    #[test]
-    #[ignore = "manual GPU validation harness for bed mass-balance work"]
-    fn manual_mass_readback_harness_runs() {
-        let Some((device, queue)) = create_test_device() else {
-            eprintln!("Skipping GPU readback harness; no adapter/device available");
-            return;
-        };
-
-        let settings = MpmSettings::benchmark_center_pour();
-        let mut sim = MpmSim3D::new(&device, &queue, settings);
-        for _ in 0..10 {
-            sim.step_frame(&device, &queue, 1.0 / 60.0);
-        }
-
-        let snapshot = readback_mass_snapshot(&sim, &device, &queue);
-        assert!(snapshot.active_particle_mass.is_finite());
-        assert!(snapshot.bed_held_mass.is_finite());
-        assert!(snapshot.active_particle_mass >= 0.0);
-        assert!(snapshot.bed_held_mass >= 0.0);
-    }
-
-    #[test]
     fn occupancy_threshold_accepts_lone_particle() {
-        // Pins the shader's classification threshold to stay strictly below
-        // a single particle's peak-weight deposit. If either side moves,
-        // this test fails and forces a review.
         let nominal_mass = inflow::MASS_UNITS_PER_ML / inflow::PARTICLES_PER_ML;
-        let peak_bspline = 0.75_f32.powi(3); // ≈ 0.421875
+        let peak_bspline = 0.75_f32.powi(3);
         let peak_deposit = nominal_mass * peak_bspline;
         let occupancy_threshold = nominal_mass * 0.1;
         assert!(
             occupancy_threshold < peak_deposit,
             "occupancy threshold {occupancy_threshold} must stay below single-particle peak \
              deposit {peak_deposit} or lone particles never register as fluid"
-        );
-    }
-
-    #[test]
-    #[ignore = "GPU-only: validates Milestone 1 volume conservation"]
-    fn water_mass_stable_after_pour_off() {
-        let Some((device, queue)) = create_test_device() else {
-            eprintln!("Skipping volume conservation test; no adapter/device available");
-            return;
-        };
-
-        let mut sim = MpmSim3D::new(&device, &queue, MpmSettings::benchmark_free_stream());
-
-        // Pour for 2 s of sim time.
-        sim.set_kettle_angle(36.0);
-        for _ in 0..120 {
-            sim.step_frame(&device, &queue, 1.0 / 60.0);
-        }
-
-        // Stop pour, let it settle for 0.5 s.
-        sim.set_kettle_angle(0.0);
-        for _ in 0..30 {
-            sim.step_frame(&device, &queue, 1.0 / 60.0);
-        }
-        let m0 = readback_mass_snapshot(&sim, &device, &queue).active_particle_mass;
-
-        // Let it sit for another 1 s and compare.
-        for _ in 0..60 {
-            sim.step_frame(&device, &queue, 1.0 / 60.0);
-        }
-        let m1 = readback_mass_snapshot(&sim, &device, &queue).active_particle_mass;
-
-        let drift = (m1 - m0).abs() / m0.max(1e-6);
-        assert!(
-            drift < 0.02,
-            "water mass drifted {:.2}% after pour-off (m0={m0}, m1={m1})",
-            drift * 100.0
-        );
-    }
-
-    #[test]
-    #[ignore = "GPU-only: regression test for divergence ghost-mirror at solid walls"]
-    fn water_pool_stable_against_cup_floor() {
-        // Targets the wall-adjacent divergence bug: previously the RHS
-        // stencil in classify_cells read solid neighbors as zero velocity,
-        // injecting a spurious sink at floor-adjacent fluid cells and
-        // pushing pooled water away from the cup. A long pour lets water
-        // actually pool against the cup SDF floor (spout is ~15 units above
-        // the floor so a short pour never develops a real pool), then the
-        // pour stops and we check that the resting pool doesn't drift.
-        let Some((device, queue)) = create_test_device() else {
-            eprintln!("Skipping wall-pool test; no adapter/device available");
-            return;
-        };
-
-        let mut sim = MpmSim3D::new(&device, &queue, MpmSettings::benchmark_free_stream());
-
-        // Pour for 5 s so water actually reaches and pools against the cup.
-        sim.set_kettle_angle(36.0);
-        for _ in 0..300 {
-            sim.step_frame(&device, &queue, 1.0 / 60.0);
-        }
-
-        // Stop pour, settle for 1 s before the first reading.
-        sim.set_kettle_angle(0.0);
-        for _ in 0..60 {
-            sim.step_frame(&device, &queue, 1.0 / 60.0);
-        }
-        let m0 = readback_mass_snapshot(&sim, &device, &queue).active_particle_mass;
-
-        // Let the pool rest for another 2 s and compare.
-        for _ in 0..120 {
-            sim.step_frame(&device, &queue, 1.0 / 60.0);
-        }
-        let m1 = readback_mass_snapshot(&sim, &device, &queue).active_particle_mass;
-
-        let drift = (m1 - m0).abs() / m0.max(1e-6);
-        assert!(
-            drift < 0.02,
-            "pooled water drifted {:.2}% after settle (m0={m0}, m1={m1})",
-            drift * 100.0
         );
     }
 }
