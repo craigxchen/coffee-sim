@@ -157,9 +157,9 @@ impl OrbitCamera {
         let focus_extent = bounds.x.max(bounds.z).max(bounds.y * 0.45);
         Self {
             yaw: -0.66,
-            pitch: 0.5,
-            radius: focus_extent * 0.62,
-            target: Vec3::new(0.0, -1.2, 0.0),
+            pitch: 0.42,
+            radius: focus_extent * 1.4,
+            target: Vec3::new(0.0, 0.0, 0.0),
         }
     }
 

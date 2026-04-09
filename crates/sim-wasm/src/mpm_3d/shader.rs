@@ -88,13 +88,11 @@ fn contact_offset() -> f32 { return u.sdf_params.w; }
 fn drag_coeff() -> f32 { return u.bed_params.x; }
 fn absorption_rate() -> f32 { return u.bed_params.y; }
 fn max_saturation() -> f32 { return u.bed_params.z; }
-fn projection_enabled() -> bool { return u.bed_params.w > 0.5; }
 fn extraction_rate() -> f32 { return u.extraction_params.x; }
 fn bed_spring() -> f32 { return u.extraction_params.y; }
 fn bed_damping() -> f32 { return u.extraction_params.z; }
 fn bed_impact() -> f32 { return u.extraction_params.w; }
 fn inactive_mass_threshold() -> f32 { return nominal_mass() * 0.10; }
-fn temp_sparse_ballistic_enabled() -> bool { return u.time_params.z > 0.5; }
 fn div_clamp_limit() -> f32 { return u.clamp_params.x; }
 fn pressure_clamp_limit() -> f32 { return u.clamp_params.y; }
 fn metrics_div_fp_scale() -> f32 { return u.clamp_params.z; }
@@ -370,18 +368,13 @@ fn p2g(@builtin(global_invocation_id) gid: vec3<u32>) {
     wz[1] = 0.75 - (fx.z - 1.0) * (fx.z - 1.0);
     wz[2] = 0.5 * (fx.z - 0.5) * (fx.z - 0.5);
 
-    var stress = 0.0;
-    if !projection_enabled() {
-        stress = -dt() * 4.0 * inv_dx() * inv_dx() * p_vol() * bulk_K() * (J - 1.0);
-    }
-
-    // Affine = stress*I + mass_p*C
+    // Affine = mass_p*C (J-stress disabled under pressure projection)
     let C0 = a.col0.xyz;
     let C1 = a.col1.xyz;
     let C2 = a.col2.xyz;
-    let aff_col0 = vec3<f32>(stress + mass_p * C0.x, mass_p * C0.y, mass_p * C0.z);
-    let aff_col1 = vec3<f32>(mass_p * C1.x, stress + mass_p * C1.y, mass_p * C1.z);
-    let aff_col2 = vec3<f32>(mass_p * C2.x, mass_p * C2.y, stress + mass_p * C2.z);
+    let aff_col0 = vec3<f32>(mass_p * C0.x, mass_p * C0.y, mass_p * C0.z);
+    let aff_col1 = vec3<f32>(mass_p * C1.x, mass_p * C1.y, mass_p * C1.z);
+    let aff_col2 = vec3<f32>(mass_p * C2.x, mass_p * C2.y, mass_p * C2.z);
 
     let fp = fp_scale();
     let cell_dx = dx();
@@ -919,7 +912,7 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>) {
         new_C2 *= inv_supported;
     }
     let in_cup_volume = xp.y < -3.5 && dot(xp.xz, xp.xz) < (3.0 + contact_offset()) * (3.0 + contact_offset());
-    if temp_sparse_ballistic_enabled() && support_ratio < 0.999 {
+    if support_ratio < 0.999 {
         let ballistic_v = vec3<f32>(p.vel.x, p.vel.y + gravity() * dt(), p.vel.z);
         let preserve = clamp((1.0 - support_ratio) * 1.15, 0.0, 0.95);
         new_v = mix(new_v, ballistic_v, preserve);
@@ -941,7 +934,7 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>) {
         bed_near = bed_lookup_load(home_idx) >= 0;
     }
     let airborne = !bed_near && sample_sdf(xp) > contact_offset() * 2.0;
-    if temp_sparse_ballistic_enabled() && airborne {
+    if airborne {
         let dense_mass = nominal_mass() * 4.0;
         let density_ratio = clamp(local_grid_mass / max(dense_mass, 1e-6), 0.0, 1.0);
         let ballistic_v = vec3<f32>(p.vel.x, p.vel.y + gravity() * dt(), p.vel.z);
@@ -953,13 +946,7 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>) {
         new_C2 *= affine_damp;
     }
 
-    // Under pressure projection, J no longer drives the water stress path.
-    var J_new = 1.0;
-    if !projection_enabled() {
-        let trace_C = new_C0.x + new_C1.y + new_C2.z;
-        J_new = J_old * (1.0 + dt() * trace_C);
-        J_new = clamp(J_new, 0.1, 10.0);
-    }
+    let J_new = 1.0;
 
     // Advect
     var new_pos = xp + new_v * dt();

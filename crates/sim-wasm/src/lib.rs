@@ -110,6 +110,7 @@ impl WasmSim3D {
         self.sim.exit_speed()
     }
 
+
     pub fn render(&mut self) -> Result<(), JsValue> {
         self.renderer.render_3d(&self.sim, self.camera)
     }
@@ -184,25 +185,6 @@ impl WasmSim3D {
         self.sim.settings().bed.is_some()
     }
 
-    #[wasm_bindgen(js_name = setTempSparseBallisticEnabled)]
-    pub fn set_temp_sparse_ballistic_enabled(&mut self, enabled: bool) {
-        self.sim.set_temp_sparse_ballistic_enabled(enabled);
-    }
-
-    #[wasm_bindgen(js_name = setPressureProjectionEnabled)]
-    pub fn set_pressure_projection_enabled(&mut self, enabled: bool) {
-        self.sim.set_pressure_projection_enabled(enabled);
-    }
-
-    #[wasm_bindgen(js_name = pressureProjectionEnabled)]
-    pub fn pressure_projection_enabled(&self) -> bool {
-        self.sim.pressure_projection_enabled()
-    }
-
-    #[wasm_bindgen(js_name = tempSparseBallisticEnabled)]
-    pub fn temp_sparse_ballistic_enabled(&self) -> bool {
-        self.sim.temp_sparse_ballistic_enabled()
-    }
 
     #[wasm_bindgen(js_name = refreshMetrics)]
     pub async fn refresh_metrics(&mut self) -> Result<(), JsValue> {
