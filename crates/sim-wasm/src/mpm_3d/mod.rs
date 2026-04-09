@@ -315,10 +315,9 @@ impl MpmSim3D {
                     pass.dispatch_workgroups(metrics_wg, 1, 1);
                 }
 
-                // 1c. bed_lookup_clear + scatter: rebuild the spatial index to
-                // match the current bed-particle positions so `classify_cells`
-                // / `bed_coupling` / `g2p` do not see a stale snapshot from
-                // when the bed was first seated.
+                // 1c. bed_lookup_clear + scatter: rebuild the spatial index
+                // so classify_cells / bed_coupling / g2p see current
+                // bed-particle positions.
                 pass.set_pipeline(&self.pipelines.bed_lookup_clear);
                 pass.dispatch_workgroups(cell_wg, 1, 1);
                 if bed_wg > 0 {
@@ -326,29 +325,17 @@ impl MpmSim3D {
                     pass.dispatch_workgroups(bed_wg, 1, 1);
                 }
 
-                // 2. bed_coupling
-                if particle_wg > 0 {
-                    pass.set_pipeline(&self.pipelines.bed_coupling);
-                    pass.dispatch_workgroups(particle_wg, 1, 1);
-                }
-
-                // 3. extraction_advect
-                if bed_wg > 0 {
-                    pass.set_pipeline(&self.pipelines.extraction_advect);
-                    pass.dispatch_workgroups(bed_wg, 1, 1);
-                }
-
-                // 4. p2g
+                // 2. p2g
                 if particle_wg > 0 {
                     pass.set_pipeline(&self.pipelines.p2g);
                     pass.dispatch_workgroups(particle_wg, 1, 1);
                 }
 
-                // 5. grid_update
+                // 3. grid_update
                 pass.set_pipeline(&self.pipelines.grid_update);
                 pass.dispatch_workgroups(cell_wg, 1, 1);
 
-                // 6. boundary_project
+                // 4. boundary_project
                 pass.set_pipeline(&self.pipelines.boundary_project);
                 pass.dispatch_workgroups(cell_wg, 1, 1);
 
@@ -379,10 +366,24 @@ impl MpmSim3D {
                     pass.dispatch_workgroups(cell_wg, 1, 1);
                 }
 
-                // 7. g2p
+                // 5. g2p
                 if particle_wg > 0 {
                     pass.set_pipeline(&self.pipelines.g2p);
                     pass.dispatch_workgroups(particle_wg, 1, 1);
+                }
+
+                // 6. bed_coupling (after g2p so absorption uses projected
+                //    velocities and the sink term in classify_cells can
+                //    predict absorption for the pressure solve)
+                if particle_wg > 0 {
+                    pass.set_pipeline(&self.pipelines.bed_coupling);
+                    pass.dispatch_workgroups(particle_wg, 1, 1);
+                }
+
+                // 7. extraction_advect (consumes bed_delta from bed_coupling)
+                if bed_wg > 0 {
+                    pass.set_pipeline(&self.pipelines.extraction_advect);
+                    pass.dispatch_workgroups(bed_wg, 1, 1);
                 }
 
                 // 8. bed_dynamics
