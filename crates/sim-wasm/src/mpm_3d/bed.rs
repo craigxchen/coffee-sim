@@ -160,8 +160,9 @@ pub(crate) fn init_bed_particles(
 
                 // Particle: pos(x,y,z,J=1), vel(0,0,0,mass=1)
                 particles.push([x, y, z, 1.0, 0.0, 0.0, 0.0, 1.0]);
-                // Phase=1.0 means bed particle.
-                affines.push([0.0, 0.0, 0.0, 1.0, x, y, z, 0.0, y, 0.0, 0.0, 0.0]);
+                // Phase=1.0 means bed particle. col1/col2 hold the APIC C
+                // matrix after the first G2P pass, so zero-init them.
+                affines.push([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
                 // BedExtract: bed(pore_water, porosity, permeability, compaction),
                 //             extract(extractable, dissolved, temp, saturation)
                 bed_extracts.push([
