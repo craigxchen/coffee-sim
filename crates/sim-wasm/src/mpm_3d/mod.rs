@@ -969,4 +969,48 @@ mod tests {
             drift * 100.0
         );
     }
+
+    #[test]
+    #[ignore = "GPU-only: regression test for divergence ghost-mirror at solid walls"]
+    fn water_pool_stable_against_cup_floor() {
+        // Targets the wall-adjacent divergence bug: previously the RHS
+        // stencil in classify_cells read solid neighbors as zero velocity,
+        // injecting a spurious sink at floor-adjacent fluid cells and
+        // pushing pooled water away from the cup. A long pour lets water
+        // actually pool against the cup SDF floor (spout is ~15 units above
+        // the floor so a short pour never develops a real pool), then the
+        // pour stops and we check that the resting pool doesn't drift.
+        let Some((device, queue)) = create_test_device() else {
+            eprintln!("Skipping wall-pool test; no adapter/device available");
+            return;
+        };
+
+        let mut sim = MpmSim3D::new(&device, &queue, MpmSettings::benchmark_free_stream());
+
+        // Pour for 5 s so water actually reaches and pools against the cup.
+        sim.set_kettle_angle(36.0);
+        for _ in 0..300 {
+            sim.step_frame(&device, &queue, 1.0 / 60.0);
+        }
+
+        // Stop pour, settle for 1 s before the first reading.
+        sim.set_kettle_angle(0.0);
+        for _ in 0..60 {
+            sim.step_frame(&device, &queue, 1.0 / 60.0);
+        }
+        let m0 = readback_mass_snapshot(&sim, &device, &queue).active_particle_mass;
+
+        // Let the pool rest for another 2 s and compare.
+        for _ in 0..120 {
+            sim.step_frame(&device, &queue, 1.0 / 60.0);
+        }
+        let m1 = readback_mass_snapshot(&sim, &device, &queue).active_particle_mass;
+
+        let drift = (m1 - m0).abs() / m0.max(1e-6);
+        assert!(
+            drift < 0.02,
+            "pooled water drifted {:.2}% after settle (m0={m0}, m1={m1})",
+            drift * 100.0
+        );
+    }
 }
