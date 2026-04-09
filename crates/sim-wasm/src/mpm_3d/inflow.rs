@@ -161,10 +161,11 @@ impl InflowState {
         let mut particle_data: Vec<[f32; 8]> = Vec::with_capacity(count as usize);
         let mut affine_data: Vec<[f32; 12]> = Vec::with_capacity(count as usize);
 
+        let emit_speed = self.exit_speed();
         let vel = Vec3::new(
-            dir.x * self.exit_speed,
-            dir.y * self.exit_speed,
-            dir.z * self.exit_speed,
+            dir.x * emit_speed,
+            dir.y * emit_speed,
+            dir.z * emit_speed,
         );
 
         // Simple disk distribution using golden angle

@@ -34,8 +34,8 @@ const fluidCellsLabel = document.getElementById("fluid-cells");
 const divClampFiresLabel = document.getElementById("div-clamp-fires");
 const pressureClampFiresLabel = document.getElementById("pressure-clamp-fires");
 const massOverflowFiresLabel = document.getElementById("mass-overflow-fires");
-const pressureProjectionToggle = document.getElementById("toggle-pressure-projection");
-const sparseBallisticToggle = document.getElementById("toggle-sparse-ballistic");
+const toggleDebugButton = document.getElementById("toggle-debug");
+const debugStats = document.getElementById("debug-stats");
 
 // Throttle metrics readback — the staging-buffer map/unmap is cheap but still
 // costs a JS microtask. Refreshing every ~10 frames keeps the HUD responsive
@@ -98,6 +98,13 @@ sceneDefaultButton.addEventListener("click", () => {
   syncUi();
 });
 
+toggleDebugButton.addEventListener("click", () => {
+  debugStats.classList.toggle("hidden");
+  toggleDebugButton.textContent = debugStats.classList.contains("hidden")
+    ? "Show Debug Stats"
+    : "Hide Debug Stats";
+});
+
 sceneFreeStreamButton.addEventListener("click", () => {
   app.loadBenchmarkFreeStream();
   syncControlDefaultsFromSim();
@@ -142,15 +149,6 @@ spoutZInput.addEventListener("input", () => {
   syncUi();
 });
 
-pressureProjectionToggle.addEventListener("change", () => {
-  app.setPressureProjectionEnabled(pressureProjectionToggle.checked);
-  syncUi();
-});
-
-sparseBallisticToggle.addEventListener("change", () => {
-  app.setTempSparseBallisticEnabled(sparseBallisticToggle.checked);
-  syncUi();
-});
 
 canvas.addEventListener("contextmenu", (e) => e.preventDefault());
 
@@ -184,7 +182,6 @@ canvas.addEventListener(
 
 window.addEventListener("keydown", (e) => {
   if (!PAN_CODES.has(e.code)) return;
-  if (e.code === "Space") e.preventDefault();
   heldKeys.add(e.code);
 });
 
@@ -234,17 +231,14 @@ function maybeRefreshMetrics() {
 function applyKeyboardPan(dt) {
   if (heldKeys.size === 0) return;
   let right = 0;
-  let up = 0;
   let forward = 0;
   if (heldKeys.has("KeyD")) right += 1;
   if (heldKeys.has("KeyA")) right -= 1;
   if (heldKeys.has("KeyW")) forward += 1;
   if (heldKeys.has("KeyS")) forward -= 1;
-  if (heldKeys.has("Space")) up += 1;
-  if (heldKeys.has("ShiftLeft") || heldKeys.has("ShiftRight")) up -= 1;
-  if (right === 0 && up === 0 && forward === 0) return;
+  if (right === 0 && forward === 0) return;
   const step = PAN_SPEED * dt;
-  app.panCamera(right * step, up * step, forward * step);
+  app.panCamera(right * step, 0, forward * step);
 }
 
 function updateFps(frameTime) {
@@ -259,8 +253,6 @@ function syncControlDefaultsFromSim() {
   spoutXInput.value = app.spoutX().toFixed(1);
   spoutYInput.value = app.spoutY().toFixed(1);
   spoutZInput.value = app.spoutZ().toFixed(1);
-  pressureProjectionToggle.checked = app.pressureProjectionEnabled();
-  sparseBallisticToggle.checked = app.tempSparseBallisticEnabled();
 }
 
 function applySpoutControls() {
@@ -272,8 +264,6 @@ function applySpoutControls() {
 }
 
 function applyHeuristicControls() {
-  app.setPressureProjectionEnabled(pressureProjectionToggle.checked);
-  app.setTempSparseBallisticEnabled(sparseBallisticToggle.checked);
 }
 
 function syncUi() {

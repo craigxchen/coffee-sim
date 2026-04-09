@@ -94,8 +94,6 @@ pub(crate) struct MpmSettings {
     pub initial_kettle_angle_deg: f32,
     pub filter: Option<FilterConfig>,
     pub bed: Option<BedConfig>,
-    pub enable_pressure_projection: bool,
-    pub enable_temp_sparse_ballistic: bool,
 }
 
 impl MpmSettings {
@@ -138,8 +136,6 @@ impl MpmSettings {
             initial_kettle_angle_deg: 36.0,
             filter: Some(filter),
             bed: Some(bed),
-            enable_pressure_projection: true,
-            enable_temp_sparse_ballistic: true,
         }
     }
 
@@ -339,32 +335,23 @@ impl MpmSim3D {
                 pass.set_pipeline(&self.pipelines.boundary_project);
                 pass.dispatch_workgroups(cell_wg, 1, 1);
 
-                if self.settings.enable_pressure_projection {
-                    pass.set_pipeline(&self.pipelines.classify_cells);
-                    pass.dispatch_workgroups(cell_wg, 1, 1);
+                // Pressure projection: classify cells, RBGS pressure
+                // solve, velocity correction, then re-project boundaries.
+                pass.set_pipeline(&self.pipelines.classify_cells);
+                pass.dispatch_workgroups(cell_wg, 1, 1);
 
-                    // RBGS sweeps per substep. On the ~730k-cell grid, 16
-                    // sweeps left large residual divergence, showing up as
-                    // visible volume drift after pour-off. 40 sweeps (20
-                    // pairs) is empirically enough to damp the pool-scale
-                    // pressure modes while staying inside the browser frame
-                    // budget. Revisit when the metrics readback path is
-                    // rewired and `METRIC_MAX_ABS_DIV_IDX` is visible on
-                    // the HUD — at that point we can tune against a live
-                    // residual number.
-                    const PRESSURE_RBGS_PAIRS: u32 = 20;
-                    for _ in 0..PRESSURE_RBGS_PAIRS {
-                        pass.set_pipeline(&self.pipelines.pressure_rbgs_red);
-                        pass.dispatch_workgroups(cell_wg, 1, 1);
-                        pass.set_pipeline(&self.pipelines.pressure_rbgs_black);
-                        pass.dispatch_workgroups(cell_wg, 1, 1);
-                    }
-
-                    pass.set_pipeline(&self.pipelines.project_pressure);
+                const PRESSURE_RBGS_PAIRS: u32 = 20;
+                for _ in 0..PRESSURE_RBGS_PAIRS {
+                    pass.set_pipeline(&self.pipelines.pressure_rbgs_red);
                     pass.dispatch_workgroups(cell_wg, 1, 1);
-                    pass.set_pipeline(&self.pipelines.boundary_project);
+                    pass.set_pipeline(&self.pipelines.pressure_rbgs_black);
                     pass.dispatch_workgroups(cell_wg, 1, 1);
                 }
+
+                pass.set_pipeline(&self.pipelines.project_pressure);
+                pass.dispatch_workgroups(cell_wg, 1, 1);
+                pass.set_pipeline(&self.pipelines.boundary_project);
+                pass.dispatch_workgroups(cell_wg, 1, 1);
 
                 // 5. g2p
                 if particle_wg > 0 {
@@ -474,6 +461,7 @@ impl MpmSim3D {
         self.inflow.exit_speed()
     }
 
+
     pub fn particle_count(&self) -> usize {
         (self.num_water + self.num_bed) as usize
     }
@@ -494,21 +482,6 @@ impl MpmSim3D {
         self.total_time
     }
 
-    pub fn set_temp_sparse_ballistic_enabled(&mut self, enabled: bool) {
-        self.settings.enable_temp_sparse_ballistic = enabled;
-    }
-
-    pub fn set_pressure_projection_enabled(&mut self, enabled: bool) {
-        self.settings.enable_pressure_projection = enabled;
-    }
-
-    pub fn pressure_projection_enabled(&self) -> bool {
-        self.settings.enable_pressure_projection
-    }
-
-    pub fn temp_sparse_ballistic_enabled(&self) -> bool {
-        self.settings.enable_temp_sparse_ballistic
-    }
 
     pub fn render_buffer(&self) -> &wgpu::Buffer {
         &self.buffers.render_data
@@ -634,21 +607,13 @@ impl MpmSim3D {
                 34.0,
                 8.0,
                 bed_capacity_per_particle,
-                if self.settings.enable_pressure_projection {
-                    1.0
-                } else {
-                    0.0
-                },
+                1.0,
             ],
             extraction_params: [0.01, 11.0, 8.5, 15.0],
             time_params: [
                 self.total_time,
                 dt,
-                if self.settings.enable_temp_sparse_ballistic {
-                    1.0
-                } else {
-                    0.0
-                },
+                1.0,
                 0.0,
             ],
             clamp_params: [
