@@ -541,28 +541,49 @@ fn classify_cells(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
 
-    var vxm = 0.0;
-    var vxp = 0.0;
-    var vym = 0.0;
-    var vyp = 0.0;
-    var vzm = 0.0;
-    var vzp = 0.0;
-    if ix_val > 0u {
+    // Central-difference divergence using cell-centered velocities. No-flow
+    // boundaries (off-grid faces and CELL_SOLID neighbors) use a ghost-mirror
+    // on the normal velocity component: v_ghost.n = -v_self.n. That makes
+    // the central difference cancel to zero at a quiescent wall cell, which
+    // is the matching RHS treatment for the Neumann LHS handling in
+    // pressure_update / project_pressure. Previously initializing these to 0
+    // injected a spurious sink (v_self.n - 0) / 2dx at every wall-adjacent
+    // fluid cell and pushed fluid away from the cup floor.
+    //
+    // Neighbor-solid detection samples the static SDF directly rather than
+    // calling cell_kind_load, because classify_cells is the dispatch that
+    // writes cell_kind — reading a neighbor's kind here races against other
+    // workgroups. The SDF is read-only so neighbor SDF probes are race-free.
+    let self_vel = grid_vel[idx].xyz;
+    let dx_vec = dx();
+    var vxm = -self_vel.x;
+    var vxp = -self_vel.x;
+    var vym = -self_vel.y;
+    var vyp = -self_vel.y;
+    var vzm = -self_vel.z;
+    var vzp = -self_vel.z;
+    if ix_val > 0u
+        && sample_sdf(cell_center + vec3<f32>(-dx_vec, 0.0, 0.0)) >= 0.0 {
         vxm = grid_vel[cell_index(ix_val - 1u, iy_val, iz_val)].x;
     }
-    if ix_val + 1u < gx() {
+    if ix_val + 1u < gx()
+        && sample_sdf(cell_center + vec3<f32>(dx_vec, 0.0, 0.0)) >= 0.0 {
         vxp = grid_vel[cell_index(ix_val + 1u, iy_val, iz_val)].x;
     }
-    if iy_val > 0u {
+    if iy_val > 0u
+        && sample_sdf(cell_center + vec3<f32>(0.0, -dx_vec, 0.0)) >= 0.0 {
         vym = grid_vel[cell_index(ix_val, iy_val - 1u, iz_val)].y;
     }
-    if iy_val + 1u < gy() {
+    if iy_val + 1u < gy()
+        && sample_sdf(cell_center + vec3<f32>(0.0, dx_vec, 0.0)) >= 0.0 {
         vyp = grid_vel[cell_index(ix_val, iy_val + 1u, iz_val)].y;
     }
-    if iz_val > 0u {
+    if iz_val > 0u
+        && sample_sdf(cell_center + vec3<f32>(0.0, 0.0, -dx_vec)) >= 0.0 {
         vzm = grid_vel[cell_index(ix_val, iy_val, iz_val - 1u)].z;
     }
-    if iz_val + 1u < gz() {
+    if iz_val + 1u < gz()
+        && sample_sdf(cell_center + vec3<f32>(0.0, 0.0, dx_vec)) >= 0.0 {
         vzp = grid_vel[cell_index(ix_val, iy_val, iz_val + 1u)].z;
     }
 
