@@ -253,12 +253,11 @@ fn resolve_radial_barrier(
     return ContactResult(out_pos, out_vel);
 }
 
-fn resolve_scene_obstacles(position: vec3<f32>, velocity: vec3<f32>) -> ContactResult {
+fn resolve_scene_obstacles(position: vec3<f32>, velocity: vec3<f32>, is_bed: bool) -> ContactResult {
     var out_pos = position;
     var out_vel = velocity;
 
-    // V60 dripper interior. Open at the top and bottom, but particles should
-    // stay inside the cone wall as they travel toward the outlet.
+    // V60 dripper interior. Radial barrier keeps particles inside the cone.
     let cone_top_y = 3.0;
     let cone_bot_y = -3.0;
     if out_pos.y <= cone_top_y && out_pos.y >= cone_bot_y {
@@ -267,6 +266,32 @@ fn resolve_scene_obstacles(position: vec3<f32>, velocity: vec3<f32>) -> ContactR
         let cone_contact = resolve_radial_barrier(out_pos, out_vel, vec2<f32>(0.0, 0.0), cone_radius);
         out_pos = cone_contact.pos;
         out_vel = cone_contact.vel;
+    }
+
+    // Paper filter (bed particles only): the filter is porous — water
+    // passes through the paper, but coffee particles are trapped above.
+    // Below the V60 cone the filter narrows to a point at y=-3.37.
+    let filter_bot_y = -3.37;
+    if is_bed {
+        if out_pos.y < cone_bot_y && out_pos.y >= filter_bot_y {
+            let ft = (out_pos.y - filter_bot_y) / (cone_bot_y - filter_bot_y);
+            let filter_r = mix(0.0, 0.26, ft) - contact_offset();
+            if filter_r > 0.0 {
+                let fc = resolve_radial_barrier(out_pos, out_vel, vec2<f32>(0.0, 0.0), filter_r);
+                out_pos = fc.pos;
+                out_vel = fc.vel;
+            }
+        }
+
+        // Filter apex: floor keeps bed particles from falling through.
+        if out_pos.y <= filter_bot_y + contact_offset() && out_pos.y > filter_bot_y - 0.5 {
+            out_pos.y = filter_bot_y + contact_offset();
+            if out_vel.y < 0.0 {
+                out_vel.y = 0.0;
+                out_vel.x *= 1.0 - friction() * 0.55;
+                out_vel.z *= 1.0 - friction() * 0.55;
+            }
+        }
     }
 
     // Carafe interior. Keep pooled water inside the cup walls and above the
@@ -291,7 +316,7 @@ fn resolve_scene_obstacles(position: vec3<f32>, velocity: vec3<f32>) -> ContactR
     return ContactResult(out_pos, out_vel);
 }
 
-fn resolve_sdf_contact(position: vec3<f32>, velocity: vec3<f32>) -> ContactResult {
+fn resolve_sdf_contact(position: vec3<f32>, velocity: vec3<f32>, is_bed: bool) -> ContactResult {
     var out_pos = position;
     var out_vel = velocity;
 
@@ -313,7 +338,7 @@ fn resolve_sdf_contact(position: vec3<f32>, velocity: vec3<f32>) -> ContactResul
         }
     }
 
-    let hard_contact = resolve_scene_obstacles(out_pos, out_vel);
+    let hard_contact = resolve_scene_obstacles(out_pos, out_vel, is_bed);
     return ContactResult(hard_contact.pos, hard_contact.vel);
 }
 
@@ -954,9 +979,9 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>) {
     // Particle-level boundary projection closes the gap left by the grid-only
     // collision pass so the dripper wall behaves like a hard barrier.
     let mid_pos = mix(xp, new_pos, 0.5);
-    var contact = resolve_sdf_contact(mid_pos, new_v);
+    var contact = resolve_sdf_contact(mid_pos, new_v, false);
     new_v = contact.vel;
-    contact = resolve_sdf_contact(new_pos, new_v);
+    contact = resolve_sdf_contact(new_pos, new_v, false);
     new_pos = contact.pos;
     new_v = contact.vel;
 
@@ -1166,7 +1191,7 @@ fn bed_dynamics(@builtin(global_invocation_id) gid: vec3<u32>) {
         rest.y = mix(rest.y, packed_rest, rebound);
     }
 
-    let contact = resolve_sdf_contact(new_pos, vel);
+    let contact = resolve_sdf_contact(new_pos, vel, true);
     new_pos = contact.pos;
     vel = contact.vel;
 

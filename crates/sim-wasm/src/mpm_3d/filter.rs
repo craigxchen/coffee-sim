@@ -18,9 +18,9 @@ impl Default for FilterConfig {
             top_y: 2.75,
             bot_y: -3.02,
             top_radius: 4.10,
-            bot_radius: 0.62,
+            bot_radius: 0.0,
             thickness: 0.08,
-            hole_radius: 0.18,
+            hole_radius: 0.0,
         }
     }
 }

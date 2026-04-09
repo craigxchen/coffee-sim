@@ -663,7 +663,7 @@ impl Renderer {
 
         let filter_uniforms = ConeUniforms {
             view_proj,
-            color: [0.98, 0.96, 0.90, 0.24],
+            color: [0.96, 0.93, 0.85, 0.42],
         };
         self.queue.write_buffer(
             &self.filter_uniform_buffer,
