@@ -115,12 +115,19 @@ fn scratch_div_idx(cell: u32) -> u32 { return grid_mom_x_idx(cell); }
 // alias is defined for it. Add one back if/when an iterative residual probe
 // needs the slot during the projection pass.
 fn scratch_kind_idx(cell: u32) -> u32 { return grid_mom_z_idx(cell); }
-fn occupancy_mass_threshold() -> f32 { return nominal_mass(); }
+// A quadratic-B-spline particle deposits at most `nominal_mass * 0.75^3 ≈
+// 0.42 * nominal_mass` to its peak cell. The threshold must stay strictly
+// below that peak or isolated particles never register as fluid. Matching
+// `inactive_mass_threshold()` at 0.1 * nominal_mass means "enough mass to
+// still exist" ⇔ "enough mass to produce a fluid cell", which is
+// semantically consistent and keeps ghost-splat noise below the bar.
+fn occupancy_mass_threshold() -> f32 { return nominal_mass() * 0.1; }
 
 const CELL_AIR: i32 = 0;
 const CELL_SURFACE_FLUID: i32 = 1;
 const CELL_INTERIOR_FLUID: i32 = 2;
 const CELL_BED_COUPLED: i32 = 3;
+const CELL_SOLID: i32 = 4;
 
 fn cell_kind_load(cell: u32) -> i32 {
     return atomicLoad(&grid[scratch_kind_idx(cell)]);
@@ -157,7 +164,19 @@ fn bed_lookup_load(cell: u32) -> i32 {
 }
 
 fn is_fluid_kind(kind: i32) -> bool {
-    return kind == CELL_INTERIOR_FLUID || kind == CELL_BED_COUPLED;
+    // Surface cells must participate in the pressure solve so hydrostatic
+    // pressure can build up in shallow puddles. Adjacent CELL_AIR cells
+    // provide the Dirichlet p=0 BC via the neighbor-loop sum in
+    // `pressure_update` (air neighbors count toward the denominator but
+    // contribute 0 to the numerator), so excluding surface cells here would
+    // zero them out and let gravity compress thin pools to a single layer.
+    return kind == CELL_INTERIOR_FLUID
+        || kind == CELL_SURFACE_FLUID
+        || kind == CELL_BED_COUPLED;
+}
+
+fn is_solid_kind(kind: i32) -> bool {
+    return kind == CELL_SOLID;
 }
 
 fn world_to_cell(position: vec3<f32>) -> vec3<i32> {
@@ -452,6 +471,30 @@ fn classify_cells(@builtin(global_invocation_id) gid: vec3<u32>) {
     let mass = grid_vel[idx].w;
     pressure_store(idx, 0.0);
 
+    // Hoist index decomposition so the SDF probe, the has_air_neighbor
+    // loop, and the divergence stencil can all reuse it.
+    let iz_val = idx / (gx() * gy());
+    let rem = idx % (gx() * gy());
+    let iy_val = rem / gx();
+    let ix_val = rem % gx();
+
+    // SDF solid classification. Sign convention (see state.rs
+    // `generate_sdf_data`):
+    //   sdf > 0  → open fluid domain (inside the cup)
+    //   sdf = 0  → on the wall surface
+    //   sdf < 0  → inside wall material or exterior ambient space
+    // Marking sdf<0 cells as CELL_SOLID lets the pressure solve treat them
+    // with a Neumann BC (∂p/∂n = 0) via the ghost-mirror trick in
+    // pressure_update / project_pressure, instead of the Dirichlet p=0
+    // they'd get if lumped with air.
+    let cell_center = u.grid_origin.xyz
+        + (vec3<f32>(f32(ix_val), f32(iy_val), f32(iz_val)) + vec3<f32>(0.5)) * dx();
+    if sample_sdf(cell_center) < 0.0 {
+        atomicStore(&grid[scratch_kind_idx(idx)], CELL_SOLID);
+        divergence_store(idx, 0.0);
+        return;
+    }
+
     if mass <= occupancy_mass_threshold() {
         atomicStore(&grid[scratch_kind_idx(idx)], CELL_AIR);
         divergence_store(idx, 0.0);
@@ -461,11 +504,6 @@ fn classify_cells(@builtin(global_invocation_id) gid: vec3<u32>) {
     if bed_lookup_load(idx) >= 0 {
         atomicStore(&grid[scratch_kind_idx(idx)], CELL_BED_COUPLED);
     } else {
-        let iz_val = idx / (gx() * gy());
-        let rem = idx % (gx() * gy());
-        let iy_val = rem / gx();
-        let ix_val = rem % gx();
-
         let offsets = array<vec3<i32>, 6>(
             vec3<i32>(-1, 0, 0),
             vec3<i32>(1, 0, 0),
@@ -502,11 +540,6 @@ fn classify_cells(@builtin(global_invocation_id) gid: vec3<u32>) {
         divergence_store(idx, 0.0);
         return;
     }
-
-    let iz_val = idx / (gx() * gy());
-    let rem = idx % (gx() * gy());
-    let iy_val = rem / gx();
-    let ix_val = rem % gx();
 
     var vxm = 0.0;
     var vxp = 0.0;
@@ -575,14 +608,27 @@ fn pressure_update(idx: u32, target_parity: u32) {
 
     for (var n = 0u; n < 6u; n++) {
         let neighbor = vec3<i32>(i32(ix_val), i32(iy_val), i32(iz_val)) + offsets[n];
+        // Off-grid neighbors act as Neumann (no-flow) — skip from both
+        // numerator and denominator. Preserves existing behavior.
         if neighbor.x < 0 || neighbor.y < 0 || neighbor.z < 0
             || u32(neighbor.x) >= gx() || u32(neighbor.y) >= gy() || u32(neighbor.z) >= gz() {
             continue;
         }
 
-        neighbor_count += 1.0;
         let neighbor_idx = cell_index(u32(neighbor.x), u32(neighbor.y), u32(neighbor.z));
         let neighbor_kind = cell_kind_load(neighbor_idx);
+
+        // Solid neighbor → Neumann BC via ghost-mirror (p_ghost = p_here).
+        // The standard 7-point Laplacian with a mirror ghost drops the
+        // solid face from both the numerator and denominator of the
+        // averaging update, so we `continue` before touching neighbor_count.
+        if is_solid_kind(neighbor_kind) {
+            continue;
+        }
+
+        neighbor_count += 1.0;
+        // Air neighbor → Dirichlet p=0, contributes 0 to pressure_sum.
+        // Fluid neighbor → contributes its pressure.
         if is_fluid_kind(neighbor_kind) {
             pressure_sum += pressure_load(neighbor_idx);
         }
@@ -639,23 +685,44 @@ fn project_pressure(@builtin(global_invocation_id) gid: vec3<u32>) {
     var p_yp = p_here;
     var p_zm = p_here;
     var p_zp = p_here;
+    // Skip the overwrite when the neighbor is solid so the mirror
+    // pressure (initialized to p_here) is preserved — this gives
+    // ∂p/∂n = 0 across the wall face and zero contribution to grad_p.
     if ix_val > 0u {
-        p_xm = pressure_load(cell_index(ix_val - 1u, iy_val, iz_val));
+        let ci = cell_index(ix_val - 1u, iy_val, iz_val);
+        if !is_solid_kind(cell_kind_load(ci)) {
+            p_xm = pressure_load(ci);
+        }
     }
     if ix_val + 1u < gx() {
-        p_xp = pressure_load(cell_index(ix_val + 1u, iy_val, iz_val));
+        let ci = cell_index(ix_val + 1u, iy_val, iz_val);
+        if !is_solid_kind(cell_kind_load(ci)) {
+            p_xp = pressure_load(ci);
+        }
     }
     if iy_val > 0u {
-        p_ym = pressure_load(cell_index(ix_val, iy_val - 1u, iz_val));
+        let ci = cell_index(ix_val, iy_val - 1u, iz_val);
+        if !is_solid_kind(cell_kind_load(ci)) {
+            p_ym = pressure_load(ci);
+        }
     }
     if iy_val + 1u < gy() {
-        p_yp = pressure_load(cell_index(ix_val, iy_val + 1u, iz_val));
+        let ci = cell_index(ix_val, iy_val + 1u, iz_val);
+        if !is_solid_kind(cell_kind_load(ci)) {
+            p_yp = pressure_load(ci);
+        }
     }
     if iz_val > 0u {
-        p_zm = pressure_load(cell_index(ix_val, iy_val, iz_val - 1u));
+        let ci = cell_index(ix_val, iy_val, iz_val - 1u);
+        if !is_solid_kind(cell_kind_load(ci)) {
+            p_zm = pressure_load(ci);
+        }
     }
     if iz_val + 1u < gz() {
-        p_zp = pressure_load(cell_index(ix_val, iy_val, iz_val + 1u));
+        let ci = cell_index(ix_val, iy_val, iz_val + 1u);
+        if !is_solid_kind(cell_kind_load(ci)) {
+            p_zp = pressure_load(ci);
+        }
     }
 
     let grad_p = 0.5 * inv_dx() * vec3<f32>(
