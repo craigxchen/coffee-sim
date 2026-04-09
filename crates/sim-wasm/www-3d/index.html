@@ -41,17 +41,17 @@
             <span>Spout X</span>
             <output id="spout-x-value">0.0</output>
           </label>
-          <input id="spout-x" type="range" min="-5.5" max="-1.8" step="0.1" value="-3.4" />
+          <input id="spout-x" type="range" min="-6.0" max="6.0" step="0.1" value="-3.4" />
           <label class="slider-field" for="spout-y">
-            <span>Spout Height</span>
+            <span>Spout Y</span>
             <output id="spout-y-value">0.0</output>
           </label>
-          <input id="spout-y" type="range" min="5.8" max="8.4" step="0.1" value="7.3" />
+          <input id="spout-y" type="range" min="5.0" max="10.0" step="0.1" value="7.3" />
           <label class="slider-field" for="spout-z">
             <span>Spout Z</span>
             <output id="spout-z-value">0.0</output>
           </label>
-          <input id="spout-z" type="range" min="-1.6" max="2.2" step="0.1" value="0.9" />
+          <input id="spout-z" type="range" min="-6.0" max="6.0" step="0.1" value="0.9" />
         </div>
         <dl class="stats">
           <div>
@@ -71,7 +71,8 @@
             <dd id="jet-speed">0.0 u/s</dd>
           </div>
         </dl>
-        <dl class="stats">
+        <button id="toggle-debug" class="toggle-debug">Show Debug Stats</button>
+        <dl class="stats debug-stats hidden" id="debug-stats">
           <div>
             <dt>Scene</dt>
             <dd id="scene-mode">Default</dd>
@@ -116,20 +117,27 @@
             <dt>Bed Enabled</dt>
             <dd id="bed-enabled">Yes</dd>
           </div>
+          <div>
+            <dt>Max |div u|</dt>
+            <dd id="max-abs-div">0.000</dd>
+          </div>
+          <div>
+            <dt>Fluid Cells</dt>
+            <dd id="fluid-cells">0</dd>
+          </div>
+          <div>
+            <dt>Div Clamp Fires</dt>
+            <dd id="div-clamp-fires">0</dd>
+          </div>
+          <div>
+            <dt>Pressure Clamp Fires</dt>
+            <dd id="pressure-clamp-fires">0</dd>
+          </div>
+          <div>
+            <dt>Mass Overflow Fires</dt>
+            <dd id="mass-overflow-fires">0</dd>
+          </div>
         </dl>
-        <div class="control-panel">
-          <label class="slider-field">
-            <span>Temporary Heuristics</span>
-          </label>
-          <label class="slider-field" for="toggle-pressure-projection">
-            <span>Pressure Projection</span>
-            <input id="toggle-pressure-projection" type="checkbox" checked />
-          </label>
-          <label class="slider-field" for="toggle-sparse-ballistic">
-            <span>Sparse Ballistic Preserve</span>
-            <input id="toggle-sparse-ballistic" type="checkbox" checked />
-          </label>
-        </div>
       </section>
       <section class="viewer">
         <canvas id="sim-canvas"></canvas>
