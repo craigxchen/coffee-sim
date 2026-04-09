@@ -2,7 +2,7 @@ use coffee_sim_core::sph::Vec3;
 
 use super::filter::FilterConfig;
 
-const RING_COUNT: usize = 10;
+pub(crate) const RING_COUNT: usize = 10;
 const SEGMENT_COUNT: usize = 32;
 const EDGE_ITERS: usize = 5;
 const DAMPING: f32 = 0.18;
@@ -113,28 +113,17 @@ impl FilterMesh {
         mesh
     }
 
-    pub(crate) fn step(&mut self, dt: f32, load: f32) {
-        // Sanitise `dt` first: if the caller passes NaN or a negative value we
-        // must bail out rather than poison every position/velocity. The manual
-        // `max(0).min(cap)` form is intentional — `clamp` would propagate NaN.
+    pub(crate) fn step_with_ring_loads(&mut self, dt: f32, ring_loads: &[f32; RING_COUNT]) {
         if !dt.is_finite() || dt <= 0.0 {
             return;
         }
         let dt = dt.min(1.0 / 20.0);
-        // Clamp dt to a small positive lower bound so the velocity reconstruction
-        // `(pos - prev_pos) / dt` below cannot explode on frame-time glitches.
         let dt = dt.max(1e-5);
 
-        let load = if load.is_finite() {
-            load.clamp(0.0, 2.0)
-        } else {
-            0.0
-        };
         self.prev_positions.copy_from_slice(&self.positions);
 
         let height = (self.config.top_y - self.config.bot_y).max(1e-6);
         let center = self.config.center;
-        let sag_strength = (0.10 + 0.42 * load).clamp(0.06, 0.72);
 
         for (i, pos) in self.positions.iter_mut().enumerate() {
             if self.pinned[i] {
@@ -142,6 +131,14 @@ impl FilterMesh {
                 self.velocities[i] = Vec3::ZERO;
                 continue;
             }
+
+            let ring = i / SEGMENT_COUNT;
+            let load = if ring_loads[ring].is_finite() {
+                ring_loads[ring].clamp(0.0, 2.0)
+            } else {
+                0.0
+            };
+            let sag_strength = (0.10 + 0.42 * load).clamp(0.06, 0.72);
 
             let rest = self.rest_positions[i];
             let depth_t = ((rest.y - (center.y + self.config.bot_y)) / height).clamp(0.0, 1.0);
@@ -176,11 +173,6 @@ impl FilterMesh {
                     continue;
                 }
 
-                // Standard PBD distance correction: move both endpoints so the
-                // edge reaches its rest length. Using `delta * 0.5 * (1 - rest/dist)`
-                // keeps corrections bounded under compression — the earlier
-                // `(dist - rest) / dist` form grew unbounded negative when
-                // `dist << rest_length`, causing the mesh to overshoot.
                 let scale = 0.5 * EDGE_STIFFNESS * (1.0 - edge.rest_length / dist);
                 let correction = delta * scale;
 
@@ -217,6 +209,10 @@ impl FilterMesh {
         }
 
         self.sync_render_vertices();
+    }
+
+    pub(crate) fn positions(&self) -> &[Vec3] {
+        &self.positions
     }
 
     pub(crate) fn render_vertices(&self) -> &[[f32; 3]] {
@@ -280,7 +276,7 @@ mod tests {
     fn load_creates_sag_but_preserves_pins() {
         let mut mesh = FilterMesh::new(&FilterConfig::default());
         let before = mesh.positions.clone();
-        mesh.step(1.0 / 60.0, 1.0);
+        mesh.step_with_ring_loads(1.0 / 60.0, &[1.0; RING_COUNT]);
         for (after, prior) in mesh.positions[..SEGMENT_COUNT]
             .iter()
             .zip(before[..SEGMENT_COUNT].iter())
@@ -303,7 +299,7 @@ mod tests {
     fn step_ignores_nonfinite_dt() {
         let mut mesh = FilterMesh::new(&FilterConfig::default());
         let before = mesh.positions.clone();
-        mesh.step(f32::NAN, 1.0);
+        mesh.step_with_ring_loads(f32::NAN, &[1.0; RING_COUNT]);
         for (after, prior) in mesh.positions.iter().zip(before.iter()) {
             assert!(after.x.is_finite());
             assert!(after.y.is_finite());
@@ -318,7 +314,7 @@ mod tests {
     fn step_ignores_nonfinite_load() {
         let mut mesh = FilterMesh::new(&FilterConfig::default());
         // NaN load should fall through to 0.0 and not poison the positions.
-        mesh.step(1.0 / 60.0, f32::NAN);
+        mesh.step_with_ring_loads(1.0 / 60.0, &[f32::NAN; RING_COUNT]);
         for pos in &mesh.positions {
             assert!(pos.x.is_finite());
             assert!(pos.y.is_finite());
@@ -340,7 +336,7 @@ mod tests {
         }
         mesh.prev_positions.copy_from_slice(&mesh.positions);
         for _ in 0..5 {
-            mesh.step(1.0 / 60.0, 0.5);
+            mesh.step_with_ring_loads(1.0 / 60.0, &[0.5; RING_COUNT]);
             for pos in &mesh.positions {
                 assert!(pos.x.is_finite());
                 assert!(pos.y.is_finite());

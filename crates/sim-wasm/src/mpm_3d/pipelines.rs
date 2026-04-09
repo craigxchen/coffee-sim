@@ -19,7 +19,6 @@ pub(crate) struct MpmPipelines {
     pub g2p: wgpu::ComputePipeline,
     pub bed_coupling: wgpu::ComputePipeline,
     pub extraction_advect: wgpu::ComputePipeline,
-    pub bed_dynamics: wgpu::ComputePipeline,
     pub prepare_render: wgpu::ComputePipeline,
 }
 
@@ -70,6 +69,10 @@ impl MpmPipelines {
                 // repurposed from the unused `bed_support_count` slot to
                 // stay within the 10-storage-buffer device limit.
                 storage_entry(10),
+                // 11: filter mesh positions (read-only, does not count
+                // against the read-write storage buffer cap on some
+                // adapters)
+                read_only_storage_entry(11),
             ],
         });
 
@@ -121,6 +124,10 @@ impl MpmPipelines {
                     binding: 10,
                     resource: buffers.metrics.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 11,
+                    resource: buffers.filter_mesh_positions.as_entire_binding(),
+                },
             ],
         });
 
@@ -162,7 +169,6 @@ impl MpmPipelines {
             g2p: make("g2p"),
             bed_coupling: make("bed_coupling"),
             extraction_advect: make("extraction_advect"),
-            bed_dynamics: make("bed_dynamics"),
             prepare_render: make("prepare_render"),
         }
     }
@@ -181,7 +187,6 @@ fn storage_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
     }
 }
 
-#[allow(dead_code)] // kept for future read-only bindings.
 fn read_only_storage_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,
