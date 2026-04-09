@@ -18,7 +18,7 @@ pub(crate) use filter::FilterConfig;
 pub(crate) use filter_mesh::{MAX_FILL_VERTEX_COUNT, MAX_RENDER_VERTEX_COUNT};
 
 use bed::{BedConfig, BedInit};
-use filter_mesh::FilterMesh;
+use filter_mesh::{FilterMesh, RING_COUNT};
 use inflow::{EmissionResult, InflowState, SpoutSettings, MASS_UNITS_PER_ML};
 use pipelines::MpmPipelines;
 use state::{
@@ -31,12 +31,8 @@ const TARGET_BED_RETENTION_ML: f32 = 42.0;
 /// Device limits required by the MPM compute pipeline.
 ///
 /// The MPM bind group holds 10 storage buffers (particles, affine, grid,
-/// grid_vel, render_data, bed_extract, bed_lookup, bed_delta, metrics) plus
-/// one SDF texture. The unused `bed_support_count` slot that previously
-/// occupied binding 10 has been repurposed for the metrics buffer so we stay
-/// within the 10-buffer cap that some WebGPU adapters enforce. Any
-/// `request_device` site that uses this pipeline must use these limits, and
-/// `mpm_pipelines_fit_within_required_limits` pins the invariant.
+/// grid_vel, render_data, bed_extract, bed_lookup, bed_delta, metrics,
+/// filter_mesh_positions) plus one SDF texture.
 pub(crate) fn required_limits() -> wgpu::Limits {
     wgpu::Limits {
         max_storage_buffers_per_shader_stage: 10,
@@ -203,6 +199,7 @@ impl MpmSim3D {
         };
 
         sim.init_bed(queue);
+        sim.upload_filter_mesh_positions(queue);
         sim
     }
 
@@ -254,6 +251,21 @@ impl MpmSim3D {
             0,
             bytemuck::cast_slice(&zero_delta),
         );
+    }
+
+    fn upload_filter_mesh_positions(&self, queue: &wgpu::Queue) {
+        if let Some(mesh) = &self.filter_mesh {
+            let data: Vec<[f32; 4]> = mesh
+                .positions()
+                .iter()
+                .map(|p| [p.x, p.y, p.z, 0.0])
+                .collect();
+            queue.write_buffer(
+                &self.buffers.filter_mesh_positions,
+                0,
+                bytemuck::cast_slice(&data),
+            );
+        }
     }
 
     pub fn step_frame(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, dt: f32) {
@@ -376,13 +388,7 @@ impl MpmSim3D {
                     pass.dispatch_workgroups(bed_wg, 1, 1);
                 }
 
-                // 8. bed_dynamics
-                if bed_wg > 0 {
-                    pass.set_pipeline(&self.pipelines.bed_dynamics);
-                    pass.dispatch_workgroups(bed_wg, 1, 1);
-                }
-
-                // 9. prepare_render
+                // 8. prepare_render
                 if particle_wg > 0 {
                     pass.set_pipeline(&self.pipelines.prepare_render);
                     pass.dispatch_workgroups(particle_wg, 1, 1);
@@ -405,19 +411,10 @@ impl MpmSim3D {
         // no benefit to running it per-substep and it would otherwise scale
         // CPU cost linearly with `substeps`.
         if let Some(mesh) = &mut self.filter_mesh {
-            let bed_factor = if self.num_bed > 0 {
-                (self.num_bed as f32 / 12_000.0).clamp(0.0, 2.0)
-            } else {
-                0.0
-            };
-            let water_factor = if self.settings.max_particles > 0 {
-                (self.num_water as f32 / self.settings.max_particles as f32).clamp(0.0, 2.0)
-            } else {
-                0.0
-            };
-            let load = (0.28 + bed_factor * 0.22 + water_factor * 0.18).clamp(0.12, 0.90);
-            mesh.step(dt, load);
+            let ring_loads = compute_ring_loads(&self.settings, self.num_bed, self.num_water);
+            mesh.step_with_ring_loads(dt, &ring_loads);
         }
+        self.upload_filter_mesh_positions(queue);
     }
 
     pub fn reset(&mut self, queue: &wgpu::Queue, _device: &wgpu::Device) {
@@ -434,6 +431,7 @@ impl MpmSim3D {
         // across resets — the GPU solver state is wiped via `init_bed` below.
         self.filter_mesh = self.settings.filter.as_ref().map(FilterMesh::new);
         self.init_bed(queue);
+        self.upload_filter_mesh_positions(queue);
     }
 
     pub fn set_kettle_angle(&mut self, angle_deg: f32) {
@@ -604,7 +602,12 @@ impl MpmSim3D {
             sdf_params: [SDF_RES as f32, 0.3, 0.0, 0.05],
             // Tie bed retention to an overall retained-water target so the bed
             // wets realistically without swallowing most of the brew.
-            bed_params: [34.0, 8.0, bed_capacity_per_particle, 1.0],
+            bed_params: [
+                34.0,
+                8.0,
+                bed_capacity_per_particle,
+                if self.filter_mesh.is_some() { 1.0 } else { 0.0 },
+            ],
             extraction_params: [0.01, 11.0, 8.5, 15.0],
             time_params: [self.total_time, dt, 1.0, 0.0],
             clamp_params: [
@@ -621,6 +624,44 @@ impl MpmSim3D {
             bytemuck::bytes_of(&uniforms),
         );
     }
+}
+
+fn compute_ring_loads(settings: &MpmSettings, num_bed: u32, num_water: u32) -> [f32; RING_COUNT] {
+    let water_factor = if settings.max_particles > 0 {
+        (num_water as f32 / settings.max_particles as f32).clamp(0.0, 2.0)
+    } else {
+        0.0
+    };
+    let base_load = 0.28 + water_factor * 0.18;
+
+    let mut ring_loads = [base_load; RING_COUNT];
+
+    if let (Some(filter), Some(bed)) = (&settings.filter, &settings.bed) {
+        if num_bed > 0 {
+            let filter_height = (filter.top_y - filter.bot_y).max(1e-6);
+            let bed_bot_abs = bed.center.y + bed.bot_y;
+            let bed_top_abs = bed.center.y + bed.top_y;
+
+            for ring in 0..RING_COUNT {
+                let ring_t = ring as f32 / (RING_COUNT - 1) as f32;
+                let ring_y = filter.center.y + filter.bot_y + filter_height * ring_t;
+
+                let bed_overlap = if ring_y >= bed_bot_abs && ring_y <= bed_top_abs {
+                    let t = ((ring_y - bed_bot_abs) / (bed_top_abs - bed_bot_abs).max(1e-6))
+                        .clamp(0.0, 1.0);
+                    let r = bed.bot_radius + (bed.top_radius - bed.bot_radius) * t;
+                    r * r
+                } else {
+                    0.0
+                };
+                let bed_factor = (num_bed as f32 / 12_000.0).clamp(0.0, 2.0) * bed_overlap
+                    / (bed.top_radius * bed.top_radius).max(1e-6);
+                ring_loads[ring] = (base_load + bed_factor * 0.22).clamp(0.12, 0.90);
+            }
+        }
+    }
+
+    ring_loads
 }
 
 fn dispatch_size(count: u32, threads: u32) -> u32 {

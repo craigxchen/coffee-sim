@@ -78,6 +78,7 @@ pub(crate) struct MpmBuffers {
     /// `MpmBuffers`; currently unread while `refresh_metrics` is stubbed.
     #[allow(dead_code)]
     pub metrics_staging: wgpu::Buffer,
+    pub filter_mesh_positions: wgpu::Buffer,
 }
 
 impl MpmBuffers {
@@ -179,6 +180,14 @@ impl MpmBuffers {
             mapped_at_creation: false,
         });
 
+        // 320 vertices (10 rings × 32 segments), each padded to vec4<f32>.
+        let filter_mesh_positions = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("mpm filter mesh positions"),
+            size: (320 * 16) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         let sdf_data = generate_sdf_data(settings);
         let sdf_class_data = generate_sdf_class_data(settings, &sdf_data);
         let (sdf_texture, sdf_view) = create_sdf_texture(device, queue, &sdf_data);
@@ -202,6 +211,7 @@ impl MpmBuffers {
             uniform_buffer,
             metrics,
             metrics_staging,
+            filter_mesh_positions,
         }
     }
 }

@@ -18,7 +18,6 @@ pub(crate) struct MpmPipelines {
     pub g2p: wgpu::ComputePipeline,
     pub bed_coupling: wgpu::ComputePipeline,
     pub extraction_advect: wgpu::ComputePipeline,
-    pub bed_dynamics: wgpu::ComputePipeline,
     pub prepare_render: wgpu::ComputePipeline,
 }
 
@@ -69,9 +68,13 @@ impl MpmPipelines {
                 // repurposed from the unused `bed_support_count` slot to
                 // stay within the 10-storage-buffer device limit.
                 storage_entry(10),
-                // 11: cached cell-solid classification for classify_cells
+                // 11: filter mesh positions (read-only, does not count
+                // against the read-write storage buffer cap on some
+                // adapters)
+                read_only_storage_entry(11),
+                // 12: cached cell-solid classification for classify_cells
                 wgpu::BindGroupLayoutEntry {
-                    binding: 11,
+                    binding: 12,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Texture {
                         sample_type: wgpu::TextureSampleType::Uint,
@@ -133,6 +136,10 @@ impl MpmPipelines {
                 },
                 wgpu::BindGroupEntry {
                     binding: 11,
+                    resource: buffers.filter_mesh_positions.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 12,
                     resource: wgpu::BindingResource::TextureView(&buffers.sdf_class_view),
                 },
             ],
@@ -175,7 +182,6 @@ impl MpmPipelines {
             g2p: make("g2p"),
             bed_coupling: make("bed_coupling"),
             extraction_advect: make("extraction_advect"),
-            bed_dynamics: make("bed_dynamics"),
             prepare_render: make("prepare_render"),
         }
     }
@@ -194,7 +200,6 @@ fn storage_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
     }
 }
 
-#[allow(dead_code)] // kept for future read-only bindings.
 fn read_only_storage_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,

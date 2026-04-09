@@ -54,7 +54,11 @@ struct ContactResult {
 @group(0) @binding(8) var<storage, read_write> bed_lookup: array<atomic<i32>>;
 @group(0) @binding(9) var<storage, read_write> bed_delta: array<atomic<i32>>;
 @group(0) @binding(10) var<storage, read_write> metrics: array<atomic<u32>>;
-@group(0) @binding(11) var sdf_class_tex: texture_3d<u32>;
+@group(0) @binding(11) var<storage, read> filter_mesh: array<vec4<f32>>;
+@group(0) @binding(12) var sdf_class_tex: texture_3d<u32>;
+
+const FILTER_RING_COUNT = 10u;
+const FILTER_SEGMENT_COUNT = 32u;
 
 // Metrics slot layout — keep in sync with `METRICS_SLOT_COUNT` in state.rs.
 const METRIC_MAX_ABS_DIV_IDX: u32 = 0u;
@@ -90,10 +94,8 @@ fn contact_offset() -> f32 { return u.sdf_params.w; }
 fn drag_coeff() -> f32 { return u.bed_params.x; }
 fn absorption_rate() -> f32 { return u.bed_params.y; }
 fn max_saturation() -> f32 { return u.bed_params.z; }
+fn has_filter() -> bool { return u.bed_params.w > 0.5; }
 fn extraction_rate() -> f32 { return u.extraction_params.x; }
-fn bed_spring() -> f32 { return u.extraction_params.y; }
-fn bed_damping() -> f32 { return u.extraction_params.z; }
-fn bed_impact() -> f32 { return u.extraction_params.w; }
 fn inactive_mass_threshold() -> f32 { return nominal_mass() * 0.10; }
 fn div_clamp_limit() -> f32 { return u.clamp_params.x; }
 fn pressure_clamp_limit() -> f32 { return u.clamp_params.y; }
@@ -174,9 +176,13 @@ fn is_fluid_kind(kind: i32) -> bool {
     // `pressure_update` (air neighbors count toward the denominator but
     // contribute 0 to the numerator), so excluding surface cells here would
     // zero them out and let gravity compress thin pools to a single layer.
+    //
+    // BED_COUPLED cells are excluded: bed particles deposit mass via P2G for
+    // PIC-averaging-based repulsion, but the pressure solver must not treat
+    // the packed bed as incompressible fluid (which would cause explosive
+    // outward pressure).
     return kind == CELL_INTERIOR_FLUID
-        || kind == CELL_SURFACE_FLUID
-        || kind == CELL_BED_COUPLED;
+        || kind == CELL_SURFACE_FLUID;
 }
 
 fn is_solid_kind(kind: i32) -> bool {
@@ -259,6 +265,61 @@ fn resolve_radial_barrier(
     return ContactResult(out_pos, out_vel);
 }
 
+fn resolve_filter_mesh_contact(pos: vec3<f32>, vel: vec3<f32>) -> ContactResult {
+    let mesh_bot_y = filter_mesh[0].y;
+    let mesh_top_y = filter_mesh[(FILTER_RING_COUNT - 1u) * FILTER_SEGMENT_COUNT].y;
+
+    if pos.y > mesh_top_y || pos.y < mesh_bot_y - 0.5 {
+        return ContactResult(pos, vel);
+    }
+
+    let ring_t = clamp((pos.y - mesh_bot_y) / (mesh_top_y - mesh_bot_y), 0.0, 1.0);
+    let ring_f = ring_t * f32(FILTER_RING_COUNT - 1u);
+    let ring_lo = u32(floor(ring_f));
+    let ring_hi = min(ring_lo + 1u, FILTER_RING_COUNT - 1u);
+    let ring_frac = ring_f - floor(ring_f);
+
+    let angle = atan2(pos.z, pos.x);
+    let seg_f = ((angle / (2.0 * 3.14159265) + 1.0) % 1.0) * f32(FILTER_SEGMENT_COUNT);
+    let seg_lo = u32(floor(seg_f)) % FILTER_SEGMENT_COUNT;
+    let seg_hi = (seg_lo + 1u) % FILTER_SEGMENT_COUNT;
+    let seg_frac = seg_f - floor(seg_f);
+
+    let v00 = filter_mesh[ring_lo * FILTER_SEGMENT_COUNT + seg_lo].xyz;
+    let v01 = filter_mesh[ring_lo * FILTER_SEGMENT_COUNT + seg_hi].xyz;
+    let v10 = filter_mesh[ring_hi * FILTER_SEGMENT_COUNT + seg_lo].xyz;
+    let v11 = filter_mesh[ring_hi * FILTER_SEGMENT_COUNT + seg_hi].xyz;
+
+    let mesh_r = mix(
+        mix(length(v00.xz), length(v01.xz), seg_frac),
+        mix(length(v10.xz), length(v11.xz), seg_frac),
+        ring_frac
+    );
+
+    var out_pos = pos;
+    var out_vel = vel;
+
+    if mesh_r > 0.1 {
+        let barrier_r = mesh_r - contact_offset();
+        let fc = resolve_radial_barrier(out_pos, out_vel, vec2<f32>(0.0, 0.0), barrier_r);
+        out_pos = fc.pos;
+        out_vel = fc.vel;
+    }
+
+    // Apex floor: only keep particles from falling through the bottom tip.
+    // The radial barrier handles the cone walls; this handles the point.
+    if out_pos.y < mesh_bot_y + contact_offset() {
+        out_pos.y = mesh_bot_y + contact_offset();
+        if out_vel.y < 0.0 {
+            out_vel.y = 0.0;
+            out_vel.x *= 1.0 - friction() * 0.55;
+            out_vel.z *= 1.0 - friction() * 0.55;
+        }
+    }
+
+    return ContactResult(out_pos, out_vel);
+}
+
 fn resolve_scene_obstacles(position: vec3<f32>, velocity: vec3<f32>, is_bed: bool) -> ContactResult {
     var out_pos = position;
     var out_vel = velocity;
@@ -274,30 +335,12 @@ fn resolve_scene_obstacles(position: vec3<f32>, velocity: vec3<f32>, is_bed: boo
         out_vel = cone_contact.vel;
     }
 
-    // Paper filter (bed particles only): the filter is porous — water
-    // passes through the paper, but coffee particles are trapped above.
-    // Below the V60 cone the filter narrows to a point at y=-3.37.
-    let filter_bot_y = -3.37;
-    if is_bed {
-        if out_pos.y < cone_bot_y && out_pos.y >= filter_bot_y {
-            let ft = (out_pos.y - filter_bot_y) / (cone_bot_y - filter_bot_y);
-            let filter_r = mix(0.0, 0.26, ft) - contact_offset();
-            if filter_r > 0.0 {
-                let fc = resolve_radial_barrier(out_pos, out_vel, vec2<f32>(0.0, 0.0), filter_r);
-                out_pos = fc.pos;
-                out_vel = fc.vel;
-            }
-        }
-
-        // Filter apex: floor keeps bed particles from falling through.
-        if out_pos.y <= filter_bot_y + contact_offset() && out_pos.y > filter_bot_y - 0.5 {
-            out_pos.y = filter_bot_y + contact_offset();
-            if out_vel.y < 0.0 {
-                out_vel.y = 0.0;
-                out_vel.x *= 1.0 - friction() * 0.55;
-                out_vel.z *= 1.0 - friction() * 0.55;
-            }
-        }
+    // Paper filter (bed particles only): the filter mesh is a deformable
+    // collision surface uploaded from the CPU cloth sim each frame.
+    if is_bed && has_filter() {
+        let fc = resolve_filter_mesh_contact(out_pos, out_vel);
+        out_pos = fc.pos;
+        out_vel = fc.vel;
     }
 
     // Carafe interior. Keep pooled water inside the cup walls and above the
@@ -376,7 +419,7 @@ fn p2g(@builtin(global_invocation_id) gid: vec3<u32>) {
     let J = p.pos.w;
     let mass_p = p.vel.w;
     let phase = a.col0.w;
-    if phase >= 0.5 || mass_p <= inactive_mass_threshold() {
+    if mass_p <= inactive_mass_threshold() {
         return;
     }
 
@@ -896,9 +939,6 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>) {
     let J_old = p.pos.w;
     let mass_p = p.vel.w;
     let phase = affine[pid].col0.w;
-    if phase >= 0.5 {
-        return;
-    }
     if mass_p <= inactive_mass_threshold() {
         particles[pid].vel.w = 0.0;
         return;
@@ -964,6 +1004,7 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>) {
     // contribute zero velocity. When support is weak, preserve more of the
     // particle's previous ballistic motion instead of letting the stream stall.
     let support_ratio = clamp(supported_weight, 0.0, 1.0);
+    let is_bed = phase >= 0.5;
     if supported_weight > 1e-6 {
         let inv_supported = 1.0 / supported_weight;
         new_v *= inv_supported;
@@ -971,8 +1012,20 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>) {
         new_C1 *= inv_supported;
         new_C2 *= inv_supported;
     }
+
+    // Bed particles deposit mass via P2G so PIC averaging provides implicit
+    // inter-particle repulsion, but they are excluded from the pressure
+    // solver. Dampen gathered velocity so the bed settles under gravity and
+    // responds to water impact without flying away.
+    if is_bed {
+        new_v *= 0.35;
+        new_C0 *= 0.35;
+        new_C1 *= 0.35;
+        new_C2 *= 0.35;
+    }
+
     let in_cup_volume = xp.y < -3.5 && dot(xp.xz, xp.xz) < (3.0 + contact_offset()) * (3.0 + contact_offset());
-    if support_ratio < 0.999 {
+    if support_ratio < 0.999 && !is_bed {
         let ballistic_v = vec3<f32>(p.vel.x, p.vel.y + gravity() * dt(), p.vel.z);
         let preserve = clamp((1.0 - support_ratio) * 1.15, 0.0, 0.95);
         new_v = mix(new_v, ballistic_v, preserve);
@@ -993,7 +1046,7 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>) {
         let home_idx = cell_index(u32(home_cell.x), u32(home_cell.y), u32(home_cell.z));
         bed_near = bed_lookup_load(home_idx) >= 0;
     }
-    let airborne = !bed_near && sample_sdf(xp) > contact_offset() * 2.0;
+    let airborne = !is_bed && !bed_near && sample_sdf(xp) > contact_offset() * 2.0;
     if airborne {
         let dense_mass = nominal_mass() * 4.0;
         let density_ratio = clamp(local_grid_mass / max(dense_mass, 1e-6), 0.0, 1.0);
@@ -1014,9 +1067,9 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>) {
     // Particle-level boundary projection closes the gap left by the grid-only
     // collision pass so the dripper wall behaves like a hard barrier.
     let mid_pos = mix(xp, new_pos, 0.5);
-    var contact = resolve_sdf_contact(mid_pos, new_v, false);
+    var contact = resolve_sdf_contact(mid_pos, new_v, is_bed);
     new_v = contact.vel;
-    contact = resolve_sdf_contact(new_pos, new_v, false);
+    contact = resolve_sdf_contact(new_pos, new_v, is_bed);
     new_pos = contact.pos;
     new_v = contact.vel;
 
@@ -1123,117 +1176,6 @@ fn extraction_advect(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     bed_extract[bid] = be;
-}
-
-// ── bed_dynamics ──
-
-@compute @workgroup_size(64)
-fn bed_dynamics(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let bid = gid.x;
-    if bid >= num_bed() { return; }
-
-    let pid = bid;
-    let p = particles[pid];
-    var rest = affine[pid].col1.xyz;
-    let pos = p.pos.xyz;
-    let mass_p = p.vel.w;
-
-    let origin = u.grid_origin.xyz;
-    let grid_pos = (pos - origin) * inv_dx();
-    let base = vec3<i32>(floor(grid_pos - 0.5));
-    let fx = grid_pos - vec3<f32>(base);
-
-    var wx: array<f32, 3>;
-    var wy: array<f32, 3>;
-    var wz: array<f32, 3>;
-    wx[0] = 0.5 * (1.5 - fx.x) * (1.5 - fx.x);
-    wx[1] = 0.75 - (fx.x - 1.0) * (fx.x - 1.0);
-    wx[2] = 0.5 * (fx.x - 0.5) * (fx.x - 0.5);
-    wy[0] = 0.5 * (1.5 - fx.y) * (1.5 - fx.y);
-    wy[1] = 0.75 - (fx.y - 1.0) * (fx.y - 1.0);
-    wy[2] = 0.5 * (fx.y - 0.5) * (fx.y - 0.5);
-    wz[0] = 0.5 * (1.5 - fx.z) * (1.5 - fx.z);
-    wz[1] = 0.75 - (fx.z - 1.0) * (fx.z - 1.0);
-    wz[2] = 0.5 * (fx.z - 0.5) * (fx.z - 0.5);
-
-    var water_v = vec3<f32>(0.0);
-    var water_mass = 0.0;
-
-    for (var i = 0u; i < 3u; i++) {
-        for (var j = 0u; j < 3u; j++) {
-            for (var k = 0u; k < 3u; k++) {
-                let offset = vec3<i32>(vec3<u32>(i, j, k));
-                let cell = base + offset;
-
-                if cell.x < 0 || cell.y < 0 || cell.z < 0 { continue; }
-                if u32(cell.x) >= gx() || u32(cell.y) >= gy() || u32(cell.z) >= gz() { continue; }
-
-                let w = wx[i] * wy[j] * wz[k];
-                let ci = cell_index(u32(cell.x), u32(cell.y), u32(cell.z));
-                let gv = grid_vel[ci];
-                water_v += w * gv.xyz;
-                water_mass += w * gv.w;
-            }
-        }
-    }
-
-    let sat = bed_extract[bid].extract.w;
-    let mobility = clamp((1.0 - sat) * (0.35 + water_mass * 0.12), 0.0, 1.0);
-    let surface_factor = clamp((rest.y + 3.0) / 3.5, 0.12, 1.0);
-    let spring = bed_spring() * (0.8 + sat * 0.5);
-    let damping = clamp(1.0 - bed_damping() * dt(), 0.0, 1.0);
-
-    var vel = p.vel.xyz;
-    vel += (rest - pos) * spring * dt();
-
-    let impact_v = vec3<f32>(water_v.x * 0.25, min(water_v.y, 0.0) * 0.9, water_v.z * 0.25);
-    vel += impact_v * bed_impact() * mobility * surface_factor * dt();
-    vel *= damping;
-
-    var new_pos = pos + vel * dt();
-    var offset = new_pos - rest;
-    let lateral_len = length(offset.xz);
-    let max_lateral = dx() * 0.9 * surface_factor;
-    if lateral_len > max_lateral && lateral_len > 1e-6 {
-        let lateral_dir = offset.xz / lateral_len;
-        offset.x = lateral_dir.x * max_lateral;
-        offset.z = lateral_dir.y * max_lateral;
-        vel.x *= 0.4;
-        vel.z *= 0.4;
-    }
-    offset.y = clamp(offset.y, -dx() * (1.75 * surface_factor + 0.2), dx() * 0.18);
-    new_pos = rest + offset;
-
-    // Plastic compaction: once the bed is indented enough, lower the remembered
-    // local rest height so the crater relaxes slowly instead of springing fully back.
-    let compression = max(rest.y - new_pos.y, 0.0);
-    let plastic_threshold = dx() * 0.18;
-    if compression > plastic_threshold {
-        let excess = compression - plastic_threshold;
-        let plasticity = clamp(
-            (0.18 + sat * 0.55 + mobility * 0.45) * surface_factor * dt() * 6.0,
-            0.0,
-            0.18,
-        );
-        rest.y -= excess * plasticity;
-    }
-
-    // Very slow rebound toward the original packed state for drier regions so
-    // old craters soften over time rather than staying perfectly frozen forever.
-    let packed_rest = affine[pid].col2.x;
-    if packed_rest != 0.0 {
-        let rebound = clamp((1.0 - sat) * dt() * 0.08, 0.0, 0.01);
-        rest.y = mix(rest.y, packed_rest, rebound);
-    }
-
-    let contact = resolve_sdf_contact(new_pos, vel, true);
-    new_pos = contact.pos;
-    vel = contact.vel;
-
-    particles[pid].pos = vec4<f32>(new_pos, p.pos.w);
-    particles[pid].vel = vec4<f32>(vel, mass_p);
-    affine[pid].col1 = vec4<f32>(rest, 0.0);
-    bed_extract[bid].bed.w = max((rest.y - new_pos.y) / max(dx(), 1e-6), 0.0);
 }
 
 // ── prepare_render ──
