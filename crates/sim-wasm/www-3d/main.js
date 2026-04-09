@@ -60,9 +60,6 @@ const PAN_CODES = new Set([
   "KeyA",
   "KeyS",
   "KeyD",
-  "Space",
-  "ShiftLeft",
-  "ShiftRight",
 ]);
 
 await init();
