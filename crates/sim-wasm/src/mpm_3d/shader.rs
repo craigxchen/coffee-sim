@@ -17,6 +17,7 @@ struct MpmUniforms {
     bed_params: vec4<f32>,
     extraction_params: vec4<f32>,
     time_params: vec4<f32>,
+    clamp_params: vec4<f32>,
 };
 
 struct Particle {
@@ -50,9 +51,16 @@ struct ContactResult {
 @group(0) @binding(5) var sdf_texture: texture_3d<f32>;
 @group(0) @binding(6) var<storage, read_write> render_data: array<vec4<f32>>;
 @group(0) @binding(7) var<storage, read_write> bed_extract: array<BedExtract>;
-@group(0) @binding(8) var<storage, read> bed_lookup: array<i32>;
+@group(0) @binding(8) var<storage, read_write> bed_lookup: array<atomic<i32>>;
 @group(0) @binding(9) var<storage, read_write> bed_delta: array<atomic<i32>>;
-@group(0) @binding(10) var<storage, read> bed_support_count: array<u32>;
+@group(0) @binding(10) var<storage, read_write> metrics: array<atomic<u32>>;
+
+// Metrics slot layout — keep in sync with `METRICS_SLOT_COUNT` in state.rs.
+const METRIC_MAX_ABS_DIV_IDX: u32 = 0u;
+const METRIC_FLUID_CELLS_IDX: u32 = 1u;
+const METRIC_DIV_CLAMP_FIRES_IDX: u32 = 2u;
+const METRIC_PRESSURE_CLAMP_FIRES_IDX: u32 = 3u;
+const METRIC_MASS_OVERFLOW_FIRES_IDX: u32 = 4u;
 
 // ── Helpers ──
 
@@ -80,13 +88,15 @@ fn contact_offset() -> f32 { return u.sdf_params.w; }
 fn drag_coeff() -> f32 { return u.bed_params.x; }
 fn absorption_rate() -> f32 { return u.bed_params.y; }
 fn max_saturation() -> f32 { return u.bed_params.z; }
-fn projection_enabled() -> bool { return u.bed_params.w > 0.5; }
 fn extraction_rate() -> f32 { return u.extraction_params.x; }
 fn bed_spring() -> f32 { return u.extraction_params.y; }
 fn bed_damping() -> f32 { return u.extraction_params.z; }
 fn bed_impact() -> f32 { return u.extraction_params.w; }
 fn inactive_mass_threshold() -> f32 { return nominal_mass() * 0.10; }
-fn temp_sparse_ballistic_enabled() -> bool { return u.time_params.z > 0.5; }
+fn div_clamp_limit() -> f32 { return u.clamp_params.x; }
+fn pressure_clamp_limit() -> f32 { return u.clamp_params.y; }
+fn metrics_div_fp_scale() -> f32 { return u.clamp_params.z; }
+fn metrics_div_inv_fp_scale() -> f32 { return u.clamp_params.w; }
 
 fn cell_index(ix: u32, iy: u32, iz: u32) -> u32 {
     return iz * gx() * gy() + iy * gx() + ix;
@@ -98,14 +108,24 @@ fn grid_mom_y_idx(cell: u32) -> u32 { return 2u * total_cells() + cell; }
 fn grid_mom_z_idx(cell: u32) -> u32 { return 3u * total_cells() + cell; }
 fn scratch_pressure_idx(cell: u32) -> u32 { return grid_mass_idx(cell); }
 fn scratch_div_idx(cell: u32) -> u32 { return grid_mom_x_idx(cell); }
-fn scratch_residual_idx(cell: u32) -> u32 { return grid_mom_y_idx(cell); }
+// Slot 2 (`grid_mom_y_idx`) is reused only as the mass/momentum accumulator
+// during `p2g`; projection no longer keeps a per-cell residual so no scratch
+// alias is defined for it. Add one back if/when an iterative residual probe
+// needs the slot during the projection pass.
 fn scratch_kind_idx(cell: u32) -> u32 { return grid_mom_z_idx(cell); }
-fn occupancy_mass_threshold() -> f32 { return nominal_mass(); }
+// A quadratic-B-spline particle deposits at most `nominal_mass * 0.75^3 ≈
+// 0.42 * nominal_mass` to its peak cell. The threshold must stay strictly
+// below that peak or isolated particles never register as fluid. Matching
+// `inactive_mass_threshold()` at 0.1 * nominal_mass means "enough mass to
+// still exist" ⇔ "enough mass to produce a fluid cell", which is
+// semantically consistent and keeps ghost-splat noise below the bar.
+fn occupancy_mass_threshold() -> f32 { return nominal_mass() * 0.1; }
 
 const CELL_AIR: i32 = 0;
 const CELL_SURFACE_FLUID: i32 = 1;
 const CELL_INTERIOR_FLUID: i32 = 2;
 const CELL_BED_COUPLED: i32 = 3;
+const CELL_SOLID: i32 = 4;
 
 fn cell_kind_load(cell: u32) -> i32 {
     return atomicLoad(&grid[scratch_kind_idx(cell)]);
@@ -116,7 +136,11 @@ fn pressure_load(cell: u32) -> f32 {
 }
 
 fn pressure_store(cell: u32, value: f32) {
-    let clamped = clamp(value, -2048.0, 2048.0);
+    let limit = pressure_clamp_limit();
+    let clamped = clamp(value, -limit, limit);
+    if clamped != value {
+        atomicAdd(&metrics[METRIC_PRESSURE_CLAMP_FIRES_IDX], 1u);
+    }
     atomicStore(&grid[scratch_pressure_idx(cell)], i32(clamped * fp_scale()));
 }
 
@@ -125,12 +149,32 @@ fn divergence_load(cell: u32) -> f32 {
 }
 
 fn divergence_store(cell: u32, value: f32) {
-    let clamped = clamp(value, -2048.0, 2048.0);
+    let limit = div_clamp_limit();
+    let clamped = clamp(value, -limit, limit);
+    if clamped != value {
+        atomicAdd(&metrics[METRIC_DIV_CLAMP_FIRES_IDX], 1u);
+    }
     atomicStore(&grid[scratch_div_idx(cell)], i32(clamped * fp_scale()));
 }
 
+fn bed_lookup_load(cell: u32) -> i32 {
+    return atomicLoad(&bed_lookup[cell]);
+}
+
 fn is_fluid_kind(kind: i32) -> bool {
-    return kind == CELL_INTERIOR_FLUID || kind == CELL_BED_COUPLED;
+    // Surface cells must participate in the pressure solve so hydrostatic
+    // pressure can build up in shallow puddles. Adjacent CELL_AIR cells
+    // provide the Dirichlet p=0 BC via the neighbor-loop sum in
+    // `pressure_update` (air neighbors count toward the denominator but
+    // contribute 0 to the numerator), so excluding surface cells here would
+    // zero them out and let gravity compress thin pools to a single layer.
+    return kind == CELL_INTERIOR_FLUID
+        || kind == CELL_SURFACE_FLUID
+        || kind == CELL_BED_COUPLED;
+}
+
+fn is_solid_kind(kind: i32) -> bool {
+    return kind == CELL_SOLID;
 }
 
 fn world_to_cell(position: vec3<f32>) -> vec3<i32> {
@@ -209,12 +253,11 @@ fn resolve_radial_barrier(
     return ContactResult(out_pos, out_vel);
 }
 
-fn resolve_scene_obstacles(position: vec3<f32>, velocity: vec3<f32>) -> ContactResult {
+fn resolve_scene_obstacles(position: vec3<f32>, velocity: vec3<f32>, is_bed: bool) -> ContactResult {
     var out_pos = position;
     var out_vel = velocity;
 
-    // V60 dripper interior. Open at the top and bottom, but particles should
-    // stay inside the cone wall as they travel toward the outlet.
+    // V60 dripper interior. Radial barrier keeps particles inside the cone.
     let cone_top_y = 3.0;
     let cone_bot_y = -3.0;
     if out_pos.y <= cone_top_y && out_pos.y >= cone_bot_y {
@@ -223,6 +266,32 @@ fn resolve_scene_obstacles(position: vec3<f32>, velocity: vec3<f32>) -> ContactR
         let cone_contact = resolve_radial_barrier(out_pos, out_vel, vec2<f32>(0.0, 0.0), cone_radius);
         out_pos = cone_contact.pos;
         out_vel = cone_contact.vel;
+    }
+
+    // Paper filter (bed particles only): the filter is porous — water
+    // passes through the paper, but coffee particles are trapped above.
+    // Below the V60 cone the filter narrows to a point at y=-3.37.
+    let filter_bot_y = -3.37;
+    if is_bed {
+        if out_pos.y < cone_bot_y && out_pos.y >= filter_bot_y {
+            let ft = (out_pos.y - filter_bot_y) / (cone_bot_y - filter_bot_y);
+            let filter_r = mix(0.0, 0.26, ft) - contact_offset();
+            if filter_r > 0.0 {
+                let fc = resolve_radial_barrier(out_pos, out_vel, vec2<f32>(0.0, 0.0), filter_r);
+                out_pos = fc.pos;
+                out_vel = fc.vel;
+            }
+        }
+
+        // Filter apex: floor keeps bed particles from falling through.
+        if out_pos.y <= filter_bot_y + contact_offset() && out_pos.y > filter_bot_y - 0.5 {
+            out_pos.y = filter_bot_y + contact_offset();
+            if out_vel.y < 0.0 {
+                out_vel.y = 0.0;
+                out_vel.x *= 1.0 - friction() * 0.55;
+                out_vel.z *= 1.0 - friction() * 0.55;
+            }
+        }
     }
 
     // Carafe interior. Keep pooled water inside the cup walls and above the
@@ -247,7 +316,7 @@ fn resolve_scene_obstacles(position: vec3<f32>, velocity: vec3<f32>) -> ContactR
     return ContactResult(out_pos, out_vel);
 }
 
-fn resolve_sdf_contact(position: vec3<f32>, velocity: vec3<f32>) -> ContactResult {
+fn resolve_sdf_contact(position: vec3<f32>, velocity: vec3<f32>, is_bed: bool) -> ContactResult {
     var out_pos = position;
     var out_vel = velocity;
 
@@ -269,7 +338,7 @@ fn resolve_sdf_contact(position: vec3<f32>, velocity: vec3<f32>) -> ContactResul
         }
     }
 
-    let hard_contact = resolve_scene_obstacles(out_pos, out_vel);
+    let hard_contact = resolve_scene_obstacles(out_pos, out_vel, is_bed);
     return ContactResult(hard_contact.pos, hard_contact.vel);
 }
 
@@ -324,18 +393,13 @@ fn p2g(@builtin(global_invocation_id) gid: vec3<u32>) {
     wz[1] = 0.75 - (fx.z - 1.0) * (fx.z - 1.0);
     wz[2] = 0.5 * (fx.z - 0.5) * (fx.z - 0.5);
 
-    var stress = 0.0;
-    if !projection_enabled() {
-        stress = -dt() * 4.0 * inv_dx() * inv_dx() * p_vol() * bulk_K() * (J - 1.0);
-    }
-
-    // Affine = stress*I + mass_p*C
+    // Affine = mass_p*C (J-stress disabled under pressure projection)
     let C0 = a.col0.xyz;
     let C1 = a.col1.xyz;
     let C2 = a.col2.xyz;
-    let aff_col0 = vec3<f32>(stress + mass_p * C0.x, mass_p * C0.y, mass_p * C0.z);
-    let aff_col1 = vec3<f32>(mass_p * C1.x, stress + mass_p * C1.y, mass_p * C1.z);
-    let aff_col2 = vec3<f32>(mass_p * C2.x, mass_p * C2.y, stress + mass_p * C2.z);
+    let aff_col0 = vec3<f32>(mass_p * C0.x, mass_p * C0.y, mass_p * C0.z);
+    let aff_col1 = vec3<f32>(mass_p * C1.x, mass_p * C1.y, mass_p * C1.z);
+    let aff_col2 = vec3<f32>(mass_p * C2.x, mass_p * C2.y, mass_p * C2.z);
 
     let fp = fp_scale();
     let cell_dx = dx();
@@ -360,10 +424,25 @@ fn p2g(@builtin(global_invocation_id) gid: vec3<u32>) {
                 ));
 
                 let ci = cell_index(u32(cell.x), u32(cell.y), u32(cell.z));
-                atomicAdd(&grid[grid_mass_idx(ci)], i32(mass_contrib * fp));
-                atomicAdd(&grid[grid_mom_x_idx(ci)], i32(mom.x * fp));
-                atomicAdd(&grid[grid_mom_y_idx(ci)], i32(mom.y * fp));
-                atomicAdd(&grid[grid_mom_z_idx(ci)], i32(mom.z * fp));
+                // Overflow probe: each per-cell per-axis term must stay below
+                // `i32::MAX`. The tightest channel in practice is momentum,
+                // which is mass_contrib * v_cap scaled by FP. We log any single
+                // contribution that comes within ~50% of the int limit so
+                // accumulation headroom stays visible from the HUD once the
+                // readback path is re-enabled.
+                let limit_m = 1.0e9;
+                let mass_fp = mass_contrib * fp;
+                let mom_x_fp = mom.x * fp;
+                let mom_y_fp = mom.y * fp;
+                let mom_z_fp = mom.z * fp;
+                if abs(mass_fp) > limit_m || abs(mom_x_fp) > limit_m
+                    || abs(mom_y_fp) > limit_m || abs(mom_z_fp) > limit_m {
+                    atomicAdd(&metrics[METRIC_MASS_OVERFLOW_FIRES_IDX], 1u);
+                }
+                atomicAdd(&grid[grid_mass_idx(ci)], i32(mass_fp));
+                atomicAdd(&grid[grid_mom_x_idx(ci)], i32(mom_x_fp));
+                atomicAdd(&grid[grid_mom_y_idx(ci)], i32(mom_y_fp));
+                atomicAdd(&grid[grid_mom_z_idx(ci)], i32(mom_z_fp));
             }
         }
     }
@@ -409,7 +488,30 @@ fn classify_cells(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     let mass = grid_vel[idx].w;
     pressure_store(idx, 0.0);
-    atomicStore(&grid[scratch_residual_idx(idx)], 0);
+
+    // Hoist index decomposition so the SDF probe, the has_air_neighbor
+    // loop, and the divergence stencil can all reuse it.
+    let iz_val = idx / (gx() * gy());
+    let rem = idx % (gx() * gy());
+    let iy_val = rem / gx();
+    let ix_val = rem % gx();
+
+    // SDF solid classification. Sign convention (see state.rs
+    // `generate_sdf_data`):
+    //   sdf > 0  → open fluid domain (inside the cup)
+    //   sdf = 0  → on the wall surface
+    //   sdf < 0  → inside wall material or exterior ambient space
+    // Marking sdf<0 cells as CELL_SOLID lets the pressure solve treat them
+    // with a Neumann BC (∂p/∂n = 0) via the ghost-mirror trick in
+    // pressure_update / project_pressure, instead of the Dirichlet p=0
+    // they'd get if lumped with air.
+    let cell_center = u.grid_origin.xyz
+        + (vec3<f32>(f32(ix_val), f32(iy_val), f32(iz_val)) + vec3<f32>(0.5)) * dx();
+    if sample_sdf(cell_center) < 0.0 {
+        atomicStore(&grid[scratch_kind_idx(idx)], CELL_SOLID);
+        divergence_store(idx, 0.0);
+        return;
+    }
 
     if mass <= occupancy_mass_threshold() {
         atomicStore(&grid[scratch_kind_idx(idx)], CELL_AIR);
@@ -417,14 +519,9 @@ fn classify_cells(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
 
-    if bed_lookup[idx] >= 0 {
+    if bed_lookup_load(idx) >= 0 {
         atomicStore(&grid[scratch_kind_idx(idx)], CELL_BED_COUPLED);
     } else {
-        let iz_val = idx / (gx() * gy());
-        let rem = idx % (gx() * gy());
-        let iy_val = rem / gx();
-        let ix_val = rem % gx();
-
         let offsets = array<vec3<i32>, 6>(
             vec3<i32>(-1, 0, 0),
             vec3<i32>(1, 0, 0),
@@ -462,38 +559,81 @@ fn classify_cells(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
 
-    let iz_val = idx / (gx() * gy());
-    let rem = idx % (gx() * gy());
-    let iy_val = rem / gx();
-    let ix_val = rem % gx();
-
-    var vxm = 0.0;
-    var vxp = 0.0;
-    var vym = 0.0;
-    var vyp = 0.0;
-    var vzm = 0.0;
-    var vzp = 0.0;
-    if ix_val > 0u {
+    // Central-difference divergence using cell-centered velocities. No-flow
+    // boundaries (off-grid faces and CELL_SOLID neighbors) use a ghost-mirror
+    // on the normal velocity component: v_ghost.n = -v_self.n. That makes
+    // the central difference cancel to zero at a quiescent wall cell, which
+    // is the matching RHS treatment for the Neumann LHS handling in
+    // pressure_update / project_pressure. Previously initializing these to 0
+    // injected a spurious sink (v_self.n - 0) / 2dx at every wall-adjacent
+    // fluid cell and pushed fluid away from the cup floor.
+    //
+    // Neighbor-solid detection samples the static SDF directly rather than
+    // calling cell_kind_load, because classify_cells is the dispatch that
+    // writes cell_kind — reading a neighbor's kind here races against other
+    // workgroups. The SDF is read-only so neighbor SDF probes are race-free.
+    let self_vel = grid_vel[idx].xyz;
+    let dx_vec = dx();
+    var vxm = -self_vel.x;
+    var vxp = -self_vel.x;
+    var vym = -self_vel.y;
+    var vyp = -self_vel.y;
+    var vzm = -self_vel.z;
+    var vzp = -self_vel.z;
+    if ix_val > 0u
+        && sample_sdf(cell_center + vec3<f32>(-dx_vec, 0.0, 0.0)) >= 0.0 {
         vxm = grid_vel[cell_index(ix_val - 1u, iy_val, iz_val)].x;
     }
-    if ix_val + 1u < gx() {
+    if ix_val + 1u < gx()
+        && sample_sdf(cell_center + vec3<f32>(dx_vec, 0.0, 0.0)) >= 0.0 {
         vxp = grid_vel[cell_index(ix_val + 1u, iy_val, iz_val)].x;
     }
-    if iy_val > 0u {
+    if iy_val > 0u
+        && sample_sdf(cell_center + vec3<f32>(0.0, -dx_vec, 0.0)) >= 0.0 {
         vym = grid_vel[cell_index(ix_val, iy_val - 1u, iz_val)].y;
     }
-    if iy_val + 1u < gy() {
+    if iy_val + 1u < gy()
+        && sample_sdf(cell_center + vec3<f32>(0.0, dx_vec, 0.0)) >= 0.0 {
         vyp = grid_vel[cell_index(ix_val, iy_val + 1u, iz_val)].y;
     }
-    if iz_val > 0u {
+    if iz_val > 0u
+        && sample_sdf(cell_center + vec3<f32>(0.0, 0.0, -dx_vec)) >= 0.0 {
         vzm = grid_vel[cell_index(ix_val, iy_val, iz_val - 1u)].z;
     }
-    if iz_val + 1u < gz() {
+    if iz_val + 1u < gz()
+        && sample_sdf(cell_center + vec3<f32>(0.0, 0.0, dx_vec)) >= 0.0 {
         vzp = grid_vel[cell_index(ix_val, iy_val, iz_val + 1u)].z;
     }
 
     let div = 0.5 * inv_dx() * ((vxp - vxm) + (vyp - vym) + (vzp - vzm));
-    divergence_store(idx, div);
+
+    // Sink-augmented divergence for bed-coupled cells (PLAN.md formula):
+    //   div(u) = -m_abs / (rho * V * dt)
+    // Adding a positive sink tells the pressure solver to allow convergent
+    // flow at bed cells rather than fighting it to zero. After projection
+    // (vel -= dt * grad_p), the dt factors cancel via the 1/dt normalization
+    // in pressure_update, so div(u_new) = -sink exactly.
+    var sink = 0.0;
+    if kind == CELL_BED_COUPLED {
+        let bed_idx = bed_lookup_load(idx);
+        if bed_idx >= 0 {
+            let be = bed_extract[u32(bed_idx)];
+            let saturation = be.extract.w;
+            let abs_frac = clamp(absorption_rate() * (1.0 - saturation) * dt(), 0.0, 0.25);
+            let predicted_abs = mass * abs_frac;
+            let ref_mass = nominal_mass() * 8.0;
+            sink = predicted_abs / (ref_mass * dt());
+        }
+    }
+    divergence_store(idx, div + sink);
+
+    // Observability: track the worst-case cell divergence and the fluid-cell
+    // footprint of the active substep. `atomicMax` on u32 gives the peak FP
+    // encoding; the HUD decodes via `METRICS_DIV_FP_SCALE`.
+    let abs_div = abs(div);
+    let fp_div = u32(clamp(abs_div * metrics_div_fp_scale(), 0.0, f32(0x7fffffffu)));
+    atomicMax(&metrics[METRIC_MAX_ABS_DIV_IDX], fp_div);
+    atomicAdd(&metrics[METRIC_FLUID_CELLS_IDX], 1u);
 }
 
 // ── pressure_rbgs ──
@@ -526,14 +666,27 @@ fn pressure_update(idx: u32, target_parity: u32) {
 
     for (var n = 0u; n < 6u; n++) {
         let neighbor = vec3<i32>(i32(ix_val), i32(iy_val), i32(iz_val)) + offsets[n];
+        // Off-grid neighbors act as Neumann (no-flow) — skip from both
+        // numerator and denominator. Preserves existing behavior.
         if neighbor.x < 0 || neighbor.y < 0 || neighbor.z < 0
             || u32(neighbor.x) >= gx() || u32(neighbor.y) >= gy() || u32(neighbor.z) >= gz() {
             continue;
         }
 
-        neighbor_count += 1.0;
         let neighbor_idx = cell_index(u32(neighbor.x), u32(neighbor.y), u32(neighbor.z));
         let neighbor_kind = cell_kind_load(neighbor_idx);
+
+        // Solid neighbor → Neumann BC via ghost-mirror (p_ghost = p_here).
+        // The standard 7-point Laplacian with a mirror ghost drops the
+        // solid face from both the numerator and denominator of the
+        // averaging update, so we `continue` before touching neighbor_count.
+        if is_solid_kind(neighbor_kind) {
+            continue;
+        }
+
+        neighbor_count += 1.0;
+        // Air neighbor → Dirichlet p=0, contributes 0 to pressure_sum.
+        // Fluid neighbor → contributes its pressure.
         if is_fluid_kind(neighbor_kind) {
             pressure_sum += pressure_load(neighbor_idx);
         }
@@ -590,23 +743,44 @@ fn project_pressure(@builtin(global_invocation_id) gid: vec3<u32>) {
     var p_yp = p_here;
     var p_zm = p_here;
     var p_zp = p_here;
+    // Skip the overwrite when the neighbor is solid so the mirror
+    // pressure (initialized to p_here) is preserved — this gives
+    // ∂p/∂n = 0 across the wall face and zero contribution to grad_p.
     if ix_val > 0u {
-        p_xm = pressure_load(cell_index(ix_val - 1u, iy_val, iz_val));
+        let ci = cell_index(ix_val - 1u, iy_val, iz_val);
+        if !is_solid_kind(cell_kind_load(ci)) {
+            p_xm = pressure_load(ci);
+        }
     }
     if ix_val + 1u < gx() {
-        p_xp = pressure_load(cell_index(ix_val + 1u, iy_val, iz_val));
+        let ci = cell_index(ix_val + 1u, iy_val, iz_val);
+        if !is_solid_kind(cell_kind_load(ci)) {
+            p_xp = pressure_load(ci);
+        }
     }
     if iy_val > 0u {
-        p_ym = pressure_load(cell_index(ix_val, iy_val - 1u, iz_val));
+        let ci = cell_index(ix_val, iy_val - 1u, iz_val);
+        if !is_solid_kind(cell_kind_load(ci)) {
+            p_ym = pressure_load(ci);
+        }
     }
     if iy_val + 1u < gy() {
-        p_yp = pressure_load(cell_index(ix_val, iy_val + 1u, iz_val));
+        let ci = cell_index(ix_val, iy_val + 1u, iz_val);
+        if !is_solid_kind(cell_kind_load(ci)) {
+            p_yp = pressure_load(ci);
+        }
     }
     if iz_val > 0u {
-        p_zm = pressure_load(cell_index(ix_val, iy_val, iz_val - 1u));
+        let ci = cell_index(ix_val, iy_val, iz_val - 1u);
+        if !is_solid_kind(cell_kind_load(ci)) {
+            p_zm = pressure_load(ci);
+        }
     }
     if iz_val + 1u < gz() {
-        p_zp = pressure_load(cell_index(ix_val, iy_val, iz_val + 1u));
+        let ci = cell_index(ix_val, iy_val, iz_val + 1u);
+        if !is_solid_kind(cell_kind_load(ci)) {
+            p_zp = pressure_load(ci);
+        }
     }
 
     let grad_p = 0.5 * inv_dx() * vec3<f32>(
@@ -763,7 +937,7 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>) {
         new_C2 *= inv_supported;
     }
     let in_cup_volume = xp.y < -3.5 && dot(xp.xz, xp.xz) < (3.0 + contact_offset()) * (3.0 + contact_offset());
-    if temp_sparse_ballistic_enabled() && support_ratio < 0.999 {
+    if support_ratio < 0.999 {
         let ballistic_v = vec3<f32>(p.vel.x, p.vel.y + gravity() * dt(), p.vel.z);
         let preserve = clamp((1.0 - support_ratio) * 1.15, 0.0, 0.95);
         new_v = mix(new_v, ballistic_v, preserve);
@@ -782,10 +956,10 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>) {
     if home_cell.x >= 0 && home_cell.y >= 0 && home_cell.z >= 0
         && u32(home_cell.x) < gx() && u32(home_cell.y) < gy() && u32(home_cell.z) < gz() {
         let home_idx = cell_index(u32(home_cell.x), u32(home_cell.y), u32(home_cell.z));
-        bed_near = bed_lookup[home_idx] >= 0;
+        bed_near = bed_lookup_load(home_idx) >= 0;
     }
     let airborne = !bed_near && sample_sdf(xp) > contact_offset() * 2.0;
-    if temp_sparse_ballistic_enabled() && airborne {
+    if airborne {
         let dense_mass = nominal_mass() * 4.0;
         let density_ratio = clamp(local_grid_mass / max(dense_mass, 1e-6), 0.0, 1.0);
         let ballistic_v = vec3<f32>(p.vel.x, p.vel.y + gravity() * dt(), p.vel.z);
@@ -797,13 +971,7 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>) {
         new_C2 *= affine_damp;
     }
 
-    // Under pressure projection, J no longer drives the water stress path.
-    var J_new = 1.0;
-    if !projection_enabled() {
-        let trace_C = new_C0.x + new_C1.y + new_C2.z;
-        J_new = J_old * (1.0 + dt() * trace_C);
-        J_new = clamp(J_new, 0.1, 10.0);
-    }
+    let J_new = 1.0;
 
     // Advect
     var new_pos = xp + new_v * dt();
@@ -811,9 +979,9 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>) {
     // Particle-level boundary projection closes the gap left by the grid-only
     // collision pass so the dripper wall behaves like a hard barrier.
     let mid_pos = mix(xp, new_pos, 0.5);
-    var contact = resolve_sdf_contact(mid_pos, new_v);
+    var contact = resolve_sdf_contact(mid_pos, new_v, false);
     new_v = contact.vel;
-    contact = resolve_sdf_contact(new_pos, new_v);
+    contact = resolve_sdf_contact(new_pos, new_v, false);
     new_pos = contact.pos;
     new_v = contact.vel;
 
@@ -850,7 +1018,7 @@ fn bed_coupling(@builtin(global_invocation_id) gid: vec3<u32>) {
     if u32(cell.x) >= gx() || u32(cell.y) >= gy() || u32(cell.z) >= gz() { return; }
 
     let ci = cell_index(u32(cell.x), u32(cell.y), u32(cell.z));
-    let bed_idx = bed_lookup[ci];
+    let bed_idx = bed_lookup_load(ci);
     if bed_idx < 0 || u32(bed_idx) >= num_bed() {
         return;
     }
@@ -1023,7 +1191,7 @@ fn bed_dynamics(@builtin(global_invocation_id) gid: vec3<u32>) {
         rest.y = mix(rest.y, packed_rest, rebound);
     }
 
-    let contact = resolve_sdf_contact(new_pos, vel);
+    let contact = resolve_sdf_contact(new_pos, vel, true);
     new_pos = contact.pos;
     vel = contact.vel;
 
@@ -1061,6 +1229,64 @@ fn prepare_render(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     render_data[pid] = vec4<f32>(p.pos.xyz, color_t);
+}
+
+// ── metrics_clear ──
+
+const METRICS_SLOT_COUNT: u32 = 8u;
+
+@compute @workgroup_size(8)
+fn metrics_clear(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if idx >= METRICS_SLOT_COUNT { return; }
+    atomicStore(&metrics[idx], 0u);
+}
+
+// ── bed_lookup_clear ──
+
+@compute @workgroup_size(64)
+fn bed_lookup_clear(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if idx >= total_cells() { return; }
+    atomicStore(&bed_lookup[idx], -1);
+}
+
+// ── bed_lookup_scatter ──
+//
+// Each bed particle stamps its id into a 3x3x3 cell neighborhood around its
+// center using `atomicMax`. The highest bed id wins deterministically, which
+// matches the CPU-side `build_cell_lookup` ordering and keeps the lookup
+// current as bed particles deform from their rest positions.
+@compute @workgroup_size(64)
+fn bed_lookup_scatter(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let bid = gid.x;
+    if bid >= num_bed() { return; }
+
+    // Bed particles occupy the leading slots in the particle array (bed
+    // first, water appended). The bed array has length `num_bed` and starts
+    // at index 0.
+    let pid = bid;
+    let phase = affine[pid].col0.w;
+    if phase < 0.5 {
+        // Defensive: bed particle should always have phase >= 0.5.
+        return;
+    }
+
+    let pos = particles[pid].pos.xyz;
+    let cell = world_to_cell(pos);
+    let id = i32(bid);
+
+    for (var di = -1; di <= 1; di++) {
+        for (var dj = -1; dj <= 1; dj++) {
+            for (var dk = -1; dk <= 1; dk++) {
+                let c = cell + vec3<i32>(di, dj, dk);
+                if c.x < 0 || c.y < 0 || c.z < 0 { continue; }
+                if u32(c.x) >= gx() || u32(c.y) >= gy() || u32(c.z) >= gz() { continue; }
+                let ci = cell_index(u32(c.x), u32(c.y), u32(c.z));
+                atomicMax(&bed_lookup[ci], id);
+            }
+        }
+    }
 }
 "#;
 

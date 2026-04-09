@@ -110,6 +110,7 @@ impl WasmSim3D {
         self.sim.exit_speed()
     }
 
+
     pub fn render(&mut self) -> Result<(), JsValue> {
         self.renderer.render_3d(&self.sim, self.camera)
     }
@@ -126,6 +127,12 @@ impl WasmSim3D {
     #[wasm_bindgen(js_name = zoomCamera)]
     pub fn zoom_camera(&mut self, delta: f32) {
         self.camera.zoom(delta, self.sim.settings().bounds_size);
+    }
+
+    #[wasm_bindgen(js_name = panCamera)]
+    pub fn pan_camera(&mut self, right: f32, up: f32, forward: f32) {
+        self.camera
+            .pan(right, up, forward, self.sim.settings().bounds_size);
     }
 
     #[wasm_bindgen(js_name = particleCount)]
@@ -178,24 +185,41 @@ impl WasmSim3D {
         self.sim.settings().bed.is_some()
     }
 
-    #[wasm_bindgen(js_name = setTempSparseBallisticEnabled)]
-    pub fn set_temp_sparse_ballistic_enabled(&mut self, enabled: bool) {
-        self.sim.set_temp_sparse_ballistic_enabled(enabled);
+
+    #[wasm_bindgen(js_name = refreshMetrics)]
+    pub async fn refresh_metrics(&mut self) -> Result<(), JsValue> {
+        // Clone the internal Arc-backed `wgpu::Device` / `wgpu::Queue` so we
+        // can hold them across the await point without overlapping
+        // `&mut self.sim`. The clones are cheap — just `Arc::clone` under
+        // the hood.
+        let device = self.renderer.device().clone();
+        let queue = self.renderer.queue().clone();
+        self.sim.refresh_metrics(&device, &queue).await
     }
 
-    #[wasm_bindgen(js_name = setPressureProjectionEnabled)]
-    pub fn set_pressure_projection_enabled(&mut self, enabled: bool) {
-        self.sim.set_pressure_projection_enabled(enabled);
+    #[wasm_bindgen(js_name = maxAbsDivergence)]
+    pub fn max_abs_divergence(&self) -> f32 {
+        self.sim.latest_metrics().max_abs_div
     }
 
-    #[wasm_bindgen(js_name = pressureProjectionEnabled)]
-    pub fn pressure_projection_enabled(&self) -> bool {
-        self.sim.pressure_projection_enabled()
+    #[wasm_bindgen(js_name = fluidCellCount)]
+    pub fn fluid_cell_count(&self) -> u32 {
+        self.sim.latest_metrics().fluid_cells
     }
 
-    #[wasm_bindgen(js_name = tempSparseBallisticEnabled)]
-    pub fn temp_sparse_ballistic_enabled(&self) -> bool {
-        self.sim.temp_sparse_ballistic_enabled()
+    #[wasm_bindgen(js_name = divClampFires)]
+    pub fn div_clamp_fires(&self) -> u32 {
+        self.sim.latest_metrics().div_clamp_fires
+    }
+
+    #[wasm_bindgen(js_name = pressureClampFires)]
+    pub fn pressure_clamp_fires(&self) -> u32 {
+        self.sim.latest_metrics().pressure_clamp_fires
+    }
+
+    #[wasm_bindgen(js_name = massOverflowFires)]
+    pub fn mass_overflow_fires(&self) -> u32 {
+        self.sim.latest_metrics().mass_overflow_fires
     }
 
 }

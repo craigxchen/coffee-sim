@@ -6,6 +6,9 @@ use super::state::MpmBuffers;
 pub(crate) struct MpmPipelines {
     pub bind_group: wgpu::BindGroup,
     pub clear_grid: wgpu::ComputePipeline,
+    pub metrics_clear: wgpu::ComputePipeline,
+    pub bed_lookup_clear: wgpu::ComputePipeline,
+    pub bed_lookup_scatter: wgpu::ComputePipeline,
     pub p2g: wgpu::ComputePipeline,
     pub grid_update: wgpu::ComputePipeline,
     pub classify_cells: wgpu::ComputePipeline,
@@ -59,12 +62,14 @@ impl MpmPipelines {
                 storage_entry(6),
                 // 7: bed_extract
                 storage_entry(7),
-                // 8: bed_lookup
-                read_only_storage_entry(8),
+                // 8: bed_lookup (rebuilt each substep via atomic scatter)
+                storage_entry(8),
                 // 9: bed_delta
                 storage_entry(9),
-                // 10: bed_support_count
-                read_only_storage_entry(10),
+                // 10: metrics (projection residual / clamp counters) —
+                // repurposed from the unused `bed_support_count` slot to
+                // stay within the 10-storage-buffer device limit.
+                storage_entry(10),
             ],
         });
 
@@ -114,7 +119,7 @@ impl MpmPipelines {
                 },
                 wgpu::BindGroupEntry {
                     binding: 10,
-                    resource: buffers.bed_support_count.as_entire_binding(),
+                    resource: buffers.metrics.as_entire_binding(),
                 },
             ],
         });
@@ -144,6 +149,9 @@ impl MpmPipelines {
         Self {
             bind_group,
             clear_grid: make("clear_grid"),
+            metrics_clear: make("metrics_clear"),
+            bed_lookup_clear: make("bed_lookup_clear"),
+            bed_lookup_scatter: make("bed_lookup_scatter"),
             p2g: make("p2g"),
             grid_update: make("grid_update"),
             classify_cells: make("classify_cells"),
@@ -173,6 +181,7 @@ fn storage_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
     }
 }
 
+#[allow(dead_code)] // kept for future read-only bindings.
 fn read_only_storage_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,

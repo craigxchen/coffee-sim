@@ -29,8 +29,20 @@ const waterSlotsLabel = document.getElementById("water-slots");
 const bedParticlesLabel = document.getElementById("bed-particles");
 const capacityUsedLabel = document.getElementById("capacity-used");
 const bedEnabledLabel = document.getElementById("bed-enabled");
-const pressureProjectionToggle = document.getElementById("toggle-pressure-projection");
-const sparseBallisticToggle = document.getElementById("toggle-sparse-ballistic");
+const maxAbsDivLabel = document.getElementById("max-abs-div");
+const fluidCellsLabel = document.getElementById("fluid-cells");
+const divClampFiresLabel = document.getElementById("div-clamp-fires");
+const pressureClampFiresLabel = document.getElementById("pressure-clamp-fires");
+const massOverflowFiresLabel = document.getElementById("mass-overflow-fires");
+const toggleDebugButton = document.getElementById("toggle-debug");
+const debugStats = document.getElementById("debug-stats");
+
+// Throttle metrics readback — the staging-buffer map/unmap is cheap but still
+// costs a JS microtask. Refreshing every ~10 frames keeps the HUD responsive
+// without pinning the event loop.
+const METRICS_REFRESH_INTERVAL = 10;
+let metricsFrameCounter = 0;
+let metricsRefreshInFlight = false;
 
 let app;
 let paused = false;
@@ -41,6 +53,14 @@ let lastClientX = 0;
 let lastClientY = 0;
 let fixedStepSeconds = null;
 let currentSceneMode = "Default";
+const heldKeys = new Set();
+const PAN_SPEED = 6.0;
+const PAN_CODES = new Set([
+  "KeyW",
+  "KeyA",
+  "KeyS",
+  "KeyD",
+]);
 
 await init();
 app = await WasmSim3D.create(canvas);
@@ -76,6 +96,13 @@ sceneDefaultButton.addEventListener("click", () => {
   toggleButton.textContent = "Pause";
   lastFrameTime = 0;
   syncUi();
+});
+
+toggleDebugButton.addEventListener("click", () => {
+  debugStats.classList.toggle("hidden");
+  toggleDebugButton.textContent = debugStats.classList.contains("hidden")
+    ? "Show Debug Stats"
+    : "Hide Debug Stats";
 });
 
 sceneFreeStreamButton.addEventListener("click", () => {
@@ -122,15 +149,6 @@ spoutZInput.addEventListener("input", () => {
   syncUi();
 });
 
-pressureProjectionToggle.addEventListener("change", () => {
-  app.setPressureProjectionEnabled(pressureProjectionToggle.checked);
-  syncUi();
-});
-
-sparseBallisticToggle.addEventListener("change", () => {
-  app.setTempSparseBallisticEnabled(sparseBallisticToggle.checked);
-  syncUi();
-});
 
 canvas.addEventListener("contextmenu", (e) => e.preventDefault());
 
@@ -162,6 +180,19 @@ canvas.addEventListener(
   { passive: false },
 );
 
+window.addEventListener("keydown", (e) => {
+  if (!PAN_CODES.has(e.code)) return;
+  heldKeys.add(e.code);
+});
+
+window.addEventListener("keyup", (e) => {
+  heldKeys.delete(e.code);
+});
+
+window.addEventListener("blur", () => {
+  heldKeys.clear();
+});
+
 function resizeCanvas() {
   const dpr = window.devicePixelRatio || 1;
   const rect = canvas.getBoundingClientRect();
@@ -177,14 +208,37 @@ function animate(timestamp) {
   const frameTime = fixedStepSeconds ?? wallFrameTime;
   lastFrameTime = timestamp;
 
+  applyKeyboardPan(frameTime);
+
   if (!paused) {
     app.stepFrame(frameTime);
   }
 
   app.render();
   updateFps(frameTime);
+  maybeRefreshMetrics();
   syncUi();
   requestAnimationFrame(animate);
+}
+
+function maybeRefreshMetrics() {
+  // Readback disabled — see the TODO on `refresh_metrics` in mod.rs.
+  // The shader-side metrics counters still run, they just aren't plumbed
+  // to the HUD. Leaving this helper wired up so the call site doesn't
+  // drift when we turn the readback back on.
+}
+
+function applyKeyboardPan(dt) {
+  if (heldKeys.size === 0) return;
+  let right = 0;
+  let forward = 0;
+  if (heldKeys.has("KeyD")) right += 1;
+  if (heldKeys.has("KeyA")) right -= 1;
+  if (heldKeys.has("KeyW")) forward += 1;
+  if (heldKeys.has("KeyS")) forward -= 1;
+  if (right === 0 && forward === 0) return;
+  const step = PAN_SPEED * dt;
+  app.panCamera(right * step, 0, forward * step);
 }
 
 function updateFps(frameTime) {
@@ -199,8 +253,6 @@ function syncControlDefaultsFromSim() {
   spoutXInput.value = app.spoutX().toFixed(1);
   spoutYInput.value = app.spoutY().toFixed(1);
   spoutZInput.value = app.spoutZ().toFixed(1);
-  pressureProjectionToggle.checked = app.pressureProjectionEnabled();
-  sparseBallisticToggle.checked = app.tempSparseBallisticEnabled();
 }
 
 function applySpoutControls() {
@@ -212,8 +264,6 @@ function applySpoutControls() {
 }
 
 function applyHeuristicControls() {
-  app.setPressureProjectionEnabled(pressureProjectionToggle.checked);
-  app.setTempSparseBallisticEnabled(sparseBallisticToggle.checked);
 }
 
 function syncUi() {
@@ -239,4 +289,9 @@ function syncUi() {
     ? `${((usedParticles / maxParticles) * 100).toFixed(1)}%`
     : "0.0%";
   bedEnabledLabel.textContent = app.hasBed() ? "Yes" : "No";
+  maxAbsDivLabel.textContent = app.maxAbsDivergence().toFixed(3);
+  fluidCellsLabel.textContent = new Intl.NumberFormat().format(app.fluidCellCount());
+  divClampFiresLabel.textContent = new Intl.NumberFormat().format(app.divClampFires());
+  pressureClampFiresLabel.textContent = new Intl.NumberFormat().format(app.pressureClampFires());
+  massOverflowFiresLabel.textContent = new Intl.NumberFormat().format(app.massOverflowFires());
 }
