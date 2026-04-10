@@ -98,10 +98,10 @@ impl MpmSettings {
     pub fn default_v60() -> Self {
         let bounds_size = Vec3::new(14.0, 20.0, 14.0);
         // Ensure uniform cell spacing: derive gy from dx = bounds_x / gx
-        let gx = 80u32;
+        let gx = 64u32;
         let dx = bounds_size.x / gx as f32;
         let gy = (bounds_size.y / dx).ceil() as u32;
-        let gz = 80u32;
+        let gz = 64u32;
         let grid_dims = [gx, gy, gz];
         let filter = FilterConfig::default();
         let bed = BedConfig::seated_in_filter(&filter);
@@ -131,7 +131,7 @@ impl MpmSettings {
                 },
             ],
             spout: SpoutSettings::default(),
-            initial_kettle_angle_deg: 36.0,
+            initial_kettle_angle_deg: 14.5,
             filter: Some(filter),
             bed: Some(bed),
         }
@@ -607,7 +607,7 @@ impl MpmSim3D {
                 bed_capacity_per_particle,
                 if self.filter_mesh.is_some() { 1.0 } else { 0.0 },
             ],
-            extraction_params: [0.01, 30000.0, 2.0, 0.01],
+            extraction_params: [0.01, 100000.0, 2.0, 0.002],
             time_params: [self.total_time, dt, 1.0, 0.0],
             clamp_params: [
                 div_clamp,
