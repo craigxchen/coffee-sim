@@ -64,7 +64,13 @@ fn readback_mass_snapshot(
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("mass readback"),
     });
-    encoder.copy_buffer_to_buffer(&sim.buffers.particles, 0, &particle_staging, 0, particle_size);
+    encoder.copy_buffer_to_buffer(
+        &sim.buffers.particles,
+        0,
+        &particle_staging,
+        0,
+        particle_size,
+    );
     encoder.copy_buffer_to_buffer(&sim.buffers.bed_extract, 0, &bed_staging, 0, bed_size);
     queue.submit(Some(encoder.finish()));
 
@@ -108,6 +114,7 @@ fn readback_mass_snapshot(
 
 #[derive(Debug)]
 struct DiagSnapshot {
+    all_finite: bool,
     total_mass: f32,
     active_count: u32,
     min_mass: f32,
@@ -121,13 +128,15 @@ struct DiagSnapshot {
     max_j: f32,
 }
 
-fn readback_diag_snapshot(
+fn readback_diag_snapshot_range(
     sim: &MpmSim3D,
     device: &wgpu::Device,
     queue: &wgpu::Queue,
+    particle_offset: usize,
+    particle_count: usize,
 ) -> DiagSnapshot {
-    let particle_count = (sim.num_water + sim.num_bed) as usize;
-    let particle_size = (particle_count * 32).max(4) as u64;
+    let total_particle_count = (sim.num_water + sim.num_bed) as usize;
+    let particle_size = (total_particle_count * 32).max(4) as u64;
 
     let staging = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("diag staging"),
@@ -165,30 +174,50 @@ fn readback_diag_snapshot(
     let mut j_min = f32::MAX;
     let mut j_max = f32::MIN;
 
-    for i in 0..particle_count {
-        let mass = data[i * 8 + 7];
-        let j = data[i * 8 + 3];
+    let mut all_finite = true;
+    let particle_end = particle_offset + particle_count;
+    for i in particle_offset..particle_end {
+        let x = data[i * 8];
         let y = data[i * 8 + 1];
+        let z = data[i * 8 + 2];
+        let j = data[i * 8 + 3];
+        let mass = data[i * 8 + 7];
+
+        all_finite &=
+            x.is_finite() && y.is_finite() && z.is_finite() && j.is_finite() && mass.is_finite();
 
         if mass <= inactive_thresh {
             continue;
         }
         active_count += 1;
         total_mass += mass;
-        if mass < min_mass { min_mass = mass; }
-        if mass > max_mass { max_mass = mass; }
-        if y < y_min { y_min = y; }
-        if y > y_max { y_max = y; }
+        if mass < min_mass {
+            min_mass = mass;
+        }
+        if mass > max_mass {
+            max_mass = mass;
+        }
+        if y < y_min {
+            y_min = y;
+        }
+        if y > y_max {
+            y_max = y;
+        }
         y_sum += y;
         j_sum += j;
-        if j < j_min { j_min = j; }
-        if j > j_max { j_max = j; }
+        if j < j_min {
+            j_min = j;
+        }
+        if j > j_max {
+            j_max = j;
+        }
     }
     drop(view);
     staging.unmap();
 
     let n = active_count.max(1) as f32;
     DiagSnapshot {
+        all_finite,
         total_mass,
         active_count,
         min_mass: if active_count > 0 { min_mass } else { 0.0 },
@@ -201,6 +230,28 @@ fn readback_diag_snapshot(
         min_j: if active_count > 0 { j_min } else { 0.0 },
         max_j: if active_count > 0 { j_max } else { 0.0 },
     }
+}
+
+fn readback_diag_snapshot(
+    sim: &MpmSim3D,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+) -> DiagSnapshot {
+    readback_diag_snapshot_range(
+        sim,
+        device,
+        queue,
+        0,
+        (sim.num_water + sim.num_bed) as usize,
+    )
+}
+
+fn readback_bed_diag_snapshot(
+    sim: &MpmSim3D,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+) -> DiagSnapshot {
+    readback_diag_snapshot_range(sim, device, queue, 0, sim.num_bed as usize)
 }
 
 // ── Pipeline validation ──
@@ -391,5 +442,100 @@ fn volume_conservation_long_settle() {
         final_mass_drift < 0.01,
         "mass drifted {:.2}% over 120s settle (expected <1%)",
         final_mass_drift * 100.0,
+    );
+}
+
+#[test]
+fn bed_settling_stability() {
+    let Some((device, queue)) = create_test_device() else {
+        eprintln!("skipping: no GPU adapter");
+        return;
+    };
+
+    let mut sim = MpmSim3D::new(&device, &queue, MpmSettings::benchmark_center_pour());
+    sim.set_kettle_angle(0.0);
+    for _ in 0..60 {
+        sim.step_frame(&device, &queue, 1.0 / 60.0);
+    }
+
+    let snapshot = readback_bed_diag_snapshot(&sim, &device, &queue);
+    assert!(
+        snapshot.all_finite,
+        "bed particles produced non-finite state: {snapshot:?}"
+    );
+    assert!(
+        snapshot.active_count > 0,
+        "expected active bed particles after settle"
+    );
+    assert!(
+        snapshot.mean_j >= 0.9 && snapshot.mean_j <= 1.1,
+        "bed mean J drifted outside settle band: {snapshot:?}",
+    );
+    assert!(
+        snapshot.min_j > 0.6 && snapshot.max_j < 1.48,
+        "bed J approached safety clamps during settle: {snapshot:?}",
+    );
+    assert!(
+        snapshot.y_extent > 1.0,
+        "bed y_extent collapsed unexpectedly: {snapshot:?}",
+    );
+}
+
+#[test]
+fn water_bed_mass_conservation() {
+    let Some((device, queue)) = create_test_device() else {
+        eprintln!("skipping: no GPU adapter");
+        return;
+    };
+
+    let mut sim = MpmSim3D::new(&device, &queue, MpmSettings::benchmark_center_pour());
+    sim.set_kettle_angle(36.0);
+    for _ in 0..120 {
+        sim.step_frame(&device, &queue, 1.0 / 60.0);
+    }
+
+    sim.set_kettle_angle(0.0);
+    let before = readback_mass_snapshot(&sim, &device, &queue);
+    let total_before = before.active_particle_mass + before.bed_held_mass;
+
+    for _ in 0..60 {
+        sim.step_frame(&device, &queue, 1.0 / 60.0);
+    }
+
+    let after = readback_mass_snapshot(&sim, &device, &queue);
+    let total_after = after.active_particle_mass + after.bed_held_mass;
+    let drift = (total_after - total_before).abs() / total_before.max(1e-6);
+    assert!(
+        drift < 0.01,
+        "combined water + bed-held mass drifted {:.2}% after pour-off (before={total_before}, after={total_after})",
+        drift * 100.0,
+    );
+}
+
+#[test]
+fn bed_j_off_clamps() {
+    let Some((device, queue)) = create_test_device() else {
+        eprintln!("skipping: no GPU adapter");
+        return;
+    };
+
+    let mut sim = MpmSim3D::new(&device, &queue, MpmSettings::benchmark_center_pour());
+    sim.set_kettle_angle(36.0);
+    for _ in 0..180 {
+        sim.step_frame(&device, &queue, 1.0 / 60.0);
+    }
+
+    let snapshot = readback_bed_diag_snapshot(&sim, &device, &queue);
+    assert!(
+        snapshot.all_finite,
+        "bed particles produced non-finite state: {snapshot:?}"
+    );
+    assert!(
+        snapshot.active_count > 0,
+        "expected active bed particles during pour"
+    );
+    assert!(
+        snapshot.min_j > 0.55 && snapshot.max_j < 1.45,
+        "bed J hit safety rails under normal pour: {snapshot:?}",
     );
 }

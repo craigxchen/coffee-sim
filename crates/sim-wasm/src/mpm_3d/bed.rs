@@ -51,11 +51,16 @@ impl BedConfig {
 
         // `f32::clamp` panics when `min > max`, so fall back to `(min + max) * 0.5`
         // whenever the filter is too narrow to host the bed with the requested margins.
-        let (top_min, top_max) = order_bounds(filter_bot_abs + 0.6, filter_top_abs - 0.35);
+        let (top_min, top_max) = order_bounds(filter_bot_abs + 0.35, filter_top_abs - 0.35);
         let top_abs = (bed.center.y + bed.top_y).clamp(top_min, top_max);
 
-        let (bot_min, bot_max) = order_bounds(filter_bot_abs + 0.4, top_abs - 1.4);
-        let bot_abs = (bed.center.y + bed.bot_y).clamp(bot_min, bot_max);
+        // Start the dry bed already packed close to the filter apex instead of
+        // with a large flat-bottom gap that would require granular settling to
+        // fill. The current solid model intentionally keeps dry grounds fairly
+        // immobile, so the initial geometry needs to be seated against the
+        // filter rather than expecting later motion to do that packing.
+        let (bot_min, bot_max) = order_bounds(filter_bot_abs + 0.22, top_abs - 1.6);
+        let bot_abs = bot_min.min(bot_max);
 
         bed.top_y = top_abs - bed.center.y;
         bed.bot_y = bot_abs - bed.center.y;
@@ -74,9 +79,8 @@ impl BedConfig {
             (filter.inner_radius_at_y(top_local) - 0.18).clamp(top_r_min, top_r_max);
 
         let (bot_r_min, bot_r_max) =
-            order_bounds(filter.opening_radius() + 0.32, bed.top_radius - 0.25);
-        bed.bot_radius =
-            (filter.inner_radius_at_y(bot_local) - 0.12).clamp(bot_r_min, bot_r_max);
+            order_bounds(filter.opening_radius() + 0.06, bed.top_radius - 0.25);
+        bed.bot_radius = (filter.inner_radius_at_y(bot_local) - 0.04).clamp(bot_r_min, bot_r_max);
 
         bed
     }
@@ -410,6 +414,7 @@ mod tests {
         assert!(bed.bot_radius < filter.inner_radius_at_y(bed_bot_local));
         assert!(bot_abs > filter_bot_abs);
         assert!(top_abs < filter_top_abs);
+        assert!(bot_abs <= filter_bot_abs + 0.26);
     }
 
     #[test]
@@ -453,6 +458,7 @@ mod tests {
         let filter_bot_abs = filter.center.y + filter.bot_y;
 
         assert!(bed_top_abs <= filter_top_abs - 0.3);
-        assert!(bed_bot_abs >= filter_bot_abs + 0.3);
+        assert!(bed_bot_abs >= filter_bot_abs + 0.05);
+        assert!(bed_bot_abs <= filter_bot_abs + 0.26);
     }
 }
