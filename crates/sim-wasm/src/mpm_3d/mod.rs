@@ -4,9 +4,9 @@ use coffee_sim_core::sph::Vec3;
 use wasm_bindgen::prelude::JsValue;
 
 pub(crate) mod bed;
-pub(crate) mod inflow;
 mod filter;
 mod filter_mesh;
+pub(crate) mod inflow;
 #[cfg(test)]
 mod physics_tests;
 mod pipelines;
