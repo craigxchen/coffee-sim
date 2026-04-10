@@ -465,6 +465,7 @@ fn project_solid_velocity_against_filter(velocity: vec3<f32>, cell_pos: vec3<f32
     let radial_len = length(radial);
 
     if mesh_r > dx() && radial_len > 1e-6 {
+        // Wide region: full surface-normal projection against the cone wall.
         let barrier_r = mesh_r - contact_offset();
         if radial_len > barrier_r {
             let outward = radial / radial_len;
@@ -477,6 +478,9 @@ fn project_solid_velocity_against_filter(velocity: vec3<f32>, cell_pos: vec3<f32
             }
         }
     } else if radial_len > 1e-6 && radial_len > mesh_r {
+        // Apex region: filter is narrower than a grid cell. Only zero the
+        // outward radial velocity to prevent sideways escape. Leave the
+        // downward component intact so the bed can settle into the tip.
         let radial_dir = radial / radial_len;
         let radial_v = dot(vec2<f32>(v.x, v.z), radial_dir);
         if radial_v > 0.0 {
@@ -485,6 +489,7 @@ fn project_solid_velocity_against_filter(velocity: vec3<f32>, cell_pos: vec3<f32
         }
     }
 
+    // Apex floor: prevent solid velocity from pushing bed through the tip.
     if cell_pos.y < mesh_bot_y + dx() && v.y < 0.0 {
         v.y = 0.0;
     }
