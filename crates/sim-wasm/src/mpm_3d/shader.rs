@@ -65,6 +65,7 @@ const METRIC_FLUID_CELLS_IDX: u32 = 1u;
 const METRIC_DIV_CLAMP_FIRES_IDX: u32 = 2u;
 const METRIC_PRESSURE_CLAMP_FIRES_IDX: u32 = 3u;
 const METRIC_MASS_OVERFLOW_FIRES_IDX: u32 = 4u;
+const BED_NEIGHBOR_SAMPLE_COUNT: u32 = 27u;
 
 // ── Helpers ──
 
@@ -105,7 +106,9 @@ fn metrics_div_inv_fp_scale() -> f32 { return u.clamp_params.w; }
 fn bed_compaction_response(saturation: f32) -> f32 {
     return smoothstep(0.05, 0.55, saturation);
 }
-
+fn determinant_from_cols(c0: vec3<f32>, c1: vec3<f32>, c2: vec3<f32>) -> f32 {
+    return dot(c0, cross(c1, c2));
+}
 fn cell_index(ix: u32, iy: u32, iz: u32) -> u32 {
     return iz * gx() * gy() + iy * gx() + ix;
 }
@@ -126,6 +129,7 @@ fn scratch_div_idx(cell: u32) -> u32 { return grid_mom_x_idx(cell); }
 // alias is defined for it. Add one back if/when an iterative residual probe
 // needs the slot during the projection pass.
 fn scratch_kind_idx(cell: u32) -> u32 { return grid_mom_z_idx(cell); }
+fn scratch_absorbed_idx(cell: u32) -> u32 { return grid_mom_y_idx(cell); }
 // A quadratic-B-spline particle deposits at most `nominal_mass * 0.75^3 ≈
 // 0.42 * nominal_mass` to its peak cell. The threshold must stay strictly
 // below that peak or isolated particles never register as fluid. Matching
@@ -601,8 +605,7 @@ fn p2g(@builtin(global_invocation_id) gid: vec3<u32>) {
     var aff_col2 = vec3<f32>(mass_p * C2.x, mass_p * C2.y, mass_p * C2.z);
     if is_bed {
         let compaction = bed_compaction_response(bed_saturation);
-        let dry_stiffness = K_bed() * 6.0;
-        let K_eff = mix(dry_stiffness, K_bed(), compaction);
+        let K_eff = mix(K_bed() * 6.0, K_bed(), compaction);
         let stress_term = dt() * p_vol() * K_eff * (1.0 - J) * 4.0 * inv_dx() * inv_dx();
         aff_col0.x += stress_term;
         aff_col1.y += stress_term;
@@ -693,6 +696,7 @@ fn grid_update(@builtin(global_invocation_id) gid: vec3<u32>) {
         v_s.y += gravity() * dt();
     }
 
+    var absorbed_frac = 0.0;
     if mass_w > 1e-6 && mass_s > 1e-6 {
         let n = uniform_porosity();
         let K = max(uniform_permeability(), 1e-4);
@@ -703,7 +707,90 @@ fn grid_update(@builtin(global_invocation_id) gid: vec3<u32>) {
         v_s -= drag / mass_s;
     }
 
-    grid_vel[idx] = vec4<f32>(clamp_velocity(v_w), mass_w);
+    // Grid-level absorption: transfer water mass into bed pore storage.
+    // This runs before G2P so the velocity/pressure fields reflect the sink.
+    var mass_w_post = mass_w;
+    if mass_w > 1e-6 && mass_s > 1e-6 {
+        let iz_val = idx / (gx() * gy());
+        let rem = idx % (gx() * gy());
+        let iy_val = rem / gx();
+        let ix_val = rem % gx();
+
+        var neighbor_ids: array<i32, 27>;
+        var neighbor_caps: array<f32, 27>;
+        var neighbor_sats: array<f32, 27>;
+        for (var init_i = 0u; init_i < BED_NEIGHBOR_SAMPLE_COUNT; init_i++) {
+            neighbor_ids[init_i] = -1;
+            neighbor_caps[init_i] = 0.0;
+            neighbor_sats[init_i] = 0.0;
+        }
+
+        var neighbor_count = 0u;
+        for (var di = -1; di <= 1; di++) {
+            for (var dj = -1; dj <= 1; dj++) {
+                for (var dk = -1; dk <= 1; dk++) {
+                    let cx = i32(ix_val) + di;
+                    let cy = i32(iy_val) + dj;
+                    let cz = i32(iz_val) + dk;
+                    if cx < 0 || cy < 0 || cz < 0 { continue; }
+                    if u32(cx) >= gx() || u32(cy) >= gy() || u32(cz) >= gz() { continue; }
+
+                    let ci = cell_index(u32(cx), u32(cy), u32(cz));
+                    let bed_idx = bed_lookup_load(ci);
+                    if bed_idx < 0 || u32(bed_idx) >= num_bed() { continue; }
+
+                    var found = false;
+                    for (var existing = 0u; existing < neighbor_count; existing++) {
+                        if neighbor_ids[existing] == bed_idx {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if found || neighbor_count >= BED_NEIGHBOR_SAMPLE_COUNT {
+                        continue;
+                    }
+
+                    let bid = u32(bed_idx);
+                    neighbor_ids[neighbor_count] = bed_idx;
+                    neighbor_caps[neighbor_count] =
+                        max(max_saturation() - bed_extract[bid].bed.x, 0.0);
+                    neighbor_sats[neighbor_count] = bed_extract[bid].extract.w;
+                    neighbor_count += 1u;
+                }
+            }
+        }
+
+        if neighbor_count > 0u {
+            var sat_sum = 0.0;
+            var cap_sum = 0.0;
+            for (var sample_i = 0u; sample_i < neighbor_count; sample_i++) {
+                sat_sum += neighbor_sats[sample_i];
+                cap_sum += neighbor_caps[sample_i];
+            }
+
+            if cap_sum > 1e-6 {
+                let saturation = sat_sum / f32(neighbor_count);
+                let abs_rate = absorption_rate() * (1.0 - saturation) * dt();
+                let m_abs = min(min(mass_w * clamp(abs_rate, 0.0, 0.3), mass_w * 0.5), cap_sum);
+                if m_abs > 1e-6 {
+                    mass_w_post = mass_w - m_abs;
+                    absorbed_frac = m_abs / mass_w;
+
+                    for (var sample_i = 0u; sample_i < neighbor_count; sample_i++) {
+                        let cap_i = neighbor_caps[sample_i];
+                        if cap_i <= 1e-6 { continue; }
+                        let share = m_abs * cap_i / cap_sum;
+                        atomicAdd(&bed_delta[u32(neighbor_ids[sample_i])], i32(share * fp_scale()));
+                    }
+                }
+            }
+        }
+    }
+
+    // Store absorbed fraction in scratch slot for bed_coupling to read.
+    atomicStore(&grid[scratch_absorbed_idx(idx)], i32(absorbed_frac * fp_scale()));
+
+    grid_vel[idx] = vec4<f32>(clamp_velocity(v_w), mass_w_post);
     grid_vel[grid_vel_solid_idx(idx)] = vec4<f32>(clamp_velocity(v_s), mass_s);
 }
 
@@ -742,13 +829,13 @@ fn classify_cells(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     let solid_mass = grid_vel[grid_vel_solid_idx(idx)].w;
-    if solid_mass > 1e-6 {
-        atomicStore(&grid[scratch_kind_idx(idx)], CELL_BED_COUPLED);
-        divergence_store(idx, 0.0);
-        return;
-    }
 
     if mass <= occupancy_mass_threshold() {
+        if solid_mass > 1e-6 {
+            atomicStore(&grid[scratch_kind_idx(idx)], CELL_BED_COUPLED);
+            divergence_store(idx, 0.0);
+            return;
+        }
         atomicStore(&grid[scratch_kind_idx(idx)], CELL_AIR);
         divergence_store(idx, 0.0);
         return;
@@ -1083,7 +1170,6 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>) {
     var new_C1 = vec3<f32>(0.0);
     var new_C2 = vec3<f32>(0.0);
     var supported_weight = 0.0;
-    var local_grid_mass = 0.0;
     let is_bed = phase >= 0.5;
 
     let B = 4.0 * inv_dx() * inv_dx();
@@ -1112,86 +1198,47 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>) {
                     new_C1 += w * B * grid_v * dpos.y;
                     new_C2 += w * B * grid_v * dpos.z;
                     supported_weight += w;
-                    local_grid_mass += w * grid_mass;
                 }
             }
         }
     }
 
-    // Sparse jets suffer strong PIC-style dissipation because empty stencil nodes
-    // contribute zero velocity. When support is weak, preserve more of the
-    // particle's previous ballistic motion instead of letting the stream stall.
-    let support_ratio = clamp(supported_weight, 0.0, 1.0);
     if supported_weight > 1e-6 {
         let inv_supported = 1.0 / supported_weight;
         new_v *= inv_supported;
         new_C0 *= inv_supported;
         new_C1 *= inv_supported;
         new_C2 *= inv_supported;
+    } else {
+        // If a particle sees no active grid support at all this substep,
+        // preserve its ballistic motion instead of collapsing it to zero.
+        new_v = vec3<f32>(p.vel.x, p.vel.y + gravity() * dt(), p.vel.z);
+        new_C0 = vec3<f32>(0.0);
+        new_C1 = vec3<f32>(0.0);
+        new_C2 = vec3<f32>(0.0);
     }
 
     if is_bed {
-        var bed_saturation = 0.0;
-        if pid < num_bed() {
-            bed_saturation = bed_extract[pid].extract.w;
-        }
-        let compaction = bed_compaction_response(bed_saturation);
-        // Dry grounds behave more like a static granular skeleton than a soft
-        // compressible blob. Keep them highly damped and unlock mobility as
-        // local pore-water saturation rises.
-        new_v *= mix(0.18, 0.55, compaction);
-        new_C0 *= mix(0.10, 0.35, compaction);
-        new_C1 *= mix(0.10, 0.35, compaction);
-        new_C2 *= mix(0.10, 0.35, compaction);
-    }
-
-    let in_cup_volume = xp.y < -3.5 && dot(xp.xz, xp.xz) < (3.0 + contact_offset()) * (3.0 + contact_offset());
-    if support_ratio < 0.999 && !is_bed {
-        let ballistic_v = vec3<f32>(p.vel.x, p.vel.y + gravity() * dt(), p.vel.z);
-        let preserve = clamp((1.0 - support_ratio) * 1.15, 0.0, 0.95);
-        new_v = mix(new_v, ballistic_v, preserve);
-        let affine_damp = 1.0 - preserve * 0.75;
-        new_C0 *= affine_damp;
-        new_C1 *= affine_damp;
-        new_C2 *= affine_damp;
-    }
-
-    // Even with full stencil support, a thin free stream below the dripper can be
-    // severely under-dense. PIC/APIC transfer then numerically diffuses momentum.
-    // Preserve more ballistic motion when the particle is airborne and local mass
-    // support is low compared with a compact fluid region.
-    let home_cell = world_to_cell(xp);
-    var bed_near = false;
-    if home_cell.x >= 0 && home_cell.y >= 0 && home_cell.z >= 0
-        && u32(home_cell.x) < gx() && u32(home_cell.y) < gy() && u32(home_cell.z) < gz() {
-        let home_idx = cell_index(u32(home_cell.x), u32(home_cell.y), u32(home_cell.z));
-        bed_near = bed_lookup_load(home_idx) >= 0;
-    }
-    let airborne = !is_bed && !bed_near && sample_sdf(xp) > contact_offset() * 2.0;
-    if airborne {
-        let dense_mass = nominal_mass() * 4.0;
-        let density_ratio = clamp(local_grid_mass / max(dense_mass, 1e-6), 0.0, 1.0);
-        let ballistic_v = vec3<f32>(p.vel.x, p.vel.y + gravity() * dt(), p.vel.z);
-        let preserve = clamp((1.0 - density_ratio) * 0.72, 0.0, 0.88);
-        new_v = mix(new_v, ballistic_v, preserve);
-        let affine_damp = 1.0 - preserve * 0.65;
-        new_C0 *= affine_damp;
-        new_C1 *= affine_damp;
-        new_C2 *= affine_damp;
+        // Mild APIC regularization for the solid phase: the current bed model
+        // has volumetric elasticity but no full shear/plastic constitutive
+        // response yet, so damping only the affine subgrid mode is a narrower
+        // stabilizer than damping particle velocity directly.
+        let apic_regularization = 0.85;
+        new_C0 *= apic_regularization;
+        new_C1 *= apic_regularization;
+        new_C2 *= apic_regularization;
     }
 
     var J_new = 1.0;
     if is_bed {
-        var bed_saturation = 0.0;
-        if pid < num_bed() {
-            bed_saturation = bed_extract[pid].extract.w;
-        }
-        let compaction = bed_compaction_response(bed_saturation);
-        let trace_C = new_C0.x + new_C1.y + new_C2.z;
-        let candidate_J = clamp(J_old * (1.0 + dt() * trace_C), 0.5, 1.5);
-        // Keep the dry bed close to its rest volume; allow genuine compaction
-        // only once the particle has absorbed enough water.
-        J_new = clamp(mix(1.0, candidate_J, compaction), 0.6, 1.5);
+        let dt_c0 = new_C0 * dt();
+        let dt_c1 = new_C1 * dt();
+        let dt_c2 = new_C2 * dt();
+        let F_col0 = vec3<f32>(1.0 + dt_c0.x, dt_c0.y, dt_c0.z);
+        let F_col1 = vec3<f32>(dt_c1.x, 1.0 + dt_c1.y, dt_c1.z);
+        let F_col2 = vec3<f32>(dt_c2.x, dt_c2.y, 1.0 + dt_c2.z);
+        let detF = max(determinant_from_cols(F_col0, F_col1, F_col2), 0.0);
+        J_new = clamp(J_old * detF, 0.5, 1.5);
     }
 
     // Advect
@@ -1228,10 +1275,10 @@ fn bed_coupling(@builtin(global_invocation_id) gid: vec3<u32>) {
     if pid >= num_particles() { return; }
 
     let phase = affine[pid].col0.w;
+    if phase >= 0.5 { return; }
 
-    if phase >= 0.5 {
-        return;
-    }
+    let mass_p = particles[pid].vel.w;
+    if mass_p <= inactive_mass_threshold() { return; }
 
     let pos = particles[pid].pos.xyz;
     let cell = world_to_cell(pos);
@@ -1239,44 +1286,16 @@ fn bed_coupling(@builtin(global_invocation_id) gid: vec3<u32>) {
     if u32(cell.x) >= gx() || u32(cell.y) >= gy() || u32(cell.z) >= gz() { return; }
 
     let ci = cell_index(u32(cell.x), u32(cell.y), u32(cell.z));
-    let bed_idx = bed_lookup_load(ci);
-    if bed_idx < 0 || u32(bed_idx) >= num_bed() {
-        return;
-    }
+    let frac = f32(atomicLoad(&grid[scratch_absorbed_idx(ci)])) * inv_fp_scale();
+    if frac <= 1e-6 { return; }
 
-    var be = bed_extract[u32(bed_idx)];
-    let saturation = be.extract.w;
-
-    let capacity = max(max_saturation() - be.bed.x, 0.0);
-    if capacity <= 1e-6 {
-        return;
-    }
-
-    let mass_p = particles[pid].vel.w;
-    let abs_rate = absorption_rate() * (1.0 - saturation) * dt();
-    let speed = length(particles[pid].vel.xyz);
-    var absorbed = min(min(mass_p * clamp(abs_rate, 0.0, 0.25), mass_p * 0.5), capacity);
-    let remaining_after_partial = mass_p - absorbed;
-    let retire_threshold = nominal_mass() * 0.22;
-    if remaining_after_partial > 0.0 && remaining_after_partial <= retire_threshold {
-        absorbed = min(mass_p, capacity);
-    } else if saturation > 0.55 && speed < 1.35 {
-        let almost_absorbed = min(mass_p, capacity);
-        if mass_p - almost_absorbed <= nominal_mass() * 0.35 {
-            absorbed = almost_absorbed;
-        }
-    }
-    if absorbed <= 1e-6 {
-        return;
-    }
-
+    let absorbed = mass_p * clamp(frac, 0.0, 0.95);
     let remaining = mass_p - absorbed;
     if remaining <= inactive_mass_threshold() {
         particles[pid].vel = vec4<f32>(vec3<f32>(0.0), 0.0);
     } else {
         particles[pid].vel = vec4<f32>(particles[pid].vel.xyz, remaining);
     }
-    atomicAdd(&bed_delta[u32(bed_idx)], i32(absorbed * fp_scale()));
 }
 
 // ── extraction_advect ──
