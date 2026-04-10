@@ -50,7 +50,7 @@ pub(crate) struct MetricsSnapshot {
     /// `METRICS_DIV_FP_SCALE`.
     pub max_abs_div: f32,
     /// Count of cells classified as fluid (`CELL_INTERIOR_FLUID` or
-    /// `CELL_BED_COUPLED`) in the most recent substep.
+    /// `CELL_SURFACE_FLUID`) in the most recent substep.
     pub fluid_cells: u32,
     /// Number of `divergence_store` calls that hit the FP clamp.
     pub div_clamp_fires: u32,
@@ -461,7 +461,6 @@ impl MpmSim3D {
         self.inflow.exit_speed()
     }
 
-
     pub fn particle_count(&self) -> usize {
         (self.num_water + self.num_bed) as usize
     }
@@ -481,7 +480,6 @@ impl MpmSim3D {
     pub fn total_time(&self) -> f32 {
         self.total_time
     }
-
 
     pub fn render_buffer(&self) -> &wgpu::Buffer {
         &self.buffers.render_data
@@ -604,18 +602,13 @@ impl MpmSim3D {
             // Tie bed retention to an overall retained-water target so the bed
             // wets realistically without swallowing most of the brew.
             bed_params: [
-                34.0,
+                0.4,
                 8.0,
                 bed_capacity_per_particle,
                 if self.filter_mesh.is_some() { 1.0 } else { 0.0 },
             ],
-            extraction_params: [0.01, 11.0, 8.5, 15.0],
-            time_params: [
-                self.total_time,
-                dt,
-                1.0,
-                0.0,
-            ],
+            extraction_params: [0.01, 30000.0, 2.0, 0.01],
+            time_params: [self.total_time, dt, 1.0, 0.0],
             clamp_params: [
                 div_clamp,
                 pressure_clamp,

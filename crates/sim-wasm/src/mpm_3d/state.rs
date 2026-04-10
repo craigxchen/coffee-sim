@@ -103,14 +103,14 @@ impl MpmBuffers {
 
         let grid = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("mpm grid atomics"),
-            size: (4 * total_cells * size_of::<i32>()) as u64,
+            size: (8 * total_cells * size_of::<i32>()) as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
 
         let grid_vel = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("mpm grid vel"),
-            size: (total_cells * 16) as u64, // vec4<f32>
+            size: (2 * total_cells * 16) as u64, // 2 x vec4<f32>
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
