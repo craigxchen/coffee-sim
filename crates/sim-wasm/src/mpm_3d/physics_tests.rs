@@ -482,6 +482,37 @@ fn bed_settling_stability() {
 }
 
 #[test]
+fn bed_long_run_creep_is_bounded_without_water() {
+    let Some((device, queue)) = create_test_device() else {
+        eprintln!("skipping: no GPU adapter");
+        return;
+    };
+
+    let mut sim = MpmSim3D::new(&device, &queue, MpmSettings::benchmark_center_pour());
+    sim.set_kettle_angle(0.0);
+    for _ in 0..120 {
+        sim.step_frame(&device, &queue, 1.0 / 60.0);
+    }
+    let settled = readback_bed_diag_snapshot(&sim, &device, &queue);
+
+    for _ in 0..480 {
+        sim.step_frame(&device, &queue, 1.0 / 60.0);
+    }
+    let later = readback_bed_diag_snapshot(&sim, &device, &queue);
+
+    let mean_y_drift = (later.y_mean - settled.y_mean).abs();
+    let extent_drift = (later.y_extent - settled.y_extent).abs();
+    assert!(
+        mean_y_drift < 0.22,
+        "dry bed kept creeping in mean height after settling (settled={settled:?}, later={later:?})",
+    );
+    assert!(
+        extent_drift < 0.28,
+        "dry bed shape kept drifting after settling (settled={settled:?}, later={later:?})",
+    );
+}
+
+#[test]
 fn water_bed_mass_conservation() {
     let Some((device, queue)) = create_test_device() else {
         eprintln!("skipping: no GPU adapter");
