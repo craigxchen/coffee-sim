@@ -55,6 +55,7 @@ struct ContactResult {
 @group(0) @binding(9) var<storage, read_write> bed_delta: array<atomic<i32>>;
 @group(0) @binding(10) var<storage, read_write> metrics: array<atomic<u32>>;
 @group(0) @binding(11) var<storage, read> filter_mesh: array<vec4<f32>>;
+@group(0) @binding(12) var sdf_class_tex: texture_3d<u32>;
 
 const FILTER_RING_COUNT = 10u;
 const FILTER_SEGMENT_COUNT = 32u;
@@ -75,6 +76,7 @@ fn gz() -> u32 { return u.grid_dims.z; }
 fn total_cells() -> u32 { return u.grid_dims.w; }
 fn num_bed() -> u32 { return u.counts.y; }
 fn num_particles() -> u32 { return u.counts.x + u.counts.y; }
+fn use_sdf_cache() -> bool { return u.counts.w > 0u; }
 fn dt() -> f32 { return u.sim_params.x; }
 fn gravity() -> f32 { return u.sim_params.y; }
 fn dx() -> f32 { return u.sim_params.z; }
@@ -176,6 +178,10 @@ fn divergence_store(cell: u32, value: f32) {
 
 fn bed_lookup_load(cell: u32) -> i32 {
     return atomicLoad(&bed_lookup[cell]);
+}
+
+fn sdf_class_is_solid(cell: vec3<i32>) -> bool {
+    return textureLoad(sdf_class_tex, cell, 0).r != 0u;
 }
 
 fn is_fluid_kind(kind: i32) -> bool {
@@ -675,6 +681,10 @@ fn grid_update(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     let inv_fp = inv_fp_scale();
     let mass_w = f32(atomicLoad(&grid[grid_mass_idx(idx)])) * inv_fp;
+    let mass_s = f32(atomicLoad(&grid[grid_solid_mass_idx(idx)])) * inv_fp;
+    if mass_w <= 1e-6 && mass_s <= 1e-6 {
+        return;
+    }
     var v_w = vec3<f32>(0.0);
     if mass_w > 1e-6 {
         v_w = vec3<f32>(
@@ -685,7 +695,6 @@ fn grid_update(@builtin(global_invocation_id) gid: vec3<u32>) {
         v_w.y += gravity() * dt();
     }
 
-    let mass_s = f32(atomicLoad(&grid[grid_solid_mass_idx(idx)])) * inv_fp;
     var v_s = vec3<f32>(0.0);
     if mass_s > 1e-6 {
         v_s = vec3<f32>(
@@ -822,7 +831,12 @@ fn classify_cells(@builtin(global_invocation_id) gid: vec3<u32>) {
     // they'd get if lumped with air.
     let cell_center = u.grid_origin.xyz
         + (vec3<f32>(f32(ix_val), f32(iy_val), f32(iz_val)) + vec3<f32>(0.5)) * dx();
-    if sample_sdf(cell_center) < 0.0 {
+    let self_is_solid = select(
+        sample_sdf(cell_center) < 0.0,
+        sdf_class_is_solid(vec3<i32>(i32(ix_val), i32(iy_val), i32(iz_val))),
+        use_sdf_cache(),
+    );
+    if self_is_solid {
         atomicStore(&grid[scratch_kind_idx(idx)], CELL_SOLID);
         divergence_store(idx, 0.0);
         return;
@@ -893,27 +907,51 @@ fn classify_cells(@builtin(global_invocation_id) gid: vec3<u32>) {
     var vzm = -self_vel.z;
     var vzp = -self_vel.z;
     if ix_val > 0u
-        && sample_sdf(cell_center + vec3<f32>(-dx_vec, 0.0, 0.0)) >= 0.0 {
+        && select(
+            sample_sdf(cell_center + vec3<f32>(-dx_vec, 0.0, 0.0)) >= 0.0,
+            !sdf_class_is_solid(vec3<i32>(i32(ix_val) - 1, i32(iy_val), i32(iz_val))),
+            use_sdf_cache(),
+        ) {
         vxm = grid_vel[cell_index(ix_val - 1u, iy_val, iz_val)].x;
     }
     if ix_val + 1u < gx()
-        && sample_sdf(cell_center + vec3<f32>(dx_vec, 0.0, 0.0)) >= 0.0 {
+        && select(
+            sample_sdf(cell_center + vec3<f32>(dx_vec, 0.0, 0.0)) >= 0.0,
+            !sdf_class_is_solid(vec3<i32>(i32(ix_val) + 1, i32(iy_val), i32(iz_val))),
+            use_sdf_cache(),
+        ) {
         vxp = grid_vel[cell_index(ix_val + 1u, iy_val, iz_val)].x;
     }
     if iy_val > 0u
-        && sample_sdf(cell_center + vec3<f32>(0.0, -dx_vec, 0.0)) >= 0.0 {
+        && select(
+            sample_sdf(cell_center + vec3<f32>(0.0, -dx_vec, 0.0)) >= 0.0,
+            !sdf_class_is_solid(vec3<i32>(i32(ix_val), i32(iy_val) - 1, i32(iz_val))),
+            use_sdf_cache(),
+        ) {
         vym = grid_vel[cell_index(ix_val, iy_val - 1u, iz_val)].y;
     }
     if iy_val + 1u < gy()
-        && sample_sdf(cell_center + vec3<f32>(0.0, dx_vec, 0.0)) >= 0.0 {
+        && select(
+            sample_sdf(cell_center + vec3<f32>(0.0, dx_vec, 0.0)) >= 0.0,
+            !sdf_class_is_solid(vec3<i32>(i32(ix_val), i32(iy_val) + 1, i32(iz_val))),
+            use_sdf_cache(),
+        ) {
         vyp = grid_vel[cell_index(ix_val, iy_val + 1u, iz_val)].y;
     }
     if iz_val > 0u
-        && sample_sdf(cell_center + vec3<f32>(0.0, 0.0, -dx_vec)) >= 0.0 {
+        && select(
+            sample_sdf(cell_center + vec3<f32>(0.0, 0.0, -dx_vec)) >= 0.0,
+            !sdf_class_is_solid(vec3<i32>(i32(ix_val), i32(iy_val), i32(iz_val) - 1)),
+            use_sdf_cache(),
+        ) {
         vzm = grid_vel[cell_index(ix_val, iy_val, iz_val - 1u)].z;
     }
     if iz_val + 1u < gz()
-        && sample_sdf(cell_center + vec3<f32>(0.0, 0.0, dx_vec)) >= 0.0 {
+        && select(
+            sample_sdf(cell_center + vec3<f32>(0.0, 0.0, dx_vec)) >= 0.0,
+            !sdf_class_is_solid(vec3<i32>(i32(ix_val), i32(iy_val), i32(iz_val) + 1)),
+            use_sdf_cache(),
+        ) {
         vzp = grid_vel[cell_index(ix_val, iy_val, iz_val + 1u)].z;
     }
 
@@ -1098,6 +1136,13 @@ fn boundary_project(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
     if idx >= total_cells() { return; }
 
+    let gv_w = grid_vel[idx];
+    let solid_idx = grid_vel_solid_idx(idx);
+    let gv_s = grid_vel[solid_idx];
+    if gv_w.w <= 1e-6 && gv_s.w <= 1e-6 {
+        return;
+    }
+
     // Reconstruct cell position from flat index
     let iz_val = idx / (gx() * gy());
     let rem = idx % (gx() * gy());
@@ -1115,14 +1160,11 @@ fn boundary_project(@builtin(global_invocation_id) gid: vec3<u32>) {
     let bmin = u.grid_origin.xyz + vec3<f32>(margin);
     let bmax = u.bounds_max.xyz - vec3<f32>(margin);
 
-    let gv_w = grid_vel[idx];
     if gv_w.w > 1e-6 {
         let v_w = project_grid_velocity(gv_w.xyz, cell_pos, sdf_val, n, bmin, bmax);
         grid_vel[idx] = vec4<f32>(v_w, gv_w.w);
     }
 
-    let solid_idx = grid_vel_solid_idx(idx);
-    let gv_s = grid_vel[solid_idx];
     if gv_s.w > 1e-6 {
         var v_s = project_grid_velocity(gv_s.xyz, cell_pos, sdf_val, n, bmin, bmax);
         v_s = project_solid_velocity_against_filter(v_s, cell_pos);
