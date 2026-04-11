@@ -71,7 +71,15 @@ mod tests {
         let mid_y = (filter.top_y + filter.bot_y) * 0.5;
         let outer = filter.radius_at_y(mid_y);
         let inner = filter.inner_radius_at_y(mid_y);
-        assert!(filter.contains_shell_point(Vec3::new(filter.center.x + (outer + inner) * 0.5, mid_y, filter.center.z)));
-        assert!(!filter.contains_shell_point(Vec3::new(filter.center.x + outer + 0.5, mid_y, filter.center.z)));
+        assert!(filter.contains_shell_point(Vec3::new(
+            filter.center.x + (outer + inner) * 0.5,
+            mid_y,
+            filter.center.z
+        )));
+        assert!(!filter.contains_shell_point(Vec3::new(
+            filter.center.x + outer + 0.5,
+            mid_y,
+            filter.center.z
+        )));
     }
 }

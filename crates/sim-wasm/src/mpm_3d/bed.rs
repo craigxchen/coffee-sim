@@ -14,6 +14,12 @@ pub(crate) struct BedConfig {
     pub num_particles: u32,
     pub initial_porosity: f32,
     pub initial_permeability: f32,
+    pub mean_grind_size: f32,
+    pub grind_size_spread: f32,
+    pub fines_fraction: f32,
+    pub spawn_drop_height: f32,
+    pub spawn_radius_scale: f32,
+    pub spawn_jitter: f32,
     pub extractable_mass: f32,
 }
 
@@ -30,7 +36,13 @@ impl Default for BedConfig {
             bot_radius: 0.95,
             num_particles: 12_000,
             initial_porosity: 0.4,
-            initial_permeability: 1.0,
+            initial_permeability: 0.002,
+            mean_grind_size: 1.0,
+            grind_size_spread: 0.32,
+            fines_fraction: 0.18,
+            spawn_drop_height: 2.8,
+            spawn_radius_scale: 0.82,
+            spawn_jitter: 0.18,
             extractable_mass: 0.15,
         }
     }
@@ -75,8 +87,7 @@ impl BedConfig {
             filter.opening_radius() + 0.8,
             filter.top_radius - filter.thickness - 0.1,
         );
-        bed.top_radius =
-            (filter.inner_radius_at_y(top_local) - 0.18).clamp(top_r_min, top_r_max);
+        bed.top_radius = (filter.inner_radius_at_y(top_local) - 0.18).clamp(top_r_min, top_r_max);
 
         let (bot_r_min, bot_r_max) =
             order_bounds(filter.opening_radius() + 0.06, bed.top_radius - 0.25);
@@ -98,9 +109,16 @@ fn order_bounds(min: f32, max: f32) -> (f32, f32) {
 pub(crate) struct BedInit {
     pub particles: Vec<[f32; 8]>,
     pub affines: Vec<[f32; 12]>,
-    pub bed_extracts: Vec<[f32; 8]>,
+    pub bed_extracts: Vec<[f32; 20]>,
     pub cell_lookup: Vec<i32>,
     pub bed_support_count: Vec<u32>,
+}
+
+#[derive(Clone, Copy)]
+struct BedHydraulicProps {
+    porosity: f32,
+    permeability: f32,
+    capacity_scale: f32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -128,9 +146,7 @@ pub(crate) fn init_bed_particles(
 
     let avg_radius = (config.top_radius + config.bot_radius) * 0.5;
     let volume = std::f32::consts::PI * avg_radius * avg_radius * height / 3.0
-        * (1.0
-            + config.bot_radius / avg_radius
-            + (config.bot_radius / avg_radius).powi(2));
+        * (1.0 + config.bot_radius / avg_radius + (config.bot_radius / avg_radius).powi(2));
     let spacing = (volume / config.num_particles.max(1) as f32).cbrt();
 
     let nx = ((config.top_radius * 2.0) / spacing).ceil() as i32;
@@ -161,22 +177,43 @@ pub(crate) fn init_bed_particles(
 
                 let particle_index = particles.len() as i32;
                 lattice_to_particle.insert(LatticeKey { ix, iy, iz }, particle_index);
+                let hydraulic = sample_bed_hydraulics(config, ix, iy, iz);
+                let spawn_jitter = sample_spawn_jitter(config, ix, iy, iz, spacing);
+                let spawn_scale = (config.spawn_radius_scale + (1.0 - t) * 0.06).clamp(0.55, 1.1);
+                let spawn_x = config.center.x + dx * spawn_scale + spawn_jitter.x;
+                let spawn_y =
+                    y + config.spawn_drop_height + spawn_jitter.y + (1.0 - t) * spacing * 0.35;
+                let spawn_z = config.center.z + dz * spawn_scale + spawn_jitter.z;
 
                 // Particle: pos(x,y,z,J=1), vel(0,0,0,mass=1)
-                particles.push([x, y, z, 1.0, 0.0, 0.0, 0.0, 1.0]);
+                particles.push([spawn_x, spawn_y, spawn_z, 1.0, 0.0, 0.0, 0.0, 1.0]);
                 // Phase=1.0 means bed particle. col1/col2 hold the APIC C
                 // matrix after the first G2P pass, so zero-init them.
                 affines.push([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
-                // BedExtract: bed(pore_water, porosity, permeability, compaction),
-                //             extract(extractable, dissolved, temp, saturation)
+                // BedExtract:
+                //   bed(pore_water, porosity, permeability, capacity_scale)
+                //   extract(extractable, dissolved, temp, saturation)
+                //   mech0/1/2 = bed-only deformation gradient F columns
                 bed_extracts.push([
                     0.0,
-                    config.initial_porosity,
-                    config.initial_permeability,
-                    0.0,
+                    hydraulic.porosity,
+                    hydraulic.permeability,
+                    hydraulic.capacity_scale,
                     config.extractable_mass,
                     0.0,
                     93.0,
+                    0.0,
+                    1.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    1.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    1.0,
                     0.0,
                 ]);
             }
@@ -212,6 +249,63 @@ pub(crate) fn init_bed_particles(
     }
 }
 
+fn sample_bed_hydraulics(config: &BedConfig, ix: i32, iy: i32, iz: i32) -> BedHydraulicProps {
+    let seed = mix_seed(ix, iy, iz);
+    let base_noise = triangular_noise(seed);
+    let grind_scale = sample_grind_scale(config, seed, base_noise);
+
+    let porosity = (config.initial_porosity * (0.84 + 0.22 * grind_scale)).clamp(0.24, 0.58);
+    let permeability = (config.initial_permeability * grind_scale.powf(2.35)).clamp(0.0002, 0.02);
+    let capacity_scale = (1.10 - 0.28 * (grind_scale - 1.0)).clamp(0.72, 1.38);
+
+    BedHydraulicProps {
+        porosity,
+        permeability,
+        capacity_scale,
+    }
+}
+
+fn sample_grind_scale(config: &BedConfig, seed: u64, base_noise: f32) -> f32 {
+    let mut grind_scale =
+        (config.mean_grind_size * (1.0 + config.grind_size_spread * base_noise)).clamp(0.35, 2.4);
+    if hash_to_unit(seed ^ 0x517c_c1b7_d2e4_f91a) < config.fines_fraction.clamp(0.0, 0.75) {
+        grind_scale *= 0.42;
+    }
+    grind_scale.clamp(0.25, 2.2)
+}
+
+fn sample_spawn_jitter(config: &BedConfig, ix: i32, iy: i32, iz: i32, spacing: f32) -> Vec3 {
+    let seed = mix_seed(ix, iy, iz) ^ 0x6eed_0e9d_13f2_8a5b;
+    let jitter_scale = config.spawn_jitter.max(0.0) * spacing;
+    let x = triangular_noise(seed ^ 0x243f_6a88_85a3_08d3) * jitter_scale;
+    let y = triangular_noise(seed ^ 0x1319_8a2e_0370_7344) * jitter_scale * 0.35;
+    let z = triangular_noise(seed ^ 0xa409_3822_299f_31d0) * jitter_scale;
+    Vec3::new(x, y, z)
+}
+
+fn triangular_noise(seed: u64) -> f32 {
+    let a = hash_to_unit(seed ^ 0x9e37_79b9_7f4a_7c15);
+    let b = hash_to_unit(seed ^ 0xbf58_476d_1ce4_e5b9);
+    (a + b - 1.0).clamp(-1.0, 1.0)
+}
+
+fn mix_seed(ix: i32, iy: i32, iz: i32) -> u64 {
+    let x = ix as u32 as u64;
+    let y = iy as u32 as u64;
+    let z = iz as u32 as u64;
+    x.wrapping_mul(0x9e37_79b9_7f4a_7c15)
+        ^ y.wrapping_mul(0xbf58_476d_1ce4_e5b9)
+        ^ z.wrapping_mul(0x94d0_49bb_1331_11eb)
+}
+
+fn hash_to_unit(seed: u64) -> f32 {
+    let mut x = seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^= x >> 31;
+    ((x >> 40) as u32) as f32 / ((1u32 << 24) as f32)
+}
+
 fn build_support_counts(cell_lookup: &[i32], num_particles: usize) -> Vec<u32> {
     let mut counts = vec![0_u32; num_particles];
     for &entry in cell_lookup {
@@ -237,7 +331,11 @@ fn build_cell_lookup(
 ) -> Vec<i32> {
     let [gx, gy, gz] = grid_dims;
     let mut lookup = vec![-1; (gx * gy * gz) as usize];
-    let grid_origin = Vec3::new(-bounds_size.x * 0.5, -bounds_size.y * 0.5, -bounds_size.z * 0.5);
+    let grid_origin = Vec3::new(
+        -bounds_size.x * 0.5,
+        -bounds_size.y * 0.5,
+        -bounds_size.z * 0.5,
+    );
     let dx = bounds_size.x / gx as f32;
     let height = config.top_y - config.bot_y;
     let bed_bottom = config.center.y + config.bot_y;
@@ -264,8 +362,10 @@ fn build_cell_lookup(
                 }
 
                 let iy_guess = (((pos.y - bed_bottom) / spacing) - 0.5).round() as i32;
-                let ix_guess = (((pos.x - (config.center.x - max_r)) / spacing) - 0.5).round() as i32;
-                let iz_guess = (((pos.z - (config.center.z - max_r)) / spacing) - 0.5).round() as i32;
+                let ix_guess =
+                    (((pos.x - (config.center.x - max_r)) / spacing) - 0.5).round() as i32;
+                let iz_guess =
+                    (((pos.z - (config.center.z - max_r)) / spacing) - 0.5).round() as i32;
 
                 let mut best = -1;
                 let mut best_dist2 = f32::INFINITY;
@@ -282,7 +382,8 @@ fn build_cell_lookup(
                             };
                             let py = bed_bottom + (key.iy as f32 + 0.5) * spacing;
                             let py_t = ((py - bed_bottom) / height).clamp(0.0, 1.0);
-                            let py_r = config.bot_radius + (config.top_radius - config.bot_radius) * py_t;
+                            let py_r =
+                                config.bot_radius + (config.top_radius - config.bot_radius) * py_t;
                             let px = config.center.x - py_r + (key.ix as f32 + 0.5) * spacing;
                             let pz = config.center.z - py_r + (key.iz as f32 + 0.5) * spacing;
                             let ddx = pos.x - px;
@@ -356,16 +457,90 @@ mod tests {
         let cfg = small_config();
         let init = init_bed_particles(&cfg, [32, 32, 32], Vec3::new(14.0, 20.0, 14.0));
         for extract in &init.bed_extracts {
-            // bed: pore_water, porosity, permeability, compaction
+            // bed: pore_water, porosity, permeability, capacity_scale
             assert_eq!(extract[0], 0.0);
-            assert!((extract[1] - cfg.initial_porosity).abs() < 1e-6);
-            assert!((extract[2] - cfg.initial_permeability).abs() < 1e-6);
-            assert_eq!(extract[3], 0.0);
+            assert!(extract[1] >= 0.24 && extract[1] <= 0.58);
+            assert!(extract[2] >= 0.0002 && extract[2] <= 0.02);
+            assert!(extract[3] >= 0.72 && extract[3] <= 1.38);
             // extract: extractable, dissolved, temp, saturation
             assert!((extract[4] - cfg.extractable_mass).abs() < 1e-6);
             assert_eq!(extract[5], 0.0);
             assert_eq!(extract[7], 0.0);
+            // mech: F starts at identity for dry bed particles
+            assert_eq!(extract[8], 1.0);
+            assert_eq!(extract[13], 1.0);
+            assert_eq!(extract[18], 1.0);
         }
+    }
+
+    #[test]
+    fn bed_hydraulics_are_non_uniform_by_default() {
+        let cfg = small_config();
+        let init = init_bed_particles(&cfg, [32, 32, 32], Vec3::new(14.0, 20.0, 14.0));
+        let min_perm = init
+            .bed_extracts
+            .iter()
+            .map(|extract| extract[2])
+            .fold(f32::MAX, f32::min);
+        let max_perm = init
+            .bed_extracts
+            .iter()
+            .map(|extract| extract[2])
+            .fold(f32::MIN, f32::max);
+        let min_cap = init
+            .bed_extracts
+            .iter()
+            .map(|extract| extract[3])
+            .fold(f32::MAX, f32::min);
+        let max_cap = init
+            .bed_extracts
+            .iter()
+            .map(|extract| extract[3])
+            .fold(f32::MIN, f32::max);
+
+        assert!(max_perm > min_perm);
+        assert!(max_cap > min_cap);
+    }
+
+    #[test]
+    fn coarser_grind_raises_mean_permeability() {
+        let mut fine = small_config();
+        fine.mean_grind_size = 0.75;
+        fine.fines_fraction = 0.28;
+        let mut coarse = small_config();
+        coarse.mean_grind_size = 1.35;
+        coarse.fines_fraction = 0.08;
+
+        let fine_init = init_bed_particles(&fine, [32, 32, 32], Vec3::new(14.0, 20.0, 14.0));
+        let coarse_init = init_bed_particles(&coarse, [32, 32, 32], Vec3::new(14.0, 20.0, 14.0));
+
+        let fine_mean_perm = fine_init
+            .bed_extracts
+            .iter()
+            .map(|extract| extract[2])
+            .sum::<f32>()
+            / fine_init.bed_extracts.len().max(1) as f32;
+        let coarse_mean_perm = coarse_init
+            .bed_extracts
+            .iter()
+            .map(|extract| extract[2])
+            .sum::<f32>()
+            / coarse_init.bed_extracts.len().max(1) as f32;
+        let fine_mean_capacity = fine_init
+            .bed_extracts
+            .iter()
+            .map(|extract| extract[3])
+            .sum::<f32>()
+            / fine_init.bed_extracts.len().max(1) as f32;
+        let coarse_mean_capacity = coarse_init
+            .bed_extracts
+            .iter()
+            .map(|extract| extract[3])
+            .sum::<f32>()
+            / coarse_init.bed_extracts.len().max(1) as f32;
+
+        assert!(coarse_mean_perm > fine_mean_perm);
+        assert!(fine_mean_capacity > coarse_mean_capacity);
     }
 
     #[test]
