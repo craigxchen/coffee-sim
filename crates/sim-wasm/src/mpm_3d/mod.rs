@@ -381,13 +381,21 @@ impl MpmSim3D {
                     pass.dispatch_workgroups(particle_wg, 1, 1);
                 }
 
-                // 7. extraction_advect (consumes bed_delta from bed_coupling)
+                // 7. bed_redistribute (spreads stored pore water laterally
+                //    through the bed before the state update is committed)
+                if bed_wg > 0 {
+                    pass.set_pipeline(&self.pipelines.bed_redistribute);
+                    pass.dispatch_workgroups(bed_wg, 1, 1);
+                }
+
+                // 8. extraction_advect (consumes bed_delta from absorption +
+                //    redistribution)
                 if bed_wg > 0 {
                     pass.set_pipeline(&self.pipelines.extraction_advect);
                     pass.dispatch_workgroups(bed_wg, 1, 1);
                 }
 
-                // 8. prepare_render
+                // 9. prepare_render
                 if particle_wg > 0 {
                     pass.set_pipeline(&self.pipelines.prepare_render);
                     pass.dispatch_workgroups(particle_wg, 1, 1);
