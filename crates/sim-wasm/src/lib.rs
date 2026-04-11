@@ -35,7 +35,11 @@ impl WasmSim3D {
         let renderer = Renderer::new(canvas, &settings).await?;
         let sim = MpmSim3D::new(renderer.device(), renderer.queue(), settings);
         let camera = OrbitCamera::new(sim.settings().bounds_size);
-        Ok(Self { sim, renderer, camera })
+        Ok(Self {
+            sim,
+            renderer,
+            camera,
+        })
     }
 
     pub fn reset(&mut self) {
@@ -109,7 +113,6 @@ impl WasmSim3D {
     pub fn exit_speed(&self) -> f32 {
         self.sim.exit_speed()
     }
-
 
     pub fn render(&mut self) -> Result<(), JsValue> {
         self.renderer.render_3d(&self.sim, self.camera)
@@ -185,7 +188,6 @@ impl WasmSim3D {
         self.sim.settings().bed.is_some()
     }
 
-
     #[wasm_bindgen(js_name = refreshMetrics)]
     pub async fn refresh_metrics(&mut self) -> Result<(), JsValue> {
         // Clone the internal Arc-backed `wgpu::Device` / `wgpu::Queue` so we
@@ -221,7 +223,6 @@ impl WasmSim3D {
     pub fn mass_overflow_fires(&self) -> u32 {
         self.sim.latest_metrics().mass_overflow_fires
     }
-
 }
 
 #[cfg(target_arch = "wasm32")]

@@ -135,7 +135,7 @@ impl MpmSettings {
                 },
             ],
             spout: SpoutSettings::default(),
-            initial_kettle_angle_deg: 36.0,
+            initial_kettle_angle_deg: 0.0,
             filter: Some(filter),
             bed: Some(bed),
         }
@@ -154,7 +154,7 @@ impl MpmSettings {
         let mut settings = Self::default_v60();
         settings.spout.origin = Vec3::new(0.0, 7.1, 0.0);
         settings.spout.aim_at(Vec3::new(0.0, 0.4, 0.0));
-        settings.initial_kettle_angle_deg = 36.0;
+        settings.initial_kettle_angle_deg = 0.0;
         settings
     }
 }
@@ -559,6 +559,18 @@ impl MpmSim3D {
         let inv_dx = 1.0 / dx;
         let initial_particle_mass = MASS_UNITS_PER_ML / inflow::PARTICLES_PER_ML;
         let particle_vol = dx * dx * dx * 0.25;
+        let default_bed_porosity = self
+            .settings
+            .bed
+            .as_ref()
+            .map(|bed| bed.initial_porosity)
+            .unwrap_or(0.4);
+        let default_bed_permeability = self
+            .settings
+            .bed
+            .as_ref()
+            .map(|bed| bed.initial_permeability)
+            .unwrap_or(0.002);
         let bed_capacity_per_particle = if self.num_bed > 0 {
             TARGET_BED_RETENTION_ML * MASS_UNITS_PER_ML / self.num_bed as f32
         } else {
@@ -611,12 +623,12 @@ impl MpmSim3D {
             // Tie bed retention to an overall retained-water target so the bed
             // wets realistically without swallowing most of the brew.
             bed_params: [
-                0.4,
+                default_bed_porosity,
                 8.0,
                 bed_capacity_per_particle,
                 if self.filter_mesh.is_some() { 1.0 } else { 0.0 },
             ],
-            extraction_params: [0.01, 30000.0, 2.0, 0.01],
+            extraction_params: [0.01, 100000.0, 2.0, default_bed_permeability],
             time_params: [self.total_time, dt, 1.0, 0.0],
             clamp_params: [
                 div_clamp,
