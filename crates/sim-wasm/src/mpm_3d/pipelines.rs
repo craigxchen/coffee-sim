@@ -5,7 +5,6 @@ use super::state::MpmBuffers;
 
 pub(crate) struct MpmPipelines {
     pub bind_group: wgpu::BindGroup,
-    pub clear_grid: wgpu::ComputePipeline,
     pub metrics_clear: wgpu::ComputePipeline,
     pub bed_lookup_clear: wgpu::ComputePipeline,
     pub bed_lookup_scatter: wgpu::ComputePipeline,
@@ -73,6 +72,17 @@ impl MpmPipelines {
                 // against the read-write storage buffer cap on some
                 // adapters)
                 read_only_storage_entry(11),
+                // 12: cached cell-solid classification for classify_cells
+                wgpu::BindGroupLayoutEntry {
+                    binding: 12,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Uint,
+                        view_dimension: wgpu::TextureViewDimension::D3,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -128,6 +138,10 @@ impl MpmPipelines {
                     binding: 11,
                     resource: buffers.filter_mesh_positions.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 12,
+                    resource: wgpu::BindingResource::TextureView(&buffers.sdf_class_view),
+                },
             ],
         });
 
@@ -155,7 +169,6 @@ impl MpmPipelines {
 
         Self {
             bind_group,
-            clear_grid: make("clear_grid"),
             metrics_clear: make("metrics_clear"),
             bed_lookup_clear: make("bed_lookup_clear"),
             bed_lookup_scatter: make("bed_lookup_scatter"),
