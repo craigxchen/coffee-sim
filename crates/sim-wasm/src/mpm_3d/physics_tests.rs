@@ -119,10 +119,16 @@ struct DiagSnapshot {
     active_count: u32,
     min_mass: f32,
     max_mass: f32,
+    x_min: f32,
+    x_max: f32,
+    x_extent: f32,
     y_min: f32,
     y_max: f32,
     y_mean: f32,
     y_extent: f32,
+    z_min: f32,
+    z_max: f32,
+    z_extent: f32,
     mean_j: f32,
     min_j: f32,
     max_j: f32,
@@ -165,8 +171,12 @@ fn readback_diag_snapshot(
     let mut active_count = 0u32;
     let mut min_mass = f32::MAX;
     let mut max_mass = f32::MIN;
+    let mut x_min = f32::MAX;
+    let mut x_max = f32::MIN;
     let mut y_min = f32::MAX;
     let mut y_max = f32::MIN;
+    let mut z_min = f32::MAX;
+    let mut z_max = f32::MIN;
     let mut y_sum = 0.0_f32;
     let mut j_sum = 0.0_f32;
     let mut j_min = f32::MAX;
@@ -175,11 +185,12 @@ fn readback_diag_snapshot(
 
     for i in 0..particle_count {
         let x = data[i * 8];
+        let z = data[i * 8 + 2];
         let mass = data[i * 8 + 7];
         let j = data[i * 8 + 3];
         let y = data[i * 8 + 1];
 
-        all_finite &= x.is_finite() && y.is_finite() && j.is_finite() && mass.is_finite();
+        all_finite &= x.is_finite() && y.is_finite() && z.is_finite() && j.is_finite() && mass.is_finite();
 
         if mass <= inactive_thresh {
             continue;
@@ -192,11 +203,23 @@ fn readback_diag_snapshot(
         if mass > max_mass {
             max_mass = mass;
         }
+        if x < x_min {
+            x_min = x;
+        }
+        if x > x_max {
+            x_max = x;
+        }
         if y < y_min {
             y_min = y;
         }
         if y > y_max {
             y_max = y;
+        }
+        if z < z_min {
+            z_min = z;
+        }
+        if z > z_max {
+            z_max = z;
         }
         y_sum += y;
         j_sum += j;
@@ -217,10 +240,16 @@ fn readback_diag_snapshot(
         active_count,
         min_mass: if active_count > 0 { min_mass } else { 0.0 },
         max_mass: if active_count > 0 { max_mass } else { 0.0 },
+        x_min: if active_count > 0 { x_min } else { 0.0 },
+        x_max: if active_count > 0 { x_max } else { 0.0 },
+        x_extent: if active_count > 0 { x_max - x_min } else { 0.0 },
         y_min: if active_count > 0 { y_min } else { 0.0 },
         y_max: if active_count > 0 { y_max } else { 0.0 },
         y_mean: y_sum / n,
         y_extent: if active_count > 0 { y_max - y_min } else { 0.0 },
+        z_min: if active_count > 0 { z_min } else { 0.0 },
+        z_max: if active_count > 0 { z_max } else { 0.0 },
+        z_extent: if active_count > 0 { z_max - z_min } else { 0.0 },
         mean_j: j_sum / n,
         min_j: if active_count > 0 { j_min } else { 0.0 },
         max_j: if active_count > 0 { j_max } else { 0.0 },
@@ -505,6 +534,57 @@ fn water_pool_stable_against_cup_floor() {
         drift < 0.02,
         "pooled water drifted {:.2}% after settle (m0={m0}, m1={m1})",
         drift * 100.0
+    );
+}
+
+#[test]
+fn pooled_water_shape_stays_bounded_after_initial_settle() {
+    let Some((device, queue)) = create_test_device() else {
+        eprintln!("skipping: no GPU adapter");
+        return;
+    };
+
+    let mut sim = MpmSim3D::new(&device, &queue, MpmSettings::benchmark_free_stream());
+
+    sim.set_kettle_angle(36.0);
+    for _ in 0..180 {
+        sim.step_frame(&device, &queue, 1.0 / 60.0);
+    }
+
+    sim.set_kettle_angle(0.0);
+    for _ in 0..60 {
+        sim.step_frame(&device, &queue, 1.0 / 60.0);
+    }
+    let settled = readback_diag_snapshot(&sim, &device, &queue);
+
+    for _ in 0..600 {
+        sim.step_frame(&device, &queue, 1.0 / 60.0);
+    }
+    let late = readback_diag_snapshot(&sim, &device, &queue);
+
+    let settled_volume_proxy = settled.x_extent * settled.y_extent * settled.z_extent;
+    let late_volume_proxy = late.x_extent * late.y_extent * late.z_extent;
+    let volume_proxy_ratio = late_volume_proxy / settled_volume_proxy.max(1e-6);
+    let height_ratio = late.y_extent / settled.y_extent.max(1e-6);
+
+    assert!(settled.all_finite && late.all_finite, "pooled water produced non-finite state");
+    assert!(
+        settled.active_count == late.active_count,
+        "pooled water changed active particle count after settling: settled={:?}, late={:?}",
+        settled,
+        late
+    );
+    assert!(
+        height_ratio > 0.8,
+        "pooled water height kept shrinking after initial settle: settled={:?}, late={:?}",
+        settled,
+        late
+    );
+    assert!(
+        volume_proxy_ratio > 0.75,
+        "pooled water occupied volume proxy kept shrinking after initial settle: settled={:?}, late={:?}",
+        settled,
+        late
     );
 }
 
