@@ -5,7 +5,6 @@ use super::state::MpmBuffers;
 
 pub(crate) struct MpmPipelines {
     pub bind_group: wgpu::BindGroup,
-    pub clear_grid: wgpu::ComputePipeline,
     pub metrics_clear: wgpu::ComputePipeline,
     pub bed_lookup_clear: wgpu::ComputePipeline,
     pub bed_lookup_scatter: wgpu::ComputePipeline,
@@ -18,8 +17,8 @@ pub(crate) struct MpmPipelines {
     pub boundary_project: wgpu::ComputePipeline,
     pub g2p: wgpu::ComputePipeline,
     pub bed_coupling: wgpu::ComputePipeline,
+    pub bed_redistribute: wgpu::ComputePipeline,
     pub extraction_advect: wgpu::ComputePipeline,
-    pub bed_dynamics: wgpu::ComputePipeline,
     pub prepare_render: wgpu::ComputePipeline,
 }
 
@@ -70,6 +69,21 @@ impl MpmPipelines {
                 // repurposed from the unused `bed_support_count` slot to
                 // stay within the 10-storage-buffer device limit.
                 storage_entry(10),
+                // 11: filter mesh positions (read-only, does not count
+                // against the read-write storage buffer cap on some
+                // adapters)
+                read_only_storage_entry(11),
+                // 12: cached cell-solid classification for classify_cells
+                wgpu::BindGroupLayoutEntry {
+                    binding: 12,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Uint,
+                        view_dimension: wgpu::TextureViewDimension::D3,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -121,6 +135,14 @@ impl MpmPipelines {
                     binding: 10,
                     resource: buffers.metrics.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 11,
+                    resource: buffers.filter_mesh_positions.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 12,
+                    resource: wgpu::BindingResource::TextureView(&buffers.sdf_class_view),
+                },
             ],
         });
 
@@ -148,7 +170,6 @@ impl MpmPipelines {
 
         Self {
             bind_group,
-            clear_grid: make("clear_grid"),
             metrics_clear: make("metrics_clear"),
             bed_lookup_clear: make("bed_lookup_clear"),
             bed_lookup_scatter: make("bed_lookup_scatter"),
@@ -161,8 +182,8 @@ impl MpmPipelines {
             boundary_project: make("boundary_project"),
             g2p: make("g2p"),
             bed_coupling: make("bed_coupling"),
+            bed_redistribute: make("bed_redistribute"),
             extraction_advect: make("extraction_advect"),
-            bed_dynamics: make("bed_dynamics"),
             prepare_render: make("prepare_render"),
         }
     }
@@ -181,7 +202,6 @@ fn storage_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
     }
 }
 
-#[allow(dead_code)] // kept for future read-only bindings.
 fn read_only_storage_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,
