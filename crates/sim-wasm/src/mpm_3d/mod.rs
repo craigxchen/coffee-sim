@@ -4,9 +4,9 @@ use coffee_sim_core::sph::Vec3;
 use wasm_bindgen::prelude::JsValue;
 
 pub(crate) mod bed;
-pub(crate) mod inflow;
 mod filter;
 mod filter_mesh;
+pub(crate) mod inflow;
 #[cfg(test)]
 mod physics_tests;
 mod pipelines;
@@ -91,6 +91,8 @@ pub(crate) struct MpmSettings {
     pub bulk_modulus: f32,
     pub viscosity: f32,
     pub render_radius: f32,
+    pub pressure_rbgs_pairs: u32,
+    pub use_sdf_cache: bool,
     pub obstacles: Vec<Obstacle>,
     pub spout: SpoutSettings,
     pub initial_kettle_angle_deg: f32,
@@ -119,6 +121,8 @@ impl MpmSettings {
             bulk_modulus: 900.0,
             viscosity: 0.12,
             render_radius: dx * 0.7,
+            pressure_rbgs_pairs: 20,
+            use_sdf_cache: true,
             obstacles: vec![
                 Obstacle::TruncatedCone {
                     center: Vec3::ZERO,
@@ -296,6 +300,8 @@ impl MpmSim3D {
             let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("mpm step"),
             });
+            encoder.clear_buffer(&self.buffers.grid, 0, None);
+            encoder.clear_buffer(&self.buffers.grid_vel, 0, None);
             {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("mpm compute"),
@@ -303,17 +309,13 @@ impl MpmSim3D {
                 });
                 pass.set_bind_group(0, &self.pipelines.bind_group, &[]);
 
-                // 1a. clear_grid
-                pass.set_pipeline(&self.pipelines.clear_grid);
-                pass.dispatch_workgroups(cell_wg, 1, 1);
-
-                // 1b. metrics_clear (fresh per-substep observability counters)
+                // 1a. metrics_clear (fresh per-substep observability counters)
                 if metrics_wg > 0 {
                     pass.set_pipeline(&self.pipelines.metrics_clear);
                     pass.dispatch_workgroups(metrics_wg, 1, 1);
                 }
 
-                // 1c. bed_lookup_clear + scatter: rebuild the spatial index
+                // 1b. bed_lookup_clear + scatter: rebuild the spatial index
                 // so classify_cells / bed_coupling / g2p see current
                 // bed-particle positions.
                 pass.set_pipeline(&self.pipelines.bed_lookup_clear);
@@ -342,8 +344,7 @@ impl MpmSim3D {
                 pass.set_pipeline(&self.pipelines.classify_cells);
                 pass.dispatch_workgroups(cell_wg, 1, 1);
 
-                const PRESSURE_RBGS_PAIRS: u32 = 20;
-                for _ in 0..PRESSURE_RBGS_PAIRS {
+                for _ in 0..self.settings.pressure_rbgs_pairs {
                     pass.set_pipeline(&self.pipelines.pressure_rbgs_red);
                     pass.dispatch_workgroups(cell_wg, 1, 1);
                     pass.set_pipeline(&self.pipelines.pressure_rbgs_black);
@@ -463,7 +464,6 @@ impl MpmSim3D {
         self.inflow.exit_speed()
     }
 
-
     pub fn particle_count(&self) -> usize {
         (self.num_water + self.num_bed) as usize
     }
@@ -483,7 +483,6 @@ impl MpmSim3D {
     pub fn total_time(&self) -> f32 {
         self.total_time
     }
-
 
     pub fn render_buffer(&self) -> &wgpu::Buffer {
         &self.buffers.render_data
@@ -577,7 +576,7 @@ impl MpmSim3D {
                 self.num_water,
                 self.num_bed,
                 self.settings.max_particles,
-                self.settings.substeps,
+                u32::from(self.settings.use_sdf_cache),
             ],
             sim_params: [dt, self.settings.gravity, dx, inv_dx],
             grid_origin: [-bs.x * 0.5, -bs.y * 0.5, -bs.z * 0.5, 0.0],
@@ -605,19 +604,9 @@ impl MpmSim3D {
             sdf_params: [SDF_RES as f32, 0.3, 0.0, 0.05],
             // Tie bed retention to an overall retained-water target so the bed
             // wets realistically without swallowing most of the brew.
-            bed_params: [
-                34.0,
-                8.0,
-                bed_capacity_per_particle,
-                1.0,
-            ],
+            bed_params: [34.0, 8.0, bed_capacity_per_particle, 1.0],
             extraction_params: [0.01, 11.0, 8.5, 15.0],
-            time_params: [
-                self.total_time,
-                dt,
-                1.0,
-                0.0,
-            ],
+            time_params: [self.total_time, dt, 1.0, 0.0],
             clamp_params: [
                 div_clamp,
                 pressure_clamp,

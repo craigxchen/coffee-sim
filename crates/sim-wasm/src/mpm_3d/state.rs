@@ -63,6 +63,8 @@ pub(crate) struct MpmBuffers {
     pub bed_delta: wgpu::Buffer,
     pub _sdf_texture: wgpu::Texture,
     pub sdf_view: wgpu::TextureView,
+    pub _sdf_class_texture: wgpu::Texture,
+    pub sdf_class_view: wgpu::TextureView,
     pub render_data: wgpu::Buffer,
     pub bed_extract: wgpu::Buffer,
     pub uniform_buffer: wgpu::Buffer,
@@ -178,7 +180,10 @@ impl MpmBuffers {
         });
 
         let sdf_data = generate_sdf_data(settings);
+        let sdf_class_data = generate_sdf_class_data(settings, &sdf_data);
         let (sdf_texture, sdf_view) = create_sdf_texture(device, queue, &sdf_data);
+        let (sdf_class_texture, sdf_class_view) =
+            create_sdf_class_texture(device, queue, settings.grid_dims, &sdf_class_data);
 
         Self {
             particles,
@@ -190,6 +195,8 @@ impl MpmBuffers {
             bed_delta,
             _sdf_texture: sdf_texture,
             sdf_view,
+            _sdf_class_texture: sdf_class_texture,
+            sdf_class_view,
             render_data,
             bed_extract,
             uniform_buffer,
@@ -273,6 +280,74 @@ fn generate_sdf_data(settings: &MpmSettings) -> Vec<f32> {
     data
 }
 
+fn load_sdf_texel(data: &[f32], c: [i32; 3]) -> f32 {
+    let max = SDF_RES as i32 - 1;
+    let x = c[0].clamp(0, max) as usize;
+    let y = c[1].clamp(0, max) as usize;
+    let z = c[2].clamp(0, max) as usize;
+    let res = SDF_RES as usize;
+    data[z * res * res + y * res + x]
+}
+
+fn sample_sdf_from_data(settings: &MpmSettings, data: &[f32], position: Vec3) -> f32 {
+    let bounds_size = settings.bounds_size;
+    let res = SDF_RES as f32;
+    let uv = Vec3::new(
+        (position.x + bounds_size.x * 0.5) / bounds_size.x * res - 0.5,
+        (position.y + bounds_size.y * 0.5) / bounds_size.y * res - 0.5,
+        (position.z + bounds_size.z * 0.5) / bounds_size.z * res - 0.5,
+    );
+    let base = [
+        uv.x.floor() as i32,
+        uv.y.floor() as i32,
+        uv.z.floor() as i32,
+    ];
+    let fx = uv.x.fract();
+    let fy = uv.y.fract();
+    let fz = uv.z.fract();
+
+    let c000 = load_sdf_texel(data, base);
+    let c100 = load_sdf_texel(data, [base[0] + 1, base[1], base[2]]);
+    let c010 = load_sdf_texel(data, [base[0], base[1] + 1, base[2]]);
+    let c110 = load_sdf_texel(data, [base[0] + 1, base[1] + 1, base[2]]);
+    let c001 = load_sdf_texel(data, [base[0], base[1], base[2] + 1]);
+    let c101 = load_sdf_texel(data, [base[0] + 1, base[1], base[2] + 1]);
+    let c011 = load_sdf_texel(data, [base[0], base[1] + 1, base[2] + 1]);
+    let c111 = load_sdf_texel(data, [base[0] + 1, base[1] + 1, base[2] + 1]);
+
+    let c00 = c000 + (c100 - c000) * fx;
+    let c10 = c010 + (c110 - c010) * fx;
+    let c01 = c001 + (c101 - c001) * fx;
+    let c11 = c011 + (c111 - c011) * fx;
+    let c0 = c00 + (c10 - c00) * fy;
+    let c1 = c01 + (c11 - c01) * fy;
+    c0 + (c1 - c0) * fz
+}
+
+fn generate_sdf_class_data(settings: &MpmSettings, sdf_data: &[f32]) -> Vec<u8> {
+    let [gx, gy, gz] = settings.grid_dims;
+    let mut out = vec![0u8; (gx * gy * gz) as usize];
+    let bounds = settings.bounds_size;
+    let dx = bounds.x / gx as f32;
+    let origin = Vec3::new(-bounds.x * 0.5, -bounds.y * 0.5, -bounds.z * 0.5);
+
+    for iz in 0..gz {
+        for iy in 0..gy {
+            for ix in 0..gx {
+                let cell_center = Vec3::new(
+                    origin.x + (ix as f32 + 0.5) * dx,
+                    origin.y + (iy as f32 + 0.5) * dx,
+                    origin.z + (iz as f32 + 0.5) * dx,
+                );
+                let idx = (iz * gx * gy + iy * gx + ix) as usize;
+                out[idx] = u8::from(sample_sdf_from_data(settings, sdf_data, cell_center) < 0.0);
+            }
+        }
+    }
+
+    out
+}
+
 fn create_sdf_texture(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -316,4 +391,84 @@ fn create_sdf_texture(
 
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
     (texture, view)
+}
+
+fn create_sdf_class_texture(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    grid_dims: [u32; 3],
+    data: &[u8],
+) -> (wgpu::Texture, wgpu::TextureView) {
+    let [gx, gy, gz] = grid_dims;
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("mpm sdf class texture"),
+        size: wgpu::Extent3d {
+            width: gx,
+            height: gy,
+            depth_or_array_layers: gz,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D3,
+        format: wgpu::TextureFormat::R8Uint,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        data,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(gx),
+            rows_per_image: Some(gy),
+        },
+        wgpu::Extent3d {
+            width: gx,
+            height: gy,
+            depth_or_array_layers: gz,
+        },
+    );
+
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    (texture, view)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sdf_class_data_matches_live_cell_center_sampling() {
+        let settings = MpmSettings::default_v60();
+        let sdf_data = generate_sdf_data(&settings);
+        let sdf_class = generate_sdf_class_data(&settings, &sdf_data);
+        let [gx, gy, gz] = settings.grid_dims;
+        let dx = settings.bounds_size.x / gx as f32;
+        let origin = Vec3::new(
+            -settings.bounds_size.x * 0.5,
+            -settings.bounds_size.y * 0.5,
+            -settings.bounds_size.z * 0.5,
+        );
+
+        for iz in 0..gz {
+            for iy in 0..gy {
+                for ix in 0..gx {
+                    let cell_center = Vec3::new(
+                        origin.x + (ix as f32 + 0.5) * dx,
+                        origin.y + (iy as f32 + 0.5) * dx,
+                        origin.z + (iz as f32 + 0.5) * dx,
+                    );
+                    let live = sample_sdf_from_data(&settings, &sdf_data, cell_center) < 0.0;
+                    let idx = (iz * gx * gy + iy * gx + ix) as usize;
+                    assert_eq!(sdf_class[idx] != 0, live, "mismatch at ({ix},{iy},{iz})");
+                }
+            }
+        }
+    }
 }
