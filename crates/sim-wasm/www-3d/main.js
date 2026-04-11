@@ -2,10 +2,12 @@ import init, { WasmSim3D } from "./pkg/coffee_sim_wasm.js";
 
 const canvas = document.getElementById("sim-canvas");
 const toggleButton = document.getElementById("toggle");
+const pourToggleButton = document.getElementById("pour-toggle");
 const resetButton = document.getElementById("reset");
 const sceneDefaultButton = document.getElementById("scene-default");
 const sceneFreeStreamButton = document.getElementById("scene-free-stream");
 const sceneCenterPourButton = document.getElementById("scene-center-pour");
+const sceneCenterPourRigidButton = document.getElementById("scene-center-pour-rigid");
 const kettleAngleInput = document.getElementById("kettle-angle");
 const kettleAngleValue = document.getElementById("kettle-angle-value");
 const spoutXInput = document.getElementById("spout-x");
@@ -53,6 +55,7 @@ let lastClientX = 0;
 let lastClientY = 0;
 let fixedStepSeconds = null;
 let currentSceneMode = "Default";
+let pourActive = false;
 const heldKeys = new Set();
 const PAN_SPEED = 6.0;
 const PAN_CODES = new Set([
@@ -65,7 +68,7 @@ const PAN_CODES = new Set([
 await init();
 app = await WasmSim3D.create(canvas);
 syncControlDefaultsFromSim();
-app.setKettleAngle(Number(kettleAngleInput.value));
+applyScenePreset("Default");
 applySpoutControls();
 resizeCanvas();
 syncUi();
@@ -78,20 +81,25 @@ toggleButton.addEventListener("click", () => {
   toggleButton.textContent = paused ? "Play" : "Pause";
 });
 
+pourToggleButton.addEventListener("click", () => {
+  setPourActive(!pourActive);
+  syncUi();
+});
+
 resetButton.addEventListener("click", () => {
   app.reset();
-  app.setKettleAngle(Number(kettleAngleInput.value));
+  syncControlDefaultsFromSim();
+  const preset = scenePreset(currentSceneMode);
+  kettleAngleInput.value = preset.targetAngle.toFixed(0);
   applySpoutControls();
+  setPourActive(preset.pourStartsOn);
   lastFrameTime = 0;
   syncUi();
 });
 
 sceneDefaultButton.addEventListener("click", () => {
   app.loadDefaultScene();
-  syncControlDefaultsFromSim();
-  applyHeuristicControls();
-  fixedStepSeconds = null;
-  currentSceneMode = "Default";
+  applyScenePreset("Default");
   paused = false;
   toggleButton.textContent = "Pause";
   lastFrameTime = 0;
@@ -107,10 +115,7 @@ toggleDebugButton.addEventListener("click", () => {
 
 sceneFreeStreamButton.addEventListener("click", () => {
   app.loadBenchmarkFreeStream();
-  syncControlDefaultsFromSim();
-  applyHeuristicControls();
-  fixedStepSeconds = 1 / 60;
-  currentSceneMode = "Free Stream";
+  applyScenePreset("Free Stream");
   paused = false;
   toggleButton.textContent = "Pause";
   lastFrameTime = 0;
@@ -119,10 +124,16 @@ sceneFreeStreamButton.addEventListener("click", () => {
 
 sceneCenterPourButton.addEventListener("click", () => {
   app.loadBenchmarkCenterPour();
-  syncControlDefaultsFromSim();
-  applyHeuristicControls();
-  fixedStepSeconds = 1 / 60;
-  currentSceneMode = "Center Pour";
+  applyScenePreset("Center Pour");
+  paused = false;
+  toggleButton.textContent = "Pause";
+  lastFrameTime = 0;
+  syncUi();
+});
+
+sceneCenterPourRigidButton.addEventListener("click", () => {
+  app.loadBenchmarkCenterPourRigidSupport();
+  applyScenePreset("Center Pour Rigid");
   paused = false;
   toggleButton.textContent = "Pause";
   lastFrameTime = 0;
@@ -130,7 +141,9 @@ sceneCenterPourButton.addEventListener("click", () => {
 });
 
 kettleAngleInput.addEventListener("input", () => {
-  app.setKettleAngle(Number(kettleAngleInput.value));
+  if (pourActive) {
+    app.setKettleAngle(Number(kettleAngleInput.value));
+  }
   syncUi();
 });
 
@@ -249,10 +262,39 @@ function updateFps(frameTime) {
 }
 
 function syncControlDefaultsFromSim() {
-  kettleAngleInput.value = app.kettleAngle().toFixed(0);
   spoutXInput.value = app.spoutX().toFixed(1);
   spoutYInput.value = app.spoutY().toFixed(1);
   spoutZInput.value = app.spoutZ().toFixed(1);
+}
+
+function scenePreset(mode) {
+  switch (mode) {
+    case "Free Stream":
+      return { targetAngle: 28, fixedStep: 1 / 60, pourStartsOn: true };
+    case "Center Pour":
+      return { targetAngle: 36, fixedStep: 1 / 60, pourStartsOn: false };
+    case "Center Pour Rigid":
+      return { targetAngle: 36, fixedStep: 1 / 60, pourStartsOn: false };
+    case "Default":
+    default:
+      return { targetAngle: 15, fixedStep: null, pourStartsOn: false };
+  }
+}
+
+function applyScenePreset(mode) {
+  currentSceneMode = mode;
+  const preset = scenePreset(mode);
+  fixedStepSeconds = preset.fixedStep;
+  syncControlDefaultsFromSim();
+  kettleAngleInput.value = preset.targetAngle.toFixed(0);
+  applySpoutControls();
+  setPourActive(preset.pourStartsOn);
+}
+
+function setPourActive(active) {
+  pourActive = active;
+  app.setKettleAngle(pourActive ? Number(kettleAngleInput.value) : 0);
+  pourToggleButton.textContent = pourActive ? "Stop Pour" : "Start Pour";
 }
 
 function applySpoutControls() {
@@ -263,12 +305,9 @@ function applySpoutControls() {
   );
 }
 
-function applyHeuristicControls() {
-}
-
 function syncUi() {
   particleLabel.textContent = new Intl.NumberFormat().format(app.particleCount());
-  kettleAngleValue.textContent = `${Math.round(app.kettleAngle())}\u00b0`;
+  kettleAngleValue.textContent = `${Math.round(Number(kettleAngleInput.value))}\u00b0`;
   spoutXValue.textContent = app.spoutX().toFixed(1);
   spoutYValue.textContent = app.spoutY().toFixed(1);
   spoutZValue.textContent = app.spoutZ().toFixed(1);

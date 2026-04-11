@@ -34,11 +34,19 @@ struct AffineC {
 struct BedExtract {
     bed: vec4<f32>,
     extract: vec4<f32>,
+    mech0: vec4<f32>,
+    mech1: vec4<f32>,
+    mech2: vec4<f32>,
 };
 
 struct ContactResult {
     pos: vec3<f32>,
     vel: vec3<f32>,
+};
+
+struct RenderParticle {
+    primary: vec4<f32>,
+    aux: vec4<f32>,
 };
 
 // ── Bindings ──
@@ -49,11 +57,16 @@ struct ContactResult {
 @group(0) @binding(3) var<storage, read_write> grid: array<atomic<i32>>;
 @group(0) @binding(4) var<storage, read_write> grid_vel: array<vec4<f32>>;
 @group(0) @binding(5) var sdf_texture: texture_3d<f32>;
-@group(0) @binding(6) var<storage, read_write> render_data: array<vec4<f32>>;
+@group(0) @binding(6) var<storage, read_write> render_data: array<RenderParticle>;
 @group(0) @binding(7) var<storage, read_write> bed_extract: array<BedExtract>;
 @group(0) @binding(8) var<storage, read_write> bed_lookup: array<atomic<i32>>;
 @group(0) @binding(9) var<storage, read_write> bed_delta: array<atomic<i32>>;
 @group(0) @binding(10) var<storage, read_write> metrics: array<atomic<u32>>;
+@group(0) @binding(11) var<storage, read> filter_mesh: array<vec4<f32>>;
+@group(0) @binding(12) var sdf_class_tex: texture_3d<u32>;
+
+const FILTER_RING_COUNT = 10u;
+const FILTER_SEGMENT_COUNT = 32u;
 
 // Metrics slot layout — keep in sync with `METRICS_SLOT_COUNT` in state.rs.
 const METRIC_MAX_ABS_DIV_IDX: u32 = 0u;
@@ -61,6 +74,7 @@ const METRIC_FLUID_CELLS_IDX: u32 = 1u;
 const METRIC_DIV_CLAMP_FIRES_IDX: u32 = 2u;
 const METRIC_PRESSURE_CLAMP_FIRES_IDX: u32 = 3u;
 const METRIC_MASS_OVERFLOW_FIRES_IDX: u32 = 4u;
+const BED_NEIGHBOR_SAMPLE_COUNT: u32 = 27u;
 
 // ── Helpers ──
 
@@ -70,6 +84,7 @@ fn gz() -> u32 { return u.grid_dims.z; }
 fn total_cells() -> u32 { return u.grid_dims.w; }
 fn num_bed() -> u32 { return u.counts.y; }
 fn num_particles() -> u32 { return u.counts.x + u.counts.y; }
+fn use_sdf_cache() -> bool { return u.counts.w > 0u; }
 fn dt() -> f32 { return u.sim_params.x; }
 fn gravity() -> f32 { return u.sim_params.y; }
 fn dx() -> f32 { return u.sim_params.z; }
@@ -85,19 +100,186 @@ fn sdf_res() -> f32 { return u.sdf_params.x; }
 fn friction() -> f32 { return u.sdf_params.y; }
 fn restitution() -> f32 { return u.sdf_params.z; }
 fn contact_offset() -> f32 { return u.sdf_params.w; }
-fn drag_coeff() -> f32 { return u.bed_params.x; }
+fn uniform_porosity() -> f32 { return u.bed_params.x; }
 fn absorption_rate() -> f32 { return u.bed_params.y; }
 fn max_saturation() -> f32 { return u.bed_params.z; }
+fn has_filter() -> bool { return u.bed_params.w > 0.5; }
 fn extraction_rate() -> f32 { return u.extraction_params.x; }
-fn bed_spring() -> f32 { return u.extraction_params.y; }
-fn bed_damping() -> f32 { return u.extraction_params.z; }
-fn bed_impact() -> f32 { return u.extraction_params.w; }
+fn K_bed() -> f32 { return u.extraction_params.y; }
+fn mu_fluid() -> f32 { return u.extraction_params.z; }
+fn uniform_permeability() -> f32 { return u.extraction_params.w; }
+fn bed_storage_redistribution_rate() -> f32 { return 0.18; }
+fn bed_filter_contact_damping() -> f32 { return 0.18; }
 fn inactive_mass_threshold() -> f32 { return nominal_mass() * 0.10; }
 fn div_clamp_limit() -> f32 { return u.clamp_params.x; }
 fn pressure_clamp_limit() -> f32 { return u.clamp_params.y; }
 fn metrics_div_fp_scale() -> f32 { return u.clamp_params.z; }
 fn metrics_div_inv_fp_scale() -> f32 { return u.clamp_params.w; }
+fn bed_compaction_response(saturation: f32) -> f32 {
+    return smoothstep(0.05, 0.55, saturation);
+}
+fn bed_particle_capacity_scale(bid: u32) -> f32 {
+    return max(bed_extract[bid].bed.w, 0.2);
+}
+fn bed_particle_capacity(bid: u32) -> f32 {
+    return max(max_saturation() * bed_particle_capacity_scale(bid), 1e-6);
+}
+fn bed_particle_porosity(bid: u32) -> f32 {
+    return clamp(bed_extract[bid].bed.y, 0.18, 0.65);
+}
+fn bed_particle_permeability(bid: u32) -> f32 {
+    return max(bed_extract[bid].bed.z, 1e-5);
+}
+fn bed_particle_saturation(bid: u32) -> f32 {
+    return clamp(bed_extract[bid].bed.x / bed_particle_capacity(bid), 0.0, 1.0);
+}
+fn bed_plastic_alpha(bid: u32) -> f32 {
+    return max(bed_extract[bid].mech0.w, 0.0);
+}
+fn bed_compaction_state(bid: u32) -> f32 {
+    return max(bed_extract[bid].mech1.w, 0.0);
+}
+fn bed_F_col0(bid: u32) -> vec3<f32> {
+    return bed_extract[bid].mech0.xyz;
+}
+fn bed_F_col1(bid: u32) -> vec3<f32> {
+    return bed_extract[bid].mech1.xyz;
+}
+fn bed_F_col2(bid: u32) -> vec3<f32> {
+    return bed_extract[bid].mech2.xyz;
+}
+fn bed_shear_modulus() -> f32 {
+    let poisson = 0.27;
+    return 3.0 * K_bed() * (1.0 - 2.0 * poisson) / (2.0 * (1.0 + poisson));
+}
+fn bed_lambda_from_bulk() -> f32 {
+    return K_bed() - 2.0 * bed_shear_modulus() / 3.0;
+}
+fn identity3() -> mat3x3<f32> {
+    return mat3x3<f32>(
+        vec3<f32>(1.0, 0.0, 0.0),
+        vec3<f32>(0.0, 1.0, 0.0),
+        vec3<f32>(0.0, 0.0, 1.0),
+    );
+}
+fn safe_mat_cols(c0: vec3<f32>, c1: vec3<f32>, c2: vec3<f32>) -> mat3x3<f32> {
+    return mat3x3<f32>(c0, c1, c2);
+}
+fn orthonormal_basis_from_F(c0: vec3<f32>, c1: vec3<f32>) -> mat3x3<f32> {
+    let r0 = normalize(select(vec3<f32>(1.0, 0.0, 0.0), c0, length(c0) > 1e-6));
+    let c1_ortho = c1 - r0 * dot(r0, c1);
+    let r1 = normalize(select(vec3<f32>(0.0, 1.0, 0.0), c1_ortho, length(c1_ortho) > 1e-6));
+    let r2 = normalize(cross(r0, r1));
+    return mat3x3<f32>(r0, r1, r2);
+}
+fn frobenius_norm(m: mat3x3<f32>) -> f32 {
+    return sqrt(
+        dot(m[0], m[0])
+            + dot(m[1], m[1])
+            + dot(m[2], m[2])
+    );
+}
+fn trace3(m: mat3x3<f32>) -> f32 {
+    return m[0].x + m[1].y + m[2].z;
+}
+fn bed_wetness(saturation: f32) -> f32 {
+    return smoothstep(0.08, 0.85, saturation);
+}
+fn bed_friction_angle_rad(saturation: f32) -> f32 {
+    return radians(mix(38.0, 26.0, bed_wetness(saturation)));
+}
+fn bed_cohesion(saturation: f32) -> f32 {
+    return mix(26.0, 12.0, bed_wetness(saturation));
+}
+fn bed_hardening(saturation: f32) -> f32 {
+    return mix(18.0, 8.0, bed_wetness(saturation));
+}
+fn bed_packing_J(saturation: f32) -> f32 {
+    return mix(0.94, 0.88, bed_wetness(saturation));
+}
+fn bed_preconsolidation_pressure(saturation: f32) -> f32 {
+    return mix(420.0, 220.0, bed_wetness(saturation));
+}
+fn bed_cap_hardening(saturation: f32) -> f32 {
+    return mix(360.0, 180.0, bed_wetness(saturation));
+}
+struct BedPlasticProjection {
+    F: mat3x3<f32>,
+    alpha: f32,
+    compaction: f32,
+};
+fn project_bed_granular_plasticity(
+    F_trial: mat3x3<f32>,
+    saturation: f32,
+    alpha_old: f32,
+    compaction_old: f32,
+) -> BedPlasticProjection {
+    var F_proj = F_trial;
+    var alpha = alpha_old;
+    var compaction = compaction_old;
 
+    let J_trial = max(determinant_from_cols(F_proj[0], F_proj[1], F_proj[2]), 1e-5);
+    let J_pack = bed_packing_J(saturation);
+    if J_trial < J_pack {
+        // Grounds compact toward a finite packing state rather than storing
+        // arbitrary bulk elastic energy and rebounding like a gel.
+        let scale = pow(J_pack / J_trial, 1.0 / 3.0);
+        F_proj = F_proj * scale;
+        compaction += abs(log(J_pack / J_trial));
+    }
+
+    let R = orthonormal_basis_from_F(F_proj[0], F_proj[1]);
+    let mu = bed_shear_modulus();
+    let bulk = K_bed();
+    let strain_hat = transpose(R) * F_proj - identity3();
+    let eps = 0.5 * (strain_hat + transpose(strain_hat));
+    let tr_eps = trace3(eps);
+    let eps_dev = eps - identity3() * (tr_eps / 3.0);
+    let sigma_dev_trial = 2.0 * mu * eps_dev;
+    let p_trial = max(-bulk * tr_eps, 0.0);
+    let q_trial = sqrt(1.5) * frobenius_norm(sigma_dev_trial);
+    let sin_phi = sin(bed_friction_angle_rad(saturation));
+    let friction_term = 0.55 * sin_phi / max(1.0 - sin_phi, 0.2);
+    let cap_pressure =
+        bed_preconsolidation_pressure(saturation) + bed_cap_hardening(saturation) * compaction;
+    let p_proj = min(p_trial, cap_pressure);
+    let volumetric_increment = max(p_trial - p_proj, 0.0) / max(bulk, 1e-5);
+
+    if q_trial <= 1e-6 {
+        let tr_eps_proj = select(tr_eps, -p_proj / bulk, p_trial > cap_pressure + 1e-6);
+        let eps_proj = identity3() * (tr_eps_proj / 3.0);
+        compaction += volumetric_increment;
+        return BedPlasticProjection(R * (identity3() + eps_proj), alpha, compaction);
+    }
+
+    let yield_strength =
+        bed_cohesion(saturation) + bed_hardening(saturation) * alpha + friction_term * p_proj;
+    let q_proj = min(q_trial, yield_strength);
+    let sigma_dev_proj = sigma_dev_trial * (q_proj / q_trial);
+    let eps_dev_proj = sigma_dev_proj * (1.0 / max(2.0 * mu, 1e-5));
+    let tr_eps_proj = -p_proj / bulk;
+    let eps_proj = eps_dev_proj + identity3() * (tr_eps_proj / 3.0);
+    F_proj = R * (identity3() + eps_proj);
+
+    let shear_increment = max(q_trial - q_proj, 0.0) / max(2.0 * mu, 1e-5);
+    alpha += shear_increment;
+    compaction += volumetric_increment;
+    return BedPlasticProjection(F_proj, alpha, compaction);
+}
+fn bed_fixed_corotated_stress(bid: u32, J: f32) -> mat3x3<f32> {
+    let F0 = bed_F_col0(bid);
+    let F1 = bed_F_col1(bid);
+    let F2 = bed_F_col2(bid);
+    let F = safe_mat_cols(F0, F1, F2);
+    let R = orthonormal_basis_from_F(F0, F1);
+    let mu = bed_shear_modulus();
+    let lambda = bed_lambda_from_bulk();
+    let PFt = (2.0 * mu) * (F - R) * transpose(F) + lambda * (J - 1.0) * J * identity3();
+    return PFt;
+}
+fn determinant_from_cols(c0: vec3<f32>, c1: vec3<f32>, c2: vec3<f32>) -> f32 {
+    return dot(c0, cross(c1, c2));
+}
 fn cell_index(ix: u32, iy: u32, iz: u32) -> u32 {
     return iz * gx() * gy() + iy * gx() + ix;
 }
@@ -106,6 +288,11 @@ fn grid_mass_idx(cell: u32) -> u32 { return cell; }
 fn grid_mom_x_idx(cell: u32) -> u32 { return total_cells() + cell; }
 fn grid_mom_y_idx(cell: u32) -> u32 { return 2u * total_cells() + cell; }
 fn grid_mom_z_idx(cell: u32) -> u32 { return 3u * total_cells() + cell; }
+fn grid_solid_mass_idx(cell: u32) -> u32 { return 4u * total_cells() + cell; }
+fn grid_solid_mom_x_idx(cell: u32) -> u32 { return 5u * total_cells() + cell; }
+fn grid_solid_mom_y_idx(cell: u32) -> u32 { return 6u * total_cells() + cell; }
+fn grid_solid_mom_z_idx(cell: u32) -> u32 { return 7u * total_cells() + cell; }
+fn grid_vel_solid_idx(cell: u32) -> u32 { return total_cells() + cell; }
 fn scratch_pressure_idx(cell: u32) -> u32 { return grid_mass_idx(cell); }
 fn scratch_div_idx(cell: u32) -> u32 { return grid_mom_x_idx(cell); }
 // Slot 2 (`grid_mom_y_idx`) is reused only as the mass/momentum accumulator
@@ -113,6 +300,7 @@ fn scratch_div_idx(cell: u32) -> u32 { return grid_mom_x_idx(cell); }
 // alias is defined for it. Add one back if/when an iterative residual probe
 // needs the slot during the projection pass.
 fn scratch_kind_idx(cell: u32) -> u32 { return grid_mom_z_idx(cell); }
+fn scratch_absorbed_idx(cell: u32) -> u32 { return grid_mom_y_idx(cell); }
 // A quadratic-B-spline particle deposits at most `nominal_mass * 0.75^3 ≈
 // 0.42 * nominal_mass` to its peak cell. The threshold must stay strictly
 // below that peak or isolated particles never register as fluid. Matching
@@ -161,6 +349,10 @@ fn bed_lookup_load(cell: u32) -> i32 {
     return atomicLoad(&bed_lookup[cell]);
 }
 
+fn sdf_class_is_solid(cell: vec3<i32>) -> bool {
+    return textureLoad(sdf_class_tex, cell, 0).r != 0u;
+}
+
 fn is_fluid_kind(kind: i32) -> bool {
     // Surface cells must participate in the pressure solve so hydrostatic
     // pressure can build up in shallow puddles. Adjacent CELL_AIR cells
@@ -168,9 +360,12 @@ fn is_fluid_kind(kind: i32) -> bool {
     // `pressure_update` (air neighbors count toward the denominator but
     // contribute 0 to the numerator), so excluding surface cells here would
     // zero them out and let gravity compress thin pools to a single layer.
+    //
+    // BED_COUPLED cells are excluded: the bed skeleton carries its own solid
+    // velocity field, and water/solid coupling happens through Darcy drag
+    // instead of treating the bed region as incompressible fluid.
     return kind == CELL_INTERIOR_FLUID
-        || kind == CELL_SURFACE_FLUID
-        || kind == CELL_BED_COUPLED;
+        || kind == CELL_SURFACE_FLUID;
 }
 
 fn is_solid_kind(kind: i32) -> bool {
@@ -253,6 +448,88 @@ fn resolve_radial_barrier(
     return ContactResult(out_pos, out_vel);
 }
 
+fn resolve_filter_mesh_contact(pos: vec3<f32>, vel: vec3<f32>) -> ContactResult {
+    let mesh_bot_y = filter_mesh[0].y;
+    let mesh_top_y = filter_mesh[(FILTER_RING_COUNT - 1u) * FILTER_SEGMENT_COUNT].y;
+
+    if pos.y > mesh_top_y || pos.y < mesh_bot_y - 0.5 {
+        return ContactResult(pos, vel);
+    }
+
+    let ring_t = clamp((pos.y - mesh_bot_y) / (mesh_top_y - mesh_bot_y), 0.0, 1.0);
+    let ring_f = ring_t * f32(FILTER_RING_COUNT - 1u);
+    let ring_lo = u32(floor(ring_f));
+    let ring_hi = min(ring_lo + 1u, FILTER_RING_COUNT - 1u);
+    let ring_frac = ring_f - floor(ring_f);
+
+    let angle = atan2(pos.z, pos.x);
+    let seg_f = ((angle / (2.0 * 3.14159265) + 1.0) % 1.0) * f32(FILTER_SEGMENT_COUNT);
+    let seg_lo = u32(floor(seg_f)) % FILTER_SEGMENT_COUNT;
+    let seg_hi = (seg_lo + 1u) % FILTER_SEGMENT_COUNT;
+    let seg_frac = seg_f - floor(seg_f);
+
+    let v00 = filter_mesh[ring_lo * FILTER_SEGMENT_COUNT + seg_lo].xyz;
+    let v01 = filter_mesh[ring_lo * FILTER_SEGMENT_COUNT + seg_hi].xyz;
+    let v10 = filter_mesh[ring_hi * FILTER_SEGMENT_COUNT + seg_lo].xyz;
+    let v11 = filter_mesh[ring_hi * FILTER_SEGMENT_COUNT + seg_hi].xyz;
+
+    let ring_r_lo = mix(length(v00.xz), length(v01.xz), seg_frac);
+    let ring_r_hi = mix(length(v10.xz), length(v11.xz), seg_frac);
+    let ring_y_lo = mix(v00.y, v01.y, seg_frac);
+    let ring_y_hi = mix(v10.y, v11.y, seg_frac);
+    let mesh_r = mix(ring_r_lo, ring_r_hi, ring_frac);
+
+    var out_pos = pos;
+    var out_vel = vel;
+
+    let radial = out_pos.xz;
+    let radial_len = length(radial);
+    if mesh_r > 0.1 && radial_len > 1e-6 {
+        let barrier_r = mesh_r - contact_offset();
+        if radial_len > barrier_r {
+            let outward = radial / radial_len;
+            let dy = max(abs(ring_y_hi - ring_y_lo), 1e-5);
+            let dr_dy = (ring_r_hi - ring_r_lo) / dy;
+            // Keep position correction radial so particles can settle onto the
+            // filter instead of being lifted above it by an over-large normal
+            // projection. Use the local cone normal only for the velocity
+            // response so the contact still provides upward support.
+            let surface_normal = normalize(vec3<f32>(outward.x, -dr_dy, outward.y));
+            let penetration = radial_len - barrier_r;
+            out_pos.x -= outward.x * penetration;
+            out_pos.z -= outward.y * penetration;
+
+            let vn = dot(out_vel, surface_normal);
+            if vn > 0.0 {
+                out_vel = out_vel - surface_normal * vn;
+                let vt = out_vel - surface_normal * dot(out_vel, surface_normal);
+                let vt_len = length(vt);
+                if vt_len > 1e-6 {
+                    let friction_impulse = min(friction() * abs(vn) * 2.4, vt_len);
+                    out_vel = out_vel - vt * (friction_impulse / vt_len);
+                }
+                out_vel *= bed_filter_contact_damping();
+                if vel.y < 0.0 && out_vel.y > 0.0 {
+                    out_vel.y = 0.0;
+                }
+            }
+        }
+    }
+
+    // Apex floor: only keep particles from falling through the bottom tip.
+    // The radial barrier handles the cone walls; this handles the point.
+    if out_pos.y < mesh_bot_y + contact_offset() {
+        out_pos.y = mesh_bot_y + contact_offset();
+        if out_vel.y < 0.0 {
+            out_vel.y = 0.0;
+            out_vel.x *= bed_filter_contact_damping() * (1.0 - friction() * 0.55);
+            out_vel.z *= bed_filter_contact_damping() * (1.0 - friction() * 0.55);
+        }
+    }
+
+    return ContactResult(out_pos, out_vel);
+}
+
 fn resolve_scene_obstacles(position: vec3<f32>, velocity: vec3<f32>, is_bed: bool) -> ContactResult {
     var out_pos = position;
     var out_vel = velocity;
@@ -268,30 +545,12 @@ fn resolve_scene_obstacles(position: vec3<f32>, velocity: vec3<f32>, is_bed: boo
         out_vel = cone_contact.vel;
     }
 
-    // Paper filter (bed particles only): the filter is porous — water
-    // passes through the paper, but coffee particles are trapped above.
-    // Below the V60 cone the filter narrows to a point at y=-3.37.
-    let filter_bot_y = -3.37;
-    if is_bed {
-        if out_pos.y < cone_bot_y && out_pos.y >= filter_bot_y {
-            let ft = (out_pos.y - filter_bot_y) / (cone_bot_y - filter_bot_y);
-            let filter_r = mix(0.0, 0.26, ft) - contact_offset();
-            if filter_r > 0.0 {
-                let fc = resolve_radial_barrier(out_pos, out_vel, vec2<f32>(0.0, 0.0), filter_r);
-                out_pos = fc.pos;
-                out_vel = fc.vel;
-            }
-        }
-
-        // Filter apex: floor keeps bed particles from falling through.
-        if out_pos.y <= filter_bot_y + contact_offset() && out_pos.y > filter_bot_y - 0.5 {
-            out_pos.y = filter_bot_y + contact_offset();
-            if out_vel.y < 0.0 {
-                out_vel.y = 0.0;
-                out_vel.x *= 1.0 - friction() * 0.55;
-                out_vel.z *= 1.0 - friction() * 0.55;
-            }
-        }
+    // Paper filter (bed particles only): the filter mesh is a deformable
+    // collision surface uploaded from the CPU cloth sim each frame.
+    if is_bed && has_filter() {
+        let fc = resolve_filter_mesh_contact(out_pos, out_vel);
+        out_pos = fc.pos;
+        out_vel = fc.vel;
     }
 
     // Carafe interior. Keep pooled water inside the cup walls and above the
@@ -342,18 +601,126 @@ fn resolve_sdf_contact(position: vec3<f32>, velocity: vec3<f32>, is_bed: bool) -
     return ContactResult(hard_contact.pos, hard_contact.vel);
 }
 
-// ── clear_grid ──
+fn clamp_velocity(v_in: vec3<f32>) -> vec3<f32> {
+    var v = v_in;
+    let speed = length(v);
+    if speed > vel_cap() {
+        v = v * (vel_cap() / speed);
+    }
+    return v;
+}
 
-@compute @workgroup_size(64)
-fn clear_grid(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
-    if idx >= total_cells() { return; }
+fn project_solid_velocity_against_filter(velocity: vec3<f32>, cell_pos: vec3<f32>) -> vec3<f32> {
+    if !has_filter() { return velocity; }
 
-    atomicStore(&grid[grid_mass_idx(idx)], 0);
-    atomicStore(&grid[grid_mom_x_idx(idx)], 0);
-    atomicStore(&grid[grid_mom_y_idx(idx)], 0);
-    atomicStore(&grid[grid_mom_z_idx(idx)], 0);
-    grid_vel[idx] = vec4<f32>(0.0);
+    let mesh_bot_y = filter_mesh[0].y;
+    let mesh_top_y = filter_mesh[(FILTER_RING_COUNT - 1u) * FILTER_SEGMENT_COUNT].y;
+
+    if cell_pos.y > mesh_top_y || cell_pos.y < mesh_bot_y - 0.5 {
+        return velocity;
+    }
+
+    let ring_t = clamp((cell_pos.y - mesh_bot_y) / (mesh_top_y - mesh_bot_y), 0.0, 1.0);
+    let ring_f = ring_t * f32(FILTER_RING_COUNT - 1u);
+    let ring_lo = u32(floor(ring_f));
+    let ring_hi = min(ring_lo + 1u, FILTER_RING_COUNT - 1u);
+    let ring_frac = ring_f - floor(ring_f);
+
+    let angle = atan2(cell_pos.z, cell_pos.x);
+    let seg_f = ((angle / (2.0 * 3.14159265) + 1.0) % 1.0) * f32(FILTER_SEGMENT_COUNT);
+    let seg_lo = u32(floor(seg_f)) % FILTER_SEGMENT_COUNT;
+    let seg_hi = (seg_lo + 1u) % FILTER_SEGMENT_COUNT;
+    let seg_frac = seg_f - floor(seg_f);
+
+    let v00 = filter_mesh[ring_lo * FILTER_SEGMENT_COUNT + seg_lo].xyz;
+    let v01 = filter_mesh[ring_lo * FILTER_SEGMENT_COUNT + seg_hi].xyz;
+    let v10 = filter_mesh[ring_hi * FILTER_SEGMENT_COUNT + seg_lo].xyz;
+    let v11 = filter_mesh[ring_hi * FILTER_SEGMENT_COUNT + seg_hi].xyz;
+
+    let ring_r_lo = mix(length(v00.xz), length(v01.xz), seg_frac);
+    let ring_r_hi = mix(length(v10.xz), length(v11.xz), seg_frac);
+    let ring_y_lo = mix(v00.y, v01.y, seg_frac);
+    let ring_y_hi = mix(v10.y, v11.y, seg_frac);
+    let mesh_r = mix(ring_r_lo, ring_r_hi, ring_frac);
+
+    var v = velocity;
+    let radial = cell_pos.xz;
+    let radial_len = length(radial);
+
+    if mesh_r > dx() && radial_len > 1e-6 {
+        // Wide region: full surface-normal projection against the cone wall.
+        let barrier_r = mesh_r - contact_offset();
+        if radial_len > barrier_r {
+            let outward = radial / radial_len;
+            let dy = max(abs(ring_y_hi - ring_y_lo), 1e-5);
+            let dr_dy = (ring_r_hi - ring_r_lo) / dy;
+            let surface_normal = normalize(vec3<f32>(outward.x, -dr_dy, outward.y));
+            let vn = dot(v, surface_normal);
+            if vn > 0.0 {
+                v = v - surface_normal * vn;
+                let vt = v - surface_normal * dot(v, surface_normal);
+                let vt_len = length(vt);
+                if vt_len > 1e-6 {
+                    let friction_impulse = min(friction() * abs(vn) * 2.0, vt_len);
+                    v = v - vt * (friction_impulse / vt_len);
+                }
+                v *= bed_filter_contact_damping();
+                if velocity.y < 0.0 && v.y > 0.0 {
+                    v.y = 0.0;
+                }
+            }
+        }
+    } else if radial_len > 1e-6 && radial_len > mesh_r {
+        // Apex region: filter is narrower than a grid cell. Only zero the
+        // outward radial velocity to prevent sideways escape. Leave the
+        // downward component intact so the bed can settle into the tip.
+        let radial_dir = radial / radial_len;
+        let radial_v = dot(vec2<f32>(v.x, v.z), radial_dir);
+        if radial_v > 0.0 {
+            v.x -= radial_dir.x * radial_v;
+            v.z -= radial_dir.y * radial_v;
+        }
+    }
+
+    // Apex floor: prevent solid velocity from pushing bed through the tip.
+    if cell_pos.y < mesh_bot_y + dx() && v.y < 0.0 {
+        v.y = 0.0;
+    }
+
+    return v;
+}
+
+fn project_grid_velocity(
+    velocity: vec3<f32>,
+    cell_pos: vec3<f32>,
+    sdf_val: f32,
+    normal: vec3<f32>,
+    bmin: vec3<f32>,
+    bmax: vec3<f32>,
+) -> vec3<f32> {
+    var v = velocity;
+
+    if sdf_val < contact_offset() {
+        let vn = dot(v, normal);
+        if vn < 0.0 {
+            v = v - normal * vn * (1.0 + restitution());
+            let vt = v - normal * dot(v, normal);
+            let vt_len = length(vt);
+            if vt_len > 1e-6 {
+                let friction_impulse = min(friction() * abs(vn), vt_len);
+                v = v - vt * (friction_impulse / vt_len);
+            }
+        }
+    }
+
+    if cell_pos.x < bmin.x && v.x < 0.0 { v.x = 0.0; }
+    if cell_pos.x > bmax.x && v.x > 0.0 { v.x = 0.0; }
+    if cell_pos.y < bmin.y && v.y < 0.0 { v.y = 0.0; }
+    if cell_pos.y > bmax.y && v.y > 0.0 { v.y = 0.0; }
+    if cell_pos.z < bmin.z && v.z < 0.0 { v.z = 0.0; }
+    if cell_pos.z > bmax.z && v.z > 0.0 { v.z = 0.0; }
+
+    return v;
 }
 
 // ── p2g ──
@@ -370,7 +737,7 @@ fn p2g(@builtin(global_invocation_id) gid: vec3<u32>) {
     let J = p.pos.w;
     let mass_p = p.vel.w;
     let phase = a.col0.w;
-    if phase >= 0.5 || mass_p <= inactive_mass_threshold() {
+    if mass_p <= inactive_mass_threshold() {
         return;
     }
 
@@ -393,13 +760,27 @@ fn p2g(@builtin(global_invocation_id) gid: vec3<u32>) {
     wz[1] = 0.75 - (fx.z - 1.0) * (fx.z - 1.0);
     wz[2] = 0.5 * (fx.z - 0.5) * (fx.z - 0.5);
 
-    // Affine = mass_p*C (J-stress disabled under pressure projection)
+    // Affine term starts as `mass_p * C`; bed particles also add an
+    // isotropic bulk-stress contribution through the same MLS-MPM channel.
     let C0 = a.col0.xyz;
     let C1 = a.col1.xyz;
     let C2 = a.col2.xyz;
-    let aff_col0 = vec3<f32>(mass_p * C0.x, mass_p * C0.y, mass_p * C0.z);
-    let aff_col1 = vec3<f32>(mass_p * C1.x, mass_p * C1.y, mass_p * C1.z);
-    let aff_col2 = vec3<f32>(mass_p * C2.x, mass_p * C2.y, mass_p * C2.z);
+    let is_bed = phase >= 0.5;
+    var bed_porosity = uniform_porosity();
+    if is_bed && pid < num_bed() {
+        bed_porosity = bed_particle_porosity(pid);
+    }
+    var aff_col0 = vec3<f32>(mass_p * C0.x, mass_p * C0.y, mass_p * C0.z);
+    var aff_col1 = vec3<f32>(mass_p * C1.x, mass_p * C1.y, mass_p * C1.z);
+    var aff_col2 = vec3<f32>(mass_p * C2.x, mass_p * C2.y, mass_p * C2.z);
+    if is_bed {
+        let packing_factor = clamp(uniform_porosity() / max(bed_porosity, 1e-3), 0.8, 1.45);
+        let PFt = bed_fixed_corotated_stress(pid, J) * packing_factor;
+        let stress_affine = PFt * (-dt() * p_vol() * 4.0 * inv_dx() * inv_dx());
+        aff_col0 += vec3<f32>(stress_affine[0].x, stress_affine[0].y, stress_affine[0].z);
+        aff_col1 += vec3<f32>(stress_affine[1].x, stress_affine[1].y, stress_affine[1].z);
+        aff_col2 += vec3<f32>(stress_affine[2].x, stress_affine[2].y, stress_affine[2].z);
+    }
 
     let fp = fp_scale();
     let cell_dx = dx();
@@ -439,10 +820,17 @@ fn p2g(@builtin(global_invocation_id) gid: vec3<u32>) {
                     || abs(mom_y_fp) > limit_m || abs(mom_z_fp) > limit_m {
                     atomicAdd(&metrics[METRIC_MASS_OVERFLOW_FIRES_IDX], 1u);
                 }
-                atomicAdd(&grid[grid_mass_idx(ci)], i32(mass_fp));
-                atomicAdd(&grid[grid_mom_x_idx(ci)], i32(mom_x_fp));
-                atomicAdd(&grid[grid_mom_y_idx(ci)], i32(mom_y_fp));
-                atomicAdd(&grid[grid_mom_z_idx(ci)], i32(mom_z_fp));
+                if is_bed {
+                    atomicAdd(&grid[grid_solid_mass_idx(ci)], i32(mass_fp));
+                    atomicAdd(&grid[grid_solid_mom_x_idx(ci)], i32(mom_x_fp));
+                    atomicAdd(&grid[grid_solid_mom_y_idx(ci)], i32(mom_y_fp));
+                    atomicAdd(&grid[grid_solid_mom_z_idx(ci)], i32(mom_z_fp));
+                } else {
+                    atomicAdd(&grid[grid_mass_idx(ci)], i32(mass_fp));
+                    atomicAdd(&grid[grid_mom_x_idx(ci)], i32(mom_x_fp));
+                    atomicAdd(&grid[grid_mom_y_idx(ci)], i32(mom_y_fp));
+                    atomicAdd(&grid[grid_mom_z_idx(ci)], i32(mom_z_fp));
+                }
             }
         }
     }
@@ -456,27 +844,145 @@ fn grid_update(@builtin(global_invocation_id) gid: vec3<u32>) {
     if idx >= total_cells() { return; }
 
     let inv_fp = inv_fp_scale();
-    let mass = f32(atomicLoad(&grid[grid_mass_idx(idx)])) * inv_fp;
-
-    if mass < 1e-6 {
-        grid_vel[idx] = vec4<f32>(0.0);
+    let mass_w = f32(atomicLoad(&grid[grid_mass_idx(idx)])) * inv_fp;
+    let mass_s = f32(atomicLoad(&grid[grid_solid_mass_idx(idx)])) * inv_fp;
+    if mass_w <= 1e-6 && mass_s <= 1e-6 {
         return;
     }
-
-    var v = vec3<f32>(
-        f32(atomicLoad(&grid[grid_mom_x_idx(idx)])) * inv_fp / mass,
-        f32(atomicLoad(&grid[grid_mom_y_idx(idx)])) * inv_fp / mass,
-        f32(atomicLoad(&grid[grid_mom_z_idx(idx)])) * inv_fp / mass,
-    );
-
-    v.y += gravity() * dt();
-
-    let speed = length(v);
-    if speed > vel_cap() {
-        v = v * (vel_cap() / speed);
+    var v_w = vec3<f32>(0.0);
+    if mass_w > 1e-6 {
+        v_w = vec3<f32>(
+            f32(atomicLoad(&grid[grid_mom_x_idx(idx)])) * inv_fp / mass_w,
+            f32(atomicLoad(&grid[grid_mom_y_idx(idx)])) * inv_fp / mass_w,
+            f32(atomicLoad(&grid[grid_mom_z_idx(idx)])) * inv_fp / mass_w,
+        );
+        v_w.y += gravity() * dt();
     }
 
-    grid_vel[idx] = vec4<f32>(v, mass);
+    var v_s = vec3<f32>(0.0);
+    if mass_s > 1e-6 {
+        v_s = vec3<f32>(
+            f32(atomicLoad(&grid[grid_solid_mom_x_idx(idx)])) * inv_fp / mass_s,
+            f32(atomicLoad(&grid[grid_solid_mom_y_idx(idx)])) * inv_fp / mass_s,
+            f32(atomicLoad(&grid[grid_solid_mom_z_idx(idx)])) * inv_fp / mass_s,
+        );
+        v_s.y += gravity() * dt();
+    }
+
+    var absorbed_frac = 0.0;
+    var mass_w_post = mass_w;
+    if mass_w > 1e-6 && mass_s > 1e-6 {
+        let iz_val = idx / (gx() * gy());
+        let rem = idx % (gx() * gy());
+        let iy_val = rem / gx();
+        let ix_val = rem % gx();
+
+        var neighbor_ids: array<i32, 27>;
+        var neighbor_caps: array<f32, 27>;
+        var neighbor_sats: array<f32, 27>;
+        var neighbor_porosities: array<f32, 27>;
+        var neighbor_perms: array<f32, 27>;
+        for (var init_i = 0u; init_i < BED_NEIGHBOR_SAMPLE_COUNT; init_i++) {
+            neighbor_ids[init_i] = -1;
+            neighbor_caps[init_i] = 0.0;
+            neighbor_sats[init_i] = 0.0;
+            neighbor_porosities[init_i] = uniform_porosity();
+            neighbor_perms[init_i] = uniform_permeability();
+        }
+
+        var neighbor_count = 0u;
+        for (var di = -1; di <= 1; di++) {
+            for (var dj = -1; dj <= 1; dj++) {
+                for (var dk = -1; dk <= 1; dk++) {
+                    let cx = i32(ix_val) + di;
+                    let cy = i32(iy_val) + dj;
+                    let cz = i32(iz_val) + dk;
+                    if cx < 0 || cy < 0 || cz < 0 { continue; }
+                    if u32(cx) >= gx() || u32(cy) >= gy() || u32(cz) >= gz() { continue; }
+
+                    let ci = cell_index(u32(cx), u32(cy), u32(cz));
+                    let bed_idx = bed_lookup_load(ci);
+                    if bed_idx < 0 || u32(bed_idx) >= num_bed() { continue; }
+
+                    var found = false;
+                    for (var existing = 0u; existing < neighbor_count; existing++) {
+                        if neighbor_ids[existing] == bed_idx {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if found || neighbor_count >= BED_NEIGHBOR_SAMPLE_COUNT {
+                        continue;
+                    }
+
+                    let bid = u32(bed_idx);
+                    let local_capacity = bed_particle_capacity(bid);
+                    neighbor_ids[neighbor_count] = bed_idx;
+                    neighbor_caps[neighbor_count] =
+                        max(local_capacity - bed_extract[bid].bed.x, 0.0);
+                    neighbor_sats[neighbor_count] = bed_particle_saturation(bid);
+                    neighbor_porosities[neighbor_count] = bed_particle_porosity(bid);
+                    neighbor_perms[neighbor_count] = bed_particle_permeability(bid);
+                    neighbor_count += 1u;
+                }
+            }
+        }
+
+        if neighbor_count > 0u {
+            var sat_sum = 0.0;
+            var cap_sum = 0.0;
+            var porosity_sum = 0.0;
+            var inv_perm_sum = 0.0;
+            for (var sample_i = 0u; sample_i < neighbor_count; sample_i++) {
+                sat_sum += neighbor_sats[sample_i];
+                cap_sum += neighbor_caps[sample_i];
+                porosity_sum += neighbor_porosities[sample_i];
+                inv_perm_sum += 1.0 / max(neighbor_perms[sample_i], 1e-5);
+            }
+
+            let saturation = sat_sum / f32(neighbor_count);
+            let local_porosity = porosity_sum / f32(neighbor_count);
+            let local_perm = f32(neighbor_count) / max(inv_perm_sum, 1e-6);
+
+            let beta = dt() * local_porosity * local_porosity * mu_fluid() / max(local_perm, 1e-5);
+            let drag = beta * (v_s - v_w)
+                / (1.0 + beta * (1.0 / mass_w + 1.0 / mass_s));
+            v_w += drag / mass_w;
+            v_s -= drag / mass_s;
+
+            if cap_sum > 1e-6 {
+                let transport_scale =
+                    clamp(local_perm / max(uniform_permeability(), 1e-5), 0.08, 1.8);
+                let abs_rate = absorption_rate() * transport_scale * (1.0 - saturation) * dt();
+                let m_abs = min(min(mass_w * clamp(abs_rate, 0.0, 0.3), mass_w * 0.5), cap_sum);
+                if m_abs > 1e-6 {
+                    mass_w_post = mass_w - m_abs;
+                    absorbed_frac = m_abs / mass_w;
+
+                    for (var sample_i = 0u; sample_i < neighbor_count; sample_i++) {
+                        let cap_i = neighbor_caps[sample_i];
+                        if cap_i <= 1e-6 { continue; }
+                        let share = m_abs * cap_i / cap_sum;
+                        atomicAdd(&bed_delta[u32(neighbor_ids[sample_i])], i32(share * fp_scale()));
+                    }
+                }
+            }
+        } else {
+            let beta =
+                dt() * uniform_porosity() * uniform_porosity() * mu_fluid()
+                    / max(uniform_permeability(), 1e-5);
+            let drag = beta * (v_s - v_w)
+                / (1.0 + beta * (1.0 / mass_w + 1.0 / mass_s));
+            v_w += drag / mass_w;
+            v_s -= drag / mass_s;
+        }
+    }
+
+    // Store absorbed fraction in scratch slot for bed_coupling to read.
+    atomicStore(&grid[scratch_absorbed_idx(idx)], i32(absorbed_frac * fp_scale()));
+
+    grid_vel[idx] = vec4<f32>(clamp_velocity(v_w), mass_w_post);
+    grid_vel[grid_vel_solid_idx(idx)] = vec4<f32>(clamp_velocity(v_s), mass_s);
 }
 
 // ── classify_cells ──
@@ -507,57 +1013,59 @@ fn classify_cells(@builtin(global_invocation_id) gid: vec3<u32>) {
     // they'd get if lumped with air.
     let cell_center = u.grid_origin.xyz
         + (vec3<f32>(f32(ix_val), f32(iy_val), f32(iz_val)) + vec3<f32>(0.5)) * dx();
-    if sample_sdf(cell_center) < 0.0 {
+    let self_is_solid = select(
+        sample_sdf(cell_center) < 0.0,
+        sdf_class_is_solid(vec3<i32>(i32(ix_val), i32(iy_val), i32(iz_val))),
+        use_sdf_cache(),
+    );
+    if self_is_solid {
         atomicStore(&grid[scratch_kind_idx(idx)], CELL_SOLID);
         divergence_store(idx, 0.0);
         return;
     }
 
+    let solid_mass = grid_vel[grid_vel_solid_idx(idx)].w;
+
     if mass <= occupancy_mass_threshold() {
+        if solid_mass > 1e-6 {
+            atomicStore(&grid[scratch_kind_idx(idx)], CELL_BED_COUPLED);
+            divergence_store(idx, 0.0);
+            return;
+        }
         atomicStore(&grid[scratch_kind_idx(idx)], CELL_AIR);
         divergence_store(idx, 0.0);
         return;
     }
 
-    if bed_lookup_load(idx) >= 0 {
-        atomicStore(&grid[scratch_kind_idx(idx)], CELL_BED_COUPLED);
-    } else {
-        let offsets = array<vec3<i32>, 6>(
-            vec3<i32>(-1, 0, 0),
-            vec3<i32>(1, 0, 0),
-            vec3<i32>(0, -1, 0),
-            vec3<i32>(0, 1, 0),
-            vec3<i32>(0, 0, -1),
-            vec3<i32>(0, 0, 1),
-        );
+    let offsets = array<vec3<i32>, 6>(
+        vec3<i32>(-1, 0, 0),
+        vec3<i32>(1, 0, 0),
+        vec3<i32>(0, -1, 0),
+        vec3<i32>(0, 1, 0),
+        vec3<i32>(0, 0, -1),
+        vec3<i32>(0, 0, 1),
+    );
 
-        var has_air_neighbor = false;
-        for (var n = 0u; n < 6u; n++) {
-            let neighbor = vec3<i32>(i32(ix_val), i32(iy_val), i32(iz_val)) + offsets[n];
-            if neighbor.x < 0 || neighbor.y < 0 || neighbor.z < 0
-                || u32(neighbor.x) >= gx() || u32(neighbor.y) >= gy() || u32(neighbor.z) >= gz() {
-                has_air_neighbor = true;
-                break;
-            }
-
-            let neighbor_idx = cell_index(u32(neighbor.x), u32(neighbor.y), u32(neighbor.z));
-            if grid_vel[neighbor_idx].w <= occupancy_mass_threshold() {
-                has_air_neighbor = true;
-                break;
-            }
+    var has_air_neighbor = false;
+    for (var n = 0u; n < 6u; n++) {
+        let neighbor = vec3<i32>(i32(ix_val), i32(iy_val), i32(iz_val)) + offsets[n];
+        if neighbor.x < 0 || neighbor.y < 0 || neighbor.z < 0
+            || u32(neighbor.x) >= gx() || u32(neighbor.y) >= gy() || u32(neighbor.z) >= gz() {
+            has_air_neighbor = true;
+            break;
         }
 
-        atomicStore(
-            &grid[scratch_kind_idx(idx)],
-            select(CELL_INTERIOR_FLUID, CELL_SURFACE_FLUID, has_air_neighbor),
-        );
+        let neighbor_idx = cell_index(u32(neighbor.x), u32(neighbor.y), u32(neighbor.z));
+        if grid_vel[neighbor_idx].w <= occupancy_mass_threshold() {
+            has_air_neighbor = true;
+            break;
+        }
     }
 
-    let kind = cell_kind_load(idx);
-    if !is_fluid_kind(kind) {
-        divergence_store(idx, 0.0);
-        return;
-    }
+    atomicStore(
+        &grid[scratch_kind_idx(idx)],
+        select(CELL_INTERIOR_FLUID, CELL_SURFACE_FLUID, has_air_neighbor),
+    );
 
     // Central-difference divergence using cell-centered velocities. No-flow
     // boundaries (off-grid faces and CELL_SOLID neighbors) use a ghost-mirror
@@ -581,51 +1089,57 @@ fn classify_cells(@builtin(global_invocation_id) gid: vec3<u32>) {
     var vzm = -self_vel.z;
     var vzp = -self_vel.z;
     if ix_val > 0u
-        && sample_sdf(cell_center + vec3<f32>(-dx_vec, 0.0, 0.0)) >= 0.0 {
+        && select(
+            sample_sdf(cell_center + vec3<f32>(-dx_vec, 0.0, 0.0)) >= 0.0,
+            !sdf_class_is_solid(vec3<i32>(i32(ix_val) - 1, i32(iy_val), i32(iz_val))),
+            use_sdf_cache(),
+        ) {
         vxm = grid_vel[cell_index(ix_val - 1u, iy_val, iz_val)].x;
     }
     if ix_val + 1u < gx()
-        && sample_sdf(cell_center + vec3<f32>(dx_vec, 0.0, 0.0)) >= 0.0 {
+        && select(
+            sample_sdf(cell_center + vec3<f32>(dx_vec, 0.0, 0.0)) >= 0.0,
+            !sdf_class_is_solid(vec3<i32>(i32(ix_val) + 1, i32(iy_val), i32(iz_val))),
+            use_sdf_cache(),
+        ) {
         vxp = grid_vel[cell_index(ix_val + 1u, iy_val, iz_val)].x;
     }
     if iy_val > 0u
-        && sample_sdf(cell_center + vec3<f32>(0.0, -dx_vec, 0.0)) >= 0.0 {
+        && select(
+            sample_sdf(cell_center + vec3<f32>(0.0, -dx_vec, 0.0)) >= 0.0,
+            !sdf_class_is_solid(vec3<i32>(i32(ix_val), i32(iy_val) - 1, i32(iz_val))),
+            use_sdf_cache(),
+        ) {
         vym = grid_vel[cell_index(ix_val, iy_val - 1u, iz_val)].y;
     }
     if iy_val + 1u < gy()
-        && sample_sdf(cell_center + vec3<f32>(0.0, dx_vec, 0.0)) >= 0.0 {
+        && select(
+            sample_sdf(cell_center + vec3<f32>(0.0, dx_vec, 0.0)) >= 0.0,
+            !sdf_class_is_solid(vec3<i32>(i32(ix_val), i32(iy_val) + 1, i32(iz_val))),
+            use_sdf_cache(),
+        ) {
         vyp = grid_vel[cell_index(ix_val, iy_val + 1u, iz_val)].y;
     }
     if iz_val > 0u
-        && sample_sdf(cell_center + vec3<f32>(0.0, 0.0, -dx_vec)) >= 0.0 {
+        && select(
+            sample_sdf(cell_center + vec3<f32>(0.0, 0.0, -dx_vec)) >= 0.0,
+            !sdf_class_is_solid(vec3<i32>(i32(ix_val), i32(iy_val), i32(iz_val) - 1)),
+            use_sdf_cache(),
+        ) {
         vzm = grid_vel[cell_index(ix_val, iy_val, iz_val - 1u)].z;
     }
     if iz_val + 1u < gz()
-        && sample_sdf(cell_center + vec3<f32>(0.0, 0.0, dx_vec)) >= 0.0 {
+        && select(
+            sample_sdf(cell_center + vec3<f32>(0.0, 0.0, dx_vec)) >= 0.0,
+            !sdf_class_is_solid(vec3<i32>(i32(ix_val), i32(iy_val), i32(iz_val) + 1)),
+            use_sdf_cache(),
+        ) {
         vzp = grid_vel[cell_index(ix_val, iy_val, iz_val + 1u)].z;
     }
 
     let div = 0.5 * inv_dx() * ((vxp - vxm) + (vyp - vym) + (vzp - vzm));
 
-    // Sink-augmented divergence for bed-coupled cells (PLAN.md formula):
-    //   div(u) = -m_abs / (rho * V * dt)
-    // Adding a positive sink tells the pressure solver to allow convergent
-    // flow at bed cells rather than fighting it to zero. After projection
-    // (vel -= dt * grad_p), the dt factors cancel via the 1/dt normalization
-    // in pressure_update, so div(u_new) = -sink exactly.
-    var sink = 0.0;
-    if kind == CELL_BED_COUPLED {
-        let bed_idx = bed_lookup_load(idx);
-        if bed_idx >= 0 {
-            let be = bed_extract[u32(bed_idx)];
-            let saturation = be.extract.w;
-            let abs_frac = clamp(absorption_rate() * (1.0 - saturation) * dt(), 0.0, 0.25);
-            let predicted_abs = mass * abs_frac;
-            let ref_mass = nominal_mass() * 8.0;
-            sink = predicted_abs / (ref_mass * dt());
-        }
-    }
-    divergence_store(idx, div + sink);
+    divergence_store(idx, div);
 
     // Observability: track the worst-case cell divergence and the fluid-cell
     // footprint of the active substep. `atomicMax` on u32 gives the peak FP
@@ -804,10 +1318,12 @@ fn boundary_project(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
     if idx >= total_cells() { return; }
 
-    let gv = grid_vel[idx];
-    if gv.w < 1e-6 { return; }
-
-    var v = gv.xyz;
+    let gv_w = grid_vel[idx];
+    let solid_idx = grid_vel_solid_idx(idx);
+    let gv_s = grid_vel[solid_idx];
+    if gv_w.w <= 1e-6 && gv_s.w <= 1e-6 {
+        return;
+    }
 
     // Reconstruct cell position from flat index
     let iz_val = idx / (gx() * gy());
@@ -819,34 +1335,23 @@ fn boundary_project(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     // SDF collision
     let sdf_val = sample_sdf(cell_pos);
-    if sdf_val < contact_offset() {
-        let n = sdf_gradient(cell_pos);
-        let vn = dot(v, n);
-        if vn < 0.0 {
-            v = v - n * vn * (1.0 + restitution());
-            // Friction: reduce tangential component
-            let vt = v - n * dot(v, n);
-            let vt_len = length(vt);
-            if vt_len > 1e-6 {
-                let friction_impulse = min(friction() * abs(vn), vt_len);
-                v = v - vt * (friction_impulse / vt_len);
-            }
-        }
-    }
+    let n = select(vec3<f32>(0.0), sdf_gradient(cell_pos), sdf_val < contact_offset());
 
     // Box boundary
     let margin = 2.0 * dx();
     let bmin = u.grid_origin.xyz + vec3<f32>(margin);
     let bmax = u.bounds_max.xyz - vec3<f32>(margin);
 
-    if cell_pos.x < bmin.x && v.x < 0.0 { v.x = 0.0; }
-    if cell_pos.x > bmax.x && v.x > 0.0 { v.x = 0.0; }
-    if cell_pos.y < bmin.y && v.y < 0.0 { v.y = 0.0; }
-    if cell_pos.y > bmax.y && v.y > 0.0 { v.y = 0.0; }
-    if cell_pos.z < bmin.z && v.z < 0.0 { v.z = 0.0; }
-    if cell_pos.z > bmax.z && v.z > 0.0 { v.z = 0.0; }
+    if gv_w.w > 1e-6 {
+        let v_w = project_grid_velocity(gv_w.xyz, cell_pos, sdf_val, n, bmin, bmax);
+        grid_vel[idx] = vec4<f32>(v_w, gv_w.w);
+    }
 
-    grid_vel[idx] = vec4<f32>(v, gv.w);
+    if gv_s.w > 1e-6 {
+        var v_s = project_grid_velocity(gv_s.xyz, cell_pos, sdf_val, n, bmin, bmax);
+        v_s = project_solid_velocity_against_filter(v_s, cell_pos);
+        grid_vel[solid_idx] = vec4<f32>(v_s, gv_s.w);
+    }
 }
 
 // ── g2p ──
@@ -861,9 +1366,6 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>) {
     let J_old = p.pos.w;
     let mass_p = p.vel.w;
     let phase = affine[pid].col0.w;
-    if phase >= 0.5 {
-        return;
-    }
     if mass_p <= inactive_mass_threshold() {
         particles[pid].vel.w = 0.0;
         return;
@@ -892,7 +1394,7 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>) {
     var new_C1 = vec3<f32>(0.0);
     var new_C2 = vec3<f32>(0.0);
     var supported_weight = 0.0;
-    var local_grid_mass = 0.0;
+    let is_bed = phase >= 0.5;
 
     let B = 4.0 * inv_dx() * inv_dx();
     let cell_dx = dx();
@@ -908,9 +1410,10 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>) {
 
                 let w = wx[i] * wy[j] * wz[k];
                 let ci = cell_index(u32(cell.x), u32(cell.y), u32(cell.z));
-                let grid_v = grid_vel[ci].xyz;
+                let vel_idx = select(ci, grid_vel_solid_idx(ci), is_bed);
+                let grid_v = grid_vel[vel_idx].xyz;
                 let dpos = (vec3<f32>(offset) - fx) * cell_dx;
-                let grid_mass = grid_vel[ci].w;
+                let grid_mass = grid_vel[vel_idx].w;
 
                 if grid_mass > 1e-6 {
                     new_v += w * grid_v;
@@ -919,59 +1422,69 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>) {
                     new_C1 += w * B * grid_v * dpos.y;
                     new_C2 += w * B * grid_v * dpos.z;
                     supported_weight += w;
-                    local_grid_mass += w * grid_mass;
                 }
             }
         }
     }
 
-    // Sparse jets suffer strong PIC-style dissipation because empty stencil nodes
-    // contribute zero velocity. When support is weak, preserve more of the
-    // particle's previous ballistic motion instead of letting the stream stall.
-    let support_ratio = clamp(supported_weight, 0.0, 1.0);
     if supported_weight > 1e-6 {
         let inv_supported = 1.0 / supported_weight;
         new_v *= inv_supported;
         new_C0 *= inv_supported;
         new_C1 *= inv_supported;
         new_C2 *= inv_supported;
-    }
-    let in_cup_volume = xp.y < -3.5 && dot(xp.xz, xp.xz) < (3.0 + contact_offset()) * (3.0 + contact_offset());
-    if support_ratio < 0.999 {
-        let ballistic_v = vec3<f32>(p.vel.x, p.vel.y + gravity() * dt(), p.vel.z);
-        let preserve = clamp((1.0 - support_ratio) * 1.15, 0.0, 0.95);
-        new_v = mix(new_v, ballistic_v, preserve);
-        let affine_damp = 1.0 - preserve * 0.75;
-        new_C0 *= affine_damp;
-        new_C1 *= affine_damp;
-        new_C2 *= affine_damp;
+    } else {
+        // If a particle sees no active grid support at all this substep,
+        // preserve its ballistic motion instead of collapsing it to zero.
+        new_v = vec3<f32>(p.vel.x, p.vel.y + gravity() * dt(), p.vel.z);
+        new_C0 = vec3<f32>(0.0);
+        new_C1 = vec3<f32>(0.0);
+        new_C2 = vec3<f32>(0.0);
     }
 
-    // Even with full stencil support, a thin free stream below the dripper can be
-    // severely under-dense. PIC/APIC transfer then numerically diffuses momentum.
-    // Preserve more ballistic motion when the particle is airborne and local mass
-    // support is low compared with a compact fluid region.
-    let home_cell = world_to_cell(xp);
-    var bed_near = false;
-    if home_cell.x >= 0 && home_cell.y >= 0 && home_cell.z >= 0
-        && u32(home_cell.x) < gx() && u32(home_cell.y) < gy() && u32(home_cell.z) < gz() {
-        let home_idx = cell_index(u32(home_cell.x), u32(home_cell.y), u32(home_cell.z));
-        bed_near = bed_lookup_load(home_idx) >= 0;
+    var J_new = 1.0;
+    if is_bed {
+        let F_old0 = bed_F_col0(pid);
+        let F_old1 = bed_F_col1(pid);
+        let F_old2 = bed_F_col2(pid);
+        let alpha_old = bed_plastic_alpha(pid);
+        let compaction_old = bed_compaction_state(pid);
+        let saturation = bed_particle_saturation(pid);
+        let F_old = mat3x3<f32>(F_old0, F_old1, F_old2);
+        let F_step = mat3x3<f32>(
+            vec3<f32>(1.0 + dt() * new_C0.x, dt() * new_C0.y, dt() * new_C0.z),
+            vec3<f32>(dt() * new_C1.x, 1.0 + dt() * new_C1.y, dt() * new_C1.z),
+            vec3<f32>(dt() * new_C2.x, dt() * new_C2.y, 1.0 + dt() * new_C2.z),
+        );
+        var F_new = F_step * F_old;
+        let plasticity = project_bed_granular_plasticity(
+            F_new,
+            saturation,
+            alpha_old,
+            compaction_old,
+        );
+        F_new = plasticity.F;
+        var F_new0 = F_new[0];
+        var F_new1 = F_new[1];
+        var F_new2 = F_new[2];
+        let detF_raw = max(determinant_from_cols(F_new0, F_new1, F_new2), 1e-5);
+        let detF_clamped = clamp(detF_raw, 0.5, 1.5);
+        if abs(detF_clamped - detF_raw) > 1e-5 {
+            let scale = pow(detF_clamped / detF_raw, 1.0 / 3.0);
+            F_new0 *= scale;
+            F_new1 *= scale;
+            F_new2 *= scale;
+            F_new = mat3x3<f32>(F_new0, F_new1, F_new2);
+        }
+        var be = bed_extract[pid];
+        be.mech0 = vec4<f32>(F_new0, 0.0);
+        be.mech1 = vec4<f32>(F_new1, 0.0);
+        be.mech2 = vec4<f32>(F_new2, 0.0);
+        be.mech0.w = plasticity.alpha;
+        be.mech1.w = plasticity.compaction;
+        bed_extract[pid] = be;
+        J_new = detF_clamped;
     }
-    let airborne = !bed_near && sample_sdf(xp) > contact_offset() * 2.0;
-    if airborne {
-        let dense_mass = nominal_mass() * 4.0;
-        let density_ratio = clamp(local_grid_mass / max(dense_mass, 1e-6), 0.0, 1.0);
-        let ballistic_v = vec3<f32>(p.vel.x, p.vel.y + gravity() * dt(), p.vel.z);
-        let preserve = clamp((1.0 - density_ratio) * 0.72, 0.0, 0.88);
-        new_v = mix(new_v, ballistic_v, preserve);
-        let affine_damp = 1.0 - preserve * 0.65;
-        new_C0 *= affine_damp;
-        new_C1 *= affine_damp;
-        new_C2 *= affine_damp;
-    }
-
-    let J_new = 1.0;
 
     // Advect
     var new_pos = xp + new_v * dt();
@@ -979,9 +1492,9 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>) {
     // Particle-level boundary projection closes the gap left by the grid-only
     // collision pass so the dripper wall behaves like a hard barrier.
     let mid_pos = mix(xp, new_pos, 0.5);
-    var contact = resolve_sdf_contact(mid_pos, new_v, false);
+    var contact = resolve_sdf_contact(mid_pos, new_v, is_bed);
     new_v = contact.vel;
-    contact = resolve_sdf_contact(new_pos, new_v, false);
+    contact = resolve_sdf_contact(new_pos, new_v, is_bed);
     new_pos = contact.pos;
     new_v = contact.vel;
 
@@ -1007,10 +1520,10 @@ fn bed_coupling(@builtin(global_invocation_id) gid: vec3<u32>) {
     if pid >= num_particles() { return; }
 
     let phase = affine[pid].col0.w;
+    if phase >= 0.5 { return; }
 
-    if phase >= 0.5 {
-        return;
-    }
+    let mass_p = particles[pid].vel.w;
+    if mass_p <= inactive_mass_threshold() { return; }
 
     let pos = particles[pid].pos.xyz;
     let cell = world_to_cell(pos);
@@ -1018,55 +1531,117 @@ fn bed_coupling(@builtin(global_invocation_id) gid: vec3<u32>) {
     if u32(cell.x) >= gx() || u32(cell.y) >= gy() || u32(cell.z) >= gz() { return; }
 
     let ci = cell_index(u32(cell.x), u32(cell.y), u32(cell.z));
-    let bed_idx = bed_lookup_load(ci);
-    if bed_idx < 0 || u32(bed_idx) >= num_bed() {
-        return;
-    }
+    let frac = f32(atomicLoad(&grid[scratch_absorbed_idx(ci)])) * inv_fp_scale();
+    if frac <= 1e-6 { return; }
 
-    var be = bed_extract[u32(bed_idx)];
-    let saturation = be.extract.w;
-    let permeability = be.bed.z;
-
-    let drag = drag_coeff() * (1.0 - permeability * 0.1) * dt();
-    let v = particles[pid].vel.xyz;
-    particles[pid].vel = vec4<f32>(
-        v / (1.0 + max(drag, 0.0)),
-        particles[pid].vel.w,
-    );
-
-    let capacity = max(max_saturation() - be.bed.x, 0.0);
-    if capacity <= 1e-6 {
-        return;
-    }
-
-    let mass_p = particles[pid].vel.w;
-    let abs_rate = absorption_rate() * (1.0 - saturation) * dt();
-    let speed = length(particles[pid].vel.xyz);
-    var absorbed = min(min(mass_p * clamp(abs_rate, 0.0, 0.25), mass_p * 0.5), capacity);
-    let remaining_after_partial = mass_p - absorbed;
-    let retire_threshold = nominal_mass() * 0.22;
-    if remaining_after_partial > 0.0 && remaining_after_partial <= retire_threshold {
-        absorbed = min(mass_p, capacity);
-    } else if saturation > 0.55 && speed < 1.35 {
-        let almost_absorbed = min(mass_p, capacity);
-        if mass_p - almost_absorbed <= nominal_mass() * 0.35 {
-            absorbed = almost_absorbed;
-        }
-    }
-    if absorbed <= 1e-6 {
-        return;
-    }
-
+    let absorbed = mass_p * clamp(frac, 0.0, 0.95);
     let remaining = mass_p - absorbed;
     if remaining <= inactive_mass_threshold() {
         particles[pid].vel = vec4<f32>(vec3<f32>(0.0), 0.0);
     } else {
         particles[pid].vel = vec4<f32>(particles[pid].vel.xyz, remaining);
     }
-    atomicAdd(&bed_delta[u32(bed_idx)], i32(absorbed * fp_scale()));
 }
 
 // ── extraction_advect ──
+
+@compute @workgroup_size(64)
+fn bed_redistribute(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let bid = gid.x;
+    if bid >= num_bed() { return; }
+
+    let self_pos = particles[bid].pos.xyz;
+    let self_pore = bed_extract[bid].bed.x;
+    let self_perm = bed_particle_permeability(bid);
+    if self_pore <= 1e-6 { return; }
+
+    let cell = world_to_cell(self_pos);
+    if cell.x < 0 || cell.y < 0 || cell.z < 0 { return; }
+    if u32(cell.x) >= gx() || u32(cell.y) >= gy() || u32(cell.z) >= gz() { return; }
+
+    var seen_ids: array<i32, 27>;
+    for (var i = 0u; i < 27u; i++) {
+        seen_ids[i] = -1;
+    }
+
+    var seen_count = 0u;
+    var best_neighbor = -1;
+    var best_neighbor_pore = 0.0;
+    var best_neighbor_capacity = 0.0;
+    var best_neighbor_perm = 0.0;
+    var best_score = 0.0;
+
+    for (var di = -1; di <= 1; di++) {
+        for (var dj = -1; dj <= 1; dj++) {
+            for (var dk = -1; dk <= 1; dk++) {
+                let c = cell + vec3<i32>(di, dj, dk);
+                if c.x < 0 || c.y < 0 || c.z < 0 { continue; }
+                if u32(c.x) >= gx() || u32(c.y) >= gy() || u32(c.z) >= gz() { continue; }
+
+                let ci = cell_index(u32(c.x), u32(c.y), u32(c.z));
+                let neighbor_id = bed_lookup_load(ci);
+                if neighbor_id < 0 || u32(neighbor_id) >= num_bed() || neighbor_id == i32(bid) {
+                    continue;
+                }
+
+                var duplicate = false;
+                for (var s = 0u; s < seen_count; s++) {
+                    if seen_ids[s] == neighbor_id {
+                        duplicate = true;
+                        break;
+                    }
+                }
+                if duplicate || seen_count >= 27u {
+                    continue;
+                }
+                seen_ids[seen_count] = neighbor_id;
+                seen_count += 1u;
+
+                let nid = u32(neighbor_id);
+                let neighbor_pos = particles[nid].pos.xyz;
+                let neighbor_pore = bed_extract[nid].bed.x;
+                let neighbor_capacity = max(bed_particle_capacity(nid) - neighbor_pore, 0.0);
+                if neighbor_capacity <= 1e-6 { continue; }
+                let neighbor_perm = bed_particle_permeability(nid);
+
+                let pore_gradient = self_pore - neighbor_pore;
+                if pore_gradient <= 1e-4 { continue; }
+
+                let downward_bias = max(self_pos.y - neighbor_pos.y, 0.0);
+                let perm_bridge =
+                    clamp(min(self_perm, neighbor_perm) / max(uniform_permeability(), 1e-5), 0.05, 2.0);
+                let score = pore_gradient * perm_bridge + downward_bias * 0.15;
+                if score > best_score {
+                    best_score = score;
+                    best_neighbor = neighbor_id;
+                    best_neighbor_pore = neighbor_pore;
+                    best_neighbor_capacity = neighbor_capacity;
+                    best_neighbor_perm = neighbor_perm;
+                }
+            }
+        }
+    }
+
+    if best_neighbor < 0 { return; }
+
+    let pore_gradient = max(self_pore - best_neighbor_pore, 0.0);
+    let transfer_scale =
+        clamp(min(self_perm, best_neighbor_perm) / max(uniform_permeability(), 1e-5), 0.04, 1.6);
+    let transfer = min(
+        min(
+            self_pore * bed_storage_redistribution_rate() * transfer_scale * dt(),
+            best_neighbor_capacity * 0.2,
+        ),
+        pore_gradient * 0.25,
+    );
+    if transfer <= 1e-6 { return; }
+
+    let delta_fp = i32(transfer * fp_scale());
+    if delta_fp <= 0 { return; }
+
+    atomicAdd(&bed_delta[bid], -delta_fp);
+    atomicAdd(&bed_delta[u32(best_neighbor)], delta_fp);
+}
 
 @compute @workgroup_size(64)
 fn extraction_advect(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -1075,9 +1650,10 @@ fn extraction_advect(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     var be = bed_extract[bid];
     let absorbed = f32(atomicExchange(&bed_delta[bid], 0)) * inv_fp_scale();
-    if absorbed > 0.0 {
-        be.bed.x = min(be.bed.x + absorbed, max_saturation());
-        be.extract.w = be.bed.x / max(max_saturation(), 1e-6);
+    let local_capacity = bed_particle_capacity(bid);
+    if abs(absorbed) > 0.0 {
+        be.bed.x = clamp(be.bed.x + absorbed, 0.0, local_capacity);
+        be.extract.w = be.bed.x / local_capacity;
     }
     let sat = be.extract.w;
 
@@ -1090,117 +1666,6 @@ fn extraction_advect(@builtin(global_invocation_id) gid: vec3<u32>) {
     bed_extract[bid] = be;
 }
 
-// ── bed_dynamics ──
-
-@compute @workgroup_size(64)
-fn bed_dynamics(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let bid = gid.x;
-    if bid >= num_bed() { return; }
-
-    let pid = bid;
-    let p = particles[pid];
-    var rest = affine[pid].col1.xyz;
-    let pos = p.pos.xyz;
-    let mass_p = p.vel.w;
-
-    let origin = u.grid_origin.xyz;
-    let grid_pos = (pos - origin) * inv_dx();
-    let base = vec3<i32>(floor(grid_pos - 0.5));
-    let fx = grid_pos - vec3<f32>(base);
-
-    var wx: array<f32, 3>;
-    var wy: array<f32, 3>;
-    var wz: array<f32, 3>;
-    wx[0] = 0.5 * (1.5 - fx.x) * (1.5 - fx.x);
-    wx[1] = 0.75 - (fx.x - 1.0) * (fx.x - 1.0);
-    wx[2] = 0.5 * (fx.x - 0.5) * (fx.x - 0.5);
-    wy[0] = 0.5 * (1.5 - fx.y) * (1.5 - fx.y);
-    wy[1] = 0.75 - (fx.y - 1.0) * (fx.y - 1.0);
-    wy[2] = 0.5 * (fx.y - 0.5) * (fx.y - 0.5);
-    wz[0] = 0.5 * (1.5 - fx.z) * (1.5 - fx.z);
-    wz[1] = 0.75 - (fx.z - 1.0) * (fx.z - 1.0);
-    wz[2] = 0.5 * (fx.z - 0.5) * (fx.z - 0.5);
-
-    var water_v = vec3<f32>(0.0);
-    var water_mass = 0.0;
-
-    for (var i = 0u; i < 3u; i++) {
-        for (var j = 0u; j < 3u; j++) {
-            for (var k = 0u; k < 3u; k++) {
-                let offset = vec3<i32>(vec3<u32>(i, j, k));
-                let cell = base + offset;
-
-                if cell.x < 0 || cell.y < 0 || cell.z < 0 { continue; }
-                if u32(cell.x) >= gx() || u32(cell.y) >= gy() || u32(cell.z) >= gz() { continue; }
-
-                let w = wx[i] * wy[j] * wz[k];
-                let ci = cell_index(u32(cell.x), u32(cell.y), u32(cell.z));
-                let gv = grid_vel[ci];
-                water_v += w * gv.xyz;
-                water_mass += w * gv.w;
-            }
-        }
-    }
-
-    let sat = bed_extract[bid].extract.w;
-    let mobility = clamp((1.0 - sat) * (0.35 + water_mass * 0.12), 0.0, 1.0);
-    let surface_factor = clamp((rest.y + 3.0) / 3.5, 0.12, 1.0);
-    let spring = bed_spring() * (0.8 + sat * 0.5);
-    let damping = clamp(1.0 - bed_damping() * dt(), 0.0, 1.0);
-
-    var vel = p.vel.xyz;
-    vel += (rest - pos) * spring * dt();
-
-    let impact_v = vec3<f32>(water_v.x * 0.25, min(water_v.y, 0.0) * 0.9, water_v.z * 0.25);
-    vel += impact_v * bed_impact() * mobility * surface_factor * dt();
-    vel *= damping;
-
-    var new_pos = pos + vel * dt();
-    var offset = new_pos - rest;
-    let lateral_len = length(offset.xz);
-    let max_lateral = dx() * 0.9 * surface_factor;
-    if lateral_len > max_lateral && lateral_len > 1e-6 {
-        let lateral_dir = offset.xz / lateral_len;
-        offset.x = lateral_dir.x * max_lateral;
-        offset.z = lateral_dir.y * max_lateral;
-        vel.x *= 0.4;
-        vel.z *= 0.4;
-    }
-    offset.y = clamp(offset.y, -dx() * (1.75 * surface_factor + 0.2), dx() * 0.18);
-    new_pos = rest + offset;
-
-    // Plastic compaction: once the bed is indented enough, lower the remembered
-    // local rest height so the crater relaxes slowly instead of springing fully back.
-    let compression = max(rest.y - new_pos.y, 0.0);
-    let plastic_threshold = dx() * 0.18;
-    if compression > plastic_threshold {
-        let excess = compression - plastic_threshold;
-        let plasticity = clamp(
-            (0.18 + sat * 0.55 + mobility * 0.45) * surface_factor * dt() * 6.0,
-            0.0,
-            0.18,
-        );
-        rest.y -= excess * plasticity;
-    }
-
-    // Very slow rebound toward the original packed state for drier regions so
-    // old craters soften over time rather than staying perfectly frozen forever.
-    let packed_rest = affine[pid].col2.x;
-    if packed_rest != 0.0 {
-        let rebound = clamp((1.0 - sat) * dt() * 0.08, 0.0, 0.01);
-        rest.y = mix(rest.y, packed_rest, rebound);
-    }
-
-    let contact = resolve_sdf_contact(new_pos, vel, true);
-    new_pos = contact.pos;
-    vel = contact.vel;
-
-    particles[pid].pos = vec4<f32>(new_pos, p.pos.w);
-    particles[pid].vel = vec4<f32>(vel, mass_p);
-    affine[pid].col1 = vec4<f32>(rest, 0.0);
-    bed_extract[bid].bed.w = max((rest.y - new_pos.y) / max(dx(), 1e-6), 0.0);
-}
-
 // ── prepare_render ──
 
 @compute @workgroup_size(64)
@@ -1211,11 +1676,13 @@ fn prepare_render(@builtin(global_invocation_id) gid: vec3<u32>) {
     let p = particles[pid];
     let phase = affine[pid].col0.w;
     if p.vel.w <= inactive_mass_threshold() {
-        render_data[pid] = vec4<f32>(0.0, -1e6, 0.0, -999.0);
+        render_data[pid].primary = vec4<f32>(0.0, -1e6, 0.0, -999.0);
+        render_data[pid].aux = vec4<f32>(0.0);
         return;
     }
 
     var color_t = 0.0;
+    var size_scale = 1.0;
     if phase < 0.5 {
         let speed = length(p.vel.xyz);
         color_t = clamp(speed / 10.0, 0.0, 2.0);
@@ -1223,12 +1690,16 @@ fn prepare_render(@builtin(global_invocation_id) gid: vec3<u32>) {
         let bed_idx = pid;
         var sat = 0.0;
         if bed_idx < num_bed() {
-            sat = bed_extract[bed_idx].extract.w;
+            sat = bed_particle_saturation(bed_idx);
+            let permeability_ratio =
+                bed_particle_permeability(bed_idx) / max(uniform_permeability(), 1e-5);
+            size_scale = clamp(pow(permeability_ratio, 0.18), 0.68, 1.42);
         }
         color_t = -1.0 - sat;
     }
 
-    render_data[pid] = vec4<f32>(p.pos.xyz, color_t);
+    render_data[pid].primary = vec4<f32>(p.pos.xyz, color_t);
+    render_data[pid].aux = vec4<f32>(size_scale, 0.0, 0.0, 0.0);
 }
 
 // ── metrics_clear ──
