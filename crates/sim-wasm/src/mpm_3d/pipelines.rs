@@ -17,6 +17,7 @@ pub(crate) struct MpmPipelines {
     pub boundary_project: wgpu::ComputePipeline,
     pub g2p: wgpu::ComputePipeline,
     pub bed_coupling: wgpu::ComputePipeline,
+    pub bed_redistribute: wgpu::ComputePipeline,
     pub extraction_advect: wgpu::ComputePipeline,
     pub prepare_render: wgpu::ComputePipeline,
 }
@@ -181,6 +182,7 @@ impl MpmPipelines {
             boundary_project: make("boundary_project"),
             g2p: make("g2p"),
             bed_coupling: make("bed_coupling"),
+            bed_redistribute: make("bed_redistribute"),
             extraction_advect: make("extraction_advect"),
             prepare_render: make("prepare_render"),
         }
