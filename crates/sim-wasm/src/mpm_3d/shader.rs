@@ -133,6 +133,9 @@ fn bed_particle_permeability(bid: u32) -> f32 {
 fn bed_particle_saturation(bid: u32) -> f32 {
     return clamp(bed_extract[bid].bed.x / bed_particle_capacity(bid), 0.0, 1.0);
 }
+fn bed_plastic_alpha(bid: u32) -> f32 {
+    return max(bed_extract[bid].mech0.w, 0.0);
+}
 fn bed_F_col0(bid: u32) -> vec3<f32> {
     return bed_extract[bid].mech0.xyz;
 }
@@ -149,6 +152,13 @@ fn bed_shear_modulus() -> f32 {
 fn bed_lambda_from_bulk() -> f32 {
     return K_bed() - 2.0 * bed_shear_modulus() / 3.0;
 }
+fn identity3() -> mat3x3<f32> {
+    return mat3x3<f32>(
+        vec3<f32>(1.0, 0.0, 0.0),
+        vec3<f32>(0.0, 1.0, 0.0),
+        vec3<f32>(0.0, 0.0, 1.0),
+    );
+}
 fn safe_mat_cols(c0: vec3<f32>, c1: vec3<f32>, c2: vec3<f32>) -> mat3x3<f32> {
     return mat3x3<f32>(c0, c1, c2);
 }
@@ -159,6 +169,64 @@ fn orthonormal_basis_from_F(c0: vec3<f32>, c1: vec3<f32>) -> mat3x3<f32> {
     let r2 = normalize(cross(r0, r1));
     return mat3x3<f32>(r0, r1, r2);
 }
+fn frobenius_norm(m: mat3x3<f32>) -> f32 {
+    return sqrt(
+        dot(m[0], m[0])
+            + dot(m[1], m[1])
+            + dot(m[2], m[2])
+    );
+}
+fn trace3(m: mat3x3<f32>) -> f32 {
+    return m[0].x + m[1].y + m[2].z;
+}
+fn dry_bed_friction_angle_rad() -> f32 {
+    return radians(32.0);
+}
+fn dry_bed_cohesion() -> f32 {
+    return 18.0;
+}
+fn dry_bed_hardening() -> f32 {
+    return 14.0;
+}
+struct BedPlasticProjection {
+    F: mat3x3<f32>,
+    alpha: f32,
+};
+fn project_bed_drucker_prager(
+    F_trial: mat3x3<f32>,
+    saturation: f32,
+    alpha_old: f32,
+) -> BedPlasticProjection {
+    if saturation > 0.08 {
+        return BedPlasticProjection(F_trial, alpha_old);
+    }
+
+    let R = orthonormal_basis_from_F(F_trial[0], F_trial[1]);
+    let strain_hat = transpose(R) * F_trial - identity3();
+    let mean_strain = trace3(strain_hat) / 3.0;
+    let dev_strain = strain_hat - identity3() * mean_strain;
+    let dev_norm = frobenius_norm(dev_strain);
+    if dev_norm <= 1e-6 {
+        return BedPlasticProjection(F_trial, alpha_old);
+    }
+
+    let mu = bed_shear_modulus();
+    let bulk = K_bed();
+    let q = 2.0 * mu * dev_norm;
+    let p = max(-bulk * 3.0 * mean_strain, 0.0);
+    let sin_phi = sin(dry_bed_friction_angle_rad());
+    let yield_strength = dry_bed_cohesion() + dry_bed_hardening() * alpha_old
+        + p * (0.55 * sin_phi / max(1.0 - sin_phi, 0.2));
+    if q <= yield_strength {
+        return BedPlasticProjection(F_trial, alpha_old);
+    }
+
+    let scale = clamp(yield_strength / q, 0.0, 1.0);
+    let projected_hat = identity3() * (1.0 + mean_strain) + dev_strain * scale;
+    let F_proj = R * projected_hat;
+    let plastic_increment = (1.0 - scale) * dev_norm;
+    return BedPlasticProjection(F_proj, alpha_old + plastic_increment);
+}
 fn bed_fixed_corotated_stress(bid: u32, J: f32) -> mat3x3<f32> {
     let F0 = bed_F_col0(bid);
     let F1 = bed_F_col1(bid);
@@ -167,11 +235,7 @@ fn bed_fixed_corotated_stress(bid: u32, J: f32) -> mat3x3<f32> {
     let R = orthonormal_basis_from_F(F0, F1);
     let mu = bed_shear_modulus();
     let lambda = bed_lambda_from_bulk();
-    let PFt = (2.0 * mu) * (F - R) * transpose(F) + lambda * (J - 1.0) * J * mat3x3<f32>(
-        vec3<f32>(1.0, 0.0, 0.0),
-        vec3<f32>(0.0, 1.0, 0.0),
-        vec3<f32>(0.0, 0.0, 1.0),
-    );
+    let PFt = (2.0 * mu) * (F - R) * transpose(F) + lambda * (J - 1.0) * J * identity3();
     return PFt;
 }
 fn determinant_from_cols(c0: vec3<f32>, c1: vec3<f32>, c2: vec3<f32>) -> f32 {
@@ -1363,6 +1427,8 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>) {
         let F_old0 = bed_F_col0(pid);
         let F_old1 = bed_F_col1(pid);
         let F_old2 = bed_F_col2(pid);
+        let alpha_old = bed_plastic_alpha(pid);
+        let saturation = bed_particle_saturation(pid);
         let F_old = mat3x3<f32>(F_old0, F_old1, F_old2);
         let F_step = mat3x3<f32>(
             vec3<f32>(1.0 + dt() * new_C0.x, dt() * new_C0.y, dt() * new_C0.z),
@@ -1370,6 +1436,8 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>) {
             vec3<f32>(dt() * new_C2.x, dt() * new_C2.y, 1.0 + dt() * new_C2.z),
         );
         var F_new = F_step * F_old;
+        let plasticity = project_bed_drucker_prager(F_new, saturation, alpha_old);
+        F_new = plasticity.F;
         var F_new0 = F_new[0];
         var F_new1 = F_new[1];
         var F_new2 = F_new[2];
@@ -1386,6 +1454,7 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>) {
         be.mech0 = vec4<f32>(F_new0, 0.0);
         be.mech1 = vec4<f32>(F_new1, 0.0);
         be.mech2 = vec4<f32>(F_new2, 0.0);
+        be.mech0.w = plasticity.alpha;
         bed_extract[pid] = be;
         J_new = detF_clamped;
     }

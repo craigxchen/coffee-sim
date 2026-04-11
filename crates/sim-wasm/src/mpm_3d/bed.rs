@@ -214,7 +214,7 @@ pub(crate) fn init_bed_particles(
                     0.0,
                     0.0,
                     1.0,
-                    0.0,
+                    0.0, // mech0.w = accumulated plastic strain alpha
                 ]);
             }
         }
@@ -470,6 +470,7 @@ mod tests {
             assert_eq!(extract[8], 1.0);
             assert_eq!(extract[13], 1.0);
             assert_eq!(extract[18], 1.0);
+            assert_eq!(extract[11], 0.0);
         }
     }
 
