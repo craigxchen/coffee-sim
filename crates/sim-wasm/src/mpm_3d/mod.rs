@@ -88,6 +88,7 @@ pub(crate) struct MpmSettings {
     pub render_radius: f32,
     pub pressure_rbgs_pairs: u32,
     pub use_sdf_cache: bool,
+    pub deformable_filter_support: bool,
     pub obstacles: Vec<Obstacle>,
     pub spout: SpoutSettings,
     pub initial_kettle_angle_deg: f32,
@@ -118,6 +119,7 @@ impl MpmSettings {
             render_radius: dx * 0.7,
             pressure_rbgs_pairs: 20,
             use_sdf_cache: true,
+            deformable_filter_support: true,
             obstacles: vec![
                 Obstacle::TruncatedCone {
                     center: Vec3::ZERO,
@@ -154,6 +156,12 @@ impl MpmSettings {
         settings.spout.origin = Vec3::new(0.0, 7.1, 0.0);
         settings.spout.aim_at(Vec3::new(0.0, 0.4, 0.0));
         settings.initial_kettle_angle_deg = 0.0;
+        settings
+    }
+
+    pub fn benchmark_center_pour_rigid_support() -> Self {
+        let mut settings = Self::benchmark_center_pour();
+        settings.deformable_filter_support = false;
         settings
     }
 }
@@ -213,7 +221,6 @@ impl MpmSim3D {
             affines,
             bed_extracts,
             cell_lookup,
-            bed_support_count,
         } = bed::init_bed_particles(config, self.settings.grid_dims, self.settings.bounds_size);
         let count = particles.len() as u32;
         if count == 0 {
@@ -235,14 +242,6 @@ impl MpmSim3D {
             &self.buffers.bed_lookup,
             0,
             bytemuck::cast_slice(&cell_lookup),
-        );
-        let mut padded_support = vec![0_u32; self.settings.max_particles as usize];
-        let copy_len = bed_support_count.len().min(padded_support.len());
-        padded_support[..copy_len].copy_from_slice(&bed_support_count[..copy_len]);
-        queue.write_buffer(
-            &self.buffers.bed_support_count,
-            0,
-            bytemuck::cast_slice(&padded_support),
         );
         let zero_delta = vec![0_i32; self.settings.max_particles as usize];
         queue.write_buffer(
@@ -418,8 +417,10 @@ impl MpmSim3D {
         // no benefit to running it per-substep and it would otherwise scale
         // CPU cost linearly with `substeps`.
         if let Some(mesh) = &mut self.filter_mesh {
-            let ring_loads = compute_ring_loads(&self.settings, self.num_bed, self.num_water);
-            mesh.step_with_ring_loads(dt, &ring_loads);
+            if self.settings.deformable_filter_support {
+                let ring_loads = compute_ring_loads(&self.settings, self.num_bed, self.num_water);
+                mesh.step_with_ring_loads(dt, &ring_loads);
+            }
         }
         self.upload_filter_mesh_positions(queue);
     }

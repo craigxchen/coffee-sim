@@ -7,6 +7,7 @@ const resetButton = document.getElementById("reset");
 const sceneDefaultButton = document.getElementById("scene-default");
 const sceneFreeStreamButton = document.getElementById("scene-free-stream");
 const sceneCenterPourButton = document.getElementById("scene-center-pour");
+const sceneCenterPourRigidButton = document.getElementById("scene-center-pour-rigid");
 const kettleAngleInput = document.getElementById("kettle-angle");
 const kettleAngleValue = document.getElementById("kettle-angle-value");
 const spoutXInput = document.getElementById("spout-x");
@@ -124,6 +125,15 @@ sceneFreeStreamButton.addEventListener("click", () => {
 sceneCenterPourButton.addEventListener("click", () => {
   app.loadBenchmarkCenterPour();
   applyScenePreset("Center Pour");
+  paused = false;
+  toggleButton.textContent = "Pause";
+  lastFrameTime = 0;
+  syncUi();
+});
+
+sceneCenterPourRigidButton.addEventListener("click", () => {
+  app.loadBenchmarkCenterPourRigidSupport();
+  applyScenePreset("Center Pour Rigid");
   paused = false;
   toggleButton.textContent = "Pause";
   lastFrameTime = 0;
@@ -262,6 +272,8 @@ function scenePreset(mode) {
     case "Free Stream":
       return { targetAngle: 28, fixedStep: 1 / 60, pourStartsOn: true };
     case "Center Pour":
+      return { targetAngle: 36, fixedStep: 1 / 60, pourStartsOn: false };
+    case "Center Pour Rigid":
       return { targetAngle: 36, fixedStep: 1 / 60, pourStartsOn: false };
     case "Default":
     default:

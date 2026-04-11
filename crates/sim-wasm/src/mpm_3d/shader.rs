@@ -109,7 +109,7 @@ fn K_bed() -> f32 { return u.extraction_params.y; }
 fn mu_fluid() -> f32 { return u.extraction_params.z; }
 fn uniform_permeability() -> f32 { return u.extraction_params.w; }
 fn bed_storage_redistribution_rate() -> f32 { return 0.18; }
-fn bed_filter_contact_damping() -> f32 { return 0.35; }
+fn bed_filter_contact_damping() -> f32 { return 0.18; }
 fn inactive_mass_threshold() -> f32 { return nominal_mass() * 0.10; }
 fn div_clamp_limit() -> f32 { return u.clamp_params.x; }
 fn pressure_clamp_limit() -> f32 { return u.clamp_params.y; }
@@ -135,6 +135,9 @@ fn bed_particle_saturation(bid: u32) -> f32 {
 }
 fn bed_plastic_alpha(bid: u32) -> f32 {
     return max(bed_extract[bid].mech0.w, 0.0);
+}
+fn bed_compaction_state(bid: u32) -> f32 {
+    return max(bed_extract[bid].mech1.w, 0.0);
 }
 fn bed_F_col0(bid: u32) -> vec3<f32> {
     return bed_extract[bid].mech0.xyz;
@@ -179,53 +182,89 @@ fn frobenius_norm(m: mat3x3<f32>) -> f32 {
 fn trace3(m: mat3x3<f32>) -> f32 {
     return m[0].x + m[1].y + m[2].z;
 }
-fn dry_bed_friction_angle_rad() -> f32 {
-    return radians(32.0);
+fn bed_wetness(saturation: f32) -> f32 {
+    return smoothstep(0.08, 0.85, saturation);
 }
-fn dry_bed_cohesion() -> f32 {
-    return 18.0;
+fn bed_friction_angle_rad(saturation: f32) -> f32 {
+    return radians(mix(38.0, 26.0, bed_wetness(saturation)));
 }
-fn dry_bed_hardening() -> f32 {
-    return 14.0;
+fn bed_cohesion(saturation: f32) -> f32 {
+    return mix(26.0, 12.0, bed_wetness(saturation));
+}
+fn bed_hardening(saturation: f32) -> f32 {
+    return mix(18.0, 8.0, bed_wetness(saturation));
+}
+fn bed_packing_J(saturation: f32) -> f32 {
+    return mix(0.94, 0.88, bed_wetness(saturation));
+}
+fn bed_preconsolidation_pressure(saturation: f32) -> f32 {
+    return mix(420.0, 220.0, bed_wetness(saturation));
+}
+fn bed_cap_hardening(saturation: f32) -> f32 {
+    return mix(360.0, 180.0, bed_wetness(saturation));
 }
 struct BedPlasticProjection {
     F: mat3x3<f32>,
     alpha: f32,
+    compaction: f32,
 };
-fn project_bed_drucker_prager(
+fn project_bed_granular_plasticity(
     F_trial: mat3x3<f32>,
     saturation: f32,
     alpha_old: f32,
+    compaction_old: f32,
 ) -> BedPlasticProjection {
-    if saturation > 0.08 {
-        return BedPlasticProjection(F_trial, alpha_old);
+    var F_proj = F_trial;
+    var alpha = alpha_old;
+    var compaction = compaction_old;
+
+    let J_trial = max(determinant_from_cols(F_proj[0], F_proj[1], F_proj[2]), 1e-5);
+    let J_pack = bed_packing_J(saturation);
+    if J_trial < J_pack {
+        // Grounds compact toward a finite packing state rather than storing
+        // arbitrary bulk elastic energy and rebounding like a gel.
+        let scale = pow(J_pack / J_trial, 1.0 / 3.0);
+        F_proj = F_proj * scale;
+        compaction += abs(log(J_pack / J_trial));
     }
 
-    let R = orthonormal_basis_from_F(F_trial[0], F_trial[1]);
-    let strain_hat = transpose(R) * F_trial - identity3();
-    let mean_strain = trace3(strain_hat) / 3.0;
-    let dev_strain = strain_hat - identity3() * mean_strain;
-    let dev_norm = frobenius_norm(dev_strain);
-    if dev_norm <= 1e-6 {
-        return BedPlasticProjection(F_trial, alpha_old);
-    }
-
+    let R = orthonormal_basis_from_F(F_proj[0], F_proj[1]);
     let mu = bed_shear_modulus();
     let bulk = K_bed();
-    let q = 2.0 * mu * dev_norm;
-    let p = max(-bulk * 3.0 * mean_strain, 0.0);
-    let sin_phi = sin(dry_bed_friction_angle_rad());
-    let yield_strength = dry_bed_cohesion() + dry_bed_hardening() * alpha_old
-        + p * (0.55 * sin_phi / max(1.0 - sin_phi, 0.2));
-    if q <= yield_strength {
-        return BedPlasticProjection(F_trial, alpha_old);
+    let strain_hat = transpose(R) * F_proj - identity3();
+    let eps = 0.5 * (strain_hat + transpose(strain_hat));
+    let tr_eps = trace3(eps);
+    let eps_dev = eps - identity3() * (tr_eps / 3.0);
+    let sigma_dev_trial = 2.0 * mu * eps_dev;
+    let p_trial = max(-bulk * tr_eps, 0.0);
+    let q_trial = sqrt(1.5) * frobenius_norm(sigma_dev_trial);
+    let sin_phi = sin(bed_friction_angle_rad(saturation));
+    let friction_term = 0.55 * sin_phi / max(1.0 - sin_phi, 0.2);
+    let cap_pressure =
+        bed_preconsolidation_pressure(saturation) + bed_cap_hardening(saturation) * compaction;
+    let p_proj = min(p_trial, cap_pressure);
+    let volumetric_increment = max(p_trial - p_proj, 0.0) / max(bulk, 1e-5);
+
+    if q_trial <= 1e-6 {
+        let tr_eps_proj = select(tr_eps, -p_proj / bulk, p_trial > cap_pressure + 1e-6);
+        let eps_proj = identity3() * (tr_eps_proj / 3.0);
+        compaction += volumetric_increment;
+        return BedPlasticProjection(R * (identity3() + eps_proj), alpha, compaction);
     }
 
-    let scale = clamp(yield_strength / q, 0.0, 1.0);
-    let projected_hat = identity3() * (1.0 + mean_strain) + dev_strain * scale;
-    let F_proj = R * projected_hat;
-    let plastic_increment = (1.0 - scale) * dev_norm;
-    return BedPlasticProjection(F_proj, alpha_old + plastic_increment);
+    let yield_strength =
+        bed_cohesion(saturation) + bed_hardening(saturation) * alpha + friction_term * p_proj;
+    let q_proj = min(q_trial, yield_strength);
+    let sigma_dev_proj = sigma_dev_trial * (q_proj / q_trial);
+    let eps_dev_proj = sigma_dev_proj * (1.0 / max(2.0 * mu, 1e-5));
+    let tr_eps_proj = -p_proj / bulk;
+    let eps_proj = eps_dev_proj + identity3() * (tr_eps_proj / 3.0);
+    F_proj = R * (identity3() + eps_proj);
+
+    let shear_increment = max(q_trial - q_proj, 0.0) / max(2.0 * mu, 1e-5);
+    alpha += shear_increment;
+    compaction += volumetric_increment;
+    return BedPlasticProjection(F_proj, alpha, compaction);
 }
 fn bed_fixed_corotated_stress(bid: u32, J: f32) -> mat3x3<f32> {
     let F0 = bed_F_col0(bid);
@@ -682,25 +721,6 @@ fn project_grid_velocity(
     if cell_pos.z > bmax.z && v.z > 0.0 { v.z = 0.0; }
 
     return v;
-}
-
-// ── clear_grid ──
-
-@compute @workgroup_size(64)
-fn clear_grid(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
-    if idx >= total_cells() { return; }
-
-    atomicStore(&grid[grid_mass_idx(idx)], 0);
-    atomicStore(&grid[grid_mom_x_idx(idx)], 0);
-    atomicStore(&grid[grid_mom_y_idx(idx)], 0);
-    atomicStore(&grid[grid_mom_z_idx(idx)], 0);
-    atomicStore(&grid[grid_solid_mass_idx(idx)], 0);
-    atomicStore(&grid[grid_solid_mom_x_idx(idx)], 0);
-    atomicStore(&grid[grid_solid_mom_y_idx(idx)], 0);
-    atomicStore(&grid[grid_solid_mom_z_idx(idx)], 0);
-    grid_vel[idx] = vec4<f32>(0.0);
-    grid_vel[grid_vel_solid_idx(idx)] = vec4<f32>(0.0);
 }
 
 // ── p2g ──
@@ -1428,6 +1448,7 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>) {
         let F_old1 = bed_F_col1(pid);
         let F_old2 = bed_F_col2(pid);
         let alpha_old = bed_plastic_alpha(pid);
+        let compaction_old = bed_compaction_state(pid);
         let saturation = bed_particle_saturation(pid);
         let F_old = mat3x3<f32>(F_old0, F_old1, F_old2);
         let F_step = mat3x3<f32>(
@@ -1436,7 +1457,12 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>) {
             vec3<f32>(dt() * new_C2.x, dt() * new_C2.y, 1.0 + dt() * new_C2.z),
         );
         var F_new = F_step * F_old;
-        let plasticity = project_bed_drucker_prager(F_new, saturation, alpha_old);
+        let plasticity = project_bed_granular_plasticity(
+            F_new,
+            saturation,
+            alpha_old,
+            compaction_old,
+        );
         F_new = plasticity.F;
         var F_new0 = F_new[0];
         var F_new1 = F_new[1];
@@ -1455,6 +1481,7 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>) {
         be.mech1 = vec4<f32>(F_new1, 0.0);
         be.mech2 = vec4<f32>(F_new2, 0.0);
         be.mech0.w = plasticity.alpha;
+        be.mech1.w = plasticity.compaction;
         bed_extract[pid] = be;
         J_new = detF_clamped;
     }
