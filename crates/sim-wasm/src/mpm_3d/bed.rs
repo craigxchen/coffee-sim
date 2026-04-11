@@ -111,7 +111,6 @@ pub(crate) struct BedInit {
     pub affines: Vec<[f32; 12]>,
     pub bed_extracts: Vec<[f32; 20]>,
     pub cell_lookup: Vec<i32>,
-    pub bed_support_count: Vec<u32>,
 }
 
 #[derive(Clone, Copy)]
@@ -140,13 +139,14 @@ pub(crate) fn init_bed_particles(
             affines: vec![],
             bed_extracts: vec![],
             cell_lookup: vec![-1; (grid_dims[0] * grid_dims[1] * grid_dims[2]) as usize],
-            bed_support_count: vec![],
         };
     }
 
-    let avg_radius = (config.top_radius + config.bot_radius) * 0.5;
-    let volume = std::f32::consts::PI * avg_radius * avg_radius * height / 3.0
-        * (1.0 + config.bot_radius / avg_radius + (config.bot_radius / avg_radius).powi(2));
+    // Truncated-cone frustum volume: V = π * h / 3 * (R^2 + R*r + r^2).
+    let top_r = config.top_radius;
+    let bot_r = config.bot_radius;
+    let volume =
+        std::f32::consts::PI * height / 3.0 * (top_r * top_r + top_r * bot_r + bot_r * bot_r);
     let spacing = (volume / config.num_particles.max(1) as f32).cbrt();
 
     let nx = ((config.top_radius * 2.0) / spacing).ceil() as i32;
@@ -194,6 +194,8 @@ pub(crate) fn init_bed_particles(
                 //   bed(pore_water, porosity, permeability, capacity_scale)
                 //   extract(extractable, dissolved, temp, saturation)
                 //   mech0/1/2 = bed-only deformation gradient F columns
+                //   mech0.w = accumulated shear hardening alpha
+                //   mech1.w = irreversible volumetric compaction state
                 bed_extracts.push([
                     0.0,
                     hydraulic.porosity,
@@ -214,7 +216,7 @@ pub(crate) fn init_bed_particles(
                     0.0,
                     0.0,
                     1.0,
-                    0.0, // mech0.w = accumulated plastic strain alpha
+                    0.0,
                 ]);
             }
         }
@@ -238,14 +240,12 @@ pub(crate) fn init_bed_particles(
         grid_dims,
         bounds_size,
     );
-    let bed_support_count = build_support_counts(&cell_lookup, particles.len());
 
     BedInit {
         particles,
         affines,
         bed_extracts,
         cell_lookup,
-        bed_support_count,
     }
 }
 
@@ -304,19 +304,6 @@ fn hash_to_unit(seed: u64) -> f32 {
     x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
     x ^= x >> 31;
     ((x >> 40) as u32) as f32 / ((1u32 << 24) as f32)
-}
-
-fn build_support_counts(cell_lookup: &[i32], num_particles: usize) -> Vec<u32> {
-    let mut counts = vec![0_u32; num_particles];
-    for &entry in cell_lookup {
-        if entry >= 0 {
-            let idx = entry as usize;
-            if idx < counts.len() {
-                counts[idx] += 1;
-            }
-        }
-    }
-    counts
 }
 
 fn build_cell_lookup(
@@ -428,7 +415,6 @@ mod tests {
         assert!(init.affines.is_empty());
         assert!(init.bed_extracts.is_empty());
         assert_eq!(init.cell_lookup.len(), 16 * 16 * 16);
-        assert!(init.bed_support_count.is_empty());
         assert!(init.cell_lookup.iter().all(|v| *v == -1));
     }
 
@@ -439,7 +425,6 @@ mod tests {
         assert!(init.particles.len() <= cfg.num_particles as usize);
         assert_eq!(init.particles.len(), init.affines.len());
         assert_eq!(init.particles.len(), init.bed_extracts.len());
-        assert_eq!(init.particles.len(), init.bed_support_count.len());
     }
 
     #[test]
@@ -555,19 +540,6 @@ mod tests {
         }
         let any_indexed = init.cell_lookup.iter().any(|v| *v >= 0);
         assert!(any_indexed, "expected at least one bed-occupied cell");
-    }
-
-    #[test]
-    fn bed_support_count_matches_lookup_fanout() {
-        let cfg = small_config();
-        let init = init_bed_particles(&cfg, [32, 32, 32], Vec3::new(14.0, 20.0, 14.0));
-        let mut recomputed = vec![0_u32; init.particles.len()];
-        for &entry in &init.cell_lookup {
-            if entry >= 0 {
-                recomputed[entry as usize] += 1;
-            }
-        }
-        assert_eq!(init.bed_support_count, recomputed);
     }
 
     #[test]

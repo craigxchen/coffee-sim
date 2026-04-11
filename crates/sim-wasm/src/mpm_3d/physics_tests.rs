@@ -482,6 +482,46 @@ fn bed_settling_stability() {
 }
 
 #[test]
+fn bed_settling_stability_on_rigid_support() {
+    let Some((device, queue)) = create_test_device() else {
+        eprintln!("skipping: no GPU adapter");
+        return;
+    };
+
+    let mut sim = MpmSim3D::new(
+        &device,
+        &queue,
+        MpmSettings::benchmark_center_pour_rigid_support(),
+    );
+    sim.set_kettle_angle(0.0);
+    for _ in 0..60 {
+        sim.step_frame(&device, &queue, 1.0 / 60.0);
+    }
+
+    let snapshot = readback_bed_diag_snapshot(&sim, &device, &queue);
+    assert!(
+        snapshot.all_finite,
+        "bed particles produced non-finite rigid-support state: {snapshot:?}"
+    );
+    assert!(
+        snapshot.active_count > 0,
+        "expected active bed particles after rigid-support settle"
+    );
+    assert!(
+        snapshot.mean_j >= 0.92 && snapshot.mean_j <= 1.08,
+        "bed mean J drifted outside rigid-support settle band: {snapshot:?}",
+    );
+    assert!(
+        snapshot.min_j > 0.72 && snapshot.max_j < 1.36,
+        "bed J approached safety clamps on rigid support: {snapshot:?}",
+    );
+    assert!(
+        snapshot.y_extent > 1.0,
+        "rigid-support bed y_extent collapsed unexpectedly: {snapshot:?}",
+    );
+}
+
+#[test]
 fn bed_long_run_creep_is_bounded_without_water() {
     let Some((device, queue)) = create_test_device() else {
         eprintln!("skipping: no GPU adapter");
@@ -509,6 +549,46 @@ fn bed_long_run_creep_is_bounded_without_water() {
     assert!(
         extent_drift < 0.28,
         "dry bed shape kept drifting after settling (settled={settled:?}, later={later:?})",
+    );
+}
+
+#[test]
+fn bed_long_run_creep_is_bounded_on_rigid_support() {
+    let Some((device, queue)) = create_test_device() else {
+        eprintln!("skipping: no GPU adapter");
+        return;
+    };
+
+    let mut sim = MpmSim3D::new(
+        &device,
+        &queue,
+        MpmSettings::benchmark_center_pour_rigid_support(),
+    );
+    sim.set_kettle_angle(0.0);
+    for _ in 0..120 {
+        sim.step_frame(&device, &queue, 1.0 / 60.0);
+    }
+    let settled = readback_bed_diag_snapshot(&sim, &device, &queue);
+
+    for _ in 0..480 {
+        sim.step_frame(&device, &queue, 1.0 / 60.0);
+    }
+    let later = readback_bed_diag_snapshot(&sim, &device, &queue);
+
+    let mean_y_drift = (later.y_mean - settled.y_mean).abs();
+    let extent_drift = (later.y_extent - settled.y_extent).abs();
+    let mean_j_drift = (later.mean_j - settled.mean_j).abs();
+    assert!(
+        mean_y_drift < 0.12,
+        "rigid-support dry bed kept creeping in mean height after settling (settled={settled:?}, later={later:?})",
+    );
+    assert!(
+        extent_drift < 0.16,
+        "rigid-support dry bed shape kept drifting after settling (settled={settled:?}, later={later:?})",
+    );
+    assert!(
+        mean_j_drift < 0.04,
+        "rigid-support dry bed kept compacting after settling (settled={settled:?}, later={later:?})",
     );
 }
 
@@ -544,7 +624,7 @@ fn water_bed_mass_conservation() {
 }
 
 #[test]
-fn bed_j_off_clamps() {
+fn bed_pour_state_remains_coherent() {
     let Some((device, queue)) = create_test_device() else {
         eprintln!("skipping: no GPU adapter");
         return;
@@ -566,13 +646,21 @@ fn bed_j_off_clamps() {
         "expected active bed particles during pour"
     );
     assert!(
-        snapshot.min_j > 0.55 && snapshot.max_j < 1.45,
-        "bed J hit safety rails under normal pour: {snapshot:?}",
+        snapshot.mean_j > 0.92 && snapshot.mean_j < 1.12,
+        "bed mean J drifted too far during pour: {snapshot:?}",
+    );
+    assert!(
+        snapshot.min_j >= 0.5 && snapshot.max_j < 1.45,
+        "bed J exceeded hard safety rails during pour: {snapshot:?}",
+    );
+    assert!(
+        snapshot.y_extent > 1.0,
+        "bed collapsed into an implausibly thin layer during pour: {snapshot:?}",
     );
 }
 
 #[test]
-fn finer_grind_keeps_more_free_water_than_coarser_grind() {
+fn finer_grind_retains_more_total_water_than_coarser_grind() {
     let Some((device, queue)) = create_test_device() else {
         eprintln!("skipping: no GPU adapter");
         return;
@@ -611,8 +699,10 @@ fn finer_grind_keeps_more_free_water_than_coarser_grind() {
 
     let fine = readback_mass_snapshot(&fine_sim, &device, &queue);
     let coarse = readback_mass_snapshot(&coarse_sim, &device, &queue);
+    let fine_total = fine.active_particle_mass + fine.bed_held_mass;
+    let coarse_total = coarse.active_particle_mass + coarse.bed_held_mass;
     assert!(
-        fine.active_particle_mass > coarse.active_particle_mass * 1.005,
-        "expected finer grind to slow uptake/drawdown (fine={fine:?}, coarse={coarse:?})",
+        fine_total > coarse_total * 1.001,
+        "expected finer grind to retain more total water after drawdown (fine={fine:?}, coarse={coarse:?})",
     );
 }

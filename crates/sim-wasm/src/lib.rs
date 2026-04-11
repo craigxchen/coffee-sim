@@ -63,6 +63,11 @@ impl WasmSim3D {
         self.rebuild_with_settings(MpmSettings::benchmark_center_pour());
     }
 
+    #[wasm_bindgen(js_name = loadBenchmarkCenterPourRigidSupport)]
+    pub fn load_benchmark_center_pour_rigid_support(&mut self) {
+        self.rebuild_with_settings(MpmSettings::benchmark_center_pour_rigid_support());
+    }
+
     #[wasm_bindgen(js_name = stepFrame)]
     pub fn step_frame(&mut self, frame_time: f32) {
         self.sim
