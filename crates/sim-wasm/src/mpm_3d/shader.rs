@@ -100,6 +100,7 @@ fn extraction_rate() -> f32 { return u.extraction_params.x; }
 fn K_bed() -> f32 { return u.extraction_params.y; }
 fn mu_fluid() -> f32 { return u.extraction_params.z; }
 fn uniform_permeability() -> f32 { return u.extraction_params.w; }
+fn bed_storage_redistribution_rate() -> f32 { return 0.18; }
 fn inactive_mass_threshold() -> f32 { return nominal_mass() * 0.10; }
 fn div_clamp_limit() -> f32 { return u.clamp_params.x; }
 fn pressure_clamp_limit() -> f32 { return u.clamp_params.y; }
@@ -1341,6 +1342,93 @@ fn bed_coupling(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 
 // ── extraction_advect ──
+
+@compute @workgroup_size(64)
+fn bed_redistribute(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let bid = gid.x;
+    if bid >= num_bed() { return; }
+
+    let self_pos = particles[bid].pos.xyz;
+    let self_pore = bed_extract[bid].bed.x;
+    if self_pore <= 1e-6 { return; }
+
+    let cell = world_to_cell(self_pos);
+    if cell.x < 0 || cell.y < 0 || cell.z < 0 { return; }
+    if u32(cell.x) >= gx() || u32(cell.y) >= gy() || u32(cell.z) >= gz() { return; }
+
+    var seen_ids: array<i32, 27>;
+    for (var i = 0u; i < 27u; i++) {
+        seen_ids[i] = -1;
+    }
+
+    var seen_count = 0u;
+    var best_neighbor = -1;
+    var best_neighbor_pore = 0.0;
+    var best_neighbor_capacity = 0.0;
+    var best_score = 0.0;
+
+    for (var di = -1; di <= 1; di++) {
+        for (var dj = -1; dj <= 1; dj++) {
+            for (var dk = -1; dk <= 1; dk++) {
+                let c = cell + vec3<i32>(di, dj, dk);
+                if c.x < 0 || c.y < 0 || c.z < 0 { continue; }
+                if u32(c.x) >= gx() || u32(c.y) >= gy() || u32(c.z) >= gz() { continue; }
+
+                let ci = cell_index(u32(c.x), u32(c.y), u32(c.z));
+                let neighbor_id = bed_lookup_load(ci);
+                if neighbor_id < 0 || u32(neighbor_id) >= num_bed() || neighbor_id == i32(bid) {
+                    continue;
+                }
+
+                var duplicate = false;
+                for (var s = 0u; s < seen_count; s++) {
+                    if seen_ids[s] == neighbor_id {
+                        duplicate = true;
+                        break;
+                    }
+                }
+                if duplicate || seen_count >= 27u {
+                    continue;
+                }
+                seen_ids[seen_count] = neighbor_id;
+                seen_count += 1u;
+
+                let nid = u32(neighbor_id);
+                let neighbor_pos = particles[nid].pos.xyz;
+                let neighbor_pore = bed_extract[nid].bed.x;
+                let neighbor_capacity = max(max_saturation() - neighbor_pore, 0.0);
+                if neighbor_capacity <= 1e-6 { continue; }
+
+                let pore_gradient = self_pore - neighbor_pore;
+                if pore_gradient <= 1e-4 { continue; }
+
+                let downward_bias = max(self_pos.y - neighbor_pos.y, 0.0);
+                let score = pore_gradient + downward_bias * 0.15;
+                if score > best_score {
+                    best_score = score;
+                    best_neighbor = neighbor_id;
+                    best_neighbor_pore = neighbor_pore;
+                    best_neighbor_capacity = neighbor_capacity;
+                }
+            }
+        }
+    }
+
+    if best_neighbor < 0 { return; }
+
+    let pore_gradient = max(self_pore - best_neighbor_pore, 0.0);
+    let transfer = min(
+        min(self_pore * bed_storage_redistribution_rate() * dt(), best_neighbor_capacity * 0.2),
+        pore_gradient * 0.25,
+    );
+    if transfer <= 1e-6 { return; }
+
+    let delta_fp = i32(transfer * fp_scale());
+    if delta_fp <= 0 { return; }
+
+    atomicAdd(&bed_delta[bid], -delta_fp);
+    atomicAdd(&bed_delta[u32(best_neighbor)], delta_fp);
+}
 
 @compute @workgroup_size(64)
 fn extraction_advect(@builtin(global_invocation_id) gid: vec3<u32>) {
