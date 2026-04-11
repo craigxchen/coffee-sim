@@ -11,6 +11,7 @@ pub(crate) struct BedConfig {
     pub bot_y: f32,
     pub top_radius: f32,
     pub bot_radius: f32,
+    pub support_filter: Option<FilterConfig>,
     pub num_particles: u32,
     pub initial_porosity: f32,
     pub initial_permeability: f32,
@@ -28,6 +29,7 @@ impl Default for BedConfig {
             bot_y: -2.25,
             top_radius: 2.65,
             bot_radius: 0.95,
+            support_filter: None,
             num_particles: 12_000,
             initial_porosity: 0.4,
             initial_permeability: 1.0,
@@ -54,8 +56,8 @@ impl BedConfig {
         let (top_min, top_max) = order_bounds(filter_bot_abs + 0.6, filter_top_abs - 0.35);
         let top_abs = (bed.center.y + bed.top_y).clamp(top_min, top_max);
 
-        let (bot_min, bot_max) = order_bounds(filter_bot_abs + 0.4, top_abs - 1.4);
-        let bot_abs = (bed.center.y + bed.bot_y).clamp(bot_min, bot_max);
+        let (bot_min, bot_max) = order_bounds(filter_bot_abs + 0.08, top_abs - 1.4);
+        let bot_abs = (filter_bot_abs + 0.08).clamp(bot_min, bot_max);
 
         bed.top_y = top_abs - bed.center.y;
         bed.bot_y = bot_abs - bed.center.y;
@@ -73,8 +75,9 @@ impl BedConfig {
         bed.top_radius = (filter.inner_radius_at_y(top_local) - 0.18).clamp(top_r_min, top_r_max);
 
         let (bot_r_min, bot_r_max) =
-            order_bounds(filter.opening_radius() + 0.32, bed.top_radius - 0.25);
-        bed.bot_radius = (filter.inner_radius_at_y(bot_local) - 0.12).clamp(bot_r_min, bot_r_max);
+            order_bounds(filter.opening_radius() + 0.08, bed.top_radius - 0.25);
+        bed.bot_radius = (filter.inner_radius_at_y(bot_local) - 0.06).clamp(bot_r_min, bot_r_max);
+        bed.support_filter = Some(filter.clone());
 
         bed
     }
@@ -87,6 +90,18 @@ fn order_bounds(min: f32, max: f32) -> (f32, f32) {
         let mid = (min + max) * 0.5;
         (mid, mid)
     }
+}
+
+fn support_surface_y_at_radius(config: &BedConfig, radius: f32) -> f32 {
+    let Some(filter) = &config.support_filter else {
+        return config.center.y + config.bot_y;
+    };
+
+    let bot_radius = filter.inner_radius_at_y(filter.bot_y);
+    let top_radius = filter.inner_radius_at_y(filter.top_y);
+    let radius_span = (top_radius - bot_radius).max(1e-6);
+    let t = ((radius - bot_radius) / radius_span).clamp(0.0, 1.0);
+    filter.center.y + filter.bot_y + (filter.top_y - filter.bot_y) * t
 }
 
 pub(crate) struct BedInit {
@@ -148,6 +163,10 @@ pub(crate) fn init_bed_particles(
                 let dz = z - config.center.z;
                 let r = (dx * dx + dz * dz).sqrt();
                 if r > max_r {
+                    continue;
+                }
+                let support_y = support_surface_y_at_radius(config, r) + spacing * 0.2;
+                if y < support_y {
                     continue;
                 }
 
@@ -269,7 +288,11 @@ fn build_cell_lookup(
                 let max_r = config.bot_radius + (config.top_radius - config.bot_radius) * t;
                 let dxr = pos.x - config.center.x;
                 let dzr = pos.z - config.center.z;
-                if (dxr * dxr + dzr * dzr).sqrt() > max_r {
+                let radius = (dxr * dxr + dzr * dzr).sqrt();
+                if radius > max_r {
+                    continue;
+                }
+                if pos.y < support_surface_y_at_radius(config, radius) + dx * 0.5 {
                     continue;
                 }
 
@@ -443,6 +466,24 @@ mod tests {
     }
 
     #[test]
+    fn seated_bed_particles_reach_near_filter_apex() {
+        let filter = FilterConfig::default();
+        let bed = BedConfig::seated_in_filter(&filter);
+        let init = init_bed_particles(&bed, [80, 115, 80], Vec3::new(14.0, 20.0, 14.0));
+
+        let min_y = init
+            .particles
+            .iter()
+            .map(|p| p[1])
+            .fold(f32::INFINITY, f32::min);
+        let filter_bot_abs = filter.center.y + filter.bot_y;
+        assert!(
+            min_y < filter_bot_abs + 0.25,
+            "bed still hovers too far above filter apex: min_y={min_y} filter_bot_abs={filter_bot_abs}"
+        );
+    }
+
+    #[test]
     fn seated_in_filter_does_not_panic_on_narrow_filter() {
         // Pathologically narrow filter that cannot actually host a bed:
         // - vertical range is 0.2 (< 0.95), which previously caused the first
@@ -483,6 +524,6 @@ mod tests {
         let filter_bot_abs = filter.center.y + filter.bot_y;
 
         assert!(bed_top_abs <= filter_top_abs - 0.3);
-        assert!(bed_bot_abs >= filter_bot_abs + 0.3);
+        assert!(bed_bot_abs >= filter_bot_abs + 0.05);
     }
 }

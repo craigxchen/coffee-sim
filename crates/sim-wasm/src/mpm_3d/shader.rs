@@ -121,12 +121,19 @@ fn bed_plastic_alpha(bid: u32) -> f32 {
 fn bed_particle_saturation(bid: u32) -> f32 {
     return clamp(bed_extract[bid].extract.w, 0.0, 1.0);
 }
-fn bed_shear_modulus() -> f32 {
-    let poisson = 0.27;
-    return 3.0 * K_bed() * (1.0 - 2.0 * poisson) / (2.0 * (1.0 + poisson));
+fn bed_wetness(saturation: f32) -> f32 {
+    return smoothstep(0.08, 0.85, saturation);
 }
-fn bed_lambda_from_bulk() -> f32 {
-    return K_bed() - 2.0 * bed_shear_modulus() / 3.0;
+fn bed_shear_modulus(saturation: f32) -> f32 {
+    let poisson = 0.27;
+    let dry_mu = 3.0 * K_bed() * (1.0 - 2.0 * poisson) / (2.0 * (1.0 + poisson));
+    return dry_mu * mix(1.0, 0.52, bed_wetness(saturation));
+}
+fn bed_bulk_modulus(saturation: f32) -> f32 {
+    return K_bed() * mix(1.0, 0.72, bed_wetness(saturation));
+}
+fn bed_lambda_from_bulk(saturation: f32) -> f32 {
+    return bed_bulk_modulus(saturation) - 2.0 * bed_shear_modulus(saturation) / 3.0;
 }
 fn identity3() -> mat3x3<f32> {
     return mat3x3<f32>(
@@ -148,14 +155,14 @@ fn frobenius_norm(m: mat3x3<f32>) -> f32 {
 fn trace3(m: mat3x3<f32>) -> f32 {
     return m[0].x + m[1].y + m[2].z;
 }
-fn dry_bed_friction_angle_rad() -> f32 {
-    return radians(32.0);
+fn bed_friction_angle_rad(saturation: f32) -> f32 {
+    return mix(radians(32.0), radians(17.0), bed_wetness(saturation));
 }
-fn dry_bed_cohesion() -> f32 {
-    return 18.0;
+fn bed_cohesion(saturation: f32) -> f32 {
+    return mix(18.0, 7.0, bed_wetness(saturation));
 }
-fn dry_bed_hardening() -> f32 {
-    return 14.0;
+fn bed_hardening(saturation: f32) -> f32 {
+    return mix(14.0, 5.5, bed_wetness(saturation));
 }
 struct BedPlasticProjection {
     F: mat3x3<f32>,
@@ -166,10 +173,6 @@ fn project_bed_drucker_prager(
     saturation: f32,
     alpha_old: f32,
 ) -> BedPlasticProjection {
-    if saturation > 0.08 {
-        return BedPlasticProjection(F_trial, alpha_old);
-    }
-
     let R = orthonormal_basis_from_F(F_trial[0], F_trial[1]);
     let strain_hat = transpose(R) * F_trial - identity3();
     let mean_strain = trace3(strain_hat) / 3.0;
@@ -179,12 +182,12 @@ fn project_bed_drucker_prager(
         return BedPlasticProjection(F_trial, alpha_old);
     }
 
-    let mu = bed_shear_modulus();
-    let bulk = K_bed();
+    let mu = bed_shear_modulus(saturation);
+    let bulk = bed_bulk_modulus(saturation);
     let q = 2.0 * mu * dev_norm;
     let p = max(-bulk * 3.0 * mean_strain, 0.0);
-    let sin_phi = sin(dry_bed_friction_angle_rad());
-    let yield_strength = dry_bed_cohesion() + dry_bed_hardening() * alpha_old
+    let sin_phi = sin(bed_friction_angle_rad(saturation));
+    let yield_strength = bed_cohesion(saturation) + bed_hardening(saturation) * alpha_old
         + p * (0.55 * sin_phi / max(1.0 - sin_phi, 0.2));
     if q <= yield_strength {
         return BedPlasticProjection(F_trial, alpha_old);
@@ -202,8 +205,9 @@ fn bed_fixed_corotated_stress(bid: u32, J: f32) -> mat3x3<f32> {
     let F2 = bed_F_col2(bid);
     let F = mat3x3<f32>(F0, F1, F2);
     let R = orthonormal_basis_from_F(F0, F1);
-    let mu = bed_shear_modulus();
-    let lambda = bed_lambda_from_bulk();
+    let saturation = bed_particle_saturation(bid);
+    let mu = bed_shear_modulus(saturation);
+    let lambda = bed_lambda_from_bulk(saturation);
     return (2.0 * mu) * (F - R) * transpose(F) + lambda * (J - 1.0) * J * identity3();
 }
 fn determinant_from_cols(c0: vec3<f32>, c1: vec3<f32>, c2: vec3<f32>) -> f32 {
