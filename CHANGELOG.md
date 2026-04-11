@@ -19,6 +19,7 @@ What changed:
 - added a first-water-impact regression so early pour loading cannot silently reintroduce immediate collapse
 - kept granular plasticity active under saturation with reduced strength instead of switching wet particles to elastic-only behavior
 - added a short-pour shape-retention regression to catch wet bed folding / rapid collapse during early loading
+- added a settled free-water pool regression so long-run shape checks compare the resting pool against itself rather than against the pre-settle airborne stream
 
 Known issues still open:
 - free water jet can still fragment unrealistically in mid-air
