@@ -152,8 +152,8 @@ impl FilterMesh {
 
             let load_force = (target - *pos) * REST_STIFFNESS;
             let gravity = Vec3::new(0.0, GRAVITY * (0.35 + 0.65 * profile), 0.0);
-            self.velocities[i] = (self.velocities[i] + (load_force + gravity) * dt)
-                * (1.0 / (1.0 + DAMPING * dt));
+            self.velocities[i] =
+                (self.velocities[i] + (load_force + gravity) * dt) * (1.0 / (1.0 + DAMPING * dt));
             *pos = *pos + self.velocities[i] * dt;
         }
 
@@ -258,7 +258,6 @@ impl FilterMesh {
                 ]);
             }
         }
-
     }
 }
 

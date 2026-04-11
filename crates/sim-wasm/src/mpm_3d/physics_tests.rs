@@ -46,7 +46,7 @@ fn readback_mass_snapshot(
 ) -> MassSnapshot {
     let particle_count = (sim.num_water + sim.num_bed) as usize;
     let particle_size = (particle_count * 32).max(4) as u64;
-    let bed_size = (sim.num_bed as usize * 32).max(4) as u64;
+    let bed_size = (sim.num_bed as usize * 80).max(4) as u64;
 
     let particle_staging = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("particle mass staging"),
@@ -101,7 +101,7 @@ fn readback_mass_snapshot(
     let bed_f32 = cast_slice::<u8, f32>(&bed_view);
     let mut bed_held_mass = 0.0;
     for i in 0..sim.num_bed as usize {
-        bed_held_mass += bed_f32[i * 8];
+        bed_held_mass += bed_f32[i * 20];
     }
     drop(bed_view);
     bed_staging.unmap();
@@ -537,5 +537,51 @@ fn bed_j_off_clamps() {
     assert!(
         snapshot.min_j > 0.55 && snapshot.max_j < 1.45,
         "bed J hit safety rails under normal pour: {snapshot:?}",
+    );
+}
+
+#[test]
+fn finer_grind_keeps_more_free_water_than_coarser_grind() {
+    let Some((device, queue)) = create_test_device() else {
+        eprintln!("skipping: no GPU adapter");
+        return;
+    };
+
+    let mut fine_settings = MpmSettings::benchmark_center_pour();
+    if let Some(bed) = fine_settings.bed.as_mut() {
+        bed.mean_grind_size = 0.78;
+        bed.grind_size_spread = 0.38;
+        bed.fines_fraction = 0.26;
+        bed.initial_permeability = 0.0015;
+    }
+
+    let mut coarse_settings = MpmSettings::benchmark_center_pour();
+    if let Some(bed) = coarse_settings.bed.as_mut() {
+        bed.mean_grind_size = 1.35;
+        bed.grind_size_spread = 0.22;
+        bed.fines_fraction = 0.06;
+        bed.initial_permeability = 0.0038;
+    }
+
+    let mut fine_sim = MpmSim3D::new(&device, &queue, fine_settings);
+    let mut coarse_sim = MpmSim3D::new(&device, &queue, coarse_settings);
+    fine_sim.set_kettle_angle(36.0);
+    coarse_sim.set_kettle_angle(36.0);
+    for _ in 0..120 {
+        fine_sim.step_frame(&device, &queue, 1.0 / 60.0);
+        coarse_sim.step_frame(&device, &queue, 1.0 / 60.0);
+    }
+    fine_sim.set_kettle_angle(0.0);
+    coarse_sim.set_kettle_angle(0.0);
+    for _ in 0..30 {
+        fine_sim.step_frame(&device, &queue, 1.0 / 60.0);
+        coarse_sim.step_frame(&device, &queue, 1.0 / 60.0);
+    }
+
+    let fine = readback_mass_snapshot(&fine_sim, &device, &queue);
+    let coarse = readback_mass_snapshot(&coarse_sim, &device, &queue);
+    assert!(
+        fine.active_particle_mass > coarse.active_particle_mass * 1.005,
+        "expected finer grind to slow uptake/drawdown (fine={fine:?}, coarse={coarse:?})",
     );
 }

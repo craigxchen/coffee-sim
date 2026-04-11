@@ -140,7 +140,7 @@ impl MpmBuffers {
 
         let render_data = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("mpm render data"),
-            size: (max_p * 16) as u64, // vec4<f32>
+            size: (max_p * 32) as u64, // 2 x vec4<f32>
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::VERTEX
                 | wgpu::BufferUsages::COPY_SRC
@@ -150,7 +150,7 @@ impl MpmBuffers {
 
         let bed_extract = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("mpm bed_extract"),
-            size: (max_p * 32) as u64, // 2 x vec4
+            size: (max_p * 80) as u64, // 5 x vec4
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_DST
                 | wgpu::BufferUsages::COPY_SRC,
@@ -307,7 +307,11 @@ fn sample_sdf_from_data(settings: &MpmSettings, data: &[f32], position: Vec3) ->
         (position.y + bounds_size.y * 0.5) / bounds_size.y * res - 0.5,
         (position.z + bounds_size.z * 0.5) / bounds_size.z * res - 0.5,
     );
-    let base = [uv.x.floor() as i32, uv.y.floor() as i32, uv.z.floor() as i32];
+    let base = [
+        uv.x.floor() as i32,
+        uv.y.floor() as i32,
+        uv.z.floor() as i32,
+    ];
     let fx = uv.x.fract();
     let fy = uv.y.fract();
     let fz = uv.z.fract();
