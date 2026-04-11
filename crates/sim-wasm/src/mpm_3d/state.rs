@@ -149,7 +149,7 @@ impl MpmBuffers {
 
         let bed_extract = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("mpm bed_extract"),
-            size: (max_p * 32) as u64, // 2 x vec4
+            size: (max_p * 80) as u64, // 5 x vec4
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_DST
                 | wgpu::BufferUsages::COPY_SRC,

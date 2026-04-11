@@ -70,13 +70,11 @@ impl BedConfig {
             filter.opening_radius() + 0.8,
             filter.top_radius - filter.thickness - 0.1,
         );
-        bed.top_radius =
-            (filter.inner_radius_at_y(top_local) - 0.18).clamp(top_r_min, top_r_max);
+        bed.top_radius = (filter.inner_radius_at_y(top_local) - 0.18).clamp(top_r_min, top_r_max);
 
         let (bot_r_min, bot_r_max) =
             order_bounds(filter.opening_radius() + 0.32, bed.top_radius - 0.25);
-        bed.bot_radius =
-            (filter.inner_radius_at_y(bot_local) - 0.12).clamp(bot_r_min, bot_r_max);
+        bed.bot_radius = (filter.inner_radius_at_y(bot_local) - 0.12).clamp(bot_r_min, bot_r_max);
 
         bed
     }
@@ -94,7 +92,7 @@ fn order_bounds(min: f32, max: f32) -> (f32, f32) {
 pub(crate) struct BedInit {
     pub particles: Vec<[f32; 8]>,
     pub affines: Vec<[f32; 12]>,
-    pub bed_extracts: Vec<[f32; 8]>,
+    pub bed_extracts: Vec<[f32; 20]>,
     pub cell_lookup: Vec<i32>,
     pub bed_support_count: Vec<u32>,
 }
@@ -124,9 +122,7 @@ pub(crate) fn init_bed_particles(
 
     let avg_radius = (config.top_radius + config.bot_radius) * 0.5;
     let volume = std::f32::consts::PI * avg_radius * avg_radius * height / 3.0
-        * (1.0
-            + config.bot_radius / avg_radius
-            + (config.bot_radius / avg_radius).powi(2));
+        * (1.0 + config.bot_radius / avg_radius + (config.bot_radius / avg_radius).powi(2));
     let spacing = (volume / config.num_particles.max(1) as f32).cbrt();
 
     let nx = ((config.top_radius * 2.0) / spacing).ceil() as i32;
@@ -160,10 +156,13 @@ pub(crate) fn init_bed_particles(
 
                 // Particle: pos(x,y,z,J=1), vel(0,0,0,mass=1)
                 particles.push([x, y, z, 1.0, 0.0, 0.0, 0.0, 1.0]);
-                // Phase=1.0 means bed particle.
-                affines.push([0.0, 0.0, 0.0, 1.0, x, y, z, 0.0, y, 0.0, 0.0, 0.0]);
-                // BedExtract: bed(pore_water, porosity, permeability, compaction),
-                //             extract(extractable, dissolved, temp, saturation)
+                // Phase=1.0 means bed particle. The APIC affine matrix starts at 0.
+                affines.push([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+                // BedExtract:
+                //   bed(pore_water, porosity, permeability, reserved)
+                //   extract(extractable, dissolved, temp, saturation)
+                //   mech0/1/2 = deformation gradient columns. mech0.w stores
+                //   accumulated dry plastic strain.
                 bed_extracts.push([
                     0.0,
                     config.initial_porosity,
@@ -172,6 +171,18 @@ pub(crate) fn init_bed_particles(
                     config.extractable_mass,
                     0.0,
                     93.0,
+                    0.0,
+                    1.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    1.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    1.0,
                     0.0,
                 ]);
             }
@@ -232,7 +243,11 @@ fn build_cell_lookup(
 ) -> Vec<i32> {
     let [gx, gy, gz] = grid_dims;
     let mut lookup = vec![-1; (gx * gy * gz) as usize];
-    let grid_origin = Vec3::new(-bounds_size.x * 0.5, -bounds_size.y * 0.5, -bounds_size.z * 0.5);
+    let grid_origin = Vec3::new(
+        -bounds_size.x * 0.5,
+        -bounds_size.y * 0.5,
+        -bounds_size.z * 0.5,
+    );
     let dx = bounds_size.x / gx as f32;
     let height = config.top_y - config.bot_y;
     let bed_bottom = config.center.y + config.bot_y;
@@ -259,8 +274,10 @@ fn build_cell_lookup(
                 }
 
                 let iy_guess = (((pos.y - bed_bottom) / spacing) - 0.5).round() as i32;
-                let ix_guess = (((pos.x - (config.center.x - max_r)) / spacing) - 0.5).round() as i32;
-                let iz_guess = (((pos.z - (config.center.z - max_r)) / spacing) - 0.5).round() as i32;
+                let ix_guess =
+                    (((pos.x - (config.center.x - max_r)) / spacing) - 0.5).round() as i32;
+                let iz_guess =
+                    (((pos.z - (config.center.z - max_r)) / spacing) - 0.5).round() as i32;
 
                 let mut best = -1;
                 let mut best_dist2 = f32::INFINITY;
@@ -277,7 +294,8 @@ fn build_cell_lookup(
                             };
                             let py = bed_bottom + (key.iy as f32 + 0.5) * spacing;
                             let py_t = ((py - bed_bottom) / height).clamp(0.0, 1.0);
-                            let py_r = config.bot_radius + (config.top_radius - config.bot_radius) * py_t;
+                            let py_r =
+                                config.bot_radius + (config.top_radius - config.bot_radius) * py_t;
                             let px = config.center.x - py_r + (key.ix as f32 + 0.5) * spacing;
                             let pz = config.center.z - py_r + (key.iz as f32 + 0.5) * spacing;
                             let ddx = pos.x - px;
@@ -351,7 +369,7 @@ mod tests {
         let cfg = small_config();
         let init = init_bed_particles(&cfg, [32, 32, 32], Vec3::new(14.0, 20.0, 14.0));
         for extract in &init.bed_extracts {
-            // bed: pore_water, porosity, permeability, compaction
+            // bed: pore_water, porosity, permeability, reserved
             assert_eq!(extract[0], 0.0);
             assert!((extract[1] - cfg.initial_porosity).abs() < 1e-6);
             assert!((extract[2] - cfg.initial_permeability).abs() < 1e-6);
@@ -360,6 +378,19 @@ mod tests {
             assert!((extract[4] - cfg.extractable_mass).abs() < 1e-6);
             assert_eq!(extract[5], 0.0);
             assert_eq!(extract[7], 0.0);
+            // mech0/1/2 = identity F, zero plastic strain
+            assert_eq!(extract[8], 1.0);
+            assert_eq!(extract[9], 0.0);
+            assert_eq!(extract[10], 0.0);
+            assert_eq!(extract[11], 0.0);
+            assert_eq!(extract[12], 0.0);
+            assert_eq!(extract[13], 1.0);
+            assert_eq!(extract[14], 0.0);
+            assert_eq!(extract[15], 0.0);
+            assert_eq!(extract[16], 0.0);
+            assert_eq!(extract[17], 0.0);
+            assert_eq!(extract[18], 1.0);
+            assert_eq!(extract[19], 0.0);
         }
     }
 

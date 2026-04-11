@@ -558,6 +558,37 @@ impl MpmSim3D {
         } else {
             0.7
         };
+        let filter_center = self
+            .settings
+            .filter
+            .as_ref()
+            .map(|filter| filter.center)
+            .unwrap_or(Vec3::ZERO);
+        let filter_top_y = self
+            .settings
+            .filter
+            .as_ref()
+            .map(|filter| filter.top_y)
+            .unwrap_or(0.0);
+        let filter_bot_y = self
+            .settings
+            .filter
+            .as_ref()
+            .map(|filter| filter.bot_y)
+            .unwrap_or(0.0);
+        let filter_top_inner_radius = self
+            .settings
+            .filter
+            .as_ref()
+            .map(|filter| filter.inner_radius_at_y(filter.top_y))
+            .unwrap_or(0.0);
+        let filter_bot_inner_radius = self
+            .settings
+            .filter
+            .as_ref()
+            .map(|filter| filter.inner_radius_at_y(filter.bot_y))
+            .unwrap_or(0.0);
+
         // Divergence clamp: a fluid cell's divergence is bounded by
         // `2 * MAX_VELOCITY * inv_dx` when both faces move at the velocity
         // cap in opposite directions. Multiply by a safety margin of 2 so
@@ -600,13 +631,16 @@ impl MpmSim3D {
                 self.settings.spout.direction.z,
                 self.inflow.exit_speed(),
             ],
-            inflow_params: [self.settings.spout.nozzle_radius, 0.0, 0.0, 0.0],
+            inflow_params: [
+                self.settings.spout.nozzle_radius,
+                filter_center.x,
+                filter_center.y,
+                filter_center.z,
+            ],
             sdf_params: [SDF_RES as f32, 0.3, 0.0, 0.05],
-            // Tie bed retention to an overall retained-water target so the bed
-            // wets realistically without swallowing most of the brew.
-            bed_params: [34.0, 8.0, bed_capacity_per_particle, 1.0],
-            extraction_params: [0.01, 11.0, 8.5, 15.0],
-            time_params: [self.total_time, dt, 1.0, 0.0],
+            bed_params: [34.0, 8.0, bed_capacity_per_particle, filter_top_y],
+            extraction_params: [0.01, 80_000.0, filter_bot_y, filter_top_inner_radius],
+            time_params: [self.total_time, dt, filter_bot_inner_radius, 0.0],
             clamp_params: [
                 div_clamp,
                 pressure_clamp,

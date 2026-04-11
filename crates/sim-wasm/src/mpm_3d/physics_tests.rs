@@ -46,7 +46,7 @@ fn readback_mass_snapshot(
 ) -> MassSnapshot {
     let particle_count = (sim.num_water + sim.num_bed) as usize;
     let particle_size = (particle_count * 32).max(4) as u64;
-    let bed_size = (sim.num_bed as usize * 32).max(4) as u64;
+    let bed_size = (sim.num_bed as usize * 80).max(4) as u64;
 
     let particle_staging = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("particle mass staging"),
@@ -64,7 +64,13 @@ fn readback_mass_snapshot(
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("mass readback"),
     });
-    encoder.copy_buffer_to_buffer(&sim.buffers.particles, 0, &particle_staging, 0, particle_size);
+    encoder.copy_buffer_to_buffer(
+        &sim.buffers.particles,
+        0,
+        &particle_staging,
+        0,
+        particle_size,
+    );
     encoder.copy_buffer_to_buffer(&sim.buffers.bed_extract, 0, &bed_staging, 0, bed_size);
     queue.submit(Some(encoder.finish()));
 
@@ -95,7 +101,7 @@ fn readback_mass_snapshot(
     let bed_f32 = cast_slice::<u8, f32>(&bed_view);
     let mut bed_held_mass = 0.0;
     for i in 0..sim.num_bed as usize {
-        bed_held_mass += bed_f32[i * 8];
+        bed_held_mass += bed_f32[i * 20];
     }
     drop(bed_view);
     bed_staging.unmap();
@@ -108,6 +114,7 @@ fn readback_mass_snapshot(
 
 #[derive(Debug)]
 struct DiagSnapshot {
+    all_finite: bool,
     total_mass: f32,
     active_count: u32,
     min_mass: f32,
@@ -164,31 +171,48 @@ fn readback_diag_snapshot(
     let mut j_sum = 0.0_f32;
     let mut j_min = f32::MAX;
     let mut j_max = f32::MIN;
+    let mut all_finite = true;
 
     for i in 0..particle_count {
+        let x = data[i * 8];
         let mass = data[i * 8 + 7];
         let j = data[i * 8 + 3];
         let y = data[i * 8 + 1];
+
+        all_finite &= x.is_finite() && y.is_finite() && j.is_finite() && mass.is_finite();
 
         if mass <= inactive_thresh {
             continue;
         }
         active_count += 1;
         total_mass += mass;
-        if mass < min_mass { min_mass = mass; }
-        if mass > max_mass { max_mass = mass; }
-        if y < y_min { y_min = y; }
-        if y > y_max { y_max = y; }
+        if mass < min_mass {
+            min_mass = mass;
+        }
+        if mass > max_mass {
+            max_mass = mass;
+        }
+        if y < y_min {
+            y_min = y;
+        }
+        if y > y_max {
+            y_max = y;
+        }
         y_sum += y;
         j_sum += j;
-        if j < j_min { j_min = j; }
-        if j > j_max { j_max = j; }
+        if j < j_min {
+            j_min = j;
+        }
+        if j > j_max {
+            j_max = j;
+        }
     }
     drop(view);
     staging.unmap();
 
     let n = active_count.max(1) as f32;
     DiagSnapshot {
+        all_finite,
         total_mass,
         active_count,
         min_mass: if active_count > 0 { min_mass } else { 0.0 },
@@ -270,6 +294,79 @@ fn mass_readback_harness() {
     assert!(snapshot.bed_held_mass.is_finite());
     assert!(snapshot.active_particle_mass >= 0.0);
     assert!(snapshot.bed_held_mass >= 0.0);
+}
+
+#[test]
+fn bed_settling_stability() {
+    let Some((device, queue)) = create_test_device() else {
+        eprintln!("skipping: no GPU adapter");
+        return;
+    };
+
+    let mut sim = MpmSim3D::new(&device, &queue, MpmSettings::benchmark_center_pour());
+    sim.set_kettle_angle(0.0);
+    for _ in 0..60 {
+        sim.step_frame(&device, &queue, 1.0 / 60.0);
+    }
+
+    let snapshot = readback_diag_snapshot(&sim, &device, &queue);
+    assert!(snapshot.all_finite, "dry bed produced non-finite state");
+    assert!(
+        snapshot.active_count > 0,
+        "dry bed lost all active particles"
+    );
+    assert!(
+        snapshot.y_extent > 0.8,
+        "dry bed collapsed to a near-point: {:?}",
+        snapshot
+    );
+    assert!(
+        snapshot.min_j > 0.55,
+        "dry bed over-compressed during settle: {:?}",
+        snapshot
+    );
+    assert!(
+        snapshot.max_j < 1.25,
+        "dry bed over-expanded during settle: {:?}",
+        snapshot
+    );
+}
+
+#[test]
+fn bed_long_run_creep_is_bounded_without_water() {
+    let Some((device, queue)) = create_test_device() else {
+        eprintln!("skipping: no GPU adapter");
+        return;
+    };
+
+    let mut sim = MpmSim3D::new(&device, &queue, MpmSettings::benchmark_center_pour());
+    sim.set_kettle_angle(0.0);
+    for _ in 0..60 {
+        sim.step_frame(&device, &queue, 1.0 / 60.0);
+    }
+    let settled = readback_diag_snapshot(&sim, &device, &queue);
+
+    for _ in 0..240 {
+        sim.step_frame(&device, &queue, 1.0 / 60.0);
+    }
+    let late = readback_diag_snapshot(&sim, &device, &queue);
+
+    assert!(
+        late.all_finite,
+        "long-run dry bed produced non-finite state"
+    );
+    let mean_drop = (settled.y_mean - late.y_mean).abs();
+    assert!(
+        mean_drop < 0.35,
+        "dry bed continued creeping after settle: settled={:?} late={:?}",
+        settled,
+        late
+    );
+    assert!(
+        late.min_j > 0.5,
+        "dry bed hit the compaction clamp during long-run settle: {:?}",
+        late
+    );
 }
 
 #[test]

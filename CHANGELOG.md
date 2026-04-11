@@ -10,10 +10,15 @@ What changed:
 - added `docs/BRANCH_AUDIT.md` to record keep/defer/superseded decisions across branches
 - committed the current long-term, performance, and validation planning docs
 - clarified that `origin/main` is the integration baseline rather than the stale local `main`
+- rewrote dry bed mechanics around bed particles that deposit to and gather from a separate solid grid velocity field
+- expanded `bed_extract` to carry deformation-gradient and dry plastic state directly instead of relying on spring/rest-position dynamics
+- kept the water pressure solve on the water field only, with `CELL_BED_COUPLED` excluded from projection
+- restored analytical filter support contact for bed particles so dry-bed validation does not depend on the spring overlay
+- added dry-bed regression coverage for settle stability and long-run creep without water
 
 Known issues still open:
 - free water jet can still fragment unrealistically in mid-air
-- bed deformation, compaction, and drawdown realism remain under active iteration
+- wet bed deformation and drawdown realism remain under active iteration
 - filter contact is still an approximation rather than a full contact solve
 
 ## Demo v0 — Baseline MPM Pour-Over Prototype
