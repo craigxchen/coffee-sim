@@ -370,6 +370,79 @@ fn bed_long_run_creep_is_bounded_without_water() {
 }
 
 #[test]
+fn bed_first_water_impact_is_bounded() {
+    let Some((device, queue)) = create_test_device() else {
+        eprintln!("skipping: no GPU adapter");
+        return;
+    };
+
+    let mut sim = MpmSim3D::new(&device, &queue, MpmSettings::benchmark_center_pour());
+    sim.set_kettle_angle(0.0);
+    for _ in 0..60 {
+        sim.step_frame(&device, &queue, 1.0 / 60.0);
+    }
+    let settled = readback_diag_snapshot(&sim, &device, &queue);
+
+    sim.set_kettle_angle(36.0);
+    for _ in 0..45 {
+        sim.step_frame(&device, &queue, 1.0 / 60.0);
+    }
+    let impacted = readback_diag_snapshot(&sim, &device, &queue);
+
+    assert!(
+        impacted.all_finite,
+        "bed produced non-finite state under first water impact"
+    );
+    assert!(
+        impacted.y_extent > settled.y_extent * 0.65,
+        "first water impact collapsed bed shape too quickly: settled={settled:?} impacted={impacted:?}",
+    );
+    assert!(
+        impacted.min_j > 0.45,
+        "first water impact over-compressed bed: settled={settled:?} impacted={impacted:?}",
+    );
+    assert!(
+        (impacted.y_mean - settled.y_mean).abs() < 0.55,
+        "first water impact displaced bed centroid too abruptly: settled={settled:?} impacted={impacted:?}",
+    );
+}
+
+#[test]
+fn bed_short_pour_retains_shape() {
+    let Some((device, queue)) = create_test_device() else {
+        eprintln!("skipping: no GPU adapter");
+        return;
+    };
+
+    let mut sim = MpmSim3D::new(&device, &queue, MpmSettings::benchmark_center_pour());
+    sim.set_kettle_angle(0.0);
+    for _ in 0..60 {
+        sim.step_frame(&device, &queue, 1.0 / 60.0);
+    }
+    let settled = readback_diag_snapshot(&sim, &device, &queue);
+
+    sim.set_kettle_angle(36.0);
+    for _ in 0..120 {
+        sim.step_frame(&device, &queue, 1.0 / 60.0);
+    }
+    let wet = readback_diag_snapshot(&sim, &device, &queue);
+
+    assert!(wet.all_finite, "short pour produced non-finite bed state");
+    assert!(
+        wet.y_extent > settled.y_extent * 0.5,
+        "short pour collapsed bed shape too aggressively: settled={settled:?} wet={wet:?}",
+    );
+    assert!(
+        wet.min_j > 0.4,
+        "short pour over-compressed bed: settled={settled:?} wet={wet:?}",
+    );
+    assert!(
+        wet.max_j < 1.4,
+        "short pour over-expanded bed: settled={settled:?} wet={wet:?}",
+    );
+}
+
+#[test]
 fn water_mass_stable_after_pour_off() {
     let Some((device, queue)) = create_test_device() else {
         eprintln!("skipping: no GPU adapter");

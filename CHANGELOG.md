@@ -15,6 +15,10 @@ What changed:
 - kept the water pressure solve on the water field only, with `CELL_BED_COUPLED` excluded from projection
 - restored analytical filter support contact for bed particles so dry-bed validation does not depend on the spring overlay
 - added dry-bed regression coverage for settle stability and long-run creep without water
+- changed the seated bed initializer to conform its lower boundary to the filter support surface instead of a flat frustum cutoff
+- added a first-water-impact regression so early pour loading cannot silently reintroduce immediate collapse
+- kept granular plasticity active under saturation with reduced strength instead of switching wet particles to elastic-only behavior
+- added a short-pour shape-retention regression to catch wet bed folding / rapid collapse during early loading
 
 Known issues still open:
 - free water jet can still fragment unrealistically in mid-air
