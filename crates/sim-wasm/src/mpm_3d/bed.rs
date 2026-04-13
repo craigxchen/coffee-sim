@@ -139,6 +139,8 @@ pub(crate) fn init_bed_particles(
     let volume = std::f32::consts::PI * avg_radius * avg_radius * height / 3.0
         * (1.0 + config.bot_radius / avg_radius + (config.bot_radius / avg_radius).powi(2));
     let spacing = (volume / config.num_particles.max(1) as f32).cbrt();
+    let cell_dx = bounds_size.x / grid_dims[0].max(1) as f32;
+    let ground_radius = (spacing * 0.46).max(cell_dx * 0.32);
 
     let nx = ((config.top_radius * 2.0) / spacing).ceil() as i32;
     let ny = (height / spacing).ceil() as i32;
@@ -178,18 +180,18 @@ pub(crate) fn init_bed_particles(
                 // Phase=1.0 means bed particle. The APIC affine matrix starts at 0.
                 affines.push([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
                 // BedExtract:
-                //   bed(pore_water, porosity, permeability, reserved)
-                //   extract(extractable, dissolved, temp, saturation)
+                //   bed(pore_water, porosity, permeability, particle_radius)
+                //   extract(extractable, dissolved, pore_pressure_proxy, saturation)
                 //   mech0/1/2 = deformation gradient columns. mech0.w stores
                 //   accumulated dry plastic strain.
                 bed_extracts.push([
                     0.0,
                     config.initial_porosity,
                     config.initial_permeability,
-                    0.0,
+                    ground_radius,
                     config.extractable_mass,
                     0.0,
-                    93.0,
+                    0.0,
                     0.0,
                     1.0,
                     0.0,
@@ -392,14 +394,15 @@ mod tests {
         let cfg = small_config();
         let init = init_bed_particles(&cfg, [32, 32, 32], Vec3::new(14.0, 20.0, 14.0));
         for extract in &init.bed_extracts {
-            // bed: pore_water, porosity, permeability, reserved
+            // bed: pore_water, porosity, permeability, particle_radius
             assert_eq!(extract[0], 0.0);
             assert!((extract[1] - cfg.initial_porosity).abs() < 1e-6);
             assert!((extract[2] - cfg.initial_permeability).abs() < 1e-6);
-            assert_eq!(extract[3], 0.0);
-            // extract: extractable, dissolved, temp, saturation
+            assert!(extract[3] > 0.0);
+            // extract: extractable, dissolved, pore_pressure_proxy, saturation
             assert!((extract[4] - cfg.extractable_mass).abs() < 1e-6);
             assert_eq!(extract[5], 0.0);
+            assert_eq!(extract[6], 0.0);
             assert_eq!(extract[7], 0.0);
             // mech0/1/2 = identity F, zero plastic strain
             assert_eq!(extract[8], 1.0);
