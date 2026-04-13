@@ -3,7 +3,7 @@ use coffee_sim_core::sph::Vec3;
 use super::state::MpmBuffers;
 
 pub(crate) const MASS_UNITS_PER_ML: f32 = 80.0;
-pub(crate) const PARTICLES_PER_ML: f32 = 160.0;
+pub(crate) const PARTICLES_PER_ML: f32 = 320.0;
 
 #[derive(Clone, Copy)]
 pub(crate) struct SpoutSettings {
@@ -60,6 +60,7 @@ pub(crate) struct InflowState {
     flow_rate: f32,
     exit_speed: f32,
     accumulator: f32,
+    emission_sequence: u32,
 }
 
 pub(crate) struct EmissionResult {
@@ -74,6 +75,7 @@ impl InflowState {
             flow_rate: 0.0,
             exit_speed: 0.0,
             accumulator: 0.0,
+            emission_sequence: 0,
         }
     }
 
@@ -168,21 +170,36 @@ impl InflowState {
             dir.z * emit_speed,
         );
 
-        // Simple disk distribution using golden angle
+        // Emit from a slightly contracted jet core rather than the full nozzle
+        // disk. This approximates the vena-contracta region just below the
+        // lip and avoids an unrealistically flared free stream when we do not
+        // model sub-nozzle cohesion.
+        let emit_origin = Vec3::new(
+            spout.origin.x + dir.x * 0.18,
+            spout.origin.y + dir.y * 0.18,
+            spout.origin.z + dir.z * 0.18,
+        );
+        let jet_radius = spout.nozzle_radius * 0.58;
+
+        // Low-discrepancy disk distribution with a persistent sample sequence
+        // so the nozzle does not replay the same few beams every frame.
         let golden_angle = 2.399_963_f32;
+        let radial_irrational = 0.754_877_7_f32;
         for i in 0..count {
-            let fi = i as f32;
-            let r = spout.nozzle_radius * (fi / count as f32).sqrt();
-            let theta = fi * golden_angle;
+            let sample = self.emission_sequence.wrapping_add(i);
+            let sf = sample as f32;
+            let radial_u = ((sf + 0.5) * radial_irrational).fract();
+            let r = jet_radius * radial_u.sqrt();
+            let theta = sf * golden_angle;
             let offset = Vec3::new(
                 t1.x * r * theta.cos() + t2.x * r * theta.sin(),
                 t1.y * r * theta.cos() + t2.y * r * theta.sin(),
                 t1.z * r * theta.cos() + t2.z * r * theta.sin(),
             );
             let pos = Vec3::new(
-                spout.origin.x + offset.x,
-                spout.origin.y + offset.y,
-                spout.origin.z + offset.z,
+                emit_origin.x + offset.x,
+                emit_origin.y + offset.y,
+                emit_origin.z + offset.z,
             );
 
             // Particle: pos(x,y,z,J), vel(vx,vy,vz,mass)
@@ -190,6 +207,7 @@ impl InflowState {
             // AffineC: col0(0,0,0,phase), col1(0,0,0,0), col2(0,0,0,0)
             affine_data.push([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
         }
+        self.emission_sequence = self.emission_sequence.wrapping_add(count);
 
         // Append new water particles after all existing particles (water + bed).
         // The shader uses phase (0.0=water, 1.0=bed) to distinguish particle types.
