@@ -109,6 +109,13 @@ impl FilterMesh {
             render_vertices: Vec::new(),
             fill_vertices: Vec::new(),
         };
+        // Pre-relax to a representative loaded shape once at construction so
+        // the support surface is stable during simulation. A live cloth step
+        // without real load coupling causes the bed to keep chasing a moving
+        // support surface and reads as artificial shrink.
+        for _ in 0..120 {
+            mesh.step(1.0 / 60.0, 0.5);
+        }
         mesh.sync_render_vertices();
         mesh
     }
