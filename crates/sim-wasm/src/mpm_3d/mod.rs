@@ -400,24 +400,10 @@ impl MpmSim3D {
         // `refresh_metrics` itself, which keeps the staging buffer idle
         // between snapshot requests.
 
-        // The filter mesh is a CPU-side cloth scaffold with no fluid coupling,
-        // so stepping it once per frame at the full `dt` is enough — there is
-        // no benefit to running it per-substep and it would otherwise scale
-        // CPU cost linearly with `substeps`.
-        if let Some(mesh) = &mut self.filter_mesh {
-            let bed_factor = if self.num_bed > 0 {
-                (self.num_bed as f32 / 12_000.0).clamp(0.0, 2.0)
-            } else {
-                0.0
-            };
-            let water_factor = if self.settings.max_particles > 0 {
-                (self.num_water as f32 / self.settings.max_particles as f32).clamp(0.0, 2.0)
-            } else {
-                0.0
-            };
-            let load = (0.28 + bed_factor * 0.22 + water_factor * 0.18).clamp(0.12, 0.90);
-            mesh.step(dt, load);
-        }
+        // The current filter mesh is only a visual/support scaffold; it does
+        // not receive real forces from the solver. Keep it static after the
+        // construction-time relaxation so the bed does not chase a fictitiously
+        // moving support surface over time.
     }
 
     pub fn reset(&mut self, queue: &wgpu::Queue, _device: &wgpu::Device) {
