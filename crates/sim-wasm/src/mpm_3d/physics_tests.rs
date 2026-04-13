@@ -108,23 +108,32 @@ fn readback_mass_snapshot(
 
 #[derive(Debug)]
 struct DiagSnapshot {
+    all_finite: bool,
     total_mass: f32,
     active_count: u32,
     min_mass: f32,
     max_mass: f32,
+    x_min: f32,
+    x_max: f32,
+    x_extent: f32,
     y_min: f32,
     y_max: f32,
     y_mean: f32,
     y_extent: f32,
+    z_min: f32,
+    z_max: f32,
+    z_extent: f32,
     mean_j: f32,
     min_j: f32,
     max_j: f32,
 }
 
-fn readback_diag_snapshot(
+fn readback_diag_snapshot_range(
     sim: &MpmSim3D,
     device: &wgpu::Device,
     queue: &wgpu::Queue,
+    start: usize,
+    count: usize,
 ) -> DiagSnapshot {
     let particle_count = (sim.num_water + sim.num_bed) as usize;
     let particle_size = (particle_count * 32).max(4) as u64;
@@ -158,17 +167,31 @@ fn readback_diag_snapshot(
     let mut active_count = 0u32;
     let mut min_mass = f32::MAX;
     let mut max_mass = f32::MIN;
+    let mut x_min = f32::MAX;
+    let mut x_max = f32::MIN;
     let mut y_min = f32::MAX;
     let mut y_max = f32::MIN;
+    let mut z_min = f32::MAX;
+    let mut z_max = f32::MIN;
     let mut y_sum = 0.0_f32;
     let mut j_sum = 0.0_f32;
     let mut j_min = f32::MAX;
     let mut j_max = f32::MIN;
+    let mut all_finite = true;
 
-    for i in 0..particle_count {
+    let end = (start + count).min(particle_count);
+    for i in start..end {
+        let x = data[i * 8];
+        let z = data[i * 8 + 2];
         let mass = data[i * 8 + 7];
         let j = data[i * 8 + 3];
         let y = data[i * 8 + 1];
+
+        all_finite &= x.is_finite()
+            && y.is_finite()
+            && z.is_finite()
+            && j.is_finite()
+            && mass.is_finite();
 
         if mass <= inactive_thresh {
             continue;
@@ -177,8 +200,12 @@ fn readback_diag_snapshot(
         total_mass += mass;
         if mass < min_mass { min_mass = mass; }
         if mass > max_mass { max_mass = mass; }
+        if x < x_min { x_min = x; }
+        if x > x_max { x_max = x; }
         if y < y_min { y_min = y; }
         if y > y_max { y_max = y; }
+        if z < z_min { z_min = z; }
+        if z > z_max { z_max = z; }
         y_sum += y;
         j_sum += j;
         if j < j_min { j_min = j; }
@@ -189,18 +216,41 @@ fn readback_diag_snapshot(
 
     let n = active_count.max(1) as f32;
     DiagSnapshot {
+        all_finite,
         total_mass,
         active_count,
         min_mass: if active_count > 0 { min_mass } else { 0.0 },
         max_mass: if active_count > 0 { max_mass } else { 0.0 },
+        x_min: if active_count > 0 { x_min } else { 0.0 },
+        x_max: if active_count > 0 { x_max } else { 0.0 },
+        x_extent: if active_count > 0 { x_max - x_min } else { 0.0 },
         y_min: if active_count > 0 { y_min } else { 0.0 },
         y_max: if active_count > 0 { y_max } else { 0.0 },
         y_mean: y_sum / n,
         y_extent: if active_count > 0 { y_max - y_min } else { 0.0 },
+        z_min: if active_count > 0 { z_min } else { 0.0 },
+        z_max: if active_count > 0 { z_max } else { 0.0 },
+        z_extent: if active_count > 0 { z_max - z_min } else { 0.0 },
         mean_j: j_sum / n,
         min_j: if active_count > 0 { j_min } else { 0.0 },
         max_j: if active_count > 0 { j_max } else { 0.0 },
     }
+}
+
+fn readback_diag_snapshot(
+    sim: &MpmSim3D,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+) -> DiagSnapshot {
+    readback_diag_snapshot_range(sim, device, queue, 0, (sim.num_water + sim.num_bed) as usize)
+}
+
+fn readback_bed_diag_snapshot(
+    sim: &MpmSim3D,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+) -> DiagSnapshot {
+    readback_diag_snapshot_range(sim, device, queue, 0, sim.num_bed as usize)
 }
 
 // ── Pipeline validation ──
@@ -270,6 +320,152 @@ fn mass_readback_harness() {
     assert!(snapshot.bed_held_mass.is_finite());
     assert!(snapshot.active_particle_mass >= 0.0);
     assert!(snapshot.bed_held_mass >= 0.0);
+}
+
+#[test]
+fn bed_settling_stability() {
+    let Some((device, queue)) = create_test_device() else {
+        eprintln!("skipping: no GPU adapter");
+        return;
+    };
+
+    let mut sim = MpmSim3D::new(&device, &queue, MpmSettings::benchmark_center_pour());
+    sim.set_kettle_angle(0.0);
+    for _ in 0..60 {
+        sim.step_frame(&device, &queue, 1.0 / 60.0);
+    }
+
+    let snapshot = readback_bed_diag_snapshot(&sim, &device, &queue);
+    assert!(snapshot.all_finite, "dry bed produced non-finite state");
+    assert!(
+        snapshot.active_count > 0,
+        "dry bed lost all active particles"
+    );
+    assert!(
+        snapshot.y_extent > 0.8,
+        "dry bed collapsed to a near-point: {:?}",
+        snapshot
+    );
+    assert!(
+        snapshot.min_j > 0.55,
+        "dry bed over-compressed during settle: {:?}",
+        snapshot
+    );
+    assert!(
+        snapshot.max_j < 1.25,
+        "dry bed over-expanded during settle: {:?}",
+        snapshot
+    );
+}
+
+#[test]
+fn bed_long_run_creep_is_bounded_without_water() {
+    let Some((device, queue)) = create_test_device() else {
+        eprintln!("skipping: no GPU adapter");
+        return;
+    };
+
+    let mut sim = MpmSim3D::new(&device, &queue, MpmSettings::benchmark_center_pour());
+    sim.set_kettle_angle(0.0);
+    for _ in 0..60 {
+        sim.step_frame(&device, &queue, 1.0 / 60.0);
+    }
+    let settled = readback_bed_diag_snapshot(&sim, &device, &queue);
+
+    for _ in 0..240 {
+        sim.step_frame(&device, &queue, 1.0 / 60.0);
+    }
+    let late = readback_bed_diag_snapshot(&sim, &device, &queue);
+
+    assert!(
+        late.all_finite,
+        "long-run dry bed produced non-finite state"
+    );
+    let mean_drop = (settled.y_mean - late.y_mean).abs();
+    assert!(
+        mean_drop < 0.35,
+        "dry bed continued creeping after settle: settled={:?} late={:?}",
+        settled,
+        late
+    );
+    assert!(
+        late.min_j > 0.5,
+        "dry bed hit the compaction clamp during long-run settle: {:?}",
+        late
+    );
+}
+
+#[test]
+fn bed_first_water_impact_is_bounded() {
+    let Some((device, queue)) = create_test_device() else {
+        eprintln!("skipping: no GPU adapter");
+        return;
+    };
+
+    let mut sim = MpmSim3D::new(&device, &queue, MpmSettings::benchmark_center_pour());
+    sim.set_kettle_angle(0.0);
+    for _ in 0..60 {
+        sim.step_frame(&device, &queue, 1.0 / 60.0);
+    }
+    let settled = readback_bed_diag_snapshot(&sim, &device, &queue);
+
+    sim.set_kettle_angle(36.0);
+    for _ in 0..45 {
+        sim.step_frame(&device, &queue, 1.0 / 60.0);
+    }
+    let impacted = readback_bed_diag_snapshot(&sim, &device, &queue);
+
+    assert!(
+        impacted.all_finite,
+        "bed produced non-finite state under first water impact"
+    );
+    assert!(
+        impacted.y_extent > settled.y_extent * 0.65,
+        "first water impact collapsed bed shape too quickly: settled={settled:?} impacted={impacted:?}",
+    );
+    assert!(
+        impacted.min_j > 0.45,
+        "first water impact over-compressed bed: settled={settled:?} impacted={impacted:?}",
+    );
+    assert!(
+        (impacted.y_mean - settled.y_mean).abs() < 0.55,
+        "first water impact displaced bed centroid too abruptly: settled={settled:?} impacted={impacted:?}",
+    );
+}
+
+#[test]
+fn bed_short_pour_retains_shape() {
+    let Some((device, queue)) = create_test_device() else {
+        eprintln!("skipping: no GPU adapter");
+        return;
+    };
+
+    let mut sim = MpmSim3D::new(&device, &queue, MpmSettings::benchmark_center_pour());
+    sim.set_kettle_angle(0.0);
+    for _ in 0..60 {
+        sim.step_frame(&device, &queue, 1.0 / 60.0);
+    }
+    let settled = readback_bed_diag_snapshot(&sim, &device, &queue);
+
+    sim.set_kettle_angle(36.0);
+    for _ in 0..120 {
+        sim.step_frame(&device, &queue, 1.0 / 60.0);
+    }
+    let wet = readback_bed_diag_snapshot(&sim, &device, &queue);
+
+    assert!(wet.all_finite, "short pour produced non-finite bed state");
+    assert!(
+        wet.y_extent > settled.y_extent * 0.5,
+        "short pour collapsed bed shape too aggressively: settled={settled:?} wet={wet:?}",
+    );
+    assert!(
+        wet.min_j > 0.4,
+        "short pour over-compressed bed: settled={settled:?} wet={wet:?}",
+    );
+    assert!(
+        wet.max_j <= 1.4001,
+        "short pour over-expanded bed: settled={settled:?} wet={wet:?}",
+    );
 }
 
 #[test]
