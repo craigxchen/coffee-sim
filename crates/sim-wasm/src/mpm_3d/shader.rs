@@ -182,8 +182,7 @@ fn is_fluid_kind(kind: i32) -> bool {
     // contribute 0 to the numerator), so excluding surface cells here would
     // zero them out and let gravity compress thin pools to a single layer.
     return kind == CELL_INTERIOR_FLUID
-        || kind == CELL_SURFACE_FLUID
-        || kind == CELL_BED_COUPLED;
+        || kind == CELL_SURFACE_FLUID;
 }
 
 fn is_solid_kind(kind: i32) -> bool {
@@ -648,26 +647,7 @@ fn classify_cells(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     let div = 0.5 * inv_dx() * ((vxp - vxm) + (vyp - vym) + (vzp - vzm));
-
-    // Sink-augmented divergence for bed-coupled cells (PLAN.md formula):
-    //   div(u) = -m_abs / (rho * V * dt)
-    // Adding a positive sink tells the pressure solver to allow convergent
-    // flow at bed cells rather than fighting it to zero. After projection
-    // (vel -= dt * grad_p), the dt factors cancel via the 1/dt normalization
-    // in pressure_update, so div(u_new) = -sink exactly.
-    var sink = 0.0;
-    if kind == CELL_BED_COUPLED {
-        let bed_idx = bed_lookup_load(idx);
-        if bed_idx >= 0 {
-            let be = bed_extract[u32(bed_idx)];
-            let saturation = be.extract.w;
-            let abs_frac = clamp(absorption_rate() * (1.0 - saturation) * dt(), 0.0, 0.25);
-            let predicted_abs = mass * abs_frac;
-            let ref_mass = nominal_mass() * 8.0;
-            sink = predicted_abs / (ref_mass * dt());
-        }
-    }
-    divergence_store(idx, div + sink);
+    divergence_store(idx, div);
 
     // Observability: track the worst-case cell divergence and the fluid-cell
     // footprint of the active substep. `atomicMax` on u32 gives the peak FP

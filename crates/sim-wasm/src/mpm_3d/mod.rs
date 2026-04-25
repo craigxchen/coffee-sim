@@ -363,8 +363,7 @@ impl MpmSim3D {
                 }
 
                 // 6. bed_coupling (after g2p so absorption uses projected
-                //    velocities and the sink term in classify_cells can
-                //    predict absorption for the pressure solve)
+                //    velocities and remains the sole bed storage transfer)
                 if particle_wg > 0 {
                     pass.set_pipeline(&self.pipelines.bed_coupling);
                     pass.dispatch_workgroups(particle_wg, 1, 1);
