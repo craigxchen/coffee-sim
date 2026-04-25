@@ -36,7 +36,9 @@ fn create_test_device() -> Option<(wgpu::Device, wgpu::Queue)> {
 #[derive(Debug)]
 struct MassSnapshot {
     active_particle_mass: f32,
+    active_water_particle_mass: f32,
     bed_held_mass: f32,
+    water_slots: u32,
 }
 
 fn readback_mass_snapshot(
@@ -85,8 +87,13 @@ fn readback_mass_snapshot(
     let particle_view = particle_slice.get_mapped_range();
     let particle_f32 = cast_slice::<u8, f32>(&particle_view);
     let mut active_particle_mass = 0.0;
+    let mut active_water_particle_mass = 0.0;
     for i in 0..particle_count {
-        active_particle_mass += particle_f32[i * 8 + 7];
+        let mass = particle_f32[i * 8 + 7];
+        active_particle_mass += mass;
+        if i >= sim.num_bed as usize {
+            active_water_particle_mass += mass;
+        }
     }
     drop(particle_view);
     particle_staging.unmap();
@@ -102,7 +109,9 @@ fn readback_mass_snapshot(
 
     MassSnapshot {
         active_particle_mass,
+        active_water_particle_mass,
         bed_held_mass,
+        water_slots: sim.num_water,
     }
 }
 
@@ -317,9 +326,55 @@ fn mass_readback_harness() {
 
     let snapshot = readback_mass_snapshot(&sim, &device, &queue);
     assert!(snapshot.active_particle_mass.is_finite());
+    assert!(snapshot.active_water_particle_mass.is_finite());
     assert!(snapshot.bed_held_mass.is_finite());
     assert!(snapshot.active_particle_mass >= 0.0);
+    assert!(snapshot.active_water_particle_mass >= 0.0);
     assert!(snapshot.bed_held_mass >= 0.0);
+}
+
+#[test]
+fn active_pour_particle_loss_matches_bed_gain() {
+    let Some((device, queue)) = create_test_device() else {
+        eprintln!("skipping: no GPU adapter");
+        return;
+    };
+
+    let mut sim = MpmSim3D::new(&device, &queue, MpmSettings::benchmark_center_pour());
+    sim.set_kettle_angle(0.0);
+    for _ in 0..60 {
+        sim.step_frame(&device, &queue, 1.0 / 60.0);
+    }
+
+    sim.set_kettle_angle(36.0);
+    for _ in 0..45 {
+        sim.step_frame(&device, &queue, 1.0 / 60.0);
+    }
+    let before = readback_mass_snapshot(&sim, &device, &queue);
+
+    for _ in 0..10 {
+        sim.step_frame(&device, &queue, 1.0 / 60.0);
+    }
+    let after = readback_mass_snapshot(&sim, &device, &queue);
+
+    let nominal_mass = inflow::MASS_UNITS_PER_ML / inflow::PARTICLES_PER_ML;
+    let emitted_mass = after.water_slots.saturating_sub(before.water_slots) as f32 * nominal_mass;
+    let water_gain = after.active_water_particle_mass - before.active_water_particle_mass;
+    let bed_gain = after.bed_held_mass - before.bed_held_mass;
+    let particle_loss_to_bed = emitted_mass - water_gain;
+    let err = (particle_loss_to_bed - bed_gain).abs();
+    let tolerance = (bed_gain.abs() * 0.08).max(nominal_mass * 16.0);
+
+    assert!(
+        bed_gain > nominal_mass,
+        "active pour did not transfer measurable water into bed: before={before:?} after={after:?}",
+    );
+    assert!(
+        err <= tolerance,
+        "water particle loss should match bed-held gain during active pour: \
+         emitted={emitted_mass} water_gain={water_gain} particle_loss_to_bed={particle_loss_to_bed} \
+         bed_gain={bed_gain} err={err} tolerance={tolerance} before={before:?} after={after:?}",
+    );
 }
 
 #[test]
@@ -531,6 +586,55 @@ fn water_pool_stable_against_cup_floor() {
         drift < 0.02,
         "pooled water drifted {:.2}% after settle (m0={m0}, m1={m1})",
         drift * 100.0
+    );
+}
+
+#[test]
+#[ignore = "known failing target until porous pressure/free-surface coupling is redesigned"]
+fn pooled_water_shape_stays_bounded_after_initial_settle() {
+    let Some((device, queue)) = create_test_device() else {
+        eprintln!("skipping: no GPU adapter");
+        return;
+    };
+
+    let mut sim = MpmSim3D::new(&device, &queue, MpmSettings::benchmark_free_stream());
+
+    sim.set_kettle_angle(36.0);
+    for _ in 0..180 {
+        sim.step_frame(&device, &queue, 1.0 / 60.0);
+    }
+
+    sim.set_kettle_angle(0.0);
+    for _ in 0..60 {
+        sim.step_frame(&device, &queue, 1.0 / 60.0);
+    }
+    let settled = readback_diag_snapshot(&sim, &device, &queue);
+
+    for _ in 0..600 {
+        sim.step_frame(&device, &queue, 1.0 / 60.0);
+    }
+    let late = readback_diag_snapshot(&sim, &device, &queue);
+
+    let settled_volume_proxy = settled.x_extent * settled.y_extent * settled.z_extent;
+    let late_volume_proxy = late.x_extent * late.y_extent * late.z_extent;
+    let volume_proxy_ratio = late_volume_proxy / settled_volume_proxy.max(1e-6);
+    let height_ratio = late.y_extent / settled.y_extent.max(1e-6);
+
+    assert!(
+        settled.all_finite && late.all_finite,
+        "pooled water produced non-finite state"
+    );
+    assert!(
+        settled.active_count == late.active_count,
+        "pooled water changed active particle count after settling: settled={settled:?}, late={late:?}",
+    );
+    assert!(
+        height_ratio > 0.8,
+        "pooled water height kept shrinking after initial settle: settled={settled:?}, late={late:?}",
+    );
+    assert!(
+        volume_proxy_ratio > 0.75,
+        "pooled water occupied volume proxy kept shrinking after initial settle: settled={settled:?}, late={late:?}",
     );
 }
 
