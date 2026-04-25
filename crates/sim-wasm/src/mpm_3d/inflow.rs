@@ -164,11 +164,7 @@ impl InflowState {
         let mut affine_data: Vec<[f32; 12]> = Vec::with_capacity(count as usize);
 
         let emit_speed = self.exit_speed();
-        let vel = Vec3::new(
-            dir.x * emit_speed,
-            dir.y * emit_speed,
-            dir.z * emit_speed,
-        );
+        let vel = Vec3::new(dir.x * emit_speed, dir.y * emit_speed, dir.z * emit_speed);
 
         // Emit from a slightly contracted jet core rather than the full nozzle
         // disk. This approximates the vena-contracta region just below the
