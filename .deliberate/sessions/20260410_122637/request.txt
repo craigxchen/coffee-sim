@@ -1,0 +1,1 @@
+We're starting to run into performance issues. Previously we were functioning smoothly at 60 fps, but it seems like after adding the dual velocity grids for the solid and water, performance has dropped and the simulation seems laggier now. How can we fix this? The physics also still need work, but look for places in the current implementation that canan be accelerated

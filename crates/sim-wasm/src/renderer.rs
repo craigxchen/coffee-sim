@@ -31,7 +31,7 @@ struct ParticleVertexInput {
     @location(0) local: vec2<f32>,
     @location(1) world_position: vec3<f32>,
     @location(2) colour_t: f32,
-    @location(3) size_scale: f32,
+    @location(3) radius: f32,
 };
 
 struct ParticleVertexOutput {
@@ -42,9 +42,8 @@ struct ParticleVertexOutput {
 
 @vertex
 fn vs_main(input: ParticleVertexInput) -> ParticleVertexOutput {
-    let water_radius = uniforms.params.x * mix(0.58, 0.40, clamp(input.colour_t * 0.7, 0.0, 1.0));
-    let base_radius = select(water_radius, uniforms.params.x * 0.62, input.colour_t < 0.0);
-    let radius = base_radius * max(input.size_scale, 0.05);
+    let water_radius = input.radius * mix(1.0, 0.72, clamp(input.colour_t * 0.7, 0.0, 1.0));
+    let radius = select(water_radius, input.radius, input.colour_t < 0.0);
     let offset = uniforms.camera_right.xyz * input.local.x * radius
         + uniforms.camera_up.xyz * input.local.y * radius;
     let world = input.world_position + offset;

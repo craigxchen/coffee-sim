@@ -49,6 +49,21 @@ struct RenderParticle {
     aux: vec4<f32>,
 };
 
+struct FilterMeshVertex {
+    current: vec4<f32>,
+    previous: vec4<f32>,
+};
+
+struct FilterSupportSample {
+    valid: bool,
+    mesh_bot_y: f32,
+    mesh_top_y: f32,
+    surface_y: f32,
+    surface_radius: f32,
+    surface_normal: vec3<f32>,
+    surface_velocity: vec3<f32>,
+};
+
 // ── Bindings ──
 
 @group(0) @binding(0) var<uniform> u: MpmUniforms;
@@ -62,11 +77,12 @@ struct RenderParticle {
 @group(0) @binding(8) var<storage, read_write> bed_lookup: array<atomic<i32>>;
 @group(0) @binding(9) var<storage, read_write> bed_delta: array<atomic<i32>>;
 @group(0) @binding(10) var<storage, read_write> metrics: array<atomic<u32>>;
-@group(0) @binding(11) var<storage, read> filter_mesh: array<vec4<f32>>;
+@group(0) @binding(11) var<storage, read> filter_mesh: array<FilterMeshVertex>;
 @group(0) @binding(12) var sdf_class_tex: texture_3d<u32>;
 
 const FILTER_RING_COUNT = 10u;
 const FILTER_SEGMENT_COUNT = 32u;
+const BED_NEIGHBOR_SAMPLE_COUNT: u32 = 27u;
 
 // Metrics slot layout — keep in sync with `METRICS_SLOT_COUNT` in state.rs.
 const METRIC_MAX_ABS_DIV_IDX: u32 = 0u;
@@ -88,6 +104,7 @@ fn dt() -> f32 { return u.sim_params.x; }
 fn gravity() -> f32 { return u.sim_params.y; }
 fn dx() -> f32 { return u.sim_params.z; }
 fn inv_dx() -> f32 { return u.sim_params.w; }
+fn sim_time() -> f32 { return u.time_params.x; }
 fn bulk_K() -> f32 { return u.fluid_params.x; }
 fn viscosity() -> f32 { return u.fluid_params.y; }
 fn nominal_mass() -> f32 { return u.fluid_params.z; }
@@ -108,7 +125,7 @@ fn K_bed() -> f32 { return u.extraction_params.y; }
 fn mu_fluid() -> f32 { return u.extraction_params.z; }
 fn uniform_permeability() -> f32 { return u.extraction_params.w; }
 fn bed_storage_redistribution_rate() -> f32 { return 0.18; }
-fn bed_filter_contact_damping() -> f32 { return 0.35; }
+fn bed_filter_contact_band() -> f32 { return max(contact_offset() * 1.5, dx() * 0.35); }
 fn inactive_mass_threshold() -> f32 { return nominal_mass() * 0.10; }
 fn div_clamp_limit() -> f32 { return u.clamp_params.x; }
 fn pressure_clamp_limit() -> f32 { return u.clamp_params.y; }
@@ -123,17 +140,35 @@ fn bed_particle_capacity_scale(bid: u32) -> f32 {
 fn bed_particle_capacity(bid: u32) -> f32 {
     return max(max_saturation() * bed_particle_capacity_scale(bid), 1e-6);
 }
+fn bed_compaction(bid: u32) -> f32 {
+    return clamp(bed_extract[bid].mech0.w, 0.0, 0.12);
+}
+fn bed_rest_porosity(bid: u32) -> f32 {
+    return clamp(max(bed_extract[bid].mech1.w, 0.0), 0.24, 0.58);
+}
+fn bed_rest_permeability(bid: u32) -> f32 {
+    return clamp(max(bed_extract[bid].mech2.w, 0.0), 0.0002, 0.02);
+}
 fn bed_particle_porosity(bid: u32) -> f32 {
-    return clamp(bed_extract[bid].bed.y, 0.18, 0.65);
+    return clamp(bed_extract[bid].bed.y, 0.18, 0.58);
 }
 fn bed_particle_permeability(bid: u32) -> f32 {
-    return max(bed_extract[bid].bed.z, 1e-5);
+    return clamp(bed_extract[bid].bed.z, 0.0002, 0.02);
+}
+fn bed_settled_activation(bid: u32) -> f32 {
+    return clamp(bed_extract[bid].extract.z, 0.0, 1.0);
 }
 fn bed_particle_saturation(bid: u32) -> f32 {
     return clamp(bed_extract[bid].bed.x / bed_particle_capacity(bid), 0.0, 1.0);
 }
-fn bed_plastic_alpha(bid: u32) -> f32 {
-    return max(bed_extract[bid].mech0.w, 0.0);
+fn water_particle_radius() -> f32 {
+    return dx() * 0.18;
+}
+fn bed_particle_render_radius(bid: u32) -> f32 {
+    let permeability_ratio =
+        bed_particle_permeability(bid) / max(uniform_permeability(), 1e-5);
+    let size_scale = clamp(pow(permeability_ratio, 0.18), 0.68, 1.42);
+    return dx() * 0.434 * size_scale;
 }
 fn bed_F_col0(bid: u32) -> vec3<f32> {
     return bed_extract[bid].mech0.xyz;
@@ -168,63 +203,258 @@ fn orthonormal_basis_from_F(c0: vec3<f32>, c1: vec3<f32>) -> mat3x3<f32> {
     let r2 = normalize(cross(r0, r1));
     return mat3x3<f32>(r0, r1, r2);
 }
-fn frobenius_norm(m: mat3x3<f32>) -> f32 {
-    return sqrt(
-        dot(m[0], m[0])
-            + dot(m[1], m[1])
-            + dot(m[2], m[2])
+fn compaction_dryness_factor(saturation: f32) -> f32 {
+    return 1.0 - smoothstep(0.10, 0.55, saturation);
+}
+fn compaction_support_factor(support_ratio: f32) -> f32 {
+    return clamp((support_ratio - 0.35) / 0.65, 0.0, 1.0);
+}
+fn compaction_compression_factor(Je: f32) -> f32 {
+    return clamp((0.98 - Je) / 0.20, 0.0, 1.0);
+}
+fn compaction_motion_factor(vertical_speed: f32) -> f32 {
+    return smoothstep(0.02, 0.18, max(-vertical_speed, 0.0));
+}
+fn compaction_rest_factor(speed: f32) -> f32 {
+    return 1.0 - smoothstep(0.04, 0.18, speed);
+}
+fn dry_settle_compaction_window() -> f32 {
+    return 1.0 - smoothstep(2.0, 3.0, sim_time());
+}
+fn settled_support_ratio_factor(support_ratio: f32) -> f32 {
+    return clamp((support_ratio - 0.40) / 0.30, 0.0, 1.0);
+}
+fn settled_support_mass_factor(local_grid_mass: f32) -> f32 {
+    return clamp(
+        (local_grid_mass - nominal_mass() * 0.14) / max(nominal_mass() * 0.60, 1e-6),
+        0.0,
+        1.0,
     );
 }
-fn trace3(m: mat3x3<f32>) -> f32 {
-    return m[0].x + m[1].y + m[2].z;
+fn settled_rest_factor(speed: f32) -> f32 {
+    return 1.0 - smoothstep(0.01, 0.05, speed);
 }
-fn dry_bed_friction_angle_rad() -> f32 {
-    return radians(32.0);
+fn settled_drain_factor(local_fluid_mass: f32) -> f32 {
+    return 1.0
+        - smoothstep(
+            occupancy_mass_threshold() * 0.02,
+            nominal_mass() * 0.008,
+            local_fluid_mass,
+        );
 }
-fn dry_bed_cohesion() -> f32 {
-    return 18.0;
-}
-fn dry_bed_hardening() -> f32 {
-    return 14.0;
-}
-struct BedPlasticProjection {
-    F: mat3x3<f32>,
-    alpha: f32,
-};
-fn project_bed_drucker_prager(
-    F_trial: mat3x3<f32>,
+fn raw_dry_contact_strength(
     saturation: f32,
-    alpha_old: f32,
-) -> BedPlasticProjection {
-    if saturation > 0.08 {
-        return BedPlasticProjection(F_trial, alpha_old);
+    support_ratio: f32,
+    local_grid_mass: f32,
+) -> f32 {
+    let dryness = 1.0 - smoothstep(0.0, 0.02, saturation);
+    let support = clamp((support_ratio - 0.40) / 0.40, 0.0, 1.0);
+    let supported_mass = clamp(
+        (local_grid_mass - nominal_mass() * 0.08) / max(nominal_mass() * 0.65, 1e-6),
+        0.0,
+        1.0,
+    );
+    return dryness * support * supported_mass;
+}
+fn settled_activation_target(
+    saturation: f32,
+    compaction: f32,
+    support_ratio: f32,
+    local_grid_mass: f32,
+    local_fluid_mass: f32,
+    speed: f32,
+) -> f32 {
+    let dryness = 1.0 - smoothstep(0.001, 0.004, saturation);
+    let packed = smoothstep(0.0015, 0.008, compaction);
+    return dryness
+        * packed
+        * settled_support_ratio_factor(support_ratio)
+        * settled_support_mass_factor(local_grid_mass)
+        * settled_drain_factor(local_fluid_mass)
+        * settled_rest_factor(speed);
+}
+fn update_settled_activation(
+    settled_old: f32,
+    saturation: f32,
+    compaction: f32,
+    support_ratio: f32,
+    local_grid_mass: f32,
+    local_fluid_mass: f32,
+    speed: f32,
+    support_strength: f32,
+) -> f32 {
+    let base_target = settled_activation_target(
+        saturation,
+        compaction,
+        support_ratio,
+        local_grid_mass,
+        local_fluid_mass,
+        speed,
+    );
+    let settle_target = max(
+        base_target,
+        0.35 * support_strength * settled_drain_factor(local_fluid_mass),
+    );
+    let rewetted = smoothstep(0.004, 0.012, saturation);
+    let fluidized = smoothstep(
+        occupancy_mass_threshold() * 0.01,
+        nominal_mass() * 0.015,
+        local_fluid_mass,
+    );
+    let destabilized = max(rewetted, fluidized);
+    if destabilized > 1e-4 {
+        let decay = min(dt() * (4.0 + 8.0 * destabilized), 0.35);
+        return mix(settled_old, 0.0, decay);
+    }
+    let rise = min(dt() * (0.04 + 0.04 * settle_target), 0.01);
+    let settled_new = mix(settled_old, settle_target, rise);
+    if saturation > 5e-4 || local_fluid_mass > occupancy_mass_threshold() * 0.001 {
+        return min(settled_new, 0.22);
+    }
+    return settled_new;
+}
+fn settled_contact_strength(
+    settled_activation: f32,
+    raw_contact_strength: f32,
+) -> f32 {
+    return smoothstep(0.12, 0.50, settled_activation) * raw_contact_strength;
+}
+fn settled_rest_activation(
+    settled_activation: f32,
+    support_ratio: f32,
+    speed: f32,
+    compaction: f32,
+) -> f32 {
+    let settled = smoothstep(0.10, 0.55, settled_activation);
+    let supported = settled_support_ratio_factor(support_ratio);
+    let near_rest = 1.0 - smoothstep(0.06, 0.22, speed);
+    let packed = smoothstep(0.004, 0.016, compaction);
+    return settled * supported * near_rest * packed;
+}
+fn runtime_porosity(rest_porosity: f32, compaction: f32) -> f32 {
+    return clamp(rest_porosity * (1.0 - 1.20 * compaction), 0.18, 0.58);
+}
+fn runtime_permeability(rest_perm: f32, compaction: f32) -> f32 {
+    return clamp(rest_perm * exp(-4.5 * compaction), 0.0002, 0.02);
+}
+fn filter_mesh_pos(idx: u32) -> vec3<f32> {
+    return filter_mesh[idx].current.xyz;
+}
+fn filter_mesh_prev_pos(idx: u32) -> vec3<f32> {
+    return filter_mesh[idx].previous.xyz;
+}
+fn filter_contact_band_strength(distance_to_surface: f32) -> f32 {
+    let band = bed_filter_contact_band();
+    return 1.0 - smoothstep(band, band * 2.0, distance_to_surface);
+}
+fn filter_wall_contact_strength(
+    position: vec3<f32>,
+    support: FilterSupportSample,
+    dry_support_strength: f32,
+) -> f32 {
+    if !support.valid || dry_support_strength <= 1e-5 {
+        return 0.0;
+    }
+    let radial_len = length(position.xz);
+    if radial_len <= 1e-6 || support.surface_radius <= 0.1 {
+        return 0.0;
+    }
+    let barrier_r = support.surface_radius - contact_offset();
+    let wall_distance = abs(barrier_r - radial_len);
+    return dry_support_strength * filter_contact_band_strength(wall_distance);
+}
+fn sample_filter_support(position: vec3<f32>) -> FilterSupportSample {
+    let mesh_bot_y = filter_mesh_pos(0u).y;
+    let mesh_top_y = filter_mesh_pos((FILTER_RING_COUNT - 1u) * FILTER_SEGMENT_COUNT).y;
+    if position.y > mesh_top_y || position.y < mesh_bot_y - 0.5 {
+        return FilterSupportSample(
+            false,
+            mesh_bot_y,
+            mesh_top_y,
+            0.0,
+            0.0,
+            vec3<f32>(0.0, 1.0, 0.0),
+            vec3<f32>(0.0),
+        );
     }
 
-    let R = orthonormal_basis_from_F(F_trial[0], F_trial[1]);
-    let strain_hat = transpose(R) * F_trial - identity3();
-    let mean_strain = trace3(strain_hat) / 3.0;
-    let dev_strain = strain_hat - identity3() * mean_strain;
-    let dev_norm = frobenius_norm(dev_strain);
-    if dev_norm <= 1e-6 {
-        return BedPlasticProjection(F_trial, alpha_old);
+    let ring_t = clamp((position.y - mesh_bot_y) / max(mesh_top_y - mesh_bot_y, 1e-5), 0.0, 1.0);
+    let ring_f = ring_t * f32(FILTER_RING_COUNT - 1u);
+    let ring_lo = u32(floor(ring_f));
+    let ring_hi = min(ring_lo + 1u, FILTER_RING_COUNT - 1u);
+    let ring_frac = ring_f - floor(ring_f);
+
+    let angle = atan2(position.z, position.x);
+    let seg_f = ((angle / (2.0 * 3.14159265) + 1.0) % 1.0) * f32(FILTER_SEGMENT_COUNT);
+    let seg_lo = u32(floor(seg_f)) % FILTER_SEGMENT_COUNT;
+    let seg_hi = (seg_lo + 1u) % FILTER_SEGMENT_COUNT;
+    let seg_frac = seg_f - floor(seg_f);
+
+    let v00 = filter_mesh_pos(ring_lo * FILTER_SEGMENT_COUNT + seg_lo);
+    let v01 = filter_mesh_pos(ring_lo * FILTER_SEGMENT_COUNT + seg_hi);
+    let v10 = filter_mesh_pos(ring_hi * FILTER_SEGMENT_COUNT + seg_lo);
+    let v11 = filter_mesh_pos(ring_hi * FILTER_SEGMENT_COUNT + seg_hi);
+    let p00 = filter_mesh_prev_pos(ring_lo * FILTER_SEGMENT_COUNT + seg_lo);
+    let p01 = filter_mesh_prev_pos(ring_lo * FILTER_SEGMENT_COUNT + seg_hi);
+    let p10 = filter_mesh_prev_pos(ring_hi * FILTER_SEGMENT_COUNT + seg_lo);
+    let p11 = filter_mesh_prev_pos(ring_hi * FILTER_SEGMENT_COUNT + seg_hi);
+
+    let ring_r_lo = mix(length(v00.xz), length(v01.xz), seg_frac);
+    let ring_r_hi = mix(length(v10.xz), length(v11.xz), seg_frac);
+    let ring_y_lo = mix(v00.y, v01.y, seg_frac);
+    let ring_y_hi = mix(v10.y, v11.y, seg_frac);
+    let current_surface = mix(mix(v00, v01, seg_frac), mix(v10, v11, seg_frac), ring_frac);
+    let previous_surface = mix(mix(p00, p01, seg_frac), mix(p10, p11, seg_frac), ring_frac);
+
+    let radial = position.xz;
+    let radial_len = length(radial);
+    let outward = select(vec2<f32>(1.0, 0.0), radial / radial_len, radial_len > 1e-6);
+    let dy = max(abs(ring_y_hi - ring_y_lo), 1e-5);
+    let dr_dy = (ring_r_hi - ring_r_lo) / dy;
+    let surface_normal = normalize(vec3<f32>(outward.x, -dr_dy, outward.y));
+    let surface_velocity = (current_surface - previous_surface) / max(dt(), 1e-5);
+
+    return FilterSupportSample(
+        true,
+        mesh_bot_y,
+        mesh_top_y,
+        current_surface.y,
+        length(current_surface.xz),
+        surface_normal,
+        surface_velocity,
+    );
+}
+fn project_dry_support_velocity(
+    velocity: vec3<f32>,
+    support_velocity: vec3<f32>,
+    support_normal: vec3<f32>,
+    support_strength: f32,
+    allow_static: bool,
+) -> vec3<f32> {
+    let strength = clamp(support_strength, 0.0, 1.0);
+    if strength <= 1e-5 {
+        return velocity;
     }
 
-    let mu = bed_shear_modulus();
-    let bulk = K_bed();
-    let q = 2.0 * mu * dev_norm;
-    let p = max(-bulk * 3.0 * mean_strain, 0.0);
-    let sin_phi = sin(dry_bed_friction_angle_rad());
-    let yield_strength = dry_bed_cohesion() + dry_bed_hardening() * alpha_old
-        + p * (0.55 * sin_phi / max(1.0 - sin_phi, 0.2));
-    if q <= yield_strength {
-        return BedPlasticProjection(F_trial, alpha_old);
+    var rel = velocity - support_velocity;
+    let outward_speed = max(dot(rel, support_normal), 0.0);
+    if outward_speed > 0.0 {
+        rel -= support_normal * outward_speed;
     }
 
-    let scale = clamp(yield_strength / q, 0.0, 1.0);
-    let projected_hat = identity3() * (1.0 + mean_strain) + dev_strain * scale;
-    let F_proj = R * projected_hat;
-    let plastic_increment = (1.0 - scale) * dev_norm;
-    return BedPlasticProjection(F_proj, alpha_old + plastic_increment);
+    let tangential = rel - support_normal * dot(rel, support_normal);
+    let tangential_speed = length(tangential);
+    if tangential_speed > 1e-6 {
+        let static_band = mix(0.02, 0.18, strength);
+        if allow_static && tangential_speed <= static_band {
+            rel -= tangential;
+        } else {
+            let kinetic_scale = min((0.45 + 0.35 * friction()) * strength, 0.97);
+            rel -= tangential * kinetic_scale;
+        }
+    }
+
+    return rel + support_velocity;
 }
 fn bed_fixed_corotated_stress(bid: u32, J: f32) -> mat3x3<f32> {
     let F0 = bed_F_col0(bid);
@@ -408,69 +638,58 @@ fn resolve_radial_barrier(
     return ContactResult(out_pos, out_vel);
 }
 
-fn resolve_filter_mesh_contact(pos: vec3<f32>, vel: vec3<f32>) -> ContactResult {
-    let mesh_bot_y = filter_mesh[0].y;
-    let mesh_top_y = filter_mesh[(FILTER_RING_COUNT - 1u) * FILTER_SEGMENT_COUNT].y;
+fn static_cone_support_normal(position: vec3<f32>) -> vec3<f32> {
+    let cone_top_y = 3.0;
+    let cone_bot_y = -3.0;
+    let radial = position.xz;
+    let radial_len = length(radial);
+    let outward = select(vec2<f32>(1.0, 0.0), radial / radial_len, radial_len > 1e-6);
+    let dr_dy = (4.5 - 0.8) / max(cone_top_y - cone_bot_y, 1e-6);
+    return normalize(vec3<f32>(outward.x, -dr_dy, outward.y));
+}
 
-    if pos.y > mesh_top_y || pos.y < mesh_bot_y - 0.5 {
+fn resolve_filter_mesh_contact(pos: vec3<f32>, vel: vec3<f32>, dry_support_strength: f32) -> ContactResult {
+    let support = sample_filter_support(pos);
+    if !support.valid {
         return ContactResult(pos, vel);
     }
-
-    let ring_t = clamp((pos.y - mesh_bot_y) / (mesh_top_y - mesh_bot_y), 0.0, 1.0);
-    let ring_f = ring_t * f32(FILTER_RING_COUNT - 1u);
-    let ring_lo = u32(floor(ring_f));
-    let ring_hi = min(ring_lo + 1u, FILTER_RING_COUNT - 1u);
-    let ring_frac = ring_f - floor(ring_f);
-
-    let angle = atan2(pos.z, pos.x);
-    let seg_f = ((angle / (2.0 * 3.14159265) + 1.0) % 1.0) * f32(FILTER_SEGMENT_COUNT);
-    let seg_lo = u32(floor(seg_f)) % FILTER_SEGMENT_COUNT;
-    let seg_hi = (seg_lo + 1u) % FILTER_SEGMENT_COUNT;
-    let seg_frac = seg_f - floor(seg_f);
-
-    let v00 = filter_mesh[ring_lo * FILTER_SEGMENT_COUNT + seg_lo].xyz;
-    let v01 = filter_mesh[ring_lo * FILTER_SEGMENT_COUNT + seg_hi].xyz;
-    let v10 = filter_mesh[ring_hi * FILTER_SEGMENT_COUNT + seg_lo].xyz;
-    let v11 = filter_mesh[ring_hi * FILTER_SEGMENT_COUNT + seg_hi].xyz;
-
-    let ring_r_lo = mix(length(v00.xz), length(v01.xz), seg_frac);
-    let ring_r_hi = mix(length(v10.xz), length(v11.xz), seg_frac);
-    let ring_y_lo = mix(v00.y, v01.y, seg_frac);
-    let ring_y_hi = mix(v10.y, v11.y, seg_frac);
-    let mesh_r = mix(ring_r_lo, ring_r_hi, ring_frac);
 
     var out_pos = pos;
     var out_vel = vel;
 
     let radial = out_pos.xz;
     let radial_len = length(radial);
-    if mesh_r > 0.1 && radial_len > 1e-6 {
-        let barrier_r = mesh_r - contact_offset();
+    if support.surface_radius > 0.1 && radial_len > 1e-6 {
+        let barrier_r = support.surface_radius - contact_offset();
+        let wall_strength = filter_wall_contact_strength(out_pos, support, dry_support_strength);
+        if wall_strength > 1e-4 {
+            out_vel = project_dry_support_velocity(
+                out_vel,
+                support.surface_velocity,
+                support.surface_normal,
+                wall_strength,
+                true,
+            );
+        }
         if radial_len > barrier_r {
             let outward = radial / radial_len;
-            let dy = max(abs(ring_y_hi - ring_y_lo), 1e-5);
-            let dr_dy = (ring_r_hi - ring_r_lo) / dy;
-            // Keep position correction radial so particles can settle onto the
-            // filter instead of being lifted above it by an over-large normal
-            // projection. Use the local cone normal only for the velocity
-            // response so the contact still provides upward support.
-            let surface_normal = normalize(vec3<f32>(outward.x, -dr_dy, outward.y));
             let penetration = radial_len - barrier_r;
             out_pos.x -= outward.x * penetration;
             out_pos.z -= outward.y * penetration;
-
-            let vn = dot(out_vel, surface_normal);
-            if vn > 0.0 {
-                out_vel = out_vel - surface_normal * vn;
-                let vt = out_vel - surface_normal * dot(out_vel, surface_normal);
-                let vt_len = length(vt);
-                if vt_len > 1e-6 {
-                    let friction_impulse = min(friction() * abs(vn) * 2.4, vt_len);
-                    out_vel = out_vel - vt * (friction_impulse / vt_len);
-                }
-                out_vel *= bed_filter_contact_damping();
-                if vel.y < 0.0 && out_vel.y > 0.0 {
-                    out_vel.y = 0.0;
+            if wall_strength <= 1e-4 {
+                let vn = dot(out_vel, support.surface_normal);
+                if vn > 0.0 {
+                    out_vel = out_vel - support.surface_normal * vn;
+                    let vt = out_vel - support.surface_normal * dot(out_vel, support.surface_normal);
+                    let vt_len = length(vt);
+                    if vt_len > 1e-6 {
+                        let friction_impulse = min(friction() * abs(vn) * 2.4, vt_len);
+                        out_vel = out_vel - vt * (friction_impulse / vt_len);
+                    }
+                    out_vel *= 0.35;
+                    if vel.y < 0.0 && out_vel.y > 0.0 {
+                        out_vel.y = 0.0;
+                    }
                 }
             }
         }
@@ -478,19 +697,36 @@ fn resolve_filter_mesh_contact(pos: vec3<f32>, vel: vec3<f32>) -> ContactResult 
 
     // Apex floor: only keep particles from falling through the bottom tip.
     // The radial barrier handles the cone walls; this handles the point.
-    if out_pos.y < mesh_bot_y + contact_offset() {
-        out_pos.y = mesh_bot_y + contact_offset();
-        if out_vel.y < 0.0 {
+    let floor_y = support.mesh_bot_y + contact_offset();
+    let floor_distance = abs(floor_y - out_pos.y);
+    let floor_strength = dry_support_strength * filter_contact_band_strength(floor_distance);
+    if floor_strength > 1e-4 && out_pos.y <= floor_y + bed_filter_contact_band() {
+        out_vel = project_dry_support_velocity(
+            out_vel,
+            vec3<f32>(0.0),
+            vec3<f32>(0.0, 1.0, 0.0),
+            floor_strength,
+            true,
+        );
+    }
+    if out_pos.y < floor_y {
+        out_pos.y = floor_y;
+        if floor_strength <= 1e-4 && out_vel.y < 0.0 {
             out_vel.y = 0.0;
-            out_vel.x *= bed_filter_contact_damping() * (1.0 - friction() * 0.55);
-            out_vel.z *= bed_filter_contact_damping() * (1.0 - friction() * 0.55);
+            out_vel.x *= 0.35 * (1.0 - friction() * 0.55);
+            out_vel.z *= 0.35 * (1.0 - friction() * 0.55);
         }
     }
 
     return ContactResult(out_pos, out_vel);
 }
 
-fn resolve_scene_obstacles(position: vec3<f32>, velocity: vec3<f32>, is_bed: bool) -> ContactResult {
+fn resolve_scene_obstacles(
+    position: vec3<f32>,
+    velocity: vec3<f32>,
+    is_bed: bool,
+    dry_support_strength: f32,
+) -> ContactResult {
     var out_pos = position;
     var out_vel = velocity;
 
@@ -508,7 +744,7 @@ fn resolve_scene_obstacles(position: vec3<f32>, velocity: vec3<f32>, is_bed: boo
     // Paper filter (bed particles only): the filter mesh is a deformable
     // collision surface uploaded from the CPU cloth sim each frame.
     if is_bed && has_filter() {
-        let fc = resolve_filter_mesh_contact(out_pos, out_vel);
+        let fc = resolve_filter_mesh_contact(out_pos, out_vel, dry_support_strength);
         out_pos = fc.pos;
         out_vel = fc.vel;
     }
@@ -535,7 +771,12 @@ fn resolve_scene_obstacles(position: vec3<f32>, velocity: vec3<f32>, is_bed: boo
     return ContactResult(out_pos, out_vel);
 }
 
-fn resolve_sdf_contact(position: vec3<f32>, velocity: vec3<f32>, is_bed: bool) -> ContactResult {
+fn resolve_sdf_contact(
+    position: vec3<f32>,
+    velocity: vec3<f32>,
+    is_bed: bool,
+    dry_support_strength: f32,
+) -> ContactResult {
     var out_pos = position;
     var out_vel = velocity;
 
@@ -557,7 +798,7 @@ fn resolve_sdf_contact(position: vec3<f32>, velocity: vec3<f32>, is_bed: bool) -
         }
     }
 
-    let hard_contact = resolve_scene_obstacles(out_pos, out_vel, is_bed);
+    let hard_contact = resolve_scene_obstacles(out_pos, out_vel, is_bed, dry_support_strength);
     return ContactResult(hard_contact.pos, hard_contact.vel);
 }
 
@@ -570,66 +811,59 @@ fn clamp_velocity(v_in: vec3<f32>) -> vec3<f32> {
     return v;
 }
 
-fn project_solid_velocity_against_filter(velocity: vec3<f32>, cell_pos: vec3<f32>) -> vec3<f32> {
+fn project_solid_velocity_against_filter(velocity: vec3<f32>, cell_pos: vec3<f32>, cell_idx: u32) -> vec3<f32> {
     if !has_filter() { return velocity; }
 
-    let mesh_bot_y = filter_mesh[0].y;
-    let mesh_top_y = filter_mesh[(FILTER_RING_COUNT - 1u) * FILTER_SEGMENT_COUNT].y;
-
-    if cell_pos.y > mesh_top_y || cell_pos.y < mesh_bot_y - 0.5 {
+    let support = sample_filter_support(cell_pos);
+    if !support.valid {
         return velocity;
     }
 
-    let ring_t = clamp((cell_pos.y - mesh_bot_y) / (mesh_top_y - mesh_bot_y), 0.0, 1.0);
-    let ring_f = ring_t * f32(FILTER_RING_COUNT - 1u);
-    let ring_lo = u32(floor(ring_f));
-    let ring_hi = min(ring_lo + 1u, FILTER_RING_COUNT - 1u);
-    let ring_frac = ring_f - floor(ring_f);
-
-    let angle = atan2(cell_pos.z, cell_pos.x);
-    let seg_f = ((angle / (2.0 * 3.14159265) + 1.0) % 1.0) * f32(FILTER_SEGMENT_COUNT);
-    let seg_lo = u32(floor(seg_f)) % FILTER_SEGMENT_COUNT;
-    let seg_hi = (seg_lo + 1u) % FILTER_SEGMENT_COUNT;
-    let seg_frac = seg_f - floor(seg_f);
-
-    let v00 = filter_mesh[ring_lo * FILTER_SEGMENT_COUNT + seg_lo].xyz;
-    let v01 = filter_mesh[ring_lo * FILTER_SEGMENT_COUNT + seg_hi].xyz;
-    let v10 = filter_mesh[ring_hi * FILTER_SEGMENT_COUNT + seg_lo].xyz;
-    let v11 = filter_mesh[ring_hi * FILTER_SEGMENT_COUNT + seg_hi].xyz;
-
-    let ring_r_lo = mix(length(v00.xz), length(v01.xz), seg_frac);
-    let ring_r_hi = mix(length(v10.xz), length(v11.xz), seg_frac);
-    let ring_y_lo = mix(v00.y, v01.y, seg_frac);
-    let ring_y_hi = mix(v10.y, v11.y, seg_frac);
-    let mesh_r = mix(ring_r_lo, ring_r_hi, ring_frac);
-
     var v = velocity;
+    var dry_support_strength = 0.0;
+    let bed_idx = bed_lookup_load(cell_idx);
+    if bed_idx >= 0 {
+        let bid = u32(bed_idx);
+        let saturation = bed_particle_saturation(bid);
+        let compaction = bed_compaction(bid);
+        let dryness = 1.0 - smoothstep(0.0, 0.08, saturation);
+        let packing = smoothstep(0.0, 0.012, compaction);
+        dry_support_strength = dryness * packing;
+    }
     let radial = cell_pos.xz;
     let radial_len = length(radial);
 
-    if mesh_r > dx() && radial_len > 1e-6 {
-        let barrier_r = mesh_r - contact_offset();
+    if support.surface_radius > dx() && radial_len > 1e-6 {
+        let barrier_r = support.surface_radius - contact_offset();
+        let wall_strength = filter_wall_contact_strength(cell_pos, support, dry_support_strength);
+        if wall_strength > 1e-4 {
+            v = project_dry_support_velocity(
+                v,
+                support.surface_velocity,
+                support.surface_normal,
+                wall_strength,
+                true,
+            );
+        }
         if radial_len > barrier_r {
-            let outward = radial / radial_len;
-            let dy = max(abs(ring_y_hi - ring_y_lo), 1e-5);
-            let dr_dy = (ring_r_hi - ring_r_lo) / dy;
-            let surface_normal = normalize(vec3<f32>(outward.x, -dr_dy, outward.y));
-            let vn = dot(v, surface_normal);
-            if vn > 0.0 {
-                v = v - surface_normal * vn;
-                let vt = v - surface_normal * dot(v, surface_normal);
-                let vt_len = length(vt);
-                if vt_len > 1e-6 {
-                    let friction_impulse = min(friction() * abs(vn) * 2.0, vt_len);
-                    v = v - vt * (friction_impulse / vt_len);
-                }
-                v *= bed_filter_contact_damping();
-                if velocity.y < 0.0 && v.y > 0.0 {
-                    v.y = 0.0;
+            if wall_strength <= 1e-4 {
+                let vn = dot(v, support.surface_normal);
+                if vn > 0.0 {
+                    v = v - support.surface_normal * vn;
+                    let vt = v - support.surface_normal * dot(v, support.surface_normal);
+                    let vt_len = length(vt);
+                    if vt_len > 1e-6 {
+                        let friction_impulse = min(friction() * abs(vn) * 2.0, vt_len);
+                        v = v - vt * (friction_impulse / vt_len);
+                    }
+                    v *= 0.35;
+                    if velocity.y < 0.0 && v.y > 0.0 {
+                        v.y = 0.0;
+                    }
                 }
             }
         }
-    } else if radial_len > 1e-6 && radial_len > mesh_r {
+    } else if radial_len > 1e-6 && radial_len > support.surface_radius {
         let radial_dir = radial / radial_len;
         let radial_v = dot(vec2<f32>(v.x, v.z), radial_dir);
         if radial_v > 0.0 {
@@ -638,7 +872,8 @@ fn project_solid_velocity_against_filter(velocity: vec3<f32>, cell_pos: vec3<f32
         }
     }
 
-    if cell_pos.y < mesh_bot_y + dx() && v.y < 0.0 {
+    let floor_y = support.mesh_bot_y + contact_offset();
+    if cell_pos.y < floor_y + dx() && v.y < 0.0 {
         v.y = 0.0;
     }
 
@@ -748,8 +983,7 @@ fn p2g(@builtin(global_invocation_id) gid: vec3<u32>) {
     var aff_col1 = vec3<f32>(mass_p * C1.x, mass_p * C1.y, mass_p * C1.z);
     var aff_col2 = vec3<f32>(mass_p * C2.x, mass_p * C2.y, mass_p * C2.z);
     if is_bed {
-        let packing_factor = clamp(uniform_porosity() / max(bed_porosity, 1e-3), 0.8, 1.45);
-        let PFt = bed_fixed_corotated_stress(pid, J) * packing_factor;
+        let PFt = bed_fixed_corotated_stress(pid, J);
         let stress_affine = PFt * (-dt() * p_vol() * 4.0 * inv_dx() * inv_dx());
         aff_col0 += vec3<f32>(stress_affine[0].x, stress_affine[0].y, stress_affine[0].z);
         aff_col1 += vec3<f32>(stress_affine[1].x, stress_affine[1].y, stress_affine[1].z);
@@ -1317,7 +1551,7 @@ fn boundary_project(@builtin(global_invocation_id) gid: vec3<u32>) {
     let gv_s = grid_vel[solid_idx];
     if gv_s.w > 1e-6 {
         var v_s = project_grid_velocity(gv_s.xyz, cell_pos, sdf_val, n, bmin, bmax);
-        v_s = project_solid_velocity_against_filter(v_s, cell_pos);
+        v_s = project_solid_velocity_against_filter(v_s, cell_pos, idx);
         grid_vel[solid_idx] = vec4<f32>(v_s, gv_s.w);
     }
 }
@@ -1363,6 +1597,7 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>) {
     var new_C2 = vec3<f32>(0.0);
     var supported_weight = 0.0;
     var local_grid_mass = 0.0;
+    var local_fluid_mass = 0.0;
     let is_bed = phase >= 0.5;
 
     let B = 4.0 * inv_dx() * inv_dx();
@@ -1383,6 +1618,9 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>) {
                 let grid_v = grid_vel[vel_idx].xyz;
                 let dpos = (vec3<f32>(offset) - fx) * cell_dx;
                 let grid_mass = grid_vel[vel_idx].w;
+                if is_bed {
+                    local_fluid_mass += w * grid_vel[ci].w;
+                }
 
                 if grid_mass > 1e-6 {
                     new_v += w * grid_v;
@@ -1410,11 +1648,15 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     var J_new = 1.0;
+    var dry_floor_strength = 0.0;
     if is_bed {
         let F_old0 = bed_F_col0(pid);
         let F_old1 = bed_F_col1(pid);
         let F_old2 = bed_F_col2(pid);
-        let alpha_old = bed_plastic_alpha(pid);
+        let compaction_old = bed_compaction(pid);
+        let settled_old = bed_settled_activation(pid);
+        let rest_porosity = bed_rest_porosity(pid);
+        let rest_perm = bed_rest_permeability(pid);
         let saturation = bed_particle_saturation(pid);
         let F_old = mat3x3<f32>(F_old0, F_old1, F_old2);
         let F_step = mat3x3<f32>(
@@ -1423,13 +1665,11 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>) {
             vec3<f32>(dt() * new_C2.x, dt() * new_C2.y, 1.0 + dt() * new_C2.z),
         );
         var F_new = F_step * F_old;
-        let plasticity = project_bed_drucker_prager(F_new, saturation, alpha_old);
-        F_new = plasticity.F;
         var F_new0 = F_new[0];
         var F_new1 = F_new[1];
         var F_new2 = F_new[2];
         let detF_raw = max(determinant_from_cols(F_new0, F_new1, F_new2), 1e-5);
-        let detF_clamped = clamp(detF_raw, 0.5, 1.5);
+        let detF_clamped = clamp(detF_raw, 0.85, 1.45);
         if abs(detF_clamped - detF_raw) > 1e-5 {
             let scale = pow(detF_clamped / detF_raw, 1.0 / 3.0);
             F_new0 *= scale;
@@ -1437,13 +1677,114 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>) {
             F_new2 *= scale;
             F_new = mat3x3<f32>(F_new0, F_new1, F_new2);
         }
+        let support_factor = compaction_support_factor(support_ratio);
+        let compression_factor = compaction_compression_factor(detF_clamped);
+        let dryness_factor = compaction_dryness_factor(saturation);
+        let motion_factor = compaction_motion_factor(new_v.y);
+        let rest_factor = compaction_rest_factor(length(new_v));
+        let phase_factor = dry_settle_compaction_window();
+        let compaction_drive = max(motion_factor, 0.75 * rest_factor);
+        let delta_compaction = min(
+            dt() * 1.10 * support_factor * compression_factor * dryness_factor * compaction_drive
+                * phase_factor,
+            0.01,
+        );
+        let compaction_new = clamp(compaction_old + delta_compaction, 0.0, 0.12);
+        let raw_contact_strength =
+            raw_dry_contact_strength(saturation, support_ratio, local_grid_mass);
+        let near_rest_support = settled_rest_factor(length(new_v));
+        let static_support =
+            settled_support_ratio_factor(support_ratio) * near_rest_support;
+        let packed_support = raw_contact_strength * max(
+            smoothstep(0.004, 0.016, compaction_new),
+            0.55 * static_support,
+        );
+        let settled_new = update_settled_activation(
+            settled_old,
+            saturation,
+            compaction_new,
+            support_ratio,
+            local_grid_mass,
+            local_fluid_mass,
+            length(new_v),
+            packed_support,
+        );
+        dry_floor_strength = packed_support;
+        let support_hold = max(packed_support, raw_contact_strength * static_support);
+        let relax_activation = max(0.85 * support_hold, 0.45 * raw_contact_strength * near_rest_support);
+        let relax_factor = min(dt() * 3.2 * relax_activation, 0.12);
+        if relax_factor > 0.0 {
+            F_new0 = mix(F_new0, vec3<f32>(1.0, 0.0, 0.0), relax_factor);
+            F_new1 = mix(F_new1, vec3<f32>(0.0, 1.0, 0.0), relax_factor);
+            F_new2 = mix(F_new2, vec3<f32>(0.0, 0.0, 1.0), relax_factor);
+            let det_relaxed_raw = max(determinant_from_cols(F_new0, F_new1, F_new2), 1e-5);
+            let det_relaxed_clamped = clamp(det_relaxed_raw, 0.85, 1.45);
+            if abs(det_relaxed_clamped - det_relaxed_raw) > 1e-5 {
+                let scale = pow(det_relaxed_clamped / det_relaxed_raw, 1.0 / 3.0);
+                F_new0 *= scale;
+                F_new1 *= scale;
+                F_new2 *= scale;
+            }
+        }
+        // A dry supported pile should shed residual affine flow as it comes to
+        // rest instead of continuing to circulate APIC shear internally.
+        let affine_rest_damping = min(dt() * 24.0 * relax_activation, 0.94);
+        if affine_rest_damping > 0.0 {
+            new_C0 *= 1.0 - affine_rest_damping;
+            new_C1 *= 1.0 - affine_rest_damping;
+            new_C2 *= 1.0 - affine_rest_damping;
+        }
+        if support_hold > 1e-4 {
+            let support_damping = min(dt() * 8.0 * support_hold, 0.24);
+            new_v.x *= 1.0 - support_damping;
+            new_v.z *= 1.0 - support_damping;
+            if new_v.y < 0.0 {
+                let vertical_hold = min(dt() * 14.0 * support_hold, 0.40);
+                new_v.y *= 1.0 - vertical_hold;
+            }
+        }
+        if packed_support > 1e-4 {
+            let support_damping = min(dt() * 6.0 * packed_support, 0.16);
+            new_v.x *= 1.0 - support_damping;
+            new_v.z *= 1.0 - support_damping;
+            if new_v.y < 0.0 {
+                let vertical_hold = min(dt() * 12.0 * packed_support, 0.30);
+                new_v.y *= 1.0 - vertical_hold;
+            }
+        }
+        let rest_damping = min(dt() * 12.0 * relax_activation, 0.34);
+        if rest_damping > 0.0 {
+            new_v *= 1.0 - rest_damping;
+            if length(new_v) < 0.06 && relax_activation > 0.22 {
+                new_v = vec3<f32>(0.0);
+                new_C0 = vec3<f32>(0.0);
+                new_C1 = vec3<f32>(0.0);
+                new_C2 = vec3<f32>(0.0);
+            }
+        }
+        let cone_hold_activation =
+            smoothstep(0.01, 0.03, compaction_new) * smoothstep(0.10, 0.35, settled_new);
+        if has_filter() && support_hold > 1e-4 && cone_hold_activation > 1e-4
+            && xp.y >= -3.0 && xp.y <= 3.0 {
+            let cone_support = clamp(0.85 * support_hold * cone_hold_activation, 0.0, 1.0);
+            new_v = project_dry_support_velocity(
+                new_v,
+                vec3<f32>(0.0),
+                static_cone_support_normal(xp),
+                cone_support,
+                true,
+            );
+        }
         var be = bed_extract[pid];
-        be.mech0 = vec4<f32>(F_new0, 0.0);
-        be.mech1 = vec4<f32>(F_new1, 0.0);
-        be.mech2 = vec4<f32>(F_new2, 0.0);
-        be.mech0.w = plasticity.alpha;
+        be.mech0 = vec4<f32>(F_new0, compaction_new);
+        be.mech1 = vec4<f32>(F_new1, rest_porosity);
+        be.mech2 = vec4<f32>(F_new2, rest_perm);
+        be.bed.y = runtime_porosity(rest_porosity, compaction_new);
+        be.bed.z = runtime_permeability(rest_perm, compaction_new);
+        be.extract.z = settled_new;
+        be.extract.w = bed_particle_saturation(pid);
         bed_extract[pid] = be;
-        J_new = detF_clamped;
+        J_new = clamp(determinant_from_cols(F_new0, F_new1, F_new2), 0.85, 1.45);
     }
 
     // Advect
@@ -1452,9 +1793,9 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>) {
     // Particle-level boundary projection closes the gap left by the grid-only
     // collision pass so the dripper wall behaves like a hard barrier.
     let mid_pos = mix(xp, new_pos, 0.5);
-    var contact = resolve_sdf_contact(mid_pos, new_v, is_bed);
+    var contact = resolve_sdf_contact(mid_pos, new_v, is_bed, dry_floor_strength);
     new_v = contact.vel;
-    contact = resolve_sdf_contact(new_pos, new_v, is_bed);
+    contact = resolve_sdf_contact(new_pos, new_v, is_bed, dry_floor_strength);
     new_pos = contact.pos;
     new_v = contact.vel;
 
@@ -1497,25 +1838,39 @@ fn bed_coupling(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     var be = bed_extract[u32(bed_idx)];
-    let saturation = be.extract.w;
-
-    let capacity = max(max_saturation() - be.bed.x, 0.0);
+    let saturation = bed_particle_saturation(u32(bed_idx));
+    let capacity = max(bed_particle_capacity(u32(bed_idx)) - be.bed.x, 0.0);
     if capacity <= 1e-6 {
         return;
     }
 
     let mass_p = particles[pid].vel.w;
-    let abs_rate = absorption_rate() * (1.0 - saturation) * dt();
+    let permeability_scale = clamp(
+        bed_particle_permeability(u32(bed_idx)) / max(uniform_permeability(), 1e-5),
+        0.05,
+        1.8,
+    );
+    let abs_rate = absorption_rate() * permeability_scale * (1.0 - saturation) * dt();
     let speed = length(particles[pid].vel.xyz);
     var absorbed = min(min(mass_p * clamp(abs_rate, 0.0, 0.25), mass_p * 0.5), capacity);
     let remaining_after_partial = mass_p - absorbed;
     let retire_threshold = nominal_mass() * 0.22;
     if remaining_after_partial > 0.0 && remaining_after_partial <= retire_threshold {
-        absorbed = min(mass_p, capacity);
+        if capacity >= mass_p {
+            absorbed = mass_p;
+        } else {
+            let safe_partial = max(mass_p - inactive_mass_threshold(), 0.0);
+            absorbed = min(min(absorbed, safe_partial), capacity);
+        }
     } else if saturation > 0.55 && speed < 1.35 {
         let almost_absorbed = min(mass_p, capacity);
         if mass_p - almost_absorbed <= nominal_mass() * 0.35 {
-            absorbed = almost_absorbed;
+            if capacity >= mass_p {
+                absorbed = mass_p;
+            } else {
+                let safe_partial = max(mass_p - inactive_mass_threshold(), 0.0);
+                absorbed = min(min(absorbed, safe_partial), capacity);
+            }
         }
     }
     if absorbed <= 1e-6 {
@@ -1641,8 +1996,8 @@ fn extraction_advect(@builtin(global_invocation_id) gid: vec3<u32>) {
     let local_capacity = bed_particle_capacity(bid);
     if abs(absorbed) > 0.0 {
         be.bed.x = clamp(be.bed.x + absorbed, 0.0, local_capacity);
-        be.extract.w = be.bed.x / local_capacity;
     }
+    be.extract.w = be.bed.x / local_capacity;
     let sat = be.extract.w;
 
     if sat > 0.01 {
@@ -1670,7 +2025,7 @@ fn prepare_render(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     var color_t = 0.0;
-    var size_scale = 1.0;
+    var radius = water_particle_radius();
     if phase < 0.5 {
         let speed = length(p.vel.xyz);
         color_t = clamp(speed / 10.0, 0.0, 2.0);
@@ -1679,15 +2034,13 @@ fn prepare_render(@builtin(global_invocation_id) gid: vec3<u32>) {
         var sat = 0.0;
         if bed_idx < num_bed() {
             sat = bed_particle_saturation(bed_idx);
-            let permeability_ratio =
-                bed_particle_permeability(bed_idx) / max(uniform_permeability(), 1e-5);
-            size_scale = clamp(pow(permeability_ratio, 0.18), 0.68, 1.42);
+            radius = bed_particle_render_radius(bed_idx);
         }
         color_t = -1.0 - sat;
     }
 
     render_data[pid].primary = vec4<f32>(p.pos.xyz, color_t);
-    render_data[pid].aux = vec4<f32>(size_scale, 0.0, 0.0, 0.0);
+    render_data[pid].aux = vec4<f32>(radius, 0.0, 0.0, 0.0);
 }
 
 // ── metrics_clear ──

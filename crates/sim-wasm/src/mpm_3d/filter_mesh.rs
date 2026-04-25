@@ -113,6 +113,7 @@ impl FilterMesh {
         mesh
     }
 
+    #[allow(dead_code)]
     pub(crate) fn step_with_ring_loads(&mut self, dt: f32, ring_loads: &[f32; RING_COUNT]) {
         if !dt.is_finite() || dt <= 0.0 {
             return;
@@ -213,6 +214,10 @@ impl FilterMesh {
 
     pub(crate) fn positions(&self) -> &[Vec3] {
         &self.positions
+    }
+
+    pub(crate) fn previous_positions(&self) -> &[Vec3] {
+        &self.prev_positions
     }
 
     pub(crate) fn render_vertices(&self) -> &[[f32; 3]] {

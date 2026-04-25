@@ -1,0 +1,1 @@
+Let's focus on fixing the heuristics in Milestones 1 and 2. Heuristics are okay if they're needed for performance so

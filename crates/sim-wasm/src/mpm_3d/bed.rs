@@ -64,7 +64,7 @@ impl BedConfig {
         // `f32::clamp` panics when `min > max`, so fall back to `(min + max) * 0.5`
         // whenever the filter is too narrow to host the bed with the requested margins.
         let (top_min, top_max) = order_bounds(filter_bot_abs + 0.35, filter_top_abs - 0.35);
-        let top_abs = (bed.center.y + bed.top_y).clamp(top_min, top_max);
+        let top_abs = ((bed.center.y + bed.top_y) - 0.22).clamp(top_min, top_max);
 
         // Start the dry bed already packed close to the filter apex instead of
         // with a large flat-bottom gap that would require granular settling to
@@ -93,8 +93,21 @@ impl BedConfig {
             order_bounds(filter.opening_radius() + 0.06, bed.top_radius - 0.25);
         bed.bot_radius = (filter.inner_radius_at_y(bot_local) - 0.04).clamp(bot_r_min, bot_r_max);
 
+        // A preloaded bed should start seated in the filter, not as a second
+        // "grounds being poured" scenario. Poured grounds can use a different
+        // config path with nonzero drop height and spawn jitter.
+        bed.spawn_drop_height = 0.0;
+        bed.spawn_radius_scale = 1.0;
+        bed.spawn_jitter = 0.0;
+
         bed
     }
+}
+
+fn uses_preloaded_spawn(config: &BedConfig) -> bool {
+    config.spawn_drop_height.abs() <= f32::EPSILON
+        && (config.spawn_radius_scale - 1.0).abs() <= f32::EPSILON
+        && config.spawn_jitter.abs() <= f32::EPSILON
 }
 
 fn order_bounds(min: f32, max: f32) -> (f32, f32) {
@@ -158,6 +171,8 @@ pub(crate) fn init_bed_particles(
     let mut bed_extracts = Vec::new();
     let mut lattice_to_particle = HashMap::new();
 
+    let preloaded_spawn = uses_preloaded_spawn(config);
+
     for iy in 0..ny {
         let y = config.center.y + config.bot_y + (iy as f32 + 0.5) * spacing;
         let t = (y - (config.center.y + config.bot_y)) / height;
@@ -179,10 +194,17 @@ pub(crate) fn init_bed_particles(
                 lattice_to_particle.insert(LatticeKey { ix, iy, iz }, particle_index);
                 let hydraulic = sample_bed_hydraulics(config, ix, iy, iz);
                 let spawn_jitter = sample_spawn_jitter(config, ix, iy, iz, spacing);
-                let spawn_scale = (config.spawn_radius_scale + (1.0 - t) * 0.06).clamp(0.55, 1.1);
+                let spawn_scale = if preloaded_spawn {
+                    1.0
+                } else {
+                    (config.spawn_radius_scale + (1.0 - t) * 0.06).clamp(0.55, 1.1)
+                };
                 let spawn_x = config.center.x + dx * spawn_scale + spawn_jitter.x;
-                let spawn_y =
-                    y + config.spawn_drop_height + spawn_jitter.y + (1.0 - t) * spacing * 0.35;
+                let spawn_y = if preloaded_spawn {
+                    y
+                } else {
+                    y + config.spawn_drop_height + spawn_jitter.y + (1.0 - t) * spacing * 0.35
+                };
                 let spawn_z = config.center.z + dz * spawn_scale + spawn_jitter.z;
 
                 // Particle: pos(x,y,z,J=1), vel(0,0,0,mass=1)
@@ -192,8 +214,10 @@ pub(crate) fn init_bed_particles(
                 affines.push([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
                 // BedExtract:
                 //   bed(pore_water, porosity, permeability, capacity_scale)
-                //   extract(extractable, dissolved, temp, saturation)
-                //   mech0/1/2 = bed-only deformation gradient F columns
+                //   extract(extractable, dissolved, settled_activation, saturation_cache)
+                //   mech0.xyz = elastic F col0, mech0.w = compaction
+                //   mech1.xyz = elastic F col1, mech1.w = rest porosity
+                //   mech2.xyz = elastic F col2, mech2.w = rest permeability
                 bed_extracts.push([
                     0.0,
                     hydraulic.porosity,
@@ -201,11 +225,6 @@ pub(crate) fn init_bed_particles(
                     hydraulic.capacity_scale,
                     config.extractable_mass,
                     0.0,
-                    93.0,
-                    0.0,
-                    1.0,
-                    0.0,
-                    0.0,
                     0.0,
                     0.0,
                     1.0,
@@ -214,7 +233,12 @@ pub(crate) fn init_bed_particles(
                     0.0,
                     0.0,
                     1.0,
-                    0.0, // mech0.w = accumulated plastic strain alpha
+                    0.0,
+                    hydraulic.porosity,
+                    0.0,
+                    0.0,
+                    1.0,
+                    hydraulic.permeability,
                 ]);
             }
         }
@@ -462,14 +486,17 @@ mod tests {
             assert!(extract[1] >= 0.24 && extract[1] <= 0.58);
             assert!(extract[2] >= 0.0002 && extract[2] <= 0.02);
             assert!(extract[3] >= 0.72 && extract[3] <= 1.38);
-            // extract: extractable, dissolved, temp, saturation
+            // extract: extractable, dissolved, settled activation, saturation cache
             assert!((extract[4] - cfg.extractable_mass).abs() < 1e-6);
             assert_eq!(extract[5], 0.0);
+            assert_eq!(extract[6], 0.0);
             assert_eq!(extract[7], 0.0);
             // mech: F starts at identity for dry bed particles
             assert_eq!(extract[8], 1.0);
             assert_eq!(extract[13], 1.0);
             assert_eq!(extract[18], 1.0);
+            assert!((extract[15] - extract[1]).abs() < 1e-6);
+            assert!((extract[19] - extract[2]).abs() < 1e-6);
             assert_eq!(extract[11], 0.0);
         }
     }
@@ -636,5 +663,33 @@ mod tests {
         assert!(bed_top_abs <= filter_top_abs - 0.3);
         assert!(bed_bot_abs >= filter_bot_abs + 0.05);
         assert!(bed_bot_abs <= filter_bot_abs + 0.26);
+    }
+
+    #[test]
+    fn seated_in_filter_starts_as_preloaded_bed() {
+        let filter = FilterConfig::default();
+        let bed = BedConfig::seated_in_filter(&filter);
+
+        assert_eq!(bed.spawn_drop_height, 0.0);
+        assert_eq!(bed.spawn_radius_scale, 1.0);
+        assert_eq!(bed.spawn_jitter, 0.0);
+    }
+
+    #[test]
+    fn preloaded_spawn_does_not_add_vertical_lift() {
+        let filter = FilterConfig::default();
+        let cfg = BedConfig::seated_in_filter(&filter);
+        let init = init_bed_particles(&cfg, [48, 48, 48], Vec3::new(16.0, 16.0, 16.0));
+        let max_y = init
+            .particles
+            .iter()
+            .map(|particle| particle[1])
+            .fold(f32::MIN, f32::max);
+
+        assert!(
+            max_y <= cfg.center.y + cfg.top_y,
+            "preloaded spawn still injected an upward lift: max_y={max_y} top_y={}",
+            cfg.center.y + cfg.top_y,
+        );
     }
 }
