@@ -70,13 +70,11 @@ impl BedConfig {
             filter.opening_radius() + 0.8,
             filter.top_radius - filter.thickness - 0.1,
         );
-        bed.top_radius =
-            (filter.inner_radius_at_y(top_local) - 0.18).clamp(top_r_min, top_r_max);
+        bed.top_radius = (filter.inner_radius_at_y(top_local) - 0.18).clamp(top_r_min, top_r_max);
 
         let (bot_r_min, bot_r_max) =
             order_bounds(filter.opening_radius() + 0.32, bed.top_radius - 0.25);
-        bed.bot_radius =
-            (filter.inner_radius_at_y(bot_local) - 0.12).clamp(bot_r_min, bot_r_max);
+        bed.bot_radius = (filter.inner_radius_at_y(bot_local) - 0.12).clamp(bot_r_min, bot_r_max);
 
         bed
     }
@@ -124,9 +122,7 @@ pub(crate) fn init_bed_particles(
 
     let avg_radius = (config.top_radius + config.bot_radius) * 0.5;
     let volume = std::f32::consts::PI * avg_radius * avg_radius * height / 3.0
-        * (1.0
-            + config.bot_radius / avg_radius
-            + (config.bot_radius / avg_radius).powi(2));
+        * (1.0 + config.bot_radius / avg_radius + (config.bot_radius / avg_radius).powi(2));
     let spacing = (volume / config.num_particles.max(1) as f32).cbrt();
 
     let nx = ((config.top_radius * 2.0) / spacing).ceil() as i32;
@@ -232,7 +228,11 @@ fn build_cell_lookup(
 ) -> Vec<i32> {
     let [gx, gy, gz] = grid_dims;
     let mut lookup = vec![-1; (gx * gy * gz) as usize];
-    let grid_origin = Vec3::new(-bounds_size.x * 0.5, -bounds_size.y * 0.5, -bounds_size.z * 0.5);
+    let grid_origin = Vec3::new(
+        -bounds_size.x * 0.5,
+        -bounds_size.y * 0.5,
+        -bounds_size.z * 0.5,
+    );
     let dx = bounds_size.x / gx as f32;
     let height = config.top_y - config.bot_y;
     let bed_bottom = config.center.y + config.bot_y;
@@ -259,8 +259,10 @@ fn build_cell_lookup(
                 }
 
                 let iy_guess = (((pos.y - bed_bottom) / spacing) - 0.5).round() as i32;
-                let ix_guess = (((pos.x - (config.center.x - max_r)) / spacing) - 0.5).round() as i32;
-                let iz_guess = (((pos.z - (config.center.z - max_r)) / spacing) - 0.5).round() as i32;
+                let ix_guess =
+                    (((pos.x - (config.center.x - max_r)) / spacing) - 0.5).round() as i32;
+                let iz_guess =
+                    (((pos.z - (config.center.z - max_r)) / spacing) - 0.5).round() as i32;
 
                 let mut best = -1;
                 let mut best_dist2 = f32::INFINITY;
@@ -277,7 +279,8 @@ fn build_cell_lookup(
                             };
                             let py = bed_bottom + (key.iy as f32 + 0.5) * spacing;
                             let py_t = ((py - bed_bottom) / height).clamp(0.0, 1.0);
-                            let py_r = config.bot_radius + (config.top_radius - config.bot_radius) * py_t;
+                            let py_r =
+                                config.bot_radius + (config.top_radius - config.bot_radius) * py_t;
                             let px = config.center.x - py_r + (key.ix as f32 + 0.5) * spacing;
                             let pz = config.center.z - py_r + (key.iz as f32 + 0.5) * spacing;
                             let ddx = pos.x - px;

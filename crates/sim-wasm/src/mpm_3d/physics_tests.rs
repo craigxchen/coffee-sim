@@ -66,7 +66,13 @@ fn readback_mass_snapshot(
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("mass readback"),
     });
-    encoder.copy_buffer_to_buffer(&sim.buffers.particles, 0, &particle_staging, 0, particle_size);
+    encoder.copy_buffer_to_buffer(
+        &sim.buffers.particles,
+        0,
+        &particle_staging,
+        0,
+        particle_size,
+    );
     encoder.copy_buffer_to_buffer(&sim.buffers.bed_extract, 0, &bed_staging, 0, bed_size);
     queue.submit(Some(encoder.finish()));
 
@@ -196,29 +202,46 @@ fn readback_diag_snapshot_range(
         let j = data[i * 8 + 3];
         let y = data[i * 8 + 1];
 
-        all_finite &= x.is_finite()
-            && y.is_finite()
-            && z.is_finite()
-            && j.is_finite()
-            && mass.is_finite();
+        all_finite &=
+            x.is_finite() && y.is_finite() && z.is_finite() && j.is_finite() && mass.is_finite();
 
         if mass <= inactive_thresh {
             continue;
         }
         active_count += 1;
         total_mass += mass;
-        if mass < min_mass { min_mass = mass; }
-        if mass > max_mass { max_mass = mass; }
-        if x < x_min { x_min = x; }
-        if x > x_max { x_max = x; }
-        if y < y_min { y_min = y; }
-        if y > y_max { y_max = y; }
-        if z < z_min { z_min = z; }
-        if z > z_max { z_max = z; }
+        if mass < min_mass {
+            min_mass = mass;
+        }
+        if mass > max_mass {
+            max_mass = mass;
+        }
+        if x < x_min {
+            x_min = x;
+        }
+        if x > x_max {
+            x_max = x;
+        }
+        if y < y_min {
+            y_min = y;
+        }
+        if y > y_max {
+            y_max = y;
+        }
+        if z < z_min {
+            z_min = z;
+        }
+        if z > z_max {
+            z_max = z;
+        }
         y_sum += y;
         j_sum += j;
-        if j < j_min { j_min = j; }
-        if j > j_max { j_max = j; }
+        if j < j_min {
+            j_min = j;
+        }
+        if j > j_max {
+            j_max = j;
+        }
     }
     drop(view);
     staging.unmap();
@@ -251,7 +274,13 @@ fn readback_diag_snapshot(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
 ) -> DiagSnapshot {
-    readback_diag_snapshot_range(sim, device, queue, 0, (sim.num_water + sim.num_bed) as usize)
+    readback_diag_snapshot_range(
+        sim,
+        device,
+        queue,
+        0,
+        (sim.num_water + sim.num_bed) as usize,
+    )
 }
 
 fn readback_bed_diag_snapshot(
