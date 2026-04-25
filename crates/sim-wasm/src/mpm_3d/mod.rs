@@ -255,10 +255,11 @@ impl MpmSim3D {
 
     fn upload_filter_mesh_positions(&self, queue: &wgpu::Queue) {
         if let Some(mesh) = &self.filter_mesh {
-            let data: Vec<[f32; 4]> = mesh
+            let data: Vec<[f32; 8]> = mesh
                 .positions()
                 .iter()
-                .map(|p| [p.x, p.y, p.z, 0.0])
+                .zip(mesh.previous_positions().iter())
+                .map(|(p, prev)| [p.x, p.y, p.z, 0.0, prev.x, prev.y, prev.z, 0.0])
                 .collect();
             queue.write_buffer(
                 &self.buffers.filter_mesh_positions,
@@ -414,15 +415,10 @@ impl MpmSim3D {
         // `refresh_metrics` itself, which keeps the staging buffer idle
         // between snapshot requests.
 
-        // The filter mesh is a CPU-side cloth scaffold with no fluid coupling,
-        // so stepping it once per frame at the full `dt` is enough — there is
-        // no benefit to running it per-substep and it would otherwise scale
-        // CPU cost linearly with `substeps`.
-        if let Some(mesh) = &mut self.filter_mesh {
-            let ring_loads = compute_ring_loads(&self.settings, self.num_bed, self.num_water);
-            mesh.step_with_ring_loads(dt, &ring_loads);
-        }
-        self.upload_filter_mesh_positions(queue);
+        // Keep the filter static for now. The CPU cloth scaffold is still
+        // available for future work, but driving solver contact from a moving
+        // synthetic mesh injects wobble back into the bed and costs an extra
+        // per-frame upload.
     }
 
     pub fn reset(&mut self, queue: &wgpu::Queue, _device: &wgpu::Device) {
@@ -646,6 +642,7 @@ impl MpmSim3D {
     }
 }
 
+#[allow(dead_code)]
 fn compute_ring_loads(settings: &MpmSettings, num_bed: u32, num_water: u32) -> [f32; RING_COUNT] {
     let water_factor = if settings.max_particles > 0 {
         (num_water as f32 / settings.max_particles as f32).clamp(0.0, 2.0)

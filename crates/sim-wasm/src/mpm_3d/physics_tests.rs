@@ -128,6 +128,24 @@ struct DiagSnapshot {
     max_j: f32,
 }
 
+#[derive(Debug)]
+struct BedStateSnapshot {
+    all_finite: bool,
+    compactions: Vec<f32>,
+    settled_activations: Vec<f32>,
+    mean_compaction: f32,
+    max_compaction: f32,
+    mean_settled_activation: f32,
+    max_settled_activation: f32,
+    mean_porosity: f32,
+    min_porosity: f32,
+    max_porosity: f32,
+    mean_permeability: f32,
+    min_permeability: f32,
+    max_permeability: f32,
+    max_saturation_cache_error: f32,
+}
+
 fn readback_diag_snapshot_range(
     sim: &MpmSim3D,
     device: &wgpu::Device,
@@ -252,6 +270,114 @@ fn readback_bed_diag_snapshot(
     queue: &wgpu::Queue,
 ) -> DiagSnapshot {
     readback_diag_snapshot_range(sim, device, queue, 0, sim.num_bed as usize)
+}
+
+fn readback_bed_state_snapshot(
+    sim: &MpmSim3D,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+) -> BedStateSnapshot {
+    let bed_size = (sim.num_bed as usize * 80).max(4) as u64;
+    let staging = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("bed state staging"),
+        size: bed_size,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("bed state readback"),
+    });
+    encoder.copy_buffer_to_buffer(&sim.buffers.bed_extract, 0, &staging, 0, bed_size);
+    queue.submit(Some(encoder.finish()));
+
+    let slice = staging.slice(..);
+    let (tx, rx) = mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |result| {
+        tx.send(result).expect("bed state map callback");
+    });
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+    rx.recv()
+        .expect("bed state map recv")
+        .expect("bed state map");
+
+    let view = slice.get_mapped_range();
+    let data = cast_slice::<u8, f32>(&view);
+    let base_capacity = if sim.num_bed > 0 {
+        TARGET_BED_RETENTION_ML * MASS_UNITS_PER_ML / sim.num_bed as f32
+    } else {
+        0.7
+    };
+
+    let mut all_finite = true;
+    let mut compactions = Vec::with_capacity(sim.num_bed as usize);
+    let mut settled_activations = Vec::with_capacity(sim.num_bed as usize);
+    let mut compaction_sum = 0.0_f32;
+    let mut max_compaction = 0.0_f32;
+    let mut settled_sum = 0.0_f32;
+    let mut max_settled_activation = 0.0_f32;
+    let mut porosity_sum = 0.0_f32;
+    let mut min_porosity = f32::MAX;
+    let mut max_porosity = f32::MIN;
+    let mut perm_sum = 0.0_f32;
+    let mut min_perm = f32::MAX;
+    let mut max_perm = f32::MIN;
+    let mut max_saturation_cache_error = 0.0_f32;
+
+    for i in 0..sim.num_bed as usize {
+        let base = i * 20;
+        let pore = data[base];
+        let porosity = data[base + 1];
+        let permeability = data[base + 2];
+        let capacity_scale = data[base + 3];
+        let settled_activation = data[base + 6];
+        let saturation_cache = data[base + 7];
+        let compaction = data[base + 11];
+        let capacity = (base_capacity * capacity_scale.max(0.2)).max(1e-6);
+        let saturation = (pore / capacity).clamp(0.0, 1.0);
+
+        all_finite &= pore.is_finite()
+            && porosity.is_finite()
+            && permeability.is_finite()
+            && settled_activation.is_finite()
+            && saturation_cache.is_finite()
+            && compaction.is_finite();
+
+        compactions.push(compaction);
+        settled_activations.push(settled_activation);
+        compaction_sum += compaction;
+        max_compaction = max_compaction.max(compaction);
+        settled_sum += settled_activation;
+        max_settled_activation = max_settled_activation.max(settled_activation);
+        porosity_sum += porosity;
+        min_porosity = min_porosity.min(porosity);
+        max_porosity = max_porosity.max(porosity);
+        perm_sum += permeability;
+        min_perm = min_perm.min(permeability);
+        max_perm = max_perm.max(permeability);
+        max_saturation_cache_error =
+            max_saturation_cache_error.max((saturation_cache - saturation).abs());
+    }
+    drop(view);
+    staging.unmap();
+
+    let n = sim.num_bed.max(1) as f32;
+    BedStateSnapshot {
+        all_finite,
+        compactions,
+        settled_activations,
+        mean_compaction: compaction_sum / n,
+        max_compaction,
+        mean_settled_activation: settled_sum / n,
+        max_settled_activation,
+        mean_porosity: porosity_sum / n,
+        min_porosity: if sim.num_bed > 0 { min_porosity } else { 0.0 },
+        max_porosity: if sim.num_bed > 0 { max_porosity } else { 0.0 },
+        mean_permeability: perm_sum / n,
+        min_permeability: if sim.num_bed > 0 { min_perm } else { 0.0 },
+        max_permeability: if sim.num_bed > 0 { max_perm } else { 0.0 },
+        max_saturation_cache_error,
+    }
 }
 
 // ── Pipeline validation ──
@@ -472,12 +598,39 @@ fn bed_settling_stability() {
         "bed mean J drifted outside settle band: {snapshot:?}",
     );
     assert!(
-        snapshot.min_j > 0.6 && snapshot.max_j < 1.48,
+        snapshot.min_j > 0.65 && snapshot.max_j < 1.45,
         "bed J approached safety clamps during settle: {snapshot:?}",
     );
     assert!(
         snapshot.y_extent > 1.0,
         "bed y_extent collapsed unexpectedly: {snapshot:?}",
+    );
+}
+
+#[test]
+fn preloaded_bed_does_not_enter_ballistic_drop_phase() {
+    let Some((device, queue)) = create_test_device() else {
+        eprintln!("skipping: no GPU adapter");
+        return;
+    };
+
+    let mut sim = MpmSim3D::new(&device, &queue, MpmSettings::benchmark_center_pour());
+    sim.set_kettle_angle(0.0);
+    let initial = readback_bed_diag_snapshot(&sim, &device, &queue);
+
+    for _ in 0..6 {
+        sim.step_frame(&device, &queue, 1.0 / 60.0);
+    }
+    let early = readback_bed_diag_snapshot(&sim, &device, &queue);
+
+    let mean_y_drift = (early.y_mean - initial.y_mean).abs();
+    assert!(
+        mean_y_drift < 0.30,
+        "preloaded bed entered a ballistic drop phase instead of starting seated (initial={initial:?}, early={early:?})",
+    );
+    assert!(
+        early.y_extent > initial.y_extent * 0.80,
+        "preloaded bed collapsed too quickly during the first few frames (initial={initial:?}, early={early:?})",
     );
 }
 
@@ -566,8 +719,171 @@ fn bed_j_off_clamps() {
         "expected active bed particles during pour"
     );
     assert!(
-        snapshot.min_j > 0.55 && snapshot.max_j < 1.45,
+        snapshot.min_j > 0.60 && snapshot.max_j < 1.45,
         "bed J hit safety rails under normal pour: {snapshot:?}",
+    );
+}
+
+#[test]
+fn bed_compaction_is_monotone_under_dry_settle() {
+    let Some((device, queue)) = create_test_device() else {
+        eprintln!("skipping: no GPU adapter");
+        return;
+    };
+
+    let mut sim = MpmSim3D::new(&device, &queue, MpmSettings::benchmark_center_pour());
+    sim.set_kettle_angle(0.0);
+    for _ in 0..60 {
+        sim.step_frame(&device, &queue, 1.0 / 60.0);
+    }
+    let early = readback_bed_state_snapshot(&sim, &device, &queue);
+
+    for _ in 0..60 {
+        sim.step_frame(&device, &queue, 1.0 / 60.0);
+    }
+    let later = readback_bed_state_snapshot(&sim, &device, &queue);
+
+    assert!(
+        early.all_finite && later.all_finite,
+        "non-finite bed state: early={early:?} later={later:?}"
+    );
+    assert_eq!(early.compactions.len(), later.compactions.len());
+    for (before, after) in early.compactions.iter().zip(&later.compactions) {
+        assert!(
+            *after + 1e-6 >= *before,
+            "bed compaction decreased during dry settle: early={early:?} later={later:?}",
+        );
+    }
+    assert!(
+        later.mean_compaction >= 0.02 && later.mean_compaction <= 0.14,
+        "dry-settle compaction drifted outside expected band: {later:?}",
+    );
+    assert!(
+        later.max_compaction <= 0.22 + 1e-6,
+        "bed compaction exceeded cap: {later:?}",
+    );
+}
+
+#[test]
+fn bed_hydraulics_remain_bounded_under_compaction() {
+    let Some((device, queue)) = create_test_device() else {
+        eprintln!("skipping: no GPU adapter");
+        return;
+    };
+
+    let mut sim = MpmSim3D::new(&device, &queue, MpmSettings::benchmark_center_pour());
+    let initial = readback_bed_state_snapshot(&sim, &device, &queue);
+    sim.set_kettle_angle(0.0);
+    for _ in 0..120 {
+        sim.step_frame(&device, &queue, 1.0 / 60.0);
+    }
+    let settled = readback_bed_state_snapshot(&sim, &device, &queue);
+
+    assert!(
+        settled.all_finite,
+        "non-finite bed state after settle: {settled:?}"
+    );
+    assert!(
+        settled.min_porosity >= 0.18 && settled.max_porosity <= 0.58,
+        "runtime porosity escaped expected range: {settled:?}",
+    );
+    assert!(
+        settled.min_permeability >= 0.0002 && settled.max_permeability <= 0.02,
+        "runtime permeability escaped expected range: {settled:?}",
+    );
+    let porosity_drop = initial.mean_porosity - settled.mean_porosity;
+    assert!(
+        porosity_drop >= 0.01 && porosity_drop <= 0.10,
+        "dry-settle porosity change drifted outside expected band: initial={initial:?} settled={settled:?}",
+    );
+    assert!(
+        settled.mean_permeability < initial.mean_permeability * 0.95,
+        "dry-settle permeability did not decrease enough: initial={initial:?} settled={settled:?}",
+    );
+}
+
+#[test]
+fn saturation_cache_matches_pore_water_state() {
+    let Some((device, queue)) = create_test_device() else {
+        eprintln!("skipping: no GPU adapter");
+        return;
+    };
+
+    let mut sim = MpmSim3D::new(&device, &queue, MpmSettings::benchmark_center_pour());
+    sim.set_kettle_angle(36.0);
+    for _ in 0..180 {
+        sim.step_frame(&device, &queue, 1.0 / 60.0);
+    }
+
+    let snapshot = readback_bed_state_snapshot(&sim, &device, &queue);
+    assert!(
+        snapshot.all_finite,
+        "non-finite bed state under pour: {snapshot:?}"
+    );
+    assert!(
+        snapshot.max_saturation_cache_error < 1e-5,
+        "bed saturation cache drifted from pore-water state: {snapshot:?}",
+    );
+}
+
+#[test]
+fn dry_settled_support_does_not_activate_during_pour_off() {
+    let Some((device, queue)) = create_test_device() else {
+        eprintln!("skipping: no GPU adapter");
+        return;
+    };
+
+    let mut sim = MpmSim3D::new(&device, &queue, MpmSettings::benchmark_center_pour());
+    sim.set_kettle_angle(36.0);
+    for _ in 0..120 {
+        sim.step_frame(&device, &queue, 1.0 / 60.0);
+    }
+
+    sim.set_kettle_angle(0.0);
+    for _ in 0..60 {
+        sim.step_frame(&device, &queue, 1.0 / 60.0);
+    }
+
+    let snapshot = readback_bed_state_snapshot(&sim, &device, &queue);
+    assert!(
+        snapshot.all_finite,
+        "non-finite bed state during pour-off: {snapshot:?}"
+    );
+    assert!(
+        snapshot.mean_settled_activation < 0.03,
+        "dry settled support activated too broadly during pour-off: {snapshot:?}",
+    );
+    assert!(
+        snapshot.max_settled_activation < 0.25,
+        "dry settled support spiked during pour-off: {snapshot:?}",
+    );
+}
+
+#[test]
+fn dry_settled_support_reactivates_after_full_drain() {
+    let Some((device, queue)) = create_test_device() else {
+        eprintln!("skipping: no GPU adapter");
+        return;
+    };
+
+    let mut sim = MpmSim3D::new(&device, &queue, MpmSettings::benchmark_center_pour());
+    sim.set_kettle_angle(0.0);
+    for _ in 0..600 {
+        sim.step_frame(&device, &queue, 1.0 / 60.0);
+    }
+
+    let snapshot = readback_bed_state_snapshot(&sim, &device, &queue);
+    assert!(
+        snapshot.all_finite,
+        "non-finite bed state after long dry settle: {snapshot:?}"
+    );
+    assert!(
+        snapshot.mean_settled_activation > 0.10,
+        "dry settled support did not reactivate after full drain: {snapshot:?}",
+    );
+    assert!(
+        snapshot.max_settled_activation > 0.50,
+        "dry settled support never formed a strong settled region: {snapshot:?}",
     );
 }
 

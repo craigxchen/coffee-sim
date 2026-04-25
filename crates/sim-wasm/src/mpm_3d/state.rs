@@ -180,10 +180,12 @@ impl MpmBuffers {
             mapped_at_creation: false,
         });
 
-        // 320 vertices (10 rings × 32 segments), each padded to vec4<f32>.
+        // 320 vertices (10 rings × 32 segments), each storing current and
+        // previous positions as 2 x vec4<f32> so the shader can derive
+        // relative support velocity for dry contact.
         let filter_mesh_positions = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("mpm filter mesh positions"),
-            size: (320 * 16) as u64,
+            size: (320 * 32) as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
