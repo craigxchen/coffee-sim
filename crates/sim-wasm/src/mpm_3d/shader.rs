@@ -36,6 +36,11 @@ struct BedExtract {
     extract: vec4<f32>,
 };
 
+struct RenderParticle {
+    data0: vec4<f32>,
+    data1: vec4<f32>,
+};
+
 struct ContactResult {
     pos: vec3<f32>,
     vel: vec3<f32>,
@@ -49,7 +54,7 @@ struct ContactResult {
 @group(0) @binding(3) var<storage, read_write> grid: array<atomic<i32>>;
 @group(0) @binding(4) var<storage, read_write> grid_vel: array<vec4<f32>>;
 @group(0) @binding(5) var sdf_texture: texture_3d<f32>;
-@group(0) @binding(6) var<storage, read_write> render_data: array<vec4<f32>>;
+@group(0) @binding(6) var<storage, read_write> render_data: array<RenderParticle>;
 @group(0) @binding(7) var<storage, read_write> bed_extract: array<BedExtract>;
 @group(0) @binding(8) var<storage, read_write> bed_lookup: array<atomic<i32>>;
 @group(0) @binding(9) var<storage, read_write> bed_delta: array<atomic<i32>>;
@@ -99,6 +104,8 @@ fn div_clamp_limit() -> f32 { return u.clamp_params.x; }
 fn pressure_clamp_limit() -> f32 { return u.clamp_params.y; }
 fn metrics_div_fp_scale() -> f32 { return u.clamp_params.z; }
 fn metrics_div_inv_fp_scale() -> f32 { return u.clamp_params.w; }
+fn water_particle_radius() -> f32 { return dx() * 0.18; }
+fn bed_particle_radius() -> f32 { return dx() * 0.62; }
 
 fn cell_index(ix: u32, iy: u32, iz: u32) -> u32 {
     return iz * gx() * gy() + iy * gx() + ix;
@@ -1246,11 +1253,15 @@ fn prepare_render(@builtin(global_invocation_id) gid: vec3<u32>) {
     let p = particles[pid];
     let phase = affine[pid].col0.w;
     if p.vel.w <= inactive_mass_threshold() {
-        render_data[pid] = vec4<f32>(0.0, -1e6, 0.0, -999.0);
+        render_data[pid] = RenderParticle(
+            vec4<f32>(0.0, -1e6, 0.0, -999.0),
+            vec4<f32>(0.0),
+        );
         return;
     }
 
     var color_t = 0.0;
+    var radius = water_particle_radius();
     if phase < 0.5 {
         let speed = length(p.vel.xyz);
         color_t = clamp(speed / 10.0, 0.0, 2.0);
@@ -1259,11 +1270,15 @@ fn prepare_render(@builtin(global_invocation_id) gid: vec3<u32>) {
         var sat = 0.0;
         if bed_idx < num_bed() {
             sat = bed_extract[bed_idx].extract.w;
+            radius = bed_particle_radius();
         }
         color_t = -1.0 - sat;
     }
 
-    render_data[pid] = vec4<f32>(p.pos.xyz, color_t);
+    render_data[pid] = RenderParticle(
+        vec4<f32>(p.pos.xyz, color_t),
+        vec4<f32>(radius, 0.0, 0.0, 0.0),
+    );
 }
 
 // ── metrics_clear ──

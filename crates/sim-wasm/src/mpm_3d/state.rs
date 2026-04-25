@@ -139,7 +139,7 @@ impl MpmBuffers {
 
         let render_data = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("mpm render data"),
-            size: (max_p * 16) as u64, // vec4<f32>
+            size: (max_p * 32) as u64, // 2 x vec4<f32>
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::VERTEX
                 | wgpu::BufferUsages::COPY_SRC
