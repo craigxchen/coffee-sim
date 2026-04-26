@@ -1099,6 +1099,59 @@ fn higher_viscosity_damps_pooled_water_kinetic_energy() {
 }
 
 #[test]
+fn viscosity_preserves_falling_stream_velocity() {
+    let Some((device, queue)) = create_test_device() else {
+        eprintln!("skipping: no GPU adapter");
+        return;
+    };
+
+    fn run_case(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        viscosity: f32,
+    ) -> WaterVelocitySnapshot {
+        let mut settings = MpmSettings::benchmark_free_stream();
+        settings.viscosity = viscosity;
+        settings.spout.origin = Vec3::new(0.0, 4.2, 0.0);
+        settings.spout.aim_at(Vec3::new(0.0, -2.0, 0.0));
+        let mut sim = MpmSim3D::new(device, queue, settings);
+
+        sim.set_kettle_angle(36.0);
+        for _ in 0..45 {
+            sim.step_frame(device, queue, 1.0 / 60.0);
+        }
+
+        readback_water_velocity_snapshot(&sim, device, queue)
+    }
+
+    let inviscid = run_case(&device, &queue, 0.0);
+    let viscous = run_case(&device, &queue, 1.2);
+    let rms_ratio = viscous.rms_speed / inviscid.rms_speed.max(1e-6);
+    let mean_ratio = viscous.mean_speed / inviscid.mean_speed.max(1e-6);
+
+    assert!(
+        inviscid.all_finite && viscous.all_finite,
+        "falling stream viscosity comparison produced non-finite velocity state: inviscid={inviscid:?} viscous={viscous:?}",
+    );
+    assert!(
+        inviscid.active_count > 0 && viscous.active_count > 0,
+        "falling stream comparison had no active water: inviscid={inviscid:?} viscous={viscous:?}",
+    );
+    assert!(
+        (viscous.active_mass - inviscid.active_mass).abs() / inviscid.active_mass.max(1e-6) < 0.05,
+        "viscosity changed falling stream active water mass unexpectedly: inviscid={inviscid:?} viscous={viscous:?}",
+    );
+    assert!(
+        rms_ratio > 0.97 && rms_ratio < 1.03,
+        "viscosity should not damp sparse falling stream RMS speed: ratio={rms_ratio:.3} inviscid={inviscid:?} viscous={viscous:?}",
+    );
+    assert!(
+        mean_ratio > 0.97 && mean_ratio < 1.03,
+        "viscosity should not damp sparse falling stream mean speed: ratio={mean_ratio:.3} inviscid={inviscid:?} viscous={viscous:?}",
+    );
+}
+
+#[test]
 #[ignore = "known failing target until porous pressure/free-surface coupling is redesigned"]
 fn pooled_water_shape_stays_bounded_after_initial_settle() {
     let Some((device, queue)) = create_test_device() else {
