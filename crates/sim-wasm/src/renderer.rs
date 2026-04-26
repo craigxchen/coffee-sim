@@ -10,6 +10,7 @@ use coffee_sim_core::sph::Vec3;
 
 use crate::mpm_3d::{
     MpmSettings, MpmSim3D, Obstacle, MAX_FILL_VERTEX_COUNT, MAX_RENDER_VERTEX_COUNT,
+    OBSTACLE_WALL_THICKNESS,
 };
 
 const EPSILON: f32 = 1e-6;
@@ -835,22 +836,75 @@ fn build_wireframe(settings: &MpmSettings) -> Vec<[f32; 3]> {
                 bot_y,
             } => {
                 let rings = 4;
+                let half_thickness = OBSTACLE_WALL_THICKNESS * 0.5;
+                let inner_radius = (radius - half_thickness).max(0.0);
+                let outer_radius = radius + half_thickness;
+                let inner_floor_y = center.y + bot_y + half_thickness;
+                let outer_floor_y = center.y + bot_y - half_thickness;
+                let top_y = center.y + top_y;
                 for ring in 0..=rings {
                     let t = ring as f32 / rings as f32;
-                    let y = center.y + bot_y + (top_y - bot_y) * t;
-                    push_ring(&mut verts, center.x, y, center.z, *radius, segments);
+                    let y = inner_floor_y + (top_y - inner_floor_y) * t;
+                    push_ring(&mut verts, center.x, y, center.z, inner_radius, segments);
+                    push_ring(&mut verts, center.x, y, center.z, outer_radius, segments);
                 }
+                push_ring(
+                    &mut verts,
+                    center.x,
+                    outer_floor_y,
+                    center.z,
+                    outer_radius,
+                    segments,
+                );
+                push_ring(
+                    &mut verts,
+                    center.x,
+                    inner_floor_y,
+                    center.z,
+                    inner_radius,
+                    segments,
+                );
+                push_ring(
+                    &mut verts,
+                    center.x,
+                    inner_floor_y,
+                    center.z,
+                    outer_radius,
+                    segments,
+                );
+
                 for i in 0..verticals {
                     let a = 2.0 * PI * i as f32 / verticals as f32;
+                    let (sin_a, cos_a) = a.sin_cos();
                     verts.push([
-                        center.x + radius * a.cos(),
-                        center.y + top_y,
-                        center.z + radius * a.sin(),
+                        center.x + outer_radius * cos_a,
+                        top_y,
+                        center.z + outer_radius * sin_a,
                     ]);
                     verts.push([
-                        center.x + radius * a.cos(),
-                        center.y + bot_y,
-                        center.z + radius * a.sin(),
+                        center.x + outer_radius * cos_a,
+                        outer_floor_y,
+                        center.z + outer_radius * sin_a,
+                    ]);
+                    verts.push([
+                        center.x + inner_radius * cos_a,
+                        top_y,
+                        center.z + inner_radius * sin_a,
+                    ]);
+                    verts.push([
+                        center.x + inner_radius * cos_a,
+                        inner_floor_y,
+                        center.z + inner_radius * sin_a,
+                    ]);
+                    verts.push([
+                        center.x + inner_radius * cos_a,
+                        inner_floor_y,
+                        center.z + inner_radius * sin_a,
+                    ]);
+                    verts.push([
+                        center.x + outer_radius * cos_a,
+                        inner_floor_y,
+                        center.z + outer_radius * sin_a,
                     ]);
                 }
             }

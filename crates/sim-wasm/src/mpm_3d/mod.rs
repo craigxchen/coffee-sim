@@ -28,6 +28,7 @@ use state::{
 };
 
 const TARGET_BED_RETENTION_ML: f32 = 42.0;
+pub(crate) const OBSTACLE_WALL_THICKNESS: f32 = 0.4;
 
 /// Device limits required by the MPM compute pipeline.
 ///
@@ -669,6 +670,7 @@ mod tests {
             })
             .expect("default scene must contain a cylinder");
         assert_eq!(cup, (3.0, -3.5, -8.0));
+        assert!(shader::MPM_COMPUTE_SHADER.contains("const OBSTACLE_WALL_THICKNESS: f32 = 0.4;"));
     }
 
     #[test]
