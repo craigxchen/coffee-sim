@@ -3,7 +3,7 @@ use std::mem::size_of;
 use bytemuck::{Pod, Zeroable};
 use coffee_sim_core::sph::Vec3;
 
-use super::{units, MpmSettings, Obstacle};
+use super::{units, MpmSettings, Obstacle, OBSTACLE_WALL_THICKNESS};
 
 // FP_SCALE derivation: 2^18 = 262144. With particle_mass=1.0, max ~50 particles
 // contributing per cell (quadratic B-spline, max weight 0.5625), worst-case mass
@@ -28,8 +28,6 @@ pub(crate) const METRICS_SLOT_COUNT: usize = 8;
 pub(crate) const METRICS_DIV_FP_SCALE: f32 = 1024.0;
 
 const SDF_NO_CONSTRAINT: f32 = 999.0;
-const WALL_THICKNESS: f32 = 0.4;
-
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub(crate) struct MpmUniforms {
@@ -270,7 +268,7 @@ fn generate_sdf_data(settings: &MpmSettings) -> Vec<f32> {
                         -bounds.y * 0.5 + (iy as f32 + 0.5) * bounds.y / n as f32,
                         -bounds.z * 0.5 + (iz as f32 + 0.5) * bounds.z / n as f32,
                     );
-                    let sd = sdf_interior(obstacle, p) - WALL_THICKNESS * 0.5;
+                    let sd = sdf_interior(obstacle, p) - OBSTACLE_WALL_THICKNESS * 0.5;
                     let idx = iz * n * n + iy * n + ix;
                     if data[idx] >= SDF_NO_CONSTRAINT - 1.0 {
                         data[idx] = sd;

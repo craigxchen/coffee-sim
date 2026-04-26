@@ -63,6 +63,7 @@ struct ContactResult {
 @group(0) @binding(11) var sdf_class_tex: texture_3d<u32>;
 
 // Metrics slot layout — keep in sync with `METRICS_SLOT_COUNT` in state.rs.
+const OBSTACLE_WALL_THICKNESS: f32 = 0.4;
 const METRIC_MAX_ABS_DIV_IDX: u32 = 0u;
 const METRIC_FLUID_CELLS_IDX: u32 = 1u;
 const METRIC_DIV_CLAMP_FIRES_IDX: u32 = 2u;
@@ -93,6 +94,7 @@ fn sdf_res() -> f32 { return u.sdf_params.x; }
 fn friction() -> f32 { return u.sdf_params.y; }
 fn restitution() -> f32 { return u.sdf_params.z; }
 fn contact_offset() -> f32 { return u.sdf_params.w; }
+fn obstacle_wall_half_thickness() -> f32 { return OBSTACLE_WALL_THICKNESS * 0.5; }
 fn drag_coeff() -> f32 { return u.bed_params.x; }
 fn absorption_rate() -> f32 { return u.bed_params.y; }
 fn max_saturation() -> f32 { return u.bed_params.z; }
@@ -351,15 +353,17 @@ fn resolve_scene_obstacles(position: vec3<f32>, velocity: vec3<f32>, is_bed: boo
         }
     }
 
-    // Carafe interior. Keep pooled water inside the cup walls and above the
-    // floor so accumulation reads as actual contained volume.
+    // Carafe interior fallback. The primary contact comes from the SDF, whose
+    // effective fluid surface is inset by half the obstacle wall thickness. Keep
+    // this analytic guard on the same surface so floor/wall contacts cannot
+    // create a second visible boundary layer.
     if out_pos.y <= -3.5 {
-        let cup_radius = 3.0 - contact_offset();
+        let cup_radius = 3.0 - obstacle_wall_half_thickness() - contact_offset();
         let cup_contact = resolve_radial_barrier(out_pos, out_vel, vec2<f32>(0.0, 0.0), cup_radius);
         out_pos = cup_contact.pos;
         out_vel = cup_contact.vel;
 
-        let floor_y = -8.0 + contact_offset();
+        let floor_y = -8.0 + obstacle_wall_half_thickness() + contact_offset();
         if out_pos.y < floor_y {
             out_pos.y = floor_y;
             if out_vel.y < 0.0 {
