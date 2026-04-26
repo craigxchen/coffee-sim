@@ -142,6 +142,7 @@ fn scratch_kind_idx(cell: u32) -> u32 { return grid_mom_z_idx(cell); }
 // still exist" ⇔ "enough mass to produce a fluid cell", which is
 // semantically consistent and keeps ghost-splat noise below the bar.
 fn occupancy_mass_threshold() -> f32 { return nominal_mass() * 0.1; }
+fn viscosity_support_mass_threshold() -> f32 { return nominal_mass() * 2.0; }
 
 const CELL_AIR: i32 = 0;
 const CELL_SURFACE_FLUID: i32 = 1;
@@ -587,11 +588,10 @@ fn viscosity_prepare(@builtin(global_invocation_id) gid: vec3<u32>) {
     let iy_val = rem / gx();
     let ix_val = rem % gx();
     let v_here = gv.xyz;
-    let cell_center = u.grid_origin.xyz
-        + (vec3<f32>(f32(ix_val), f32(iy_val), f32(iz_val)) + vec3<f32>(0.5)) * dx();
-    let cup_radius = 3.0 - obstacle_wall_half_thickness() - contact_offset();
-    let in_cup_pool_region = cell_center.y < -3.5 && dot(cell_center.xz, cell_center.xz) < cup_radius * cup_radius;
-    if !in_cup_pool_region || gv.w <= nominal_mass() * 2.0 {
+    // Viscosity is a bulk-fluid stress. Sparse streams have too little local
+    // support for a stable velocity Laplacian, so gate it by local occupancy
+    // rather than by scene location.
+    if gv.w <= viscosity_support_mass_threshold() {
         velocity_scratch_store(idx, v_here);
         return;
     }
@@ -621,14 +621,14 @@ fn viscosity_prepare(@builtin(global_invocation_id) gid: vec3<u32>) {
 
         let neighbor_idx = cell_index(u32(neighbor.x), u32(neighbor.y), u32(neighbor.z));
         let neighbor_gv = grid_vel[neighbor_idx];
-        if neighbor_gv.w <= occupancy_mass_threshold() {
+        if neighbor_gv.w <= viscosity_support_mass_threshold() {
             continue;
         }
         laplacian += neighbor_gv.xyz - v_here;
         neighbor_count += 1u;
     }
 
-    if neighbor_count < 3u {
+    if neighbor_count < 5u {
         velocity_scratch_store(idx, v_here);
         return;
     }
