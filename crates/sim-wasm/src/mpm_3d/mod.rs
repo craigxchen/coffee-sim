@@ -12,6 +12,7 @@ mod physics_tests;
 mod pipelines;
 mod shader;
 mod state;
+mod units;
 
 pub(crate) use filter::FilterConfig;
 #[cfg(target_arch = "wasm32")]
@@ -116,12 +117,12 @@ impl MpmSettings {
             bounds_size,
             grid_dims,
             max_particles: 220_000,
-            substeps: 5,
-            gravity: -10.0,
+            substeps: 10,
+            gravity: units::EARTH_GRAVITY_SIM_UNITS,
             bulk_modulus: 900.0,
             viscosity: 0.12,
             render_radius: dx * 0.7,
-            pressure_rbgs_pairs: 20,
+            pressure_rbgs_pairs: 40,
             use_sdf_cache: true,
             obstacles: vec![
                 Obstacle::TruncatedCone {
@@ -449,6 +450,10 @@ impl MpmSim3D {
         self.inflow.exit_speed()
     }
 
+    pub fn exit_speed_m_s(&self) -> f32 {
+        units::sim_speed_to_meters_per_second(self.inflow.exit_speed())
+    }
+
     pub fn particle_count(&self) -> usize {
         (self.num_water + self.num_bed) as usize
     }
@@ -598,6 +603,7 @@ impl MpmSim3D {
                 METRICS_DIV_FP_SCALE,
                 1.0 / METRICS_DIV_FP_SCALE,
             ],
+            projection_params: [32.0, 2.0, 1.20, 0.0],
         };
 
         queue.write_buffer(
@@ -673,6 +679,26 @@ mod tests {
         assert!((dx - dz).abs() < 1e-5);
         let height_covered = s.grid_dims[1] as f32 * dx;
         assert!(height_covered >= s.bounds_size.y - dx);
+    }
+
+    #[test]
+    fn expanded_grid_atomic_lanes_fit_storage_binding_limit() {
+        let s = MpmSettings::default_v60();
+        let total_cells = s.grid_dims[0] as u64 * s.grid_dims[1] as u64 * s.grid_dims[2] as u64;
+        // `grid` is bound in WGSL as `array<atomic<i32>>`, not as a vecN array.
+        // Extra lanes are scalar structure-of-arrays slices addressed as
+        // `lane * total_cells + cell`, so there is no vec4 stride to preserve.
+        assert_eq!(std::mem::size_of::<i32>(), 4);
+        let proposed_grid_lanes = 6_u64;
+        let proposed_grid_bytes =
+            proposed_grid_lanes * total_cells * std::mem::size_of::<i32>() as u64;
+        let limit = required_limits().max_storage_buffer_binding_size as u64;
+
+        assert!(
+            proposed_grid_bytes <= limit,
+            "proposed {proposed_grid_lanes}-lane grid atomics buffer is {proposed_grid_bytes} \
+             bytes, exceeding max_storage_buffer_binding_size={limit}"
+        );
     }
 
     #[test]
