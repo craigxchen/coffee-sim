@@ -586,9 +586,19 @@ fn viscosity_prepare(@builtin(global_invocation_id) gid: vec3<u32>) {
     let rem = idx % (gx() * gy());
     let iy_val = rem / gx();
     let ix_val = rem % gx();
-    let alpha = clamp(viscosity() * dt() / max(dx() * dx(), 1e-6), 0.0, 0.12);
     let v_here = gv.xyz;
+    let cell_center = u.grid_origin.xyz
+        + (vec3<f32>(f32(ix_val), f32(iy_val), f32(iz_val)) + vec3<f32>(0.5)) * dx();
+    let cup_radius = 3.0 - obstacle_wall_half_thickness() - contact_offset();
+    let in_cup_pool_region = cell_center.y < -3.5 && dot(cell_center.xz, cell_center.xz) < cup_radius * cup_radius;
+    if !in_cup_pool_region || gv.w <= nominal_mass() * 2.0 {
+        velocity_scratch_store(idx, v_here);
+        return;
+    }
+
+    let alpha = clamp(viscosity() * dt() / max(dx() * dx(), 1e-6), 0.0, 0.12);
     var laplacian = vec3<f32>(0.0);
+    var neighbor_count = 0u;
 
     let offsets = array<vec3<i32>, 6>(
         vec3<i32>(-1, 0, 0),
@@ -615,6 +625,12 @@ fn viscosity_prepare(@builtin(global_invocation_id) gid: vec3<u32>) {
             continue;
         }
         laplacian += neighbor_gv.xyz - v_here;
+        neighbor_count += 1u;
+    }
+
+    if neighbor_count < 3u {
+        velocity_scratch_store(idx, v_here);
+        return;
     }
 
     velocity_scratch_store(idx, v_here + alpha * laplacian);
