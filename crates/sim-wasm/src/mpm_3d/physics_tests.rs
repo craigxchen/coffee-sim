@@ -133,6 +133,18 @@ struct WaterParticleVolumeSnapshot {
     max_j: f32,
 }
 
+#[derive(Debug)]
+struct WaterVelocitySnapshot {
+    all_finite: bool,
+    active_count: u32,
+    active_mass: f32,
+    kinetic_energy: f32,
+    rms_speed: f32,
+    mean_speed: f32,
+    max_speed: f32,
+    momentum: [f32; 3],
+}
+
 fn readback_water_particle_volume_snapshot(
     sim: &MpmSim3D,
     device: &wgpu::Device,
@@ -223,6 +235,92 @@ fn readback_water_particle_volume_snapshot(
         mean_j: j_sum / n,
         min_j: if active_count > 0 { min_j } else { 0.0 },
         max_j: if active_count > 0 { max_j } else { 0.0 },
+    }
+}
+
+fn readback_water_velocity_snapshot(
+    sim: &MpmSim3D,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+) -> WaterVelocitySnapshot {
+    let particle_count = (sim.num_water + sim.num_bed) as usize;
+    let particle_size = (particle_count * 32).max(4) as u64;
+
+    let staging = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("water velocity staging"),
+        size: particle_size,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("water velocity readback"),
+    });
+    encoder.copy_buffer_to_buffer(&sim.buffers.particles, 0, &staging, 0, particle_size);
+    queue.submit(Some(encoder.finish()));
+
+    let slice = staging.slice(..);
+    let (tx, rx) = mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |result| {
+        tx.send(result).expect("water velocity map callback");
+    });
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+    rx.recv()
+        .expect("water velocity map recv")
+        .expect("water velocity map");
+
+    let view = slice.get_mapped_range();
+    let data = cast_slice::<u8, f32>(&view);
+
+    let inactive_thresh = inflow::MASS_UNITS_PER_ML / inflow::PARTICLES_PER_ML * 0.1;
+    let start = sim.num_bed as usize;
+    let end = start + sim.num_water as usize;
+    let mut all_finite = true;
+    let mut active_count = 0u32;
+    let mut active_mass = 0.0_f32;
+    let mut kinetic_energy = 0.0_f32;
+    let mut mass_weighted_speed_sq = 0.0_f32;
+    let mut speed_sum = 0.0_f32;
+    let mut max_speed = 0.0_f32;
+    let mut momentum = [0.0_f32; 3];
+
+    for i in start..end {
+        let vx = data[i * 8 + 4];
+        let vy = data[i * 8 + 5];
+        let vz = data[i * 8 + 6];
+        let mass = data[i * 8 + 7];
+
+        all_finite &= vx.is_finite() && vy.is_finite() && vz.is_finite() && mass.is_finite();
+
+        if mass <= inactive_thresh {
+            continue;
+        }
+
+        let speed_sq = vx * vx + vy * vy + vz * vz;
+        let speed = speed_sq.sqrt();
+        active_count += 1;
+        active_mass += mass;
+        kinetic_energy += 0.5 * mass * speed_sq;
+        mass_weighted_speed_sq += mass * speed_sq;
+        speed_sum += speed;
+        max_speed = max_speed.max(speed);
+        momentum[0] += mass * vx;
+        momentum[1] += mass * vy;
+        momentum[2] += mass * vz;
+    }
+    drop(view);
+    staging.unmap();
+
+    let n = active_count.max(1) as f32;
+    WaterVelocitySnapshot {
+        all_finite,
+        active_count,
+        active_mass,
+        kinetic_energy,
+        rms_speed: (mass_weighted_speed_sq / active_mass.max(1e-6)).sqrt(),
+        mean_speed: speed_sum / n,
+        max_speed,
+        momentum,
     }
 }
 
@@ -878,6 +976,71 @@ fn pooled_water_particle_volume_stable_after_pour_off() {
     assert!(
         mean_j_drift < 0.2,
         "pooled water mean J drifted after pour-off: settled={settled:?} late={late:?}",
+    );
+}
+
+#[test]
+fn pooled_water_kinetic_energy_decays_after_pour_off() {
+    let Some((device, queue)) = create_test_device() else {
+        eprintln!("skipping: no GPU adapter");
+        return;
+    };
+
+    let mut sim = MpmSim3D::new(&device, &queue, MpmSettings::benchmark_free_stream());
+
+    sim.set_kettle_angle(36.0);
+    for _ in 0..180 {
+        sim.step_frame(&device, &queue, 1.0 / 60.0);
+    }
+
+    sim.set_kettle_angle(0.0);
+    for _ in 0..120 {
+        sim.step_frame(&device, &queue, 1.0 / 60.0);
+    }
+    let settled = readback_water_velocity_snapshot(&sim, &device, &queue);
+
+    for _ in 0..180 {
+        sim.step_frame(&device, &queue, 1.0 / 60.0);
+    }
+    let late = readback_water_velocity_snapshot(&sim, &device, &queue);
+
+    let kinetic_ratio = late.kinetic_energy / settled.kinetic_energy.max(1e-6);
+    let rms_ratio = late.rms_speed / settled.rms_speed.max(1e-6);
+    let momentum0 = settled.momentum[0]
+        .hypot(settled.momentum[1])
+        .hypot(settled.momentum[2]);
+    let momentum1 = late.momentum[0]
+        .hypot(late.momentum[1])
+        .hypot(late.momentum[2]);
+    let momentum_ratio = momentum1 / momentum0.max(1e-6);
+
+    assert!(
+        settled.all_finite && late.all_finite,
+        "pooled water produced non-finite velocity state: settled={settled:?} late={late:?}",
+    );
+    assert!(
+        settled.active_count > 0 && late.active_count > 0,
+        "pooled water velocity readback had no active particles: settled={settled:?} late={late:?}",
+    );
+    assert_eq!(
+        settled.active_count, late.active_count,
+        "pooled water changed active particle count while checking velocity decay: settled={settled:?} late={late:?}",
+    );
+    assert!(
+        (late.active_mass - settled.active_mass).abs() / settled.active_mass.max(1e-6) < 0.02,
+        "pooled water mass drifted while checking velocity decay: settled={settled:?} late={late:?}",
+    );
+    assert!(
+        kinetic_ratio < 1.05,
+        "pooled water gained kinetic energy after pour-off: ratio={kinetic_ratio:.3} settled={settled:?} late={late:?}",
+    );
+    assert!(
+        rms_ratio < 1.02,
+        "pooled water RMS speed increased after pour-off: ratio={rms_ratio:.3} settled={settled:?} late={late:?}",
+    );
+    assert!(
+        momentum_ratio < 1.20,
+        "pooled water net momentum grew after pour-off: ratio={momentum_ratio:.3} settled={settled:?} late={late:?}",
     );
 }
 
