@@ -18,6 +18,7 @@ struct MpmUniforms {
     extraction_params: vec4<f32>,
     time_params: vec4<f32>,
     clamp_params: vec4<f32>,
+    projection_params: vec4<f32>,
 };
 
 struct Particle {
@@ -104,8 +105,16 @@ fn div_clamp_limit() -> f32 { return u.clamp_params.x; }
 fn pressure_clamp_limit() -> f32 { return u.clamp_params.y; }
 fn metrics_div_fp_scale() -> f32 { return u.clamp_params.z; }
 fn metrics_div_inv_fp_scale() -> f32 { return u.clamp_params.w; }
+fn projection_j_alpha() -> f32 { return u.projection_params.x; }
+fn projection_j_expand_alpha() -> f32 { return u.projection_params.y; }
+fn projection_max_rest_volume_fraction() -> f32 { return u.projection_params.z; }
 fn water_particle_radius() -> f32 { return dx() * 0.18; }
 fn bed_particle_radius() -> f32 { return dx() * 0.62; }
+fn min_particle_j() -> f32 { return 0.40; }
+fn max_particle_j() -> f32 { return 2.00; }
+fn clamp_particle_j(value: f32) -> f32 {
+    return clamp(value, min_particle_j(), max_particle_j());
+}
 
 fn cell_index(ix: u32, iy: u32, iz: u32) -> u32 {
     return iz * gx() * gy() + iy * gx() + ix;
@@ -115,6 +124,8 @@ fn grid_mass_idx(cell: u32) -> u32 { return cell; }
 fn grid_mom_x_idx(cell: u32) -> u32 { return total_cells() + cell; }
 fn grid_mom_y_idx(cell: u32) -> u32 { return 2u * total_cells() + cell; }
 fn grid_mom_z_idx(cell: u32) -> u32 { return 3u * total_cells() + cell; }
+fn grid_rest_volume_idx(cell: u32) -> u32 { return 4u * total_cells() + cell; }
+fn grid_current_volume_idx(cell: u32) -> u32 { return 5u * total_cells() + cell; }
 fn scratch_pressure_idx(cell: u32) -> u32 { return grid_mass_idx(cell); }
 fn scratch_div_idx(cell: u32) -> u32 { return grid_mom_x_idx(cell); }
 // Slot 2 (`grid_mom_y_idx`) is reused only as the mass/momentum accumulator
@@ -157,6 +168,14 @@ fn divergence_load(cell: u32) -> f32 {
     return f32(atomicLoad(&grid[scratch_div_idx(cell)])) * inv_fp_scale();
 }
 
+fn rest_volume_load(cell: u32) -> f32 {
+    return f32(atomicLoad(&grid[grid_rest_volume_idx(cell)])) * inv_fp_scale();
+}
+
+fn current_volume_load(cell: u32) -> f32 {
+    return f32(atomicLoad(&grid[grid_current_volume_idx(cell)])) * inv_fp_scale();
+}
+
 fn divergence_store(cell: u32, value: f32) {
     let limit = div_clamp_limit();
     let clamped = clamp(value, -limit, limit);
@@ -187,6 +206,32 @@ fn is_fluid_kind(kind: i32) -> bool {
 
 fn is_solid_kind(kind: i32) -> bool {
     return kind == CELL_SOLID;
+}
+
+fn volume_projection_target_divergence(rest_volume: f32, current_volume: f32) -> f32 {
+    let cell_volume = dx() * dx() * dx();
+    let rest_volume_eps = max(cell_volume * 1e-5, p_vol() * 1e-3);
+    if rest_volume <= rest_volume_eps {
+        return 0.0;
+    }
+
+    let j_cell = current_volume / rest_volume;
+    let compressed_error = clamp(1.0 - j_cell, 0.0, 0.75);
+    let expanded_error = clamp(j_cell - 1.0, 0.0, 0.75);
+    var target_div = compressed_error * projection_j_alpha()
+        - expanded_error * projection_j_expand_alpha();
+
+    // A cell can have J≈1 yet contain too much material because many particle
+    // kernels overlap there. Use rest-volume fraction as a positive expansion
+    // guard only while the cell is not already expanded; otherwise the guard
+    // fights the J correction and ratchets particles toward the high-J clamp.
+    let rest_fraction = rest_volume / max(cell_volume, 1e-8);
+    let overfill_error = max(rest_fraction - projection_max_rest_volume_fraction(), 0.0);
+    if j_cell <= 1.05 {
+        target_div = max(target_div, overfill_error * projection_j_alpha());
+    }
+
+    return target_div;
 }
 
 fn world_to_cell(position: vec3<f32>) -> vec3<i32> {
@@ -365,6 +410,8 @@ fn clear_grid(@builtin(global_invocation_id) gid: vec3<u32>) {
     atomicStore(&grid[grid_mom_x_idx(idx)], 0);
     atomicStore(&grid[grid_mom_y_idx(idx)], 0);
     atomicStore(&grid[grid_mom_z_idx(idx)], 0);
+    atomicStore(&grid[grid_rest_volume_idx(idx)], 0);
+    atomicStore(&grid[grid_current_volume_idx(idx)], 0);
     grid_vel[idx] = vec4<f32>(0.0);
 }
 
@@ -415,6 +462,8 @@ fn p2g(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     let fp = fp_scale();
     let cell_dx = dx();
+    let rest_particle_volume = p_vol() * mass_p / max(nominal_mass(), 1e-6);
+    let current_particle_volume = rest_particle_volume * clamp_particle_j(J);
 
     for (var i = 0u; i < 3u; i++) {
         for (var j = 0u; j < 3u; j++) {
@@ -429,6 +478,8 @@ fn p2g(@builtin(global_invocation_id) gid: vec3<u32>) {
                 let dpos = (vec3<f32>(offset) - fx) * cell_dx;
 
                 let mass_contrib = w * mass_p;
+                let rest_volume_contrib = w * rest_particle_volume;
+                let current_volume_contrib = w * current_particle_volume;
                 let mom = w * (mass_p * vp + vec3<f32>(
                     dot(aff_col0, dpos),
                     dot(aff_col1, dpos),
@@ -444,17 +495,22 @@ fn p2g(@builtin(global_invocation_id) gid: vec3<u32>) {
                 // readback path is re-enabled.
                 let limit_m = 1.0e9;
                 let mass_fp = mass_contrib * fp;
+                let rest_volume_fp = rest_volume_contrib * fp;
+                let current_volume_fp = current_volume_contrib * fp;
                 let mom_x_fp = mom.x * fp;
                 let mom_y_fp = mom.y * fp;
                 let mom_z_fp = mom.z * fp;
                 if abs(mass_fp) > limit_m || abs(mom_x_fp) > limit_m
-                    || abs(mom_y_fp) > limit_m || abs(mom_z_fp) > limit_m {
+                    || abs(mom_y_fp) > limit_m || abs(mom_z_fp) > limit_m
+                    || abs(rest_volume_fp) > limit_m || abs(current_volume_fp) > limit_m {
                     atomicAdd(&metrics[METRIC_MASS_OVERFLOW_FIRES_IDX], 1u);
                 }
                 atomicAdd(&grid[grid_mass_idx(ci)], i32(mass_fp));
                 atomicAdd(&grid[grid_mom_x_idx(ci)], i32(mom_x_fp));
                 atomicAdd(&grid[grid_mom_y_idx(ci)], i32(mom_y_fp));
                 atomicAdd(&grid[grid_mom_z_idx(ci)], i32(mom_z_fp));
+                atomicAdd(&grid[grid_rest_volume_idx(ci)], i32(rest_volume_fp));
+                atomicAdd(&grid[grid_current_volume_idx(ci)], i32(current_volume_fp));
             }
         }
     }
@@ -647,7 +703,11 @@ fn classify_cells(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     let div = 0.5 * inv_dx() * ((vxp - vxm) + (vyp - vym) + (vzp - vzm));
-    divergence_store(idx, div);
+    let target_divergence = volume_projection_target_divergence(
+        rest_volume_load(idx),
+        current_volume_load(idx),
+    );
+    divergence_store(idx, div - target_divergence);
 
     // Observability: track the worst-case cell divergence and the fluid-cell
     // footprint of the active substep. `atomicMax` on u32 gives the peak FP
@@ -951,6 +1011,7 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>) {
     // contribute zero velocity. When support is weak, preserve more of the
     // particle's previous ballistic motion instead of letting the stream stall.
     let support_ratio = clamp(supported_weight, 0.0, 1.0);
+    var j_update_support = support_ratio;
     if supported_weight > 1e-6 {
         let inv_supported = 1.0 / supported_weight;
         new_v *= inv_supported;
@@ -958,10 +1019,13 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>) {
         new_C1 *= inv_supported;
         new_C2 *= inv_supported;
     }
-    let in_cup_volume = xp.y < -3.5 && dot(xp.xz, xp.xz) < (3.0 + contact_offset()) * (3.0 + contact_offset());
+    let in_cup_volume =
+        xp.y < -3.5 && dot(xp.xz, xp.xz) < (3.0 + contact_offset()) * (3.0 + contact_offset());
     if support_ratio < 0.999 {
         let ballistic_v = vec3<f32>(p.vel.x, p.vel.y + gravity() * dt(), p.vel.z);
-        let preserve = clamp((1.0 - support_ratio) * 1.15, 0.0, 0.95);
+        let preserve_gain = select(1.35, 1.15, in_cup_volume);
+        let preserve_cap = select(0.995, 0.95, in_cup_volume);
+        let preserve = clamp((1.0 - support_ratio) * preserve_gain, 0.0, preserve_cap);
         new_v = mix(new_v, ballistic_v, preserve);
         let affine_damp = 1.0 - preserve * 0.75;
         new_C0 *= affine_damp;
@@ -984,8 +1048,11 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>) {
     if airborne {
         let dense_mass = nominal_mass() * 4.0;
         let density_ratio = clamp(local_grid_mass / max(dense_mass, 1e-6), 0.0, 1.0);
+        j_update_support = min(j_update_support, density_ratio);
         let ballistic_v = vec3<f32>(p.vel.x, p.vel.y + gravity() * dt(), p.vel.z);
-        let preserve = clamp((1.0 - density_ratio) * 0.72, 0.0, 0.88);
+        let preserve_gain = select(0.98, 0.72, in_cup_volume);
+        let preserve_cap = select(0.98, 0.88, in_cup_volume);
+        let preserve = clamp((1.0 - density_ratio) * preserve_gain, 0.0, preserve_cap);
         new_v = mix(new_v, ballistic_v, preserve);
         let affine_damp = 1.0 - preserve * 0.65;
         new_C0 *= affine_damp;
@@ -993,7 +1060,11 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>) {
         new_C2 *= affine_damp;
     }
 
-    let J_new = 1.0;
+    let trace_C = new_C0.x + new_C1.y + new_C2.z;
+    let J_old_clamped = clamp_particle_j(select(1.0, J_old, J_old > 0.0));
+    let J_apic = clamp_particle_j(J_old_clamped * exp(clamp(dt() * trace_C, -0.35, 0.35)));
+    let J_blend = smoothstep(0.35, 0.85, clamp(j_update_support, 0.0, 1.0));
+    let J_new = clamp_particle_j(mix(J_old_clamped, J_apic, J_blend));
 
     // Advect
     var new_pos = xp + new_v * dt();
@@ -1075,6 +1146,11 @@ fn bed_coupling(@builtin(global_invocation_id) gid: vec3<u32>) {
             absorbed = almost_absorbed;
         }
     }
+    // Do not create a remnant that the inactive-particle path will zero on a
+    // later pass unless the bed can be credited for the whole particle mass.
+    if mass_p - absorbed <= inactive_mass_threshold() && absorbed < mass_p {
+        absorbed = max(mass_p - inactive_mass_threshold() * 1.05, 0.0);
+    }
     if absorbed <= 1e-6 {
         return;
     }
@@ -1098,8 +1174,12 @@ fn extraction_advect(@builtin(global_invocation_id) gid: vec3<u32>) {
     var be = bed_extract[bid];
     let absorbed = f32(atomicExchange(&bed_delta[bid], 0)) * inv_fp_scale();
     if absorbed > 0.0 {
-        be.bed.x = min(be.bed.x + absorbed, max_saturation());
-        be.extract.w = be.bed.x / max(max_saturation(), 1e-6);
+        // Multiple water particles can reserve capacity against the same stale
+        // bed state within one dispatch. Credit all atomically reported mass
+        // here so water loss remains conservative, then clamp only the
+        // saturation ratio that gates future absorption.
+        be.bed.x += absorbed;
+        be.extract.w = clamp(be.bed.x / max(max_saturation(), 1e-6), 0.0, 1.0);
     }
     let sat = be.extract.w;
 

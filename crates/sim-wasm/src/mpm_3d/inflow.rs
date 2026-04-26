@@ -1,6 +1,6 @@
 use coffee_sim_core::sph::Vec3;
 
-use super::state::MpmBuffers;
+use super::{state::MpmBuffers, units};
 
 pub(crate) const MASS_UNITS_PER_ML: f32 = 80.0;
 pub(crate) const PARTICLES_PER_ML: f32 = 320.0;
@@ -34,9 +34,9 @@ impl Default for SpoutSettings {
             head_at_activation: 0.04,
             head_at_full_angle: 24.0,
             discharge_coeff: 0.92,
-            volume_to_ml: 5.4,
+            volume_to_ml: units::ML_PER_SIM_UNIT_CUBED,
             max_flow_rate_ml_s: 11.5,
-            max_exit_speed: 22.0,
+            max_exit_speed: units::GENTLE_POUR_EXIT_SPEED_SIM_UNITS,
             stem_length: 1.9,
         }
     }
@@ -245,7 +245,7 @@ fn exit_speed_from_head(head: f32, max_exit_speed: f32) -> f32 {
     if head < 1e-6 {
         return 0.0;
     }
-    let speed = (2.0 * 10.0 * head).sqrt();
+    let speed = (2.0 * units::STANDARD_GRAVITY_M_S2 * units::SIM_UNITS_PER_METER * head).sqrt();
     speed.min(max_exit_speed)
 }
 

@@ -3,18 +3,19 @@ use std::mem::size_of;
 use bytemuck::{Pod, Zeroable};
 use coffee_sim_core::sph::Vec3;
 
-use super::{MpmSettings, Obstacle};
+use super::{units, MpmSettings, Obstacle};
 
-// FP_SCALE derivation: 2^20 = 1048576. With particle_mass=1.0, max ~50 particles
+// FP_SCALE derivation: 2^18 = 262144. With particle_mass=1.0, max ~50 particles
 // contributing per cell (quadratic B-spline, max weight 0.5625), worst-case mass
-// per cell ≈ 28. Worst-case momentum per axis ≈ 28 * 2*v_max ≈ 1680. Both fit
-// comfortably in i32 range (2^31 / 2^20 ≈ 2048).
-pub(crate) const FP_SCALE: f32 = 1048576.0;
-pub(crate) const MAX_VELOCITY: f32 = 30.0;
+// per cell ≈ 28. Worst-case momentum per axis at the physical water speed cap is
+// ≈ 28 * 2 * 86.55 ≈ 4847. Both fit comfortably in i32 range
+// (2^31 / 2^18 ≈ 8192).
+pub(crate) const FP_SCALE: f32 = 262144.0;
+pub(crate) const MAX_VELOCITY: f32 = units::MAX_WATER_SPEED_SIM_UNITS;
 /// Hard ceiling for values stored through `pressure_store` / `divergence_store`
 /// before the FP encoding overflows i32. Derived from `i32::MAX / FP_SCALE`:
-/// `2^31 / 2^20 ≈ 2048`. Clamp targets must stay strictly below this.
-pub(crate) const FP_VALUE_LIMIT: f32 = 2048.0;
+/// `2^31 / 2^18 ≈ 8192`. Clamp targets must stay strictly below this.
+pub(crate) const FP_VALUE_LIMIT: f32 = 8192.0;
 pub(crate) const NUM_THREADS: u32 = 64;
 pub(crate) const SDF_RES: u32 = 128;
 
@@ -51,6 +52,9 @@ pub(crate) struct MpmUniforms {
     /// `divergence_store` / `pressure_store` and are derived per frame from the
     /// grid spacing and the velocity cap, not hardcoded.
     pub clamp_params: [f32; 4],
+    /// `[j_alpha, j_expand_alpha, max_rest_volume_fraction, _]` for the
+    /// volume/J-coupled pressure RHS.
+    pub projection_params: [f32; 4],
 }
 
 pub(crate) struct MpmBuffers {
@@ -104,7 +108,7 @@ impl MpmBuffers {
 
         let grid = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("mpm grid atomics"),
-            size: (4 * total_cells * size_of::<i32>()) as u64,
+            size: (6 * total_cells * size_of::<i32>()) as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });

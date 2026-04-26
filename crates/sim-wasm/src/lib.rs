@@ -114,6 +114,11 @@ impl WasmSim3D {
         self.sim.exit_speed()
     }
 
+    #[wasm_bindgen(js_name = exitSpeedMetersPerSecond)]
+    pub fn exit_speed_m_s(&self) -> f32 {
+        self.sim.exit_speed_m_s()
+    }
+
     pub fn render(&mut self) -> Result<(), JsValue> {
         self.renderer.render_3d(&self.sim, self.camera)
     }

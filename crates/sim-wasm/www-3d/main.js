@@ -273,7 +273,7 @@ function syncUi() {
   spoutYValue.textContent = app.spoutY().toFixed(1);
   spoutZValue.textContent = app.spoutZ().toFixed(1);
   flowRateLabel.textContent = `${app.flowRate().toFixed(1)} mL/s`;
-  jetSpeedLabel.textContent = `${app.exitSpeed().toFixed(1)} u/s`;
+  jetSpeedLabel.textContent = `${app.exitSpeedMetersPerSecond().toFixed(2)} m/s`;
   sceneModeLabel.textContent = currentSceneMode;
   stepModeLabel.textContent = fixedStepSeconds ? "Fixed 60 Hz" : "Real Time";
   simTimeLabel.textContent = `${app.simTime().toFixed(1)}s`;
