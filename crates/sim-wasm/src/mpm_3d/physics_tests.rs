@@ -1045,6 +1045,60 @@ fn pooled_water_kinetic_energy_decays_after_pour_off() {
 }
 
 #[test]
+fn higher_viscosity_damps_pooled_water_kinetic_energy() {
+    let Some((device, queue)) = create_test_device() else {
+        eprintln!("skipping: no GPU adapter");
+        return;
+    };
+
+    fn run_case(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        viscosity: f32,
+    ) -> WaterVelocitySnapshot {
+        let mut settings = MpmSettings::benchmark_free_stream();
+        settings.viscosity = viscosity;
+        let mut sim = MpmSim3D::new(device, queue, settings);
+
+        sim.set_kettle_angle(36.0);
+        for _ in 0..180 {
+            sim.step_frame(device, queue, 1.0 / 60.0);
+        }
+
+        sim.set_kettle_angle(0.0);
+        for _ in 0..180 {
+            sim.step_frame(device, queue, 1.0 / 60.0);
+        }
+
+        readback_water_velocity_snapshot(&sim, device, queue)
+    }
+
+    let inviscid = run_case(&device, &queue, 0.0);
+    let viscous = run_case(&device, &queue, 1.2);
+
+    assert!(
+        inviscid.all_finite && viscous.all_finite,
+        "viscosity comparison produced non-finite velocity state: inviscid={inviscid:?} viscous={viscous:?}",
+    );
+    assert!(
+        inviscid.active_count > 0 && viscous.active_count > 0,
+        "viscosity comparison had no active water: inviscid={inviscid:?} viscous={viscous:?}",
+    );
+    assert!(
+        (viscous.active_mass - inviscid.active_mass).abs() / inviscid.active_mass.max(1e-6) < 0.02,
+        "viscosity changed active water mass unexpectedly: inviscid={inviscid:?} viscous={viscous:?}",
+    );
+    assert!(
+        viscous.kinetic_energy < inviscid.kinetic_energy * 0.90,
+        "higher viscosity should lower pooled-water kinetic energy: inviscid={inviscid:?} viscous={viscous:?}",
+    );
+    assert!(
+        viscous.rms_speed < inviscid.rms_speed * 0.95,
+        "higher viscosity should lower pooled-water RMS speed: inviscid={inviscid:?} viscous={viscous:?}",
+    );
+}
+
+#[test]
 #[ignore = "known failing target until porous pressure/free-surface coupling is redesigned"]
 fn pooled_water_shape_stays_bounded_after_initial_settle() {
     let Some((device, queue)) = create_test_device() else {

@@ -170,6 +170,25 @@ fn divergence_load(cell: u32) -> f32 {
     return f32(atomicLoad(&grid[scratch_div_idx(cell)])) * inv_fp_scale();
 }
 
+fn velocity_scratch_load(cell: u32) -> vec3<f32> {
+    return vec3<f32>(
+        f32(atomicLoad(&grid[grid_mom_x_idx(cell)])) * inv_fp_scale(),
+        f32(atomicLoad(&grid[grid_mom_y_idx(cell)])) * inv_fp_scale(),
+        f32(atomicLoad(&grid[grid_mom_z_idx(cell)])) * inv_fp_scale(),
+    );
+}
+
+fn velocity_scratch_store(cell: u32, value: vec3<f32>) {
+    var clamped = value;
+    let speed = length(clamped);
+    if speed > vel_cap() {
+        clamped = clamped * (vel_cap() / speed);
+    }
+    atomicStore(&grid[grid_mom_x_idx(cell)], i32(clamped.x * fp_scale()));
+    atomicStore(&grid[grid_mom_y_idx(cell)], i32(clamped.y * fp_scale()));
+    atomicStore(&grid[grid_mom_z_idx(cell)], i32(clamped.z * fp_scale()));
+}
+
 fn rest_volume_load(cell: u32) -> f32 {
     return f32(atomicLoad(&grid[grid_rest_volume_idx(cell)])) * inv_fp_scale();
 }
@@ -548,6 +567,71 @@ fn grid_update(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     grid_vel[idx] = vec4<f32>(v, mass);
+}
+
+// ── viscosity ──
+
+@compute @workgroup_size(64)
+fn viscosity_prepare(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if idx >= total_cells() { return; }
+
+    let gv = grid_vel[idx];
+    if gv.w <= occupancy_mass_threshold() || viscosity() <= 0.0 {
+        velocity_scratch_store(idx, gv.xyz);
+        return;
+    }
+
+    let iz_val = idx / (gx() * gy());
+    let rem = idx % (gx() * gy());
+    let iy_val = rem / gx();
+    let ix_val = rem % gx();
+    let alpha = clamp(viscosity() * dt() / max(dx() * dx(), 1e-6), 0.0, 0.12);
+    let v_here = gv.xyz;
+    var laplacian = vec3<f32>(0.0);
+
+    let offsets = array<vec3<i32>, 6>(
+        vec3<i32>(-1, 0, 0),
+        vec3<i32>(1, 0, 0),
+        vec3<i32>(0, -1, 0),
+        vec3<i32>(0, 1, 0),
+        vec3<i32>(0, 0, -1),
+        vec3<i32>(0, 0, 1),
+    );
+
+    for (var n = 0u; n < 6u; n++) {
+        let neighbor = vec3<i32>(i32(ix_val), i32(iy_val), i32(iz_val)) + offsets[n];
+        if neighbor.x < 0 || neighbor.y < 0 || neighbor.z < 0
+            || u32(neighbor.x) >= gx() || u32(neighbor.y) >= gy() || u32(neighbor.z) >= gz() {
+            continue;
+        }
+        if sdf_class_is_solid(neighbor) {
+            continue;
+        }
+
+        let neighbor_idx = cell_index(u32(neighbor.x), u32(neighbor.y), u32(neighbor.z));
+        let neighbor_gv = grid_vel[neighbor_idx];
+        if neighbor_gv.w <= occupancy_mass_threshold() {
+            continue;
+        }
+        laplacian += neighbor_gv.xyz - v_here;
+    }
+
+    velocity_scratch_store(idx, v_here + alpha * laplacian);
+}
+
+@compute @workgroup_size(64)
+fn viscosity_apply(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if idx >= total_cells() { return; }
+
+    let mass = grid_vel[idx].w;
+    if mass <= occupancy_mass_threshold() {
+        grid_vel[idx] = vec4<f32>(0.0);
+        return;
+    }
+
+    grid_vel[idx] = vec4<f32>(velocity_scratch_load(idx), mass);
 }
 
 // ── classify_cells ──

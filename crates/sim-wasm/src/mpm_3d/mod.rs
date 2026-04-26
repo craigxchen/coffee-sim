@@ -337,7 +337,16 @@ impl MpmSim3D {
                 pass.set_pipeline(&self.pipelines.grid_update);
                 pass.dispatch_workgroups(cell_wg, 1, 1);
 
-                // 4. boundary_project
+                // 4. viscosity diffusion. This uses grid momentum lanes as
+                // temporary FP-encoded velocity scratch after `grid_update`
+                // has consumed them and before `classify_cells` repurposes
+                // those lanes for pressure/divergence/kind scratch.
+                pass.set_pipeline(&self.pipelines.viscosity_prepare);
+                pass.dispatch_workgroups(cell_wg, 1, 1);
+                pass.set_pipeline(&self.pipelines.viscosity_apply);
+                pass.dispatch_workgroups(cell_wg, 1, 1);
+
+                // 5. boundary_project
                 pass.set_pipeline(&self.pipelines.boundary_project);
                 pass.dispatch_workgroups(cell_wg, 1, 1);
 
@@ -358,32 +367,32 @@ impl MpmSim3D {
                 pass.set_pipeline(&self.pipelines.boundary_project);
                 pass.dispatch_workgroups(cell_wg, 1, 1);
 
-                // 5. g2p
+                // 6. g2p
                 if particle_wg > 0 {
                     pass.set_pipeline(&self.pipelines.g2p);
                     pass.dispatch_workgroups(particle_wg, 1, 1);
                 }
 
-                // 6. bed_coupling (after g2p so absorption uses projected
+                // 7. bed_coupling (after g2p so absorption uses projected
                 //    velocities and remains the sole bed storage transfer)
                 if particle_wg > 0 {
                     pass.set_pipeline(&self.pipelines.bed_coupling);
                     pass.dispatch_workgroups(particle_wg, 1, 1);
                 }
 
-                // 7. extraction_advect (consumes bed_delta from bed_coupling)
+                // 8. extraction_advect (consumes bed_delta from bed_coupling)
                 if bed_wg > 0 {
                     pass.set_pipeline(&self.pipelines.extraction_advect);
                     pass.dispatch_workgroups(bed_wg, 1, 1);
                 }
 
-                // 8. bed_dynamics
+                // 9. bed_dynamics
                 if bed_wg > 0 {
                     pass.set_pipeline(&self.pipelines.bed_dynamics);
                     pass.dispatch_workgroups(bed_wg, 1, 1);
                 }
 
-                // 9. prepare_render
+                // 10. prepare_render
                 if particle_wg > 0 {
                     pass.set_pipeline(&self.pipelines.prepare_render);
                     pass.dispatch_workgroups(particle_wg, 1, 1);
@@ -671,6 +680,8 @@ mod tests {
             .expect("default scene must contain a cylinder");
         assert_eq!(cup, (3.0, -3.5, -8.0));
         assert!(shader::MPM_COMPUTE_SHADER.contains("const OBSTACLE_WALL_THICKNESS: f32 = 0.4;"));
+        assert!(shader::MPM_COMPUTE_SHADER.contains("fn viscosity_prepare("));
+        assert!(shader::MPM_COMPUTE_SHADER.contains("fn viscosity_apply("));
     }
 
     #[test]
