@@ -438,6 +438,7 @@ impl MpmSim3D {
 
     pub fn set_spout_position(&mut self, x: f32, y: f32, z: f32) {
         self.settings.spout.origin = Vec3::new(x, y, z);
+        self.settings.spout.aim_at(self.settings.spout.target);
     }
 
     pub fn set_spout_target(&mut self, x: f32, y: f32, z: f32) {

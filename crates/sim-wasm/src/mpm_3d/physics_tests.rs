@@ -141,6 +141,7 @@ struct WaterVelocitySnapshot {
     kinetic_energy: f32,
     rms_speed: f32,
     mean_speed: f32,
+    lateral_rms_speed: f32,
     max_speed: f32,
     momentum: [f32; 3],
 }
@@ -280,6 +281,7 @@ fn readback_water_velocity_snapshot(
     let mut active_mass = 0.0_f32;
     let mut kinetic_energy = 0.0_f32;
     let mut mass_weighted_speed_sq = 0.0_f32;
+    let mut mass_weighted_lateral_speed_sq = 0.0_f32;
     let mut speed_sum = 0.0_f32;
     let mut max_speed = 0.0_f32;
     let mut momentum = [0.0_f32; 3];
@@ -302,6 +304,7 @@ fn readback_water_velocity_snapshot(
         active_mass += mass;
         kinetic_energy += 0.5 * mass * speed_sq;
         mass_weighted_speed_sq += mass * speed_sq;
+        mass_weighted_lateral_speed_sq += mass * (vx * vx + vz * vz);
         speed_sum += speed;
         max_speed = max_speed.max(speed);
         momentum[0] += mass * vx;
@@ -319,6 +322,7 @@ fn readback_water_velocity_snapshot(
         kinetic_energy,
         rms_speed: (mass_weighted_speed_sq / active_mass.max(1e-6)).sqrt(),
         mean_speed: speed_sum / n,
+        lateral_rms_speed: (mass_weighted_lateral_speed_sq / active_mass.max(1e-6)).sqrt(),
         max_speed,
         momentum,
     }
@@ -1200,6 +1204,55 @@ fn viscosity_preserves_falling_stream_velocity() {
     assert!(
         mean_ratio > 0.97 && mean_ratio < 1.03,
         "viscosity should not damp sparse falling stream mean speed: ratio={mean_ratio:.3} inviscid={inviscid:?} viscous={viscous:?}",
+    );
+}
+
+#[test]
+fn slow_spout_translation_does_not_whip_free_stream() {
+    let Some((device, queue)) = create_test_device() else {
+        eprintln!("skipping: no GPU adapter");
+        return;
+    };
+
+    fn run_case(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        translate_spout: bool,
+    ) -> WaterVelocitySnapshot {
+        let mut settings = MpmSettings::benchmark_free_stream();
+        settings.spout.origin = Vec3::new(0.0, 4.2, 0.0);
+        settings.spout.aim_at(Vec3::new(0.0, -2.0, 0.0));
+        let mut sim = MpmSim3D::new(device, queue, settings);
+
+        sim.set_kettle_angle(36.0);
+        for frame in 0..90 {
+            if translate_spout {
+                let t = (frame as f32 + 1.0) / 90.0;
+                sim.set_spout_position(-0.3 * t, 4.2, 0.0);
+            }
+            sim.step_frame(device, queue, 1.0 / 60.0);
+        }
+
+        readback_water_velocity_snapshot(&sim, device, queue)
+    }
+
+    let stationary = run_case(&device, &queue, false);
+    let translated = run_case(&device, &queue, true);
+    let stationary_lateral_ratio = stationary.lateral_rms_speed / stationary.rms_speed.max(1e-6);
+    let translated_lateral_ratio = translated.lateral_rms_speed / translated.rms_speed.max(1e-6);
+    let mean_vx = translated.momentum[0] / translated.active_mass.max(1e-6);
+
+    assert!(
+        stationary.all_finite && translated.all_finite && translated.active_count > 0,
+        "translated free stream produced invalid velocity state: stationary={stationary:?} translated={translated:?}",
+    );
+    assert!(
+        translated_lateral_ratio <= stationary_lateral_ratio * 1.15 + 0.02,
+        "slow spout translation amplified lateral stream motion: stationary_ratio={stationary_lateral_ratio:.3} translated_ratio={translated_lateral_ratio:.3} stationary={stationary:?} translated={translated:?}",
+    );
+    assert!(
+        mean_vx.abs() < 2.0,
+        "slow spout translation injected excessive net x momentum: mean_vx={mean_vx:.3} translated={translated:?}",
     );
 }
 
