@@ -368,6 +368,101 @@ struct DiagSnapshot {
     max_j: f32,
 }
 
+#[derive(Debug)]
+struct BedFilterContainmentSnapshot {
+    all_finite: bool,
+    active_count: u32,
+    max_radial_excess: f32,
+    min_floor_clearance: f32,
+}
+
+fn readback_bed_filter_containment_snapshot(
+    sim: &MpmSim3D,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+) -> BedFilterContainmentSnapshot {
+    let particle_count = (sim.num_water + sim.num_bed) as usize;
+    let particle_size = (particle_count * 32).max(4) as u64;
+
+    let staging = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("bed filter containment staging"),
+        size: particle_size,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("bed filter containment readback"),
+    });
+    encoder.copy_buffer_to_buffer(&sim.buffers.particles, 0, &staging, 0, particle_size);
+    queue.submit(Some(encoder.finish()));
+
+    let slice = staging.slice(..);
+    let (tx, rx) = mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |result| {
+        tx.send(result)
+            .expect("bed filter containment map callback");
+    });
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+    rx.recv()
+        .expect("bed filter containment map recv")
+        .expect("bed filter containment map");
+
+    let view = slice.get_mapped_range();
+    let data = cast_slice::<u8, f32>(&view);
+
+    let filter = FilterConfig::default();
+    let filter_bot_abs = filter.center.y + filter.bot_y;
+    let filter_top_abs = filter.center.y + filter.top_y;
+    let dx = sim.settings.bounds_size.x / sim.settings.grid_dims[0] as f32;
+    let bed_radius = dx * 0.62;
+    let inactive_thresh = inflow::MASS_UNITS_PER_ML / inflow::PARTICLES_PER_ML * 0.1;
+    let mut all_finite = true;
+    let mut active_count = 0u32;
+    let mut max_radial_excess = f32::MIN;
+    let mut min_floor_clearance = f32::MAX;
+
+    for i in 0..sim.num_bed as usize {
+        let x = data[i * 8];
+        let y = data[i * 8 + 1];
+        let z = data[i * 8 + 2];
+        let mass = data[i * 8 + 7];
+
+        all_finite &= x.is_finite() && y.is_finite() && z.is_finite() && mass.is_finite();
+        if mass <= inactive_thresh {
+            continue;
+        }
+        active_count += 1;
+
+        let local_y = (y - filter.center.y).clamp(filter.bot_y, filter.top_y);
+        let inner_radius = filter.inner_radius_at_y(local_y);
+        let radial = (x * x + z * z).sqrt();
+        max_radial_excess = max_radial_excess.max(radial + bed_radius - inner_radius);
+        min_floor_clearance = min_floor_clearance.min(y - (filter_bot_abs + bed_radius));
+
+        if y < filter_bot_abs || y > filter_top_abs {
+            all_finite = all_finite && y.is_finite();
+        }
+    }
+    drop(view);
+    staging.unmap();
+
+    BedFilterContainmentSnapshot {
+        all_finite,
+        active_count,
+        max_radial_excess: if active_count > 0 {
+            max_radial_excess
+        } else {
+            0.0
+        },
+        min_floor_clearance: if active_count > 0 {
+            min_floor_clearance
+        } else {
+            0.0
+        },
+    }
+}
+
 fn readback_diag_snapshot_range(
     sim: &MpmSim3D,
     device: &wgpu::Device,
@@ -883,6 +978,39 @@ fn bed_does_not_rebound_after_pour_off() {
     assert!(
         recovered.max_j <= 1.4001,
         "bed elastic volume recovery exceeded wet-bed bound after pour-off: wet={wet:?} recovered={recovered:?}",
+    );
+}
+
+#[test]
+fn wet_bed_stays_inside_filter_paper() {
+    let Some((device, queue)) = create_test_device() else {
+        eprintln!("skipping: no GPU adapter");
+        return;
+    };
+
+    let mut sim = MpmSim3D::new(&device, &queue, MpmSettings::benchmark_center_pour());
+    sim.set_kettle_angle(36.0);
+    for _ in 0..180 {
+        sim.step_frame(&device, &queue, 1.0 / 60.0);
+    }
+    sim.set_kettle_angle(0.0);
+    for _ in 0..60 {
+        sim.step_frame(&device, &queue, 1.0 / 60.0);
+    }
+
+    let containment = readback_bed_filter_containment_snapshot(&sim, &device, &queue);
+    let tolerance = sim.settings.bounds_size.x / sim.settings.grid_dims[0] as f32 * 0.25;
+    assert!(
+        containment.all_finite && containment.active_count > 0,
+        "wet bed filter containment readback was invalid: {containment:?}",
+    );
+    assert!(
+        containment.max_radial_excess <= tolerance,
+        "wet bed escaped radially through filter paper: tolerance={tolerance} containment={containment:?}",
+    );
+    assert!(
+        containment.min_floor_clearance >= -tolerance,
+        "wet bed escaped below filter apex: tolerance={tolerance} containment={containment:?}",
     );
 }
 
