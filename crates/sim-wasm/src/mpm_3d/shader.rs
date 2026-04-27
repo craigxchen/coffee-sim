@@ -978,6 +978,19 @@ fn project_pressure(@builtin(global_invocation_id) gid: vec3<u32>) {
     );
 
     var v = gv.xyz - dt() * grad_p;
+    if kind == CELL_BED_COUPLED {
+        let bed_idx = bed_lookup_load(idx);
+        if bed_idx >= 0 && u32(bed_idx) < num_bed() {
+            let be = bed_extract[u32(bed_idx)];
+            let permeability = be.bed.z;
+            let porous_drag = drag_coeff() * (1.0 - permeability * 0.1) * dt();
+            let vertical_damping = 1.0 / (1.0 + max(porous_drag, 0.0));
+            let lateral_damping = 1.0 / (1.0 + max(porous_drag * 16.0, 0.0));
+            v.x *= lateral_damping;
+            v.y *= vertical_damping;
+            v.z *= lateral_damping;
+        }
+    }
     let speed = length(v);
     if speed > vel_cap() {
         v = v * (vel_cap() / speed);
@@ -1081,6 +1094,7 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>) {
     var new_C2 = vec3<f32>(0.0);
     var supported_weight = 0.0;
     var local_grid_mass = 0.0;
+    var bed_overlap_weight = 0.0;
 
     let B = 4.0 * inv_dx() * inv_dx();
     let cell_dx = dx();
@@ -1108,6 +1122,9 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>) {
                     new_C2 += w * B * grid_v * dpos.z;
                     supported_weight += w;
                     local_grid_mass += w * grid_mass;
+                }
+                if num_bed() > 0u && bed_lookup_load(ci) >= 0 {
+                    bed_overlap_weight += w;
                 }
             }
         }
@@ -1143,14 +1160,11 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>) {
     // severely under-dense. PIC/APIC transfer then numerically diffuses momentum.
     // Preserve more ballistic motion when the particle is airborne and local mass
     // support is low compared with a compact fluid region.
-    let home_cell = world_to_cell(xp);
-    var bed_near = false;
-    if home_cell.x >= 0 && home_cell.y >= 0 && home_cell.z >= 0
-        && u32(home_cell.x) < gx() && u32(home_cell.y) < gy() && u32(home_cell.z) < gz() {
-        let home_idx = cell_index(u32(home_cell.x), u32(home_cell.y), u32(home_cell.z));
-        bed_near = bed_lookup_load(home_idx) >= 0;
-    }
-    let airborne = !bed_near && sample_sdf(xp) > contact_offset() * 2.0;
+    // Use the particle's interpolation stencil rather than a single home-cell
+    // bed lookup so particles exiting the coffee bed do not toggle abruptly
+    // between porous and airborne transfer behavior at cell boundaries.
+    let porous_overlap = clamp(bed_overlap_weight, 0.0, 1.0);
+    let airborne = porous_overlap <= 0.05 && sample_sdf(xp) > contact_offset() * 2.0;
     if airborne {
         let dense_mass = nominal_mass() * 4.0;
         let density_ratio = clamp(local_grid_mass / max(dense_mass, 1e-6), 0.0, 1.0);
@@ -1224,14 +1238,6 @@ fn bed_coupling(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     var be = bed_extract[u32(bed_idx)];
     let saturation = be.extract.w;
-    let permeability = be.bed.z;
-
-    let drag = drag_coeff() * (1.0 - permeability * 0.1) * dt();
-    let v = particles[pid].vel.xyz;
-    particles[pid].vel = vec4<f32>(
-        v / (1.0 + max(drag, 0.0)),
-        particles[pid].vel.w,
-    );
 
     let capacity = max(max_saturation() - be.bed.x, 0.0);
     if capacity <= 1e-6 {
