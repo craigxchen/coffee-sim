@@ -813,6 +813,58 @@ fn bed_short_pour_retains_shape() {
 }
 
 #[test]
+fn bed_does_not_rebound_after_pour_off() {
+    let Some((device, queue)) = create_test_device() else {
+        eprintln!("skipping: no GPU adapter");
+        return;
+    };
+
+    let mut sim = MpmSim3D::new(&device, &queue, MpmSettings::benchmark_center_pour());
+    sim.set_kettle_angle(0.0);
+    for _ in 0..60 {
+        sim.step_frame(&device, &queue, 1.0 / 60.0);
+    }
+    let settled = readback_bed_diag_snapshot(&sim, &device, &queue);
+
+    sim.set_kettle_angle(36.0);
+    for _ in 0..120 {
+        sim.step_frame(&device, &queue, 1.0 / 60.0);
+    }
+    let wet = readback_bed_diag_snapshot(&sim, &device, &queue);
+
+    sim.set_kettle_angle(0.0);
+    for _ in 0..90 {
+        sim.step_frame(&device, &queue, 1.0 / 60.0);
+    }
+    let recovered = readback_bed_diag_snapshot(&sim, &device, &queue);
+
+    assert!(
+        settled.all_finite && wet.all_finite && recovered.all_finite,
+        "post-pour bed recovery produced non-finite state: settled={settled:?} wet={wet:?} recovered={recovered:?}",
+    );
+    assert_eq!(
+        wet.active_count, recovered.active_count,
+        "bed active particle count changed during post-pour recovery: wet={wet:?} recovered={recovered:?}",
+    );
+    assert!(
+        wet.y_mean <= settled.y_mean + 0.05,
+        "short pour did not leave bed measurably compressed before recovery check: settled={settled:?} wet={wet:?}",
+    );
+    assert!(
+        recovered.y_mean <= wet.y_mean + 0.12,
+        "bed centroid rebounded upward after pour-off: settled={settled:?} wet={wet:?} recovered={recovered:?}",
+    );
+    assert!(
+        recovered.y_extent <= wet.y_extent * 1.12,
+        "bed expanded vertically after pour-off: settled={settled:?} wet={wet:?} recovered={recovered:?}",
+    );
+    assert!(
+        recovered.max_j <= 1.4001,
+        "bed elastic volume recovery exceeded wet-bed bound after pour-off: wet={wet:?} recovered={recovered:?}",
+    );
+}
+
+#[test]
 fn water_mass_stable_after_pour_off() {
     let Some((device, queue)) = create_test_device() else {
         eprintln!("skipping: no GPU adapter");

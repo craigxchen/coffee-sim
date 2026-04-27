@@ -99,7 +99,7 @@ fn drag_coeff() -> f32 { return u.bed_params.x; }
 fn absorption_rate() -> f32 { return u.bed_params.y; }
 fn max_saturation() -> f32 { return u.bed_params.z; }
 fn extraction_rate() -> f32 { return u.extraction_params.x; }
-fn bed_spring() -> f32 { return u.extraction_params.y; }
+fn bed_compaction_rate() -> f32 { return u.extraction_params.y; }
 fn bed_damping() -> f32 { return u.extraction_params.z; }
 fn bed_impact() -> f32 { return u.extraction_params.w; }
 fn inactive_mass_threshold() -> f32 { return nominal_mass() * 0.10; }
@@ -216,14 +216,16 @@ fn sdf_class_is_solid(cell: vec3<i32>) -> bool {
 }
 
 fn is_fluid_kind(kind: i32) -> bool {
-    // Surface cells must participate in the pressure solve so hydrostatic
-    // pressure can build up in shallow puddles. Adjacent CELL_AIR cells
+    // Surface and bed-coupled cells must participate in the pressure solve so
+    // hydrostatic pressure can build up in shallow puddles and water inside the
+    // bed remains part of the incompressible solve. Adjacent CELL_AIR cells
     // provide the Dirichlet p=0 BC via the neighbor-loop sum in
     // `pressure_update` (air neighbors count toward the denominator but
     // contribute 0 to the numerator), so excluding surface cells here would
     // zero them out and let gravity compress thin pools to a single layer.
     return kind == CELL_INTERIOR_FLUID
-        || kind == CELL_SURFACE_FLUID;
+        || kind == CELL_SURFACE_FLUID
+        || kind == CELL_BED_COUPLED;
 }
 
 fn is_solid_kind(kind: i32) -> bool {
@@ -1351,11 +1353,9 @@ fn bed_dynamics(@builtin(global_invocation_id) gid: vec3<u32>) {
     let sat = bed_extract[bid].extract.w;
     let mobility = clamp((1.0 - sat) * (0.35 + water_mass * 0.12), 0.0, 1.0);
     let surface_factor = clamp((rest.y + 3.0) / 3.5, 0.12, 1.0);
-    let spring = bed_spring() * (0.8 + sat * 0.5);
     let damping = clamp(1.0 - bed_damping() * dt(), 0.0, 1.0);
 
     var vel = p.vel.xyz;
-    vel += (rest - pos) * spring * dt();
 
     let impact_v = vec3<f32>(water_v.x * 0.25, min(water_v.y, 0.0) * 0.9, water_v.z * 0.25);
     vel += impact_v * bed_impact() * mobility * surface_factor * dt();
@@ -1372,29 +1372,24 @@ fn bed_dynamics(@builtin(global_invocation_id) gid: vec3<u32>) {
         vel.x *= 0.4;
         vel.z *= 0.4;
     }
-    offset.y = clamp(offset.y, -dx() * (1.75 * surface_factor + 0.2), dx() * 0.18);
+    offset.y = clamp(offset.y, -dx() * (1.75 * surface_factor + 0.2), dx() * 0.04);
     new_pos = rest + offset;
 
     // Plastic compaction: once the bed is indented enough, lower the remembered
-    // local rest height so the crater relaxes slowly instead of springing fully back.
+    // local rest height instead of applying an elastic spring back to the
+    // original packed surface. Coffee grounds are treated here as an overdamped
+    // porous granular bed; recovery should come from later flow/packing dynamics,
+    // not from a shape-memory spring.
     let compression = max(rest.y - new_pos.y, 0.0);
     let plastic_threshold = dx() * 0.18;
     if compression > plastic_threshold {
         let excess = compression - plastic_threshold;
         let plasticity = clamp(
-            (0.18 + sat * 0.55 + mobility * 0.45) * surface_factor * dt() * 6.0,
+            (0.05 + sat * 0.35 + mobility * 0.55) * surface_factor * bed_compaction_rate() * dt(),
             0.0,
             0.18,
         );
         rest.y -= excess * plasticity;
-    }
-
-    // Very slow rebound toward the original packed state for drier regions so
-    // old craters soften over time rather than staying perfectly frozen forever.
-    let packed_rest = affine[pid].col2.x;
-    if packed_rest != 0.0 {
-        let rebound = clamp((1.0 - sat) * dt() * 0.08, 0.0, 0.01);
-        rest.y = mix(rest.y, packed_rest, rebound);
     }
 
     let contact = resolve_sdf_contact(new_pos, vel, true);
