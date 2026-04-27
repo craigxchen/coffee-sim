@@ -9,6 +9,7 @@ pub(crate) const PARTICLES_PER_ML: f32 = 320.0;
 pub(crate) struct SpoutSettings {
     pub origin: Vec3,
     pub direction: Vec3,
+    pub target: Vec3,
     pub nozzle_radius: f32,
     pub stem_radius: f32,
     pub activation_angle_deg: f32,
@@ -27,6 +28,7 @@ impl Default for SpoutSettings {
         Self {
             origin: Vec3::new(-3.4, 7.3, 0.9),
             direction: Vec3::new(0.36, -0.92, -0.12).normalized(),
+            target: Vec3::new(-0.7, 0.4, 0.0),
             nozzle_radius: 0.18,
             stem_radius: 0.24,
             activation_angle_deg: 8.0,
@@ -44,6 +46,7 @@ impl Default for SpoutSettings {
 
 impl SpoutSettings {
     pub fn aim_at(&mut self, target: Vec3) {
+        self.target = target;
         let delta = Vec3::new(
             target.x - self.origin.x,
             target.y - self.origin.y,
