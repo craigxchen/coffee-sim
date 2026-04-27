@@ -349,14 +349,23 @@ fn resolve_scene_obstacles(position: vec3<f32>, velocity: vec3<f32>, is_bed: boo
         out_vel = cone_contact.vel;
     }
 
-    // Paper filter (bed particles only): the filter is porous — water
-    // passes through the paper, but coffee particles are trapped above.
-    // Below the V60 cone the filter narrows to a point at y=-3.37.
-    let filter_bot_y = -3.37;
+    // Paper filter (bed particles only): the filter is porous — water passes
+    // through the paper, but coffee particles are trapped inside the actual
+    // paper interior. This constraint mirrors `FilterConfig::default()`:
+    // center.y=-0.35, top_y=2.75, bot_y=-3.02, top_radius=4.10,
+    // bot_radius=0.0, thickness=0.08. The dripper cone above is wider near the
+    // outlet, so bed particles must use the tighter filter surface or they can
+    // visibly pass through the rendered paper.
+    let filter_center_y = -0.35;
+    let filter_top_y = filter_center_y + 2.75;
+    let filter_bot_y = filter_center_y - 3.02;
+    let filter_top_radius = 4.10;
+    let filter_thickness = 0.08;
+    let bed_contact_offset = max(contact_offset(), bed_particle_radius());
     if is_bed {
-        if out_pos.y < cone_bot_y && out_pos.y >= filter_bot_y {
-            let ft = (out_pos.y - filter_bot_y) / (cone_bot_y - filter_bot_y);
-            let filter_r = mix(0.0, 0.26, ft) - contact_offset();
+        if out_pos.y <= filter_top_y && out_pos.y >= filter_bot_y {
+            let ft = clamp((out_pos.y - filter_bot_y) / (filter_top_y - filter_bot_y), 0.0, 1.0);
+            let filter_r = filter_top_radius * ft - filter_thickness - bed_contact_offset;
             if filter_r > 0.0 {
                 let fc = resolve_radial_barrier(out_pos, out_vel, vec2<f32>(0.0, 0.0), filter_r);
                 out_pos = fc.pos;
@@ -365,8 +374,8 @@ fn resolve_scene_obstacles(position: vec3<f32>, velocity: vec3<f32>, is_bed: boo
         }
 
         // Filter apex: floor keeps bed particles from falling through.
-        if out_pos.y <= filter_bot_y + contact_offset() && out_pos.y > filter_bot_y - 0.5 {
-            out_pos.y = filter_bot_y + contact_offset();
+        if out_pos.y <= filter_bot_y + bed_contact_offset && out_pos.y > filter_bot_y - 0.5 {
+            out_pos.y = filter_bot_y + bed_contact_offset;
             if out_vel.y < 0.0 {
                 out_vel.y = 0.0;
                 out_vel.x *= 1.0 - friction() * 0.55;
