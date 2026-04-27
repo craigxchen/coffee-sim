@@ -244,6 +244,22 @@ fn readback_water_velocity_snapshot(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
 ) -> WaterVelocitySnapshot {
+    readback_water_velocity_snapshot_in_y_range(
+        sim,
+        device,
+        queue,
+        f32::NEG_INFINITY,
+        f32::INFINITY,
+    )
+}
+
+fn readback_water_velocity_snapshot_in_y_range(
+    sim: &MpmSim3D,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    y_min: f32,
+    y_max: f32,
+) -> WaterVelocitySnapshot {
     let particle_count = (sim.num_water + sim.num_bed) as usize;
     let particle_size = (particle_count * 32).max(4) as u64;
 
@@ -287,14 +303,16 @@ fn readback_water_velocity_snapshot(
     let mut momentum = [0.0_f32; 3];
 
     for i in start..end {
+        let y = data[i * 8 + 1];
         let vx = data[i * 8 + 4];
         let vy = data[i * 8 + 5];
         let vz = data[i * 8 + 6];
         let mass = data[i * 8 + 7];
 
-        all_finite &= vx.is_finite() && vy.is_finite() && vz.is_finite() && mass.is_finite();
+        all_finite &=
+            y.is_finite() && vx.is_finite() && vy.is_finite() && vz.is_finite() && mass.is_finite();
 
-        if mass <= inactive_thresh {
+        if mass <= inactive_thresh || y < y_min || y > y_max {
             continue;
         }
 
@@ -1122,7 +1140,7 @@ fn higher_viscosity_damps_pooled_water_kinetic_energy() {
         }
 
         sim.set_kettle_angle(0.0);
-        for _ in 0..180 {
+        for _ in 0..300 {
             sim.step_frame(device, queue, 1.0 / 60.0);
         }
 
@@ -1253,6 +1271,53 @@ fn slow_spout_translation_does_not_whip_free_stream() {
     assert!(
         mean_vx.abs() < 2.0,
         "slow spout translation injected excessive net x momentum: mean_vx={mean_vx:.3} translated={translated:?}",
+    );
+}
+
+#[test]
+fn slow_spout_translation_does_not_whip_post_bed_stream() {
+    let Some((device, queue)) = create_test_device() else {
+        eprintln!("skipping: no GPU adapter");
+        return;
+    };
+
+    fn run_case(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        translate_spout: bool,
+    ) -> WaterVelocitySnapshot {
+        let mut sim = MpmSim3D::new(device, queue, MpmSettings::benchmark_center_pour());
+        sim.set_kettle_angle(36.0);
+        for frame in 0..150 {
+            if translate_spout {
+                let t = (frame as f32 + 1.0) / 150.0;
+                sim.set_spout_position(-0.3 * t, 7.1, 0.0);
+            }
+            sim.step_frame(device, queue, 1.0 / 60.0);
+        }
+
+        // Region between the filter exit and the main cup pool. This catches
+        // stream behavior downstream of the bed without letting the whole cup
+        // dominate the velocity statistic.
+        readback_water_velocity_snapshot_in_y_range(&sim, device, queue, -6.2, -3.35)
+    }
+
+    let stationary = run_case(&device, &queue, false);
+    let translated = run_case(&device, &queue, true);
+    let stationary_lateral_ratio = stationary.lateral_rms_speed / stationary.rms_speed.max(1e-6);
+    let translated_lateral_ratio = translated.lateral_rms_speed / translated.rms_speed.max(1e-6);
+
+    assert!(
+        stationary.all_finite && translated.all_finite,
+        "post-bed stream produced invalid velocity state: stationary={stationary:?} translated={translated:?}",
+    );
+    assert!(
+        stationary.active_count > 20 && translated.active_count > 20,
+        "post-bed stream readback did not capture enough water particles: stationary={stationary:?} translated={translated:?}",
+    );
+    assert!(
+        translated_lateral_ratio <= stationary_lateral_ratio * 1.20 + 0.04,
+        "slow spout translation amplified post-bed lateral stream motion: stationary_ratio={stationary_lateral_ratio:.3} translated_ratio={translated_lateral_ratio:.3} stationary={stationary:?} translated={translated:?}",
     );
 }
 
