@@ -196,15 +196,16 @@ impl InflowState {
             let radial_u = ((sf + 0.5) * radial_irrational).fract();
             let r = jet_radius * radial_u.sqrt();
             let theta = sf * golden_angle;
+            let emission_age = ((i as f32 + 0.5) / count as f32) * dt;
             let offset = Vec3::new(
                 t1.x * r * theta.cos() + t2.x * r * theta.sin(),
                 t1.y * r * theta.cos() + t2.y * r * theta.sin(),
                 t1.z * r * theta.cos() + t2.z * r * theta.sin(),
             );
             let pos = Vec3::new(
-                emit_origin.x + offset.x,
-                emit_origin.y + offset.y,
-                emit_origin.z + offset.z,
+                emit_origin.x + offset.x - vel.x * emission_age,
+                emit_origin.y + offset.y - vel.y * emission_age,
+                emit_origin.z + offset.z - vel.z * emission_age,
             );
 
             // Particle: pos(x,y,z,J), vel(vx,vy,vz,mass)
