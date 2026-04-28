@@ -56,6 +56,12 @@ impl SpoutSettings {
             self.direction = delta.normalized();
         }
     }
+
+    pub fn translate_origin_to(&mut self, origin: Vec3) {
+        let delta = origin - self.origin;
+        self.origin = origin;
+        self.target = self.target + delta;
+    }
 }
 
 pub(crate) struct InflowState {
@@ -336,5 +342,25 @@ mod tests {
         assert!(inflow.flow_rate() > 0.0);
         assert!(inflow.exit_speed() <= spout.max_exit_speed);
         assert!(inflow.flow_rate() <= spout.max_flow_rate_ml_s);
+    }
+
+    #[test]
+    fn translating_spout_preserves_jet_direction() {
+        let mut spout = SpoutSettings::default();
+        spout.aim_at(Vec3::new(0.0, 0.4, 0.0));
+        let before_origin = spout.origin;
+        let before_target = spout.target;
+        let before_direction = spout.direction;
+
+        let new_origin = before_origin + Vec3::new(-0.3, 0.0, 0.0);
+        spout.translate_origin_to(new_origin);
+
+        let target_delta = spout.target - before_target;
+        assert!((target_delta.x + 0.3).abs() < 1e-5);
+        assert!(target_delta.y.abs() < 1e-5);
+        assert!(target_delta.z.abs() < 1e-5);
+        assert!((spout.direction.x - before_direction.x).abs() < 1e-5);
+        assert!((spout.direction.y - before_direction.y).abs() < 1e-5);
+        assert!((spout.direction.z - before_direction.z).abs() < 1e-5);
     }
 }
