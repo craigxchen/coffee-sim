@@ -376,6 +376,15 @@ struct BedFilterContainmentSnapshot {
     min_floor_clearance: f32,
 }
 
+#[derive(Debug)]
+struct SaturatedBedMotionSnapshot {
+    all_finite: bool,
+    active_count: u32,
+    saturated_count: u32,
+    mean_compression: f32,
+    saturated_mean_compression: f32,
+}
+
 fn readback_bed_filter_containment_snapshot(
     sim: &MpmSim3D,
     device: &wgpu::Device,
@@ -460,6 +469,105 @@ fn readback_bed_filter_containment_snapshot(
         } else {
             0.0
         },
+    }
+}
+
+fn readback_saturated_bed_motion_snapshot(
+    sim: &MpmSim3D,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+) -> SaturatedBedMotionSnapshot {
+    let particle_count = (sim.num_water + sim.num_bed) as usize;
+    let particle_size = (particle_count * 32).max(4) as u64;
+    let bed_size = (sim.num_bed as usize * 32).max(4) as u64;
+
+    let particle_staging = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("saturated bed particle staging"),
+        size: particle_size,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let bed_staging = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("saturated bed extract staging"),
+        size: bed_size,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("saturated bed motion readback"),
+    });
+    encoder.copy_buffer_to_buffer(
+        &sim.buffers.particles,
+        0,
+        &particle_staging,
+        0,
+        particle_size,
+    );
+    encoder.copy_buffer_to_buffer(&sim.buffers.bed_extract, 0, &bed_staging, 0, bed_size);
+    queue.submit(Some(encoder.finish()));
+
+    let particle_slice = particle_staging.slice(..);
+    let bed_slice = bed_staging.slice(..);
+    let (tx, rx) = mpsc::channel();
+    let tx_particles = tx.clone();
+    particle_slice.map_async(wgpu::MapMode::Read, move |result| {
+        tx_particles
+            .send(result)
+            .expect("saturated bed particle map callback");
+    });
+    bed_slice.map_async(wgpu::MapMode::Read, move |result| {
+        tx.send(result).expect("saturated bed extract map callback");
+    });
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+    rx.recv()
+        .expect("saturated bed particle map recv")
+        .expect("saturated bed particle map");
+    rx.recv()
+        .expect("saturated bed extract map recv")
+        .expect("saturated bed extract map");
+
+    let particle_view = particle_slice.get_mapped_range();
+    let particle_f32 = cast_slice::<u8, f32>(&particle_view);
+    let bed_view = bed_slice.get_mapped_range();
+    let bed_f32 = cast_slice::<u8, f32>(&bed_view);
+
+    let inactive_thresh = inflow::MASS_UNITS_PER_ML / inflow::PARTICLES_PER_ML * 0.1;
+    let mut all_finite = true;
+    let mut active_count = 0u32;
+    let mut saturated_count = 0u32;
+    let mut compression_sum = 0.0_f32;
+    let mut saturated_compression_sum = 0.0_f32;
+
+    for i in 0..sim.num_bed as usize {
+        let mass = particle_f32[i * 8 + 7];
+        let compression = bed_f32[i * 8 + 3];
+        let saturation = bed_f32[i * 8 + 7];
+
+        all_finite &= mass.is_finite() && compression.is_finite() && saturation.is_finite();
+        if mass <= inactive_thresh {
+            continue;
+        }
+
+        active_count += 1;
+        compression_sum += compression;
+        if saturation >= 0.65 {
+            saturated_count += 1;
+            saturated_compression_sum += compression;
+        }
+    }
+
+    drop(bed_view);
+    bed_staging.unmap();
+    drop(particle_view);
+    particle_staging.unmap();
+
+    SaturatedBedMotionSnapshot {
+        all_finite,
+        active_count,
+        saturated_count,
+        mean_compression: compression_sum / active_count.max(1) as f32,
+        saturated_mean_compression: saturated_compression_sum / saturated_count.max(1) as f32,
     }
 }
 
@@ -1011,6 +1119,39 @@ fn wet_bed_stays_inside_filter_paper() {
     assert!(
         containment.min_floor_clearance >= -tolerance,
         "wet bed escaped below filter apex: tolerance={tolerance} containment={containment:?}",
+    );
+}
+
+#[test]
+fn saturated_bed_particles_remain_mechanically_coupled() {
+    let Some((device, queue)) = create_test_device() else {
+        eprintln!("skipping: no GPU adapter");
+        return;
+    };
+
+    let mut sim = MpmSim3D::new(&device, &queue, MpmSettings::benchmark_center_pour());
+    sim.set_kettle_angle(0.0);
+    for _ in 0..60 {
+        sim.step_frame(&device, &queue, 1.0 / 60.0);
+    }
+
+    sim.set_kettle_angle(36.0);
+    for _ in 0..180 {
+        sim.step_frame(&device, &queue, 1.0 / 60.0);
+    }
+
+    let snapshot = readback_saturated_bed_motion_snapshot(&sim, &device, &queue);
+    assert!(
+        snapshot.all_finite && snapshot.active_count > 0,
+        "saturated bed motion readback was invalid: {snapshot:?}",
+    );
+    assert!(
+        snapshot.saturated_count > 8,
+        "center pour did not create a saturated bed population: {snapshot:?}",
+    );
+    assert!(
+        snapshot.saturated_mean_compression >= snapshot.mean_compression * 0.35,
+        "saturated bed particles are lagging the deforming bed instead of moving with it: {snapshot:?}",
     );
 }
 

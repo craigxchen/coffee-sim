@@ -1366,7 +1366,10 @@ fn bed_dynamics(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     let sat = bed_extract[bid].extract.w;
-    let mobility = clamp((1.0 - sat) * (0.35 + water_mass * 0.12), 0.0, 1.0);
+    // Saturation should not pin individual grains. Treat bound water as added
+    // inertia while leaving wet particles mechanically coupled to the bed.
+    let wet_inertia = 1.0 / (1.0 + sat * 0.35);
+    let mobility = clamp((0.35 + water_mass * 0.12) * wet_inertia, 0.0, 1.0);
     let surface_factor = clamp((rest.y + 3.0) / 3.5, 0.12, 1.0);
     let damping = clamp(1.0 - bed_damping() * dt(), 0.0, 1.0);
 
