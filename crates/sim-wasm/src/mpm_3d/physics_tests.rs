@@ -1538,8 +1538,9 @@ fn slow_spout_translation_does_not_whip_free_stream() {
         "slow spout translation amplified lateral stream motion: stationary_ratio={stationary_lateral_ratio:.3} translated_ratio={translated_lateral_ratio:.3} stationary={stationary:?} translated={translated:?}",
     );
     assert!(
-        mean_vx.abs() < 2.0,
-        "slow spout translation injected excessive net x momentum: mean_vx={mean_vx:.3} translated={translated:?}",
+        mean_vx.abs() < translated.rms_speed * 0.12,
+        "slow spout translation injected excessive net x momentum relative to stream speed: \
+         mean_vx={mean_vx:.3} translated={translated:?}",
     );
 }
 
@@ -1587,6 +1588,55 @@ fn slow_spout_translation_does_not_whip_post_bed_stream() {
     assert!(
         translated_lateral_ratio <= stationary_lateral_ratio * 1.20 + 0.04,
         "slow spout translation amplified post-bed lateral stream motion: stationary_ratio={stationary_lateral_ratio:.3} translated_ratio={translated_lateral_ratio:.3} stationary={stationary:?} translated={translated:?}",
+    );
+}
+
+#[test]
+fn coffee_bed_slows_post_bed_downward_flow() {
+    let Some((device, queue)) = create_test_device() else {
+        eprintln!("skipping: no GPU adapter");
+        return;
+    };
+
+    fn run_case(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        with_bed: bool,
+    ) -> WaterVelocitySnapshot {
+        let settings = if with_bed {
+            MpmSettings::benchmark_center_pour()
+        } else {
+            let mut settings = MpmSettings::benchmark_center_pour();
+            settings.bed = None;
+            settings
+        };
+        let mut sim = MpmSim3D::new(device, queue, settings);
+        sim.set_kettle_angle(36.0);
+        for _ in 0..150 {
+            sim.step_frame(device, queue, 1.0 / 60.0);
+        }
+
+        readback_water_velocity_snapshot_in_y_range(&sim, device, queue, -6.2, -3.35)
+    }
+
+    let open_filter = run_case(&device, &queue, false);
+    let coffee_bed = run_case(&device, &queue, true);
+    let open_downward_speed =
+        (-open_filter.momentum[1] / open_filter.active_mass.max(1e-6)).max(0.0);
+    let bed_downward_speed = (-coffee_bed.momentum[1] / coffee_bed.active_mass.max(1e-6)).max(0.0);
+
+    assert!(
+        open_filter.all_finite && coffee_bed.all_finite,
+        "post-bed velocity readback was invalid: open_filter={open_filter:?} coffee_bed={coffee_bed:?}",
+    );
+    assert!(
+        open_filter.active_count > 20 && coffee_bed.active_count > 20,
+        "post-bed velocity readback did not capture enough water: open_filter={open_filter:?} coffee_bed={coffee_bed:?}",
+    );
+    assert!(
+        bed_downward_speed < open_downward_speed * 0.85,
+        "coffee bed should slow downward post-bed flow: open_downward_speed={open_downward_speed:.3} \
+         bed_downward_speed={bed_downward_speed:.3} open_filter={open_filter:?} coffee_bed={coffee_bed:?}",
     );
 }
 

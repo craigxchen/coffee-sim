@@ -1153,10 +1153,16 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     let in_cup_volume =
         xp.y < -3.5 && dot(xp.xz, xp.xz) < (3.0 + contact_offset()) * (3.0 + contact_offset());
+    // Use the particle's interpolation stencil rather than a single home-cell
+    // bed lookup so particles exiting the coffee bed do not toggle abruptly
+    // between porous and airborne transfer behavior at cell boundaries.
+    let porous_overlap = clamp(bed_overlap_weight, 0.0, 1.0);
     if support_ratio < 0.999 {
         let ballistic_v = vec3<f32>(p.vel.x, p.vel.y + gravity() * dt(), p.vel.z);
-        let preserve_gain = select(1.35, 1.15, in_cup_volume);
-        let preserve_cap = select(0.995, 0.95, in_cup_volume);
+        let free_preserve_gain = select(1.35, 1.15, in_cup_volume);
+        let free_preserve_cap = select(0.995, 0.95, in_cup_volume);
+        let preserve_gain = mix(free_preserve_gain, 0.18, porous_overlap);
+        let preserve_cap = mix(free_preserve_cap, 0.16, porous_overlap);
         let preserve = clamp((1.0 - support_ratio) * preserve_gain, 0.0, preserve_cap);
         new_v = mix(new_v, ballistic_v, preserve);
         let affine_damp = 1.0 - preserve * 0.75;
@@ -1169,10 +1175,6 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>) {
     // severely under-dense. PIC/APIC transfer then numerically diffuses momentum.
     // Preserve more ballistic motion when the particle is airborne and local mass
     // support is low compared with a compact fluid region.
-    // Use the particle's interpolation stencil rather than a single home-cell
-    // bed lookup so particles exiting the coffee bed do not toggle abruptly
-    // between porous and airborne transfer behavior at cell boundaries.
-    let porous_overlap = clamp(bed_overlap_weight, 0.0, 1.0);
     let airborne = porous_overlap <= 0.05 && sample_sdf(xp) > contact_offset() * 2.0;
     if airborne {
         let dense_mass = nominal_mass() * 4.0;
