@@ -121,7 +121,7 @@ impl MpmSettings {
             substeps: 10,
             gravity: units::EARTH_GRAVITY_SIM_UNITS,
             bulk_modulus: 900.0,
-            viscosity: 0.12,
+            viscosity: 1.2,
             render_radius: dx * 0.7,
             pressure_rbgs_pairs: 40,
             use_sdf_cache: true,
@@ -141,7 +141,7 @@ impl MpmSettings {
                 },
             ],
             spout: SpoutSettings::default(),
-            initial_kettle_angle_deg: 36.0,
+            initial_kettle_angle_deg: 9.0,
             filter: Some(filter),
             bed: Some(bed),
         }
@@ -152,7 +152,7 @@ impl MpmSettings {
         settings.bed = None;
         settings.spout.origin = Vec3::new(0.0, 6.8, 0.0);
         settings.spout.aim_at(Vec3::new(0.0, -6.8, 0.0));
-        settings.initial_kettle_angle_deg = 28.0;
+        settings.initial_kettle_angle_deg = 9.0;
         settings
     }
 
@@ -160,7 +160,7 @@ impl MpmSettings {
         let mut settings = Self::default_v60();
         settings.spout.origin = Vec3::new(0.0, 7.1, 0.0);
         settings.spout.aim_at(Vec3::new(0.0, 0.4, 0.0));
-        settings.initial_kettle_angle_deg = 36.0;
+        settings.initial_kettle_angle_deg = 9.0;
         settings
     }
 }
@@ -604,7 +604,7 @@ impl MpmSim3D {
             sdf_params: [SDF_RES as f32, 0.3, 0.0, 0.05],
             // Tie bed retention to an overall retained-water target so the bed
             // wets realistically without swallowing most of the brew.
-            bed_params: [34.0, 8.0, bed_capacity_per_particle, 1.0],
+            bed_params: [90.0, 1.6, bed_capacity_per_particle, 1.0],
             extraction_params: [0.01, 11.0, 8.5, 15.0],
             time_params: [self.total_time, dt, 1.0, 0.0],
             clamp_params: [
@@ -692,6 +692,14 @@ mod tests {
         assert!((dx - dz).abs() < 1e-5);
         let height_covered = s.grid_dims[1] as f32 * dx;
         assert!(height_covered >= s.bounds_size.y - dx);
+    }
+
+    #[test]
+    fn default_v60_uses_slow_gooseneck_angle() {
+        let s = MpmSettings::default_v60();
+        assert!(s.initial_kettle_angle_deg <= 10.0);
+        assert!(s.spout.max_flow_rate_ml_s <= 4.0);
+        assert!(s.spout.max_exit_speed * units::METERS_PER_SIM_UNIT <= 0.13);
     }
 
     #[test]

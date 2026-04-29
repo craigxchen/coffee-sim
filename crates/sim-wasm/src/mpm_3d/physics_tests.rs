@@ -1641,6 +1641,57 @@ fn coffee_bed_slows_post_bed_downward_flow() {
 }
 
 #[test]
+fn coffee_bed_retains_water_above_bed_surface() {
+    let Some((device, queue)) = create_test_device() else {
+        eprintln!("skipping: no GPU adapter");
+        return;
+    };
+
+    fn run_case(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        with_bed: bool,
+    ) -> WaterVelocitySnapshot {
+        let settings = if with_bed {
+            MpmSettings::benchmark_center_pour()
+        } else {
+            let mut settings = MpmSettings::benchmark_center_pour();
+            settings.bed = None;
+            settings
+        };
+        let mut sim = MpmSim3D::new(device, queue, settings);
+        sim.set_kettle_angle(36.0);
+        for _ in 0..240 {
+            sim.step_frame(device, queue, 1.0 / 60.0);
+        }
+
+        readback_water_velocity_snapshot_in_y_range(&sim, device, queue, -0.9, 0.2)
+    }
+
+    let open_filter = run_case(&device, &queue, false);
+    let coffee_bed = run_case(&device, &queue, true);
+
+    assert!(
+        open_filter.all_finite && coffee_bed.all_finite,
+        "above-bed water readback was invalid: open_filter={open_filter:?} coffee_bed={coffee_bed:?}",
+    );
+    let open_near_surface_speed = open_filter.rms_speed;
+    let bed_near_surface_speed = coffee_bed.rms_speed;
+
+    assert!(
+        coffee_bed.active_count > open_filter.active_count + 20
+            && coffee_bed.active_mass > open_filter.active_mass * 1.5,
+        "coffee bed did not retain a visible top-bed water population: open_filter={open_filter:?} coffee_bed={coffee_bed:?}",
+    );
+    assert!(
+        bed_near_surface_speed < open_near_surface_speed * 0.65,
+        "coffee bed should turn the fast falling stream into slower near-surface water: \
+         open_near_surface_speed={open_near_surface_speed:.3} bed_near_surface_speed={bed_near_surface_speed:.3} \
+         open_filter={open_filter:?} coffee_bed={coffee_bed:?}",
+    );
+}
+
+#[test]
 #[ignore = "known failing target until porous pressure/free-surface coupling is redesigned"]
 fn pooled_water_shape_stays_bounded_after_initial_settle() {
     let Some((device, queue)) = create_test_device() else {
