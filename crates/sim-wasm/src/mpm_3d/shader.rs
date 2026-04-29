@@ -110,8 +110,8 @@ fn metrics_div_inv_fp_scale() -> f32 { return u.clamp_params.w; }
 fn projection_j_alpha() -> f32 { return u.projection_params.x; }
 fn projection_j_expand_alpha() -> f32 { return u.projection_params.y; }
 fn projection_max_rest_volume_fraction() -> f32 { return u.projection_params.z; }
-fn water_particle_radius() -> f32 { return dx() * 0.18; }
-fn bed_particle_radius() -> f32 { return dx() * 0.62; }
+fn water_particle_radius() -> f32 { return dx() * u.inflow_params.y; }
+fn bed_particle_radius() -> f32 { return dx() * u.inflow_params.z; }
 fn min_particle_j() -> f32 { return 0.40; }
 fn max_particle_j() -> f32 { return 2.00; }
 fn clamp_particle_j(value: f32) -> f32 {

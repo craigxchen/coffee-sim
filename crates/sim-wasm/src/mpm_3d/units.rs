@@ -1,3 +1,5 @@
+use super::brew_config::DEFAULT_BREW;
+
 /// Unit map for the V60 MPM scene.
 ///
 /// The solver uses abstract scene units for positions and velocities, but time
@@ -24,7 +26,7 @@ pub(crate) const EARTH_GRAVITY_SIM_UNITS: f32 = -STANDARD_GRAVITY_M_S2 * SIM_UNI
 pub(crate) const MAX_WATER_SPEED_M_S: f32 = 1.5;
 pub(crate) const MAX_WATER_SPEED_SIM_UNITS: f32 = MAX_WATER_SPEED_M_S * SIM_UNITS_PER_METER;
 
-pub(crate) const GENTLE_POUR_EXIT_SPEED_M_S: f32 = 0.12;
+pub(crate) const GENTLE_POUR_EXIT_SPEED_M_S: f32 = DEFAULT_BREW.gentle_pour_exit_speed_m_s;
 pub(crate) const GENTLE_POUR_EXIT_SPEED_SIM_UNITS: f32 =
     GENTLE_POUR_EXIT_SPEED_M_S * SIM_UNITS_PER_METER;
 
