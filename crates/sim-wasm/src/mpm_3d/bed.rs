@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use coffee_sim_core::sph::Vec3;
 
-use super::FilterConfig;
+use super::{brew_config::DEFAULT_BREW, FilterConfig};
 
 #[derive(Clone)]
 pub(crate) struct BedConfig {
@@ -28,9 +28,9 @@ impl Default for BedConfig {
             bot_y: -2.25,
             top_radius: 2.65,
             bot_radius: 0.95,
-            num_particles: 12_000,
-            initial_porosity: 0.4,
-            initial_permeability: 0.32,
+            num_particles: DEFAULT_BREW.bed_particle_samples,
+            initial_porosity: DEFAULT_BREW.bed_porosity,
+            initial_permeability: DEFAULT_BREW.initial_bed_permeability,
             extractable_mass: 0.15,
         }
     }

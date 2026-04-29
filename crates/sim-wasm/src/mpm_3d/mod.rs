@@ -4,6 +4,7 @@ use coffee_sim_core::sph::Vec3;
 use wasm_bindgen::prelude::JsValue;
 
 pub(crate) mod bed;
+mod brew_config;
 mod filter;
 mod filter_mesh;
 pub(crate) mod inflow;
@@ -19,6 +20,7 @@ pub(crate) use filter::FilterConfig;
 pub(crate) use filter_mesh::{MAX_FILL_VERTEX_COUNT, MAX_RENDER_VERTEX_COUNT};
 
 use bed::{BedConfig, BedInit};
+use brew_config::DEFAULT_BREW;
 use filter_mesh::FilterMesh;
 use inflow::{EmissionResult, InflowState, SpoutSettings, MASS_UNITS_PER_ML};
 use pipelines::MpmPipelines;
@@ -27,7 +29,7 @@ use state::{
     METRICS_SLOT_COUNT, NUM_THREADS, SDF_RES,
 };
 
-const TARGET_BED_RETENTION_ML: f32 = 42.0;
+const TARGET_BED_RETENTION_ML: f32 = DEFAULT_BREW.target_bed_retention_ml;
 pub(crate) const OBSTACLE_WALL_THICKNESS: f32 = 0.4;
 
 /// Device limits required by the MPM compute pipeline.
@@ -121,7 +123,7 @@ impl MpmSettings {
             substeps: 10,
             gravity: units::EARTH_GRAVITY_SIM_UNITS,
             bulk_modulus: 900.0,
-            viscosity: 1.2,
+            viscosity: DEFAULT_BREW.water_viscosity,
             render_radius: dx * 0.7,
             pressure_rbgs_pairs: 40,
             use_sdf_cache: true,
@@ -141,7 +143,7 @@ impl MpmSettings {
                 },
             ],
             spout: SpoutSettings::default(),
-            initial_kettle_angle_deg: 9.0,
+            initial_kettle_angle_deg: DEFAULT_BREW.initial_kettle_angle_deg,
             filter: Some(filter),
             bed: Some(bed),
         }
@@ -152,7 +154,7 @@ impl MpmSettings {
         settings.bed = None;
         settings.spout.origin = Vec3::new(0.0, 6.8, 0.0);
         settings.spout.aim_at(Vec3::new(0.0, -6.8, 0.0));
-        settings.initial_kettle_angle_deg = 9.0;
+        settings.initial_kettle_angle_deg = DEFAULT_BREW.initial_kettle_angle_deg;
         settings
     }
 
@@ -160,7 +162,7 @@ impl MpmSettings {
         let mut settings = Self::default_v60();
         settings.spout.origin = Vec3::new(0.0, 7.1, 0.0);
         settings.spout.aim_at(Vec3::new(0.0, 0.4, 0.0));
-        settings.initial_kettle_angle_deg = 9.0;
+        settings.initial_kettle_angle_deg = DEFAULT_BREW.initial_kettle_angle_deg;
         settings
     }
 }
@@ -600,11 +602,21 @@ impl MpmSim3D {
                 self.settings.spout.direction.z,
                 self.inflow.exit_speed(),
             ],
-            inflow_params: [self.settings.spout.nozzle_radius, 0.0, 0.0, 0.0],
+            inflow_params: [
+                self.settings.spout.nozzle_radius,
+                DEFAULT_BREW.water_sample_radius_dx,
+                DEFAULT_BREW.bed_sample_radius_dx,
+                0.0,
+            ],
             sdf_params: [SDF_RES as f32, 0.3, 0.0, 0.05],
             // Tie bed retention to an overall retained-water target so the bed
             // wets realistically without swallowing most of the brew.
-            bed_params: [90.0, 1.6, bed_capacity_per_particle, 1.0],
+            bed_params: [
+                DEFAULT_BREW.bed_drag_coeff,
+                DEFAULT_BREW.bed_absorption_rate,
+                bed_capacity_per_particle,
+                1.0,
+            ],
             extraction_params: [0.01, 11.0, 8.5, 15.0],
             time_params: [self.total_time, dt, 1.0, 0.0],
             clamp_params: [
