@@ -992,7 +992,9 @@ fn project_pressure(@builtin(global_invocation_id) gid: vec3<u32>) {
         if bed_idx >= 0 && u32(bed_idx) < num_bed() {
             let be = bed_extract[u32(bed_idx)];
             let permeability = be.bed.z;
-            let porous_drag = drag_coeff() * (1.0 - permeability * 0.1) * dt();
+            let saturation = be.extract.w;
+            let resistance = (1.0 / max(permeability, 0.08)) * (1.0 + saturation * 0.75);
+            let porous_drag = drag_coeff() * resistance * dt();
             let vertical_damping = 1.0 / (1.0 + max(porous_drag, 0.0));
             let lateral_damping = 1.0 / (1.0 + max(porous_drag * 16.0, 0.0));
             v.x *= lateral_damping;

@@ -30,7 +30,7 @@ impl Default for BedConfig {
             bot_radius: 0.95,
             num_particles: 12_000,
             initial_porosity: 0.4,
-            initial_permeability: 1.0,
+            initial_permeability: 0.32,
             extractable_mass: 0.15,
         }
     }
@@ -133,6 +133,7 @@ pub(crate) fn init_bed_particles(
     let mut affines = Vec::new();
     let mut bed_extracts = Vec::new();
     let mut lattice_to_particle = HashMap::new();
+    let mut particle_keys = Vec::new();
 
     for iy in 0..ny {
         let y = config.center.y + config.bot_y + (iy as f32 + 0.5) * spacing;
@@ -152,7 +153,9 @@ pub(crate) fn init_bed_particles(
                 }
 
                 let particle_index = particles.len() as i32;
-                lattice_to_particle.insert(LatticeKey { ix, iy, iz }, particle_index);
+                let key = LatticeKey { ix, iy, iz };
+                lattice_to_particle.insert(key, particle_index);
+                particle_keys.push(key);
 
                 // Particle: pos(x,y,z,J=1), vel(0,0,0,mass=1)
                 particles.push([x, y, z, 1.0, 0.0, 0.0, 0.0, 1.0]);
@@ -176,10 +179,26 @@ pub(crate) fn init_bed_particles(
 
     let target_n = config.num_particles as usize;
     if particles.len() > target_n {
-        particles.truncate(target_n);
-        affines.truncate(target_n);
-        bed_extracts.truncate(target_n);
-        lattice_to_particle.retain(|_, idx| (*idx as usize) < target_n);
+        let source_len = particles.len();
+        let mut sampled_particles = Vec::with_capacity(target_n);
+        let mut sampled_affines = Vec::with_capacity(target_n);
+        let mut sampled_bed_extracts = Vec::with_capacity(target_n);
+        let mut sampled_lookup = HashMap::new();
+
+        for out_idx in 0..target_n {
+            let src_idx = (((out_idx as f32 + 0.5) * source_len as f32) / target_n as f32)
+                .floor()
+                .min((source_len - 1) as f32) as usize;
+            sampled_particles.push(particles[src_idx]);
+            sampled_affines.push(affines[src_idx]);
+            sampled_bed_extracts.push(bed_extracts[src_idx]);
+            sampled_lookup.insert(particle_keys[src_idx], out_idx as i32);
+        }
+
+        particles = sampled_particles;
+        affines = sampled_affines;
+        bed_extracts = sampled_bed_extracts;
+        lattice_to_particle = sampled_lookup;
     }
 
     let cell_lookup = build_cell_lookup(
@@ -337,6 +356,33 @@ mod tests {
         assert_eq!(init.particles.len(), init.affines.len());
         assert_eq!(init.particles.len(), init.bed_extracts.len());
         assert_eq!(init.particles.len(), init.bed_support_count.len());
+    }
+
+    #[test]
+    fn downsampled_bed_spans_configured_height() {
+        let cfg = BedConfig::default();
+        let init = init_bed_particles(&cfg, [32, 32, 32], Vec3::new(14.0, 20.0, 14.0));
+        let y_min = init
+            .particles
+            .iter()
+            .map(|p| p[1])
+            .fold(f32::INFINITY, f32::min);
+        let y_max = init
+            .particles
+            .iter()
+            .map(|p| p[1])
+            .fold(f32::NEG_INFINITY, f32::max);
+
+        let expected_bottom = cfg.center.y + cfg.bot_y;
+        let expected_top = cfg.center.y + cfg.top_y;
+        assert!(
+            y_min <= expected_bottom + 0.2,
+            "downsampled bed lost its lower region: y_min={y_min} expected_bottom={expected_bottom}",
+        );
+        assert!(
+            y_max >= expected_top - 0.2,
+            "downsampled bed lost its upper region: y_max={y_max} expected_top={expected_top}",
+        );
     }
 
     #[test]

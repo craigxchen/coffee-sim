@@ -37,7 +37,7 @@ impl Default for SpoutSettings {
             head_at_full_angle: 24.0,
             discharge_coeff: 0.92,
             volume_to_ml: units::ML_PER_SIM_UNIT_CUBED,
-            max_flow_rate_ml_s: 11.5,
+            max_flow_rate_ml_s: 4.0,
             max_exit_speed: units::GENTLE_POUR_EXIT_SPEED_SIM_UNITS,
             stem_length: 1.9,
         }
@@ -319,16 +319,16 @@ mod tests {
     #[test]
     fn flow_rate_from_speed_is_monotonic_and_capped() {
         let nozzle_radius = SpoutSettings::default().nozzle_radius;
-        let low = flow_rate_from_speed(4.0, nozzle_radius, 0.92, 5.4, 11.5);
-        let mid = flow_rate_from_speed(10.0, nozzle_radius, 0.92, 5.4, 11.5);
-        let high = flow_rate_from_speed(40.0, nozzle_radius, 0.92, 5.4, 11.5);
+        let low = flow_rate_from_speed(4.0, nozzle_radius, 0.92, 5.4, 4.0);
+        let mid = flow_rate_from_speed(10.0, nozzle_radius, 0.92, 5.4, 4.0);
+        let high = flow_rate_from_speed(40.0, nozzle_radius, 0.92, 5.4, 4.0);
 
         assert!(low > 0.0);
         assert!(mid > low);
         assert!(high >= mid);
-        assert!(high <= 11.5);
+        assert!(high <= 4.0);
         assert_eq!(
-            flow_rate_from_speed(0.0, nozzle_radius, 0.92, 5.4, 11.5),
+            flow_rate_from_speed(0.0, nozzle_radius, 0.92, 5.4, 4.0),
             0.0
         );
     }

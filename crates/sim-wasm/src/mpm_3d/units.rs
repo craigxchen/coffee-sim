@@ -24,7 +24,7 @@ pub(crate) const EARTH_GRAVITY_SIM_UNITS: f32 = -STANDARD_GRAVITY_M_S2 * SIM_UNI
 pub(crate) const MAX_WATER_SPEED_M_S: f32 = 1.5;
 pub(crate) const MAX_WATER_SPEED_SIM_UNITS: f32 = MAX_WATER_SPEED_M_S * SIM_UNITS_PER_METER;
 
-pub(crate) const GENTLE_POUR_EXIT_SPEED_M_S: f32 = 0.30;
+pub(crate) const GENTLE_POUR_EXIT_SPEED_M_S: f32 = 0.12;
 pub(crate) const GENTLE_POUR_EXIT_SPEED_SIM_UNITS: f32 =
     GENTLE_POUR_EXIT_SPEED_M_S * SIM_UNITS_PER_METER;
 
@@ -49,8 +49,8 @@ mod tests {
 
     #[test]
     fn gentle_pour_speed_matches_kettle_scale() {
-        assert!((GENTLE_POUR_EXIT_SPEED_M_S - 0.30).abs() < 1e-6);
-        assert!((GENTLE_POUR_EXIT_SPEED_SIM_UNITS * METERS_PER_SIM_UNIT - 0.30).abs() < 1e-6);
+        assert!((GENTLE_POUR_EXIT_SPEED_M_S - 0.12).abs() < 1e-6);
+        assert!((GENTLE_POUR_EXIT_SPEED_SIM_UNITS * METERS_PER_SIM_UNIT - 0.12).abs() < 1e-6);
     }
 
     #[test]
