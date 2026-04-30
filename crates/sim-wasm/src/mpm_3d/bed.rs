@@ -21,13 +21,14 @@ impl Default for BedConfig {
     fn default() -> Self {
         Self {
             // Keep the default bed comfortably inside the V60 cone:
-            // absolute y range ~= [-2.6, 0.1], with radii that stay inset from
-            // the dripper wall all the way down to the outlet.
+            // absolute y range ~= [-3.05, 0.1], with a small finite plug near
+            // the apex. The bottom is intentionally not a zero-radius point:
+            // the bed is a pre-settled granular scaffold, not free-falling sand.
             center: Vec3::new(0.0, -0.35, 0.0),
             top_y: 0.45,
-            bot_y: -2.25,
+            bot_y: -2.70,
             top_radius: 2.65,
-            bot_radius: 0.95,
+            bot_radius: 0.18,
             num_particles: DEFAULT_BREW.bed_particle_samples,
             initial_porosity: DEFAULT_BREW.bed_porosity,
             initial_permeability: DEFAULT_BREW.bed_permeability_m2(),
@@ -73,7 +74,7 @@ impl BedConfig {
         bed.top_radius = (filter.inner_radius_at_y(top_local) - 0.18).clamp(top_r_min, top_r_max);
 
         let (bot_r_min, bot_r_max) =
-            order_bounds(filter.opening_radius() + 0.32, bed.top_radius - 0.25);
+            order_bounds(filter.opening_radius() + 0.14, bed.top_radius - 0.25);
         bed.bot_radius = (filter.inner_radius_at_y(bot_local) - 0.12).clamp(bot_r_min, bot_r_max);
 
         bed
@@ -136,8 +137,8 @@ pub(crate) fn init_bed_particles(
     let mut particle_keys = Vec::new();
 
     for iy in 0..ny {
-        let y = config.center.y + config.bot_y + (iy as f32 + 0.5) * spacing;
-        let t = (y - (config.center.y + config.bot_y)) / height;
+        let base_y = config.center.y + config.bot_y + (iy as f32 + 0.5) * spacing;
+        let t = (base_y - (config.center.y + config.bot_y)) / height;
         let max_r = config.bot_radius + (config.top_radius - config.bot_radius) * t;
 
         for ix in 0..nx {
@@ -151,6 +152,13 @@ pub(crate) fn init_bed_particles(
                 if r > max_r {
                     continue;
                 }
+
+                // Round the finite bottom plug so the seated bed does not
+                // render as an obvious planar cutoff near the filter apex.
+                let cap_t = (t / 0.16).clamp(0.0, 1.0);
+                let radial_t = if max_r > 1e-6 { r / max_r } else { 0.0 };
+                let edge_lift = spacing * 0.75 * (1.0 - cap_t).powi(2) * radial_t.powi(2);
+                let y = base_y + edge_lift;
 
                 let particle_index = particles.len() as i32;
                 let key = LatticeKey { ix, iy, iz };
@@ -386,6 +394,44 @@ mod tests {
     }
 
     #[test]
+    fn seated_bed_bottom_is_rounded_not_planar() {
+        let filter = FilterConfig::default();
+        let cfg = BedConfig::seated_in_filter(&filter);
+        let init = init_bed_particles(&cfg, [64, 64, 64], Vec3::new(14.0, 20.0, 14.0));
+
+        let bottom = cfg.center.y + cfg.bot_y;
+        let lower_band = 0.45;
+        let mut center_y_sum = 0.0_f32;
+        let mut center_count = 0_u32;
+        let mut edge_y_sum = 0.0_f32;
+        let mut edge_count = 0_u32;
+
+        for p in &init.particles {
+            let y = p[1];
+            if y > bottom + lower_band {
+                continue;
+            }
+            let r = (p[0] * p[0] + p[2] * p[2]).sqrt();
+            if r < cfg.bot_radius * 0.45 {
+                center_y_sum += y;
+                center_count += 1;
+            } else if r > cfg.bot_radius * 0.80 {
+                edge_y_sum += y;
+                edge_count += 1;
+            }
+        }
+
+        assert!(center_count > 0, "expected lower-center bed particles");
+        assert!(edge_count > 0, "expected lower-edge bed particles");
+        let center_mean_y = center_y_sum / center_count as f32;
+        let edge_mean_y = edge_y_sum / edge_count as f32;
+        assert!(
+            edge_mean_y > center_mean_y + 0.03,
+            "bottom plug should taper upward at the edge, not form a flat disk: center={center_mean_y} edge={edge_mean_y}",
+        );
+    }
+
+    #[test]
     fn bed_particles_carry_water_phase_marker() {
         let cfg = small_config();
         let init = init_bed_particles(&cfg, [32, 32, 32], Vec3::new(14.0, 20.0, 14.0));
@@ -457,6 +503,11 @@ mod tests {
         assert!(bed.top_radius < filter.inner_radius_at_y(bed_top_local));
         assert!(bed.bot_radius < filter.inner_radius_at_y(bed_bot_local));
         assert!(bot_abs > filter_bot_abs);
+        assert!(
+            bot_abs - filter_bot_abs >= bed.bot_radius * 0.65,
+            "bed bottom should stay a finite plug above the apex: bed={bot_abs}, filter={filter_bot_abs}, radius={}",
+            bed.bot_radius
+        );
         assert!(top_abs < filter_top_abs);
     }
 

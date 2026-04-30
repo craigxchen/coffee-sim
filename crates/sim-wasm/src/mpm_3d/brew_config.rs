@@ -24,6 +24,11 @@ pub(crate) struct BrewConfig {
     pub min_bed_permeability_m2: f32,
     pub bed_absorption_rate: f32,
     pub target_bed_retention_ml: f32,
+    pub bed_pore_capacity_scale: f32,
+    pub bed_pore_overfill_alpha: f32,
+    pub bed_surface_void_scale: f32,
+    pub filter_pore_capacity_scale: f32,
+    pub bed_compaction_rate: f32,
 }
 
 pub(crate) const DEFAULT_BREW: BrewConfig = BrewConfig {
@@ -48,6 +53,11 @@ pub(crate) const DEFAULT_BREW: BrewConfig = BrewConfig {
     min_bed_permeability_m2: 1.0e-12,
     bed_absorption_rate: 1.6,
     target_bed_retention_ml: 42.0,
+    bed_pore_capacity_scale: 1.0,
+    bed_pore_overfill_alpha: 18.0,
+    bed_surface_void_scale: 1.0,
+    filter_pore_capacity_scale: 1.0,
+    bed_compaction_rate: 5.5,
 };
 
 #[allow(dead_code)]
