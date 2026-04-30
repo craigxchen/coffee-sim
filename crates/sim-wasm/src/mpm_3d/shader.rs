@@ -95,9 +95,10 @@ fn friction() -> f32 { return u.sdf_params.y; }
 fn restitution() -> f32 { return u.sdf_params.z; }
 fn contact_offset() -> f32 { return u.sdf_params.w; }
 fn obstacle_wall_half_thickness() -> f32 { return OBSTACLE_WALL_THICKNESS * 0.5; }
-fn drag_coeff() -> f32 { return u.bed_params.x; }
+fn water_kinematic_viscosity_m2_s() -> f32 { return u.bed_params.x; }
 fn absorption_rate() -> f32 { return u.bed_params.y; }
 fn max_saturation() -> f32 { return u.bed_params.z; }
+fn min_bed_permeability_m2() -> f32 { return u.bed_params.w; }
 fn extraction_rate() -> f32 { return u.extraction_params.x; }
 fn bed_compaction_rate() -> f32 { return u.extraction_params.y; }
 fn bed_damping() -> f32 { return u.extraction_params.z; }
@@ -991,15 +992,10 @@ fn project_pressure(@builtin(global_invocation_id) gid: vec3<u32>) {
         let bed_idx = bed_lookup_load(idx);
         if bed_idx >= 0 && u32(bed_idx) < num_bed() {
             let be = bed_extract[u32(bed_idx)];
-            let permeability = be.bed.z;
-            let saturation = be.extract.w;
-            let resistance = (1.0 / max(permeability, 0.08)) * (1.0 + saturation * 0.75);
-            let porous_drag = drag_coeff() * resistance * dt();
-            let vertical_damping = 1.0 / (1.0 + max(porous_drag, 0.0));
-            let lateral_damping = 1.0 / (1.0 + max(porous_drag * 16.0, 0.0));
-            v.x *= lateral_damping;
-            v.y *= vertical_damping;
-            v.z *= lateral_damping;
+            let permeability_m2 = max(be.bed.z, min_bed_permeability_m2());
+            let darcy_rate = water_kinematic_viscosity_m2_s() / permeability_m2;
+            let darcy_damping = 1.0 / (1.0 + max(darcy_rate * dt(), 0.0));
+            v *= darcy_damping;
         }
     }
     let speed = length(v);

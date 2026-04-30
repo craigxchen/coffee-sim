@@ -30,7 +30,7 @@ impl Default for BedConfig {
             bot_radius: 0.95,
             num_particles: DEFAULT_BREW.bed_particle_samples,
             initial_porosity: DEFAULT_BREW.bed_porosity,
-            initial_permeability: DEFAULT_BREW.initial_bed_permeability,
+            initial_permeability: DEFAULT_BREW.bed_permeability_m2(),
             extractable_mass: 0.15,
         }
     }
