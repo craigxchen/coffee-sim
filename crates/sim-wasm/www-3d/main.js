@@ -47,6 +47,7 @@ let metricsRefreshInFlight = false;
 let app;
 let paused = false;
 let lastFrameTime = 0;
+let skipStepOnce = false;
 let fpsWindow = [];
 let dragging = false;
 let lastClientX = 0;
@@ -76,6 +77,11 @@ window.addEventListener("resize", resizeCanvas);
 toggleButton.addEventListener("click", () => {
   paused = !paused;
   toggleButton.textContent = paused ? "Play" : "Pause";
+  if (!paused) {
+    lastFrameTime = 0;
+    fpsWindow = [];
+    skipStepOnce = true;
+  }
 });
 
 resetButton.addEventListener("click", () => {
@@ -210,7 +216,9 @@ function animate(timestamp) {
 
   applyKeyboardPan(frameTime);
 
-  if (!paused) {
+  if (!paused && skipStepOnce) {
+    skipStepOnce = false;
+  } else if (!paused) {
     app.stepFrame(frameTime);
   }
 

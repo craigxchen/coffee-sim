@@ -111,6 +111,9 @@ fn metrics_div_inv_fp_scale() -> f32 { return u.clamp_params.w; }
 fn projection_j_alpha() -> f32 { return u.projection_params.x; }
 fn projection_j_expand_alpha() -> f32 { return u.projection_params.y; }
 fn projection_max_rest_volume_fraction() -> f32 { return u.projection_params.z; }
+fn bed_surface_void_scale() -> f32 { return u.projection_params.w; }
+fn bed_pore_capacity_scale() -> f32 { return u.time_params.z; }
+fn bed_pore_overfill_alpha() -> f32 { return u.time_params.w; }
 fn water_particle_radius() -> f32 { return dx() * u.inflow_params.y; }
 fn bed_particle_radius() -> f32 { return dx() * u.inflow_params.z; }
 fn min_particle_j() -> f32 { return 0.40; }
@@ -255,6 +258,33 @@ fn volume_projection_target_divergence(rest_volume: f32, current_volume: f32) ->
     if j_cell <= 1.05 {
         target_div = max(target_div, overfill_error * projection_j_alpha());
     }
+
+    return target_div;
+}
+
+fn bed_pore_projection_target_divergence(
+    bed_idx: u32,
+    cell_center: vec3<f32>,
+    rest_volume: f32,
+    current_volume: f32,
+) -> f32 {
+    var target_div = volume_projection_target_divergence(rest_volume, current_volume);
+    let cell_volume = dx() * dx() * dx();
+    let base_porosity = clamp(bed_extract[bed_idx].bed.y, 0.0, 1.0);
+    let bed_center_y = particles[bed_idx].pos.y;
+    // `bed_lookup` stamps neighboring cells around each bed sample. Near the
+    // upper bed surface, those stamped cells are only partially occupied by
+    // grounds; treating them as full porous cells makes the first impact point
+    // reject water like a hard plug and produces a hollow wetting ring.
+    let surface_t = smoothstep(-0.25, 0.75, (cell_center.y - bed_center_y) * inv_dx());
+    let effective_porosity = mix(
+        base_porosity,
+        1.0,
+        surface_t * clamp(bed_surface_void_scale(), 0.0, 1.0),
+    );
+    let pore_capacity = effective_porosity * cell_volume * max(bed_pore_capacity_scale(), 0.0);
+    let overfill_fraction = max(current_volume - pore_capacity, 0.0) / max(cell_volume, 1e-8);
+    target_div = max(target_div, overfill_fraction * bed_pore_overfill_alpha());
 
     return target_div;
 }
@@ -819,10 +849,20 @@ fn classify_cells(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     let div = 0.5 * inv_dx() * ((vxp - vxm) + (vyp - vym) + (vzp - vzm));
-    let target_divergence = volume_projection_target_divergence(
-        rest_volume_load(idx),
-        current_volume_load(idx),
-    );
+    let rest_volume = rest_volume_load(idx);
+    let current_volume = current_volume_load(idx);
+    var target_divergence = volume_projection_target_divergence(rest_volume, current_volume);
+    if kind == CELL_BED_COUPLED {
+        let bed_idx = bed_lookup_load(idx);
+        if bed_idx >= 0 && u32(bed_idx) < num_bed() {
+            target_divergence = bed_pore_projection_target_divergence(
+                u32(bed_idx),
+                cell_center,
+                rest_volume,
+                current_volume,
+            );
+        }
+    }
     divergence_store(idx, div - target_divergence);
 
     // Observability: track the worst-case cell divergence and the fluid-cell

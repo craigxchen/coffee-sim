@@ -617,15 +617,20 @@ impl MpmSim3D {
                 bed_capacity_per_particle,
                 DEFAULT_BREW.min_bed_permeability_m2,
             ],
-            extraction_params: [0.01, 11.0, 8.5, 15.0],
-            time_params: [self.total_time, dt, 1.0, 0.0],
+            extraction_params: [0.01, DEFAULT_BREW.bed_compaction_rate, 8.5, 15.0],
+            time_params: [
+                self.total_time,
+                dt,
+                DEFAULT_BREW.bed_pore_capacity_scale,
+                DEFAULT_BREW.bed_pore_overfill_alpha,
+            ],
             clamp_params: [
                 div_clamp,
                 pressure_clamp,
                 METRICS_DIV_FP_SCALE,
                 1.0 / METRICS_DIV_FP_SCALE,
             ],
-            projection_params: [32.0, 2.0, 1.20, 0.0],
+            projection_params: [32.0, 2.0, 1.20, DEFAULT_BREW.bed_surface_void_scale],
         };
 
         queue.write_buffer(
