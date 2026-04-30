@@ -612,10 +612,10 @@ impl MpmSim3D {
             // Tie bed retention to an overall retained-water target so the bed
             // wets realistically without swallowing most of the brew.
             bed_params: [
-                DEFAULT_BREW.bed_drag_coeff,
+                DEFAULT_BREW.water_kinematic_viscosity_m2_s,
                 DEFAULT_BREW.bed_absorption_rate,
                 bed_capacity_per_particle,
-                1.0,
+                DEFAULT_BREW.min_bed_permeability_m2,
             ],
             extraction_params: [0.01, 11.0, 8.5, 15.0],
             time_params: [self.total_time, dt, 1.0, 0.0],
