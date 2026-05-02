@@ -18,6 +18,7 @@ pub(crate) struct BrewConfig {
     pub bed_sample_radius_dx: f32,
     pub max_flow_rate_ml_s: f32,
     pub gentle_pour_exit_speed_m_s: f32,
+    pub high_pour_exit_speed_m_s: f32,
     pub initial_kettle_angle_deg: f32,
     pub water_viscosity: f32,
     pub water_kinematic_viscosity_m2_s: f32,
@@ -28,7 +29,10 @@ pub(crate) struct BrewConfig {
     pub bed_pore_overfill_alpha: f32,
     pub bed_surface_void_scale: f32,
     pub filter_pore_capacity_scale: f32,
+    pub dripper_outlet_radius: f32,
+    pub filter_absorption_rate_s: f32,
     pub bed_compaction_rate: f32,
+    pub bed_impact_rate: f32,
 }
 
 pub(crate) const DEFAULT_BREW: BrewConfig = BrewConfig {
@@ -45,8 +49,9 @@ pub(crate) const DEFAULT_BREW: BrewConfig = BrewConfig {
     water_mass_units_per_ml: 80.0,
     water_sample_radius_dx: 0.18,
     bed_sample_radius_dx: 0.62,
-    max_flow_rate_ml_s: 4.0,
+    max_flow_rate_ml_s: 12.0,
     gentle_pour_exit_speed_m_s: 0.12,
+    high_pour_exit_speed_m_s: 0.45,
     initial_kettle_angle_deg: 9.0,
     water_viscosity: 1.2,
     water_kinematic_viscosity_m2_s: 1.0e-6,
@@ -54,10 +59,13 @@ pub(crate) const DEFAULT_BREW: BrewConfig = BrewConfig {
     bed_absorption_rate: 1.6,
     target_bed_retention_ml: 42.0,
     bed_pore_capacity_scale: 1.0,
-    bed_pore_overfill_alpha: 18.0,
+    bed_pore_overfill_alpha: 10.0,
     bed_surface_void_scale: 1.0,
     filter_pore_capacity_scale: 1.0,
+    dripper_outlet_radius: 0.42,
+    filter_absorption_rate_s: 1.2,
     bed_compaction_rate: 5.5,
+    bed_impact_rate: 8.0,
 };
 
 #[allow(dead_code)]

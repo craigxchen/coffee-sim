@@ -4,10 +4,15 @@ use super::filter::FilterConfig;
 
 const RING_COUNT: usize = 10;
 const SEGMENT_COUNT: usize = 32;
+#[allow(dead_code)]
 const EDGE_ITERS: usize = 5;
+#[allow(dead_code)]
 const DAMPING: f32 = 0.18;
+#[allow(dead_code)]
 const GRAVITY: f32 = -0.55;
+#[allow(dead_code)]
 const REST_STIFFNESS: f32 = 3.25;
+#[allow(dead_code)]
 const EDGE_STIFFNESS: f32 = 0.86;
 
 // Compile-time guards: the sync loops below divide by `(RING_COUNT - 1)` and
@@ -26,6 +31,7 @@ pub(crate) const MAX_FILL_VERTEX_COUNT: usize = (RING_COUNT - 1) * SEGMENT_COUNT
 pub(crate) const MAX_RENDER_VERTEX_COUNT: usize =
     (RING_COUNT * SEGMENT_COUNT + (RING_COUNT - 1) * SEGMENT_COUNT * 2) * 2;
 
+#[allow(dead_code)]
 #[derive(Clone, Copy)]
 struct Edge {
     a: usize,
@@ -33,6 +39,7 @@ struct Edge {
     rest_length: f32,
 }
 
+#[allow(dead_code)]
 pub(crate) struct FilterMesh {
     config: FilterConfig,
     rest_positions: Vec<Vec3>,
@@ -94,8 +101,9 @@ impl FilterMesh {
         let positions = rest_positions.clone();
         let prev_positions = positions.clone();
         let velocities = vec![Vec3::ZERO; positions.len()];
+        let top_ring_start = (RING_COUNT - 1) * SEGMENT_COUNT;
         let pinned = (0..positions.len())
-            .map(|idx| idx < SEGMENT_COUNT)
+            .map(|idx| idx >= top_ring_start)
             .collect::<Vec<_>>();
 
         let mut mesh = Self {
@@ -109,17 +117,14 @@ impl FilterMesh {
             render_vertices: Vec::new(),
             fill_vertices: Vec::new(),
         };
-        // Pre-relax to a representative loaded shape once at construction so
-        // the support surface is stable during simulation. A live cloth step
-        // without real load coupling causes the bed to keep chasing a moving
-        // support surface and reads as artificial shrink.
-        for _ in 0..120 {
-            mesh.step(1.0 / 60.0, 0.5);
-        }
+        // Start the render mesh on the exact paper cone. The live simulation
+        // currently keeps this mesh static, so construction-time sag would
+        // only create a visual mismatch against the rigid V60 support.
         mesh.sync_render_vertices();
         mesh
     }
 
+    #[allow(dead_code)]
     pub(crate) fn step(&mut self, dt: f32, load: f32) {
         // Sanitise `dt` first: if the caller passes NaN or a negative value we
         // must bail out rather than poison every position/velocity. The manual
@@ -152,12 +157,21 @@ impl FilterMesh {
 
             let rest = self.rest_positions[i];
             let depth_t = ((rest.y - (center.y + self.config.bot_y)) / height).clamp(0.0, 1.0);
-            let profile = depth_t.powf(1.45);
-            let inward = 1.0 - 0.10 * profile;
+            let profile = (1.0 - depth_t).powf(1.45);
+            let target_y = rest.y - sag_strength * profile;
+            let target_local_y = (target_y - center.y).clamp(self.config.bot_y, self.config.top_y);
+            let target_radius = self.config.radius_at_y(target_local_y);
+            let rest_radial = Vec3::new(rest.x - center.x, 0.0, rest.z - center.z);
+            let rest_radius = rest_radial.length();
+            let radial_scale = if rest_radius > 1e-6 {
+                target_radius / rest_radius
+            } else {
+                0.0
+            };
             let target = Vec3::new(
-                center.x + (rest.x - center.x) * inward,
-                rest.y - sag_strength * profile,
-                center.z + (rest.z - center.z) * inward,
+                center.x + rest_radial.x * radial_scale,
+                target_y,
+                center.z + rest_radial.z * radial_scale,
             );
 
             let load_force = (target - *pos) * REST_STIFFNESS;
@@ -279,7 +293,23 @@ mod tests {
     #[test]
     fn top_rim_vertices_are_pinned() {
         let mesh = FilterMesh::new(&FilterConfig::default());
-        assert!(mesh.pinned.iter().take(SEGMENT_COUNT).all(|p| *p));
+        let top_ring_start = (RING_COUNT - 1) * SEGMENT_COUNT;
+        assert!(mesh.pinned.iter().take(top_ring_start).all(|p| !*p));
+        assert!(mesh.pinned.iter().skip(top_ring_start).all(|p| *p));
+    }
+
+    #[test]
+    fn new_mesh_starts_on_filter_cone() {
+        let config = FilterConfig::default();
+        let mesh = FilterMesh::new(&config);
+        for pos in &mesh.positions {
+            let local_y = pos.y - config.center.y;
+            let expected = config.radius_at_y(local_y);
+            let dx = pos.x - config.center.x;
+            let dz = pos.z - config.center.z;
+            let r = (dx * dx + dz * dz).sqrt();
+            assert!((r - expected).abs() < 1e-4);
+        }
     }
 
     #[test]
@@ -287,16 +317,17 @@ mod tests {
         let mut mesh = FilterMesh::new(&FilterConfig::default());
         let before = mesh.positions.clone();
         mesh.step(1.0 / 60.0, 1.0);
-        for (after, prior) in mesh.positions[..SEGMENT_COUNT]
+        let top_ring_start = (RING_COUNT - 1) * SEGMENT_COUNT;
+        for (after, prior) in mesh.positions[top_ring_start..]
             .iter()
-            .zip(before[..SEGMENT_COUNT].iter())
+            .zip(before[top_ring_start..].iter())
         {
             assert!((after.x - prior.x).abs() < 1e-6);
             assert!((after.y - prior.y).abs() < 1e-6);
             assert!((after.z - prior.z).abs() < 1e-6);
         }
-        let lower_ring_start = (RING_COUNT - 1) * SEGMENT_COUNT;
-        assert!(mesh.positions[lower_ring_start].y < before[lower_ring_start].y);
+        let mid_ring_start = (RING_COUNT / 2) * SEGMENT_COUNT;
+        assert!(mesh.positions[mid_ring_start].y < before[mid_ring_start].y);
     }
 
     #[test]
