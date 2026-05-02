@@ -1040,6 +1040,7 @@ fn bed_short_pour_retains_shape() {
         sim.step_frame(&device, &queue, 1.0 / 60.0);
     }
     let wet = readback_bed_diag_snapshot(&sim, &device, &queue);
+    let dx = sim.settings.bounds_size.x / sim.settings.grid_dims[0] as f32;
 
     assert!(wet.all_finite, "short pour produced non-finite bed state");
     assert!(
@@ -1053,6 +1054,12 @@ fn bed_short_pour_retains_shape() {
     assert!(
         wet.max_j <= 1.4001,
         "short pour over-expanded bed: settled={settled:?} wet={wet:?}",
+    );
+    assert!(
+        wet.x_extent <= settled.x_extent * 1.04 + dx
+            && wet.z_extent <= settled.z_extent * 1.04 + dx,
+        "short pour pushed the coffee bed laterally into a wall-piled shape: \
+         settled={settled:?} wet={wet:?}",
     );
 }
 
@@ -1719,6 +1726,75 @@ fn coffee_bed_builds_visible_water_above_surface() {
             && coffee_bed.active_mass >= open_filter.active_mass * 1.5 + nominal_mass * 12.0,
         "coffee bed did not build visibly more active water just above the surface: \
          open_filter={open_filter:?} coffee_bed={coffee_bed:?}",
+    );
+}
+
+#[test]
+fn faster_pour_builds_more_water_above_coffee_bed() {
+    let Some((device, queue)) = create_test_device() else {
+        eprintln!("skipping: no GPU adapter");
+        return;
+    };
+
+    fn run_case(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        kettle_angle_deg: f32,
+    ) -> (WaterVelocitySnapshot, f32, f32) {
+        let (_, bed_top_y) = benchmark_bed_bounds_y();
+        let mut sim = MpmSim3D::new(device, queue, MpmSettings::benchmark_center_pour());
+
+        sim.set_kettle_angle(0.0);
+        for _ in 0..60 {
+            sim.step_frame(device, queue, 1.0 / 60.0);
+        }
+
+        sim.set_kettle_angle(kettle_angle_deg);
+        for _ in 0..180 {
+            sim.step_frame(device, queue, 1.0 / 60.0);
+        }
+
+        let flow_rate = sim.flow_rate_ml_s();
+        let emitted_mass = sim.total_emitted_mass();
+        let above_surface = readback_water_velocity_snapshot_in_y_range(
+            &sim,
+            device,
+            queue,
+            bed_top_y - 0.10,
+            bed_top_y + 1.10,
+        );
+        (above_surface, flow_rate, emitted_mass)
+    }
+
+    let (slow_above, slow_flow, slow_emitted) = run_case(&device, &queue, 14.0);
+    let (fast_above, fast_flow, fast_emitted) = run_case(&device, &queue, 56.0);
+    let nominal_mass = inflow::MASS_UNITS_PER_ML / inflow::PARTICLES_PER_ML;
+    let slow_surface_fraction = slow_above.active_mass / slow_emitted.max(1e-6);
+    let fast_surface_fraction = fast_above.active_mass / fast_emitted.max(1e-6);
+
+    assert!(
+        slow_above.all_finite && fast_above.all_finite,
+        "rate comparison produced invalid water readback: slow={slow_above:?} fast={fast_above:?}",
+    );
+    assert!(
+        fast_flow >= slow_flow * 2.5 && fast_emitted >= slow_emitted * 2.5,
+        "test did not create distinct slow and fast pours: \
+         slow_flow={slow_flow:.3} fast_flow={fast_flow:.3} \
+         slow_emitted={slow_emitted:.3} fast_emitted={fast_emitted:.3}",
+    );
+    assert!(
+        fast_above.active_count >= slow_above.active_count + 48
+            && fast_above.active_mass >= slow_above.active_mass * 2.0 + nominal_mass * 24.0,
+        "faster pour should build a visibly larger water pool above the coffee bed: \
+         slow_flow={slow_flow:.3} fast_flow={fast_flow:.3} \
+         slow_fraction={slow_surface_fraction:.3} fast_fraction={fast_surface_fraction:.3} \
+         slow={slow_above:?} fast={fast_above:?}",
+    );
+    assert!(
+        fast_surface_fraction >= slow_surface_fraction * 0.55,
+        "faster pour should not only increase total emitted mass; it should retain a comparable \
+         share of water above the bed: slow_fraction={slow_surface_fraction:.3} \
+         fast_fraction={fast_surface_fraction:.3} slow={slow_above:?} fast={fast_above:?}",
     );
 }
 

@@ -128,13 +128,7 @@ impl MpmSettings {
             pressure_rbgs_pairs: 40,
             use_sdf_cache: true,
             obstacles: vec![
-                Obstacle::TruncatedCone {
-                    center: Vec3::ZERO,
-                    top_radius: 4.5,
-                    bot_radius: 0.8,
-                    top_y: 3.0,
-                    bot_y: -3.0,
-                },
+                v60_support_cone(&filter),
                 Obstacle::Cylinder {
                     center: Vec3::ZERO,
                     radius: 3.0,
@@ -164,6 +158,22 @@ impl MpmSettings {
         settings.spout.aim_at(Vec3::new(0.0, 0.4, 0.0));
         settings.initial_kettle_angle_deg = DEFAULT_BREW.initial_kettle_angle_deg;
         settings
+    }
+}
+
+fn v60_support_cone(filter: &FilterConfig) -> Obstacle {
+    let top_y = 3.0;
+    let bot_y = -3.0;
+    let filter_height = (filter.top_y - filter.bot_y).max(1e-6);
+    let filter_slope = (filter.top_radius - filter.bot_radius) / filter_height;
+    let bot_radius = DEFAULT_BREW.dripper_outlet_radius;
+
+    Obstacle::TruncatedCone {
+        center: Vec3::ZERO,
+        top_radius: bot_radius + filter_slope * (top_y - bot_y),
+        bot_radius,
+        top_y,
+        bot_y,
     }
 }
 
@@ -589,7 +599,12 @@ impl MpmSim3D {
                 initial_particle_mass,
                 particle_vol,
             ],
-            fp_params: [FP_SCALE, 1.0 / FP_SCALE, MAX_VELOCITY, 0.0],
+            fp_params: [
+                FP_SCALE,
+                1.0 / FP_SCALE,
+                MAX_VELOCITY,
+                DEFAULT_BREW.dripper_outlet_radius,
+            ],
             inflow_origin: [
                 self.settings.spout.origin.x,
                 self.settings.spout.origin.y,
@@ -606,7 +621,7 @@ impl MpmSim3D {
                 self.settings.spout.nozzle_radius,
                 DEFAULT_BREW.water_sample_radius_dx,
                 DEFAULT_BREW.bed_sample_radius_dx,
-                0.0,
+                DEFAULT_BREW.filter_absorption_rate_s,
             ],
             sdf_params: [SDF_RES as f32, 0.3, 0.0, 0.05],
             // Tie bed retention to an overall retained-water target so the bed
@@ -617,7 +632,12 @@ impl MpmSim3D {
                 bed_capacity_per_particle,
                 DEFAULT_BREW.min_bed_permeability_m2,
             ],
-            extraction_params: [0.01, DEFAULT_BREW.bed_compaction_rate, 8.5, 15.0],
+            extraction_params: [
+                0.01,
+                DEFAULT_BREW.bed_compaction_rate,
+                8.5,
+                DEFAULT_BREW.bed_impact_rate,
+            ],
             time_params: [
                 self.total_time,
                 dt,
@@ -680,7 +700,13 @@ mod tests {
                 _ => None,
             })
             .expect("default scene must contain a truncated cone");
-        assert_eq!(cone, (4.5, 0.8, 3.0, -3.0));
+        assert!((cone.0 - 4.523).abs() < 0.01);
+        assert!((cone.1 - DEFAULT_BREW.dripper_outlet_radius).abs() < 1e-6);
+        assert_eq!((cone.2, cone.3), (3.0, -3.0));
+        let filter = FilterConfig::default();
+        let filter_slope = (filter.top_radius - filter.bot_radius) / (filter.top_y - filter.bot_y);
+        let cone_slope = (cone.0 - cone.1) / (cone.2 - cone.3);
+        assert!((cone_slope - filter_slope).abs() < 1e-5);
 
         let cup = s
             .obstacles
@@ -697,6 +723,7 @@ mod tests {
             .expect("default scene must contain a cylinder");
         assert_eq!(cup, (3.0, -3.5, -8.0));
         assert!(shader::MPM_COMPUTE_SHADER.contains("const OBSTACLE_WALL_THICKNESS: f32 = 0.4;"));
+        assert!(shader::MPM_COMPUTE_SHADER.contains("mix(dripper_outlet_radius(), 4.523, t)"));
         assert!(shader::MPM_COMPUTE_SHADER.contains("fn viscosity_prepare("));
         assert!(shader::MPM_COMPUTE_SHADER.contains("fn viscosity_apply("));
     }
@@ -715,8 +742,12 @@ mod tests {
     fn default_v60_uses_slow_gooseneck_angle() {
         let s = MpmSettings::default_v60();
         assert!(s.initial_kettle_angle_deg <= 10.0);
-        assert!(s.spout.max_flow_rate_ml_s <= 4.0);
-        assert!(s.spout.max_exit_speed * units::METERS_PER_SIM_UNIT <= 0.13);
+        assert!(s.spout.max_flow_rate_ml_s <= 12.0);
+
+        let mut inflow = InflowState::new(s.initial_kettle_angle_deg);
+        inflow.update(&s.spout);
+        assert!(inflow.exit_speed() * units::METERS_PER_SIM_UNIT <= 0.13);
+        assert!(s.spout.max_exit_speed * units::METERS_PER_SIM_UNIT <= 0.50);
     }
 
     #[test]

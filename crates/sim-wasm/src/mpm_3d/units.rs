@@ -29,6 +29,9 @@ pub(crate) const MAX_WATER_SPEED_SIM_UNITS: f32 = MAX_WATER_SPEED_M_S * SIM_UNIT
 pub(crate) const GENTLE_POUR_EXIT_SPEED_M_S: f32 = DEFAULT_BREW.gentle_pour_exit_speed_m_s;
 pub(crate) const GENTLE_POUR_EXIT_SPEED_SIM_UNITS: f32 =
     GENTLE_POUR_EXIT_SPEED_M_S * SIM_UNITS_PER_METER;
+pub(crate) const HIGH_POUR_EXIT_SPEED_M_S: f32 = DEFAULT_BREW.high_pour_exit_speed_m_s;
+pub(crate) const HIGH_POUR_EXIT_SPEED_SIM_UNITS: f32 =
+    HIGH_POUR_EXIT_SPEED_M_S * SIM_UNITS_PER_METER;
 
 pub(crate) fn sim_speed_to_meters_per_second(speed: f32) -> f32 {
     speed * METERS_PER_SIM_UNIT
@@ -53,6 +56,8 @@ mod tests {
     fn gentle_pour_speed_matches_kettle_scale() {
         assert!((GENTLE_POUR_EXIT_SPEED_M_S - 0.12).abs() < 1e-6);
         assert!((GENTLE_POUR_EXIT_SPEED_SIM_UNITS * METERS_PER_SIM_UNIT - 0.12).abs() < 1e-6);
+        assert!(HIGH_POUR_EXIT_SPEED_M_S > GENTLE_POUR_EXIT_SPEED_M_S);
+        assert!(HIGH_POUR_EXIT_SPEED_SIM_UNITS > GENTLE_POUR_EXIT_SPEED_SIM_UNITS);
     }
 
     #[test]

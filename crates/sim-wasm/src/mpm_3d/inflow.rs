@@ -19,6 +19,7 @@ pub(crate) struct SpoutSettings {
     pub discharge_coeff: f32,
     pub volume_to_ml: f32,
     pub max_flow_rate_ml_s: f32,
+    pub gentle_exit_speed: f32,
     pub max_exit_speed: f32,
     pub stem_length: f32,
 }
@@ -38,7 +39,8 @@ impl Default for SpoutSettings {
             discharge_coeff: 0.92,
             volume_to_ml: units::ML_PER_SIM_UNIT_CUBED,
             max_flow_rate_ml_s: DEFAULT_BREW.max_flow_rate_ml_s,
-            max_exit_speed: units::GENTLE_POUR_EXIT_SPEED_SIM_UNITS,
+            gentle_exit_speed: units::GENTLE_POUR_EXIT_SPEED_SIM_UNITS,
+            max_exit_speed: units::HIGH_POUR_EXIT_SPEED_SIM_UNITS,
             stem_length: 1.9,
         }
     }
@@ -106,7 +108,8 @@ impl InflowState {
 
     pub fn update(&mut self, spout: &SpoutSettings) {
         let head = effective_head_from_angle(self.kettle_angle_deg, spout);
-        self.exit_speed = exit_speed_from_head(head, spout.max_exit_speed);
+        let speed_cap = exit_speed_cap_from_angle(self.kettle_angle_deg, spout);
+        self.exit_speed = exit_speed_from_head(head, speed_cap);
         self.flow_rate = flow_rate_from_speed(
             self.exit_speed,
             spout.nozzle_radius,
@@ -245,10 +248,25 @@ fn effective_head_from_angle(angle_deg: f32, spout: &SpoutSettings) -> f32 {
     if angle_deg >= spout.full_flow_angle_deg {
         return spout.head_at_full_angle;
     }
+    let s = pour_fraction_from_angle(angle_deg, spout);
+    spout.head_at_activation + s * (spout.head_at_full_angle - spout.head_at_activation)
+}
+
+fn exit_speed_cap_from_angle(angle_deg: f32, spout: &SpoutSettings) -> f32 {
+    let s = pour_fraction_from_angle(angle_deg, spout);
+    spout.gentle_exit_speed + s * (spout.max_exit_speed - spout.gentle_exit_speed)
+}
+
+fn pour_fraction_from_angle(angle_deg: f32, spout: &SpoutSettings) -> f32 {
+    if angle_deg <= spout.activation_angle_deg {
+        return 0.0;
+    }
+    if angle_deg >= spout.full_flow_angle_deg {
+        return 1.0;
+    }
     let t = (angle_deg - spout.activation_angle_deg)
         / (spout.full_flow_angle_deg - spout.activation_angle_deg);
-    let s = t * t * (3.0 - 2.0 * t);
-    spout.head_at_activation + s * (spout.head_at_full_angle - spout.head_at_activation)
+    t * t * (3.0 - 2.0 * t)
 }
 
 fn exit_speed_from_head(head: f32, max_exit_speed: f32) -> f32 {
@@ -314,6 +332,20 @@ mod tests {
         assert!(high >= mid);
         assert!(high <= 22.0);
         assert_eq!(exit_speed_from_head(0.0, 22.0), 0.0);
+    }
+
+    #[test]
+    fn exit_speed_cap_tracks_pour_angle() {
+        let spout = SpoutSettings::default();
+        let barely_open = exit_speed_cap_from_angle(9.0, &spout);
+        let medium = exit_speed_cap_from_angle(36.0, &spout);
+        let full = exit_speed_cap_from_angle(spout.full_flow_angle_deg, &spout);
+
+        assert!(barely_open >= spout.gentle_exit_speed);
+        assert!(barely_open <= spout.gentle_exit_speed * 1.01);
+        assert!(medium > barely_open);
+        assert!(full > medium);
+        assert!((full - spout.max_exit_speed).abs() < 1e-6);
     }
 
     #[test]
