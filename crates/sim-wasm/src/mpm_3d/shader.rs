@@ -96,6 +96,7 @@ fn friction() -> f32 { return u.sdf_params.y; }
 fn restitution() -> f32 { return u.sdf_params.z; }
 fn contact_offset() -> f32 { return u.sdf_params.w; }
 fn obstacle_wall_half_thickness() -> f32 { return OBSTACLE_WALL_THICKNESS * 0.5; }
+fn cup_floor_y() -> f32 { return -8.0 + obstacle_wall_half_thickness() + contact_offset(); }
 fn water_kinematic_viscosity_m2_s() -> f32 { return u.bed_params.x; }
 fn absorption_rate() -> f32 { return u.bed_params.y; }
 fn max_saturation() -> f32 { return u.bed_params.z; }
@@ -122,6 +123,18 @@ fn min_particle_j() -> f32 { return 0.40; }
 fn max_particle_j() -> f32 { return 2.00; }
 fn clamp_particle_j(value: f32) -> f32 {
     return clamp(value, min_particle_j(), max_particle_j());
+}
+
+fn coffee_filter_floor_y() -> f32 {
+    let filter_center_y = -0.35;
+    let filter_bot_y = filter_center_y - 3.02;
+    let filter_top_y = filter_center_y + 2.75;
+    let filter_top_radius = 4.10;
+    let filter_thickness = 0.08;
+    let bed_contact_offset = max(contact_offset(), bed_particle_radius());
+    let filter_height = max(filter_top_y - filter_bot_y, 1e-6);
+    let filter_slope = filter_top_radius / filter_height;
+    return filter_bot_y + (bed_contact_offset + filter_thickness) / max(filter_slope, 1e-6);
 }
 
 fn cell_index(ix: u32, iy: u32, iz: u32) -> u32 {
@@ -538,26 +551,31 @@ fn resolve_scene_obstacles(position: vec3<f32>, velocity: vec3<f32>, is_bed: boo
     let filter_top_radius = 4.10;
     let filter_thickness = 0.08;
     let bed_contact_offset = max(contact_offset(), bed_particle_radius());
+    let coffee_floor_y = coffee_filter_floor_y();
     if is_bed {
         if out_pos.y <= filter_top_y && out_pos.y >= filter_bot_y {
             let ft = clamp((out_pos.y - filter_bot_y) / (filter_top_y - filter_bot_y), 0.0, 1.0);
             let outer_r = mix(0.0, filter_top_radius, ft);
             let filter_r = max(outer_r - filter_thickness, 0.0) - bed_contact_offset;
-            if filter_r > 0.0 {
-                let fc = resolve_radial_barrier(out_pos, out_vel, vec2<f32>(0.0, 0.0), filter_r);
-                out_pos = fc.pos;
-                out_vel = fc.vel;
-            }
+            let fc = resolve_radial_barrier(out_pos, out_vel, vec2<f32>(0.0, 0.0), max(filter_r, 0.0));
+            out_pos = fc.pos;
+            out_vel = fc.vel;
         }
 
-        // Filter apex: floor keeps bed particles from falling through.
-        if out_pos.y <= filter_bot_y + bed_contact_offset && out_pos.y > filter_bot_y - 0.5 {
-            out_pos.y = filter_bot_y + bed_contact_offset;
+        // Filter apex: the paper comes to a tip, so a finite-size coffee
+        // particle cannot sit at the geometric apex; it rests where the inner
+        // cone radius can contain its particle radius.
+        if out_pos.y <= coffee_floor_y {
+            out_pos.y = coffee_floor_y;
+            out_pos.x = 0.0;
+            out_pos.z = 0.0;
             if out_vel.y < 0.0 {
                 out_vel.y = 0.0;
                 out_vel.x *= 1.0 - friction() * 0.55;
                 out_vel.z *= 1.0 - friction() * 0.55;
             }
+            out_vel.x *= 1.0 - friction() * 0.55;
+            out_vel.z *= 1.0 - friction() * 0.55;
         }
     }
 
@@ -571,7 +589,7 @@ fn resolve_scene_obstacles(position: vec3<f32>, velocity: vec3<f32>, is_bed: boo
         out_pos = cup_contact.pos;
         out_vel = cup_contact.vel;
 
-        let floor_y = -8.0 + obstacle_wall_half_thickness() + contact_offset();
+        let floor_y = cup_floor_y();
         if out_pos.y < floor_y {
             out_pos.y = floor_y;
             if out_vel.y < 0.0 {
@@ -579,6 +597,60 @@ fn resolve_scene_obstacles(position: vec3<f32>, velocity: vec3<f32>, is_bed: boo
                 out_vel.x *= 1.0 - friction() * 0.55;
                 out_vel.z *= 1.0 - friction() * 0.55;
             }
+        }
+    }
+
+    return ContactResult(out_pos, out_vel);
+}
+
+fn resolve_coffee_particle_packing(
+    position: vec3<f32>,
+    velocity: vec3<f32>,
+    self_bid: u32,
+) -> ContactResult {
+    var closest_delta = vec3<f32>(0.0);
+    var closest_dist = 1e9;
+    var found = false;
+    let center_cell = world_to_cell(position);
+
+    for (var di = -1; di <= 1; di++) {
+        for (var dj = -1; dj <= 1; dj++) {
+            for (var dk = -1; dk <= 1; dk++) {
+                let c = center_cell + vec3<i32>(di, dj, dk);
+                if c.x < 0 || c.y < 0 || c.z < 0 { continue; }
+                if u32(c.x) >= gx() || u32(c.y) >= gy() || u32(c.z) >= gz() { continue; }
+
+                let ci = cell_index(u32(c.x), u32(c.y), u32(c.z));
+                let other_bid = bed_lookup_load(ci);
+                if other_bid < 0 || u32(other_bid) == self_bid || u32(other_bid) >= num_bed() {
+                    continue;
+                }
+
+                let delta = position - particles[u32(other_bid)].pos.xyz;
+                let dist = length(delta);
+                if dist < closest_dist {
+                    closest_dist = dist;
+                    closest_delta = delta;
+                    found = true;
+                }
+            }
+        }
+    }
+
+    var out_pos = position;
+    var out_vel = velocity;
+    let min_sep = bed_particle_radius() * 1.78;
+    if found && closest_dist < min_sep {
+        var n = vec3<f32>(0.0, 1.0, 0.0);
+        if closest_dist > 1e-5 {
+            n = closest_delta / closest_dist;
+        }
+
+        let penetration = min_sep - closest_dist;
+        out_pos += n * min(penetration * 0.65, dx() * 0.22);
+        let vn = dot(out_vel, n);
+        if vn < 0.0 {
+            out_vel -= n * vn;
         }
     }
 
@@ -1250,7 +1322,8 @@ fn boundary_project(@builtin(global_invocation_id) gid: vec3<u32>) {
     let iy_val = rem / gx();
     let ix_val = rem % gx();
     let origin = u.grid_origin.xyz;
-    let cell_pos = origin + vec3<f32>(f32(ix_val), f32(iy_val), f32(iz_val)) * dx();
+    let cell_pos = origin
+        + (vec3<f32>(f32(ix_val), f32(iy_val), f32(iz_val)) + vec3<f32>(0.5)) * dx();
 
     // SDF collision
     let sdf_val = sample_sdf(cell_pos);
@@ -1582,6 +1655,8 @@ fn bed_dynamics(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     var water_v = vec3<f32>(0.0);
     var water_mass = 0.0;
+    var anchored_support_weight = 0.0;
+    var lower_anchored_support_weight = 0.0;
 
     for (var i = 0u; i < 3u; i++) {
         for (var j = 0u; j < 3u; j++) {
@@ -1597,17 +1672,28 @@ fn bed_dynamics(@builtin(global_invocation_id) gid: vec3<u32>) {
                 let gv = grid_vel[ci];
                 water_v += w * gv.xyz;
                 water_mass += w * gv.w;
+
+                let support_bid = bed_lookup_load(ci);
+                if support_bid >= 0 && u32(support_bid) != bid {
+                    anchored_support_weight += w;
+                    let cell_center_y = origin.y + (f32(cell.y) + 0.5) * dx();
+                    if cell_center_y <= pos.y + dx() * 0.25 {
+                        lower_anchored_support_weight += w;
+                    }
+                }
             }
         }
     }
 
     if is_suspended_coffee_phase(phase) {
         let water_support = clamp(water_mass / max(nominal_mass() * 2.0, 1e-6), 0.0, 1.0);
-        let drag = clamp((2.5 + 7.0 * water_support) * dt(), 0.0, 1.0);
-        // Suspended grounds are close to neutrally buoyant while carried by
-        // water, but settle slowly when the surrounding water support thins.
-        let unsupported_v = p.vel.xyz + vec3<f32>(0.0, gravity() * dt() * 0.25, 0.0);
-        let carried_v = water_v + vec3<f32>(0.0, -0.08 * water_support, 0.0);
+        let drag = clamp((6.0 + 12.0 * water_support) * dt(), 0.0, 1.0);
+        // Suspended grounds are denser than water: surrounding flow can carry
+        // fines, but they should still settle and should fall normally once
+        // they leave a supported water region.
+        let unsupported_v = p.vel.xyz + vec3<f32>(0.0, gravity() * dt() * 0.85, 0.0);
+        let settling_speed = mix(1.10, 0.42, water_support);
+        let carried_v = water_v + vec3<f32>(0.0, -settling_speed, 0.0);
         var suspended_v = mix(unsupported_v, carried_v, drag);
         let speed = length(suspended_v);
         if speed > vel_cap() {
@@ -1621,6 +1707,14 @@ fn bed_dynamics(@builtin(global_invocation_id) gid: vec3<u32>) {
 
         particles[pid].pos = vec4<f32>(suspended_pos, p.pos.w);
         particles[pid].vel = vec4<f32>(suspended_v, mass_p);
+        let anchored_contact =
+            lower_anchored_support_weight > 0.06 || anchored_support_weight > 0.20;
+        let redeposit =
+            suspended_pos.y <= coffee_filter_floor_y() + dx() * 0.35
+            || (anchored_contact && suspended_v.y <= 0.20);
+        if redeposit {
+            phase = 1.0;
+        }
         affine[pid].col0 = vec4<f32>(affine[pid].col0.xyz, phase);
         affine[pid].col1 = vec4<f32>(suspended_pos, 0.0);
         bed_extract[bid].bed.w = 0.0;
@@ -1699,6 +1793,9 @@ fn bed_dynamics(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     offset.y = clamp(offset.y, -dx() * (1.75 * surface_factor + 0.2), dx() * 0.04);
     new_pos = rest + offset;
+    let packing_contact = resolve_coffee_particle_packing(new_pos, vel, bid);
+    new_pos = packing_contact.pos;
+    vel = packing_contact.vel;
 
     // Plastic compaction: once the bed is indented enough, lower the remembered
     // local rest height instead of applying an elastic spring back to the
@@ -1722,7 +1819,13 @@ fn bed_dynamics(@builtin(global_invocation_id) gid: vec3<u32>) {
         && pore_load > 0.70
         && water_mass > nominal_mass() * 2.0
         && (compression > dx() * 0.80 || clamped_lateral_len > dx() * 0.75);
-    if hydraulic_detach {
+    let isolated_saturated_grain =
+        sat > 0.55
+        && water_mass < nominal_mass() * 0.75
+        && anchored_support_weight < 0.04
+        && lower_anchored_support_weight < 0.03
+        && new_pos.y > coffee_filter_floor_y() + dx() * 0.50;
+    if hydraulic_detach || isolated_saturated_grain {
         phase = PHASE_SUSPENDED_COFFEE;
         rest = new_pos;
     }
