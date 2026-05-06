@@ -121,6 +121,97 @@ fn fs_main(input: ConeVertexOutput) -> @location(0) vec4<f32> {
 }
 "#;
 
+const CROSS_SECTION_SHADER: &str = r#"
+struct CrossSectionUniforms {
+    bounds: vec4<f32>,
+    params: vec4<f32>,
+};
+
+@group(0) @binding(0)
+var<uniform> uniforms: CrossSectionUniforms;
+
+struct ParticleVertexInput {
+    @location(0) local: vec2<f32>,
+    @location(1) world_position: vec3<f32>,
+    @location(2) colour_t: f32,
+    @location(3) radius: f32,
+};
+
+struct ParticleVertexOutput {
+    @builtin(position) clip_position: vec4<f32>,
+    @location(0) local: vec2<f32>,
+    @location(1) colour_t: f32,
+    @location(2) visible: f32,
+};
+
+@vertex
+fn vs_main(input: ParticleVertexInput) -> ParticleVertexOutput {
+    let x_min = uniforms.bounds.x;
+    let x_max = uniforms.bounds.y;
+    let y_min = uniforms.bounds.z;
+    let y_max = uniforms.bounds.w;
+    let z_center = uniforms.params.x;
+    let slice_half_width = uniforms.params.y;
+    let radius_scale = uniforms.params.z;
+
+    let x_range = max(x_max - x_min, 1e-5);
+    let y_range = max(y_max - y_min, 1e-5);
+    let in_slice = abs(input.world_position.z - z_center) <= slice_half_width;
+    let in_bounds = input.world_position.x >= x_min
+        && input.world_position.x <= x_max
+        && input.world_position.y >= y_min
+        && input.world_position.y <= y_max
+        && input.world_position.y > -1e5;
+    let visible = select(0.0, 1.0, in_slice && in_bounds);
+
+    let center = vec2<f32>(
+        ((input.world_position.x - x_min) / x_range) * 2.0 - 1.0,
+        ((input.world_position.y - y_min) / y_range) * 2.0 - 1.0,
+    );
+    let particle_radius = input.radius * radius_scale;
+    let radius_ndc = vec2<f32>(
+        max(particle_radius * 2.0 / x_range, 0.0025),
+        max(particle_radius * 2.0 / y_range, 0.0025),
+    );
+
+    var output: ParticleVertexOutput;
+    output.clip_position = select(
+        vec4<f32>(2.4, 2.4, 0.0, 1.0),
+        vec4<f32>(center + input.local * radius_ndc, 0.0, 1.0),
+        visible > 0.5,
+    );
+    output.local = input.local;
+    output.colour_t = input.colour_t;
+    output.visible = visible;
+    return output;
+}
+
+fn palette(colour_t: f32) -> vec3<f32> {
+    if (colour_t < 0.0) {
+        let wetness = clamp(-colour_t - 1.0, 0.0, 1.0);
+        let dry = vec3<f32>(0.42, 0.28, 0.12);
+        let wet = vec3<f32>(0.16, 0.10, 0.05);
+        return mix(dry, wet, wetness);
+    }
+    let water = vec3<f32>(0.08, 0.34, 0.86);
+    let fast = vec3<f32>(0.74, 0.92, 1.0);
+    return mix(water, fast, clamp(colour_t * 0.45, 0.0, 1.0));
+}
+
+@fragment
+fn fs_main(input: ParticleVertexOutput) -> @location(0) vec4<f32> {
+    if (input.visible < 0.5) {
+        discard;
+    }
+    let radial = dot(input.local, input.local);
+    if (radial > 1.0) {
+        discard;
+    }
+    let alpha = smoothstep(1.0, 0.72, radial);
+    return vec4<f32>(palette(input.colour_t), alpha * 0.92);
+}
+"#;
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct QuadVertex {
@@ -143,6 +234,13 @@ struct Particle3DUniforms {
 struct ConeUniforms {
     view_proj: [[f32; 4]; 4],
     color: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct CrossSectionUniforms {
+    bounds: [f32; 4],
+    params: [f32; 4],
 }
 
 #[derive(Clone, Copy)]
@@ -214,10 +312,13 @@ pub(crate) struct Renderer {
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     particle_3d_pipeline: wgpu::RenderPipeline,
+    cross_section_pipeline: wgpu::RenderPipeline,
     filter_fill_pipeline: wgpu::RenderPipeline,
     cone_pipeline: wgpu::RenderPipeline,
     particle_3d_uniform_buffer: wgpu::Buffer,
     particle_3d_bind_group: wgpu::BindGroup,
+    cross_section_uniform_buffer: wgpu::Buffer,
+    cross_section_bind_group: wgpu::BindGroup,
     cone_uniform_buffer: wgpu::Buffer,
     cone_bind_group: wgpu::BindGroup,
     filter_uniform_buffer: wgpu::Buffer,
@@ -280,6 +381,13 @@ impl Renderer {
             mapped_at_creation: false,
         });
 
+        let cross_section_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cross section uniforms"),
+            size: size_of::<CrossSectionUniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("particle 3d bind group layout"),
             entries: &[wgpu::BindGroupLayoutEntry {
@@ -300,6 +408,15 @@ impl Renderer {
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
                 resource: particle_3d_uniform_buffer.as_entire_binding(),
+            }],
+        });
+
+        let cross_section_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("cross section bind group"),
+            layout: &bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: cross_section_uniform_buffer.as_entire_binding(),
             }],
         });
 
@@ -340,6 +457,10 @@ impl Renderer {
         let particle_3d_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("particle 3d shader"),
             source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(PARTICLE_3D_SHADER)),
+        });
+        let cross_section_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("cross section shader"),
+            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(CROSS_SECTION_SHADER)),
         });
         let cone_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("cone shader"),
@@ -423,6 +544,78 @@ impl Renderer {
             multiview_mask: None,
             cache: None,
         });
+
+        let cross_section_pipeline =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("cross section pipeline"),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &cross_section_shader,
+                    entry_point: Some("vs_main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    buffers: &[
+                        wgpu::VertexBufferLayout {
+                            array_stride: size_of::<QuadVertex>() as u64,
+                            step_mode: wgpu::VertexStepMode::Vertex,
+                            attributes: &[wgpu::VertexAttribute {
+                                offset: 0,
+                                shader_location: 0,
+                                format: wgpu::VertexFormat::Float32x2,
+                            }],
+                        },
+                        wgpu::VertexBufferLayout {
+                            array_stride: (size_of::<f32>() * 8) as u64,
+                            step_mode: wgpu::VertexStepMode::Instance,
+                            attributes: &[
+                                wgpu::VertexAttribute {
+                                    offset: 0,
+                                    shader_location: 1,
+                                    format: wgpu::VertexFormat::Float32x3,
+                                },
+                                wgpu::VertexAttribute {
+                                    offset: 12,
+                                    shader_location: 2,
+                                    format: wgpu::VertexFormat::Float32,
+                                },
+                                wgpu::VertexAttribute {
+                                    offset: 16,
+                                    shader_location: 3,
+                                    format: wgpu::VertexFormat::Float32,
+                                },
+                            ],
+                        },
+                    ],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &cross_section_shader,
+                    entry_point: Some("fs_main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: config.format,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: None,
+                    unclipped_depth: false,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    conservative: false,
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: wgpu::TextureFormat::Depth24Plus,
+                    depth_write_enabled: Some(false),
+                    depth_compare: Some(wgpu::CompareFunction::Always),
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            });
 
         let filter_fill_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("filter fill pipeline"),
@@ -582,10 +775,13 @@ impl Renderer {
             queue,
             config,
             particle_3d_pipeline,
+            cross_section_pipeline,
             filter_fill_pipeline,
             cone_pipeline,
             particle_3d_uniform_buffer,
             particle_3d_bind_group,
+            cross_section_uniform_buffer,
+            cross_section_bind_group,
             cone_uniform_buffer,
             cone_bind_group,
             filter_uniform_buffer,
@@ -655,6 +851,16 @@ impl Renderer {
             &self.particle_3d_uniform_buffer,
             0,
             bytemuck::bytes_of(&particle_uniforms),
+        );
+
+        let cross_section_uniforms = CrossSectionUniforms {
+            bounds: [-4.8, 4.8, -4.2, 3.2],
+            params: [0.0, 0.28, 1.0, 0.0],
+        };
+        self.queue.write_buffer(
+            &self.cross_section_uniform_buffer,
+            0,
+            bytemuck::bytes_of(&cross_section_uniforms),
         );
 
         // Update cone uniforms
@@ -785,6 +991,35 @@ impl Renderer {
                 pass.set_vertex_buffer(0, self.quad_vertex_buffer.slice(..));
                 pass.set_vertex_buffer(1, simulation.render_buffer().slice(..));
                 pass.draw(0..6, 0..simulation.particle_count() as u32);
+
+                let overlay_margin = 16.0;
+                let overlay_width = (self.config.width as f32 * 0.28).clamp(220.0, 360.0);
+                let overlay_height = overlay_width * 0.72;
+                if self.config.width as f32 > overlay_width + overlay_margin
+                    && self.config.height as f32 > overlay_height + overlay_margin
+                {
+                    pass.set_viewport(
+                        self.config.width as f32 - overlay_width - overlay_margin,
+                        overlay_margin,
+                        overlay_width,
+                        overlay_height,
+                        0.0,
+                        1.0,
+                    );
+                    pass.set_pipeline(&self.cross_section_pipeline);
+                    pass.set_bind_group(0, &self.cross_section_bind_group, &[]);
+                    pass.set_vertex_buffer(0, self.quad_vertex_buffer.slice(..));
+                    pass.set_vertex_buffer(1, simulation.render_buffer().slice(..));
+                    pass.draw(0..6, 0..simulation.particle_count() as u32);
+                    pass.set_viewport(
+                        0.0,
+                        0.0,
+                        self.config.width as f32,
+                        self.config.height as f32,
+                        0.0,
+                        1.0,
+                    );
+                }
             }
         }
 

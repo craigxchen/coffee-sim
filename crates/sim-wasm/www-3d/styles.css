@@ -144,6 +144,34 @@ canvas {
   display: block;
 }
 
+.cross-section-overlay {
+  position: absolute;
+  top: 16px;
+  right: 16px;
+  width: clamp(220px, 28vw, 360px);
+  aspect-ratio: 1.38;
+  pointer-events: none;
+  border: 1px solid rgba(233, 239, 230, 0.68);
+  background:
+    linear-gradient(rgba(233, 239, 230, 0.12) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(233, 239, 230, 0.12) 1px, transparent 1px);
+  background-size: 25% 25%;
+  box-shadow:
+    inset 0 0 0 1px rgba(9, 16, 19, 0.82),
+    0 0 0 1px rgba(0, 0, 0, 0.52),
+    0 10px 30px rgba(0, 0, 0, 0.22);
+}
+
+.cross-section-overlay span {
+  position: absolute;
+  top: 8px;
+  left: 10px;
+  color: rgba(233, 239, 230, 0.78);
+  font-size: 0.68rem;
+  letter-spacing: 0.10em;
+  text-transform: uppercase;
+}
+
 .debug-stats.hidden {
   display: none;
 }
