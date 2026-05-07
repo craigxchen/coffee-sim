@@ -2132,11 +2132,15 @@ fn fine_grind_pools_more_than_coarse_grind() {
         "fine grind should retain more active water above the bed surface: \
          fine_above={fine_above:?} coarse_above={coarse_above:?}",
     );
+    let fine_downward_flux = (-fine_below.momentum[1]).max(0.0);
+    let coarse_downward_flux = (-coarse_below.momentum[1]).max(0.0);
     assert!(
-        fine_below.active_mass <= coarse_below.active_mass * 0.85
-            && fine_below.active_count <= coarse_below.active_count.saturating_sub(12),
-        "fine grind should send less active water below the bed over the same pour window: \
-         fine_below={fine_below:?} coarse_below={coarse_below:?}",
+        fine_downward_flux <= coarse_downward_flux * 0.75
+            && fine_below.rms_speed <= coarse_below.rms_speed * 0.85,
+        "fine grind should reduce below-bed downward flux, not merely slow water so it lingers \
+         in the readback band: fine_flux={fine_downward_flux:.3} \
+         coarse_flux={coarse_downward_flux:.3} fine_below={fine_below:?} \
+         coarse_below={coarse_below:?}",
     );
 }
 

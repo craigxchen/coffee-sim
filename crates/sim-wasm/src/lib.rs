@@ -173,9 +173,19 @@ impl WasmSim3D {
         self.sim.frame_emitted_mass()
     }
 
+    #[wasm_bindgen(js_name = frameEmittedMl)]
+    pub fn frame_emitted_ml(&self) -> f32 {
+        self.sim.frame_emitted_ml()
+    }
+
     #[wasm_bindgen(js_name = totalEmittedMass)]
     pub fn total_emitted_mass(&self) -> f32 {
         self.sim.total_emitted_mass()
+    }
+
+    #[wasm_bindgen(js_name = totalEmittedMl)]
+    pub fn total_emitted_ml(&self) -> f32 {
+        self.sim.total_emitted_ml()
     }
 
     #[wasm_bindgen(js_name = frameDroppedParticles)]

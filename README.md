@@ -46,12 +46,8 @@ coffee-sim/
 │       └── www-3d/
 ├── docs/
 │   ├── ARCHITECTURE.md
-│   └── BRANCH_AUDIT.md
-├── LONG_TERM_PLAN.md
-├── PERFORMANCE_OPTIMIZATION_PLAN.md
-├── PHYSICS_VALIDATION_PLAN.md
+│   └── ROADMAP.md
 ├── CHANGELOG.md
-├── CLAUDE.md
 └── AGENTS.md
 ```
 
@@ -113,10 +109,5 @@ cargo clippy -p coffee-sim-wasm -- -D warnings
 
 Use these files as the current source of truth:
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md): as-built implementation map
-- [`docs/BRANCH_AUDIT.md`](docs/BRANCH_AUDIT.md): branch comparison and merge decisions
-- [`LONG_TERM_PLAN.md`](LONG_TERM_PLAN.md): long-range simulation direction
-- [`PERFORMANCE_OPTIMIZATION_PLAN.md`](PERFORMANCE_OPTIMIZATION_PLAN.md): current perf plan and completed wins
-- [`PHYSICS_VALIDATION_PLAN.md`](PHYSICS_VALIDATION_PLAN.md): validation-harness direction
-
-Known open implementation issues that are not yet solved are tracked in
-[`ISSUES.md`](ISSUES.md).
+- [`docs/ROADMAP.md`](docs/ROADMAP.md): current physics, validation, and performance direction
+- [`CHANGELOG.md`](CHANGELOG.md): shipped or snapshot-worthy behavior changes

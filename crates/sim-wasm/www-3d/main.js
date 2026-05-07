@@ -1,4 +1,4 @@
-import init, { WasmSim3D } from "./pkg/coffee_sim_wasm.js";
+import init, { WasmSim3D } from "./pkg/coffee_sim_wasm.js?v=volume-ml-3";
 
 const canvas = document.getElementById("sim-canvas");
 const toggleButton = document.getElementById("toggle");
@@ -285,8 +285,8 @@ function syncUi() {
   sceneModeLabel.textContent = currentSceneMode;
   stepModeLabel.textContent = fixedStepSeconds ? "Fixed 60 Hz" : "Real Time";
   simTimeLabel.textContent = `${app.simTime().toFixed(1)}s`;
-  frameEmittedMassLabel.textContent = app.frameEmittedMass().toFixed(2);
-  totalEmittedMassLabel.textContent = app.totalEmittedMass().toFixed(2);
+  frameEmittedMassLabel.textContent = app.frameEmittedMl().toFixed(2);
+  totalEmittedMassLabel.textContent = app.totalEmittedMl().toFixed(2);
   frameDroppedEmissionLabel.textContent = new Intl.NumberFormat().format(app.frameDroppedParticles());
   totalDroppedEmissionLabel.textContent = new Intl.NumberFormat().format(app.totalDroppedParticles());
   waterSlotsLabel.textContent = new Intl.NumberFormat().format(app.waterSlotsUsed());

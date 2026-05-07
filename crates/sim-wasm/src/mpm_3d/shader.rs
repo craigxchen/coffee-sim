@@ -1039,9 +1039,11 @@ fn viscosity_prepare(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
 
-    let alpha = clamp(viscosity() * dt() / max(dx() * dx(), 1e-6), 0.0, 0.12);
-    var laplacian = vec3<f32>(0.0);
-    var neighbor_count = 0u;
+    let alpha = clamp(viscosity() * dt() / max(dx() * dx(), 1e-6), 0.0, 0.14);
+    var neighbor_velocity_sum = vec3<f32>(0.0);
+    var neighbor_weight_sum = 0.0;
+    var fluid_neighbor_count = 0u;
+    let wall_viscosity_weight = 1.0;
 
     let offsets = array<vec3<i32>, 6>(
         vec3<i32>(-1, 0, 0),
@@ -1056,27 +1058,40 @@ fn viscosity_prepare(@builtin(global_invocation_id) gid: vec3<u32>) {
         let neighbor = vec3<i32>(i32(ix_val), i32(iy_val), i32(iz_val)) + offsets[n];
         if neighbor.x < 0 || neighbor.y < 0 || neighbor.z < 0
             || u32(neighbor.x) >= gx() || u32(neighbor.y) >= gy() || u32(neighbor.z) >= gz() {
+            // No-slip boundary: outside the simulation domain is stationary
+            // support for viscous diffusion, not missing fluid support.
+            neighbor_weight_sum += wall_viscosity_weight;
             continue;
         }
         if sdf_class_is_solid(neighbor) {
+            // No-slip boundary: static solids dissipate tangential pool motion.
+            neighbor_weight_sum += wall_viscosity_weight;
             continue;
         }
 
         let neighbor_idx = cell_index(u32(neighbor.x), u32(neighbor.y), u32(neighbor.z));
         let neighbor_gv = grid_vel[neighbor_idx];
-        if neighbor_gv.w <= viscosity_support_mass_threshold() {
+        if neighbor_gv.w <= occupancy_mass_threshold() {
             continue;
         }
-        laplacian += neighbor_gv.xyz - v_here;
-        neighbor_count += 1u;
+        let neighbor_weight = clamp(
+            neighbor_gv.w / max(max(gv.w, nominal_mass()), 1e-6),
+            0.0,
+            1.0,
+        );
+        neighbor_velocity_sum += neighbor_gv.xyz * neighbor_weight;
+        neighbor_weight_sum += neighbor_weight;
+        fluid_neighbor_count += 1u;
     }
 
-    if neighbor_count < 5u {
+    if fluid_neighbor_count < 3u || neighbor_weight_sum <= 1e-6 {
         velocity_scratch_store(idx, v_here);
         return;
     }
 
-    velocity_scratch_store(idx, v_here + alpha * laplacian);
+    let neighbor_average = neighbor_velocity_sum / neighbor_weight_sum;
+    let blend = clamp(alpha * neighbor_weight_sum, 0.0, 0.65);
+    velocity_scratch_store(idx, mix(v_here, neighbor_average, blend));
 }
 
 @compute @workgroup_size(64)
@@ -1610,6 +1625,8 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     let in_cup_volume =
         xp.y < -3.5 && dot(xp.xz, xp.xz) < (3.0 + contact_offset()) * (3.0 + contact_offset());
+    let dense_support_ratio =
+        clamp(local_grid_mass / max(nominal_mass() * 4.0, 1e-6), 0.0, 1.0);
     // Use the particle's interpolation stencil rather than a single home-cell
     // bed lookup so particles exiting the coffee bed do not toggle abruptly
     // between porous and airborne transfer behavior at cell boundaries.
@@ -1627,7 +1644,9 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>) {
         let free_preserve_cap = select(0.995, 0.95, in_cup_volume);
         let preserve_gain = mix(free_preserve_gain, 0.18, porous_overlap);
         let preserve_cap = mix(free_preserve_cap, 0.16, porous_overlap);
-        let preserve = clamp((1.0 - support_ratio) * preserve_gain, 0.0, preserve_cap);
+        let dense_pool_damping = mix(1.0, 0.12, dense_support_ratio);
+        let preserve =
+            clamp((1.0 - support_ratio) * preserve_gain * dense_pool_damping, 0.0, preserve_cap);
         new_v = mix(new_v, ballistic_v, preserve);
         let affine_damp = 1.0 - preserve * 0.75;
         new_C0 *= affine_damp;
