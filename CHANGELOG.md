@@ -2,18 +2,18 @@
 
 ## Unreleased
 
-Mainline documentation and integration audit refresh.
+Mainline physics and documentation cleanup after the physics-mainline merge.
 
 What changed:
 - rewrote `README.md` around the current MPM browser app
 - added `docs/ARCHITECTURE.md` as the as-built implementation map
-- added `docs/BRANCH_AUDIT.md` to record keep/defer/superseded decisions across branches
-- committed the current long-term, performance, and validation planning docs
-- clarified that `origin/main` is the integration baseline rather than the stale local `main`
+- consolidated active planning into `docs/ROADMAP.md`
+- removed stale branch-audit and historical issue files that no longer described `main`
+- merged the porous-bed physics mainline into `main`
 
 Known issues still open:
 - free water jet can still fragment unrealistically in mid-air
-- bed deformation, compaction, and drawdown realism remain under active iteration
+- coffee-bed advection, grind-size distribution, and extraction color remain future work
 - filter contact is still an approximation rather than a full contact solve
 
 ## Demo v0 — Baseline MPM Pour-Over Prototype

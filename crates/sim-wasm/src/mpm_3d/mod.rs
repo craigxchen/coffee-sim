@@ -350,16 +350,7 @@ impl MpmSim3D {
                 pass.set_pipeline(&self.pipelines.grid_update);
                 pass.dispatch_workgroups(cell_wg, 1, 1);
 
-                // 4. viscosity diffusion. This uses grid momentum lanes as
-                // temporary FP-encoded velocity scratch after `grid_update`
-                // has consumed them and before `classify_cells` repurposes
-                // those lanes for pressure/divergence/kind scratch.
-                pass.set_pipeline(&self.pipelines.viscosity_prepare);
-                pass.dispatch_workgroups(cell_wg, 1, 1);
-                pass.set_pipeline(&self.pipelines.viscosity_apply);
-                pass.dispatch_workgroups(cell_wg, 1, 1);
-
-                // 5. boundary_project
+                // 4. boundary_project
                 pass.set_pipeline(&self.pipelines.boundary_project);
                 pass.dispatch_workgroups(cell_wg, 1, 1);
 
@@ -376,6 +367,19 @@ impl MpmSim3D {
                 }
 
                 pass.set_pipeline(&self.pipelines.project_pressure);
+                pass.dispatch_workgroups(cell_wg, 1, 1);
+                pass.set_pipeline(&self.pipelines.boundary_project);
+                pass.dispatch_workgroups(cell_wg, 1, 1);
+
+                // Viscosity is split after pressure projection so the pressure
+                // solve cannot immediately reintroduce the high-frequency pool
+                // velocities that diffusion just removed. It uses grid
+                // momentum lanes as temporary FP-encoded velocity scratch; at
+                // this point pressure/divergence/kind scratch is no longer
+                // needed by later passes in the substep.
+                pass.set_pipeline(&self.pipelines.viscosity_prepare);
+                pass.dispatch_workgroups(cell_wg, 1, 1);
+                pass.set_pipeline(&self.pipelines.viscosity_apply);
                 pass.dispatch_workgroups(cell_wg, 1, 1);
                 pass.set_pipeline(&self.pipelines.boundary_project);
                 pass.dispatch_workgroups(cell_wg, 1, 1);
@@ -517,12 +521,20 @@ impl MpmSim3D {
         self.frame_emitted_mass
     }
 
+    pub fn frame_emitted_ml(&self) -> f32 {
+        self.frame_emitted_mass / MASS_UNITS_PER_ML
+    }
+
     pub fn frame_dropped_particles(&self) -> u32 {
         self.frame_dropped_particles
     }
 
     pub fn total_emitted_mass(&self) -> f32 {
         self.total_emitted_mass
+    }
+
+    pub fn total_emitted_ml(&self) -> f32 {
+        self.total_emitted_mass / MASS_UNITS_PER_ML
     }
 
     pub fn total_dropped_particles(&self) -> u32 {

@@ -134,5 +134,4 @@ The browser app must stay a thin controller over `WasmSim3D`, not a second simul
 - filter contact is still an approximation rather than a full contact solve
 - extraction remains provisional
 
-For active merge/defer decisions across branches, see
-[`docs/BRANCH_AUDIT.md`](BRANCH_AUDIT.md).
+For active planning and validation priorities, see [`docs/ROADMAP.md`](ROADMAP.md).

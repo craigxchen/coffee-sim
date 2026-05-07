@@ -30,4 +30,4 @@ Repository-wide instructions for coding agents.
 ## References
 
 - Start with `README.md`
-- Then use `docs/ARCHITECTURE.md` and `docs/BRANCH_AUDIT.md`
+- Then use `docs/ARCHITECTURE.md` and `docs/ROADMAP.md`
