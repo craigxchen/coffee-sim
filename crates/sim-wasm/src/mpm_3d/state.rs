@@ -132,9 +132,11 @@ impl MpmBuffers {
             mapped_at_creation: false,
         });
 
+        // Four atomic lanes per bed particle:
+        // retained water mass, then Darcy reaction impulse x/y/z.
         let bed_delta = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("mpm bed delta"),
-            size: (max_p * size_of::<i32>()) as u64,
+            size: (4 * max_p * size_of::<i32>()) as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
