@@ -34,7 +34,7 @@
             <span>Kettle Angle</span>
             <output id="kettle-angle-value">0°</output>
           </label>
-          <input id="kettle-angle" type="range" min="0" max="70" step="1" value="36" />
+          <input id="kettle-angle" type="range" min="0" max="70" step="1" value="9" />
         </div>
         <div class="control-panel">
           <label class="slider-field" for="spout-x">
@@ -68,7 +68,7 @@
           </div>
           <div>
             <dt>Jet Speed</dt>
-            <dd id="jet-speed">0.0 u/s</dd>
+            <dd id="jet-speed">0.00 m/s</dd>
           </div>
         </dl>
         <button id="toggle-debug" class="toggle-debug">Show Debug Stats</button>
@@ -141,6 +141,9 @@
       </section>
       <section class="viewer">
         <canvas id="sim-canvas"></canvas>
+        <div class="cross-section-overlay" aria-hidden="true">
+          <span>Center Cross-Section</span>
+        </div>
       </section>
     </main>
     <script type="module" src="./main.js"></script>

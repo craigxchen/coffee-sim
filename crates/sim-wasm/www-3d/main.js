@@ -47,6 +47,7 @@ let metricsRefreshInFlight = false;
 let app;
 let paused = false;
 let lastFrameTime = 0;
+let skipStepOnce = false;
 let fpsWindow = [];
 let dragging = false;
 let lastClientX = 0;
@@ -76,6 +77,11 @@ window.addEventListener("resize", resizeCanvas);
 toggleButton.addEventListener("click", () => {
   paused = !paused;
   toggleButton.textContent = paused ? "Play" : "Pause";
+  if (!paused) {
+    lastFrameTime = 0;
+    fpsWindow = [];
+    skipStepOnce = true;
+  }
 });
 
 resetButton.addEventListener("click", () => {
@@ -210,7 +216,9 @@ function animate(timestamp) {
 
   applyKeyboardPan(frameTime);
 
-  if (!paused) {
+  if (!paused && skipStepOnce) {
+    skipStepOnce = false;
+  } else if (!paused) {
     app.stepFrame(frameTime);
   }
 
@@ -273,7 +281,7 @@ function syncUi() {
   spoutYValue.textContent = app.spoutY().toFixed(1);
   spoutZValue.textContent = app.spoutZ().toFixed(1);
   flowRateLabel.textContent = `${app.flowRate().toFixed(1)} mL/s`;
-  jetSpeedLabel.textContent = `${app.exitSpeed().toFixed(1)} u/s`;
+  jetSpeedLabel.textContent = `${app.exitSpeedMetersPerSecond().toFixed(2)} m/s`;
   sceneModeLabel.textContent = currentSceneMode;
   stepModeLabel.textContent = fixedStepSeconds ? "Fixed 60 Hz" : "Real Time";
   simTimeLabel.textContent = `${app.simTime().toFixed(1)}s`;
