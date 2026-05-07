@@ -6,6 +6,10 @@ use bytemuck::cast_slice;
 // ── Device setup ──
 
 fn request_adapter() -> Option<wgpu::Adapter> {
+    if std::env::var_os("COFFEE_SIM_SKIP_GPU_TESTS").is_some() {
+        return None;
+    }
+
     let instance = wgpu::Instance::default();
     pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).ok()
 }

@@ -1,0 +1,55 @@
+name: Long Horizon Diagnostics
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 9 * * *"
+
+concurrency:
+  group: long-horizon-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  WGPU_BACKEND: vulkan
+
+jobs:
+  diagnostics:
+    name: Long-settle physics diagnostics
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system GPU dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libvulkan1 mesa-vulkan-drivers
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: long-horizon-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            long-horizon-${{ runner.os }}-
+
+      - name: Long mass-conservation settle
+        run: >
+          cargo test -p coffee-sim-wasm volume_conservation_long_settle --lib
+          -- --nocapture --test-threads=1
+
+      - name: Known free-surface shape target
+        continue-on-error: true
+        run: >
+          cargo test -p coffee-sim-wasm pooled_water_shape_stays_bounded_after_initial_settle --lib
+          -- --ignored --nocapture --test-threads=1
