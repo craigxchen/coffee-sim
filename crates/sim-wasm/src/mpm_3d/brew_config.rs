@@ -63,7 +63,9 @@ pub(crate) const DEFAULT_BREW: BrewConfig = BrewConfig {
     bed_surface_void_scale: 1.0,
     filter_pore_capacity_scale: 1.0,
     dripper_outlet_radius: 0.42,
-    filter_absorption_rate_s: 1.2,
+    // Disabled until paper has a finite reservoir/release model. The previous
+    // mass sink made long default brews lose visible cup volume.
+    filter_absorption_rate_s: 0.0,
     bed_compaction_rate: 5.5,
     bed_impact_rate: 8.0,
 };

@@ -1,0 +1,122 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  WGPU_BACKEND: vulkan
+
+jobs:
+  rust:
+    name: Rust checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      COFFEE_SIM_SKIP_GPU_TESTS: "1"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install wasm target
+        run: rustup target add wasm32-unknown-unknown
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy -p coffee-sim-wasm -- -D warnings
+
+      - name: Test
+        run: cargo test -p coffee-sim-wasm --lib
+
+      - name: Check wasm target
+        run: cargo check -p coffee-sim-wasm --target wasm32-unknown-unknown
+
+  gpu-smoke:
+    name: Headless GPU smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system GPU dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libvulkan1 mesa-vulkan-drivers
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: gpu-smoke-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            gpu-smoke-${{ runner.os }}-
+
+      - name: Shader parser smoke
+        run: cargo test -p coffee-sim-wasm mpm_3d::shader::tests::shader_parses_with_naga --lib
+
+      - name: Pool mass smoke
+        run: >
+          cargo test -p coffee-sim-wasm water_mass_stable_after_pour_off --lib
+          -- --test-threads=1
+
+  wasm-pack:
+    name: WASM package
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    needs:
+      - rust
+      - gpu-smoke
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install wasm target
+        run: rustup target add wasm32-unknown-unknown
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: wasm-pack-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            wasm-pack-${{ runner.os }}-
+
+      - name: Install wasm-pack
+        run: cargo install wasm-pack --locked
+
+      - name: Build web package
+        run: wasm-pack build crates/sim-wasm --target web --release --out-dir www-3d/pkg

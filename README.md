@@ -1,5 +1,8 @@
 # Coffee Sim
 
+[![CI](https://github.com/craigxchen/coffee-sim/actions/workflows/ci.yml/badge.svg)](https://github.com/craigxchen/coffee-sim/actions/workflows/ci.yml)
+[![Long Horizon Diagnostics](https://github.com/craigxchen/coffee-sim/actions/workflows/long-horizon.yml/badge.svg)](https://github.com/craigxchen/coffee-sim/actions/workflows/long-horizon.yml)
+
 `coffee-sim` is a browser-first pour-over coffee simulator written in Rust.
 The active product is the WebGPU-powered 3D MPM demo in
 [`crates/sim-wasm/www-3d`](crates/sim-wasm/www-3d).
@@ -104,6 +107,26 @@ Before landing a meaningful branch, also run:
 cargo fmt --check
 cargo clippy -p coffee-sim-wasm -- -D warnings
 ```
+
+## Continuous Integration
+
+GitHub Actions runs the standard quality gate on pushes to `main` and on pull
+requests:
+
+```bash
+cargo fmt --check
+cargo clippy -p coffee-sim-wasm -- -D warnings
+cargo test -p coffee-sim-wasm --lib
+cargo check -p coffee-sim-wasm --target wasm32-unknown-unknown
+wasm-pack build crates/sim-wasm --target web --release --out-dir www-3d/pkg
+```
+
+The fast unit lane sets `COFFEE_SIM_SKIP_GPU_TESTS=1` so PR feedback does not
+depend on a slow software GPU. CI also runs a small headless GPU smoke test.
+Long-horizon physics diagnostics run on a nightly schedule and can be launched
+manually from Actions. These use accelerated headless stepping, not browser
+wall-clock playback. The known free-surface shape target is reported there as a
+diagnostic until the pooled-water collapse issue is fixed.
 
 ## Documentation
 

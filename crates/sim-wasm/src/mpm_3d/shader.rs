@@ -1747,6 +1747,10 @@ fn bed_coupling(@builtin(global_invocation_id) gid: vec3<u32>) {
     if u32(cell.x) >= gx() || u32(cell.y) >= gy() || u32(cell.z) >= gz() { return; }
 
     var mass_p = particles[pid].vel.w;
+    // Paper absorption is intentionally disabled by default until the paper
+    // has finite retained-water storage and a release path. Keep the codepath
+    // dormant for future work, but do not let the paper act as an infinite
+    // water sink in long brews.
     let paper_weight = filter_paper_absorption_weight(pos);
     if paper_weight > 1e-4 && filter_absorption_rate() > 0.0 {
         let paper_absorb_fraction = clamp(filter_absorption_rate() * paper_weight * dt(), 0.0, 0.04);
