@@ -66,12 +66,28 @@ mod tests {
     }
 
     #[test]
+    fn default_filter_paper_comes_to_a_tip() {
+        let filter = FilterConfig::default();
+        assert_eq!(filter.opening_radius(), 0.0);
+        assert_eq!(filter.radius_at_y(filter.bot_y), 0.0);
+        assert_eq!(filter.inner_radius_at_y(filter.bot_y), 0.0);
+    }
+
+    #[test]
     fn filter_contains_shell_points_on_the_cone_band() {
         let filter = FilterConfig::default();
         let mid_y = (filter.top_y + filter.bot_y) * 0.5;
         let outer = filter.radius_at_y(mid_y);
         let inner = filter.inner_radius_at_y(mid_y);
-        assert!(filter.contains_shell_point(Vec3::new(filter.center.x + (outer + inner) * 0.5, mid_y, filter.center.z)));
-        assert!(!filter.contains_shell_point(Vec3::new(filter.center.x + outer + 0.5, mid_y, filter.center.z)));
+        assert!(filter.contains_shell_point(Vec3::new(
+            filter.center.x + (outer + inner) * 0.5,
+            mid_y,
+            filter.center.z
+        )));
+        assert!(!filter.contains_shell_point(Vec3::new(
+            filter.center.x + outer + 0.5,
+            mid_y,
+            filter.center.z
+        )));
     }
 }

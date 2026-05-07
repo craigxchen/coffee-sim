@@ -1,14 +1,15 @@
 use coffee_sim_core::sph::Vec3;
 
-use super::state::MpmBuffers;
+use super::{brew_config::DEFAULT_BREW, state::MpmBuffers, units};
 
-pub(crate) const MASS_UNITS_PER_ML: f32 = 80.0;
-pub(crate) const PARTICLES_PER_ML: f32 = 160.0;
+pub(crate) const MASS_UNITS_PER_ML: f32 = DEFAULT_BREW.water_mass_units_per_ml;
+pub(crate) const PARTICLES_PER_ML: f32 = DEFAULT_BREW.water_particles_per_ml;
 
 #[derive(Clone, Copy)]
 pub(crate) struct SpoutSettings {
     pub origin: Vec3,
     pub direction: Vec3,
+    pub target: Vec3,
     pub nozzle_radius: f32,
     pub stem_radius: f32,
     pub activation_angle_deg: f32,
@@ -18,6 +19,7 @@ pub(crate) struct SpoutSettings {
     pub discharge_coeff: f32,
     pub volume_to_ml: f32,
     pub max_flow_rate_ml_s: f32,
+    pub gentle_exit_speed: f32,
     pub max_exit_speed: f32,
     pub stem_length: f32,
 }
@@ -27,6 +29,7 @@ impl Default for SpoutSettings {
         Self {
             origin: Vec3::new(-3.4, 7.3, 0.9),
             direction: Vec3::new(0.36, -0.92, -0.12).normalized(),
+            target: Vec3::new(-0.7, 0.4, 0.0),
             nozzle_radius: 0.18,
             stem_radius: 0.24,
             activation_angle_deg: 8.0,
@@ -34,9 +37,10 @@ impl Default for SpoutSettings {
             head_at_activation: 0.04,
             head_at_full_angle: 24.0,
             discharge_coeff: 0.92,
-            volume_to_ml: 5.4,
-            max_flow_rate_ml_s: 11.5,
-            max_exit_speed: 22.0,
+            volume_to_ml: units::ML_PER_SIM_UNIT_CUBED,
+            max_flow_rate_ml_s: DEFAULT_BREW.max_flow_rate_ml_s,
+            gentle_exit_speed: units::GENTLE_POUR_EXIT_SPEED_SIM_UNITS,
+            max_exit_speed: units::HIGH_POUR_EXIT_SPEED_SIM_UNITS,
             stem_length: 1.9,
         }
     }
@@ -44,6 +48,7 @@ impl Default for SpoutSettings {
 
 impl SpoutSettings {
     pub fn aim_at(&mut self, target: Vec3) {
+        self.target = target;
         let delta = Vec3::new(
             target.x - self.origin.x,
             target.y - self.origin.y,
@@ -53,6 +58,12 @@ impl SpoutSettings {
             self.direction = delta.normalized();
         }
     }
+
+    pub fn translate_origin_to(&mut self, origin: Vec3) {
+        let delta = origin - self.origin;
+        self.origin = origin;
+        self.target = self.target + delta;
+    }
 }
 
 pub(crate) struct InflowState {
@@ -60,6 +71,7 @@ pub(crate) struct InflowState {
     flow_rate: f32,
     exit_speed: f32,
     accumulator: f32,
+    emission_sequence: u32,
 }
 
 pub(crate) struct EmissionResult {
@@ -74,6 +86,7 @@ impl InflowState {
             flow_rate: 0.0,
             exit_speed: 0.0,
             accumulator: 0.0,
+            emission_sequence: 0,
         }
     }
 
@@ -95,7 +108,8 @@ impl InflowState {
 
     pub fn update(&mut self, spout: &SpoutSettings) {
         let head = effective_head_from_angle(self.kettle_angle_deg, spout);
-        self.exit_speed = exit_speed_from_head(head, spout.max_exit_speed);
+        let speed_cap = exit_speed_cap_from_angle(self.kettle_angle_deg, spout);
+        self.exit_speed = exit_speed_from_head(head, speed_cap);
         self.flow_rate = flow_rate_from_speed(
             self.exit_speed,
             spout.nozzle_radius,
@@ -162,27 +176,39 @@ impl InflowState {
         let mut affine_data: Vec<[f32; 12]> = Vec::with_capacity(count as usize);
 
         let emit_speed = self.exit_speed();
-        let vel = Vec3::new(
-            dir.x * emit_speed,
-            dir.y * emit_speed,
-            dir.z * emit_speed,
-        );
+        let vel = Vec3::new(dir.x * emit_speed, dir.y * emit_speed, dir.z * emit_speed);
 
-        // Simple disk distribution using golden angle
+        // Emit from a slightly contracted jet core rather than the full nozzle
+        // disk. This approximates the vena-contracta region just below the
+        // lip and avoids an unrealistically flared free stream when we do not
+        // model sub-nozzle cohesion.
+        let emit_origin = Vec3::new(
+            spout.origin.x + dir.x * 0.18,
+            spout.origin.y + dir.y * 0.18,
+            spout.origin.z + dir.z * 0.18,
+        );
+        let jet_radius = spout.nozzle_radius * 0.58;
+
+        // Low-discrepancy disk distribution with a persistent sample sequence
+        // so the nozzle does not replay the same few beams every frame.
         let golden_angle = 2.399_963_f32;
+        let radial_irrational = 0.754_877_7_f32;
         for i in 0..count {
-            let fi = i as f32;
-            let r = spout.nozzle_radius * (fi / count as f32).sqrt();
-            let theta = fi * golden_angle;
+            let sample = self.emission_sequence.wrapping_add(i);
+            let sf = sample as f32;
+            let radial_u = ((sf + 0.5) * radial_irrational).fract();
+            let r = jet_radius * radial_u.sqrt();
+            let theta = sf * golden_angle;
+            let emission_age = ((i as f32 + 0.5) / count as f32) * dt;
             let offset = Vec3::new(
                 t1.x * r * theta.cos() + t2.x * r * theta.sin(),
                 t1.y * r * theta.cos() + t2.y * r * theta.sin(),
                 t1.z * r * theta.cos() + t2.z * r * theta.sin(),
             );
             let pos = Vec3::new(
-                spout.origin.x + offset.x,
-                spout.origin.y + offset.y,
-                spout.origin.z + offset.z,
+                emit_origin.x + offset.x - vel.x * emission_age,
+                emit_origin.y + offset.y - vel.y * emission_age,
+                emit_origin.z + offset.z - vel.z * emission_age,
             );
 
             // Particle: pos(x,y,z,J), vel(vx,vy,vz,mass)
@@ -190,6 +216,7 @@ impl InflowState {
             // AffineC: col0(0,0,0,phase), col1(0,0,0,0), col2(0,0,0,0)
             affine_data.push([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
         }
+        self.emission_sequence = self.emission_sequence.wrapping_add(count);
 
         // Append new water particles after all existing particles (water + bed).
         // The shader uses phase (0.0=water, 1.0=bed) to distinguish particle types.
@@ -221,17 +248,32 @@ fn effective_head_from_angle(angle_deg: f32, spout: &SpoutSettings) -> f32 {
     if angle_deg >= spout.full_flow_angle_deg {
         return spout.head_at_full_angle;
     }
+    let s = pour_fraction_from_angle(angle_deg, spout);
+    spout.head_at_activation + s * (spout.head_at_full_angle - spout.head_at_activation)
+}
+
+fn exit_speed_cap_from_angle(angle_deg: f32, spout: &SpoutSettings) -> f32 {
+    let s = pour_fraction_from_angle(angle_deg, spout);
+    spout.gentle_exit_speed + s * (spout.max_exit_speed - spout.gentle_exit_speed)
+}
+
+fn pour_fraction_from_angle(angle_deg: f32, spout: &SpoutSettings) -> f32 {
+    if angle_deg <= spout.activation_angle_deg {
+        return 0.0;
+    }
+    if angle_deg >= spout.full_flow_angle_deg {
+        return 1.0;
+    }
     let t = (angle_deg - spout.activation_angle_deg)
         / (spout.full_flow_angle_deg - spout.activation_angle_deg);
-    let s = t * t * (3.0 - 2.0 * t);
-    spout.head_at_activation + s * (spout.head_at_full_angle - spout.head_at_activation)
+    t * t * (3.0 - 2.0 * t)
 }
 
 fn exit_speed_from_head(head: f32, max_exit_speed: f32) -> f32 {
     if head < 1e-6 {
         return 0.0;
     }
-    let speed = (2.0 * 10.0 * head).sqrt();
+    let speed = (2.0 * units::STANDARD_GRAVITY_M_S2 * units::SIM_UNITS_PER_METER * head).sqrt();
     speed.min(max_exit_speed)
 }
 
@@ -293,18 +335,32 @@ mod tests {
     }
 
     #[test]
+    fn exit_speed_cap_tracks_pour_angle() {
+        let spout = SpoutSettings::default();
+        let barely_open = exit_speed_cap_from_angle(9.0, &spout);
+        let medium = exit_speed_cap_from_angle(36.0, &spout);
+        let full = exit_speed_cap_from_angle(spout.full_flow_angle_deg, &spout);
+
+        assert!(barely_open >= spout.gentle_exit_speed);
+        assert!(barely_open <= spout.gentle_exit_speed * 1.01);
+        assert!(medium > barely_open);
+        assert!(full > medium);
+        assert!((full - spout.max_exit_speed).abs() < 1e-6);
+    }
+
+    #[test]
     fn flow_rate_from_speed_is_monotonic_and_capped() {
         let nozzle_radius = SpoutSettings::default().nozzle_radius;
-        let low = flow_rate_from_speed(4.0, nozzle_radius, 0.92, 5.4, 11.5);
-        let mid = flow_rate_from_speed(10.0, nozzle_radius, 0.92, 5.4, 11.5);
-        let high = flow_rate_from_speed(40.0, nozzle_radius, 0.92, 5.4, 11.5);
+        let low = flow_rate_from_speed(4.0, nozzle_radius, 0.92, 5.4, 4.0);
+        let mid = flow_rate_from_speed(10.0, nozzle_radius, 0.92, 5.4, 4.0);
+        let high = flow_rate_from_speed(40.0, nozzle_radius, 0.92, 5.4, 4.0);
 
         assert!(low > 0.0);
         assert!(mid > low);
         assert!(high >= mid);
-        assert!(high <= 11.5);
+        assert!(high <= 4.0);
         assert_eq!(
-            flow_rate_from_speed(0.0, nozzle_radius, 0.92, 5.4, 11.5),
+            flow_rate_from_speed(0.0, nozzle_radius, 0.92, 5.4, 4.0),
             0.0
         );
     }
@@ -319,5 +375,25 @@ mod tests {
         assert!(inflow.flow_rate() > 0.0);
         assert!(inflow.exit_speed() <= spout.max_exit_speed);
         assert!(inflow.flow_rate() <= spout.max_flow_rate_ml_s);
+    }
+
+    #[test]
+    fn translating_spout_preserves_jet_direction() {
+        let mut spout = SpoutSettings::default();
+        spout.aim_at(Vec3::new(0.0, 0.4, 0.0));
+        let before_origin = spout.origin;
+        let before_target = spout.target;
+        let before_direction = spout.direction;
+
+        let new_origin = before_origin + Vec3::new(-0.3, 0.0, 0.0);
+        spout.translate_origin_to(new_origin);
+
+        let target_delta = spout.target - before_target;
+        assert!((target_delta.x + 0.3).abs() < 1e-5);
+        assert!(target_delta.y.abs() < 1e-5);
+        assert!(target_delta.z.abs() < 1e-5);
+        assert!((spout.direction.x - before_direction.x).abs() < 1e-5);
+        assert!((spout.direction.y - before_direction.y).abs() < 1e-5);
+        assert!((spout.direction.z - before_direction.z).abs() < 1e-5);
     }
 }

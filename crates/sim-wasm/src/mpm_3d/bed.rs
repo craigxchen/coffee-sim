@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use coffee_sim_core::sph::Vec3;
 
-use super::FilterConfig;
+use super::{brew_config::DEFAULT_BREW, FilterConfig};
 
 #[derive(Clone)]
 pub(crate) struct BedConfig {
@@ -21,16 +21,17 @@ impl Default for BedConfig {
     fn default() -> Self {
         Self {
             // Keep the default bed comfortably inside the V60 cone:
-            // absolute y range ~= [-2.6, 0.1], with radii that stay inset from
-            // the dripper wall all the way down to the outlet.
+            // absolute y range ~= [-3.05, 0.1], with a small finite plug near
+            // the apex. The bottom is intentionally not a zero-radius point:
+            // the bed is a pre-settled granular scaffold, not free-falling sand.
             center: Vec3::new(0.0, -0.35, 0.0),
             top_y: 0.45,
-            bot_y: -2.25,
+            bot_y: -2.70,
             top_radius: 2.65,
-            bot_radius: 0.95,
-            num_particles: 12_000,
-            initial_porosity: 0.4,
-            initial_permeability: 1.0,
+            bot_radius: 0.18,
+            num_particles: DEFAULT_BREW.bed_particle_samples,
+            initial_porosity: DEFAULT_BREW.bed_porosity,
+            initial_permeability: DEFAULT_BREW.bed_permeability_m2(),
             extractable_mass: 0.15,
         }
     }
@@ -70,13 +71,11 @@ impl BedConfig {
             filter.opening_radius() + 0.8,
             filter.top_radius - filter.thickness - 0.1,
         );
-        bed.top_radius =
-            (filter.inner_radius_at_y(top_local) - 0.18).clamp(top_r_min, top_r_max);
+        bed.top_radius = (filter.inner_radius_at_y(top_local) - 0.18).clamp(top_r_min, top_r_max);
 
         let (bot_r_min, bot_r_max) =
-            order_bounds(filter.opening_radius() + 0.32, bed.top_radius - 0.25);
-        bed.bot_radius =
-            (filter.inner_radius_at_y(bot_local) - 0.12).clamp(bot_r_min, bot_r_max);
+            order_bounds(filter.opening_radius() + 0.14, bed.top_radius - 0.25);
+        bed.bot_radius = (filter.inner_radius_at_y(bot_local) - 0.12).clamp(bot_r_min, bot_r_max);
 
         bed
     }
@@ -124,9 +123,7 @@ pub(crate) fn init_bed_particles(
 
     let avg_radius = (config.top_radius + config.bot_radius) * 0.5;
     let volume = std::f32::consts::PI * avg_radius * avg_radius * height / 3.0
-        * (1.0
-            + config.bot_radius / avg_radius
-            + (config.bot_radius / avg_radius).powi(2));
+        * (1.0 + config.bot_radius / avg_radius + (config.bot_radius / avg_radius).powi(2));
     let spacing = (volume / config.num_particles.max(1) as f32).cbrt();
 
     let nx = ((config.top_radius * 2.0) / spacing).ceil() as i32;
@@ -137,10 +134,11 @@ pub(crate) fn init_bed_particles(
     let mut affines = Vec::new();
     let mut bed_extracts = Vec::new();
     let mut lattice_to_particle = HashMap::new();
+    let mut particle_keys = Vec::new();
 
     for iy in 0..ny {
-        let y = config.center.y + config.bot_y + (iy as f32 + 0.5) * spacing;
-        let t = (y - (config.center.y + config.bot_y)) / height;
+        let base_y = config.center.y + config.bot_y + (iy as f32 + 0.5) * spacing;
+        let t = (base_y - (config.center.y + config.bot_y)) / height;
         let max_r = config.bot_radius + (config.top_radius - config.bot_radius) * t;
 
         for ix in 0..nx {
@@ -155,8 +153,17 @@ pub(crate) fn init_bed_particles(
                     continue;
                 }
 
+                // Round the finite bottom plug so the seated bed does not
+                // render as an obvious planar cutoff near the filter apex.
+                let cap_t = (t / 0.16).clamp(0.0, 1.0);
+                let radial_t = if max_r > 1e-6 { r / max_r } else { 0.0 };
+                let edge_lift = spacing * 0.75 * (1.0 - cap_t).powi(2) * radial_t.powi(2);
+                let y = base_y + edge_lift;
+
                 let particle_index = particles.len() as i32;
-                lattice_to_particle.insert(LatticeKey { ix, iy, iz }, particle_index);
+                let key = LatticeKey { ix, iy, iz };
+                lattice_to_particle.insert(key, particle_index);
+                particle_keys.push(key);
 
                 // Particle: pos(x,y,z,J=1), vel(0,0,0,mass=1)
                 particles.push([x, y, z, 1.0, 0.0, 0.0, 0.0, 1.0]);
@@ -180,10 +187,26 @@ pub(crate) fn init_bed_particles(
 
     let target_n = config.num_particles as usize;
     if particles.len() > target_n {
-        particles.truncate(target_n);
-        affines.truncate(target_n);
-        bed_extracts.truncate(target_n);
-        lattice_to_particle.retain(|_, idx| (*idx as usize) < target_n);
+        let source_len = particles.len();
+        let mut sampled_particles = Vec::with_capacity(target_n);
+        let mut sampled_affines = Vec::with_capacity(target_n);
+        let mut sampled_bed_extracts = Vec::with_capacity(target_n);
+        let mut sampled_lookup = HashMap::new();
+
+        for out_idx in 0..target_n {
+            let src_idx = (((out_idx as f32 + 0.5) * source_len as f32) / target_n as f32)
+                .floor()
+                .min((source_len - 1) as f32) as usize;
+            sampled_particles.push(particles[src_idx]);
+            sampled_affines.push(affines[src_idx]);
+            sampled_bed_extracts.push(bed_extracts[src_idx]);
+            sampled_lookup.insert(particle_keys[src_idx], out_idx as i32);
+        }
+
+        particles = sampled_particles;
+        affines = sampled_affines;
+        bed_extracts = sampled_bed_extracts;
+        lattice_to_particle = sampled_lookup;
     }
 
     let cell_lookup = build_cell_lookup(
@@ -232,7 +255,11 @@ fn build_cell_lookup(
 ) -> Vec<i32> {
     let [gx, gy, gz] = grid_dims;
     let mut lookup = vec![-1; (gx * gy * gz) as usize];
-    let grid_origin = Vec3::new(-bounds_size.x * 0.5, -bounds_size.y * 0.5, -bounds_size.z * 0.5);
+    let grid_origin = Vec3::new(
+        -bounds_size.x * 0.5,
+        -bounds_size.y * 0.5,
+        -bounds_size.z * 0.5,
+    );
     let dx = bounds_size.x / gx as f32;
     let height = config.top_y - config.bot_y;
     let bed_bottom = config.center.y + config.bot_y;
@@ -259,8 +286,10 @@ fn build_cell_lookup(
                 }
 
                 let iy_guess = (((pos.y - bed_bottom) / spacing) - 0.5).round() as i32;
-                let ix_guess = (((pos.x - (config.center.x - max_r)) / spacing) - 0.5).round() as i32;
-                let iz_guess = (((pos.z - (config.center.z - max_r)) / spacing) - 0.5).round() as i32;
+                let ix_guess =
+                    (((pos.x - (config.center.x - max_r)) / spacing) - 0.5).round() as i32;
+                let iz_guess =
+                    (((pos.z - (config.center.z - max_r)) / spacing) - 0.5).round() as i32;
 
                 let mut best = -1;
                 let mut best_dist2 = f32::INFINITY;
@@ -277,7 +306,8 @@ fn build_cell_lookup(
                             };
                             let py = bed_bottom + (key.iy as f32 + 0.5) * spacing;
                             let py_t = ((py - bed_bottom) / height).clamp(0.0, 1.0);
-                            let py_r = config.bot_radius + (config.top_radius - config.bot_radius) * py_t;
+                            let py_r =
+                                config.bot_radius + (config.top_radius - config.bot_radius) * py_t;
                             let px = config.center.x - py_r + (key.ix as f32 + 0.5) * spacing;
                             let pz = config.center.z - py_r + (key.iz as f32 + 0.5) * spacing;
                             let ddx = pos.x - px;
@@ -334,6 +364,71 @@ mod tests {
         assert_eq!(init.particles.len(), init.affines.len());
         assert_eq!(init.particles.len(), init.bed_extracts.len());
         assert_eq!(init.particles.len(), init.bed_support_count.len());
+    }
+
+    #[test]
+    fn downsampled_bed_spans_configured_height() {
+        let cfg = BedConfig::default();
+        let init = init_bed_particles(&cfg, [32, 32, 32], Vec3::new(14.0, 20.0, 14.0));
+        let y_min = init
+            .particles
+            .iter()
+            .map(|p| p[1])
+            .fold(f32::INFINITY, f32::min);
+        let y_max = init
+            .particles
+            .iter()
+            .map(|p| p[1])
+            .fold(f32::NEG_INFINITY, f32::max);
+
+        let expected_bottom = cfg.center.y + cfg.bot_y;
+        let expected_top = cfg.center.y + cfg.top_y;
+        assert!(
+            y_min <= expected_bottom + 0.2,
+            "downsampled bed lost its lower region: y_min={y_min} expected_bottom={expected_bottom}",
+        );
+        assert!(
+            y_max >= expected_top - 0.2,
+            "downsampled bed lost its upper region: y_max={y_max} expected_top={expected_top}",
+        );
+    }
+
+    #[test]
+    fn seated_bed_bottom_is_rounded_not_planar() {
+        let filter = FilterConfig::default();
+        let cfg = BedConfig::seated_in_filter(&filter);
+        let init = init_bed_particles(&cfg, [64, 64, 64], Vec3::new(14.0, 20.0, 14.0));
+
+        let bottom = cfg.center.y + cfg.bot_y;
+        let lower_band = 0.45;
+        let mut center_y_sum = 0.0_f32;
+        let mut center_count = 0_u32;
+        let mut edge_y_sum = 0.0_f32;
+        let mut edge_count = 0_u32;
+
+        for p in &init.particles {
+            let y = p[1];
+            if y > bottom + lower_band {
+                continue;
+            }
+            let r = (p[0] * p[0] + p[2] * p[2]).sqrt();
+            if r < cfg.bot_radius * 0.45 {
+                center_y_sum += y;
+                center_count += 1;
+            } else if r > cfg.bot_radius * 0.80 {
+                edge_y_sum += y;
+                edge_count += 1;
+            }
+        }
+
+        assert!(center_count > 0, "expected lower-center bed particles");
+        assert!(edge_count > 0, "expected lower-edge bed particles");
+        let center_mean_y = center_y_sum / center_count as f32;
+        let edge_mean_y = edge_y_sum / edge_count as f32;
+        assert!(
+            edge_mean_y > center_mean_y + 0.03,
+            "bottom plug should taper upward at the edge, not form a flat disk: center={center_mean_y} edge={edge_mean_y}",
+        );
     }
 
     #[test]
@@ -408,6 +503,11 @@ mod tests {
         assert!(bed.top_radius < filter.inner_radius_at_y(bed_top_local));
         assert!(bed.bot_radius < filter.inner_radius_at_y(bed_bot_local));
         assert!(bot_abs > filter_bot_abs);
+        assert!(
+            bot_abs - filter_bot_abs >= bed.bot_radius * 0.65,
+            "bed bottom should stay a finite plug above the apex: bed={bot_abs}, filter={filter_bot_abs}, radius={}",
+            bed.bot_radius
+        );
         assert!(top_abs < filter_top_abs);
     }
 

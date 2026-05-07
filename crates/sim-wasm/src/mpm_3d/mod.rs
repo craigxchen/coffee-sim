@@ -4,6 +4,7 @@ use coffee_sim_core::sph::Vec3;
 use wasm_bindgen::prelude::JsValue;
 
 pub(crate) mod bed;
+mod brew_config;
 mod filter;
 mod filter_mesh;
 pub(crate) mod inflow;
@@ -12,12 +13,14 @@ mod physics_tests;
 mod pipelines;
 mod shader;
 mod state;
+mod units;
 
 pub(crate) use filter::FilterConfig;
 #[cfg(target_arch = "wasm32")]
 pub(crate) use filter_mesh::{MAX_FILL_VERTEX_COUNT, MAX_RENDER_VERTEX_COUNT};
 
 use bed::{BedConfig, BedInit};
+use brew_config::DEFAULT_BREW;
 use filter_mesh::FilterMesh;
 use inflow::{EmissionResult, InflowState, SpoutSettings, MASS_UNITS_PER_ML};
 use pipelines::MpmPipelines;
@@ -26,7 +29,8 @@ use state::{
     METRICS_SLOT_COUNT, NUM_THREADS, SDF_RES,
 };
 
-const TARGET_BED_RETENTION_ML: f32 = 42.0;
+const TARGET_BED_RETENTION_ML: f32 = DEFAULT_BREW.target_bed_retention_ml;
+pub(crate) const OBSTACLE_WALL_THICKNESS: f32 = 0.4;
 
 /// Device limits required by the MPM compute pipeline.
 ///
@@ -116,21 +120,15 @@ impl MpmSettings {
             bounds_size,
             grid_dims,
             max_particles: 220_000,
-            substeps: 5,
-            gravity: -10.0,
+            substeps: 10,
+            gravity: units::EARTH_GRAVITY_SIM_UNITS,
             bulk_modulus: 900.0,
-            viscosity: 0.12,
+            viscosity: DEFAULT_BREW.water_viscosity,
             render_radius: dx * 0.7,
-            pressure_rbgs_pairs: 20,
+            pressure_rbgs_pairs: 40,
             use_sdf_cache: true,
             obstacles: vec![
-                Obstacle::TruncatedCone {
-                    center: Vec3::ZERO,
-                    top_radius: 4.5,
-                    bot_radius: 0.8,
-                    top_y: 3.0,
-                    bot_y: -3.0,
-                },
+                v60_support_cone(&filter),
                 Obstacle::Cylinder {
                     center: Vec3::ZERO,
                     radius: 3.0,
@@ -139,7 +137,7 @@ impl MpmSettings {
                 },
             ],
             spout: SpoutSettings::default(),
-            initial_kettle_angle_deg: 36.0,
+            initial_kettle_angle_deg: DEFAULT_BREW.initial_kettle_angle_deg,
             filter: Some(filter),
             bed: Some(bed),
         }
@@ -150,7 +148,7 @@ impl MpmSettings {
         settings.bed = None;
         settings.spout.origin = Vec3::new(0.0, 6.8, 0.0);
         settings.spout.aim_at(Vec3::new(0.0, -6.8, 0.0));
-        settings.initial_kettle_angle_deg = 28.0;
+        settings.initial_kettle_angle_deg = DEFAULT_BREW.initial_kettle_angle_deg;
         settings
     }
 
@@ -158,8 +156,24 @@ impl MpmSettings {
         let mut settings = Self::default_v60();
         settings.spout.origin = Vec3::new(0.0, 7.1, 0.0);
         settings.spout.aim_at(Vec3::new(0.0, 0.4, 0.0));
-        settings.initial_kettle_angle_deg = 36.0;
+        settings.initial_kettle_angle_deg = DEFAULT_BREW.initial_kettle_angle_deg;
         settings
+    }
+}
+
+fn v60_support_cone(filter: &FilterConfig) -> Obstacle {
+    let top_y = 3.0;
+    let bot_y = -3.0;
+    let filter_height = (filter.top_y - filter.bot_y).max(1e-6);
+    let filter_slope = (filter.top_radius - filter.bot_radius) / filter_height;
+    let bot_radius = DEFAULT_BREW.dripper_outlet_radius;
+
+    Obstacle::TruncatedCone {
+        center: Vec3::ZERO,
+        top_radius: bot_radius + filter_slope * (top_y - bot_y),
+        bot_radius,
+        top_y,
+        bot_y,
     }
 }
 
@@ -248,7 +262,8 @@ impl MpmSim3D {
             0,
             bytemuck::cast_slice(&padded_support),
         );
-        let zero_delta = vec![0_i32; self.settings.max_particles as usize];
+        // Match the shader's four-lane bed_delta layout: water plus impulse xyz.
+        let zero_delta = vec![0_i32; self.settings.max_particles as usize * 4];
         queue.write_buffer(
             &self.buffers.bed_delta,
             0,
@@ -335,7 +350,16 @@ impl MpmSim3D {
                 pass.set_pipeline(&self.pipelines.grid_update);
                 pass.dispatch_workgroups(cell_wg, 1, 1);
 
-                // 4. boundary_project
+                // 4. viscosity diffusion. This uses grid momentum lanes as
+                // temporary FP-encoded velocity scratch after `grid_update`
+                // has consumed them and before `classify_cells` repurposes
+                // those lanes for pressure/divergence/kind scratch.
+                pass.set_pipeline(&self.pipelines.viscosity_prepare);
+                pass.dispatch_workgroups(cell_wg, 1, 1);
+                pass.set_pipeline(&self.pipelines.viscosity_apply);
+                pass.dispatch_workgroups(cell_wg, 1, 1);
+
+                // 5. boundary_project
                 pass.set_pipeline(&self.pipelines.boundary_project);
                 pass.dispatch_workgroups(cell_wg, 1, 1);
 
@@ -356,33 +380,32 @@ impl MpmSim3D {
                 pass.set_pipeline(&self.pipelines.boundary_project);
                 pass.dispatch_workgroups(cell_wg, 1, 1);
 
-                // 5. g2p
+                // 6. g2p
                 if particle_wg > 0 {
                     pass.set_pipeline(&self.pipelines.g2p);
                     pass.dispatch_workgroups(particle_wg, 1, 1);
                 }
 
-                // 6. bed_coupling (after g2p so absorption uses projected
-                //    velocities and the sink term in classify_cells can
-                //    predict absorption for the pressure solve)
+                // 7. bed_coupling (after g2p so absorption uses projected
+                //    velocities and remains the sole bed storage transfer)
                 if particle_wg > 0 {
                     pass.set_pipeline(&self.pipelines.bed_coupling);
                     pass.dispatch_workgroups(particle_wg, 1, 1);
                 }
 
-                // 7. extraction_advect (consumes bed_delta from bed_coupling)
+                // 8. extraction_advect (consumes bed water delta from bed_coupling)
                 if bed_wg > 0 {
                     pass.set_pipeline(&self.pipelines.extraction_advect);
                     pass.dispatch_workgroups(bed_wg, 1, 1);
                 }
 
-                // 8. bed_dynamics
+                // 9. bed_dynamics
                 if bed_wg > 0 {
                     pass.set_pipeline(&self.pipelines.bed_dynamics);
                     pass.dispatch_workgroups(bed_wg, 1, 1);
                 }
 
-                // 9. prepare_render
+                // 10. prepare_render
                 if particle_wg > 0 {
                     pass.set_pipeline(&self.pipelines.prepare_render);
                     pass.dispatch_workgroups(particle_wg, 1, 1);
@@ -400,24 +423,10 @@ impl MpmSim3D {
         // `refresh_metrics` itself, which keeps the staging buffer idle
         // between snapshot requests.
 
-        // The filter mesh is a CPU-side cloth scaffold with no fluid coupling,
-        // so stepping it once per frame at the full `dt` is enough — there is
-        // no benefit to running it per-substep and it would otherwise scale
-        // CPU cost linearly with `substeps`.
-        if let Some(mesh) = &mut self.filter_mesh {
-            let bed_factor = if self.num_bed > 0 {
-                (self.num_bed as f32 / 12_000.0).clamp(0.0, 2.0)
-            } else {
-                0.0
-            };
-            let water_factor = if self.settings.max_particles > 0 {
-                (self.num_water as f32 / self.settings.max_particles as f32).clamp(0.0, 2.0)
-            } else {
-                0.0
-            };
-            let load = (0.28 + bed_factor * 0.22 + water_factor * 0.18).clamp(0.12, 0.90);
-            mesh.step(dt, load);
-        }
+        // The current filter mesh is only a visual/support scaffold; it does
+        // not receive real forces from the solver. Keep it static after the
+        // construction-time relaxation so the bed does not chase a fictitiously
+        // moving support surface over time.
     }
 
     pub fn reset(&mut self, queue: &wgpu::Queue, _device: &wgpu::Device) {
@@ -441,7 +450,7 @@ impl MpmSim3D {
     }
 
     pub fn set_spout_position(&mut self, x: f32, y: f32, z: f32) {
-        self.settings.spout.origin = Vec3::new(x, y, z);
+        self.settings.spout.translate_origin_to(Vec3::new(x, y, z));
     }
 
     pub fn set_spout_target(&mut self, x: f32, y: f32, z: f32) {
@@ -462,6 +471,10 @@ impl MpmSim3D {
 
     pub fn exit_speed(&self) -> f32 {
         self.inflow.exit_speed()
+    }
+
+    pub fn exit_speed_m_s(&self) -> f32 {
+        units::sim_speed_to_meters_per_second(self.inflow.exit_speed())
     }
 
     pub fn particle_count(&self) -> usize {
@@ -587,7 +600,12 @@ impl MpmSim3D {
                 initial_particle_mass,
                 particle_vol,
             ],
-            fp_params: [FP_SCALE, 1.0 / FP_SCALE, MAX_VELOCITY, 0.0],
+            fp_params: [
+                FP_SCALE,
+                1.0 / FP_SCALE,
+                MAX_VELOCITY,
+                DEFAULT_BREW.dripper_outlet_radius,
+            ],
             inflow_origin: [
                 self.settings.spout.origin.x,
                 self.settings.spout.origin.y,
@@ -600,19 +618,40 @@ impl MpmSim3D {
                 self.settings.spout.direction.z,
                 self.inflow.exit_speed(),
             ],
-            inflow_params: [self.settings.spout.nozzle_radius, 0.0, 0.0, 0.0],
+            inflow_params: [
+                self.settings.spout.nozzle_radius,
+                DEFAULT_BREW.water_sample_radius_dx,
+                DEFAULT_BREW.bed_sample_radius_dx,
+                DEFAULT_BREW.filter_absorption_rate_s,
+            ],
             sdf_params: [SDF_RES as f32, 0.3, 0.0, 0.05],
             // Tie bed retention to an overall retained-water target so the bed
             // wets realistically without swallowing most of the brew.
-            bed_params: [34.0, 8.0, bed_capacity_per_particle, 1.0],
-            extraction_params: [0.01, 11.0, 8.5, 15.0],
-            time_params: [self.total_time, dt, 1.0, 0.0],
+            bed_params: [
+                DEFAULT_BREW.water_kinematic_viscosity_m2_s,
+                DEFAULT_BREW.bed_absorption_rate,
+                bed_capacity_per_particle,
+                DEFAULT_BREW.min_bed_permeability_m2,
+            ],
+            extraction_params: [
+                0.01,
+                DEFAULT_BREW.bed_compaction_rate,
+                8.5,
+                DEFAULT_BREW.bed_impact_rate,
+            ],
+            time_params: [
+                self.total_time,
+                dt,
+                DEFAULT_BREW.bed_pore_capacity_scale,
+                DEFAULT_BREW.bed_pore_overfill_alpha,
+            ],
             clamp_params: [
                 div_clamp,
                 pressure_clamp,
                 METRICS_DIV_FP_SCALE,
                 1.0 / METRICS_DIV_FP_SCALE,
             ],
+            projection_params: [32.0, 2.0, 1.20, DEFAULT_BREW.bed_surface_void_scale],
         };
 
         queue.write_buffer(
@@ -662,7 +701,15 @@ mod tests {
                 _ => None,
             })
             .expect("default scene must contain a truncated cone");
-        assert_eq!(cone, (4.5, 0.8, 3.0, -3.0));
+        let filter = FilterConfig::default();
+        let filter_slope = (filter.top_radius - filter.bot_radius) / (filter.top_y - filter.bot_y);
+        let expected_top_radius =
+            DEFAULT_BREW.dripper_outlet_radius + filter_slope * (cone.2 - cone.3);
+        assert!((cone.0 - expected_top_radius).abs() < 0.01);
+        assert!((cone.1 - DEFAULT_BREW.dripper_outlet_radius).abs() < 1e-6);
+        assert_eq!((cone.2, cone.3), (3.0, -3.0));
+        let cone_slope = (cone.0 - cone.1) / (cone.2 - cone.3);
+        assert!((cone_slope - filter_slope).abs() < 1e-5);
 
         let cup = s
             .obstacles
@@ -678,6 +725,12 @@ mod tests {
             })
             .expect("default scene must contain a cylinder");
         assert_eq!(cup, (3.0, -3.5, -8.0));
+        assert!(shader::MPM_COMPUTE_SHADER.contains("const OBSTACLE_WALL_THICKNESS: f32 = 0.4;"));
+        assert!(shader::MPM_COMPUTE_SHADER.contains("fn dripper_top_radius()"));
+        assert!(shader::MPM_COMPUTE_SHADER
+            .contains("mix(dripper_outlet_radius(), dripper_top_radius(), t)"));
+        assert!(shader::MPM_COMPUTE_SHADER.contains("fn viscosity_prepare("));
+        assert!(shader::MPM_COMPUTE_SHADER.contains("fn viscosity_apply("));
     }
 
     #[test]
@@ -688,6 +741,38 @@ mod tests {
         assert!((dx - dz).abs() < 1e-5);
         let height_covered = s.grid_dims[1] as f32 * dx;
         assert!(height_covered >= s.bounds_size.y - dx);
+    }
+
+    #[test]
+    fn default_v60_uses_slow_gooseneck_angle() {
+        let s = MpmSettings::default_v60();
+        assert!(s.initial_kettle_angle_deg <= 10.0);
+        assert!(s.spout.max_flow_rate_ml_s <= 12.0);
+
+        let mut inflow = InflowState::new(s.initial_kettle_angle_deg);
+        inflow.update(&s.spout);
+        assert!(inflow.exit_speed() * units::METERS_PER_SIM_UNIT <= 0.13);
+        assert!(s.spout.max_exit_speed * units::METERS_PER_SIM_UNIT <= 0.50);
+    }
+
+    #[test]
+    fn expanded_grid_atomic_lanes_fit_storage_binding_limit() {
+        let s = MpmSettings::default_v60();
+        let total_cells = s.grid_dims[0] as u64 * s.grid_dims[1] as u64 * s.grid_dims[2] as u64;
+        // `grid` is bound in WGSL as `array<atomic<i32>>`, not as a vecN array.
+        // Extra lanes are scalar structure-of-arrays slices addressed as
+        // `lane * total_cells + cell`, so there is no vec4 stride to preserve.
+        assert_eq!(std::mem::size_of::<i32>(), 4);
+        let proposed_grid_lanes = 6_u64;
+        let proposed_grid_bytes =
+            proposed_grid_lanes * total_cells * std::mem::size_of::<i32>() as u64;
+        let limit = required_limits().max_storage_buffer_binding_size as u64;
+
+        assert!(
+            proposed_grid_bytes <= limit,
+            "proposed {proposed_grid_lanes}-lane grid atomics buffer is {proposed_grid_bytes} \
+             bytes, exceeding max_storage_buffer_binding_size={limit}"
+        );
     }
 
     #[test]
