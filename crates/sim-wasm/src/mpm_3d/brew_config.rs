@@ -42,7 +42,7 @@ pub(crate) const DEFAULT_BREW: BrewConfig = BrewConfig {
     brew_water_ml: 250.0,
     // Medium-fine pourover grind. This feeds the bed permeability through a
     // Kozeny-Carman estimate, so finer grind lowers flow roughly with d^2.
-    grind_diameter_um: 650.0,
+    grind_diameter_um: 450.0,
     bed_porosity: 0.40,
     bed_particle_samples: 12_000,
     water_particles_per_ml: 320.0,
@@ -59,7 +59,7 @@ pub(crate) const DEFAULT_BREW: BrewConfig = BrewConfig {
     bed_absorption_rate: 1.6,
     target_bed_retention_ml: 42.0,
     bed_pore_capacity_scale: 1.0,
-    bed_pore_overfill_alpha: 10.0,
+    bed_pore_overfill_alpha: 18.0,
     bed_surface_void_scale: 1.0,
     filter_pore_capacity_scale: 1.0,
     dripper_outlet_radius: 0.42,

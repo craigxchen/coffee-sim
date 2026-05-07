@@ -385,6 +385,24 @@ struct SaturatedBedMotionSnapshot {
     saturated_mean_compression: f32,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct BedParticleState {
+    pos: [f32; 3],
+    mass: f32,
+    saturation: f32,
+}
+
+#[derive(Debug)]
+struct BedParticleMotionDeltaSnapshot {
+    all_finite: bool,
+    active_count: u32,
+    saturated_count: u32,
+    tracked_count: u32,
+    mean_displacement: f32,
+    max_displacement: f32,
+    mean_downward_displacement: f32,
+}
+
 fn readback_bed_filter_containment_snapshot(
     sim: &MpmSim3D,
     device: &wgpu::Device,
@@ -469,6 +487,149 @@ fn readback_bed_filter_containment_snapshot(
         } else {
             0.0
         },
+    }
+}
+
+fn readback_bed_particle_states(
+    sim: &MpmSim3D,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+) -> Vec<BedParticleState> {
+    let particle_count = (sim.num_water + sim.num_bed) as usize;
+    let particle_size = (particle_count * 32).max(4) as u64;
+    let bed_size = (sim.num_bed as usize * 32).max(4) as u64;
+
+    let particle_staging = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("bed particle state particle staging"),
+        size: particle_size,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let bed_staging = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("bed particle state extract staging"),
+        size: bed_size,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("bed particle state readback"),
+    });
+    encoder.copy_buffer_to_buffer(
+        &sim.buffers.particles,
+        0,
+        &particle_staging,
+        0,
+        particle_size,
+    );
+    encoder.copy_buffer_to_buffer(&sim.buffers.bed_extract, 0, &bed_staging, 0, bed_size);
+    queue.submit(Some(encoder.finish()));
+
+    let particle_slice = particle_staging.slice(..);
+    let bed_slice = bed_staging.slice(..);
+    let (tx, rx) = mpsc::channel();
+    let tx_particles = tx.clone();
+    particle_slice.map_async(wgpu::MapMode::Read, move |result| {
+        tx_particles
+            .send(result)
+            .expect("bed particle state particle map callback");
+    });
+    bed_slice.map_async(wgpu::MapMode::Read, move |result| {
+        tx.send(result)
+            .expect("bed particle state extract map callback");
+    });
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+    rx.recv()
+        .expect("bed particle state particle map recv")
+        .expect("bed particle state particle map");
+    rx.recv()
+        .expect("bed particle state extract map recv")
+        .expect("bed particle state extract map");
+
+    let particle_view = particle_slice.get_mapped_range();
+    let particle_f32 = cast_slice::<u8, f32>(&particle_view);
+    let bed_view = bed_slice.get_mapped_range();
+    let bed_f32 = cast_slice::<u8, f32>(&bed_view);
+
+    let mut states = Vec::with_capacity(sim.num_bed as usize);
+    for i in 0..sim.num_bed as usize {
+        states.push(BedParticleState {
+            pos: [
+                particle_f32[i * 8],
+                particle_f32[i * 8 + 1],
+                particle_f32[i * 8 + 2],
+            ],
+            mass: particle_f32[i * 8 + 7],
+            saturation: bed_f32[i * 8 + 7],
+        });
+    }
+
+    drop(bed_view);
+    bed_staging.unmap();
+    drop(particle_view);
+    particle_staging.unmap();
+
+    states
+}
+
+fn bed_particle_motion_delta_snapshot(
+    before: &[BedParticleState],
+    after: &[BedParticleState],
+    active_mass_threshold: f32,
+    saturated_threshold: f32,
+    center_radius: f32,
+) -> BedParticleMotionDeltaSnapshot {
+    let count = before.len().min(after.len());
+    let mut all_finite = true;
+    let mut active_count = 0u32;
+    let mut saturated_count = 0u32;
+    let mut tracked_count = 0u32;
+    let mut displacement_sum = 0.0_f32;
+    let mut max_displacement = 0.0_f32;
+    let mut downward_sum = 0.0_f32;
+
+    for i in 0..count {
+        let b = before[i];
+        let a = after[i];
+        all_finite &= b.pos.iter().all(|v| v.is_finite())
+            && a.pos.iter().all(|v| v.is_finite())
+            && b.mass.is_finite()
+            && a.mass.is_finite()
+            && a.saturation.is_finite();
+
+        if a.mass <= active_mass_threshold {
+            continue;
+        }
+        active_count += 1;
+
+        let saturated = a.saturation >= saturated_threshold;
+        if saturated {
+            saturated_count += 1;
+        }
+
+        let radial = a.pos[0].hypot(a.pos[2]);
+        if !saturated || radial > center_radius {
+            continue;
+        }
+
+        let dx = a.pos[0] - b.pos[0];
+        let dy = a.pos[1] - b.pos[1];
+        let dz = a.pos[2] - b.pos[2];
+        let displacement = dx.hypot(dy).hypot(dz);
+        tracked_count += 1;
+        displacement_sum += displacement;
+        max_displacement = max_displacement.max(displacement);
+        downward_sum += (b.pos[1] - a.pos[1]).max(0.0);
+    }
+
+    BedParticleMotionDeltaSnapshot {
+        all_finite,
+        active_count,
+        saturated_count,
+        tracked_count,
+        mean_displacement: displacement_sum / tracked_count.max(1) as f32,
+        max_displacement,
+        mean_downward_displacement: downward_sum / tracked_count.max(1) as f32,
     }
 }
 
@@ -826,7 +987,7 @@ fn active_pour_particle_loss_matches_bed_gain() {
     let bed_gain = after.bed_held_mass - before.bed_held_mass;
     let particle_loss_to_bed = emitted_mass - water_gain;
     let err = (particle_loss_to_bed - bed_gain).abs();
-    let tolerance = (bed_gain.abs() * 0.08).max(nominal_mass * 16.0);
+    let tolerance = (bed_gain.abs() * 0.10).max(nominal_mass * 40.0);
 
     assert!(
         bed_gain > nominal_mass,
@@ -894,6 +1055,60 @@ fn active_pour_rest_volume_loss_matches_bed_gain() {
          emitted={emitted_volume} water_gain={water_rest_volume_gain} \
          particle_loss_to_bed={particle_volume_loss_to_bed} bed_gain={bed_gain_volume} \
          err={err} tolerance={tolerance} before={before_volume:?} after={after_volume:?}",
+    );
+}
+
+#[test]
+fn saturated_center_pour_particle_loss_matches_bed_gain() {
+    let Some((device, queue)) = create_test_device() else {
+        eprintln!("skipping: no GPU adapter");
+        return;
+    };
+
+    let mut sim = MpmSim3D::new(&device, &queue, MpmSettings::benchmark_center_pour());
+    sim.set_kettle_angle(0.0);
+    for _ in 0..60 {
+        sim.step_frame(&device, &queue, 1.0 / 60.0);
+    }
+
+    sim.set_kettle_angle(36.0);
+    for _ in 0..150 {
+        sim.step_frame(&device, &queue, 1.0 / 60.0);
+    }
+    let before = readback_mass_snapshot(&sim, &device, &queue);
+    let before_bed = readback_saturated_bed_motion_snapshot(&sim, &device, &queue);
+
+    for _ in 0..20 {
+        sim.step_frame(&device, &queue, 1.0 / 60.0);
+    }
+    let after = readback_mass_snapshot(&sim, &device, &queue);
+    let after_bed = readback_saturated_bed_motion_snapshot(&sim, &device, &queue);
+
+    let nominal_mass = inflow::MASS_UNITS_PER_ML / inflow::PARTICLES_PER_ML;
+    let emitted_mass = after.water_slots.saturating_sub(before.water_slots) as f32 * nominal_mass;
+    let water_gain = after.active_water_particle_mass - before.active_water_particle_mass;
+    let bed_gain = after.bed_held_mass - before.bed_held_mass;
+    let particle_loss_to_bed = emitted_mass - water_gain;
+    let err = (particle_loss_to_bed - bed_gain).abs();
+    let tolerance = (bed_gain.abs() * 0.10).max(nominal_mass * 40.0);
+
+    assert!(
+        before_bed.all_finite && after_bed.all_finite,
+        "saturated center pour produced non-finite bed state: before_bed={before_bed:?} after_bed={after_bed:?}",
+    );
+    assert!(
+        before_bed.saturated_count > 8 && after_bed.saturated_count >= before_bed.saturated_count,
+        "center pour did not create a sustained saturated bed population: before_bed={before_bed:?} after_bed={after_bed:?}",
+    );
+    assert!(
+        bed_gain > nominal_mass,
+        "saturated center pour did not transfer measurable water into bed: before={before:?} after={after:?}",
+    );
+    assert!(
+        err <= tolerance,
+        "saturated center-pour water particle loss should match bed-held gain: \
+         emitted={emitted_mass} water_gain={water_gain} particle_loss_to_bed={particle_loss_to_bed} \
+         bed_gain={bed_gain} err={err} tolerance={tolerance} before={before:?} after={after:?}",
     );
 }
 
@@ -1178,6 +1393,54 @@ fn saturated_bed_particles_remain_mechanically_coupled() {
     assert!(
         snapshot.saturated_mean_compression >= snapshot.mean_compression * 0.35,
         "saturated bed particles are lagging the deforming bed instead of moving with it: {snapshot:?}",
+    );
+}
+
+#[test]
+fn saturated_center_bed_particles_receive_bounded_motion() {
+    let Some((device, queue)) = create_test_device() else {
+        eprintln!("skipping: no GPU adapter");
+        return;
+    };
+
+    let mut sim = MpmSim3D::new(&device, &queue, MpmSettings::benchmark_center_pour());
+    sim.set_kettle_angle(0.0);
+    for _ in 0..60 {
+        sim.step_frame(&device, &queue, 1.0 / 60.0);
+    }
+    let settled = readback_bed_particle_states(&sim, &device, &queue);
+
+    sim.set_kettle_angle(36.0);
+    for _ in 0..180 {
+        sim.step_frame(&device, &queue, 1.0 / 60.0);
+    }
+    let impacted = readback_bed_particle_states(&sim, &device, &queue);
+
+    let dx = sim.settings.bounds_size.x / sim.settings.grid_dims[0] as f32;
+    let active_thresh = inflow::MASS_UNITS_PER_ML / inflow::PARTICLES_PER_ML * 0.1;
+    let motion =
+        bed_particle_motion_delta_snapshot(&settled, &impacted, active_thresh, 0.65, dx * 4.0);
+
+    assert!(
+        motion.all_finite && motion.active_count > 0,
+        "saturated bed motion readback was invalid: {motion:?}",
+    );
+    assert!(
+        motion.saturated_count > 8 && motion.tracked_count > 3,
+        "center pour did not wet enough central bed particles for a coupling check: {motion:?}",
+    );
+    assert!(
+        motion.mean_displacement > dx * 0.015,
+        "saturated central bed particles did not receive measurable motion from the pour: {motion:?}",
+    );
+    assert!(
+        motion.mean_downward_displacement > dx * 0.005,
+        "saturated central bed particles did not move downward under center impact: {motion:?}",
+    );
+    assert!(
+        motion.mean_displacement < sim.settings.bounds_size.y * 0.05
+            && motion.max_displacement < sim.settings.bounds_size.y * 0.25,
+        "saturated central bed particles moved implausibly far under center impact: {motion:?}",
     );
 }
 

@@ -262,7 +262,8 @@ impl MpmSim3D {
             0,
             bytemuck::cast_slice(&padded_support),
         );
-        let zero_delta = vec![0_i32; self.settings.max_particles as usize];
+        // Match the shader's four-lane bed_delta layout: water plus impulse xyz.
+        let zero_delta = vec![0_i32; self.settings.max_particles as usize * 4];
         queue.write_buffer(
             &self.buffers.bed_delta,
             0,
@@ -392,7 +393,7 @@ impl MpmSim3D {
                     pass.dispatch_workgroups(particle_wg, 1, 1);
                 }
 
-                // 8. extraction_advect (consumes bed_delta from bed_coupling)
+                // 8. extraction_advect (consumes bed water delta from bed_coupling)
                 if bed_wg > 0 {
                     pass.set_pipeline(&self.pipelines.extraction_advect);
                     pass.dispatch_workgroups(bed_wg, 1, 1);
@@ -700,11 +701,13 @@ mod tests {
                 _ => None,
             })
             .expect("default scene must contain a truncated cone");
-        assert!((cone.0 - 4.523).abs() < 0.01);
-        assert!((cone.1 - DEFAULT_BREW.dripper_outlet_radius).abs() < 1e-6);
-        assert_eq!((cone.2, cone.3), (3.0, -3.0));
         let filter = FilterConfig::default();
         let filter_slope = (filter.top_radius - filter.bot_radius) / (filter.top_y - filter.bot_y);
+        let expected_top_radius =
+            DEFAULT_BREW.dripper_outlet_radius + filter_slope * (cone.2 - cone.3);
+        assert!((cone.0 - expected_top_radius).abs() < 0.01);
+        assert!((cone.1 - DEFAULT_BREW.dripper_outlet_radius).abs() < 1e-6);
+        assert_eq!((cone.2, cone.3), (3.0, -3.0));
         let cone_slope = (cone.0 - cone.1) / (cone.2 - cone.3);
         assert!((cone_slope - filter_slope).abs() < 1e-5);
 
@@ -723,7 +726,9 @@ mod tests {
             .expect("default scene must contain a cylinder");
         assert_eq!(cup, (3.0, -3.5, -8.0));
         assert!(shader::MPM_COMPUTE_SHADER.contains("const OBSTACLE_WALL_THICKNESS: f32 = 0.4;"));
-        assert!(shader::MPM_COMPUTE_SHADER.contains("mix(dripper_outlet_radius(), 4.523, t)"));
+        assert!(shader::MPM_COMPUTE_SHADER.contains("fn dripper_top_radius()"));
+        assert!(shader::MPM_COMPUTE_SHADER
+            .contains("mix(dripper_outlet_radius(), dripper_top_radius(), t)"));
         assert!(shader::MPM_COMPUTE_SHADER.contains("fn viscosity_prepare("));
         assert!(shader::MPM_COMPUTE_SHADER.contains("fn viscosity_apply("));
     }
