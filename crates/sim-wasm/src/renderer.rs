@@ -14,6 +14,11 @@ use crate::mpm_3d::{
 };
 
 const EPSILON: f32 = 1e-6;
+const CROSS_SECTION_ASPECT: f32 = 1.38;
+const CROSS_SECTION_MARGIN_CSS_PX: f32 = 16.0;
+const CROSS_SECTION_WORLD_CENTER_X: f32 = 0.0;
+const CROSS_SECTION_WORLD_CENTER_Y: f32 = -0.5;
+const CROSS_SECTION_WORLD_HEIGHT: f32 = 7.4;
 
 const PARTICLE_3D_SHADER: &str = r#"
 struct Particle3DUniforms {
@@ -311,6 +316,8 @@ pub(crate) struct Renderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
+    css_width: f32,
+    css_height: f32,
     particle_3d_pipeline: wgpu::RenderPipeline,
     cross_section_pipeline: wgpu::RenderPipeline,
     filter_fill_pipeline: wgpu::RenderPipeline,
@@ -774,6 +781,8 @@ impl Renderer {
             device,
             queue,
             config,
+            css_width: width as f32,
+            css_height: height as f32,
             particle_3d_pipeline,
             cross_section_pipeline,
             filter_fill_pipeline,
@@ -807,15 +816,47 @@ impl Renderer {
     }
 
     pub(crate) fn resize(&mut self, width: u32, height: u32) {
+        self.resize_with_css_size(width, height, width as f32, height as f32);
+    }
+
+    pub(crate) fn resize_with_css_size(
+        &mut self,
+        width: u32,
+        height: u32,
+        css_width: f32,
+        css_height: f32,
+    ) {
         if width == 0 || height == 0 {
             return;
         }
         self.config.width = width;
         self.config.height = height;
+        self.css_width = css_width.max(1.0);
+        self.css_height = css_height.max(1.0);
         self.surface.configure(&self.device, &self.config);
         let (depth_texture, depth_view) = create_depth_resources(&self.device, width, height);
         self.depth_texture = depth_texture;
         self.depth_view = depth_view;
+    }
+
+    fn cross_section_viewport(&self) -> Option<(f32, f32, f32, f32, f32)> {
+        let css_width = self.css_width.max(1.0);
+        let css_height = self.css_height.max(1.0);
+        let overlay_width_css = cross_section_overlay_width_css(css_width);
+        let overlay_height_css = overlay_width_css / CROSS_SECTION_ASPECT;
+        if css_width <= overlay_width_css + CROSS_SECTION_MARGIN_CSS_PX
+            || css_height <= overlay_height_css + CROSS_SECTION_MARGIN_CSS_PX
+        {
+            return None;
+        }
+
+        let scale_x = self.config.width as f32 / css_width;
+        let scale_y = self.config.height as f32 / css_height;
+        let x = (css_width - overlay_width_css - CROSS_SECTION_MARGIN_CSS_PX) * scale_x;
+        let y = CROSS_SECTION_MARGIN_CSS_PX * scale_y;
+        let width = overlay_width_css * scale_x;
+        let height = overlay_height_css * scale_y;
+        Some((x, y, width, height, width / height.max(EPSILON)))
     }
 
     pub(crate) fn render_3d(
@@ -853,8 +894,12 @@ impl Renderer {
             bytemuck::bytes_of(&particle_uniforms),
         );
 
+        let cross_section_viewport = self.cross_section_viewport();
+        let cross_section_aspect = cross_section_viewport
+            .map(|(_, _, width, height, _)| width / height.max(EPSILON))
+            .unwrap_or(CROSS_SECTION_ASPECT);
         let cross_section_uniforms = CrossSectionUniforms {
-            bounds: [-4.8, 4.8, -4.2, 3.2],
+            bounds: cross_section_world_bounds(cross_section_aspect),
             params: [0.0, 0.28, 1.0, 0.0],
         };
         self.queue.write_buffer(
@@ -992,15 +1037,12 @@ impl Renderer {
                 pass.set_vertex_buffer(1, simulation.render_buffer().slice(..));
                 pass.draw(0..6, 0..simulation.particle_count() as u32);
 
-                let overlay_margin = 16.0;
-                let overlay_width = (self.config.width as f32 * 0.28).clamp(220.0, 360.0);
-                let overlay_height = overlay_width * 0.72;
-                if self.config.width as f32 > overlay_width + overlay_margin
-                    && self.config.height as f32 > overlay_height + overlay_margin
+                if let Some((overlay_x, overlay_y, overlay_width, overlay_height, _)) =
+                    cross_section_viewport
                 {
                     pass.set_viewport(
-                        self.config.width as f32 - overlay_width - overlay_margin,
-                        overlay_margin,
+                        overlay_x,
+                        overlay_y,
                         overlay_width,
                         overlay_height,
                         0.0,
@@ -1248,6 +1290,21 @@ fn perspective(fov_y_radians: f32, aspect: f32, near: f32, far: f32) -> [[f32; 4
         [0.0, f, 0.0, 0.0],
         [0.0, 0.0, far / (near - far), -1.0],
         [0.0, 0.0, (near * far) / (near - far), 0.0],
+    ]
+}
+
+fn cross_section_overlay_width_css(container_width: f32) -> f32 {
+    (container_width * 0.24).clamp(150.0, 280.0)
+}
+
+fn cross_section_world_bounds(viewport_aspect: f32) -> [f32; 4] {
+    let half_height = CROSS_SECTION_WORLD_HEIGHT * 0.5;
+    let half_width = CROSS_SECTION_WORLD_HEIGHT * viewport_aspect * 0.5;
+    [
+        CROSS_SECTION_WORLD_CENTER_X - half_width,
+        CROSS_SECTION_WORLD_CENTER_X + half_width,
+        CROSS_SECTION_WORLD_CENTER_Y - half_height,
+        CROSS_SECTION_WORLD_CENTER_Y + half_height,
     ]
 }
 

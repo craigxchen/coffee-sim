@@ -20,17 +20,17 @@ html, body {
 
 .layout {
   display: grid;
-  grid-template-columns: 280px 1fr;
+  grid-template-columns: clamp(300px, 26vw, 400px) minmax(0, 1fr);
   height: 100vh;
 }
 
 .sidebar {
-  padding: 24px;
+  padding: clamp(16px, 1.6vw, 24px);
   background: var(--panel);
   border-right: 1px solid var(--panel-border);
   display: flex;
   flex-direction: column;
-  gap: 16px;
+  gap: 14px;
   overflow-y: auto;
 }
 
@@ -81,10 +81,145 @@ h1 {
   letter-spacing: 0.08em;
 }
 
+.slider-field output {
+  white-space: nowrap;
+}
+
 input[type="range"] {
   width: 100%;
   margin: 0;
   accent-color: var(--accent);
+}
+
+.spout-control {
+  --spout-plane-size: auto;
+  display: grid;
+  grid-template-columns: minmax(118px, 1fr) minmax(54px, 68px);
+  column-gap: clamp(18px, 5%, 30px);
+  align-items: start;
+}
+
+.spout-plane {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 1 / 1;
+  align-self: start;
+  justify-self: stretch;
+  overflow: hidden;
+  touch-action: none;
+  cursor: crosshair;
+  border-radius: 8px;
+  border: 1px solid rgba(177, 200, 194, 0.28);
+  background:
+    linear-gradient(rgba(233, 239, 230, 0.10) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(233, 239, 230, 0.10) 1px, transparent 1px),
+    radial-gradient(circle at center, rgba(217, 179, 106, 0.12), transparent 62%),
+    rgba(9, 16, 19, 0.42);
+  background-size: 25% 25%, 25% 25%, 100% 100%, 100% 100%;
+}
+
+.spout-plane:focus-visible {
+  outline: 2px solid rgba(217, 179, 106, 0.72);
+  outline-offset: 2px;
+}
+
+.spout-plane-axis {
+  position: absolute;
+  pointer-events: none;
+  background: rgba(233, 239, 230, 0.26);
+}
+
+.spout-plane-axis-x {
+  left: 0;
+  right: 0;
+  top: 50%;
+  height: 1px;
+}
+
+.spout-plane-axis-z {
+  top: 0;
+  bottom: 0;
+  left: 50%;
+  width: 1px;
+}
+
+.spout-plane-marker {
+  position: absolute;
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  transform: translate(-50%, -50%);
+  border: 2px solid var(--accent);
+  background: rgba(9, 16, 19, 0.62);
+  box-shadow:
+    0 0 0 2px rgba(9, 16, 19, 0.72),
+    0 0 0 3px rgba(233, 239, 230, 0.48),
+    0 4px 12px rgba(0, 0, 0, 0.32);
+  pointer-events: none;
+}
+
+.spout-plane-marker::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  transform: translate(-50%, -50%);
+  background: var(--accent);
+}
+
+.height-control {
+  min-width: 0;
+  min-height: 0;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  justify-items: center;
+  align-items: center;
+  gap: 12px;
+  padding-left: clamp(10px, 3%, 14px);
+  border-left: 1px solid rgba(177, 200, 194, 0.18);
+  color: var(--muted);
+  font-size: 0.70rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  height: var(--spout-plane-size);
+  align-self: start;
+  overflow: hidden;
+}
+
+.height-control span {
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  text-align: center;
+}
+
+.height-control input[type="range"] {
+  width: 28px;
+  height: 100%;
+  min-height: 0;
+  writing-mode: vertical-lr;
+  direction: rtl;
+  appearance: slider-vertical;
+  -webkit-appearance: slider-vertical;
+}
+
+.height-control output {
+  color: var(--ink);
+  font-weight: 600;
+  letter-spacing: 0;
+}
+
+@media (max-width: 760px) {
+  .spout-control {
+    grid-template-columns: minmax(112px, 1fr) 54px;
+    column-gap: 16px;
+  }
+
+  .height-control {
+    padding-left: 10px;
+  }
 }
 
 button {
@@ -148,7 +283,7 @@ canvas {
   position: absolute;
   top: 16px;
   right: 16px;
-  width: clamp(220px, 28vw, 360px);
+  width: clamp(150px, 24%, 280px);
   aspect-ratio: 1.38;
   pointer-events: none;
   border: 1px solid rgba(233, 239, 230, 0.68);
@@ -164,12 +299,15 @@ canvas {
 
 .cross-section-overlay span {
   position: absolute;
-  top: 8px;
-  left: 10px;
+  bottom: 8px;
+  left: 50%;
+  transform: translateX(-50%);
   color: rgba(233, 239, 230, 0.78);
   font-size: 0.68rem;
   letter-spacing: 0.10em;
+  text-align: center;
   text-transform: uppercase;
+  white-space: nowrap;
 }
 
 .debug-stats.hidden {
@@ -187,10 +325,13 @@ canvas {
 @media (max-width: 700px) {
   .layout {
     grid-template-columns: 1fr;
-    grid-template-rows: auto 1fr;
+    grid-template-rows: auto minmax(0, 1fr);
     height: 100vh;
   }
   .sidebar {
+    max-height: min(48vh, 360px);
+    padding: 14px;
+    gap: 10px;
     border-right: none;
     border-bottom: 1px solid var(--panel-border);
   }
