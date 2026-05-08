@@ -4,12 +4,14 @@
 Rust/WebGPU MPM solver through WebAssembly and renders a V60-style scene with
 live pour controls.
 
+![Coffee Sim center pour](docs/assets/coffee-sim-center-pour.gif)
+
 ## Quick Start
 
 Prerequisites:
 
 - Rust: <https://rustup.rs/>
-- Python 3, for a simple local file server
+- a local static file server
 - a browser with WebGPU support
 
 Clone the repo and install the WebAssembly tooling:
@@ -27,7 +29,7 @@ Build the browser bundle:
 wasm-pack build crates/sim-wasm --target web --release --out-dir www-3d/pkg
 ```
 
-Serve the app:
+Serve the app with any static file server. For example, with Python 3:
 
 ```bash
 cd crates/sim-wasm/www-3d
