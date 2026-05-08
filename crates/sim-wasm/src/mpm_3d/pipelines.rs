@@ -199,17 +199,3 @@ fn storage_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
         count: None,
     }
 }
-
-#[allow(dead_code)] // kept for future read-only bindings.
-fn read_only_storage_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
-    wgpu::BindGroupLayoutEntry {
-        binding,
-        visibility: wgpu::ShaderStages::COMPUTE,
-        ty: wgpu::BindingType::Buffer {
-            ty: wgpu::BufferBindingType::Storage { read_only: true },
-            has_dynamic_offset: false,
-            min_binding_size: None,
-        },
-        count: None,
-    }
-}

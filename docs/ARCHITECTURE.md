@@ -23,7 +23,7 @@ Authoritative runtime state:
 - grid accumulators and velocities: `grid`, `grid_vel`
 - bed auxiliary state: `bed_extract`, `bed_lookup`, `bed_delta`
 - static field state: SDF texture, cached SDF classification texture
-- filter support geometry: `filter_mesh_positions`
+- static filter support geometry: CPU `filter_mesh` render vertices
 
 Rendering is downstream of that state via `render_data`.
 
@@ -55,7 +55,7 @@ Important invariant:
   - top-level settings
   - scene presets
   - per-frame orchestration
-  - buffer upload / filter-mesh stepping / readback helpers
+  - buffer upload and readback helpers
 - `state.rs`
   - `MpmUniforms`
   - buffer allocation
@@ -75,7 +75,7 @@ Important invariant:
 - `filter.rs`
   - geometric filter configuration
 - `filter_mesh.rs`
-  - deformable filter support mesh and upload-ready vertex state
+  - static filter support mesh and upload-ready vertex state
 - `physics_tests.rs`
   - headless GPU regression tests against the MPM stack
 
@@ -92,7 +92,7 @@ Hot simulation buffers:
 Medium-frequency state:
 - `bed_extract`
 - `metrics`
-- `filter_mesh_positions`
+- filter mesh render vertices
 
 Static/cold state:
 - `sdf_texture`
