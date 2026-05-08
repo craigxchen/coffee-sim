@@ -1,4 +1,4 @@
-use coffee_sim_core::sph::Vec3;
+use coffee_sim_core::Vec3;
 
 #[derive(Clone)]
 pub(crate) struct FilterConfig {

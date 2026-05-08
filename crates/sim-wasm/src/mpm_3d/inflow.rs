@@ -1,4 +1,4 @@
-use coffee_sim_core::sph::Vec3;
+use coffee_sim_core::Vec3;
 
 use super::{brew_config::DEFAULT_BREW, state::MpmBuffers, units};
 

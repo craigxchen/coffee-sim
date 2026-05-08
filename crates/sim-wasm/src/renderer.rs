@@ -6,7 +6,7 @@ use bytemuck::{Pod, Zeroable};
 use wasm_bindgen::prelude::*;
 use web_sys::HtmlCanvasElement;
 
-use coffee_sim_core::sph::Vec3;
+use coffee_sim_core::Vec3;
 
 use crate::mpm_3d::{
     MpmSettings, MpmSim3D, Obstacle, MAX_FILL_VERTEX_COUNT, MAX_RENDER_VERTEX_COUNT,

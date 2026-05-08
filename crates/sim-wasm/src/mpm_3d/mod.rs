@@ -1,4 +1,4 @@
-use coffee_sim_core::sph::Vec3;
+use coffee_sim_core::Vec3;
 
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::JsValue;
@@ -34,11 +34,10 @@ pub(crate) const OBSTACLE_WALL_THICKNESS: f32 = 0.4;
 
 /// Device limits required by the MPM compute pipeline.
 ///
-/// The MPM bind group holds 10 storage buffers (particles, affine, grid,
+/// The MPM bind group holds 9 storage buffers (particles, affine, grid,
 /// grid_vel, render_data, bed_extract, bed_lookup, bed_delta, metrics) plus
-/// one SDF texture. The unused `bed_support_count` slot that previously
-/// occupied binding 10 has been repurposed for the metrics buffer so we stay
-/// within the 10-buffer cap that some WebGPU adapters enforce. Any
+/// one SDF texture. This stays within the 10-buffer cap that some WebGPU
+/// adapters enforce. Any
 /// `request_device` site that uses this pipeline must use these limits, and
 /// `mpm_pipelines_fit_within_required_limits` pins the invariant.
 pub(crate) fn required_limits() -> wgpu::Limits {
@@ -231,7 +230,6 @@ impl MpmSim3D {
             affines,
             bed_extracts,
             cell_lookup,
-            bed_support_count,
         } = bed::init_bed_particles(config, self.settings.grid_dims, self.settings.bounds_size);
         let count = particles.len() as u32;
         if count == 0 {
@@ -253,14 +251,6 @@ impl MpmSim3D {
             &self.buffers.bed_lookup,
             0,
             bytemuck::cast_slice(&cell_lookup),
-        );
-        let mut padded_support = vec![0_u32; self.settings.max_particles as usize];
-        let copy_len = bed_support_count.len().min(padded_support.len());
-        padded_support[..copy_len].copy_from_slice(&bed_support_count[..copy_len]);
-        queue.write_buffer(
-            &self.buffers.bed_support_count,
-            0,
-            bytemuck::cast_slice(&padded_support),
         );
         // Match the shader's four-lane bed_delta layout: water plus impulse xyz.
         let zero_delta = vec![0_i32; self.settings.max_particles as usize * 4];

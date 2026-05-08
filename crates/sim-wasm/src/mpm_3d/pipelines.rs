@@ -69,9 +69,7 @@ impl MpmPipelines {
                 storage_entry(8),
                 // 9: bed_delta
                 storage_entry(9),
-                // 10: metrics (projection residual / clamp counters) —
-                // repurposed from the unused `bed_support_count` slot to
-                // stay within the 10-storage-buffer device limit.
+                // 10: metrics (projection residual / clamp counters).
                 storage_entry(10),
                 // 11: cached cell-solid classification for classify_cells
                 wgpu::BindGroupLayoutEntry {
