@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Coffee Sim | 3D Pourover</title>
-    <link rel="stylesheet" href="./styles.css" />
+    <link rel="stylesheet" href="./styles.css?v=spout-plane-13" />
   </head>
   <body>
     <main class="layout">
@@ -21,12 +21,11 @@
         </div>
         <div class="control-panel">
           <div class="slider-field">
-            <span>Benchmark Scenes</span>
+            <span>Scenes</span>
           </div>
           <div class="controls">
-            <button id="scene-default">Default</button>
-            <button id="scene-free-stream">Free Stream</button>
             <button id="scene-center-pour">Center Pour</button>
+            <button id="scene-free-stream">Water Only</button>
           </div>
         </div>
         <div class="control-panel">
@@ -37,21 +36,32 @@
           <input id="kettle-angle" type="range" min="0" max="70" step="1" value="9" />
         </div>
         <div class="control-panel">
-          <label class="slider-field" for="spout-x">
-            <span>Spout X</span>
-            <output id="spout-x-value">0.0</output>
-          </label>
-          <input id="spout-x" type="range" min="-6.0" max="6.0" step="0.1" value="-3.4" />
-          <label class="slider-field" for="spout-y">
-            <span>Spout Y</span>
-            <output id="spout-y-value">0.0</output>
-          </label>
-          <input id="spout-y" type="range" min="5.0" max="10.0" step="0.1" value="7.3" />
-          <label class="slider-field" for="spout-z">
-            <span>Spout Z</span>
-            <output id="spout-z-value">0.0</output>
-          </label>
-          <input id="spout-z" type="range" min="-6.0" max="6.0" step="0.1" value="0.9" />
+          <div class="slider-field">
+            <span>Spout Position</span>
+            <output id="spout-plane-value">(0.0, 0.0)</output>
+          </div>
+          <div class="spout-control">
+            <div
+              id="spout-plane"
+              class="spout-plane"
+              role="slider"
+              tabindex="0"
+              aria-label="Spout X/Z position"
+              aria-valuemin="-6"
+              aria-valuemax="6"
+              aria-valuenow="0"
+              aria-valuetext="X 0.0, Z 0.0"
+            >
+              <span class="spout-plane-axis spout-plane-axis-x"></span>
+              <span class="spout-plane-axis spout-plane-axis-z"></span>
+              <span id="spout-plane-marker" class="spout-plane-marker"></span>
+            </div>
+            <label class="height-control" for="spout-height">
+              <span>Height</span>
+              <input id="spout-height" type="range" min="5.0" max="10.0" step="0.1" value="7.3" />
+              <output id="spout-height-value">7.3</output>
+            </label>
+          </div>
         </div>
         <dl class="stats">
           <div>
@@ -75,11 +85,11 @@
         <dl class="stats debug-stats hidden" id="debug-stats">
           <div>
             <dt>Scene</dt>
-            <dd id="scene-mode">Default</dd>
+            <dd id="scene-mode">Center Pour</dd>
           </div>
           <div>
             <dt>Step Mode</dt>
-            <dd id="step-mode">Real Time</dd>
+            <dd id="step-mode">Fixed 60 Hz</dd>
           </div>
           <div>
             <dt>Sim Time</dt>
@@ -146,6 +156,6 @@
         </div>
       </section>
     </main>
-    <script type="module" src="./main.js?v=volume-ml-3"></script>
+    <script type="module" src="./main.js?v=spout-plane-13"></script>
   </body>
 </html>

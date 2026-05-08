@@ -1,19 +1,17 @@
-import init, { WasmSim3D } from "./pkg/coffee_sim_wasm.js?v=volume-ml-3";
+import init, { WasmSim3D } from "./pkg/coffee_sim_wasm.js?v=spout-plane-13";
 
 const canvas = document.getElementById("sim-canvas");
 const toggleButton = document.getElementById("toggle");
 const resetButton = document.getElementById("reset");
-const sceneDefaultButton = document.getElementById("scene-default");
 const sceneFreeStreamButton = document.getElementById("scene-free-stream");
 const sceneCenterPourButton = document.getElementById("scene-center-pour");
 const kettleAngleInput = document.getElementById("kettle-angle");
 const kettleAngleValue = document.getElementById("kettle-angle-value");
-const spoutXInput = document.getElementById("spout-x");
-const spoutXValue = document.getElementById("spout-x-value");
-const spoutYInput = document.getElementById("spout-y");
-const spoutYValue = document.getElementById("spout-y-value");
-const spoutZInput = document.getElementById("spout-z");
-const spoutZValue = document.getElementById("spout-z-value");
+const spoutPlane = document.getElementById("spout-plane");
+const spoutPlaneMarker = document.getElementById("spout-plane-marker");
+const spoutPlaneValue = document.getElementById("spout-plane-value");
+const spoutHeightInput = document.getElementById("spout-height");
+const spoutHeightValue = document.getElementById("spout-height-value");
 const particleLabel = document.getElementById("particles");
 const fpsLabel = document.getElementById("fps");
 const flowRateLabel = document.getElementById("flow-rate");
@@ -53,26 +51,40 @@ let dragging = false;
 let lastClientX = 0;
 let lastClientY = 0;
 let fixedStepSeconds = null;
-let currentSceneMode = "Default";
+let currentSceneMode = "Center Pour";
 const heldKeys = new Set();
 const PAN_SPEED = 6.0;
+const SPOUT_X_MIN = -6.0;
+const SPOUT_X_MAX = 6.0;
+const SPOUT_Z_MIN = -6.0;
+const SPOUT_Z_MAX = 6.0;
+const SPOUT_STEP = 0.1;
 const PAN_CODES = new Set([
   "KeyW",
   "KeyA",
   "KeyS",
   "KeyD",
 ]);
+let spoutX = 0.0;
+let spoutZ = 0.0;
+let spoutPlaneDragging = false;
 
 await init();
 app = await WasmSim3D.create(canvas);
+app.loadBenchmarkCenterPour();
+fixedStepSeconds = 1 / 60;
 syncControlDefaultsFromSim();
 app.setKettleAngle(Number(kettleAngleInput.value));
 applySpoutControls();
 resizeCanvas();
+syncSpoutControlSize();
 syncUi();
 requestAnimationFrame(animate);
 
 window.addEventListener("resize", resizeCanvas);
+if ("ResizeObserver" in window) {
+  new ResizeObserver(syncSpoutControlSize).observe(spoutPlane);
+}
 
 toggleButton.addEventListener("click", () => {
   paused = !paused;
@@ -92,18 +104,6 @@ resetButton.addEventListener("click", () => {
   syncUi();
 });
 
-sceneDefaultButton.addEventListener("click", () => {
-  app.loadDefaultScene();
-  syncControlDefaultsFromSim();
-  applyHeuristicControls();
-  fixedStepSeconds = null;
-  currentSceneMode = "Default";
-  paused = false;
-  toggleButton.textContent = "Pause";
-  lastFrameTime = 0;
-  syncUi();
-});
-
 toggleDebugButton.addEventListener("click", () => {
   debugStats.classList.toggle("hidden");
   toggleDebugButton.textContent = debugStats.classList.contains("hidden")
@@ -116,7 +116,7 @@ sceneFreeStreamButton.addEventListener("click", () => {
   syncControlDefaultsFromSim();
   applyHeuristicControls();
   fixedStepSeconds = 1 / 60;
-  currentSceneMode = "Free Stream";
+  currentSceneMode = "Water Only";
   paused = false;
   toggleButton.textContent = "Pause";
   lastFrameTime = 0;
@@ -140,21 +140,47 @@ kettleAngleInput.addEventListener("input", () => {
   syncUi();
 });
 
-spoutXInput.addEventListener("input", () => {
+spoutHeightInput.addEventListener("input", () => {
   applySpoutControls();
   syncUi();
 });
 
-spoutYInput.addEventListener("input", () => {
-  applySpoutControls();
-  syncUi();
+spoutPlane.addEventListener("pointerdown", (e) => {
+  e.preventDefault();
+  spoutPlaneDragging = true;
+  spoutPlane.setPointerCapture(e.pointerId);
+  updateSpoutPlaneFromPointer(e);
 });
 
-spoutZInput.addEventListener("input", () => {
-  applySpoutControls();
-  syncUi();
+spoutPlane.addEventListener("pointermove", (e) => {
+  if (!spoutPlaneDragging) return;
+  updateSpoutPlaneFromPointer(e);
 });
 
+spoutPlane.addEventListener("pointerup", (e) => {
+  spoutPlaneDragging = false;
+  if (spoutPlane.hasPointerCapture(e.pointerId)) {
+    spoutPlane.releasePointerCapture(e.pointerId);
+  }
+});
+
+spoutPlane.addEventListener("pointercancel", () => {
+  spoutPlaneDragging = false;
+});
+
+spoutPlane.addEventListener("keydown", (e) => {
+  const step = e.shiftKey ? SPOUT_STEP * 5.0 : SPOUT_STEP;
+  let nextX = spoutX;
+  let nextZ = spoutZ;
+  if (e.key === "ArrowLeft") nextX -= step;
+  else if (e.key === "ArrowRight") nextX += step;
+  else if (e.key === "ArrowDown") nextZ -= step;
+  else if (e.key === "ArrowUp") nextZ += step;
+  else return;
+
+  e.preventDefault();
+  setSpoutPlaneValue(nextX, nextZ);
+});
 
 canvas.addEventListener("contextmenu", (e) => e.preventDefault());
 
@@ -204,7 +230,14 @@ function resizeCanvas() {
   const rect = canvas.getBoundingClientRect();
   canvas.width = Math.round(rect.width * dpr);
   canvas.height = Math.round(rect.height * dpr);
-  app?.resize(canvas.width, canvas.height);
+  app?.resizeWithCssSize(canvas.width, canvas.height, rect.width, rect.height);
+  syncSpoutControlSize();
+}
+
+function syncSpoutControlSize() {
+  const rect = spoutPlane.getBoundingClientRect();
+  if (rect.width <= 0) return;
+  spoutPlane.parentElement.style.setProperty("--spout-plane-size", `${rect.width}px`);
 }
 
 function animate(timestamp) {
@@ -258,28 +291,64 @@ function updateFps(frameTime) {
 
 function syncControlDefaultsFromSim() {
   kettleAngleInput.value = app.kettleAngle().toFixed(0);
-  spoutXInput.value = app.spoutX().toFixed(1);
-  spoutYInput.value = app.spoutY().toFixed(1);
-  spoutZInput.value = app.spoutZ().toFixed(1);
+  spoutX = clamp(snap(app.spoutX()), SPOUT_X_MIN, SPOUT_X_MAX);
+  spoutZ = clamp(snap(app.spoutZ()), SPOUT_Z_MIN, SPOUT_Z_MAX);
+  spoutHeightInput.value = app.spoutY().toFixed(1);
+  updateSpoutPlaneUi();
 }
 
 function applySpoutControls() {
   app.setSpoutPosition(
-    Number(spoutXInput.value),
-    Number(spoutYInput.value),
-    Number(spoutZInput.value),
+    spoutX,
+    Number(spoutHeightInput.value),
+    spoutZ,
   );
 }
 
 function applyHeuristicControls() {
 }
 
+function updateSpoutPlaneFromPointer(e) {
+  const rect = spoutPlane.getBoundingClientRect();
+  const u = clamp((e.clientX - rect.left) / rect.width, 0.0, 1.0);
+  const v = clamp((e.clientY - rect.top) / rect.height, 0.0, 1.0);
+  const nextX = SPOUT_X_MIN + u * (SPOUT_X_MAX - SPOUT_X_MIN);
+  const nextZ = SPOUT_Z_MAX - v * (SPOUT_Z_MAX - SPOUT_Z_MIN);
+  setSpoutPlaneValue(nextX, nextZ);
+}
+
+function setSpoutPlaneValue(x, z) {
+  spoutX = clamp(snap(x), SPOUT_X_MIN, SPOUT_X_MAX);
+  spoutZ = clamp(snap(z), SPOUT_Z_MIN, SPOUT_Z_MAX);
+  applySpoutControls();
+  syncUi();
+}
+
+function updateSpoutPlaneUi() {
+  const xRatio = (spoutX - SPOUT_X_MIN) / (SPOUT_X_MAX - SPOUT_X_MIN);
+  const zRatio = (spoutZ - SPOUT_Z_MIN) / (SPOUT_Z_MAX - SPOUT_Z_MIN);
+  spoutPlaneMarker.style.left = `${xRatio * 100.0}%`;
+  spoutPlaneMarker.style.top = `${(1.0 - zRatio) * 100.0}%`;
+  spoutPlaneValue.textContent = `(${spoutX.toFixed(1)}, ${spoutZ.toFixed(1)})`;
+  spoutPlane.setAttribute("aria-valuenow", spoutX.toFixed(1));
+  spoutPlane.setAttribute("aria-valuetext", `X ${spoutX.toFixed(1)}, Z ${spoutZ.toFixed(1)}`);
+}
+
+function snap(value) {
+  return Math.round(value / SPOUT_STEP) * SPOUT_STEP;
+}
+
+function clamp(value, min, max) {
+  return Math.min(Math.max(value, min), max);
+}
+
 function syncUi() {
   particleLabel.textContent = new Intl.NumberFormat().format(app.particleCount());
   kettleAngleValue.textContent = `${Math.round(app.kettleAngle())}\u00b0`;
-  spoutXValue.textContent = app.spoutX().toFixed(1);
-  spoutYValue.textContent = app.spoutY().toFixed(1);
-  spoutZValue.textContent = app.spoutZ().toFixed(1);
+  spoutX = clamp(snap(app.spoutX()), SPOUT_X_MIN, SPOUT_X_MAX);
+  spoutZ = clamp(snap(app.spoutZ()), SPOUT_Z_MIN, SPOUT_Z_MAX);
+  spoutHeightValue.textContent = app.spoutY().toFixed(1);
+  updateSpoutPlaneUi();
   flowRateLabel.textContent = `${app.flowRate().toFixed(1)} mL/s`;
   jetSpeedLabel.textContent = `${app.exitSpeedMetersPerSecond().toFixed(2)} m/s`;
   sceneModeLabel.textContent = currentSceneMode;

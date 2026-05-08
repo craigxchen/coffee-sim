@@ -127,6 +127,18 @@ impl WasmSim3D {
         self.renderer.resize(width, height);
     }
 
+    #[wasm_bindgen(js_name = resizeWithCssSize)]
+    pub fn resize_with_css_size(
+        &mut self,
+        width: u32,
+        height: u32,
+        css_width: f32,
+        css_height: f32,
+    ) {
+        self.renderer
+            .resize_with_css_size(width, height, css_width, css_height);
+    }
+
     #[wasm_bindgen(js_name = orbitCamera)]
     pub fn orbit_camera(&mut self, delta_x: f32, delta_y: f32) {
         self.camera.orbit(delta_x, delta_y);
