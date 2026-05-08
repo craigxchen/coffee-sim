@@ -157,10 +157,10 @@ fn grid_rest_volume_idx(cell: u32) -> u32 { return 4u * total_cells() + cell; }
 fn grid_current_volume_idx(cell: u32) -> u32 { return 5u * total_cells() + cell; }
 fn scratch_pressure_idx(cell: u32) -> u32 { return grid_mass_idx(cell); }
 fn scratch_div_idx(cell: u32) -> u32 { return grid_mom_x_idx(cell); }
-// Slot 2 (`grid_mom_y_idx`) is reused only as the mass/momentum accumulator
-// during `p2g`; projection no longer keeps a per-cell residual so no scratch
-// alias is defined for it. Add one back if/when an iterative residual probe
-// needs the slot during the projection pass.
+// Slot 2 (`grid_mom_y_idx`) is free after `grid_update` consumes p2g
+// momentum. It carries the temporary unilateral packing pressure before
+// viscosity reuses the momentum lanes as velocity scratch.
+fn scratch_packing_idx(cell: u32) -> u32 { return grid_mom_y_idx(cell); }
 fn scratch_kind_idx(cell: u32) -> u32 { return grid_mom_z_idx(cell); }
 // A quadratic-B-spline particle deposits at most `nominal_mass * 0.75^3 ≈
 // 0.42 * nominal_mass` to its peak cell. The threshold must stay strictly
@@ -206,6 +206,19 @@ fn pressure_store(cell: u32, value: f32) {
         atomicAdd(&metrics[METRIC_PRESSURE_CLAMP_FIRES_IDX], 1u);
     }
     atomicStore(&grid[scratch_pressure_idx(cell)], i32(clamped * fp_scale()));
+}
+
+fn packing_pressure_load(cell: u32) -> f32 {
+    return f32(atomicLoad(&grid[scratch_packing_idx(cell)])) * inv_fp_scale();
+}
+
+fn packing_pressure_store(cell: u32, value: f32) {
+    let limit = pressure_clamp_limit();
+    let clamped = clamp(value, 0.0, limit);
+    if clamped != value {
+        atomicAdd(&metrics[METRIC_PRESSURE_CLAMP_FIRES_IDX], 1u);
+    }
+    atomicStore(&grid[scratch_packing_idx(cell)], i32(clamped * fp_scale()));
 }
 
 fn pressure_or_mirror(cell: vec3<i32>, mirror_pressure: f32) -> f32 {
@@ -275,6 +288,65 @@ fn rest_volume_load(cell: u32) -> f32 {
 
 fn current_volume_load(cell: u32) -> f32 {
     return f32(atomicLoad(&grid[grid_current_volume_idx(cell)])) * inv_fp_scale();
+}
+
+fn liquid_fill_fraction(cell: u32, kind: i32) -> f32 {
+    if kind == CELL_INTERIOR_FLUID || kind == CELL_BED_COUPLED {
+        return 1.0;
+    }
+    if kind != CELL_SURFACE_FLUID {
+        return 0.0;
+    }
+
+    let cell_volume = max(dx() * dx() * dx(), 1e-8);
+    let deposited_fraction = max(rest_volume_load(cell), current_volume_load(cell)) / cell_volume;
+    return clamp(deposited_fraction, 0.0, 1.0);
+}
+
+fn pressure_face_weight(
+    self_kind: i32,
+    self_fill: f32,
+    neighbor_cell: u32,
+    neighbor_kind: i32,
+) -> f32 {
+    if is_solid_kind(neighbor_kind) {
+        return 0.0;
+    }
+    if self_kind == CELL_BED_COUPLED || neighbor_kind == CELL_BED_COUPLED {
+        return 1.0;
+    }
+    if !is_fluid_kind(neighbor_kind) {
+        return self_fill;
+    }
+
+    return min(self_fill, liquid_fill_fraction(neighbor_cell, neighbor_kind));
+}
+
+fn pressure_weighted_or_mirror(
+    cell: vec3<i32>,
+    mirror_pressure: f32,
+    self_kind: i32,
+    self_fill: f32,
+) -> f32 {
+    if cell.x < 0 || cell.y < 0 || cell.z < 0 {
+        return mirror_pressure;
+    }
+    if u32(cell.x) >= gx() || u32(cell.y) >= gy() || u32(cell.z) >= gz() {
+        return mirror_pressure;
+    }
+
+    let ci = cell_index(u32(cell.x), u32(cell.y), u32(cell.z));
+    let kind = cell_kind_load(ci);
+    if is_solid_kind(kind) {
+        return mirror_pressure;
+    }
+
+    var neighbor_pressure = 0.0;
+    if is_fluid_kind(kind) {
+        neighbor_pressure = pressure_load(ci);
+    }
+    let face_weight = pressure_face_weight(self_kind, self_fill, ci, kind);
+    return mix(mirror_pressure, neighbor_pressure, face_weight);
 }
 
 fn divergence_store(cell: u32, value: f32) {
@@ -510,11 +582,9 @@ fn sdf_class_is_solid(cell: vec3<i32>) -> bool {
 fn is_fluid_kind(kind: i32) -> bool {
     // Surface and bed-coupled cells must participate in the pressure solve so
     // hydrostatic pressure can build up in shallow puddles and water inside the
-    // bed remains part of the incompressible solve. Adjacent CELL_AIR cells
-    // provide the Dirichlet p=0 BC via the neighbor-loop sum in
-    // `pressure_update` (air neighbors count toward the denominator but
-    // contribute 0 to the numerator), so excluding surface cells here would
-    // zero them out and let gravity compress thin pools to a single layer.
+    // bed remains part of the incompressible solve. Surface/air faces are
+    // weighted by the cell's deposited liquid fraction in `pressure_update`
+    // instead of being treated as full-cell Dirichlet p=0 faces.
     return kind == CELL_INTERIOR_FLUID
         || kind == CELL_SURFACE_FLUID
         || kind == CELL_BED_COUPLED;
@@ -537,15 +607,13 @@ fn volume_projection_target_divergence(rest_volume: f32, current_volume: f32) ->
     var target_div = compressed_error * projection_j_alpha()
         - expanded_error * projection_j_expand_alpha();
 
-    // A cell can have J≈1 yet contain too much material because many particle
-    // kernels overlap there. Use rest-volume fraction as a positive expansion
-    // guard only while the cell is not already expanded; otherwise the guard
-    // fights the J correction and ratchets particles toward the high-J clamp.
-    let rest_fraction = rest_volume / max(cell_volume, 1e-8);
-    let overfill_error = max(rest_fraction - projection_max_rest_volume_fraction(), 0.0);
-    if j_cell <= 1.05 {
-        target_div = max(target_div, overfill_error * projection_j_alpha());
-    }
+    // A cell can have an acceptable per-particle J yet contain too much
+    // material because many particle kernels overlap there. Treat overpacked
+    // cells as an independent positive expansion target, including cells whose
+    // current volume is already above rest volume.
+    let packed_fraction = max(rest_volume, current_volume) / max(cell_volume, 1e-8);
+    let overpack_error = max(packed_fraction - projection_max_rest_volume_fraction(), 0.0);
+    target_div = max(target_div, overpack_error * projection_j_alpha());
 
     return target_div;
 }
@@ -1317,6 +1385,7 @@ fn pressure_update(idx: u32, target_parity: u32) {
 
     var neighbor_count = 0.0;
     var pressure_sum = 0.0;
+    let self_fill = liquid_fill_fraction(idx, kind);
     let offsets = array<vec3<i32>, 6>(
         vec3<i32>(-1, 0, 0),
         vec3<i32>(1, 0, 0),
@@ -1346,11 +1415,16 @@ fn pressure_update(idx: u32, target_parity: u32) {
             continue;
         }
 
-        neighbor_count += 1.0;
-        // Air neighbor → Dirichlet p=0, contributes 0 to pressure_sum.
-        // Fluid neighbor → contributes its pressure.
+        let face_weight = pressure_face_weight(kind, self_fill, neighbor_idx, neighbor_kind);
+        if face_weight <= 0.0 {
+            continue;
+        }
+
+        neighbor_count += face_weight;
+        // Air neighbor → weighted Dirichlet p=0, contributes 0 to
+        // pressure_sum. Fluid neighbor → weighted pressure contribution.
         if is_fluid_kind(neighbor_kind) {
-            pressure_sum += pressure_load(neighbor_idx);
+            pressure_sum += face_weight * pressure_load(neighbor_idx);
         }
     }
 
@@ -1359,7 +1433,7 @@ fn pressure_update(idx: u32, target_parity: u32) {
         return;
     }
 
-    let rhs = divergence_load(idx) / max(dt(), 1e-6);
+    let rhs = divergence_load(idx) * self_fill / max(dt(), 1e-6);
     let p_new = (pressure_sum - dx() * dx() * rhs) / neighbor_count;
     pressure_store(idx, p_new);
 }
@@ -1399,51 +1473,46 @@ fn project_pressure(@builtin(global_invocation_id) gid: vec3<u32>) {
     let ix_val = rem % gx();
 
     let p_here = pressure_load(idx);
-    var p_xm = p_here;
-    var p_xp = p_here;
-    var p_ym = p_here;
-    var p_yp = p_here;
-    var p_zm = p_here;
-    var p_zp = p_here;
-    // Skip the overwrite when the neighbor is solid so the mirror
-    // pressure (initialized to p_here) is preserved — this gives
-    // ∂p/∂n = 0 across the wall face and zero contribution to grad_p.
-    if ix_val > 0u {
-        let ci = cell_index(ix_val - 1u, iy_val, iz_val);
-        if !is_solid_kind(cell_kind_load(ci)) {
-            p_xm = pressure_load(ci);
-        }
-    }
-    if ix_val + 1u < gx() {
-        let ci = cell_index(ix_val + 1u, iy_val, iz_val);
-        if !is_solid_kind(cell_kind_load(ci)) {
-            p_xp = pressure_load(ci);
-        }
-    }
-    if iy_val > 0u {
-        let ci = cell_index(ix_val, iy_val - 1u, iz_val);
-        if !is_solid_kind(cell_kind_load(ci)) {
-            p_ym = pressure_load(ci);
-        }
-    }
-    if iy_val + 1u < gy() {
-        let ci = cell_index(ix_val, iy_val + 1u, iz_val);
-        if !is_solid_kind(cell_kind_load(ci)) {
-            p_yp = pressure_load(ci);
-        }
-    }
-    if iz_val > 0u {
-        let ci = cell_index(ix_val, iy_val, iz_val - 1u);
-        if !is_solid_kind(cell_kind_load(ci)) {
-            p_zm = pressure_load(ci);
-        }
-    }
-    if iz_val + 1u < gz() {
-        let ci = cell_index(ix_val, iy_val, iz_val + 1u);
-        if !is_solid_kind(cell_kind_load(ci)) {
-            p_zp = pressure_load(ci);
-        }
-    }
+    let self_fill = liquid_fill_fraction(idx, kind);
+    let cell = vec3<i32>(i32(ix_val), i32(iy_val), i32(iz_val));
+    // Solid/off-grid neighbors keep the mirror pressure, while air and fluid
+    // faces blend toward the neighboring pressure by the liquid face weight.
+    let p_xm = pressure_weighted_or_mirror(
+        cell + vec3<i32>(-1, 0, 0),
+        p_here,
+        kind,
+        self_fill,
+    );
+    let p_xp = pressure_weighted_or_mirror(
+        cell + vec3<i32>(1, 0, 0),
+        p_here,
+        kind,
+        self_fill,
+    );
+    let p_ym = pressure_weighted_or_mirror(
+        cell + vec3<i32>(0, -1, 0),
+        p_here,
+        kind,
+        self_fill,
+    );
+    let p_yp = pressure_weighted_or_mirror(
+        cell + vec3<i32>(0, 1, 0),
+        p_here,
+        kind,
+        self_fill,
+    );
+    let p_zm = pressure_weighted_or_mirror(
+        cell + vec3<i32>(0, 0, -1),
+        p_here,
+        kind,
+        self_fill,
+    );
+    let p_zp = pressure_weighted_or_mirror(
+        cell + vec3<i32>(0, 0, 1),
+        p_here,
+        kind,
+        self_fill,
+    );
 
     let grad_p = 0.5 * inv_dx() * vec3<f32>(
         p_xp - p_xm,
@@ -1466,6 +1535,89 @@ fn project_pressure(@builtin(global_invocation_id) gid: vec3<u32>) {
             bed_impulse_delta_add_neighborhood(bed_cell, -water_impulse * BED_REACTION_ALPHA);
         }
     }
+    let speed = length(v);
+    if speed > vel_cap() {
+        v = v * (vel_cap() / speed);
+    }
+    grid_vel[idx] = vec4<f32>(v, gv.w);
+}
+
+// ── packing pressure ──
+
+fn packing_pressure_or_mirror(cell: vec3<i32>, mirror_pressure: f32) -> f32 {
+    if cell.x < 0 || cell.y < 0 || cell.z < 0 {
+        return mirror_pressure;
+    }
+    if u32(cell.x) >= gx() || u32(cell.y) >= gy() || u32(cell.z) >= gz() {
+        return mirror_pressure;
+    }
+
+    let ci = cell_index(u32(cell.x), u32(cell.y), u32(cell.z));
+    let kind = cell_kind_load(ci);
+    if is_solid_kind(kind) {
+        return mirror_pressure;
+    }
+    if !is_fluid_kind(kind) {
+        return 0.0;
+    }
+    return packing_pressure_load(ci);
+}
+
+@compute @workgroup_size(64)
+fn packing_prepare(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if idx >= total_cells() { return; }
+
+    let kind = cell_kind_load(idx);
+    if !is_fluid_kind(kind) || kind == CELL_BED_COUPLED {
+        packing_pressure_store(idx, 0.0);
+        return;
+    }
+
+    let cell_volume = dx() * dx() * dx();
+    let packed_fraction = max(rest_volume_load(idx), current_volume_load(idx))
+        / max(cell_volume, 1e-8);
+    let packing_target = min(projection_max_rest_volume_fraction(), 1.0);
+    let overpack = max(packed_fraction - packing_target, 0.0);
+    packing_pressure_store(idx, bulk_K() * overpack);
+}
+
+@compute @workgroup_size(64)
+fn packing_apply(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if idx >= total_cells() { return; }
+
+    let gv = grid_vel[idx];
+    if gv.w <= occupancy_mass_threshold() {
+        return;
+    }
+
+    let kind = cell_kind_load(idx);
+    if !is_fluid_kind(kind) {
+        return;
+    }
+
+    let iz_val = idx / (gx() * gy());
+    let rem = idx % (gx() * gy());
+    let iy_val = rem / gx();
+    let ix_val = rem % gx();
+    let cell = vec3<i32>(i32(ix_val), i32(iy_val), i32(iz_val));
+
+    let p_here = packing_pressure_load(idx);
+    let p_xm = packing_pressure_or_mirror(cell + vec3<i32>(-1, 0, 0), p_here);
+    let p_xp = packing_pressure_or_mirror(cell + vec3<i32>(1, 0, 0), p_here);
+    let p_ym = packing_pressure_or_mirror(cell + vec3<i32>(0, -1, 0), p_here);
+    let p_yp = packing_pressure_or_mirror(cell + vec3<i32>(0, 1, 0), p_here);
+    let p_zm = packing_pressure_or_mirror(cell + vec3<i32>(0, 0, -1), p_here);
+    let p_zp = packing_pressure_or_mirror(cell + vec3<i32>(0, 0, 1), p_here);
+
+    let grad_packing = 0.5 * inv_dx() * vec3<f32>(
+        p_xp - p_xm,
+        p_yp - p_ym,
+        p_zp - p_zm,
+    );
+
+    var v = gv.xyz - dt() * grad_packing;
     let speed = length(v);
     if speed > vel_cap() {
         v = v * (vel_cap() / speed);
