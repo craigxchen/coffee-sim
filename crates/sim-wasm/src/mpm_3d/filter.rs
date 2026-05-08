@@ -36,20 +36,6 @@ impl FilterConfig {
         (self.radius_at_y(y) - self.thickness).max(self.hole_radius)
     }
 
-    #[allow(dead_code)]
-    pub fn contains_shell_point(&self, point: Vec3) -> bool {
-        if point.y < self.bot_y || point.y > self.top_y {
-            return false;
-        }
-
-        let dx = point.x - self.center.x;
-        let dz = point.z - self.center.z;
-        let r = (dx * dx + dz * dz).sqrt();
-        let outer = self.radius_at_y(point.y);
-        let inner = self.inner_radius_at_y(point.y);
-        r <= outer && r >= inner
-    }
-
     pub fn opening_radius(&self) -> f32 {
         self.hole_radius
     }
@@ -58,6 +44,19 @@ impl FilterConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn contains_shell_point(filter: &FilterConfig, point: Vec3) -> bool {
+        if point.y < filter.bot_y || point.y > filter.top_y {
+            return false;
+        }
+
+        let dx = point.x - filter.center.x;
+        let dz = point.z - filter.center.z;
+        let r = (dx * dx + dz * dz).sqrt();
+        let outer = filter.radius_at_y(point.y);
+        let inner = filter.inner_radius_at_y(point.y);
+        r <= outer && r >= inner
+    }
 
     #[test]
     fn filter_radius_decreases_toward_the_apex() {
@@ -79,15 +78,17 @@ mod tests {
         let mid_y = (filter.top_y + filter.bot_y) * 0.5;
         let outer = filter.radius_at_y(mid_y);
         let inner = filter.inner_radius_at_y(mid_y);
-        assert!(filter.contains_shell_point(Vec3::new(
-            filter.center.x + (outer + inner) * 0.5,
-            mid_y,
-            filter.center.z
-        )));
-        assert!(!filter.contains_shell_point(Vec3::new(
-            filter.center.x + outer + 0.5,
-            mid_y,
-            filter.center.z
-        )));
+        assert!(contains_shell_point(
+            &filter,
+            Vec3::new(
+                filter.center.x + (outer + inner) * 0.5,
+                mid_y,
+                filter.center.z
+            )
+        ));
+        assert!(!contains_shell_point(
+            &filter,
+            Vec3::new(filter.center.x + outer + 0.5, mid_y, filter.center.z)
+        ));
     }
 }

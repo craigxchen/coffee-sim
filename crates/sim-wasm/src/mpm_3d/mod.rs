@@ -425,10 +425,8 @@ impl MpmSim3D {
         // `refresh_metrics` itself, which keeps the staging buffer idle
         // between snapshot requests.
 
-        // The current filter mesh is only a visual/support scaffold; it does
-        // not receive real forces from the solver. Keep it static after the
-        // construction-time relaxation so the bed does not chase a fictitiously
-        // moving support surface over time.
+        // The filter mesh is static CPU render geometry, not solver state, so
+        // there is no per-frame mesh work here.
     }
 
     pub fn reset(&mut self, queue: &wgpu::Queue, _device: &wgpu::Device) {
@@ -441,8 +439,8 @@ impl MpmSim3D {
         self.total_dropped_particles = 0;
         self.latest_metrics = MetricsSnapshot::default();
         self.inflow = InflowState::new(self.settings.initial_kettle_angle_deg);
-        // Rebuild the CPU filter mesh so its deformation state does not leak
-        // across resets — the GPU solver state is wiped via `init_bed` below.
+        // Rebuild the CPU filter mesh so reset/scene changes keep render
+        // geometry aligned with the active filter config.
         self.filter_mesh = self.settings.filter.as_ref().map(FilterMesh::new);
         self.init_bed(queue);
     }
