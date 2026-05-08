@@ -1,7 +1,7 @@
 use std::mem::size_of;
 
 use bytemuck::{Pod, Zeroable};
-use coffee_sim_core::sph::Vec3;
+use coffee_sim_core::Vec3;
 
 use super::{units, MpmSettings, Obstacle, OBSTACLE_WALL_THICKNESS};
 
@@ -61,7 +61,6 @@ pub(crate) struct MpmBuffers {
     pub grid: wgpu::Buffer,
     pub grid_vel: wgpu::Buffer,
     pub bed_lookup: wgpu::Buffer,
-    pub bed_support_count: wgpu::Buffer,
     pub bed_delta: wgpu::Buffer,
     pub _sdf_texture: wgpu::Texture,
     pub sdf_view: wgpu::TextureView,
@@ -121,13 +120,6 @@ impl MpmBuffers {
         let bed_lookup = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("mpm bed lookup"),
             size: (total_cells * size_of::<i32>()) as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        let bed_support_count = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("mpm bed support count"),
-            size: (max_p * size_of::<u32>()) as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -195,7 +187,6 @@ impl MpmBuffers {
             grid,
             grid_vel,
             bed_lookup,
-            bed_support_count,
             bed_delta,
             _sdf_texture: sdf_texture,
             sdf_view,

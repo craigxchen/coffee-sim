@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use coffee_sim_core::sph::Vec3;
+use coffee_sim_core::Vec3;
 
 use super::{brew_config::DEFAULT_BREW, FilterConfig};
 
@@ -95,7 +95,6 @@ pub(crate) struct BedInit {
     pub affines: Vec<[f32; 12]>,
     pub bed_extracts: Vec<[f32; 8]>,
     pub cell_lookup: Vec<i32>,
-    pub bed_support_count: Vec<u32>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -117,7 +116,6 @@ pub(crate) fn init_bed_particles(
             affines: vec![],
             bed_extracts: vec![],
             cell_lookup: vec![-1; (grid_dims[0] * grid_dims[1] * grid_dims[2]) as usize],
-            bed_support_count: vec![],
         };
     }
 
@@ -219,28 +217,12 @@ pub(crate) fn init_bed_particles(
         grid_dims,
         bounds_size,
     );
-    let bed_support_count = build_support_counts(&cell_lookup, particles.len());
-
     BedInit {
         particles,
         affines,
         bed_extracts,
         cell_lookup,
-        bed_support_count,
     }
-}
-
-fn build_support_counts(cell_lookup: &[i32], num_particles: usize) -> Vec<u32> {
-    let mut counts = vec![0_u32; num_particles];
-    for &entry in cell_lookup {
-        if entry >= 0 {
-            let idx = entry as usize;
-            if idx < counts.len() {
-                counts[idx] += 1;
-            }
-        }
-    }
-    counts
 }
 
 fn build_cell_lookup(
@@ -352,7 +334,6 @@ mod tests {
         assert!(init.affines.is_empty());
         assert!(init.bed_extracts.is_empty());
         assert_eq!(init.cell_lookup.len(), 16 * 16 * 16);
-        assert!(init.bed_support_count.is_empty());
         assert!(init.cell_lookup.iter().all(|v| *v == -1));
     }
 
@@ -363,7 +344,6 @@ mod tests {
         assert!(init.particles.len() <= cfg.num_particles as usize);
         assert_eq!(init.particles.len(), init.affines.len());
         assert_eq!(init.particles.len(), init.bed_extracts.len());
-        assert_eq!(init.particles.len(), init.bed_support_count.len());
     }
 
     #[test]
@@ -469,19 +449,6 @@ mod tests {
         }
         let any_indexed = init.cell_lookup.iter().any(|v| *v >= 0);
         assert!(any_indexed, "expected at least one bed-occupied cell");
-    }
-
-    #[test]
-    fn bed_support_count_matches_lookup_fanout() {
-        let cfg = small_config();
-        let init = init_bed_particles(&cfg, [32, 32, 32], Vec3::new(14.0, 20.0, 14.0));
-        let mut recomputed = vec![0_u32; init.particles.len()];
-        for &entry in &init.cell_lookup {
-            if entry >= 0 {
-                recomputed[entry as usize] += 1;
-            }
-        }
-        assert_eq!(init.bed_support_count, recomputed);
     }
 
     #[test]
