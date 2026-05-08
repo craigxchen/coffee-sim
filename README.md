@@ -151,9 +151,12 @@ wasm-pack build crates/sim-wasm --target web --release --out-dir www-3d/pkg
 The fast unit lane skips GPU-backed physics tests so PR feedback does not depend
 on a slow software GPU. CI also runs a small headless GPU smoke job with Vulkan
 software drivers. Long-horizon physics diagnostics run on a nightly schedule and
-can be launched manually from Actions. These use accelerated headless stepping,
-not browser wall-clock playback. The known free-surface shape target is reported
-there as a diagnostic until the pooled-water collapse issue is fixed.
+can be launched manually from Actions. The nightly job uses a bounded
+post-pour settle horizon so it fits GitHub runner limits; manual runs can raise
+`settle_frames` to `7200` for the full local diagnostic. These use accelerated
+headless stepping, not browser wall-clock playback. The known free-surface shape
+target is reported there as a diagnostic until the pooled-water collapse issue is
+fixed.
 
 ## Documentation
 

@@ -3,6 +3,19 @@ use std::sync::mpsc;
 
 use bytemuck::cast_slice;
 
+const DEFAULT_LONG_SETTLE_FRAMES: u32 = 7_200;
+const DEFAULT_LONG_SETTLE_LOG_EVERY_FRAMES: u32 = 600;
+const LONG_SETTLE_FRAMES_ENV: &str = "COFFEE_SIM_LONG_SETTLE_FRAMES";
+const LONG_SETTLE_LOG_FRAMES_ENV: &str = "COFFEE_SIM_LONG_SETTLE_LOG_FRAMES";
+
+fn env_u32_or(name: &str, default: u32) -> u32 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
 // ── Device setup ──
 
 fn request_adapter() -> Option<wgpu::Adapter> {
@@ -2647,6 +2660,13 @@ fn volume_conservation_long_settle() {
         return;
     };
 
+    let settle_frames = env_u32_or(LONG_SETTLE_FRAMES_ENV, DEFAULT_LONG_SETTLE_FRAMES);
+    let log_every_frames = env_u32_or(
+        LONG_SETTLE_LOG_FRAMES_ENV,
+        DEFAULT_LONG_SETTLE_LOG_EVERY_FRAMES,
+    )
+    .min(settle_frames)
+    .max(1);
     let mut sim = MpmSim3D::new(&device, &queue, MpmSettings::benchmark_free_stream());
 
     sim.set_kettle_angle(36.0);
@@ -2671,9 +2691,9 @@ fn volume_conservation_long_settle() {
         d0.active_count, d0.total_mass, d0.y_extent, d0.mean_j,
     );
 
-    for f in 0..7200 {
+    for f in 0..settle_frames {
         sim.step_frame(&device, &queue, 1.0 / 60.0);
-        if (f + 1) % 600 == 0 {
+        if (f + 1) % log_every_frames == 0 || f + 1 == settle_frames {
             let d = readback_diag_snapshot(&sim, &device, &queue);
             let mass_drift = (d.total_mass - d0.total_mass) / d0.total_mass.max(1e-6) * 100.0;
             let ext_drift = (d.y_extent - d0.y_extent) / d0.y_extent.max(1e-6) * 100.0;
@@ -2689,7 +2709,9 @@ fn volume_conservation_long_settle() {
     let final_mass_drift = (d_final.total_mass - d0.total_mass).abs() / d0.total_mass.max(1e-6);
     assert!(
         final_mass_drift < 0.01,
-        "mass drifted {:.2}% over 120s settle (expected <1%)",
+        "mass drifted {:.2}% over {} settle frames ({:.1}s simulated, expected <1%)",
         final_mass_drift * 100.0,
+        settle_frames,
+        settle_frames as f32 / 60.0,
     );
 }

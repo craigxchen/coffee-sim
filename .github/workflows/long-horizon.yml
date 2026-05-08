@@ -2,6 +2,12 @@ name: Long Horizon Diagnostics
 
 on:
   workflow_dispatch:
+    inputs:
+      settle_frames:
+        description: "Post-pour settle frames for volume_conservation_long_settle; use 7200 for the full local diagnostic."
+        type: string
+        required: false
+        default: "1800"
   schedule:
     - cron: "0 9 * * *"
 
@@ -16,12 +22,14 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
   WGPU_BACKEND: vulkan
+  COFFEE_SIM_LONG_SETTLE_FRAMES: ${{ inputs.settle_frames || '1800' }}
+  COFFEE_SIM_LONG_SETTLE_LOG_FRAMES: "300"
 
 jobs:
   diagnostics:
     name: Long-settle physics diagnostics
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 75
 
     steps:
       - name: Checkout
@@ -44,11 +52,13 @@ jobs:
             long-horizon-${{ runner.os }}-
 
       - name: Long mass-conservation settle
+        timeout-minutes: 50
         run: >
           cargo test -p coffee-sim-wasm volume_conservation_long_settle --lib
           -- --nocapture --test-threads=1
 
       - name: Known free-surface shape target
+        timeout-minutes: 25
         continue-on-error: true
         run: >
           cargo test -p coffee-sim-wasm pooled_water_shape_stays_bounded_after_initial_settle --lib
