@@ -4,27 +4,32 @@
 [![Long Horizon Diagnostics](https://github.com/craigxchen/coffee-sim/actions/workflows/long-horizon.yml/badge.svg)](https://github.com/craigxchen/coffee-sim/actions/workflows/long-horizon.yml)
 
 `coffee-sim` is a browser-first pour-over coffee simulator written in Rust.
-The active product is the WebGPU-powered 3D MPM demo in
+The primary product surface is the WebGPU-powered 3D MPM demo in
 [`crates/sim-wasm/www-3d`](crates/sim-wasm/www-3d).
 
 ## Current State
 
 The current mainline architecture is:
-- an MLS-MPM-style free-water solver running on WebGPU
-- a coffee-bed material layer coupled on the same simulation grid
-- a V60 + filter + carafe browser scene with live controls and debug stats
+- an MLS-MPM-style water solver running on WebGPU
+- coffee-bed particles coupled through the same simulation grid
+- a V60 + filter + carafe browser scene with live controls, debug stats, and
+  cross-section diagnostics
 
-What is implemented today:
+Implemented today:
 - browser-native WASM app with `wgpu` and `wasm-bindgen`
-- pressure-projected water solver under [`mpm_3d`](crates/sim-wasm/src/mpm_3d)
+- pressure-projected water under [`mpm_3d`](crates/sim-wasm/src/mpm_3d),
+  including fractional free-surface pressure support and grid packing pressure
+- finite coffee-bed pore capacity with Darcy/Brinkman resistance, saturation,
+  compaction feedback, and suspended-ground support
 - kettle-driven inflow with adjustable angle and spout placement
-- filter collision scaffold and bed coupling groundwork
-- headless GPU physics tests for regression coverage
+- filter/dripper collision geometry and headless GPU physics regression tests
 
-What is still in progress:
+Still in progress:
 - more realistic free-flight jet cohesion
-- more physical bed deformation, compaction, and drawdown
-- richer filter / drainage / extraction behavior
+- stronger wet-ground advection and grind-size distribution
+- richer paper-filter drainage, clogging, and extraction behavior
+- long-time free-surface fidelity and performance under very large particle
+  counts
 
 ## Repository Layout
 
@@ -58,7 +63,9 @@ coffee-sim/
 
 Prerequisites:
 - Rust toolchain via `rustup`
-- `wasm-pack`
+- the Rust WebAssembly target:
+  `rustup target add wasm32-unknown-unknown`
+- `wasm-pack`: `cargo install wasm-pack --locked`
 - a browser with WebGPU enabled
 
 Build the WASM bundle:
@@ -93,20 +100,40 @@ The main simulation entrypoints are:
 - [`state.rs`](crates/sim-wasm/src/mpm_3d/state.rs): buffers, uniforms, and static field generation
 - [`shader.rs`](crates/sim-wasm/src/mpm_3d/shader.rs): WGSL simulation passes
 
-Useful checks:
+Fast local checks:
 
 ```bash
+cargo fmt --check
+cargo clippy -p coffee-sim-wasm -- -D warnings
+COFFEE_SIM_SKIP_GPU_TESTS=1 cargo test -p coffee-sim-wasm --lib
+```
+
+WASM target check:
+
+```bash
+cargo check -p coffee-sim-wasm --target wasm32-unknown-unknown
+```
+
+Focused GPU smoke checks:
+
+```bash
+cargo test -p coffee-sim-wasm mpm_3d::shader::tests::shader_parses_with_naga --lib
+cargo test -p coffee-sim-wasm water_mass_stable_after_pour_off --lib -- --test-threads=1
+```
+
+Full landing gate:
+
+```bash
+cargo fmt --check
+cargo clippy -p coffee-sim-wasm -- -D warnings
 cargo test -p coffee-sim-wasm --lib
 cargo check -p coffee-sim-wasm --target wasm32-unknown-unknown
 wasm-pack build crates/sim-wasm --target web --release --out-dir www-3d/pkg
 ```
 
-Before landing a meaningful branch, also run:
-
-```bash
-cargo fmt --check
-cargo clippy -p coffee-sim-wasm -- -D warnings
-```
+The full `cargo test -p coffee-sim-wasm --lib` path includes headless GPU
+physics regressions and can be slow. Use the fast local checks while iterating,
+then run the full gate before landing meaningful solver changes.
 
 ## Continuous Integration
 
@@ -116,17 +143,17 @@ requests:
 ```bash
 cargo fmt --check
 cargo clippy -p coffee-sim-wasm -- -D warnings
-cargo test -p coffee-sim-wasm --lib
+COFFEE_SIM_SKIP_GPU_TESTS=1 cargo test -p coffee-sim-wasm --lib
 cargo check -p coffee-sim-wasm --target wasm32-unknown-unknown
 wasm-pack build crates/sim-wasm --target web --release --out-dir www-3d/pkg
 ```
 
-The fast unit lane sets `COFFEE_SIM_SKIP_GPU_TESTS=1` so PR feedback does not
-depend on a slow software GPU. CI also runs a small headless GPU smoke test.
-Long-horizon physics diagnostics run on a nightly schedule and can be launched
-manually from Actions. These use accelerated headless stepping, not browser
-wall-clock playback. The known free-surface shape target is reported there as a
-diagnostic until the pooled-water collapse issue is fixed.
+The fast unit lane skips GPU-backed physics tests so PR feedback does not depend
+on a slow software GPU. CI also runs a small headless GPU smoke job with Vulkan
+software drivers. Long-horizon physics diagnostics run on a nightly schedule and
+can be launched manually from Actions. These use accelerated headless stepping,
+not browser wall-clock playback. The known free-surface shape target is reported
+there as a diagnostic until the pooled-water collapse issue is fixed.
 
 ## Documentation
 
