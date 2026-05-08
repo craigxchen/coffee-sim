@@ -371,12 +371,20 @@ impl MpmSim3D {
                 pass.set_pipeline(&self.pipelines.boundary_project);
                 pass.dispatch_workgroups(cell_wg, 1, 1);
 
-                // Viscosity is split after pressure projection so the pressure
-                // solve cannot immediately reintroduce the high-frequency pool
-                // velocities that diffusion just removed. It uses grid
-                // momentum lanes as temporary FP-encoded velocity scratch; at
-                // this point pressure/divergence/kind scratch is no longer
-                // needed by later passes in the substep.
+                // Packing pressure reuses the projection scratch lanes before
+                // viscosity overwrites the grid momentum lanes with temporary
+                // FP-encoded velocity scratch.
+                pass.set_pipeline(&self.pipelines.packing_prepare);
+                pass.dispatch_workgroups(cell_wg, 1, 1);
+                pass.set_pipeline(&self.pipelines.packing_apply);
+                pass.dispatch_workgroups(cell_wg, 1, 1);
+                pass.set_pipeline(&self.pipelines.boundary_project);
+                pass.dispatch_workgroups(cell_wg, 1, 1);
+
+                // Viscosity is split after the pressure and packing
+                // projections so neither correction can immediately
+                // reintroduce the high-frequency pool velocities that
+                // diffusion just removed.
                 pass.set_pipeline(&self.pipelines.viscosity_prepare);
                 pass.dispatch_workgroups(cell_wg, 1, 1);
                 pass.set_pipeline(&self.pipelines.viscosity_apply);

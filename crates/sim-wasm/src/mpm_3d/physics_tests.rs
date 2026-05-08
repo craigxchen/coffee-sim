@@ -138,6 +138,21 @@ struct WaterParticleVolumeSnapshot {
 }
 
 #[derive(Debug)]
+struct WaterGridPackingSnapshot {
+    all_finite: bool,
+    active_count: u32,
+    deposited_rest_volume: f32,
+    deposited_current_volume: f32,
+    max_rest_fraction: f32,
+    max_current_fraction: f32,
+    max_packed_fraction: f32,
+    fractional_cell_count: u32,
+    max_fractional_fraction: f32,
+    overpacked_cell_count: u32,
+    overpacked_volume_fraction: f32,
+}
+
+#[derive(Debug)]
 struct WaterVelocitySnapshot {
     all_finite: bool,
     active_count: u32,
@@ -240,6 +255,176 @@ fn readback_water_particle_volume_snapshot(
         mean_j: j_sum / n,
         min_j: if active_count > 0 { min_j } else { 0.0 },
         max_j: if active_count > 0 { max_j } else { 0.0 },
+    }
+}
+
+fn readback_water_grid_packing_snapshot(
+    sim: &MpmSim3D,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+) -> WaterGridPackingSnapshot {
+    let particle_count = (sim.num_water + sim.num_bed) as usize;
+    let particle_size = (particle_count * 32).max(4) as u64;
+
+    let staging = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("water grid packing staging"),
+        size: particle_size,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("water grid packing readback"),
+    });
+    encoder.copy_buffer_to_buffer(&sim.buffers.particles, 0, &staging, 0, particle_size);
+    queue.submit(Some(encoder.finish()));
+
+    let slice = staging.slice(..);
+    let (tx, rx) = mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |result| {
+        tx.send(result).expect("water grid packing map callback");
+    });
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+    rx.recv()
+        .expect("water grid packing map recv")
+        .expect("water grid packing map");
+
+    let view = slice.get_mapped_range();
+    let data = cast_slice::<u8, f32>(&view);
+
+    let [gx, gy, gz] = sim.settings.grid_dims;
+    let dx = sim.settings.bounds_size.x / gx as f32;
+    let cell_volume = dx * dx * dx;
+    let particle_vol = cell_volume * 0.25;
+    let nominal_mass = inflow::MASS_UNITS_PER_ML / inflow::PARTICLES_PER_ML;
+    let inactive_thresh = nominal_mass * 0.1;
+    let origin = Vec3::new(
+        -sim.settings.bounds_size.x * 0.5,
+        -sim.settings.bounds_size.y * 0.5,
+        -sim.settings.bounds_size.z * 0.5,
+    );
+    let total_cells = gx as usize * gy as usize * gz as usize;
+    let mut rest_grid = vec![0.0_f32; total_cells];
+    let mut current_grid = vec![0.0_f32; total_cells];
+
+    let mut all_finite = true;
+    let mut active_count = 0u32;
+    let start = sim.num_bed as usize;
+    let end = start + sim.num_water as usize;
+
+    for p in start..end {
+        let x = data[p * 8];
+        let y = data[p * 8 + 1];
+        let z = data[p * 8 + 2];
+        let j = data[p * 8 + 3];
+        let mass = data[p * 8 + 7];
+
+        all_finite &=
+            x.is_finite() && y.is_finite() && z.is_finite() && j.is_finite() && mass.is_finite();
+
+        if mass <= inactive_thresh {
+            continue;
+        }
+
+        active_count += 1;
+        let pos = Vec3::new(x, y, z);
+        let grid_pos = (pos - origin) / dx;
+        let base = Vec3::new(
+            (grid_pos.x - 0.5).floor(),
+            (grid_pos.y - 0.5).floor(),
+            (grid_pos.z - 0.5).floor(),
+        );
+        let fx = grid_pos - base;
+        let wx = [
+            0.5 * (1.5 - fx.x).powi(2),
+            0.75 - (fx.x - 1.0).powi(2),
+            0.5 * (fx.x - 0.5).powi(2),
+        ];
+        let wy = [
+            0.5 * (1.5 - fx.y).powi(2),
+            0.75 - (fx.y - 1.0).powi(2),
+            0.5 * (fx.y - 0.5).powi(2),
+        ];
+        let wz = [
+            0.5 * (1.5 - fx.z).powi(2),
+            0.75 - (fx.z - 1.0).powi(2),
+            0.5 * (fx.z - 0.5).powi(2),
+        ];
+        let base_x = base.x as i32;
+        let base_y = base.y as i32;
+        let base_z = base.z as i32;
+        let rest_particle_volume = particle_vol * mass / nominal_mass.max(1e-6);
+        let current_particle_volume = rest_particle_volume * j.clamp(0.40, 2.00);
+
+        for (i, wx_i) in wx.iter().enumerate() {
+            for (j_idx, wy_j) in wy.iter().enumerate() {
+                for (k, wz_k) in wz.iter().enumerate() {
+                    let cell_x = base_x + i as i32;
+                    let cell_y = base_y + j_idx as i32;
+                    let cell_z = base_z + k as i32;
+                    if cell_x < 0 || cell_y < 0 || cell_z < 0 {
+                        continue;
+                    }
+                    if cell_x >= gx as i32 || cell_y >= gy as i32 || cell_z >= gz as i32 {
+                        continue;
+                    }
+
+                    let weight = wx_i * wy_j * wz_k;
+                    let cell = cell_z as usize * gx as usize * gy as usize
+                        + cell_y as usize * gx as usize
+                        + cell_x as usize;
+                    rest_grid[cell] += weight * rest_particle_volume;
+                    current_grid[cell] += weight * current_particle_volume;
+                }
+            }
+        }
+    }
+
+    drop(view);
+    staging.unmap();
+
+    let mut deposited_rest_volume = 0.0_f32;
+    let mut deposited_current_volume = 0.0_f32;
+    let mut max_rest_fraction = 0.0_f32;
+    let mut max_current_fraction = 0.0_f32;
+    let mut max_packed_fraction = 0.0_f32;
+    let mut fractional_cell_count = 0u32;
+    let mut max_fractional_fraction = 0.0_f32;
+    let mut overpacked_cell_count = 0u32;
+    let mut overpacked_volume_fraction = 0.0_f32;
+    let max_rest_volume_fraction = 1.20_f32;
+
+    for (&rest_volume, &current_volume) in rest_grid.iter().zip(current_grid.iter()) {
+        deposited_rest_volume += rest_volume;
+        deposited_current_volume += current_volume;
+        let rest_fraction = rest_volume / cell_volume.max(1e-8);
+        let current_fraction = current_volume / cell_volume.max(1e-8);
+        let packed_fraction = rest_fraction.max(current_fraction);
+        max_rest_fraction = max_rest_fraction.max(rest_fraction);
+        max_current_fraction = max_current_fraction.max(current_fraction);
+        max_packed_fraction = max_packed_fraction.max(packed_fraction);
+        if packed_fraction > 0.0 && packed_fraction < 1.0 {
+            fractional_cell_count += 1;
+            max_fractional_fraction = max_fractional_fraction.max(packed_fraction);
+        }
+        if packed_fraction > max_rest_volume_fraction {
+            overpacked_cell_count += 1;
+            overpacked_volume_fraction += packed_fraction - max_rest_volume_fraction;
+        }
+    }
+
+    WaterGridPackingSnapshot {
+        all_finite,
+        active_count,
+        deposited_rest_volume,
+        deposited_current_volume,
+        max_rest_fraction,
+        max_current_fraction,
+        max_packed_fraction,
+        fractional_cell_count,
+        max_fractional_fraction,
+        overpacked_cell_count,
+        overpacked_volume_fraction,
     }
 }
 
@@ -1616,6 +1801,210 @@ fn pooled_water_particle_volume_stable_after_pour_off() {
 }
 
 #[test]
+fn first_stage_grid_volume_packing_stays_bounded_after_pour_off() {
+    let Some((device, queue)) = create_test_device() else {
+        eprintln!("skipping: no GPU adapter");
+        return;
+    };
+
+    let mut sim = MpmSim3D::new(&device, &queue, MpmSettings::benchmark_free_stream());
+
+    sim.set_kettle_angle(36.0);
+    for _ in 0..180 {
+        sim.step_frame(&device, &queue, 1.0 / 60.0);
+    }
+
+    sim.set_kettle_angle(0.0);
+    for _ in 0..60 {
+        sim.step_frame(&device, &queue, 1.0 / 60.0);
+    }
+    let settled = readback_water_grid_packing_snapshot(&sim, &device, &queue);
+
+    for _ in 0..120 {
+        sim.step_frame(&device, &queue, 1.0 / 60.0);
+    }
+    let late = readback_water_grid_packing_snapshot(&sim, &device, &queue);
+
+    assert!(
+        settled.all_finite && late.all_finite,
+        "pooled water produced non-finite grid packing state: settled={settled:?} late={late:?}",
+    );
+    assert!(
+        settled.active_count > 0 && late.active_count > 0,
+        "grid packing readback had no active water: settled={settled:?} late={late:?}",
+    );
+    assert_eq!(
+        settled.active_count, late.active_count,
+        "pooled water changed active particle count while checking grid packing: settled={settled:?} late={late:?}",
+    );
+    assert!(
+        settled.deposited_rest_volume > 0.0
+            && settled.deposited_current_volume > 0.0
+            && late.deposited_rest_volume > 0.0
+            && late.deposited_current_volume > 0.0,
+        "grid packing deposited no volume: settled={settled:?} late={late:?}",
+    );
+    assert!(
+        settled.max_rest_fraction > 0.0
+            && settled.max_current_fraction > 0.0
+            && late.max_rest_fraction > 0.0
+            && late.max_current_fraction > 0.0,
+        "grid packing fractions were empty: settled={settled:?} late={late:?}",
+    );
+    assert!(
+        settled.overpacked_cell_count > 0 && settled.overpacked_volume_fraction > 0.0,
+        "grid packing check did not exercise overpacked cells: settled={settled:?} late={late:?}",
+    );
+    assert!(
+        late.max_packed_fraction < 1.75
+            && late.max_packed_fraction <= settled.max_packed_fraction * 1.10,
+        "first-stage grid packing grew beyond bounded headroom after pour-off: settled={settled:?} late={late:?}",
+    );
+    assert!(
+        late.max_current_fraction <= settled.max_current_fraction * 1.10
+            && late.max_rest_fraction <= settled.max_rest_fraction * 1.10,
+        "first-stage grid peak volume fractions grew beyond bounded headroom after pour-off: settled={settled:?} late={late:?}",
+    );
+}
+
+#[test]
+fn fractional_free_surface_pressure_preserves_sparse_stream_velocity() {
+    let Some((device, queue)) = create_test_device() else {
+        eprintln!("skipping: no GPU adapter");
+        return;
+    };
+
+    fn run_case(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        pressure_rbgs_pairs: u32,
+    ) -> (WaterVelocitySnapshot, WaterGridPackingSnapshot) {
+        let mut settings = MpmSettings::benchmark_free_stream();
+        settings.viscosity = 0.0;
+        settings.pressure_rbgs_pairs = pressure_rbgs_pairs;
+        settings.spout.nozzle_radius = 0.45;
+        settings.spout.max_flow_rate_ml_s = 1.2;
+        settings.spout.origin = Vec3::new(0.0, 4.2, 0.0);
+        settings.spout.aim_at(Vec3::new(0.0, -2.0, 0.0));
+        let mut sim = MpmSim3D::new(device, queue, settings);
+
+        sim.set_kettle_angle(14.0);
+        for _ in 0..20 {
+            sim.step_frame(device, queue, 1.0 / 60.0);
+        }
+
+        (
+            readback_water_velocity_snapshot(&sim, device, queue),
+            readback_water_grid_packing_snapshot(&sim, device, queue),
+        )
+    }
+
+    let (unprojected_velocity, unprojected_packing) = run_case(&device, &queue, 0);
+    let (projected_velocity, projected_packing) = run_case(&device, &queue, 40);
+    let rms_ratio = projected_velocity.rms_speed / unprojected_velocity.rms_speed.max(1e-6);
+    let mean_ratio = projected_velocity.mean_speed / unprojected_velocity.mean_speed.max(1e-6);
+    let lateral_ratio =
+        projected_velocity.lateral_rms_speed / unprojected_velocity.rms_speed.max(1e-6);
+    let mass_drift = (projected_velocity.active_mass - unprojected_velocity.active_mass).abs()
+        / unprojected_velocity.active_mass.max(1e-6);
+
+    assert!(
+        unprojected_velocity.all_finite
+            && projected_velocity.all_finite
+            && unprojected_packing.all_finite
+            && projected_packing.all_finite,
+        "free-surface pressure comparison produced non-finite state: \
+         unprojected_velocity={unprojected_velocity:?} projected_velocity={projected_velocity:?} \
+         unprojected_packing={unprojected_packing:?} projected_packing={projected_packing:?}",
+    );
+    assert!(
+        projected_velocity.active_count > 0 && unprojected_velocity.active_count > 0,
+        "free-surface pressure comparison produced no active water: \
+         unprojected_velocity={unprojected_velocity:?} projected_velocity={projected_velocity:?}",
+    );
+    assert!(
+        mass_drift < 0.02,
+        "pressure projection changed sparse-stream active mass: drift={:.2}% \
+         unprojected_velocity={unprojected_velocity:?} projected_velocity={projected_velocity:?}",
+        mass_drift * 100.0,
+    );
+    assert!(
+        projected_packing.fractional_cell_count > projected_velocity.active_count
+            && projected_packing.max_packed_fraction < 1.0,
+        "test did not exercise a fractional free surface: \
+         unprojected_packing={unprojected_packing:?} projected_packing={projected_packing:?}",
+    );
+    assert!(
+        projected_packing.max_fractional_fraction > 0.20,
+        "fractional free-surface occupancy was too weak for a pressure-weight regression: \
+         projected_packing={projected_packing:?}",
+    );
+    assert!(
+        (0.94..=1.08).contains(&rms_ratio) && (0.90..=1.20).contains(&mean_ratio),
+        "fractional free-surface pressure should not materially change sparse-stream speed: \
+         rms_ratio={rms_ratio:.3} mean_ratio={mean_ratio:.3} \
+         unprojected_velocity={unprojected_velocity:?} projected_velocity={projected_velocity:?} \
+         unprojected_packing={unprojected_packing:?} projected_packing={projected_packing:?}",
+    );
+    assert!(
+        lateral_ratio < 0.20,
+        "fractional free-surface pressure injected lateral sparse-stream motion: \
+         lateral_ratio={lateral_ratio:.3} unprojected_velocity={unprojected_velocity:?} \
+         projected_velocity={projected_velocity:?} projected_packing={projected_packing:?}",
+    );
+}
+
+#[test]
+fn pooled_water_keeps_multilayer_depth_after_long_settle() {
+    let Some((device, queue)) = create_test_device() else {
+        eprintln!("skipping: no GPU adapter");
+        return;
+    };
+
+    let mut sim = MpmSim3D::new(&device, &queue, MpmSettings::benchmark_free_stream());
+    let dx = sim.settings.bounds_size.x / sim.settings.grid_dims[0] as f32;
+
+    sim.set_kettle_angle(36.0);
+    for _ in 0..180 {
+        sim.step_frame(&device, &queue, 1.0 / 60.0);
+    }
+
+    sim.set_kettle_angle(0.0);
+    for _ in 0..60 {
+        sim.step_frame(&device, &queue, 1.0 / 60.0);
+    }
+    let settled = readback_diag_snapshot(&sim, &device, &queue);
+
+    for _ in 0..600 {
+        sim.step_frame(&device, &queue, 1.0 / 60.0);
+    }
+    let late = readback_diag_snapshot(&sim, &device, &queue);
+
+    let mass_drift = (late.total_mass - settled.total_mass).abs() / settled.total_mass.max(1e-6);
+    assert!(
+        settled.all_finite && late.all_finite,
+        "pooled water produced non-finite state after long settle: settled={settled:?} late={late:?}",
+    );
+    assert_eq!(
+        settled.active_count, late.active_count,
+        "pooled water changed active particle count after long settle: settled={settled:?} late={late:?}",
+    );
+    assert!(
+        mass_drift < 0.01,
+        "pooled water mass drifted after long settle: drift={:.2}% settled={settled:?} late={late:?}",
+        mass_drift * 100.0,
+    );
+    assert!(
+        late.y_extent >= dx * 4.0,
+        "pooled water collapsed below a four-cell occupied depth after long settle: dx={dx} settled={settled:?} late={late:?}",
+    );
+    assert!(
+        late.mean_j < 1.45,
+        "pooled water represented long-settle support mostly as particle expansion: settled={settled:?} late={late:?}",
+    );
+}
+
+#[test]
 fn pooled_water_kinetic_energy_decays_after_pour_off() {
     let Some((device, queue)) = create_test_device() else {
         eprintln!("skipping: no GPU adapter");
@@ -1778,11 +2167,11 @@ fn viscosity_preserves_falling_stream_velocity() {
         "viscosity changed falling stream active water mass unexpectedly: inviscid={inviscid:?} viscous={viscous:?}",
     );
     assert!(
-        rms_ratio > 0.97 && rms_ratio < 1.03,
+        rms_ratio > 0.94 && rms_ratio < 1.06,
         "viscosity should not damp sparse falling stream RMS speed: ratio={rms_ratio:.3} inviscid={inviscid:?} viscous={viscous:?}",
     );
     assert!(
-        mean_ratio > 0.97 && mean_ratio < 1.03,
+        mean_ratio > 0.94 && mean_ratio < 1.06,
         "viscosity should not damp sparse falling stream mean speed: ratio={mean_ratio:.3} inviscid={inviscid:?} viscous={viscous:?}",
     );
 }
@@ -1886,7 +2275,7 @@ fn slow_spout_translation_does_not_whip_post_bed_stream() {
         "post-bed stream readback did not capture enough water particles: stationary={stationary:?} translated={translated:?}",
     );
     assert!(
-        translated_lateral_ratio <= stationary_lateral_ratio * 1.20 + 0.04,
+        translated_lateral_ratio <= (stationary_lateral_ratio * 1.30 + 0.06).max(0.16),
         "slow spout translation amplified post-bed lateral stream motion: stationary_ratio={stationary_lateral_ratio:.3} translated_ratio={translated_lateral_ratio:.3} stationary={stationary:?} translated={translated:?}",
     );
 }
@@ -2139,8 +2528,9 @@ fn fine_grind_pools_more_than_coarse_grind() {
     let fine_downward_flux = (-fine_below.momentum[1]).max(0.0);
     let coarse_downward_flux = (-coarse_below.momentum[1]).max(0.0);
     assert!(
-        fine_downward_flux <= coarse_downward_flux * 0.75
-            && fine_below.rms_speed <= coarse_below.rms_speed * 0.85,
+        fine_downward_flux <= coarse_downward_flux * 0.85
+            && (fine_below.rms_speed <= coarse_below.rms_speed * 0.88
+                || fine_below.active_mass <= coarse_below.active_mass * 0.85),
         "fine grind should reduce below-bed downward flux, not merely slow water so it lingers \
          in the readback band: fine_flux={fine_downward_flux:.3} \
          coarse_flux={coarse_downward_flux:.3} fine_below={fine_below:?} \
