@@ -41,9 +41,11 @@ const debugStats = document.getElementById("debug-stats");
 const METRICS_REFRESH_INTERVAL = 10;
 let metricsFrameCounter = 0;
 let metricsRefreshInFlight = false;
+const AUTO_PAUSE_DELAY_MS = 30_000;
 
 let app;
 let paused = false;
+let autoPauseTimer = 0;
 let lastFrameTime = 0;
 let skipStepOnce = false;
 let fpsWindow = [];
@@ -80,6 +82,7 @@ resizeCanvas();
 syncSpoutControlSize();
 syncUi();
 requestAnimationFrame(animate);
+scheduleAutoPauseIfInactive();
 
 window.addEventListener("resize", resizeCanvas);
 if ("ResizeObserver" in window) {
@@ -87,13 +90,7 @@ if ("ResizeObserver" in window) {
 }
 
 toggleButton.addEventListener("click", () => {
-  paused = !paused;
-  toggleButton.textContent = paused ? "Play" : "Pause";
-  if (!paused) {
-    lastFrameTime = 0;
-    fpsWindow = [];
-    skipStepOnce = true;
-  }
+  setPaused(!paused);
 });
 
 resetButton.addEventListener("click", () => {
@@ -117,8 +114,7 @@ sceneFreeStreamButton.addEventListener("click", () => {
   applyHeuristicControls();
   fixedStepSeconds = 1 / 60;
   currentSceneMode = "Water Only";
-  paused = false;
-  toggleButton.textContent = "Pause";
+  setPaused(false);
   lastFrameTime = 0;
   syncUi();
 });
@@ -129,8 +125,7 @@ sceneCenterPourButton.addEventListener("click", () => {
   applyHeuristicControls();
   fixedStepSeconds = 1 / 60;
   currentSceneMode = "Center Pour";
-  paused = false;
-  toggleButton.textContent = "Pause";
+  setPaused(false);
   lastFrameTime = 0;
   syncUi();
 });
@@ -223,6 +218,19 @@ window.addEventListener("keyup", (e) => {
 
 window.addEventListener("blur", () => {
   heldKeys.clear();
+  scheduleAutoPauseIfInactive();
+});
+
+window.addEventListener("focus", () => {
+  clearAutoPauseTimer();
+});
+
+document.addEventListener("visibilitychange", () => {
+  if (isPageActive()) {
+    clearAutoPauseTimer();
+  } else {
+    scheduleAutoPauseIfInactive();
+  }
 });
 
 function resizeCanvas() {
@@ -260,6 +268,38 @@ function animate(timestamp) {
   maybeRefreshMetrics();
   syncUi();
   requestAnimationFrame(animate);
+}
+
+function setPaused(nextPaused) {
+  paused = nextPaused;
+  toggleButton.textContent = paused ? "Play" : "Pause";
+  if (!paused) {
+    lastFrameTime = 0;
+    fpsWindow = [];
+    skipStepOnce = true;
+  }
+}
+
+function isPageActive() {
+  return document.visibilityState === "visible" && document.hasFocus();
+}
+
+function scheduleAutoPauseIfInactive() {
+  clearAutoPauseTimer();
+  if (isPageActive()) return;
+  autoPauseTimer = window.setTimeout(() => {
+    if (isPageActive() || paused) return;
+    heldKeys.clear();
+    dragging = false;
+    spoutPlaneDragging = false;
+    setPaused(true);
+  }, AUTO_PAUSE_DELAY_MS);
+}
+
+function clearAutoPauseTimer() {
+  if (!autoPauseTimer) return;
+  window.clearTimeout(autoPauseTimer);
+  autoPauseTimer = 0;
 }
 
 function maybeRefreshMetrics() {
