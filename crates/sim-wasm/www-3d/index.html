@@ -3,8 +3,9 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta http-equiv="Cache-Control" content="no-store" />
     <title>Coffee Sim | 3D Pourover</title>
-    <link rel="stylesheet" href="./styles.css?v=spout-plane-13" />
+    <link rel="stylesheet" href="./styles.css?v=smooth-fluid-v11" />
   </head>
   <body>
     <main class="layout">
@@ -151,11 +152,12 @@
       </section>
       <section class="viewer">
         <canvas id="sim-canvas"></canvas>
+        <div id="render-error" class="render-error hidden" role="status"></div>
         <div class="cross-section-overlay" aria-hidden="true">
           <span>Center Cross-Section</span>
         </div>
       </section>
     </main>
-    <script type="module" src="./main.js?v=spout-plane-13"></script>
+    <script type="module" src="./main.js?v=smooth-fluid-v11"></script>
   </body>
 </html>

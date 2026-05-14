@@ -48,7 +48,7 @@ struct ParticleVertexOutput {
 
 @vertex
 fn vs_main(input: ParticleVertexInput) -> ParticleVertexOutput {
-    let water_radius = input.radius * mix(1.0, 0.72, clamp(input.colour_t * 0.7, 0.0, 1.0));
+    let water_radius = input.radius * mix(2.35, 1.45, clamp(input.colour_t * 0.7, 0.0, 1.0));
     let radius = select(water_radius, input.radius, input.colour_t < 0.0);
     let offset = uniforms.camera_right.xyz * input.local.x * radius
         + uniforms.camera_up.xyz * input.local.y * radius;
@@ -64,18 +64,24 @@ fn vs_main(input: ParticleVertexInput) -> ParticleVertexOutput {
 fn palette(colour_t: f32) -> vec3<f32> {
     if (colour_t < 0.0) {
         let wetness = clamp(-colour_t - 1.0, 0.0, 1.0);
-        let dry = vec3<f32>(0.34, 0.24, 0.12);
-        let wet = vec3<f32>(0.17, 0.11, 0.06);
+        let dry = vec3<f32>(0.52, 0.34, 0.16);
+        let wet = vec3<f32>(0.30, 0.17, 0.08);
         return mix(dry, wet, wetness);
     }
-    let base = vec3<f32>(0.07, 0.20, 0.47);
-    let mid = vec3<f32>(0.10, 0.47, 0.74);
-    let crest = vec3<f32>(0.87, 0.95, 0.98);
+    let base = vec3<f32>(0.04, 0.25, 0.70);
+    let mid = vec3<f32>(0.08, 0.62, 0.96);
+    let crest = vec3<f32>(0.82, 0.96, 1.0);
     return mix(mix(base, mid, clamp(colour_t, 0.0, 1.0)), crest, clamp(colour_t * 0.6, 0.0, 1.0));
 }
 
 @fragment
 fn fs_main(input: ParticleVertexOutput) -> @location(0) vec4<f32> {
+    let render_mode = uniforms.params.w;
+    let is_water = input.colour_t >= 0.0;
+    if ((render_mode < -0.5 && is_water) || (render_mode > 0.5 && !is_water)) {
+        discard;
+    }
+
     let radial = dot(input.local, input.local);
     if (radial > 1.0) {
         discard;
@@ -90,8 +96,12 @@ fn fs_main(input: ParticleVertexOutput) -> @location(0) vec4<f32> {
     let light = normalize(-uniforms.light_dir.xyz);
     let diffuse = max(dot(normal, light), 0.0);
     let rim = pow(1.0 - sphere_z, 2.5);
-    let color = palette(input.colour_t) * (0.34 + diffuse * 0.9) + vec3<f32>(rim * 0.12);
-    let alpha = smoothstep(1.0, 0.82, radial);
+    let water_boost = select(1.0, 1.18, input.colour_t >= 0.0);
+    let color = palette(input.colour_t) * (0.40 + diffuse * 0.95) * water_boost
+        + vec3<f32>(rim * 0.20);
+    let water_alpha = (1.0 - smoothstep(0.45, 1.0, radial)) * 0.68;
+    let solid_alpha = 1.0 - smoothstep(0.82, 1.0, radial);
+    let alpha = select(water_alpha, solid_alpha, input.colour_t < 0.0);
     return vec4<f32>(color, alpha);
 }
 "#;
@@ -319,11 +329,14 @@ pub(crate) struct Renderer {
     css_width: f32,
     css_height: f32,
     particle_3d_pipeline: wgpu::RenderPipeline,
+    water_3d_pipeline: wgpu::RenderPipeline,
     cross_section_pipeline: wgpu::RenderPipeline,
     filter_fill_pipeline: wgpu::RenderPipeline,
     cone_pipeline: wgpu::RenderPipeline,
     particle_3d_uniform_buffer: wgpu::Buffer,
     particle_3d_bind_group: wgpu::BindGroup,
+    water_3d_uniform_buffer: wgpu::Buffer,
+    water_3d_bind_group: wgpu::BindGroup,
     cross_section_uniform_buffer: wgpu::Buffer,
     cross_section_bind_group: wgpu::BindGroup,
     cone_uniform_buffer: wgpu::Buffer,
@@ -388,6 +401,13 @@ impl Renderer {
             mapped_at_creation: false,
         });
 
+        let water_3d_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("water 3d uniforms"),
+            size: size_of::<Particle3DUniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         let cross_section_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("cross section uniforms"),
             size: size_of::<CrossSectionUniforms>() as u64,
@@ -415,6 +435,15 @@ impl Renderer {
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
                 resource: particle_3d_uniform_buffer.as_entire_binding(),
+            }],
+        });
+
+        let water_3d_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("water 3d bind group"),
+            layout: &bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: water_3d_uniform_buffer.as_entire_binding(),
             }],
         });
 
@@ -544,6 +573,77 @@ impl Renderer {
                 format: wgpu::TextureFormat::Depth24Plus,
                 depth_write_enabled: Some(true),
                 depth_compare: Some(wgpu::CompareFunction::Less),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        let water_3d_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("water 3d pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &particle_3d_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                buffers: &[
+                    wgpu::VertexBufferLayout {
+                        array_stride: size_of::<QuadVertex>() as u64,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &[wgpu::VertexAttribute {
+                            offset: 0,
+                            shader_location: 0,
+                            format: wgpu::VertexFormat::Float32x2,
+                        }],
+                    },
+                    wgpu::VertexBufferLayout {
+                        array_stride: (size_of::<f32>() * 8) as u64,
+                        step_mode: wgpu::VertexStepMode::Instance,
+                        attributes: &[
+                            wgpu::VertexAttribute {
+                                offset: 0,
+                                shader_location: 1,
+                                format: wgpu::VertexFormat::Float32x3,
+                            },
+                            wgpu::VertexAttribute {
+                                offset: 12,
+                                shader_location: 2,
+                                format: wgpu::VertexFormat::Float32,
+                            },
+                            wgpu::VertexAttribute {
+                                offset: 16,
+                                shader_location: 3,
+                                format: wgpu::VertexFormat::Float32,
+                            },
+                        ],
+                    },
+                ],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &particle_3d_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                unclipped_depth: false,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth24Plus,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
@@ -784,11 +884,14 @@ impl Renderer {
             css_width: width as f32,
             css_height: height as f32,
             particle_3d_pipeline,
+            water_3d_pipeline,
             cross_section_pipeline,
             filter_fill_pipeline,
             cone_pipeline,
             particle_3d_uniform_buffer,
             particle_3d_bind_group,
+            water_3d_uniform_buffer,
+            water_3d_bind_group,
             cross_section_uniform_buffer,
             cross_section_bind_group,
             cone_uniform_buffer,
@@ -880,18 +983,27 @@ impl Renderer {
         let view_proj = mat4_mul(projection, view);
 
         // Update particle uniforms
-        let particle_uniforms = Particle3DUniforms {
+        let solid_particle_uniforms = Particle3DUniforms {
             view_proj,
             camera_right: [right.x, right.y, right.z, 0.0],
             camera_up: [up.x, up.y, up.z, 0.0],
             camera_forward: [forward.x, forward.y, forward.z, 0.0],
             light_dir: [-0.45, -0.9, -0.25, 0.0],
-            params: [simulation.settings().render_radius, 0.0, 0.0, 0.0],
+            params: [simulation.settings().render_radius, 0.0, 0.0, -1.0],
+        };
+        let water_particle_uniforms = Particle3DUniforms {
+            params: [simulation.settings().render_radius, 0.0, 0.0, 1.0],
+            ..solid_particle_uniforms
         };
         self.queue.write_buffer(
             &self.particle_3d_uniform_buffer,
             0,
-            bytemuck::bytes_of(&particle_uniforms),
+            bytemuck::bytes_of(&solid_particle_uniforms),
+        );
+        self.queue.write_buffer(
+            &self.water_3d_uniform_buffer,
+            0,
+            bytemuck::bytes_of(&water_particle_uniforms),
         );
 
         let cross_section_viewport = self.cross_section_viewport();
@@ -911,7 +1023,7 @@ impl Renderer {
         // Update cone uniforms
         let cone_uniforms = ConeUniforms {
             view_proj,
-            color: [0.95, 0.90, 0.78, 0.35],
+            color: [1.0, 0.82, 0.34, 0.82],
         };
         self.queue.write_buffer(
             &self.cone_uniform_buffer,
@@ -921,7 +1033,7 @@ impl Renderer {
 
         let filter_uniforms = ConeUniforms {
             view_proj,
-            color: [0.96, 0.93, 0.85, 0.42],
+            color: [0.95, 0.86, 0.62, 0.62],
         };
         self.queue.write_buffer(
             &self.filter_uniform_buffer,
@@ -956,8 +1068,13 @@ impl Renderer {
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame)
             | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
-            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
-                return Ok(())
+            wgpu::CurrentSurfaceTexture::Timeout => {
+                return Err(JsValue::from_str(
+                    "WebGPU surface timed out before presenting a frame.",
+                ));
+            }
+            wgpu::CurrentSurfaceTexture::Occluded => {
+                return Err(JsValue::from_str("WebGPU surface is reported as occluded."));
             }
             wgpu::CurrentSurfaceTexture::Outdated => {
                 self.surface.configure(&self.device, &self.config);
@@ -986,9 +1103,9 @@ impl Renderer {
                     depth_slice: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.05,
-                            g: 0.08,
-                            b: 0.10,
+                            r: 0.07,
+                            g: 0.11,
+                            b: 0.13,
                             a: 1.0,
                         }),
                         store: wgpu::StoreOp::Store,
@@ -1033,6 +1150,12 @@ impl Renderer {
             if simulation.particle_count() > 0 {
                 pass.set_pipeline(&self.particle_3d_pipeline);
                 pass.set_bind_group(0, &self.particle_3d_bind_group, &[]);
+                pass.set_vertex_buffer(0, self.quad_vertex_buffer.slice(..));
+                pass.set_vertex_buffer(1, simulation.render_buffer().slice(..));
+                pass.draw(0..6, 0..simulation.particle_count() as u32);
+
+                pass.set_pipeline(&self.water_3d_pipeline);
+                pass.set_bind_group(0, &self.water_3d_bind_group, &[]);
                 pass.set_vertex_buffer(0, self.quad_vertex_buffer.slice(..));
                 pass.set_vertex_buffer(1, simulation.render_buffer().slice(..));
                 pass.draw(0..6, 0..simulation.particle_count() as u32);

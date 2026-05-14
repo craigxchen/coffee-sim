@@ -1,4 +1,13 @@
-import init, { WasmSim3D } from "./pkg/coffee_sim_wasm.js?v=spout-plane-13";
+import init, { WasmSim3D } from "./pkg/coffee_sim_wasm.js?v=smooth-fluid-v11";
+
+if (window.location.hostname === "127.0.0.1") {
+  const localhostUrl = new URL(window.location.href);
+  localhostUrl.hostname = "localhost";
+  window.location.replace(localhostUrl.href);
+  await new Promise(() => {});
+}
+
+patchWebGpuRequiredLimitsBug();
 
 const canvas = document.getElementById("sim-canvas");
 const toggleButton = document.getElementById("toggle");
@@ -34,6 +43,7 @@ const pressureClampFiresLabel = document.getElementById("pressure-clamp-fires");
 const massOverflowFiresLabel = document.getElementById("mass-overflow-fires");
 const toggleDebugButton = document.getElementById("toggle-debug");
 const debugStats = document.getElementById("debug-stats");
+const renderError = document.getElementById("render-error");
 
 // Throttle metrics readback — the staging-buffer map/unmap is cheap but still
 // costs a JS microtask. Refreshing every ~10 frames keeps the HUD responsive
@@ -41,9 +51,11 @@ const debugStats = document.getElementById("debug-stats");
 const METRICS_REFRESH_INTERVAL = 10;
 let metricsFrameCounter = 0;
 let metricsRefreshInFlight = false;
+const AUTO_PAUSE_DELAY_MS = 30_000;
 
 let app;
 let paused = false;
+let autoPauseTimer = 0;
 let lastFrameTime = 0;
 let skipStepOnce = false;
 let fpsWindow = [];
@@ -52,6 +64,8 @@ let lastClientX = 0;
 let lastClientY = 0;
 let fixedStepSeconds = null;
 let currentSceneMode = "Center Pour";
+let animationLoopStarted = false;
+let intervalLoopActive = false;
 const heldKeys = new Set();
 const PAN_SPEED = 6.0;
 const SPOUT_X_MIN = -6.0;
@@ -69,17 +83,32 @@ let spoutX = 0.0;
 let spoutZ = 0.0;
 let spoutPlaneDragging = false;
 
-await init();
-app = await WasmSim3D.create(canvas);
-app.loadBenchmarkCenterPour();
-fixedStepSeconds = 1 / 60;
-syncControlDefaultsFromSim();
-app.setKettleAngle(Number(kettleAngleInput.value));
-applySpoutControls();
-resizeCanvas();
-syncSpoutControlSize();
-syncUi();
-requestAnimationFrame(animate);
+try {
+  setRenderStatus("Initializing wasm module...");
+  await init(new URL("./pkg/coffee_sim_wasm_bg.wasm?v=smooth-fluid-v11", import.meta.url));
+  setRenderStatus("Creating WebGPU renderer...");
+  const cancelSlowCreateStatus = setDelayedRenderStatus(
+    "Still waiting for the WebGPU device...",
+    6000,
+  );
+  app = await WasmSim3D.create(canvas);
+  cancelSlowCreateStatus();
+  setRenderStatus("Loading simulation particles...");
+  app.loadBenchmarkCenterPour();
+  fixedStepSeconds = 1 / 60;
+  syncControlDefaultsFromSim();
+  app.setKettleAngle(Number(kettleAngleInput.value));
+  applySpoutControls();
+  resizeCanvas();
+  syncSpoutControlSize();
+  syncUi();
+  clearRenderStatus();
+  startAnimationLoop();
+  scheduleAutoPauseIfInactive();
+} catch (error) {
+  showRenderError(error);
+  throw error;
+}
 
 window.addEventListener("resize", resizeCanvas);
 if ("ResizeObserver" in window) {
@@ -87,13 +116,7 @@ if ("ResizeObserver" in window) {
 }
 
 toggleButton.addEventListener("click", () => {
-  paused = !paused;
-  toggleButton.textContent = paused ? "Play" : "Pause";
-  if (!paused) {
-    lastFrameTime = 0;
-    fpsWindow = [];
-    skipStepOnce = true;
-  }
+  setPaused(!paused);
 });
 
 resetButton.addEventListener("click", () => {
@@ -117,8 +140,7 @@ sceneFreeStreamButton.addEventListener("click", () => {
   applyHeuristicControls();
   fixedStepSeconds = 1 / 60;
   currentSceneMode = "Water Only";
-  paused = false;
-  toggleButton.textContent = "Pause";
+  setPaused(false);
   lastFrameTime = 0;
   syncUi();
 });
@@ -129,8 +151,7 @@ sceneCenterPourButton.addEventListener("click", () => {
   applyHeuristicControls();
   fixedStepSeconds = 1 / 60;
   currentSceneMode = "Center Pour";
-  paused = false;
-  toggleButton.textContent = "Pause";
+  setPaused(false);
   lastFrameTime = 0;
   syncUi();
 });
@@ -223,6 +244,19 @@ window.addEventListener("keyup", (e) => {
 
 window.addEventListener("blur", () => {
   heldKeys.clear();
+  scheduleAutoPauseIfInactive();
+});
+
+window.addEventListener("focus", () => {
+  clearAutoPauseTimer();
+});
+
+document.addEventListener("visibilitychange", () => {
+  if (isPageActive()) {
+    clearAutoPauseTimer();
+  } else {
+    scheduleAutoPauseIfInactive();
+  }
 });
 
 function resizeCanvas() {
@@ -241,6 +275,7 @@ function syncSpoutControlSize() {
 }
 
 function animate(timestamp) {
+  animationLoopStarted = true;
   if (!lastFrameTime) lastFrameTime = timestamp;
 
   const wallFrameTime = Math.min((timestamp - lastFrameTime) / 1000, 0.05);
@@ -255,11 +290,64 @@ function animate(timestamp) {
     app.stepFrame(frameTime);
   }
 
-  app.render();
+  try {
+    app.render();
+  } catch (error) {
+    showRenderError(error);
+    setPaused(true);
+    return;
+  }
   updateFps(frameTime);
   maybeRefreshMetrics();
   syncUi();
+  scheduleNextFrame();
+}
+
+function startAnimationLoop() {
   requestAnimationFrame(animate);
+  window.setTimeout(() => {
+    if (animationLoopStarted) return;
+    intervalLoopActive = true;
+    window.setInterval(() => animate(performance.now()), 1000 / 60);
+  }, 250);
+}
+
+function scheduleNextFrame() {
+  if (!intervalLoopActive) {
+    requestAnimationFrame(animate);
+  }
+}
+
+function setPaused(nextPaused) {
+  paused = nextPaused;
+  toggleButton.textContent = paused ? "Play" : "Pause";
+  if (!paused) {
+    lastFrameTime = 0;
+    fpsWindow = [];
+    skipStepOnce = true;
+  }
+}
+
+function isPageActive() {
+  return document.visibilityState === "visible" && document.hasFocus();
+}
+
+function scheduleAutoPauseIfInactive() {
+  clearAutoPauseTimer();
+  if (isPageActive()) return;
+  autoPauseTimer = window.setTimeout(() => {
+    if (isPageActive() || paused) return;
+    heldKeys.clear();
+    dragging = false;
+    spoutPlaneDragging = false;
+    setPaused(true);
+  }, AUTO_PAUSE_DELAY_MS);
+}
+
+function clearAutoPauseTimer() {
+  if (!autoPauseTimer) return;
+  window.clearTimeout(autoPauseTimer);
+  autoPauseTimer = 0;
 }
 
 function maybeRefreshMetrics() {
@@ -280,6 +368,50 @@ function applyKeyboardPan(dt) {
   if (right === 0 && forward === 0) return;
   const step = PAN_SPEED * dt;
   app.panCamera(right * step, 0, forward * step);
+}
+
+function showRenderError(error) {
+  renderError.classList.remove("info");
+  renderError.textContent = error instanceof Error ? error.message : String(error);
+  renderError.classList.remove("hidden");
+}
+
+function setRenderStatus(message) {
+  renderError.textContent = message;
+  renderError.classList.add("info");
+  renderError.classList.remove("hidden");
+}
+
+function clearRenderStatus() {
+  renderError.classList.add("hidden");
+  renderError.textContent = "";
+  renderError.classList.remove("info");
+}
+
+function setDelayedRenderStatus(message, delayMs) {
+  const timer = window.setTimeout(() => setRenderStatus(message), delayMs);
+  return () => window.clearTimeout(timer);
+}
+
+function patchWebGpuRequiredLimitsBug() {
+  const adapterPrototype = globalThis.GPUAdapter?.prototype;
+  if (!adapterPrototype || adapterPrototype.__coffeeSimNoRequiredLimits) return;
+
+  const requestDevice = adapterPrototype.requestDevice;
+  adapterPrototype.requestDevice = function patchedRequestDevice(descriptor = {}) {
+    if (!descriptor.requiredLimits) {
+      return requestDevice.call(this, descriptor);
+    }
+
+    return requestDevice.call(this, {
+      label: descriptor.label,
+      requiredFeatures: descriptor.requiredFeatures ?? [],
+      defaultQueue: descriptor.defaultQueue,
+    });
+  };
+  Object.defineProperty(adapterPrototype, "__coffeeSimNoRequiredLimits", {
+    value: true,
+  });
 }
 
 function updateFps(frameTime) {

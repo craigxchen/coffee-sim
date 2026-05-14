@@ -1113,7 +1113,7 @@ fn pipelines_fit_within_required_limits() {
 }
 
 #[test]
-fn pipelines_exceed_spec_default_limits() {
+fn pipelines_fit_within_spec_default_limits() {
     let Some(adapter) = request_adapter() else {
         eprintln!("skipping: no GPU adapter available");
         return;
@@ -1129,9 +1129,8 @@ fn pipelines_exceed_spec_default_limits() {
     let _sim = MpmSim3D::new(&device, &queue, MpmSettings::default_v60());
     let error = pollster::block_on(error_scope.pop());
     assert!(
-        error.is_some(),
-        "expected a validation error when constructing MpmSim3D at spec-default limits, but \
-         pipeline creation succeeded — `required_limits()` may no longer be necessary",
+        error.is_none(),
+        "MpmSim3D::new produced a validation error under spec-default limits: {error:?}",
     );
 }
 

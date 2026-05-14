@@ -271,6 +271,9 @@ dd {
 .viewer {
   position: relative;
   overflow: hidden;
+  background:
+    radial-gradient(circle at 54% 30%, rgba(12, 38, 44, 0.82), transparent 28%),
+    linear-gradient(180deg, #101a1d 0%, #071012 100%);
 }
 
 canvas {
@@ -279,8 +282,34 @@ canvas {
   display: block;
 }
 
+.render-error {
+  position: absolute;
+  left: 18px;
+  right: 18px;
+  bottom: 18px;
+  z-index: 4;
+  padding: 12px 14px;
+  border: 1px solid rgba(255, 164, 119, 0.72);
+  border-radius: 8px;
+  background: rgba(52, 18, 12, 0.88);
+  color: #ffe8dc;
+  font: 13px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
+  overflow-wrap: anywhere;
+}
+
+.render-error.hidden {
+  display: none;
+}
+
+.render-error.info {
+  border-color: rgba(177, 200, 194, 0.36);
+  background: rgba(8, 20, 24, 0.84);
+  color: rgba(233, 239, 230, 0.88);
+}
+
 .cross-section-overlay {
   position: absolute;
+  z-index: 3;
   top: 16px;
   right: 16px;
   width: clamp(150px, 24%, 280px);

@@ -59,16 +59,9 @@ struct ContactResult {
 @group(0) @binding(7) var<storage, read_write> bed_extract: array<BedExtract>;
 @group(0) @binding(8) var<storage, read_write> bed_lookup: array<atomic<i32>>;
 @group(0) @binding(9) var<storage, read_write> bed_delta: array<atomic<i32>>;
-@group(0) @binding(10) var<storage, read_write> metrics: array<atomic<u32>>;
 @group(0) @binding(11) var sdf_class_tex: texture_3d<u32>;
 
-// Metrics slot layout — keep in sync with `METRICS_SLOT_COUNT` in state.rs.
 const OBSTACLE_WALL_THICKNESS: f32 = 0.4;
-const METRIC_MAX_ABS_DIV_IDX: u32 = 0u;
-const METRIC_FLUID_CELLS_IDX: u32 = 1u;
-const METRIC_DIV_CLAMP_FIRES_IDX: u32 = 2u;
-const METRIC_PRESSURE_CLAMP_FIRES_IDX: u32 = 3u;
-const METRIC_MASS_OVERFLOW_FIRES_IDX: u32 = 4u;
 const BED_DELTA_WATER_LANE: u32 = 0u;
 const BED_DELTA_IMPULSE_X_LANE: u32 = 1u;
 const BED_DELTA_IMPULSE_Y_LANE: u32 = 2u;
@@ -116,8 +109,6 @@ fn bed_impact() -> f32 { return u.extraction_params.w; }
 fn inactive_mass_threshold() -> f32 { return nominal_mass() * 0.10; }
 fn div_clamp_limit() -> f32 { return u.clamp_params.x; }
 fn pressure_clamp_limit() -> f32 { return u.clamp_params.y; }
-fn metrics_div_fp_scale() -> f32 { return u.clamp_params.z; }
-fn metrics_div_inv_fp_scale() -> f32 { return u.clamp_params.w; }
 fn projection_j_alpha() -> f32 { return u.projection_params.x; }
 fn projection_j_expand_alpha() -> f32 { return u.projection_params.y; }
 fn projection_max_rest_volume_fraction() -> f32 { return u.projection_params.z; }
@@ -202,9 +193,6 @@ fn pressure_load(cell: u32) -> f32 {
 fn pressure_store(cell: u32, value: f32) {
     let limit = pressure_clamp_limit();
     let clamped = clamp(value, -limit, limit);
-    if clamped != value {
-        atomicAdd(&metrics[METRIC_PRESSURE_CLAMP_FIRES_IDX], 1u);
-    }
     atomicStore(&grid[scratch_pressure_idx(cell)], i32(clamped * fp_scale()));
 }
 
@@ -215,9 +203,6 @@ fn packing_pressure_load(cell: u32) -> f32 {
 fn packing_pressure_store(cell: u32, value: f32) {
     let limit = pressure_clamp_limit();
     let clamped = clamp(value, 0.0, limit);
-    if clamped != value {
-        atomicAdd(&metrics[METRIC_PRESSURE_CLAMP_FIRES_IDX], 1u);
-    }
     atomicStore(&grid[scratch_packing_idx(cell)], i32(clamped * fp_scale()));
 }
 
@@ -352,9 +337,6 @@ fn pressure_weighted_or_mirror(
 fn divergence_store(cell: u32, value: f32) {
     let limit = div_clamp_limit();
     let clamped = clamp(value, -limit, limit);
-    if clamped != value {
-        atomicAdd(&metrics[METRIC_DIV_CLAMP_FIRES_IDX], 1u);
-    }
     atomicStore(&grid[scratch_div_idx(cell)], i32(clamped * fp_scale()));
 }
 
@@ -1022,24 +1004,12 @@ fn p2g(@builtin(global_invocation_id) gid: vec3<u32>) {
                 ));
 
                 let ci = cell_index(u32(cell.x), u32(cell.y), u32(cell.z));
-                // Overflow probe: each per-cell per-axis term must stay below
-                // `i32::MAX`. The tightest channel in practice is momentum,
-                // which is mass_contrib * v_cap scaled by FP. We log any single
-                // contribution that comes within ~50% of the int limit so
-                // accumulation headroom stays visible from the HUD once the
-                // readback path is re-enabled.
-                let limit_m = 1.0e9;
                 let mass_fp = mass_contrib * fp;
                 let rest_volume_fp = rest_volume_contrib * fp;
                 let current_volume_fp = current_volume_contrib * fp;
                 let mom_x_fp = mom.x * fp;
                 let mom_y_fp = mom.y * fp;
                 let mom_z_fp = mom.z * fp;
-                if abs(mass_fp) > limit_m || abs(mom_x_fp) > limit_m
-                    || abs(mom_y_fp) > limit_m || abs(mom_z_fp) > limit_m
-                    || abs(rest_volume_fp) > limit_m || abs(current_volume_fp) > limit_m {
-                    atomicAdd(&metrics[METRIC_MASS_OVERFLOW_FIRES_IDX], 1u);
-                }
                 atomicAdd(&grid[grid_mass_idx(ci)], i32(mass_fp));
                 atomicAdd(&grid[grid_mom_x_idx(ci)], i32(mom_x_fp));
                 atomicAdd(&grid[grid_mom_y_idx(ci)], i32(mom_y_fp));
@@ -1111,6 +1081,7 @@ fn viscosity_prepare(@builtin(global_invocation_id) gid: vec3<u32>) {
     var neighbor_velocity_sum = vec3<f32>(0.0);
     var neighbor_weight_sum = 0.0;
     var fluid_neighbor_count = 0u;
+    var wall_neighbor_count = 0u;
     let wall_viscosity_weight = 1.0;
 
     let offsets = array<vec3<i32>, 6>(
@@ -1129,11 +1100,13 @@ fn viscosity_prepare(@builtin(global_invocation_id) gid: vec3<u32>) {
             // No-slip boundary: outside the simulation domain is stationary
             // support for viscous diffusion, not missing fluid support.
             neighbor_weight_sum += wall_viscosity_weight;
+            wall_neighbor_count += 1u;
             continue;
         }
         if sdf_class_is_solid(neighbor) {
             // No-slip boundary: static solids dissipate tangential pool motion.
             neighbor_weight_sum += wall_viscosity_weight;
+            wall_neighbor_count += 1u;
             continue;
         }
 
@@ -1152,7 +1125,7 @@ fn viscosity_prepare(@builtin(global_invocation_id) gid: vec3<u32>) {
         fluid_neighbor_count += 1u;
     }
 
-    if fluid_neighbor_count < 3u || neighbor_weight_sum <= 1e-6 {
+    if (fluid_neighbor_count < 3u && wall_neighbor_count == 0u) || neighbor_weight_sum <= 1e-6 {
         velocity_scratch_store(idx, v_here);
         return;
     }
@@ -1356,14 +1329,6 @@ fn classify_cells(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
     divergence_store(idx, div - target_divergence);
-
-    // Observability: track the worst-case cell divergence and the fluid-cell
-    // footprint of the active substep. `atomicMax` on u32 gives the peak FP
-    // encoding; the HUD decodes via `METRICS_DIV_FP_SCALE`.
-    let abs_div = abs(div);
-    let fp_div = u32(clamp(abs_div * metrics_div_fp_scale(), 0.0, f32(0x7fffffffu)));
-    atomicMax(&metrics[METRIC_MAX_ABS_DIV_IDX], fp_div);
-    atomicAdd(&metrics[METRIC_FLUID_CELLS_IDX], 1u);
 }
 
 // ── pressure_rbgs ──
@@ -2273,17 +2238,6 @@ fn prepare_render(@builtin(global_invocation_id) gid: vec3<u32>) {
         vec4<f32>(p.pos.xyz, color_t),
         vec4<f32>(radius, 0.0, 0.0, 0.0),
     );
-}
-
-// ── metrics_clear ──
-
-const METRICS_SLOT_COUNT: u32 = 8u;
-
-@compute @workgroup_size(8)
-fn metrics_clear(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
-    if idx >= METRICS_SLOT_COUNT { return; }
-    atomicStore(&metrics[idx], 0u);
 }
 
 // ── bed_lookup_clear ──

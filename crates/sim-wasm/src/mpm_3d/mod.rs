@@ -26,7 +26,7 @@ use inflow::{EmissionResult, InflowState, SpoutSettings, MASS_UNITS_PER_ML};
 use pipelines::MpmPipelines;
 use state::{
     MpmBuffers, MpmUniforms, FP_SCALE, FP_VALUE_LIMIT, MAX_VELOCITY, METRICS_DIV_FP_SCALE,
-    METRICS_SLOT_COUNT, NUM_THREADS, SDF_RES,
+    NUM_THREADS, SDF_RES,
 };
 
 const TARGET_BED_RETENTION_ML: f32 = DEFAULT_BREW.target_bed_retention_ml;
@@ -34,22 +34,15 @@ pub(crate) const OBSTACLE_WALL_THICKNESS: f32 = 0.4;
 
 /// Device limits required by the MPM compute pipeline.
 ///
-/// The MPM bind group holds 9 storage buffers (particles, affine, grid,
-/// grid_vel, render_data, bed_extract, bed_lookup, bed_delta, metrics) plus
-/// one SDF texture. This stays within the 10-buffer cap that some WebGPU
-/// adapters enforce. Any
-/// `request_device` site that uses this pipeline must use these limits, and
-/// `mpm_pipelines_fit_within_required_limits` pins the invariant.
+/// Keep this at WebGPU defaults for browser-native startup. Some browser GPU
+/// stacks hang when a page requests explicit `requiredLimits`, even when the
+/// requested value is otherwise supported.
 pub(crate) fn required_limits() -> wgpu::Limits {
-    wgpu::Limits {
-        max_storage_buffers_per_shader_stage: 10,
-        ..wgpu::Limits::default()
-    }
+    wgpu::Limits::default()
 }
 
-/// Snapshot of the projection observability counters sampled asynchronously
-/// from the GPU metrics buffer. Values are the last successful readback; they
-/// decay to `None` / stale values if the readback path has not completed yet.
+/// Snapshot of debug observability counters. Disabled in the browser visual
+/// path while the MPM bind group stays within default WebGPU limits.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct MetricsSnapshot {
     /// Peak `|div u|` observed across any fluid cell in the most recent
@@ -300,8 +293,6 @@ impl MpmSim3D {
             let particle_wg = dispatch_size(num_particles, NUM_THREADS);
             let bed_wg = dispatch_size(self.num_bed, NUM_THREADS);
 
-            let metrics_wg = dispatch_size(METRICS_SLOT_COUNT as u32, 8);
-
             let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("mpm step"),
             });
@@ -314,13 +305,7 @@ impl MpmSim3D {
                 });
                 pass.set_bind_group(0, &self.pipelines.bind_group, &[]);
 
-                // 1a. metrics_clear (fresh per-substep observability counters)
-                if metrics_wg > 0 {
-                    pass.set_pipeline(&self.pipelines.metrics_clear);
-                    pass.dispatch_workgroups(metrics_wg, 1, 1);
-                }
-
-                // 1b. bed_lookup_clear + scatter: rebuild the spatial index
+                // 1a. bed_lookup_clear + scatter: rebuild the spatial index
                 // so classify_cells / bed_coupling / g2p see current
                 // bed-particle positions.
                 pass.set_pipeline(&self.pipelines.bed_lookup_clear);
@@ -417,13 +402,6 @@ impl MpmSim3D {
 
             self.total_time += sub_dt;
         }
-
-        // The metrics staging copy used to happen here every frame, but that
-        // races against the async `map_async` in `refresh_metrics` — the next
-        // frame's copy would try to write into a buffer that was still in a
-        // pending-map state, and wgpu panics. The copy now lives inside
-        // `refresh_metrics` itself, which keeps the staging buffer idle
-        // between snapshot requests.
 
         // The filter mesh is static CPU render geometry, not solver state, so
         // there is no per-frame mesh work here.
@@ -543,20 +521,11 @@ impl MpmSim3D {
         self.latest_metrics
     }
 
-    /// Async staging-buffer readback for the GPU metrics counters.
+    /// Async readback for debug metrics.
     ///
-    /// Currently **disabled** — every form of the readback path we tried
-    /// (per-frame copy, inline copy-then-map, fire-and-forget map) freezes
-    /// the browser tab on the second or third call. The shader-side
-    /// instrumentation still runs and writes to the GPU `metrics` buffer on
-    /// every substep; only the CPU-side pull-back is gated off until we can
-    /// get a proper map/unmap lifecycle working.
-    ///
-    /// TODO(readback): reimplement using either
-    ///   1. a dedicated staging buffer per in-flight request + a small
-    ///      ring so a pending map never blocks a new copy, or
-    ///   2. `queue.on_submitted_work_done` as a gate before calling
-    ///      `map_async`, so the map only starts after GPU work drains.
+    /// Disabled for the browser-native visual path. Removing the extra metrics
+    /// storage binding keeps the MPM bind group within default WebGPU limits,
+    /// which avoids a browser hang during device creation.
     #[cfg(target_arch = "wasm32")]
     pub async fn refresh_metrics(
         &mut self,

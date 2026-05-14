@@ -19,9 +19,6 @@ pub(crate) const FP_VALUE_LIMIT: f32 = 8192.0;
 pub(crate) const NUM_THREADS: u32 = 64;
 pub(crate) const SDF_RES: u32 = 128;
 
-/// Number of `u32` slots in the metrics buffer. Keep in sync with the indices
-/// in `shader.rs` (`METRIC_*_IDX`).
-pub(crate) const METRICS_SLOT_COUNT: usize = 8;
 /// Fixed-point scale used by the `MAX_ABS_DIV` slot — divergence is already a
 /// moderate-magnitude quantity, so a smaller scale keeps the atomic headroom
 /// comfortable while still giving useful resolution on the HUD.
@@ -45,7 +42,7 @@ pub(crate) struct MpmUniforms {
     pub bed_params: [f32; 4],
     pub extraction_params: [f32; 4],
     pub time_params: [f32; 4],
-    /// `[div_clamp, pressure_clamp, metrics_div_fp_scale, metrics_div_inv_fp_scale]`.
+    /// `[div_clamp, pressure_clamp, reserved_debug_scale, reserved_debug_inv_scale]`.
     /// `div_clamp` and `pressure_clamp` feed the fixed-point bound checks in
     /// `divergence_store` / `pressure_store` and are derived per frame from the
     /// grid spacing and the velocity cap, not hardcoded.
@@ -69,16 +66,6 @@ pub(crate) struct MpmBuffers {
     pub render_data: wgpu::Buffer,
     pub bed_extract: wgpu::Buffer,
     pub uniform_buffer: wgpu::Buffer,
-    /// Compute-side scratch buffer for projection + overflow observability.
-    /// Layout: `u32[METRICS_SLOT_COUNT]`. Indices match `METRIC_*_IDX` in the
-    /// shader. Populated every substep via atomics, cleared via
-    /// `metrics_clear`.
-    pub metrics: wgpu::Buffer,
-    /// MAP_READ staging buffer for async CPU readback of `metrics`. Kept in
-    /// place so the readback path can be rewired without reshaping
-    /// `MpmBuffers`; currently unread while `refresh_metrics` is stubbed.
-    #[allow(dead_code)]
-    pub metrics_staging: wgpu::Buffer,
 }
 
 impl MpmBuffers {
@@ -159,22 +146,6 @@ impl MpmBuffers {
             mapped_at_creation: false,
         });
 
-        let metrics_size = (METRICS_SLOT_COUNT * size_of::<u32>()) as u64;
-        let metrics = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("mpm metrics"),
-            size: metrics_size,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let metrics_staging = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("mpm metrics staging"),
-            size: metrics_size,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-
         let sdf_data = generate_sdf_data(settings);
         let sdf_class_data = generate_sdf_class_data(settings, &sdf_data);
         let (sdf_texture, sdf_view) = create_sdf_texture(device, queue, &sdf_data);
@@ -195,8 +166,6 @@ impl MpmBuffers {
             render_data,
             bed_extract,
             uniform_buffer,
-            metrics,
-            metrics_staging,
         }
     }
 }

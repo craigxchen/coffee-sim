@@ -5,7 +5,6 @@ use super::state::MpmBuffers;
 
 pub(crate) struct MpmPipelines {
     pub bind_group: wgpu::BindGroup,
-    pub metrics_clear: wgpu::ComputePipeline,
     pub bed_lookup_clear: wgpu::ComputePipeline,
     pub bed_lookup_scatter: wgpu::ComputePipeline,
     pub p2g: wgpu::ComputePipeline,
@@ -69,8 +68,6 @@ impl MpmPipelines {
                 storage_entry(8),
                 // 9: bed_delta
                 storage_entry(9),
-                // 10: metrics (projection residual / clamp counters).
-                storage_entry(10),
                 // 11: cached cell-solid classification for classify_cells
                 wgpu::BindGroupLayoutEntry {
                     binding: 11,
@@ -130,10 +127,6 @@ impl MpmPipelines {
                     resource: buffers.bed_delta.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
-                    binding: 10,
-                    resource: buffers.metrics.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
                     binding: 11,
                     resource: wgpu::BindingResource::TextureView(&buffers.sdf_class_view),
                 },
@@ -164,7 +157,6 @@ impl MpmPipelines {
 
         Self {
             bind_group,
-            metrics_clear: make("metrics_clear"),
             bed_lookup_clear: make("bed_lookup_clear"),
             bed_lookup_scatter: make("bed_lookup_scatter"),
             p2g: make("p2g"),
