@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Coffee Sim | 3D Pourover</title>
-    <link rel="stylesheet" href="./styles.css?v=viewcube-pressure-1" />
+    <link rel="stylesheet" href="./styles.css?v=debug-scenes-1" />
   </head>
   <body>
     <main class="layout">
@@ -23,9 +23,39 @@
           <div class="slider-field">
             <span>Scenes</span>
           </div>
-          <div class="controls">
+          <div class="scene-tabs" role="tablist" aria-label="Scene groups">
+            <button
+              id="scene-tab-main"
+              class="scene-tab is-active"
+              type="button"
+              role="tab"
+              aria-selected="true"
+              aria-controls="scene-panel-main"
+            >
+              Scenes
+            </button>
+            <button
+              id="scene-tab-debug"
+              class="scene-tab"
+              type="button"
+              role="tab"
+              aria-selected="false"
+              aria-controls="scene-panel-debug"
+            >
+              Debug Scenes
+            </button>
+          </div>
+          <div id="scene-panel-main" class="scene-panel controls" role="tabpanel" aria-labelledby="scene-tab-main">
             <button id="scene-center-pour">Center Pour</button>
             <button id="scene-free-stream">Water Only</button>
+          </div>
+          <div
+            id="scene-panel-debug"
+            class="scene-panel controls"
+            role="tabpanel"
+            aria-labelledby="scene-tab-debug"
+            hidden
+          >
             <button id="scene-water-block">Water Block</button>
           </div>
         </div>
@@ -183,6 +213,6 @@
         </div>
       </section>
     </main>
-    <script type="module" src="./main.js?v=viewcube-pressure-1"></script>
+    <script type="module" src="./main.js?v=debug-scenes-1"></script>
   </body>
 </html>
