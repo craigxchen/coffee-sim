@@ -221,6 +221,12 @@ impl WasmSim3D {
         self.rebuild_with_settings(MpmSettings::benchmark_center_pour());
     }
 
+    #[wasm_bindgen(js_name = loadBenchmarkFilterWaterBlock)]
+    pub fn load_benchmark_filter_water_block(&mut self) {
+        self.rebuild_with_settings(MpmSettings::benchmark_filter_water_block());
+        self.sim.seed_filter_water_block(self.renderer.queue());
+    }
+
     #[wasm_bindgen(js_name = stepFrame)]
     pub fn step_frame(&mut self, frame_time: f32) {
         self.sim

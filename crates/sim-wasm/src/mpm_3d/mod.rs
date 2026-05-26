@@ -258,6 +258,14 @@ impl MpmSettings {
         settings.initial_water_speed_m_s = DEFAULT_BREW.initial_water_speed_m_s;
         settings
     }
+
+    pub fn benchmark_filter_water_block() -> Self {
+        let mut settings = Self::default_v60();
+        settings.spout.origin = Vec3::new(0.0, 7.1, 0.0);
+        settings.initial_water_speed_m_s = 0.0;
+        settings.pressure_rbgs_pairs = 80;
+        settings
+    }
 }
 
 fn v60_support_cone(filter: &FilterConfig) -> Obstacle {
@@ -289,6 +297,15 @@ fn cup_region(settings: &MpmSettings) -> Option<(f32, f32, f32)> {
             } => Some((*radius, *top_y, *bot_y)),
             _ => None,
         })
+}
+
+fn deterministic_unit_float(mut value: u32) -> f32 {
+    value ^= value >> 16;
+    value = value.wrapping_mul(0x7feb_352d);
+    value ^= value >> 15;
+    value = value.wrapping_mul(0x846c_a68b);
+    value ^= value >> 16;
+    value as f32 / u32::MAX as f32
 }
 
 pub(crate) struct MpmSim3D {
@@ -377,6 +394,87 @@ impl MpmSim3D {
             0,
             bytemuck::cast_slice(&zero_delta),
         );
+    }
+
+    pub fn seed_filter_water_block(&mut self, queue: &wgpu::Queue) {
+        let Some(filter) = self.settings.filter.as_ref() else {
+            return;
+        };
+
+        let [gx, _, _] = self.settings.grid_dims;
+        let dx = self.settings.bounds_size.x / gx as f32;
+        let spacing = dx * 0.80;
+        let particle_mass = MASS_UNITS_PER_ML / inflow::PARTICLES_PER_ML;
+        let available = self.settings.max_particles.saturating_sub(self.num_bed);
+        if available == 0 {
+            return;
+        }
+
+        let bed_top_y = self
+            .settings
+            .bed
+            .as_ref()
+            .map(|bed| bed.center.y + bed.top_y)
+            .unwrap_or(filter.center.y + filter.bot_y + 0.8);
+        let y_min = bed_top_y + spacing * 1.5;
+        let y_max = (filter.center.y + filter.top_y - spacing * 3.0).min(y_min + 1.65);
+        let wall_margin = dx * 3.0;
+        let golden_angle = 2.399_963_1_f32;
+
+        let mut particle_data: Vec<[f32; 8]> = Vec::new();
+        let mut affine_data: Vec<[f32; 12]> = Vec::new();
+
+        let mut layer = 0_u32;
+        let mut y = y_min;
+        while y <= y_max && particle_data.len() < available as usize {
+            let local_y = y - filter.center.y;
+            let inner_radius = (filter.inner_radius_at_y(local_y) - wall_margin).max(0.0);
+            let layer_area = std::f32::consts::PI * inner_radius * inner_radius;
+            let sample_area = spacing * spacing * 0.92;
+            let samples = (layer_area / sample_area).ceil().max(1.0) as u32;
+            let layer_rotation = layer as f32 * 0.618_034;
+            for i in 0..samples {
+                if particle_data.len() >= available as usize {
+                    break;
+                }
+                let seed = layer.wrapping_mul(1_664_525).wrapping_add(i);
+                let radius_jitter =
+                    (deterministic_unit_float(seed ^ 0x9e37_79b9) - 0.5) * spacing * 0.30;
+                let angle_jitter = (deterministic_unit_float(seed ^ 0x85eb_ca6b) - 0.5) * 0.22;
+                let t = (i as f32 + 0.5) / samples as f32;
+                let radius_limit = (inner_radius - spacing * 0.35).max(0.0);
+                let radius = (inner_radius * t.sqrt() + radius_jitter).clamp(0.0, radius_limit);
+                let angle = i as f32 * golden_angle + layer_rotation + angle_jitter;
+                let x = filter.center.x + radius * angle.cos();
+                let z = filter.center.z + radius * angle.sin();
+                particle_data.push([x, y, z, 1.0, 0.0, 0.0, 0.0, particle_mass]);
+                affine_data.push([0.0; 12]);
+            }
+            layer += 1;
+            y += spacing;
+        }
+
+        let particle_offset = (self.num_bed as u64) * 32;
+        let affine_offset = (self.num_bed as u64) * 48;
+        queue.write_buffer(
+            &self.buffers.particles,
+            particle_offset,
+            bytemuck::cast_slice(&particle_data),
+        );
+        queue.write_buffer(
+            &self.buffers.affine,
+            affine_offset,
+            bytemuck::cast_slice(&affine_data),
+        );
+
+        self.num_water = particle_data.len() as u32;
+        self.total_time = 0.0;
+        self.frame_emitted_mass = particle_mass * self.num_water as f32;
+        self.total_emitted_mass = self.frame_emitted_mass;
+        self.frame_dropped_particles = 0;
+        self.total_dropped_particles = 0;
+        self.latest_metrics = MetricsSnapshot::default();
+        self.set_exit_speed_m_s(0.0);
     }
 
     fn water_diagnostics_from_particle_data(&self, data: &[f32]) -> WaterDiagnostics {
@@ -1150,6 +1248,10 @@ mod tests {
         assert!(shader::MPM_COMPUTE_SHADER.contains("fn dripper_top_radius()"));
         assert!(shader::MPM_COMPUTE_SHADER.contains("fn resolve_conical_barrier("));
         assert!(shader::MPM_COMPUTE_SHADER
+            .contains("Use analytic obstacles for live contact and pressure classification"));
+        assert!(shader::MPM_COMPUTE_SHADER
+            .contains("return sample_sdf(cell_center_from_cell(cell)) < 0.0;"));
+        assert!(shader::MPM_COMPUTE_SHADER
             .contains("(dripper_top_radius() - dripper_outlet_radius()) / cone_height"));
         assert!(shader::MPM_COMPUTE_SHADER.contains("fn viscosity_prepare("));
         assert!(shader::MPM_COMPUTE_SHADER.contains("fn viscosity_apply("));
@@ -1181,6 +1283,15 @@ mod tests {
         inflow.update(&s.spout);
         assert!(inflow.exit_speed() * units::METERS_PER_SIM_UNIT <= 0.13);
         assert!(s.spout.max_exit_speed * units::METERS_PER_SIM_UNIT <= 0.50);
+    }
+
+    #[test]
+    fn filter_water_block_scene_keeps_filter_bed_and_disables_inflow() {
+        let s = MpmSettings::benchmark_filter_water_block();
+        assert!(s.filter.is_some());
+        assert!(s.bed.is_some());
+        assert_eq!(s.initial_water_speed_m_s, 0.0);
+        assert!(s.pressure_rbgs_pairs >= MpmSettings::default_v60().pressure_rbgs_pairs);
     }
 
     #[test]
