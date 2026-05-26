@@ -30,6 +30,7 @@ use state::{
 };
 
 const TARGET_BED_RETENTION_ML: f32 = DEFAULT_BREW.target_bed_retention_ml;
+pub(crate) const CONTACT_OFFSET: f32 = 0.05;
 pub(crate) const OBSTACLE_WALL_THICKNESS: f32 = 0.4;
 
 /// Device limits required by the MPM compute pipeline.
@@ -1143,7 +1144,7 @@ impl MpmSim3D {
                 DEFAULT_BREW.bed_sample_radius_dx,
                 DEFAULT_BREW.filter_absorption_rate_s,
             ],
-            sdf_params: [SDF_RES as f32, 0.3, 0.0, 0.05],
+            sdf_params: [SDF_RES as f32, 0.3, 0.0, CONTACT_OFFSET],
             // Tie bed retention to an overall retained-water target so the bed
             // wets realistically without swallowing most of the brew.
             bed_params: [
@@ -1244,6 +1245,7 @@ mod tests {
             })
             .expect("default scene must contain a cylinder");
         assert_eq!(cup, (3.0, -3.5, -8.0));
+        assert!(shader::MPM_COMPUTE_SHADER.contains("fn contact_offset() -> f32"));
         assert!(shader::MPM_COMPUTE_SHADER.contains("const OBSTACLE_WALL_THICKNESS: f32 = 0.4;"));
         assert!(shader::MPM_COMPUTE_SHADER.contains("fn dripper_top_radius()"));
         assert!(shader::MPM_COMPUTE_SHADER.contains("fn resolve_conical_barrier("));

@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Coffee Sim | 3D Pourover</title>
-    <link rel="stylesheet" href="./styles.css?v=vertical-velocity-2" />
+    <link rel="stylesheet" href="./styles.css?v=viewcube-2" />
   </head>
   <body>
     <main class="layout">
@@ -155,8 +155,18 @@
         <div class="cross-section-overlay" aria-hidden="true">
           <span>Center Cross-Section</span>
         </div>
+        <div class="view-cube" role="img" aria-label="Camera orientation">
+          <div id="view-cube-stage" class="view-cube-stage">
+            <span class="view-cube-face view-cube-face-front">+Z</span>
+            <span class="view-cube-face view-cube-face-back">-Z</span>
+            <span class="view-cube-face view-cube-face-right">+X</span>
+            <span class="view-cube-face view-cube-face-left">-X</span>
+            <span class="view-cube-face view-cube-face-top">+Y</span>
+            <span class="view-cube-face view-cube-face-bottom">-Y</span>
+          </div>
+        </div>
       </section>
     </main>
-    <script type="module" src="./main.js?v=water-block-3"></script>
+    <script type="module" src="./main.js?v=viewcube-2"></script>
   </body>
 </html>
