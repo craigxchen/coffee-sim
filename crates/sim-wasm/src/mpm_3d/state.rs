@@ -262,6 +262,9 @@ fn generate_sdf_data(settings: &MpmSettings) -> Vec<f32> {
                         -bounds.z * 0.5 + (iz as f32 + 0.5) * bounds.z / n as f32,
                     );
                     let sd = sdf_interior(obstacle, p) - OBSTACLE_WALL_THICKNESS * 0.5;
+                    if sd >= SDF_NO_CONSTRAINT - 1.0 {
+                        continue;
+                    }
                     let idx = iz * n * n + iy * n + ix;
                     if data[idx] >= SDF_NO_CONSTRAINT - 1.0 {
                         data[idx] = sd;
@@ -465,5 +468,24 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn sdf_union_keeps_active_cone_when_cup_is_inactive() {
+        let settings = MpmSettings::default_v60();
+        let sdf_data = generate_sdf_data(&settings);
+
+        let inside_cone = sample_sdf_from_data(&settings, &sdf_data, Vec3::new(0.0, 0.0, 0.0));
+        let outside_cone_wall =
+            sample_sdf_from_data(&settings, &sdf_data, Vec3::new(3.0, 0.0, 0.0));
+
+        assert!(
+            inside_cone > 0.0,
+            "centerline should stay open inside the V60 cone: {inside_cone}"
+        );
+        assert!(
+            outside_cone_wall < 0.0,
+            "V60 cone wall should remain solid even where the cup cylinder is inactive: {outside_cone_wall}"
+        );
     }
 }

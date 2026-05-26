@@ -1,10 +1,11 @@
-import init, { WasmSim3D } from "./pkg/coffee_sim_wasm.js?v=realism-eval-7";
+import init, { WasmSim3D } from "./pkg/coffee_sim_wasm.js?v=water-block-3";
 
 const canvas = document.getElementById("sim-canvas");
 const toggleButton = document.getElementById("toggle");
 const resetButton = document.getElementById("reset");
 const sceneFreeStreamButton = document.getElementById("scene-free-stream");
 const sceneCenterPourButton = document.getElementById("scene-center-pour");
+const sceneWaterBlockButton = document.getElementById("scene-water-block");
 const waterVelocityInput = document.getElementById("water-velocity");
 const waterVelocityValue = document.getElementById("water-velocity-value");
 const spoutPlane = document.getElementById("spout-plane");
@@ -96,6 +97,10 @@ toggleButton.addEventListener("click", () => {
 });
 
 resetButton.addEventListener("click", () => {
+  if (currentSceneMode === "Water Block") {
+    loadWaterBlockScene();
+    return;
+  }
   app.reset();
   applyWaterVelocityControl();
   applySpoutControls();
@@ -130,6 +135,10 @@ sceneCenterPourButton.addEventListener("click", () => {
   setPaused(false);
   lastFrameTime = 0;
   syncUi();
+});
+
+sceneWaterBlockButton.addEventListener("click", () => {
+  loadWaterBlockScene();
 });
 
 waterVelocityInput.addEventListener("input", () => {
@@ -359,6 +368,18 @@ function applySpoutControls() {
 function applySceneControls() {
 }
 
+function loadWaterBlockScene() {
+  app.loadBenchmarkFilterWaterBlock();
+  syncControlDefaultsFromSim();
+  applySceneControls();
+  fixedStepSeconds = 1 / 60;
+  currentSceneMode = "Water Block";
+  app.stepFrame(0);
+  setPaused(true);
+  lastFrameTime = 0;
+  syncUi();
+}
+
 function updateSpoutPlaneFromPointer(e) {
   const rect = spoutPlane.getBoundingClientRect();
   const u = clamp((e.clientX - rect.left) / rect.width, 0.0, 1.0);
@@ -514,6 +535,10 @@ function loadEvaluationScene(scene) {
   if (scene === "water-only" || scene === "free-stream") {
     app.loadBenchmarkFreeStream();
     currentSceneMode = "Water Only";
+  } else if (scene === "water-block" || scene === "filter-water-block") {
+    app.loadBenchmarkFilterWaterBlock();
+    currentSceneMode = "Water Block";
+    app.stepFrame(0);
   } else {
     app.loadBenchmarkCenterPour();
     currentSceneMode = "Center Pour";

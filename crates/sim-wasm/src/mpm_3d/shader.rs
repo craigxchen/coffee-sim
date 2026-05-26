@@ -618,7 +618,7 @@ fn deposit_absorbed_bed_water(home_cell: vec3<i32>, home_bed_idx: i32, absorbed:
 }
 
 fn sdf_class_is_solid(cell: vec3<i32>) -> bool {
-    return textureLoad(sdf_class_tex, cell, 0).r != 0u;
+    return sample_sdf(cell_center_from_cell(cell)) < 0.0;
 }
 
 fn is_fluid_kind(kind: i32) -> bool {
@@ -729,26 +729,35 @@ fn load_sdf_texel(c: vec3<i32>) -> f32 {
 }
 
 fn sample_sdf(position: vec3<f32>) -> f32 {
-    let bounds_size = u.bounds_max.xyz * 2.0;
-    let res = sdf_res();
-    let uv = (position + u.bounds_max.xyz) / bounds_size * res - vec3<f32>(0.5);
-    let base = vec3<i32>(floor(uv));
-    let f = fract(uv);
-    let c000 = load_sdf_texel(base);
-    let c100 = load_sdf_texel(base + vec3<i32>(1, 0, 0));
-    let c010 = load_sdf_texel(base + vec3<i32>(0, 1, 0));
-    let c110 = load_sdf_texel(base + vec3<i32>(1, 1, 0));
-    let c001 = load_sdf_texel(base + vec3<i32>(0, 0, 1));
-    let c101 = load_sdf_texel(base + vec3<i32>(1, 0, 1));
-    let c011 = load_sdf_texel(base + vec3<i32>(0, 1, 1));
-    let c111 = load_sdf_texel(base + vec3<i32>(1, 1, 1));
-    let c00 = mix(c000, c100, f.x);
-    let c10 = mix(c010, c110, f.x);
-    let c01 = mix(c001, c101, f.x);
-    let c11 = mix(c011, c111, f.x);
-    let c0 = mix(c00, c10, f.y);
-    let c1 = mix(c01, c11, f.y);
-    return mix(c0, c1, f.z);
+    // Use analytic obstacles for live contact and pressure classification.
+    // The texture SDF is coarse enough that a circular cone picks up a
+    // fourfold Cartesian alias, which traps water on the filter wall and then
+    // ejects it inward. Keep this parallel to `MpmSettings::default_v60()`.
+    var result = 999.0;
+
+    let cone_top_y = 3.0;
+    let cone_bot_y = -3.0;
+    if position.y <= cone_top_y && position.y >= cone_bot_y {
+        let t = clamp((position.y - cone_bot_y) / (cone_top_y - cone_bot_y), 0.0, 1.0);
+        let cone_radius = mix(dripper_outlet_radius(), dripper_top_radius(), t);
+        result = cone_radius - length(position.xz) - obstacle_wall_half_thickness();
+    }
+
+    let cup_top_y = -3.5;
+    let cup_bot_y = -8.0;
+    if position.y <= cup_top_y {
+        let radial_sd = 3.0 - length(position.xz);
+        let floor_sd = position.y - cup_bot_y;
+        let cup_sd = min(radial_sd, floor_sd) - obstacle_wall_half_thickness();
+        result = select(max(result, cup_sd), cup_sd, result >= 998.0);
+    }
+
+    return result;
+}
+
+fn cell_center_from_cell(cell: vec3<i32>) -> vec3<f32> {
+    return u.grid_origin.xyz
+        + (vec3<f32>(cell) + vec3<f32>(0.5)) * dx();
 }
 
 fn sdf_gradient(position: vec3<f32>) -> vec3<f32> {
