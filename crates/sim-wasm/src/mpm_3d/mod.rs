@@ -116,6 +116,13 @@ pub(crate) struct WaterDiagnostics {
     pub surface_tilt_height_y: f32,
     pub surface_residual_rms_y: f32,
     pub surface_residual_peak_to_peak_y: f32,
+    pub hydrostatic_sample_count: u32,
+    pub hydrostatic_depth_m: f32,
+    pub hydrostatic_top_pressure_pa: f32,
+    pub hydrostatic_bottom_pressure_pa: f32,
+    pub hydrostatic_delta_pressure_pa: f32,
+    pub hydrostatic_gradient_pa_per_m: f32,
+    pub hydrostatic_bottom_higher: bool,
 }
 
 impl Default for WaterDiagnostics {
@@ -161,6 +168,13 @@ impl Default for WaterDiagnostics {
             surface_tilt_height_y: 0.0,
             surface_residual_rms_y: 0.0,
             surface_residual_peak_to_peak_y: 0.0,
+            hydrostatic_sample_count: 0,
+            hydrostatic_depth_m: 0.0,
+            hydrostatic_top_pressure_pa: 0.0,
+            hydrostatic_bottom_pressure_pa: 0.0,
+            hydrostatic_delta_pressure_pa: 0.0,
+            hydrostatic_gradient_pa_per_m: 0.0,
+            hydrostatic_bottom_higher: false,
         }
     }
 }
@@ -727,7 +741,89 @@ impl MpmSim3D {
             diagnostics.surface_residual_peak_to_peak_y = residual_max - residual_min;
         }
 
+        let surface_y_for_pressure = if diagnostics.surface_bin_count > 0 {
+            diagnostics.surface_mean_y
+        } else {
+            diagnostics.max.y
+        };
+        self.update_hydrostatic_diagnostics(
+            data,
+            start,
+            end,
+            inactive_thresh,
+            surface_y_for_pressure,
+            &mut diagnostics,
+        );
+
         diagnostics
+    }
+
+    fn update_hydrostatic_diagnostics(
+        &self,
+        data: &[f32],
+        start: usize,
+        end: usize,
+        inactive_thresh: f32,
+        surface_y: f32,
+        diagnostics: &mut WaterDiagnostics,
+    ) {
+        const PRESSURE_BANDS: usize = 6;
+        const WATER_DENSITY_KG_M3: f32 = 1_000.0;
+
+        if diagnostics.active_count < 2 || !surface_y.is_finite() {
+            return;
+        }
+
+        let height = diagnostics.extent.y;
+        if height <= 1e-4 {
+            return;
+        }
+
+        let mut band_counts = [0_u32; PRESSURE_BANDS];
+        let mut band_y_sums = [0.0_f32; PRESSURE_BANDS];
+        for i in start..end {
+            let base = i * 8;
+            let y = data[base + 1];
+            let mass = data[base + 7];
+            if mass <= inactive_thresh || !y.is_finite() {
+                continue;
+            }
+
+            let t = ((y - diagnostics.min.y) / height).clamp(0.0, 0.999_999);
+            let band = (t * PRESSURE_BANDS as f32) as usize;
+            band_counts[band] += 1;
+            band_y_sums[band] += y;
+        }
+
+        let bottom_band = band_counts.iter().position(|count| *count > 0);
+        let top_band = band_counts.iter().rposition(|count| *count > 0);
+        let (Some(bottom_band), Some(top_band)) = (bottom_band, top_band) else {
+            return;
+        };
+        if bottom_band == top_band {
+            return;
+        }
+
+        let bottom_y = band_y_sums[bottom_band] / band_counts[bottom_band] as f32;
+        let top_y = band_y_sums[top_band] / band_counts[top_band] as f32;
+        let pressure_from_head = |y: f32| {
+            WATER_DENSITY_KG_M3
+                * units::STANDARD_GRAVITY_M_S2
+                * ((surface_y - y).max(0.0) * units::METERS_PER_SIM_UNIT)
+        };
+        let top_pressure = pressure_from_head(top_y);
+        let bottom_pressure = pressure_from_head(bottom_y);
+        let depth_m = ((top_y - bottom_y).max(0.0)) * units::METERS_PER_SIM_UNIT;
+        let delta = bottom_pressure - top_pressure;
+
+        diagnostics.hydrostatic_sample_count = band_counts[bottom_band] + band_counts[top_band];
+        diagnostics.hydrostatic_depth_m = depth_m;
+        diagnostics.hydrostatic_top_pressure_pa = top_pressure;
+        diagnostics.hydrostatic_bottom_pressure_pa = bottom_pressure;
+        diagnostics.hydrostatic_delta_pressure_pa = delta;
+        diagnostics.hydrostatic_gradient_pa_per_m =
+            if depth_m > 1e-6 { delta / depth_m } else { 0.0 };
+        diagnostics.hydrostatic_bottom_higher = delta > 1.0;
     }
 
     pub fn step_frame(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, dt: f32) {

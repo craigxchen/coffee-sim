@@ -1,4 +1,4 @@
-import init, { WasmSim3D } from "./pkg/coffee_sim_wasm.js?v=viewcube-2";
+import init, { WasmSim3D } from "./pkg/coffee_sim_wasm.js?v=viewcube-pressure-1";
 
 const canvas = document.getElementById("sim-canvas");
 const viewCubeStage = document.getElementById("view-cube-stage");
@@ -34,6 +34,10 @@ const fluidCellsLabel = document.getElementById("fluid-cells");
 const divClampFiresLabel = document.getElementById("div-clamp-fires");
 const pressureClampFiresLabel = document.getElementById("pressure-clamp-fires");
 const massOverflowFiresLabel = document.getElementById("mass-overflow-fires");
+const pressureDepthLabel = document.getElementById("pressure-depth");
+const pressureBottomLabel = document.getElementById("pressure-bottom");
+const pressureDeltaLabel = document.getElementById("pressure-delta");
+const pressureStatusLabel = document.getElementById("pressure-status");
 const toggleDebugButton = document.getElementById("toggle-debug");
 const debugStats = document.getElementById("debug-stats");
 
@@ -43,6 +47,9 @@ const debugStats = document.getElementById("debug-stats");
 const METRICS_REFRESH_INTERVAL = 10;
 let metricsFrameCounter = 0;
 let metricsRefreshInFlight = false;
+const PRESSURE_DIAGNOSTICS_INTERVAL = 60;
+let pressureDiagnosticsFrameCounter = 0;
+let pressureDiagnosticsInFlight = false;
 const AUTO_PAUSE_DELAY_MS = 30_000;
 
 let app;
@@ -114,6 +121,7 @@ toggleDebugButton.addEventListener("click", () => {
   toggleDebugButton.textContent = debugStats.classList.contains("hidden")
     ? "Show Debug Stats"
     : "Hide Debug Stats";
+  pressureDiagnosticsFrameCounter = PRESSURE_DIAGNOSTICS_INTERVAL;
 });
 
 sceneFreeStreamButton.addEventListener("click", () => {
@@ -284,6 +292,7 @@ function animate(timestamp) {
   updateViewCube();
   updateFps(frameTime);
   maybeRefreshMetrics();
+  maybeRefreshPressureDiagnostics();
   syncUi();
   requestAnimationFrame(animate);
 }
@@ -325,6 +334,38 @@ function maybeRefreshMetrics() {
   // The shader-side metrics counters still run, they just aren't plumbed
   // to the HUD. Leaving this helper wired up so the call site doesn't
   // drift when we turn the readback back on.
+}
+
+function maybeRefreshPressureDiagnostics() {
+  if (debugStats.classList.contains("hidden") || pressureDiagnosticsInFlight) return;
+  pressureDiagnosticsFrameCounter += 1;
+  if (pressureDiagnosticsFrameCounter < PRESSURE_DIAGNOSTICS_INTERVAL) return;
+  pressureDiagnosticsFrameCounter = 0;
+  pressureDiagnosticsInFlight = true;
+  app.waterDiagnostics()
+    .then(updatePressureDiagnostics)
+    .catch(() => {
+      pressureStatusLabel.textContent = "Readback failed";
+    })
+    .finally(() => {
+      pressureDiagnosticsInFlight = false;
+    });
+}
+
+function updatePressureDiagnostics(diagnostics) {
+  const pressure = diagnostics?.hydrostaticPressure;
+  if (!pressure || pressure.sampleCount <= 0 || pressure.depthMeters <= 0) {
+    pressureDepthLabel.textContent = "n/a";
+    pressureBottomLabel.textContent = "n/a";
+    pressureDeltaLabel.textContent = "n/a";
+    pressureStatusLabel.textContent = "n/a";
+    return;
+  }
+
+  pressureDepthLabel.textContent = `${(pressure.depthMeters * 1000).toFixed(1)} mm`;
+  pressureBottomLabel.textContent = `${pressure.bottomPressurePa.toFixed(0)} Pa`;
+  pressureDeltaLabel.textContent = `${pressure.deltaPressurePa.toFixed(0)} Pa`;
+  pressureStatusLabel.textContent = pressure.bottomHigher ? "OK" : "Check";
 }
 
 function applyKeyboardPan(dt) {
