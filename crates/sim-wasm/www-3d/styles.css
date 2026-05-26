@@ -61,6 +61,37 @@ h1 {
   gap: 8px;
 }
 
+.scene-tabs {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 4px;
+  padding: 3px;
+  border-radius: 10px;
+  border: 1px solid rgba(177, 200, 194, 0.16);
+  background: rgba(9, 16, 19, 0.38);
+}
+
+.scene-tab {
+  min-height: 32px;
+  padding: 6px 8px;
+  border-radius: 7px;
+  border-color: transparent;
+  background: transparent;
+  color: var(--muted);
+  font-size: 0.75rem;
+  letter-spacing: 0.04em;
+}
+
+.scene-tab.is-active {
+  border-color: rgba(217, 179, 106, 0.42);
+  background: rgba(217, 179, 106, 0.12);
+  color: var(--ink);
+}
+
+.scene-panel[hidden] {
+  display: none;
+}
+
 .control-panel {
   display: grid;
   gap: 10px;

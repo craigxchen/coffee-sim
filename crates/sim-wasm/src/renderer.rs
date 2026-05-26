@@ -310,7 +310,7 @@ impl OrbitCamera {
         // Frame the actual pourover apparatus, not the full simulation box.
         let focus_extent = bounds.x.max(bounds.z).max(bounds.y * 0.45);
         Self {
-            yaw: -0.66,
+            yaw: 0.66,
             pitch: 0.42,
             radius: focus_extent * 1.4,
             target: Vec3::new(0.0, 0.0, 0.0),
@@ -1584,6 +1584,15 @@ fn js_error(error: impl ToString) -> JsValue {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_camera_starts_in_positive_octant() {
+        let bounds = Vec3::new(14.0, 20.0, 14.0);
+        let eye = OrbitCamera::new(bounds).eye();
+        assert!(eye.x > 0.0, "default eye should start at +X: {eye:?}");
+        assert!(eye.y > 0.0, "default eye should start at +Y: {eye:?}");
+        assert!(eye.z > 0.0, "default eye should start at +Z: {eye:?}");
+    }
 
     #[test]
     fn pan_translates_target() {

@@ -1,9 +1,13 @@
-import init, { WasmSim3D } from "./pkg/coffee_sim_wasm.js?v=viewcube-pressure-1";
+import init, { WasmSim3D } from "./pkg/coffee_sim_wasm.js?v=debug-scenes-1";
 
 const canvas = document.getElementById("sim-canvas");
 const viewCubeStage = document.getElementById("view-cube-stage");
 const toggleButton = document.getElementById("toggle");
 const resetButton = document.getElementById("reset");
+const sceneMainTab = document.getElementById("scene-tab-main");
+const sceneDebugTab = document.getElementById("scene-tab-debug");
+const sceneMainPanel = document.getElementById("scene-panel-main");
+const sceneDebugPanel = document.getElementById("scene-panel-debug");
 const sceneFreeStreamButton = document.getElementById("scene-free-stream");
 const sceneCenterPourButton = document.getElementById("scene-center-pour");
 const sceneWaterBlockButton = document.getElementById("scene-water-block");
@@ -124,12 +128,21 @@ toggleDebugButton.addEventListener("click", () => {
   pressureDiagnosticsFrameCounter = PRESSURE_DIAGNOSTICS_INTERVAL;
 });
 
+sceneMainTab.addEventListener("click", () => {
+  setSceneTab("main");
+});
+
+sceneDebugTab.addEventListener("click", () => {
+  setSceneTab("debug");
+});
+
 sceneFreeStreamButton.addEventListener("click", () => {
   app.loadBenchmarkFreeStream();
   syncControlDefaultsFromSim();
   applySceneControls();
   fixedStepSeconds = 1 / 60;
   currentSceneMode = "Water Only";
+  setSceneTab("main");
   setPaused(false);
   lastFrameTime = 0;
   syncUi();
@@ -141,6 +154,7 @@ sceneCenterPourButton.addEventListener("click", () => {
   applySceneControls();
   fixedStepSeconds = 1 / 60;
   currentSceneMode = "Center Pour";
+  setSceneTab("main");
   setPaused(false);
   lastFrameTime = 0;
   syncUi();
@@ -430,12 +444,23 @@ function applySpoutControls() {
 function applySceneControls() {
 }
 
+function setSceneTab(tabName) {
+  const debugSelected = tabName === "debug";
+  sceneMainTab.classList.toggle("is-active", !debugSelected);
+  sceneDebugTab.classList.toggle("is-active", debugSelected);
+  sceneMainTab.setAttribute("aria-selected", debugSelected ? "false" : "true");
+  sceneDebugTab.setAttribute("aria-selected", debugSelected ? "true" : "false");
+  sceneMainPanel.hidden = debugSelected;
+  sceneDebugPanel.hidden = !debugSelected;
+}
+
 function loadWaterBlockScene() {
   app.loadBenchmarkFilterWaterBlock();
   syncControlDefaultsFromSim();
   applySceneControls();
   fixedStepSeconds = 1 / 60;
   currentSceneMode = "Water Block";
+  setSceneTab("debug");
   app.stepFrame(0);
   setPaused(true);
   lastFrameTime = 0;
@@ -597,13 +622,16 @@ function loadEvaluationScene(scene) {
   if (scene === "water-only" || scene === "free-stream") {
     app.loadBenchmarkFreeStream();
     currentSceneMode = "Water Only";
+    setSceneTab("main");
   } else if (scene === "water-block" || scene === "filter-water-block") {
     app.loadBenchmarkFilterWaterBlock();
     currentSceneMode = "Water Block";
+    setSceneTab("debug");
     app.stepFrame(0);
   } else {
     app.loadBenchmarkCenterPour();
     currentSceneMode = "Center Pour";
+    setSceneTab("main");
   }
   fixedStepSeconds = 1 / 60;
   syncControlDefaultsFromSim();
