@@ -314,6 +314,16 @@ impl WasmSim3D {
             .pan(right, up, forward, self.sim.settings().bounds_size);
     }
 
+    #[wasm_bindgen(js_name = cameraYaw)]
+    pub fn camera_yaw(&self) -> f32 {
+        self.camera.yaw
+    }
+
+    #[wasm_bindgen(js_name = cameraPitch)]
+    pub fn camera_pitch(&self) -> f32 {
+        self.camera.pitch
+    }
+
     #[wasm_bindgen(js_name = particleCount)]
     pub fn particle_count(&self) -> usize {
         self.sim.particle_count()

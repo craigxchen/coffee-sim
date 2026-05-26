@@ -1,6 +1,7 @@
-import init, { WasmSim3D } from "./pkg/coffee_sim_wasm.js?v=water-block-3";
+import init, { WasmSim3D } from "./pkg/coffee_sim_wasm.js?v=viewcube-2";
 
 const canvas = document.getElementById("sim-canvas");
+const viewCubeStage = document.getElementById("view-cube-stage");
 const toggleButton = document.getElementById("toggle");
 const resetButton = document.getElementById("reset");
 const sceneFreeStreamButton = document.getElementById("scene-free-stream");
@@ -280,6 +281,7 @@ function animate(timestamp) {
   }
 
   app.render();
+  updateViewCube();
   updateFps(frameTime);
   maybeRefreshMetrics();
   syncUi();
@@ -343,6 +345,25 @@ function updateFps(frameTime) {
   if (fpsWindow.length > 20) fpsWindow.shift();
   const avg = fpsWindow.reduce((s, v) => s + v, 0) / fpsWindow.length;
   fpsLabel.textContent = avg > 0 ? Math.round(1 / avg).toString() : "0";
+}
+
+function updateViewCube() {
+  const yaw = app.cameraYaw();
+  const pitch = app.cameraPitch();
+  const sinYaw = Math.sin(yaw);
+  const cosYaw = Math.cos(yaw);
+  const sinPitch = Math.sin(pitch);
+  const cosPitch = Math.cos(pitch);
+  const right = [cosYaw, 0, -sinYaw];
+  const forward = [-sinYaw * cosPitch, -sinPitch, -cosYaw * cosPitch];
+  const up = [-sinYaw * sinPitch, cosPitch, -cosYaw * sinPitch];
+  const matrix = [
+    right[0], -up[0], -forward[0], 0,
+    right[1], -up[1], -forward[1], 0,
+    right[2], -up[2], -forward[2], 0,
+    0, 0, 0, 1,
+  ];
+  viewCubeStage.style.transform = `matrix3d(${matrix.join(",")})`;
 }
 
 function syncControlDefaultsFromSim() {

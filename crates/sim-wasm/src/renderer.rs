@@ -9,8 +9,8 @@ use web_sys::HtmlCanvasElement;
 use coffee_sim_core::Vec3;
 
 use crate::mpm_3d::{
-    MpmSettings, MpmSim3D, Obstacle, MAX_FILL_VERTEX_COUNT, MAX_RENDER_VERTEX_COUNT,
-    OBSTACLE_WALL_THICKNESS,
+    MpmSettings, MpmSim3D, Obstacle, CONTACT_OFFSET, MAX_FILL_VERTEX_COUNT,
+    MAX_RENDER_VERTEX_COUNT, OBSTACLE_WALL_THICKNESS,
 };
 
 const EPSILON: f32 = 1e-6;
@@ -19,6 +19,10 @@ const CROSS_SECTION_MARGIN_CSS_PX: f32 = 16.0;
 const CROSS_SECTION_WORLD_CENTER_X: f32 = 0.0;
 const CROSS_SECTION_WORLD_CENTER_Y: f32 = -0.5;
 const CROSS_SECTION_WORLD_HEIGHT: f32 = 7.4;
+const WORLD_AXIS_LENGTH: f32 = 1.45;
+const WORLD_AXIS_NEGATIVE_STUB: f32 = 0.22;
+const WORLD_AXIS_ARROW_LENGTH: f32 = 0.24;
+const WORLD_AXIS_ARROW_WIDTH: f32 = 0.12;
 
 const PARTICLE_3D_SHADER: &str = r#"
 struct Particle3DUniforms {
@@ -123,6 +127,38 @@ fn vs_main(input: ConeVertexInput) -> ConeVertexOutput {
 @fragment
 fn fs_main(input: ConeVertexOutput) -> @location(0) vec4<f32> {
     return uniforms.color;
+}
+"#;
+
+const AXIS_SHADER: &str = r#"
+struct AxisUniforms {
+    view_proj: mat4x4<f32>,
+};
+
+@group(0) @binding(0)
+var<uniform> uniforms: AxisUniforms;
+
+struct AxisVertexInput {
+    @location(0) position: vec3<f32>,
+    @location(1) color: vec3<f32>,
+};
+
+struct AxisVertexOutput {
+    @builtin(position) clip_position: vec4<f32>,
+    @location(0) color: vec3<f32>,
+};
+
+@vertex
+fn vs_main(input: AxisVertexInput) -> AxisVertexOutput {
+    var output: AxisVertexOutput;
+    output.clip_position = uniforms.view_proj * vec4<f32>(input.position, 1.0);
+    output.color = input.color;
+    return output;
+}
+
+@fragment
+fn fs_main(input: AxisVertexOutput) -> @location(0) vec4<f32> {
+    return vec4<f32>(input.color, 0.92);
 }
 "#;
 
@@ -243,6 +279,19 @@ struct ConeUniforms {
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
+struct AxisUniforms {
+    view_proj: [[f32; 4]; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct AxisVertex {
+    position: [f32; 3],
+    color: [f32; 3],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
 struct CrossSectionUniforms {
     bounds: [f32; 4],
     params: [f32; 4],
@@ -322,17 +371,22 @@ pub(crate) struct Renderer {
     cross_section_pipeline: wgpu::RenderPipeline,
     filter_fill_pipeline: wgpu::RenderPipeline,
     cone_pipeline: wgpu::RenderPipeline,
+    axis_pipeline: wgpu::RenderPipeline,
     particle_3d_uniform_buffer: wgpu::Buffer,
     particle_3d_bind_group: wgpu::BindGroup,
     cross_section_uniform_buffer: wgpu::Buffer,
     cross_section_bind_group: wgpu::BindGroup,
     cone_uniform_buffer: wgpu::Buffer,
     cone_bind_group: wgpu::BindGroup,
+    axis_uniform_buffer: wgpu::Buffer,
+    axis_bind_group: wgpu::BindGroup,
     filter_uniform_buffer: wgpu::Buffer,
     filter_bind_group: wgpu::BindGroup,
     quad_vertex_buffer: wgpu::Buffer,
     cone_vertex_buffer: wgpu::Buffer,
     cone_vertex_count: u32,
+    axis_vertex_buffer: wgpu::Buffer,
+    axis_vertex_count: u32,
     filter_fill_vertex_buffer: wgpu::Buffer,
     filter_fill_vertex_count: u32,
     filter_vertex_buffer: wgpu::Buffer,
@@ -444,6 +498,22 @@ impl Renderer {
             }],
         });
 
+        let axis_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("axis uniforms"),
+            size: size_of::<AxisUniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let axis_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("axis bind group"),
+            layout: &bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: axis_uniform_buffer.as_entire_binding(),
+            }],
+        });
+
         let filter_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("filter uniforms"),
             size: size_of::<ConeUniforms>() as u64,
@@ -472,6 +542,10 @@ impl Renderer {
         let cone_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("cone shader"),
             source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(CONE_SHADER)),
+        });
+        let axis_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("axis shader"),
+            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(AXIS_SHADER)),
         });
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -721,6 +795,61 @@ impl Renderer {
             cache: None,
         });
 
+        let axis_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("world axis pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &axis_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: size_of::<AxisVertex>() as u64,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &[
+                        wgpu::VertexAttribute {
+                            offset: 0,
+                            shader_location: 0,
+                            format: wgpu::VertexFormat::Float32x3,
+                        },
+                        wgpu::VertexAttribute {
+                            offset: 12,
+                            shader_location: 1,
+                            format: wgpu::VertexFormat::Float32x3,
+                        },
+                    ],
+                }],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &axis_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::LineList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                unclipped_depth: false,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth24Plus,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
         // Quad vertex buffer (billboard)
         let quad_vertices = [
             QuadVertex {
@@ -752,6 +881,16 @@ impl Renderer {
             mapped_at_creation: false,
         });
         queue.write_buffer(&cone_vertex_buffer, 0, bytemuck::cast_slice(&cone_verts));
+
+        let axis_verts = build_world_axes(settings);
+        let axis_vertex_count = axis_verts.len() as u32;
+        let axis_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("world axis vertex buffer"),
+            size: (axis_verts.len() * size_of::<AxisVertex>()).max(16) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&axis_vertex_buffer, 0, bytemuck::cast_slice(&axis_verts));
 
         // Size the filter buffers from the CPU-mesh capacity constants so they
         // are guaranteed large enough for any `FilterMesh::sync_render_vertices`
@@ -787,17 +926,22 @@ impl Renderer {
             cross_section_pipeline,
             filter_fill_pipeline,
             cone_pipeline,
+            axis_pipeline,
             particle_3d_uniform_buffer,
             particle_3d_bind_group,
             cross_section_uniform_buffer,
             cross_section_bind_group,
             cone_uniform_buffer,
             cone_bind_group,
+            axis_uniform_buffer,
+            axis_bind_group,
             filter_uniform_buffer,
             filter_bind_group,
             quad_vertex_buffer,
             cone_vertex_buffer,
             cone_vertex_count,
+            axis_vertex_buffer,
+            axis_vertex_count,
             filter_fill_vertex_buffer,
             filter_fill_vertex_count,
             filter_vertex_buffer,
@@ -919,6 +1063,13 @@ impl Renderer {
             bytemuck::bytes_of(&cone_uniforms),
         );
 
+        let axis_uniforms = AxisUniforms { view_proj };
+        self.queue.write_buffer(
+            &self.axis_uniform_buffer,
+            0,
+            bytemuck::bytes_of(&axis_uniforms),
+        );
+
         let filter_uniforms = ConeUniforms {
             view_proj,
             color: [0.96, 0.93, 0.85, 0.42],
@@ -1029,6 +1180,13 @@ impl Renderer {
                 pass.draw(0..self.filter_vertex_count, 0..1);
             }
 
+            if self.axis_vertex_count > 0 {
+                pass.set_pipeline(&self.axis_pipeline);
+                pass.set_bind_group(0, &self.axis_bind_group, &[]);
+                pass.set_vertex_buffer(0, self.axis_vertex_buffer.slice(..));
+                pass.draw(0..self.axis_vertex_count, 0..1);
+            }
+
             // Draw particles
             if simulation.particle_count() > 0 {
                 pass.set_pipeline(&self.particle_3d_pipeline);
@@ -1069,6 +1227,104 @@ impl Renderer {
         frame.present();
         Ok(())
     }
+}
+
+fn build_world_axes(settings: &MpmSettings) -> Vec<AxisVertex> {
+    let origin = cup_bottom_origin(settings);
+    let mut verts = Vec::new();
+    push_axis(
+        &mut verts,
+        origin,
+        Vec3::new(1.0, 0.0, 0.0),
+        Vec3::new(0.0, 1.0, 0.0),
+        Vec3::new(0.0, 0.0, 1.0),
+        [0.95, 0.22, 0.18],
+    );
+    push_axis(
+        &mut verts,
+        origin,
+        Vec3::new(0.0, 1.0, 0.0),
+        Vec3::new(1.0, 0.0, 0.0),
+        Vec3::new(0.0, 0.0, 1.0),
+        [0.36, 0.86, 0.35],
+    );
+    push_axis(
+        &mut verts,
+        origin,
+        Vec3::new(0.0, 0.0, 1.0),
+        Vec3::new(1.0, 0.0, 0.0),
+        Vec3::new(0.0, 1.0, 0.0),
+        [0.26, 0.54, 1.0],
+    );
+    verts
+}
+
+fn cup_bottom_origin(settings: &MpmSettings) -> Vec3 {
+    settings
+        .obstacles
+        .iter()
+        .find_map(|obstacle| match obstacle {
+            Obstacle::Cylinder { center, bot_y, .. } => {
+                let half_thickness = OBSTACLE_WALL_THICKNESS * 0.5;
+                Some(Vec3::new(
+                    center.x,
+                    center.y + bot_y + half_thickness + CONTACT_OFFSET,
+                    center.z,
+                ))
+            }
+            _ => None,
+        })
+        .unwrap_or(Vec3::ZERO)
+}
+
+fn push_axis(
+    verts: &mut Vec<AxisVertex>,
+    origin: Vec3,
+    direction: Vec3,
+    side_a: Vec3,
+    side_b: Vec3,
+    color: [f32; 3],
+) {
+    let start = origin - direction * WORLD_AXIS_NEGATIVE_STUB;
+    let tip = origin + direction * WORLD_AXIS_LENGTH;
+    push_axis_line(verts, start, tip, color);
+
+    let arrow_base = tip - direction * WORLD_AXIS_ARROW_LENGTH;
+    push_axis_line(
+        verts,
+        tip,
+        arrow_base + side_a * WORLD_AXIS_ARROW_WIDTH,
+        color,
+    );
+    push_axis_line(
+        verts,
+        tip,
+        arrow_base - side_a * WORLD_AXIS_ARROW_WIDTH,
+        color,
+    );
+    push_axis_line(
+        verts,
+        tip,
+        arrow_base + side_b * WORLD_AXIS_ARROW_WIDTH,
+        color,
+    );
+    push_axis_line(
+        verts,
+        tip,
+        arrow_base - side_b * WORLD_AXIS_ARROW_WIDTH,
+        color,
+    );
+}
+
+fn push_axis_line(verts: &mut Vec<AxisVertex>, start: Vec3, end: Vec3, color: [f32; 3]) {
+    verts.push(AxisVertex {
+        position: [start.x, start.y, start.z],
+        color,
+    });
+    verts.push(AxisVertex {
+        position: [end.x, end.y, end.z],
+        color,
+    });
 }
 
 fn build_wireframe(settings: &MpmSettings) -> Vec<[f32; 3]> {

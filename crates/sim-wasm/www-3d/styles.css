@@ -310,6 +310,104 @@ canvas {
   white-space: nowrap;
 }
 
+.view-cube {
+  --cube-size: 56px;
+  --cube-half: calc(var(--cube-size) / 2);
+  position: absolute;
+  right: 18px;
+  bottom: 18px;
+  width: 108px;
+  height: 108px;
+  display: grid;
+  place-items: center;
+  pointer-events: none;
+  perspective: 420px;
+  filter: drop-shadow(0 12px 24px rgba(0, 0, 0, 0.38));
+}
+
+.view-cube::before {
+  content: "";
+  position: absolute;
+  inset: 8px;
+  border-radius: 8px;
+  border: 1px solid rgba(233, 239, 230, 0.16);
+  background:
+    radial-gradient(circle at 50% 48%, rgba(233, 239, 230, 0.12), transparent 48%),
+    rgba(9, 16, 19, 0.42);
+}
+
+.view-cube-stage {
+  position: relative;
+  width: var(--cube-size);
+  height: var(--cube-size);
+  transform-style: preserve-3d;
+  transition: transform 80ms linear;
+}
+
+.view-cube-face {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  width: var(--cube-size);
+  height: var(--cube-size);
+  border: 1px solid rgba(233, 239, 230, 0.42);
+  border-radius: 6px;
+  color: rgba(255, 255, 255, 0.92);
+  font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0;
+  line-height: 1;
+  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.62);
+  backface-visibility: hidden;
+}
+
+.view-cube-face-front,
+.view-cube-face-back {
+  background: linear-gradient(145deg, rgba(73, 128, 236, 0.82), rgba(28, 56, 122, 0.82));
+}
+
+.view-cube-face-right,
+.view-cube-face-left {
+  background: linear-gradient(145deg, rgba(226, 70, 62, 0.82), rgba(116, 33, 30, 0.82));
+}
+
+.view-cube-face-top,
+.view-cube-face-bottom {
+  background: linear-gradient(145deg, rgba(75, 185, 95, 0.82), rgba(34, 92, 46, 0.82));
+}
+
+.view-cube-face-back,
+.view-cube-face-left,
+.view-cube-face-bottom {
+  opacity: 0.82;
+}
+
+.view-cube-face-front {
+  transform: translateZ(var(--cube-half));
+}
+
+.view-cube-face-back {
+  transform: rotateY(180deg) translateZ(var(--cube-half));
+}
+
+.view-cube-face-right {
+  transform: rotateY(90deg) translateZ(var(--cube-half));
+}
+
+.view-cube-face-left {
+  transform: rotateY(-90deg) translateZ(var(--cube-half));
+}
+
+.view-cube-face-top {
+  transform: rotateX(90deg) translateZ(var(--cube-half));
+}
+
+.view-cube-face-bottom {
+  transform: rotateX(-90deg) translateZ(var(--cube-half));
+}
+
 .debug-stats.hidden {
   display: none;
 }
