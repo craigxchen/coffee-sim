@@ -180,6 +180,211 @@ struct WaterVelocitySnapshot {
     momentum: [f32; 3],
 }
 
+#[derive(Debug)]
+struct FilterContactSnapshot {
+    all_finite: bool,
+    active_count: u32,
+    near_wall_count: u32,
+    outside_paper_count: u32,
+    outward_jet_count: u32,
+    tangential_sheet_count: u32,
+    stuck_wall_count: u32,
+    near_wall_fraction: f32,
+    outside_paper_fraction: f32,
+    outward_jet_fraction: f32,
+    tangential_sheet_fraction: f32,
+    stuck_wall_fraction: f32,
+    max_wall_penetration_m: f32,
+    max_outward_speed_m_s: f32,
+    max_tangential_speed_m_s: f32,
+}
+
+fn readback_particle_data(
+    sim: &MpmSim3D,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    label: &str,
+) -> Vec<f32> {
+    let particle_count = (sim.num_water + sim.num_bed) as usize;
+    let particle_size = (particle_count * 32).max(4) as u64;
+
+    let staging = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(label),
+        size: particle_size,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("particle data readback"),
+    });
+    encoder.copy_buffer_to_buffer(&sim.buffers.particles, 0, &staging, 0, particle_size);
+    queue.submit(Some(encoder.finish()));
+
+    let slice = staging.slice(..);
+    let (tx, rx) = mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |result| {
+        tx.send(result).expect("particle data map callback");
+    });
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+    rx.recv()
+        .expect("particle data map recv")
+        .expect("particle data map");
+
+    let view = slice.get_mapped_range();
+    let data = cast_slice::<u8, f32>(&view).to_vec();
+    drop(view);
+    staging.unmap();
+    data
+}
+
+fn readback_water_diagnostics_snapshot(
+    sim: &MpmSim3D,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+) -> WaterDiagnostics {
+    let data = readback_particle_data(sim, device, queue, "water diagnostics staging");
+    sim.water_diagnostics_from_particle_data(&data)
+}
+
+fn readback_filter_contact_snapshot(
+    sim: &MpmSim3D,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+) -> FilterContactSnapshot {
+    let data = readback_particle_data(sim, device, queue, "filter contact staging");
+    let Some(filter) = sim.settings.filter.as_ref() else {
+        return FilterContactSnapshot {
+            all_finite: true,
+            active_count: 0,
+            near_wall_count: 0,
+            outside_paper_count: 0,
+            outward_jet_count: 0,
+            tangential_sheet_count: 0,
+            stuck_wall_count: 0,
+            near_wall_fraction: 0.0,
+            outside_paper_fraction: 0.0,
+            outward_jet_fraction: 0.0,
+            tangential_sheet_fraction: 0.0,
+            stuck_wall_fraction: 0.0,
+            max_wall_penetration_m: 0.0,
+            max_outward_speed_m_s: 0.0,
+            max_tangential_speed_m_s: 0.0,
+        };
+    };
+
+    let dx = sim.settings.bounds_size.x / sim.settings.grid_dims[0] as f32;
+    let inactive_thresh = inflow::MASS_UNITS_PER_ML / inflow::PARTICLES_PER_ML * 0.1;
+    let filter_bot_abs = filter.center.y + filter.bot_y;
+    let filter_top_abs = filter.center.y + filter.top_y;
+    let near_wall_margin = dx * 2.5;
+    let outside_tolerance = dx * 1.25;
+    let outward_jet_speed = units::sim_speed_from_meters_per_second(0.12);
+    let tangential_sheet_speed = units::sim_speed_from_meters_per_second(0.12);
+    let stuck_speed = units::sim_speed_from_meters_per_second(0.015);
+
+    let start = sim.num_bed as usize;
+    let end = start + sim.num_water as usize;
+    let mut snapshot = FilterContactSnapshot {
+        all_finite: true,
+        active_count: 0,
+        near_wall_count: 0,
+        outside_paper_count: 0,
+        outward_jet_count: 0,
+        tangential_sheet_count: 0,
+        stuck_wall_count: 0,
+        near_wall_fraction: 0.0,
+        outside_paper_fraction: 0.0,
+        outward_jet_fraction: 0.0,
+        tangential_sheet_fraction: 0.0,
+        stuck_wall_fraction: 0.0,
+        max_wall_penetration_m: 0.0,
+        max_outward_speed_m_s: 0.0,
+        max_tangential_speed_m_s: 0.0,
+    };
+
+    for i in start..end {
+        let base = i * 8;
+        let x = data[base];
+        let y = data[base + 1];
+        let z = data[base + 2];
+        let vx = data[base + 4];
+        let vy = data[base + 5];
+        let vz = data[base + 6];
+        let mass = data[base + 7];
+
+        snapshot.all_finite &= x.is_finite()
+            && y.is_finite()
+            && z.is_finite()
+            && vx.is_finite()
+            && vy.is_finite()
+            && vz.is_finite()
+            && mass.is_finite();
+
+        if mass <= inactive_thresh || y < filter_bot_abs || y > filter_top_abs {
+            continue;
+        }
+
+        snapshot.active_count += 1;
+        let dx_from_center = x - filter.center.x;
+        let dz_from_center = z - filter.center.z;
+        let radial = (dx_from_center * dx_from_center + dz_from_center * dz_from_center).sqrt();
+        let local_y = y - filter.center.y;
+        let inner_radius = filter.inner_radius_at_y(local_y);
+        let outer_radius = filter.radius_at_y(local_y);
+        let gap_to_inner_wall = inner_radius - radial;
+        let wall_penetration = (radial - outer_radius).max(0.0);
+        snapshot.max_wall_penetration_m = snapshot
+            .max_wall_penetration_m
+            .max(wall_penetration * units::METERS_PER_SIM_UNIT);
+
+        if radial > outer_radius + outside_tolerance {
+            snapshot.outside_paper_count += 1;
+        }
+
+        let near_wall =
+            gap_to_inner_wall.abs() <= near_wall_margin || radial > inner_radius - near_wall_margin;
+        if !near_wall {
+            continue;
+        }
+
+        snapshot.near_wall_count += 1;
+        let inv_radial = if radial > 1e-6 { 1.0 / radial } else { 0.0 };
+        let radial_dir_x = dx_from_center * inv_radial;
+        let radial_dir_z = dz_from_center * inv_radial;
+        let outward_speed = vx * radial_dir_x + vz * radial_dir_z;
+        let lateral_speed_sq = vx * vx + vz * vz;
+        let tangential_speed = (lateral_speed_sq - outward_speed * outward_speed)
+            .max(0.0)
+            .sqrt();
+        let speed = (lateral_speed_sq + vy * vy).sqrt();
+        snapshot.max_outward_speed_m_s = snapshot
+            .max_outward_speed_m_s
+            .max(outward_speed.max(0.0) * units::METERS_PER_SIM_UNIT);
+        snapshot.max_tangential_speed_m_s = snapshot
+            .max_tangential_speed_m_s
+            .max(tangential_speed * units::METERS_PER_SIM_UNIT);
+
+        if outward_speed > outward_jet_speed {
+            snapshot.outward_jet_count += 1;
+        }
+        if tangential_speed > tangential_sheet_speed {
+            snapshot.tangential_sheet_count += 1;
+        }
+        if speed < stuck_speed {
+            snapshot.stuck_wall_count += 1;
+        }
+    }
+
+    let active = snapshot.active_count.max(1) as f32;
+    snapshot.near_wall_fraction = snapshot.near_wall_count as f32 / active;
+    snapshot.outside_paper_fraction = snapshot.outside_paper_count as f32 / active;
+    snapshot.outward_jet_fraction = snapshot.outward_jet_count as f32 / active;
+    snapshot.tangential_sheet_fraction = snapshot.tangential_sheet_count as f32 / active;
+    snapshot.stuck_wall_fraction = snapshot.stuck_wall_count as f32 / active;
+    snapshot
+}
+
 fn readback_water_particle_volume_snapshot(
     sim: &MpmSim3D,
     device: &wgpu::Device,
@@ -1791,6 +1996,89 @@ fn water_j_stays_near_rest_after_cup_settle() {
 }
 
 #[test]
+fn water_only_settle_satisfies_realism_properties() {
+    let Some((device, queue)) = create_test_device() else {
+        eprintln!("skipping: no GPU adapter");
+        return;
+    };
+
+    let mut sim = MpmSim3D::new(&device, &queue, MpmSettings::benchmark_free_stream());
+
+    sim.set_exit_speed_m_s(DEFAULT_BREW.high_pour_exit_speed_m_s);
+    for _ in 0..30 {
+        sim.step_frame(&device, &queue, 1.0 / 60.0);
+    }
+    let pour_off = readback_water_diagnostics_snapshot(&sim, &device, &queue);
+
+    sim.set_exit_speed_m_s(0.0);
+    for _ in 0..90 {
+        sim.step_frame(&device, &queue, 1.0 / 60.0);
+    }
+    let settled = readback_water_diagnostics_snapshot(&sim, &device, &queue);
+
+    let mass_drift =
+        (settled.active_mass - pour_off.active_mass).abs() / pour_off.active_mass.max(1e-6);
+    let kinetic_ratio = settled.kinetic_energy / pour_off.kinetic_energy.max(1e-6);
+    let vertical_rms_m_s = units::sim_speed_to_meters_per_second(settled.vertical_rms_speed);
+    let surface_rms_m = settled.surface_rms_y * units::METERS_PER_SIM_UNIT;
+    let surface_peak_to_peak_m = settled.surface_peak_to_peak_y * units::METERS_PER_SIM_UNIT;
+    let surface_tilt_height_m = settled.surface_tilt_height_y * units::METERS_PER_SIM_UNIT;
+    let residual_rms_m = settled.surface_residual_rms_y * units::METERS_PER_SIM_UNIT;
+
+    assert!(
+        pour_off.all_finite && settled.all_finite,
+        "water-only diagnostics found non-finite particles: pour_off={pour_off:?} settled={settled:?}",
+    );
+    assert!(
+        pour_off.active_count > 0 && settled.active_count > 0,
+        "water-only realism check had no active water: pour_off={pour_off:?} settled={settled:?}",
+    );
+    assert!(
+        mass_drift < 0.02,
+        "water-only active mass drifted {:.2}% during settle: pour_off={pour_off:?} settled={settled:?}",
+        mass_drift * 100.0,
+    );
+    assert!(
+        kinetic_ratio < 0.05,
+        "water-only kinetic energy did not decay after pour-off: ratio={kinetic_ratio:.3} \
+         pour_off={pour_off:?} settled={settled:?}",
+    );
+    assert!(
+        vertical_rms_m_s < 0.020,
+        "settled water retained too much vertical motion: vertical_rms={vertical_rms_m_s:.4} m/s \
+         settled={settled:?}",
+    );
+    assert!(
+        settled.surface_bin_count > settled.surface_possible_bins / 2,
+        "settled cup surface was too sparse for a levelness check: settled={settled:?}",
+    );
+    assert!(
+        surface_rms_m < 0.006 && surface_peak_to_peak_m < 0.025,
+        "settled water surface remained too rough: rms={:.2}mm peak_to_peak={:.2}mm \
+         settled={settled:?}",
+        surface_rms_m * 1000.0,
+        surface_peak_to_peak_m * 1000.0,
+    );
+    assert!(
+        surface_tilt_height_m < 0.012 && residual_rms_m < 0.006,
+        "settled water surface stayed non-level: tilt_height={:.2}mm residual_rms={:.2}mm \
+         settled={settled:?}",
+        surface_tilt_height_m * 1000.0,
+        residual_rms_m * 1000.0,
+    );
+    if settled.hydrostatic_sample_count > 0 && settled.hydrostatic_depth_m > 0.004 {
+        let expected_gradient = 1_000.0 * units::STANDARD_GRAVITY_M_S2;
+        let gradient_error = (settled.hydrostatic_gradient_pa_per_m - expected_gradient).abs()
+            / expected_gradient.max(1e-6);
+        assert!(
+            settled.hydrostatic_bottom_higher && gradient_error < 0.08,
+            "hydrostatic pressure ordering was implausible: expected_gradient={expected_gradient:.1} \
+             gradient_error={gradient_error:.3} settled={settled:?}",
+        );
+    }
+}
+
+#[test]
 fn pooled_water_particle_volume_stable_after_pour_off() {
     let Some((device, queue)) = create_test_device() else {
         eprintln!("skipping: no GPU adapter");
@@ -2631,6 +2919,105 @@ fn coffee_bed_retains_water_above_bed_surface() {
         "coffee bed should turn the fast falling stream into slower near-surface water: \
          open_near_surface_speed={open_near_surface_speed:.3} bed_near_surface_speed={bed_near_surface_speed:.3} \
          open_filter={open_filter:?} coffee_bed={coffee_bed:?}",
+    );
+}
+
+#[test]
+#[ignore = "property target: detects filter-paper sticking and side jets without blocking the default suite"]
+fn center_pour_filter_contact_has_no_side_jets() {
+    let Some((device, queue)) = create_test_device() else {
+        eprintln!("skipping: no GPU adapter");
+        return;
+    };
+
+    let mut sim = MpmSim3D::new(&device, &queue, MpmSettings::benchmark_center_pour());
+    sim.set_exit_speed_m_s(DEFAULT_BREW.high_pour_exit_speed_m_s);
+    for _ in 0..210 {
+        sim.step_frame(&device, &queue, 1.0 / 60.0);
+    }
+
+    let contact = readback_filter_contact_snapshot(&sim, &device, &queue);
+    assert!(
+        contact.all_finite,
+        "filter contact readback found non-finite water particles: {contact:?}",
+    );
+    assert!(
+        contact.active_count > 0,
+        "filter contact scenario had no active water: {contact:?}",
+    );
+    assert!(
+        contact.outside_paper_fraction < 0.01 && contact.max_wall_penetration_m < 0.004,
+        "water escaped outside the paper filter band: {contact:?}",
+    );
+    assert!(
+        contact.outward_jet_fraction < 0.015 && contact.max_outward_speed_m_s < 0.18,
+        "water formed a high-speed outward side jet near the filter paper: {contact:?}",
+    );
+    assert!(
+        contact.tangential_sheet_fraction < 0.04 && contact.max_tangential_speed_m_s < 0.20,
+        "water formed a fast tangential sheet along the filter paper: {contact:?}",
+    );
+}
+
+#[test]
+#[ignore = "property target: checks a seeded water block against filter-wall sticking and non-hydrostatic settling"]
+fn filter_water_block_settles_without_wall_sheeting() {
+    let Some((device, queue)) = create_test_device() else {
+        eprintln!("skipping: no GPU adapter");
+        return;
+    };
+
+    let mut sim = MpmSim3D::new(&device, &queue, MpmSettings::benchmark_filter_water_block());
+    sim.seed_filter_water_block(&queue);
+
+    for _ in 0..60 {
+        sim.step_frame(&device, &queue, 1.0 / 60.0);
+    }
+    let initial = readback_water_diagnostics_snapshot(&sim, &device, &queue);
+
+    for _ in 0..180 {
+        sim.step_frame(&device, &queue, 1.0 / 60.0);
+    }
+    let settled = readback_water_diagnostics_snapshot(&sim, &device, &queue);
+    let contact = readback_filter_contact_snapshot(&sim, &device, &queue);
+
+    let mass_drift =
+        (settled.active_mass - initial.active_mass).abs() / initial.active_mass.max(1e-6);
+    let kinetic_ratio = settled.kinetic_energy / initial.kinetic_energy.max(1e-6);
+    let vertical_rms_m_s = units::sim_speed_to_meters_per_second(settled.vertical_rms_speed);
+
+    assert!(
+        initial.all_finite && settled.all_finite && contact.all_finite,
+        "filter water block produced non-finite state: initial={initial:?} \
+         settled={settled:?} contact={contact:?}",
+    );
+    assert!(
+        initial.active_count > 0 && settled.active_count > 0 && contact.active_count > 0,
+        "filter water block had no active water: initial={initial:?} \
+         settled={settled:?} contact={contact:?}",
+    );
+    assert!(
+        mass_drift < 0.03,
+        "filter water block mass drifted {:.2}% while settling: initial={initial:?} \
+         settled={settled:?}",
+        mass_drift * 100.0,
+    );
+    assert!(
+        kinetic_ratio < 0.50 && vertical_rms_m_s < 0.035,
+        "filter water block retained too much motion: kinetic_ratio={kinetic_ratio:.3} \
+         vertical_rms={vertical_rms_m_s:.4}m/s initial={initial:?} settled={settled:?}",
+    );
+    assert!(
+        contact.outside_paper_fraction < 0.01 && contact.max_wall_penetration_m < 0.004,
+        "filter water block escaped outside the paper band: {contact:?}",
+    );
+    assert!(
+        contact.outward_jet_fraction < 0.01 && contact.max_outward_speed_m_s < 0.12,
+        "filter water block generated outward jets near the paper: {contact:?}",
+    );
+    assert!(
+        contact.stuck_wall_fraction < 0.25,
+        "filter water block left too much nearly stationary water stuck to the paper wall: {contact:?}",
     );
 }
 

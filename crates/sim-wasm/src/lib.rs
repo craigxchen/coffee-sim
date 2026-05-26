@@ -169,6 +169,40 @@ fn water_diagnostics_object(
     };
     set_number(&surface, "coverage", coverage)?;
     set_object(&obj, "surface", &surface)?;
+
+    let pressure = js_sys::Object::new();
+    set_u32(
+        &pressure,
+        "sampleCount",
+        diagnostics.hydrostatic_sample_count,
+    )?;
+    set_number(&pressure, "depthMeters", diagnostics.hydrostatic_depth_m)?;
+    set_number(
+        &pressure,
+        "topPressurePa",
+        diagnostics.hydrostatic_top_pressure_pa,
+    )?;
+    set_number(
+        &pressure,
+        "bottomPressurePa",
+        diagnostics.hydrostatic_bottom_pressure_pa,
+    )?;
+    set_number(
+        &pressure,
+        "deltaPressurePa",
+        diagnostics.hydrostatic_delta_pressure_pa,
+    )?;
+    set_number(
+        &pressure,
+        "gradientPaPerMeter",
+        diagnostics.hydrostatic_gradient_pa_per_m,
+    )?;
+    set_bool(
+        &pressure,
+        "bottomHigher",
+        diagnostics.hydrostatic_bottom_higher,
+    )?;
+    set_object(&obj, "hydrostaticPressure", &pressure)?;
     Ok(obj)
 }
 

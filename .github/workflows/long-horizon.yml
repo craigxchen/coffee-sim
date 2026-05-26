@@ -64,3 +64,17 @@ jobs:
         run: >
           cargo test -p coffee-sim-wasm pooled_water_shape_stays_bounded_after_initial_settle --lib
           -- --ignored --nocapture --test-threads=1
+
+      - name: Known center-pour filter-contact property target
+        timeout-minutes: 10
+        continue-on-error: true
+        run: >
+          cargo test -p coffee-sim-wasm center_pour_filter_contact_has_no_side_jets --lib
+          -- --ignored --nocapture --test-threads=1
+
+      - name: Known seeded filter water-block property target
+        timeout-minutes: 10
+        continue-on-error: true
+        run: >
+          cargo test -p coffee-sim-wasm filter_water_block_settles_without_wall_sheeting --lib
+          -- --ignored --nocapture --test-threads=1
