@@ -290,7 +290,7 @@ fn current_volume_load(cell: u32) -> f32 {
     return f32(atomicLoad(&grid[grid_current_volume_idx(cell)])) * inv_fp_scale();
 }
 
-fn liquid_fill_fraction(cell: u32, kind: i32) -> f32 {
+fn raw_liquid_fill_fraction(cell: u32, kind: i32) -> f32 {
     if kind == CELL_INTERIOR_FLUID || kind == CELL_BED_COUPLED {
         return 1.0;
     }
@@ -301,6 +301,48 @@ fn liquid_fill_fraction(cell: u32, kind: i32) -> f32 {
     let cell_volume = max(dx() * dx() * dx(), 1e-8);
     let deposited_fraction = max(rest_volume_load(cell), current_volume_load(cell)) / cell_volume;
     return clamp(deposited_fraction, 0.0, 1.0);
+}
+
+fn liquid_fill_fraction(cell: u32, kind: i32) -> f32 {
+    if kind == CELL_INTERIOR_FLUID || kind == CELL_BED_COUPLED {
+        return 1.0;
+    }
+    if kind != CELL_SURFACE_FLUID {
+        return 0.0;
+    }
+
+    let iz_val = cell / (gx() * gy());
+    let rem = cell % (gx() * gy());
+    let iy_val = rem / gx();
+    let ix_val = rem % gx();
+    let self_raw_fill = raw_liquid_fill_fraction(cell, kind);
+    var fill_sum = self_raw_fill * 2.0;
+    var fill_weight = 2.0;
+    let offsets = array<vec3<i32>, 6>(
+        vec3<i32>(-1, 0, 0),
+        vec3<i32>(1, 0, 0),
+        vec3<i32>(0, -1, 0),
+        vec3<i32>(0, 1, 0),
+        vec3<i32>(0, 0, -1),
+        vec3<i32>(0, 0, 1),
+    );
+
+    for (var n = 0u; n < 6u; n++) {
+        let neighbor = vec3<i32>(i32(ix_val), i32(iy_val), i32(iz_val)) + offsets[n];
+        if neighbor.x < 0 || neighbor.y < 0 || neighbor.z < 0
+            || u32(neighbor.x) >= gx() || u32(neighbor.y) >= gy() || u32(neighbor.z) >= gz() {
+            continue;
+        }
+        let neighbor_idx = cell_index(u32(neighbor.x), u32(neighbor.y), u32(neighbor.z));
+        let neighbor_kind = cell_kind_load(neighbor_idx);
+        if !is_fluid_kind(neighbor_kind) {
+            continue;
+        }
+        fill_sum += raw_liquid_fill_fraction(neighbor_idx, neighbor_kind);
+        fill_weight += 1.0;
+    }
+
+    return clamp(fill_sum / max(fill_weight, 1e-6), 0.0, 1.0);
 }
 
 fn pressure_face_weight(
@@ -590,6 +632,17 @@ fn is_fluid_kind(kind: i32) -> bool {
         || kind == CELL_BED_COUPLED;
 }
 
+fn is_viscous_kind(kind: i32) -> bool {
+    // Viscosity is a continuum stress. Surface cells need it too once they
+    // have enough neighboring fluid support; otherwise dense cup-pool pockets
+    // can keep grid-transfer/packing energy and bubble upward after pour-off.
+    // Sparse free-falling jets are still protected by the support gates in
+    // `viscosity_prepare`.
+    return kind == CELL_INTERIOR_FLUID
+        || kind == CELL_SURFACE_FLUID
+        || kind == CELL_BED_COUPLED;
+}
+
 fn is_solid_kind(kind: i32) -> bool {
     return kind == CELL_SOLID;
 }
@@ -741,21 +794,85 @@ fn resolve_radial_barrier(
     return ContactResult(out_pos, out_vel);
 }
 
+fn resolve_conical_barrier(
+    position: vec3<f32>,
+    velocity: vec3<f32>,
+    center: vec2<f32>,
+    bot_y: f32,
+    bot_radius: f32,
+    slope: f32,
+) -> ContactResult {
+    var out_pos = position;
+    var out_vel = velocity;
+
+    let radial = out_pos.xz - center;
+    let r = length(radial);
+    if r > 1e-6 {
+        let outward = radial / r;
+        let cone_radius = bot_radius + slope * (out_pos.y - bot_y);
+        let sdf_val = cone_radius - r;
+        if sdf_val < contact_offset() {
+            let n = normalize(vec3<f32>(-outward.x, slope, -outward.y));
+            out_pos += n * (contact_offset() - sdf_val);
+
+            let vn = dot(out_vel, n);
+            let radial_v = dot(out_vel.xz, outward);
+            if vn < 0.0 && radial_v > 0.0 {
+                out_vel = out_vel - n * vn * (1.0 + restitution());
+                let vt = out_vel - n * dot(out_vel, n);
+                let vt_len = length(vt);
+                if vt_len > 1e-6 {
+                    let friction_impulse = min(friction() * abs(vn), vt_len);
+                    out_vel = out_vel - vt * (friction_impulse / vt_len);
+                }
+            }
+        }
+    }
+
+    return ContactResult(out_pos, out_vel);
+}
+
 fn resolve_scene_obstacles(position: vec3<f32>, velocity: vec3<f32>, is_bed: bool) -> ContactResult {
     var out_pos = position;
     var out_vel = velocity;
 
-    // V60 dripper interior. Radial barrier keeps particles inside the cone.
+    // V60 dripper interior. The analytic fallback uses the conical surface
+    // normal, not a cylindrical radial clamp, so wall impact becomes
+    // down-slope film motion instead of a collapse onto a vertical ray.
     // Keep this analytic fallback parallel to `FilterConfig::default()` and
     // `v60_support_cone`; the SDF texture uses the same obstacle radii.
     let cone_top_y = 3.0;
     let cone_bot_y = -3.0;
+    let cone_height = cone_top_y - cone_bot_y;
+    let cone_slope = (dripper_top_radius() - dripper_outlet_radius()) / cone_height;
     if out_pos.y <= cone_top_y && out_pos.y >= cone_bot_y {
-        let t = clamp((out_pos.y - cone_bot_y) / (cone_top_y - cone_bot_y), 0.0, 1.0);
-        let cone_radius = mix(dripper_outlet_radius(), dripper_top_radius(), t) - contact_offset();
-        let cone_contact = resolve_radial_barrier(out_pos, out_vel, vec2<f32>(0.0, 0.0), cone_radius);
-        out_pos = cone_contact.pos;
-        out_vel = cone_contact.vel;
+        let outlet_rim_band = dx() * 4.0;
+        if out_pos.y <= cone_bot_y + outlet_rim_band {
+            let t = clamp((out_pos.y - cone_bot_y) / cone_height, 0.0, 1.0);
+            let cone_radius = mix(dripper_outlet_radius(), dripper_top_radius(), t) - contact_offset();
+            let cone_contact = resolve_radial_barrier(out_pos, out_vel, vec2<f32>(0.0, 0.0), cone_radius);
+            out_pos = cone_contact.pos;
+            out_vel = cone_contact.vel;
+            let outlet_radial = out_pos.xz;
+            let outlet_r = length(outlet_radial);
+            if outlet_r > 1e-6 {
+                let outlet_outward = outlet_radial / outlet_r;
+                let inward_v = min(dot(out_vel.xz, outlet_outward), 0.0);
+                out_vel.x -= outlet_outward.x * inward_v;
+                out_vel.z -= outlet_outward.y * inward_v;
+            }
+        } else {
+            let cone_contact = resolve_conical_barrier(
+                out_pos,
+                out_vel,
+                vec2<f32>(0.0, 0.0),
+                cone_bot_y,
+                dripper_outlet_radius(),
+                cone_slope,
+            );
+            out_pos = cone_contact.pos;
+            out_vel = cone_contact.vel;
+        }
     }
 
     // Paper filter (bed particles only): the filter is porous — water passes
@@ -987,13 +1104,12 @@ fn p2g(@builtin(global_invocation_id) gid: vec3<u32>) {
     wz[1] = 0.75 - (fx.z - 1.0) * (fx.z - 1.0);
     wz[2] = 0.5 * (fx.z - 0.5) * (fx.z - 0.5);
 
-    // Affine = mass_p*C (J-stress disabled under pressure projection)
+    // APIC affine state is stored by spatial-gradient columns:
+    // C0=dv/dx, C1=dv/dy, C2=dv/dz. P2G must apply C*dpos with the
+    // same orientation that g2p reconstructs below.
     let C0 = a.col0.xyz;
     let C1 = a.col1.xyz;
     let C2 = a.col2.xyz;
-    let aff_col0 = vec3<f32>(mass_p * C0.x, mass_p * C0.y, mass_p * C0.z);
-    let aff_col1 = vec3<f32>(mass_p * C1.x, mass_p * C1.y, mass_p * C1.z);
-    let aff_col2 = vec3<f32>(mass_p * C2.x, mass_p * C2.y, mass_p * C2.z);
 
     let fp = fp_scale();
     let cell_dx = dx();
@@ -1015,11 +1131,8 @@ fn p2g(@builtin(global_invocation_id) gid: vec3<u32>) {
                 let mass_contrib = w * mass_p;
                 let rest_volume_contrib = w * rest_particle_volume;
                 let current_volume_contrib = w * current_particle_volume;
-                let mom = w * (mass_p * vp + vec3<f32>(
-                    dot(aff_col0, dpos),
-                    dot(aff_col1, dpos),
-                    dot(aff_col2, dpos),
-                ));
+                let affine_mom = mass_p * (C0 * dpos.x + C1 * dpos.y + C2 * dpos.z);
+                let mom = w * (mass_p * vp + affine_mom);
 
                 let ci = cell_index(u32(cell.x), u32(cell.y), u32(cell.z));
                 // Overflow probe: each per-cell per-axis term must stay below
@@ -1099,6 +1212,10 @@ fn viscosity_prepare(@builtin(global_invocation_id) gid: vec3<u32>) {
     let iy_val = rem / gx();
     let ix_val = rem % gx();
     let v_here = gv.xyz;
+    if !is_viscous_kind(cell_kind_load(idx)) {
+        velocity_scratch_store(idx, v_here);
+        return;
+    }
     // Viscosity is a bulk-fluid stress. Sparse streams have too little local
     // support for a stable velocity Laplacian, so gate it by local occupancy
     // rather than by scene location.
@@ -1221,7 +1338,8 @@ fn classify_cells(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
 
-    if bed_lookup_load(idx) >= 0 {
+    let bed_idx_here = bed_lookup_load(idx);
+    if bed_idx_here >= 0 {
         atomicStore(&grid[scratch_kind_idx(idx)], CELL_BED_COUPLED);
     } else {
         let offsets = array<vec3<i32>, 6>(
@@ -1577,7 +1695,7 @@ fn packing_prepare(@builtin(global_invocation_id) gid: vec3<u32>) {
     let cell_volume = dx() * dx() * dx();
     let packed_fraction = max(rest_volume_load(idx), current_volume_load(idx))
         / max(cell_volume, 1e-8);
-    let packing_target = min(projection_max_rest_volume_fraction(), 1.0);
+    let packing_target = projection_max_rest_volume_fraction();
     let overpack = max(packed_fraction - packing_target, 0.0);
     packing_pressure_store(idx, bulk_K() * overpack);
 }
@@ -2344,5 +2462,11 @@ mod tests {
         let module = naga::front::wgsl::parse_str(MPM_COMPUTE_SHADER)
             .expect("mpm compute shader should parse");
         assert!(!module.entry_points.is_empty());
+    }
+
+    #[test]
+    fn apic_columns_are_applied_without_transpose() {
+        assert!(MPM_COMPUTE_SHADER.contains("C0 * dpos.x + C1 * dpos.y + C2 * dpos.z"));
+        assert!(!MPM_COMPUTE_SHADER.contains("dot(aff_col0, dpos)"));
     }
 }

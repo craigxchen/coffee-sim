@@ -1,12 +1,12 @@
-import init, { WasmSim3D } from "./pkg/coffee_sim_wasm.js?v=spout-plane-13";
+import init, { WasmSim3D } from "./pkg/coffee_sim_wasm.js?v=realism-eval-7";
 
 const canvas = document.getElementById("sim-canvas");
 const toggleButton = document.getElementById("toggle");
 const resetButton = document.getElementById("reset");
 const sceneFreeStreamButton = document.getElementById("scene-free-stream");
 const sceneCenterPourButton = document.getElementById("scene-center-pour");
-const kettleAngleInput = document.getElementById("kettle-angle");
-const kettleAngleValue = document.getElementById("kettle-angle-value");
+const waterVelocityInput = document.getElementById("water-velocity");
+const waterVelocityValue = document.getElementById("water-velocity-value");
 const spoutPlane = document.getElementById("spout-plane");
 const spoutPlaneMarker = document.getElementById("spout-plane-marker");
 const spoutPlaneValue = document.getElementById("spout-plane-value");
@@ -48,6 +48,7 @@ let paused = false;
 let autoPauseTimer = 0;
 let lastFrameTime = 0;
 let skipStepOnce = false;
+let evaluationActive = false;
 let fpsWindow = [];
 let dragging = false;
 let lastClientX = 0;
@@ -76,13 +77,14 @@ app = await WasmSim3D.create(canvas);
 app.loadBenchmarkCenterPour();
 fixedStepSeconds = 1 / 60;
 syncControlDefaultsFromSim();
-app.setKettleAngle(Number(kettleAngleInput.value));
+applyWaterVelocityControl();
 applySpoutControls();
 resizeCanvas();
 syncSpoutControlSize();
 syncUi();
 requestAnimationFrame(animate);
 scheduleAutoPauseIfInactive();
+publishDebugHooks();
 
 window.addEventListener("resize", resizeCanvas);
 if ("ResizeObserver" in window) {
@@ -95,7 +97,7 @@ toggleButton.addEventListener("click", () => {
 
 resetButton.addEventListener("click", () => {
   app.reset();
-  app.setKettleAngle(Number(kettleAngleInput.value));
+  applyWaterVelocityControl();
   applySpoutControls();
   lastFrameTime = 0;
   syncUi();
@@ -111,7 +113,7 @@ toggleDebugButton.addEventListener("click", () => {
 sceneFreeStreamButton.addEventListener("click", () => {
   app.loadBenchmarkFreeStream();
   syncControlDefaultsFromSim();
-  applyHeuristicControls();
+  applySceneControls();
   fixedStepSeconds = 1 / 60;
   currentSceneMode = "Water Only";
   setPaused(false);
@@ -122,7 +124,7 @@ sceneFreeStreamButton.addEventListener("click", () => {
 sceneCenterPourButton.addEventListener("click", () => {
   app.loadBenchmarkCenterPour();
   syncControlDefaultsFromSim();
-  applyHeuristicControls();
+  applySceneControls();
   fixedStepSeconds = 1 / 60;
   currentSceneMode = "Center Pour";
   setPaused(false);
@@ -130,8 +132,8 @@ sceneCenterPourButton.addEventListener("click", () => {
   syncUi();
 });
 
-kettleAngleInput.addEventListener("input", () => {
-  app.setKettleAngle(Number(kettleAngleInput.value));
+waterVelocityInput.addEventListener("input", () => {
+  applyWaterVelocityControl();
   syncUi();
 });
 
@@ -255,6 +257,11 @@ function animate(timestamp) {
   const frameTime = fixedStepSeconds ?? wallFrameTime;
   lastFrameTime = timestamp;
 
+  if (evaluationActive) {
+    requestAnimationFrame(animate);
+    return;
+  }
+
   applyKeyboardPan(frameTime);
 
   if (!paused && skipStepOnce) {
@@ -330,11 +337,15 @@ function updateFps(frameTime) {
 }
 
 function syncControlDefaultsFromSim() {
-  kettleAngleInput.value = app.kettleAngle().toFixed(0);
+  waterVelocityInput.value = app.waterVelocityMetersPerSecond().toFixed(2);
   spoutX = clamp(snap(app.spoutX()), SPOUT_X_MIN, SPOUT_X_MAX);
   spoutZ = clamp(snap(app.spoutZ()), SPOUT_Z_MIN, SPOUT_Z_MAX);
   spoutHeightInput.value = app.spoutY().toFixed(1);
   updateSpoutPlaneUi();
+}
+
+function applyWaterVelocityControl() {
+  app.setWaterVelocityMetersPerSecond(Number(waterVelocityInput.value));
 }
 
 function applySpoutControls() {
@@ -345,7 +356,7 @@ function applySpoutControls() {
   );
 }
 
-function applyHeuristicControls() {
+function applySceneControls() {
 }
 
 function updateSpoutPlaneFromPointer(e) {
@@ -384,7 +395,7 @@ function clamp(value, min, max) {
 
 function syncUi() {
   particleLabel.textContent = new Intl.NumberFormat().format(app.particleCount());
-  kettleAngleValue.textContent = `${Math.round(app.kettleAngle())}\u00b0`;
+  waterVelocityValue.textContent = `${app.waterVelocityMetersPerSecond().toFixed(2)} m/s`;
   spoutX = clamp(snap(app.spoutX()), SPOUT_X_MIN, SPOUT_X_MAX);
   spoutZ = clamp(snap(app.spoutZ()), SPOUT_Z_MIN, SPOUT_Z_MAX);
   spoutHeightValue.textContent = app.spoutY().toFixed(1);
@@ -411,4 +422,277 @@ function syncUi() {
   divClampFiresLabel.textContent = new Intl.NumberFormat().format(app.divClampFires());
   pressureClampFiresLabel.textContent = new Intl.NumberFormat().format(app.pressureClampFires());
   massOverflowFiresLabel.textContent = new Intl.NumberFormat().format(app.massOverflowFires());
+}
+
+function publishDebugHooks() {
+  window.__coffeeSim = {
+    app,
+    canvas,
+    evaluate: runRealismEvaluation,
+    setPaused,
+    isPaused: () => paused,
+    stepFramesForEvaluation,
+    sampleRealism: captureRealismSample,
+    runRealismEvaluation,
+  };
+  document.addEventListener("coffee-sim-run-realism-evaluation", (event) => {
+    const output = ensureRealismEvaluationOutput();
+    output.dataset.status = "running";
+    output.textContent = "";
+    runRealismEvaluation(event.detail ?? {})
+      .then((result) => {
+        publishRealismEvaluationResult(result);
+      })
+      .catch((error) => {
+        publishRealismEvaluationError(error);
+      });
+  });
+}
+
+function publishRealismEvaluationResult(result) {
+  const output = ensureRealismEvaluationOutput();
+  output.dataset.status = "done";
+  output.textContent = JSON.stringify(stripEvaluationImages(result));
+  output.dispatchEvent(new CustomEvent("coffee-sim-realism-evaluation-complete"));
+  console.info("Coffee sim realism evaluation", stripEvaluationImages(result));
+}
+
+function publishRealismEvaluationProgress(sample, samples) {
+  const output = ensureRealismEvaluationOutput();
+  output.dataset.status = "running";
+  output.textContent = JSON.stringify({
+    status: "running",
+    latestSample: sample.label,
+    sampleCount: samples.length,
+  });
+}
+
+function publishRealismEvaluationError(error) {
+  const output = ensureRealismEvaluationOutput();
+  output.dataset.status = "error";
+  output.textContent = JSON.stringify({
+    error: error instanceof Error ? error.message : String(error),
+  });
+}
+
+function ensureRealismEvaluationOutput() {
+  let output = document.getElementById("realism-eval-output");
+  if (!output) {
+    output = document.createElement("pre");
+    output.id = "realism-eval-output";
+    output.hidden = true;
+    document.body.appendChild(output);
+  }
+  return output;
+}
+
+function stripEvaluationImages(result) {
+  return {
+    ...result,
+    samples: result.samples.map((sample) => ({
+      ...sample,
+      imageDataUrl: sample.imageDataUrl ? "[captured]" : null,
+    })),
+  };
+}
+
+function nextAnimationFrame() {
+  return new Promise((resolve) => requestAnimationFrame(() => resolve()));
+}
+
+function setEvaluationWaterVelocity(speed) {
+  waterVelocityInput.value = clamp(
+    speed,
+    Number(waterVelocityInput.min),
+    Number(waterVelocityInput.max),
+  ).toFixed(2);
+  applyWaterVelocityControl();
+  syncUi();
+}
+
+function loadEvaluationScene(scene) {
+  if (scene === "water-only" || scene === "free-stream") {
+    app.loadBenchmarkFreeStream();
+    currentSceneMode = "Water Only";
+  } else {
+    app.loadBenchmarkCenterPour();
+    currentSceneMode = "Center Pour";
+  }
+  fixedStepSeconds = 1 / 60;
+  syncControlDefaultsFromSim();
+  applySceneControls();
+  lastFrameTime = 0;
+  syncUi();
+}
+
+async function stepFramesForEvaluation(frames, secondsPerFrame = 1 / 60) {
+  const count = Math.max(0, Math.floor(frames));
+  for (let i = 0; i < count; i += 1) {
+    app.stepFrame(secondsPerFrame);
+    if ((i + 1) % 30 === 0) {
+      app.render();
+      await nextAnimationFrame();
+    }
+  }
+  app.render();
+  syncUi();
+}
+
+async function captureRealismSample(label, { includeImage = true } = {}) {
+  app.render();
+  await nextAnimationFrame();
+  const diagnostics = await app.waterDiagnostics();
+  return {
+    label,
+    sceneMode: currentSceneMode,
+    simTimeSeconds: app.simTime(),
+    waterVelocityMetersPerSecond: app.waterVelocityMetersPerSecond(),
+    diagnostics,
+    imageDataUrl: includeImage ? canvas.toDataURL("image/png") : null,
+  };
+}
+
+async function runRealismEvaluation(options = {}) {
+  if (evaluationActive) {
+    throw new Error("A realism evaluation is already running");
+  }
+
+  const {
+    scene = "water-only",
+    pourSpeedMetersPerSecond = 0.45,
+    pourFrames = 180,
+    settleFrames = [60, 180, 360],
+    includeImages = true,
+    onSample = null,
+  } = options;
+
+  evaluationActive = true;
+  try {
+    setPaused(true);
+    heldKeys.clear();
+    dragging = false;
+    spoutPlaneDragging = false;
+    loadEvaluationScene(scene);
+    setEvaluationWaterVelocity(pourSpeedMetersPerSecond);
+
+    const samples = [];
+    async function recordSample(label) {
+      const sample = await captureRealismSample(label, { includeImage: includeImages });
+      samples.push(sample);
+      onSample?.(sample, samples);
+    }
+
+    await recordSample("initial");
+    await stepFramesForEvaluation(pourFrames);
+    await recordSample("during-pour");
+    setEvaluationWaterVelocity(0.0);
+    await recordSample("pour-off");
+
+    let previousSettleFrame = 0;
+    for (const settleFrame of settleFrames) {
+      const nextSettleFrame = Math.max(previousSettleFrame, Math.floor(settleFrame));
+      await stepFramesForEvaluation(nextSettleFrame - previousSettleFrame);
+      previousSettleFrame = nextSettleFrame;
+      await recordSample(`settle-${nextSettleFrame}f`);
+    }
+
+    return {
+      scene,
+      pourSpeedMetersPerSecond,
+      pourFrames,
+      settleFrames,
+      samples,
+      assessment: assessRealismSamples(samples),
+    };
+  } finally {
+    evaluationActive = false;
+    lastFrameTime = 0;
+    syncUi();
+  }
+}
+
+function assessRealismSamples(samples) {
+  const warnings = [];
+  const usable = samples.filter((sample) => sample.diagnostics?.activeCount > 0);
+  if (usable.length === 0) {
+    return { status: "warning", warnings: ["no active water particles were measured"] };
+  }
+
+  for (const sample of usable) {
+    if (!sample.diagnostics.allFinite) {
+      warnings.push(`${sample.label}: non-finite particle state`);
+    }
+  }
+
+  const first = usable[0].diagnostics;
+  const last = usable[usable.length - 1].diagnostics;
+  const massDriftPct =
+    first.activeMassMl > 1e-6
+      ? Math.abs(last.activeMassMl - first.activeMassMl) / first.activeMassMl * 100
+      : 0;
+  if (massDriftPct > 3.0) {
+    warnings.push(`active water mass drifted ${massDriftPct.toFixed(2)}%`);
+  }
+
+  const pourOffIndex = samples.findIndex((sample) => sample.label === "pour-off");
+  if (pourOffIndex >= 0) {
+    const settleSamples = samples.slice(pourOffIndex).filter((sample) => sample.diagnostics);
+    for (let i = 1; i < settleSamples.length; i += 1) {
+      const prev = settleSamples[i - 1].diagnostics;
+      const next = settleSamples[i].diagnostics;
+      const kineticRatio = next.kineticEnergy / Math.max(prev.kineticEnergy, 1e-6);
+      if (kineticRatio > 1.10) {
+        warnings.push(
+          `${settleSamples[i].label}: kinetic energy grew ${(kineticRatio * 100 - 100).toFixed(1)}% after pour-off`,
+        );
+      }
+    }
+  }
+
+  const surface = last.surface;
+  if (surface?.coverage > 0.25) {
+    if (surface.rmsMeters > 0.006) {
+      warnings.push(`settled surface RMS roughness is ${(surface.rmsMeters * 1000).toFixed(1)} mm`);
+    }
+    if (surface.peakToPeakMeters > 0.025) {
+      warnings.push(
+        `settled surface peak-to-peak variation is ${(surface.peakToPeakMeters * 1000).toFixed(1)} mm`,
+      );
+    }
+    if (surface.tiltHeightMeters > 0.012) {
+      warnings.push(
+        `settled surface tilt spans ${(surface.tiltHeightMeters * 1000).toFixed(1)} mm across the cup`,
+      );
+    }
+  }
+
+  if (last.verticalDipoleMetersPerSecond > 0.010) {
+    warnings.push(
+      `settled vertical up/down dipole is ${last.verticalDipoleMetersPerSecond.toFixed(3)} m/s`,
+    );
+  }
+  if (last.verticalRmsSpeedMetersPerSecond > 0.012) {
+    warnings.push(
+      `settled vertical RMS speed is ${last.verticalRmsSpeedMetersPerSecond.toFixed(3)} m/s`,
+    );
+  }
+
+  return {
+    status: warnings.length === 0 ? "ok" : "warning",
+    warnings,
+    summary: {
+      activeMassMl: last.activeMassMl,
+      massDriftPct,
+      kineticEnergy: last.kineticEnergy,
+      rmsSpeedMetersPerSecond: last.rmsSpeedMetersPerSecond,
+      verticalRmsSpeedMetersPerSecond: last.verticalRmsSpeedMetersPerSecond,
+      verticalDipoleMetersPerSecond: last.verticalDipoleMetersPerSecond,
+      lateralRmsSpeedMetersPerSecond: last.lateralRmsSpeedMetersPerSecond,
+      surfaceRmsMillimeters: (surface?.rmsMeters ?? 0) * 1000,
+      surfacePeakToPeakMillimeters: (surface?.peakToPeakMeters ?? 0) * 1000,
+      surfaceTiltHeightMillimeters: (surface?.tiltHeightMeters ?? 0) * 1000,
+      surfaceResidualRmsMillimeters: (surface?.residualRmsMeters ?? 0) * 1000,
+      surfaceCoverage: surface?.coverage ?? 0,
+    },
+  };
 }

@@ -13,7 +13,7 @@ mod physics_tests;
 mod pipelines;
 mod shader;
 mod state;
-mod units;
+pub(crate) mod units;
 
 pub(crate) use filter::FilterConfig;
 #[cfg(target_arch = "wasm32")]
@@ -67,6 +67,103 @@ pub(crate) struct MetricsSnapshot {
     pub mass_overflow_fires: u32,
 }
 
+/// One-shot water-state readback used by the browser realism evaluator.
+///
+/// These are deliberately physical-ish quantities rather than shader internals:
+/// mass/volume conservation, kinetic energy, net momentum, and a coarse
+/// top-surface roughness estimate over the cup pool. The visual evaluator can
+/// pair this with canvas snapshots so we stop relying on vibes alone.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct WaterDiagnostics {
+    pub all_finite: bool,
+    pub sim_time_s: f32,
+    pub active_count: u32,
+    pub pool_count: u32,
+    pub active_mass: f32,
+    pub active_mass_ml: f32,
+    pub emitted_ml: f32,
+    pub rest_volume_ml: f32,
+    pub current_volume_ml: f32,
+    pub mean_j: f32,
+    pub kinetic_energy: f32,
+    pub rms_speed: f32,
+    pub vertical_rms_speed: f32,
+    pub mean_vertical_speed: f32,
+    pub lateral_rms_speed: f32,
+    pub max_speed: f32,
+    pub max_upward_speed: f32,
+    pub max_downward_speed: f32,
+    pub upward_momentum: f32,
+    pub downward_momentum: f32,
+    pub vertical_dipole: Vec3,
+    pub vertical_dipole_magnitude: f32,
+    pub momentum: Vec3,
+    pub momentum_magnitude: f32,
+    pub centroid: Vec3,
+    pub min: Vec3,
+    pub max: Vec3,
+    pub extent: Vec3,
+    pub surface_bin_count: u32,
+    pub surface_possible_bins: u32,
+    pub surface_mean_y: f32,
+    pub surface_rms_y: f32,
+    pub surface_min_y: f32,
+    pub surface_max_y: f32,
+    pub surface_peak_to_peak_y: f32,
+    pub surface_tilt: Vec3,
+    pub surface_tilt_magnitude: f32,
+    pub surface_tilt_height_y: f32,
+    pub surface_residual_rms_y: f32,
+    pub surface_residual_peak_to_peak_y: f32,
+}
+
+impl Default for WaterDiagnostics {
+    fn default() -> Self {
+        Self {
+            all_finite: true,
+            sim_time_s: 0.0,
+            active_count: 0,
+            pool_count: 0,
+            active_mass: 0.0,
+            active_mass_ml: 0.0,
+            emitted_ml: 0.0,
+            rest_volume_ml: 0.0,
+            current_volume_ml: 0.0,
+            mean_j: 0.0,
+            kinetic_energy: 0.0,
+            rms_speed: 0.0,
+            vertical_rms_speed: 0.0,
+            mean_vertical_speed: 0.0,
+            lateral_rms_speed: 0.0,
+            max_speed: 0.0,
+            max_upward_speed: 0.0,
+            max_downward_speed: 0.0,
+            upward_momentum: 0.0,
+            downward_momentum: 0.0,
+            vertical_dipole: Vec3::ZERO,
+            vertical_dipole_magnitude: 0.0,
+            momentum: Vec3::ZERO,
+            momentum_magnitude: 0.0,
+            centroid: Vec3::ZERO,
+            min: Vec3::ZERO,
+            max: Vec3::ZERO,
+            extent: Vec3::ZERO,
+            surface_bin_count: 0,
+            surface_possible_bins: 0,
+            surface_mean_y: 0.0,
+            surface_rms_y: 0.0,
+            surface_min_y: 0.0,
+            surface_max_y: 0.0,
+            surface_peak_to_peak_y: 0.0,
+            surface_tilt: Vec3::ZERO,
+            surface_tilt_magnitude: 0.0,
+            surface_tilt_height_y: 0.0,
+            surface_residual_rms_y: 0.0,
+            surface_residual_peak_to_peak_y: 0.0,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) enum Obstacle {
     TruncatedCone {
@@ -98,7 +195,7 @@ pub(crate) struct MpmSettings {
     pub use_sdf_cache: bool,
     pub obstacles: Vec<Obstacle>,
     pub spout: SpoutSettings,
-    pub initial_kettle_angle_deg: f32,
+    pub initial_water_speed_m_s: f32,
     pub filter: Option<FilterConfig>,
     pub bed: Option<BedConfig>,
 }
@@ -136,7 +233,7 @@ impl MpmSettings {
                 },
             ],
             spout: SpoutSettings::default(),
-            initial_kettle_angle_deg: DEFAULT_BREW.initial_kettle_angle_deg,
+            initial_water_speed_m_s: DEFAULT_BREW.initial_water_speed_m_s,
             filter: Some(filter),
             bed: Some(bed),
         }
@@ -146,16 +243,19 @@ impl MpmSettings {
         let mut settings = Self::default_v60();
         settings.bed = None;
         settings.spout.origin = Vec3::new(0.0, 6.8, 0.0);
-        settings.spout.aim_at(Vec3::new(0.0, -6.8, 0.0));
-        settings.initial_kettle_angle_deg = DEFAULT_BREW.initial_kettle_angle_deg;
+        // Free-water pools have no porous bed to dissipate pressure-solve
+        // residuals, so the water-only scene needs tighter projection
+        // convergence to keep the cup surface from settling into a lopsided
+        // heap.
+        settings.pressure_rbgs_pairs = 80;
+        settings.initial_water_speed_m_s = DEFAULT_BREW.initial_water_speed_m_s;
         settings
     }
 
     pub fn benchmark_center_pour() -> Self {
         let mut settings = Self::default_v60();
         settings.spout.origin = Vec3::new(0.0, 7.1, 0.0);
-        settings.spout.aim_at(Vec3::new(0.0, 0.4, 0.0));
-        settings.initial_kettle_angle_deg = DEFAULT_BREW.initial_kettle_angle_deg;
+        settings.initial_water_speed_m_s = DEFAULT_BREW.initial_water_speed_m_s;
         settings
     }
 }
@@ -174,6 +274,21 @@ fn v60_support_cone(filter: &FilterConfig) -> Obstacle {
         top_y,
         bot_y,
     }
+}
+
+fn cup_region(settings: &MpmSettings) -> Option<(f32, f32, f32)> {
+    settings
+        .obstacles
+        .iter()
+        .find_map(|obstacle| match obstacle {
+            Obstacle::Cylinder {
+                radius,
+                top_y,
+                bot_y,
+                ..
+            } => Some((*radius, *top_y, *bot_y)),
+            _ => None,
+        })
 }
 
 pub(crate) struct MpmSim3D {
@@ -196,7 +311,10 @@ impl MpmSim3D {
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, settings: MpmSettings) -> Self {
         let buffers = MpmBuffers::new(device, queue, &settings);
         let pipelines = MpmPipelines::new(device, &buffers);
-        let inflow = InflowState::new(settings.initial_kettle_angle_deg);
+        let mut inflow = InflowState::new(units::sim_speed_from_meters_per_second(
+            settings.initial_water_speed_m_s,
+        ));
+        inflow.update(&settings.spout);
         let filter_mesh = settings.filter.as_ref().map(FilterMesh::new);
 
         let mut sim = Self {
@@ -259,6 +377,258 @@ impl MpmSim3D {
             0,
             bytemuck::cast_slice(&zero_delta),
         );
+    }
+
+    fn water_diagnostics_from_particle_data(&self, data: &[f32]) -> WaterDiagnostics {
+        const SURFACE_BINS: usize = 16;
+
+        let [gx, _, _] = self.settings.grid_dims;
+        let dx = self.settings.bounds_size.x / gx as f32;
+        let particle_vol = dx * dx * dx * 0.25;
+        let nominal_mass = MASS_UNITS_PER_ML / inflow::PARTICLES_PER_ML;
+        let inactive_thresh = nominal_mass * 0.1;
+        let mut diagnostics = WaterDiagnostics {
+            sim_time_s: self.total_time,
+            emitted_ml: self.total_emitted_ml(),
+            ..WaterDiagnostics::default()
+        };
+
+        let start = self.num_bed as usize;
+        let end = start + self.num_water as usize;
+        if data.len() < end * 8 {
+            diagnostics.all_finite = false;
+            return diagnostics;
+        }
+
+        let cup = cup_region(&self.settings);
+        let mut surface_y = [f32::NEG_INFINITY; SURFACE_BINS * SURFACE_BINS];
+        let mut surface_possible_bins = 0u32;
+        if let Some((cup_radius, _, _)) = cup {
+            for bx in 0..SURFACE_BINS {
+                for bz in 0..SURFACE_BINS {
+                    let x = (((bx as f32) + 0.5) / SURFACE_BINS as f32 * 2.0 - 1.0) * cup_radius;
+                    let z = (((bz as f32) + 0.5) / SURFACE_BINS as f32 * 2.0 - 1.0) * cup_radius;
+                    if x * x + z * z <= cup_radius * cup_radius {
+                        surface_possible_bins += 1;
+                    }
+                }
+            }
+        }
+
+        let mut centroid_sum = Vec3::ZERO;
+        let mut mass_weighted_speed_sq = 0.0_f32;
+        let mut mass_weighted_vertical_speed_sq = 0.0_f32;
+        let mut mass_weighted_lateral_speed_sq = 0.0_f32;
+        let mut vertical_velocity_sum = 0.0_f32;
+        let mut vertical_dipole_sum = Vec3::ZERO;
+        let mut j_sum = 0.0_f32;
+        let mut min_pos = Vec3::new(f32::MAX, f32::MAX, f32::MAX);
+        let mut max_pos = Vec3::new(f32::MIN, f32::MIN, f32::MIN);
+
+        for i in start..end {
+            let base = i * 8;
+            let x = data[base];
+            let y = data[base + 1];
+            let z = data[base + 2];
+            let j = data[base + 3];
+            let vx = data[base + 4];
+            let vy = data[base + 5];
+            let vz = data[base + 6];
+            let mass = data[base + 7];
+
+            diagnostics.all_finite &= x.is_finite()
+                && y.is_finite()
+                && z.is_finite()
+                && j.is_finite()
+                && vx.is_finite()
+                && vy.is_finite()
+                && vz.is_finite()
+                && mass.is_finite();
+
+            if mass <= inactive_thresh {
+                continue;
+            }
+
+            let pos = Vec3::new(x, y, z);
+            let vel = Vec3::new(vx, vy, vz);
+            let speed_sq = vel.length_squared();
+            let vertical_speed_sq = vy * vy;
+            let lateral_speed_sq = vx * vx + vz * vz;
+            let speed = speed_sq.sqrt();
+            let mass_scale = mass / nominal_mass.max(1e-6);
+            let rest_volume = mass_scale * particle_vol;
+            let current_volume = rest_volume * j.clamp(0.40, 2.00);
+
+            diagnostics.active_count += 1;
+            diagnostics.active_mass += mass;
+            diagnostics.rest_volume_ml += rest_volume * units::ML_PER_SIM_UNIT_CUBED;
+            diagnostics.current_volume_ml += current_volume * units::ML_PER_SIM_UNIT_CUBED;
+            diagnostics.kinetic_energy += 0.5 * mass * speed_sq;
+            diagnostics.momentum = diagnostics.momentum + vel * mass;
+            diagnostics.max_speed = diagnostics.max_speed.max(speed);
+            diagnostics.max_upward_speed = diagnostics.max_upward_speed.max(vy.max(0.0));
+            diagnostics.max_downward_speed = diagnostics.max_downward_speed.max((-vy).max(0.0));
+            diagnostics.upward_momentum += mass * vy.max(0.0);
+            diagnostics.downward_momentum += mass * (-vy).max(0.0);
+            centroid_sum = centroid_sum + pos * mass;
+            mass_weighted_speed_sq += mass * speed_sq;
+            mass_weighted_vertical_speed_sq += mass * vertical_speed_sq;
+            mass_weighted_lateral_speed_sq += mass * lateral_speed_sq;
+            vertical_velocity_sum += mass * vy;
+            vertical_dipole_sum = vertical_dipole_sum + Vec3::new(x, 0.0, z) * (mass * vy);
+            j_sum += j;
+
+            min_pos.x = min_pos.x.min(x);
+            min_pos.y = min_pos.y.min(y);
+            min_pos.z = min_pos.z.min(z);
+            max_pos.x = max_pos.x.max(x);
+            max_pos.y = max_pos.y.max(y);
+            max_pos.z = max_pos.z.max(z);
+
+            if let Some((cup_radius, cup_top_y, cup_bot_y)) = cup {
+                let r_sq = x * x + z * z;
+                if r_sq <= (cup_radius + dx) * (cup_radius + dx)
+                    && y <= cup_top_y + dx
+                    && y >= cup_bot_y - dx
+                {
+                    diagnostics.pool_count += 1;
+                    if r_sq <= cup_radius * cup_radius {
+                        let bx =
+                            (((x / cup_radius + 1.0) * 0.5) * SURFACE_BINS as f32).floor() as i32;
+                        let bz =
+                            (((z / cup_radius + 1.0) * 0.5) * SURFACE_BINS as f32).floor() as i32;
+                        if bx >= 0
+                            && bz >= 0
+                            && (bx as usize) < SURFACE_BINS
+                            && (bz as usize) < SURFACE_BINS
+                        {
+                            let bin = bx as usize + bz as usize * SURFACE_BINS;
+                            surface_y[bin] = surface_y[bin].max(y);
+                        }
+                    }
+                }
+            }
+        }
+
+        diagnostics.active_mass_ml = diagnostics.active_mass / MASS_UNITS_PER_ML;
+        if diagnostics.active_count == 0 || diagnostics.active_mass <= 0.0 {
+            return diagnostics;
+        }
+
+        diagnostics.centroid = centroid_sum / diagnostics.active_mass;
+        diagnostics.min = min_pos;
+        diagnostics.max = max_pos;
+        diagnostics.extent = max_pos - min_pos;
+        diagnostics.mean_j = j_sum / diagnostics.active_count as f32;
+        diagnostics.rms_speed = (mass_weighted_speed_sq / diagnostics.active_mass.max(1e-6)).sqrt();
+        diagnostics.vertical_rms_speed =
+            (mass_weighted_vertical_speed_sq / diagnostics.active_mass.max(1e-6)).sqrt();
+        diagnostics.mean_vertical_speed = vertical_velocity_sum / diagnostics.active_mass.max(1e-6);
+        diagnostics.lateral_rms_speed =
+            (mass_weighted_lateral_speed_sq / diagnostics.active_mass.max(1e-6)).sqrt();
+        if let Some((cup_radius, _, _)) = cup {
+            diagnostics.vertical_dipole =
+                vertical_dipole_sum / (diagnostics.active_mass.max(1e-6) * cup_radius.max(1e-6));
+            diagnostics.vertical_dipole_magnitude = diagnostics.vertical_dipole.length();
+        }
+        diagnostics.momentum_magnitude = diagnostics.momentum.length();
+
+        let mut surface_sum = 0.0_f32;
+        let mut surface_x_sum = 0.0_f32;
+        let mut surface_z_sum = 0.0_f32;
+        let mut surface_min = f32::MAX;
+        let mut surface_max = f32::MIN;
+        for (bin, y) in surface_y.iter().copied().enumerate() {
+            if !y.is_finite() {
+                continue;
+            }
+            let bx = bin % SURFACE_BINS;
+            let bz = bin / SURFACE_BINS;
+            let Some((cup_radius, _, _)) = cup else {
+                continue;
+            };
+            let x = (((bx as f32) + 0.5) / SURFACE_BINS as f32 * 2.0 - 1.0) * cup_radius;
+            let z = (((bz as f32) + 0.5) / SURFACE_BINS as f32 * 2.0 - 1.0) * cup_radius;
+            diagnostics.surface_bin_count += 1;
+            surface_sum += y;
+            surface_x_sum += x;
+            surface_z_sum += z;
+            surface_min = surface_min.min(y);
+            surface_max = surface_max.max(y);
+        }
+        diagnostics.surface_possible_bins = surface_possible_bins;
+        if diagnostics.surface_bin_count > 0 {
+            diagnostics.surface_mean_y = surface_sum / diagnostics.surface_bin_count as f32;
+            let surface_mean_x = surface_x_sum / diagnostics.surface_bin_count as f32;
+            let surface_mean_z = surface_z_sum / diagnostics.surface_bin_count as f32;
+            let mut x_variance = 0.0_f32;
+            let mut z_variance = 0.0_f32;
+            let mut xy_covariance = 0.0_f32;
+            let mut zy_covariance = 0.0_f32;
+            let mut variance_sum = 0.0_f32;
+            for (bin, y) in surface_y.iter().copied().enumerate() {
+                if !y.is_finite() {
+                    continue;
+                }
+                let bx = bin % SURFACE_BINS;
+                let bz = bin / SURFACE_BINS;
+                let Some((cup_radius, _, _)) = cup else {
+                    continue;
+                };
+                let x = (((bx as f32) + 0.5) / SURFACE_BINS as f32 * 2.0 - 1.0) * cup_radius;
+                let z = (((bz as f32) + 0.5) / SURFACE_BINS as f32 * 2.0 - 1.0) * cup_radius;
+                let dx = x - surface_mean_x;
+                let dz = z - surface_mean_z;
+                let dy = y - diagnostics.surface_mean_y;
+                x_variance += dx * dx;
+                z_variance += dz * dz;
+                xy_covariance += dx * dy;
+                zy_covariance += dz * dy;
+                variance_sum += dy * dy;
+            }
+            diagnostics.surface_rms_y =
+                (variance_sum / diagnostics.surface_bin_count as f32).sqrt();
+            diagnostics.surface_min_y = surface_min;
+            diagnostics.surface_max_y = surface_max;
+            diagnostics.surface_peak_to_peak_y = surface_max - surface_min;
+            diagnostics.surface_tilt = Vec3::new(
+                xy_covariance / x_variance.max(1e-6),
+                0.0,
+                zy_covariance / z_variance.max(1e-6),
+            );
+            diagnostics.surface_tilt_magnitude = diagnostics.surface_tilt.length();
+            if let Some((cup_radius, _, _)) = cup {
+                diagnostics.surface_tilt_height_y =
+                    diagnostics.surface_tilt_magnitude * cup_radius * 2.0;
+            }
+            let mut residual_sum = 0.0_f32;
+            let mut residual_min = f32::MAX;
+            let mut residual_max = f32::MIN;
+            for (bin, y) in surface_y.iter().copied().enumerate() {
+                if !y.is_finite() {
+                    continue;
+                }
+                let bx = bin % SURFACE_BINS;
+                let bz = bin / SURFACE_BINS;
+                let Some((cup_radius, _, _)) = cup else {
+                    continue;
+                };
+                let x = (((bx as f32) + 0.5) / SURFACE_BINS as f32 * 2.0 - 1.0) * cup_radius;
+                let z = (((bz as f32) + 0.5) / SURFACE_BINS as f32 * 2.0 - 1.0) * cup_radius;
+                let predicted_y = diagnostics.surface_mean_y
+                    + diagnostics.surface_tilt.x * (x - surface_mean_x)
+                    + diagnostics.surface_tilt.z * (z - surface_mean_z);
+                let residual = y - predicted_y;
+                residual_sum += residual * residual;
+                residual_min = residual_min.min(residual);
+                residual_max = residual_max.max(residual);
+            }
+            diagnostics.surface_residual_rms_y =
+                (residual_sum / diagnostics.surface_bin_count as f32).sqrt();
+            diagnostics.surface_residual_peak_to_peak_y = residual_max - residual_min;
+        }
+
+        diagnostics
     }
 
     pub fn step_frame(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, dt: f32) {
@@ -438,27 +808,25 @@ impl MpmSim3D {
         self.total_emitted_mass = 0.0;
         self.total_dropped_particles = 0;
         self.latest_metrics = MetricsSnapshot::default();
-        self.inflow = InflowState::new(self.settings.initial_kettle_angle_deg);
+        self.inflow = InflowState::new(units::sim_speed_from_meters_per_second(
+            self.settings.initial_water_speed_m_s,
+        ));
+        self.inflow.update(&self.settings.spout);
         // Rebuild the CPU filter mesh so reset/scene changes keep render
         // geometry aligned with the active filter config.
         self.filter_mesh = self.settings.filter.as_ref().map(FilterMesh::new);
         self.init_bed(queue);
     }
 
-    pub fn set_kettle_angle(&mut self, angle_deg: f32) {
-        self.inflow.set_angle(angle_deg);
+    pub fn set_exit_speed_m_s(&mut self, speed_m_s: f32) {
+        self.inflow
+            .set_exit_speed(units::sim_speed_from_meters_per_second(speed_m_s));
+        self.inflow.update(&self.settings.spout);
     }
 
     pub fn set_spout_position(&mut self, x: f32, y: f32, z: f32) {
         self.settings.spout.translate_origin_to(Vec3::new(x, y, z));
-    }
-
-    pub fn set_spout_target(&mut self, x: f32, y: f32, z: f32) {
-        self.settings.spout.aim_at(Vec3::new(x, y, z));
-    }
-
-    pub fn kettle_angle(&self) -> f32 {
-        self.inflow.angle()
+        self.inflow.update(&self.settings.spout);
     }
 
     pub fn spout_position(&self) -> Vec3 {
@@ -541,6 +909,51 @@ impl MpmSim3D {
     /// the zero default until the first successful readback.
     pub fn latest_metrics(&self) -> MetricsSnapshot {
         self.latest_metrics
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub async fn water_diagnostics(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) -> Result<WaterDiagnostics, JsValue> {
+        let particle_count = (self.num_water + self.num_bed) as usize;
+        let particle_size = (particle_count * 32).max(4) as u64;
+        let staging = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("water diagnostics staging"),
+            size: particle_size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("water diagnostics readback"),
+        });
+        encoder.copy_buffer_to_buffer(&self.buffers.particles, 0, &staging, 0, particle_size);
+        queue.submit(Some(encoder.finish()));
+
+        let slice = staging.slice(..);
+        let promise = js_sys::Promise::new(&mut |resolve, reject| {
+            slice.map_async(wgpu::MapMode::Read, move |result| match result {
+                Ok(()) => {
+                    let _ = resolve.call0(&JsValue::NULL);
+                }
+                Err(err) => {
+                    let _ = reject.call1(
+                        &JsValue::NULL,
+                        &JsValue::from_str(&format!("water diagnostics map failed: {err:?}")),
+                    );
+                }
+            });
+        });
+        wasm_bindgen_futures::JsFuture::from(promise).await?;
+
+        let view = slice.get_mapped_range();
+        let data = bytemuck::cast_slice::<u8, f32>(&view);
+        let diagnostics = self.water_diagnostics_from_particle_data(data);
+        drop(view);
+        staging.unmap();
+        Ok(diagnostics)
     }
 
     /// Async staging-buffer readback for the GPU metrics counters.
@@ -735,10 +1148,12 @@ mod tests {
         assert_eq!(cup, (3.0, -3.5, -8.0));
         assert!(shader::MPM_COMPUTE_SHADER.contains("const OBSTACLE_WALL_THICKNESS: f32 = 0.4;"));
         assert!(shader::MPM_COMPUTE_SHADER.contains("fn dripper_top_radius()"));
+        assert!(shader::MPM_COMPUTE_SHADER.contains("fn resolve_conical_barrier("));
         assert!(shader::MPM_COMPUTE_SHADER
-            .contains("mix(dripper_outlet_radius(), dripper_top_radius(), t)"));
+            .contains("(dripper_top_radius() - dripper_outlet_radius()) / cone_height"));
         assert!(shader::MPM_COMPUTE_SHADER.contains("fn viscosity_prepare("));
         assert!(shader::MPM_COMPUTE_SHADER.contains("fn viscosity_apply("));
+        assert!(shader::MPM_COMPUTE_SHADER.contains("|| kind == CELL_SURFACE_FLUID"));
     }
 
     #[test]
@@ -752,12 +1167,17 @@ mod tests {
     }
 
     #[test]
-    fn default_v60_uses_slow_gooseneck_angle() {
+    fn default_v60_uses_gentle_vertical_water_speed() {
         let s = MpmSettings::default_v60();
-        assert!(s.initial_kettle_angle_deg <= 10.0);
+        assert!(s.initial_water_speed_m_s <= 0.13);
         assert!(s.spout.max_flow_rate_ml_s <= 12.0);
+        assert!(s.spout.direction.x.abs() < 1e-6);
+        assert!((s.spout.direction.y + 1.0).abs() < 1e-6);
+        assert!(s.spout.direction.z.abs() < 1e-6);
 
-        let mut inflow = InflowState::new(s.initial_kettle_angle_deg);
+        let mut inflow = InflowState::new(units::sim_speed_from_meters_per_second(
+            s.initial_water_speed_m_s,
+        ));
         inflow.update(&s.spout);
         assert!(inflow.exit_speed() * units::METERS_PER_SIM_UNIT <= 0.13);
         assert!(s.spout.max_exit_speed * units::METERS_PER_SIM_UNIT <= 0.50);

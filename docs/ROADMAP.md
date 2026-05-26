@@ -43,6 +43,9 @@ Priority work:
 Known solver gaps:
 
 - free-stream spout translation can still inject excessive lateral momentum
+- high-velocity free jets still show small side-to-side wobble from sparse
+  particle sampling and grid-transfer noise; revisit with a more coherent
+  airborne jet model rather than treating it as air resistance
 - high-viscosity pooled-water kinetic-energy regression needs follow-up
 - pressure projection has no residual/convergence readback in the browser
 - V60/filter geometry is still partly duplicated between Rust setup and WGSL
@@ -78,4 +81,3 @@ Deferred work:
 - timestamp-query profiling
 - adaptive substeps or pressure iterations based on measured residuals
 - settled-particle sleeping only after profiling identifies the bottleneck
-

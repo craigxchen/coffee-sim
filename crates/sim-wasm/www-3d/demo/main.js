@@ -14,10 +14,6 @@ const DEMO = {
   radiusZ: 1.35,
   heightBase: 7.35,
   heightWave: 0.22,
-  aimCenter: { x: 0.0, y: 1.45, z: 0.0 },
-  aimRadiusX: 1.35,
-  aimRadiusZ: 1.0,
-  aimLead: 0.38,
 };
 
 let app;
@@ -95,7 +91,7 @@ function resetDemo() {
   app.reset();
   elapsed = 0;
   lastFrameTime = 0;
-  app.setKettleAngle(40);
+  app.setWaterVelocityMetersPerSecond(0.45);
   applyAutopour(0);
   syncUi();
 }
@@ -119,17 +115,13 @@ function animate(timestamp) {
 
 function applyAutopour(time) {
   const phase = ((time % DEMO.period) / DEMO.period) * Math.PI * 2.0;
-  const aimPhase = phase + DEMO.aimLead;
   const x = DEMO.centerX + Math.cos(phase) * DEMO.radiusX;
   const z = DEMO.centerZ + Math.sin(phase) * DEMO.radiusZ;
   const y = DEMO.heightBase + Math.sin(phase * 2.0) * DEMO.heightWave;
-  const targetX = DEMO.aimCenter.x + Math.cos(aimPhase) * DEMO.aimRadiusX;
-  const targetZ = DEMO.aimCenter.z + Math.sin(aimPhase) * DEMO.aimRadiusZ;
-  const angle = 38 + Math.sin(phase - Math.PI * 0.35) * 2.5;
+  const speed = 0.42 + Math.sin(phase - Math.PI * 0.35) * 0.03;
 
   app.setSpoutPosition(x, y, z);
-  app.setSpoutTarget(targetX, DEMO.aimCenter.y, targetZ);
-  app.setKettleAngle(angle);
+  app.setWaterVelocityMetersPerSecond(speed);
 }
 
 function syncUi() {
