@@ -19,7 +19,7 @@ pub(crate) struct BrewConfig {
     pub max_flow_rate_ml_s: f32,
     pub gentle_pour_exit_speed_m_s: f32,
     pub high_pour_exit_speed_m_s: f32,
-    pub initial_kettle_angle_deg: f32,
+    pub initial_water_speed_m_s: f32,
     pub water_viscosity: f32,
     pub water_kinematic_viscosity_m2_s: f32,
     pub min_bed_permeability_m2: f32,
@@ -36,8 +36,8 @@ pub(crate) struct BrewConfig {
 }
 
 pub(crate) const DEFAULT_BREW: BrewConfig = BrewConfig {
-    // A modest single-cup V60 recipe. The water dose is not yet used as an
-    // automatic pour stop; for now it documents the intended physical scale.
+    // A modest single-cup V60 recipe. The water dose documents the intended
+    // physical scale.
     coffee_dose_g: 15.0,
     brew_water_ml: 250.0,
     // Medium-fine pourover grind. This feeds the bed permeability through a
@@ -52,7 +52,7 @@ pub(crate) const DEFAULT_BREW: BrewConfig = BrewConfig {
     max_flow_rate_ml_s: 12.0,
     gentle_pour_exit_speed_m_s: 0.12,
     high_pour_exit_speed_m_s: 0.45,
-    initial_kettle_angle_deg: 9.0,
+    initial_water_speed_m_s: 0.12,
     water_viscosity: 1.2,
     water_kinematic_viscosity_m2_s: 1.0e-6,
     min_bed_permeability_m2: 1.0e-12,

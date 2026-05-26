@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Coffee Sim | 3D Pourover</title>
-    <link rel="stylesheet" href="./styles.css?v=spout-plane-13" />
+    <link rel="stylesheet" href="./styles.css?v=vertical-velocity-2" />
   </head>
   <body>
     <main class="layout">
@@ -13,7 +13,7 @@
         <h1>V60 Pourover</h1>
         <p class="lede">
           GPU MPM fluid simulation with a V60 cone boundary and porous coffee bed.
-          Drag to orbit, scroll to zoom, and adjust kettle angle to change the stream.
+          Drag to orbit, scroll to zoom, and adjust water velocity to change the stream.
         </p>
         <div class="controls">
           <button id="toggle">Pause</button>
@@ -29,11 +29,11 @@
           </div>
         </div>
         <div class="control-panel">
-          <label class="slider-field" for="kettle-angle">
-            <span>Kettle Angle</span>
-            <output id="kettle-angle-value">0°</output>
+          <label class="slider-field" for="water-velocity">
+            <span>Water Velocity</span>
+            <output id="water-velocity-value">0.12 m/s</output>
           </label>
-          <input id="kettle-angle" type="range" min="0" max="70" step="1" value="9" />
+          <input id="water-velocity" type="range" min="0" max="0.60" step="0.01" value="0.12" />
         </div>
         <div class="control-panel">
           <div class="slider-field">
@@ -156,6 +156,6 @@
         </div>
       </section>
     </main>
-    <script type="module" src="./main.js?v=spout-plane-13"></script>
+    <script type="module" src="./main.js?v=realism-eval-7"></script>
   </body>
 </html>
