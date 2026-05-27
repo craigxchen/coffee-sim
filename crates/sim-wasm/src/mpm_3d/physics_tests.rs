@@ -1325,6 +1325,55 @@ fn benchmark_bed_bounds_y() -> (f32, f32) {
     (bed.center.y + bed.bot_y, bed.center.y + bed.top_y)
 }
 
+// ── Debug scene smoke tests ──
+
+#[test]
+fn debug_scene_seed_dispatch_matches_scene_type() {
+    let Some((device, queue)) = create_test_device() else {
+        eprintln!("skipping: no GPU adapter available");
+        return;
+    };
+
+    for scene in DebugScene::ALL {
+        let mut sim = MpmSim3D::new(&device, &queue, scene.settings());
+        scene.seed(&mut sim, &queue);
+
+        match scene {
+            DebugScene::FilterWaterBlock
+            | DebugScene::SeededPaperWallSheet
+            | DebugScene::FilterApexDrain
+            | DebugScene::CupWallFloorCornerContact
+            | DebugScene::AsymmetricCupMoundSettle
+            | DebugScene::HydrostaticColumn
+            | DebugScene::DamBreakSlosh
+            | DebugScene::HighVelocityJetImpact
+            | DebugScene::UniformBedSaturation => {
+                assert!(
+                    sim.water_slots_used() > 0,
+                    "{} should seed initial water particles",
+                    scene.id(),
+                );
+            }
+            DebugScene::OffCenterFilterWallPour
+            | DebugScene::SparseFreeJet
+            | DebugScene::PermeabilityComparison
+            | DebugScene::ParticleCapacityStress => {
+                assert_eq!(
+                    sim.water_slots_used(),
+                    0,
+                    "{} should rely on live inflow instead of seeded water",
+                    scene.id(),
+                );
+                assert!(
+                    sim.exit_speed_m_s() > 0.0,
+                    "{} live-inflow scene should start with a non-zero exit speed",
+                    scene.id(),
+                );
+            }
+        }
+    }
+}
+
 // ── Pipeline validation ──
 
 #[test]

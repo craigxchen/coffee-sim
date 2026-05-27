@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Coffee Sim | 3D Pourover</title>
-    <link rel="stylesheet" href="./styles.css?v=debug-scenes-1" />
+    <link rel="stylesheet" href="./styles.css?v=debug-scenes-2" />
   </head>
   <body>
     <main class="layout">
@@ -51,12 +51,24 @@
           </div>
           <div
             id="scene-panel-debug"
-            class="scene-panel controls"
+            class="scene-panel controls debug-scene-grid"
             role="tabpanel"
             aria-labelledby="scene-tab-debug"
             hidden
           >
-            <button id="scene-water-block">Water Block</button>
+            <button data-debug-scene="filter-water-block">Water Block</button>
+            <button data-debug-scene="off-center-filter-wall-pour">Off-Center Wall Pour</button>
+            <button data-debug-scene="seeded-paper-wall-sheet">Paper-Wall Sheet</button>
+            <button data-debug-scene="filter-apex-drain">Filter Apex Drain</button>
+            <button data-debug-scene="cup-wall-floor-corner-contact">Cup Corner Contact</button>
+            <button data-debug-scene="asymmetric-cup-mound-settle">Asymmetric Mound</button>
+            <button data-debug-scene="hydrostatic-column">Hydrostatic Column</button>
+            <button data-debug-scene="dam-break-slosh">Dam Break Slosh</button>
+            <button data-debug-scene="sparse-free-jet">Sparse Free Jet</button>
+            <button data-debug-scene="high-velocity-jet-impact">High-Velocity Impact</button>
+            <button data-debug-scene="uniform-bed-saturation">Uniform Bed Saturation</button>
+            <button data-debug-scene="permeability-comparison">Permeability Stress</button>
+            <button data-debug-scene="particle-capacity-stress">Capacity Stress</button>
           </div>
         </div>
         <div class="control-panel">
@@ -213,6 +225,6 @@
         </div>
       </section>
     </main>
-    <script type="module" src="./main.js?v=debug-scenes-1"></script>
+    <script type="module" src="./main.js?v=debug-scenes-2"></script>
   </body>
 </html>

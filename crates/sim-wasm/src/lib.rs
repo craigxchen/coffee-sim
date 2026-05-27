@@ -6,7 +6,7 @@ pub(crate) mod mpm_3d;
 mod renderer;
 
 #[cfg(target_arch = "wasm32")]
-use mpm_3d::{MpmSettings, MpmSim3D};
+use mpm_3d::{DebugScene, MpmSettings, MpmSim3D};
 #[cfg(target_arch = "wasm32")]
 use renderer::{OrbitCamera, Renderer};
 #[cfg(target_arch = "wasm32")]
@@ -259,6 +259,15 @@ impl WasmSim3D {
     pub fn load_benchmark_filter_water_block(&mut self) {
         self.rebuild_with_settings(MpmSettings::benchmark_filter_water_block());
         self.sim.seed_filter_water_block(self.renderer.queue());
+    }
+
+    #[wasm_bindgen(js_name = loadDebugScene)]
+    pub fn load_debug_scene(&mut self, scene_id: &str) -> Result<(), JsValue> {
+        let scene = DebugScene::from_id(scene_id)
+            .ok_or_else(|| JsValue::from_str(&format!("unknown debug scene: {scene_id}")))?;
+        self.rebuild_with_settings(scene.settings());
+        scene.seed(&mut self.sim, self.renderer.queue());
+        Ok(())
     }
 
     #[wasm_bindgen(js_name = stepFrame)]

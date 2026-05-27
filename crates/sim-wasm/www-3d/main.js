@@ -1,4 +1,4 @@
-import init, { WasmSim3D } from "./pkg/coffee_sim_wasm.js?v=debug-scenes-1";
+import init, { WasmSim3D } from "./pkg/coffee_sim_wasm.js?v=debug-scenes-2";
 
 const canvas = document.getElementById("sim-canvas");
 const viewCubeStage = document.getElementById("view-cube-stage");
@@ -10,7 +10,6 @@ const sceneMainPanel = document.getElementById("scene-panel-main");
 const sceneDebugPanel = document.getElementById("scene-panel-debug");
 const sceneFreeStreamButton = document.getElementById("scene-free-stream");
 const sceneCenterPourButton = document.getElementById("scene-center-pour");
-const sceneWaterBlockButton = document.getElementById("scene-water-block");
 const waterVelocityInput = document.getElementById("water-velocity");
 const waterVelocityValue = document.getElementById("water-velocity-value");
 const spoutPlane = document.getElementById("spout-plane");
@@ -68,6 +67,7 @@ let lastClientX = 0;
 let lastClientY = 0;
 let fixedStepSeconds = null;
 let currentSceneMode = "Center Pour";
+let currentSceneId = "center-pour";
 const heldKeys = new Set();
 const PAN_SPEED = 6.0;
 const SPOUT_X_MIN = -6.0;
@@ -80,6 +80,28 @@ const PAN_CODES = new Set([
   "KeyA",
   "KeyS",
   "KeyD",
+]);
+const DEBUG_SCENE_LABELS = new Map([
+  ["filter-water-block", "Water Block"],
+  ["off-center-filter-wall-pour", "Off-Center Wall Pour"],
+  ["seeded-paper-wall-sheet", "Paper-Wall Sheet"],
+  ["filter-apex-drain", "Filter Apex Drain"],
+  ["cup-wall-floor-corner-contact", "Cup Corner Contact"],
+  ["asymmetric-cup-mound-settle", "Asymmetric Mound"],
+  ["hydrostatic-column", "Hydrostatic Column"],
+  ["dam-break-slosh", "Dam Break Slosh"],
+  ["sparse-free-jet", "Sparse Free Jet"],
+  ["high-velocity-jet-impact", "High-Velocity Impact"],
+  ["uniform-bed-saturation", "Uniform Bed Saturation"],
+  ["permeability-comparison", "Permeability Stress"],
+  ["particle-capacity-stress", "Capacity Stress"],
+]);
+const DEBUG_SCENE_PAUSE_ON_LOAD = new Set([
+  "filter-water-block",
+  "seeded-paper-wall-sheet",
+  "filter-apex-drain",
+  "cup-wall-floor-corner-contact",
+  "uniform-bed-saturation",
 ]);
 let spoutX = 0.0;
 let spoutZ = 0.0;
@@ -109,15 +131,7 @@ toggleButton.addEventListener("click", () => {
 });
 
 resetButton.addEventListener("click", () => {
-  if (currentSceneMode === "Water Block") {
-    loadWaterBlockScene();
-    return;
-  }
-  app.reset();
-  applyWaterVelocityControl();
-  applySpoutControls();
-  lastFrameTime = 0;
-  syncUi();
+  reloadCurrentScene();
 });
 
 toggleDebugButton.addEventListener("click", () => {
@@ -137,31 +151,17 @@ sceneDebugTab.addEventListener("click", () => {
 });
 
 sceneFreeStreamButton.addEventListener("click", () => {
-  app.loadBenchmarkFreeStream();
-  syncControlDefaultsFromSim();
-  applySceneControls();
-  fixedStepSeconds = 1 / 60;
-  currentSceneMode = "Water Only";
-  setSceneTab("main");
-  setPaused(false);
-  lastFrameTime = 0;
-  syncUi();
+  loadFreeStreamScene();
 });
 
 sceneCenterPourButton.addEventListener("click", () => {
-  app.loadBenchmarkCenterPour();
-  syncControlDefaultsFromSim();
-  applySceneControls();
-  fixedStepSeconds = 1 / 60;
-  currentSceneMode = "Center Pour";
-  setSceneTab("main");
-  setPaused(false);
-  lastFrameTime = 0;
-  syncUi();
+  loadCenterPourScene();
 });
 
-sceneWaterBlockButton.addEventListener("click", () => {
-  loadWaterBlockScene();
+sceneDebugPanel.addEventListener("click", (event) => {
+  const button = event.target.closest("[data-debug-scene]");
+  if (!button || !sceneDebugPanel.contains(button)) return;
+  loadDebugScene(button.dataset.debugScene);
 });
 
 waterVelocityInput.addEventListener("input", () => {
@@ -454,17 +454,59 @@ function setSceneTab(tabName) {
   sceneDebugPanel.hidden = !debugSelected;
 }
 
-function loadWaterBlockScene() {
-  app.loadBenchmarkFilterWaterBlock();
+function finishSceneLoad({ sceneId, label, tab, pausedOnLoad = false }) {
   syncControlDefaultsFromSim();
   applySceneControls();
   fixedStepSeconds = 1 / 60;
-  currentSceneMode = "Water Block";
-  setSceneTab("debug");
-  app.stepFrame(0);
-  setPaused(true);
+  currentSceneId = sceneId;
+  currentSceneMode = label;
+  setSceneTab(tab);
+  if (pausedOnLoad) {
+    app.stepFrame(0);
+  }
+  setPaused(pausedOnLoad);
   lastFrameTime = 0;
   syncUi();
+}
+
+function loadCenterPourScene() {
+  app.loadBenchmarkCenterPour();
+  finishSceneLoad({
+    sceneId: "center-pour",
+    label: "Center Pour",
+    tab: "main",
+  });
+}
+
+function loadFreeStreamScene() {
+  app.loadBenchmarkFreeStream();
+  finishSceneLoad({
+    sceneId: "free-stream",
+    label: "Water Only",
+    tab: "main",
+  });
+}
+
+function loadDebugScene(sceneId) {
+  app.loadDebugScene(sceneId);
+  finishSceneLoad({
+    sceneId: `debug:${sceneId}`,
+    label: DEBUG_SCENE_LABELS.get(sceneId) ?? sceneId,
+    tab: "debug",
+    pausedOnLoad: DEBUG_SCENE_PAUSE_ON_LOAD.has(sceneId),
+  });
+}
+
+function reloadCurrentScene() {
+  if (currentSceneId.startsWith("debug:")) {
+    loadDebugScene(currentSceneId.slice("debug:".length));
+  } else {
+    app.reset();
+    applyWaterVelocityControl();
+    applySpoutControls();
+    lastFrameTime = 0;
+    syncUi();
+  }
 }
 
 function updateSpoutPlaneFromPointer(e) {
@@ -539,6 +581,8 @@ function publishDebugHooks() {
     evaluate: runRealismEvaluation,
     setPaused,
     isPaused: () => paused,
+    loadDebugScene,
+    debugScenes: Object.fromEntries(DEBUG_SCENE_LABELS),
     stepFramesForEvaluation,
     sampleRealism: captureRealismSample,
     runRealismEvaluation,
@@ -622,15 +666,26 @@ function loadEvaluationScene(scene) {
   if (scene === "water-only" || scene === "free-stream") {
     app.loadBenchmarkFreeStream();
     currentSceneMode = "Water Only";
+    currentSceneId = "free-stream";
     setSceneTab("main");
-  } else if (scene === "water-block" || scene === "filter-water-block") {
-    app.loadBenchmarkFilterWaterBlock();
-    currentSceneMode = "Water Block";
+  } else if (scene === "center-pour" || scene === "pourover") {
+    app.loadBenchmarkCenterPour();
+    currentSceneMode = "Center Pour";
+    currentSceneId = "center-pour";
+    setSceneTab("main");
+  } else if (scene === "water-block" || DEBUG_SCENE_LABELS.has(scene)) {
+    const sceneId = scene === "water-block" ? "filter-water-block" : scene;
+    app.loadDebugScene(sceneId);
+    currentSceneMode = DEBUG_SCENE_LABELS.get(sceneId) ?? sceneId;
+    currentSceneId = `debug:${sceneId}`;
     setSceneTab("debug");
-    app.stepFrame(0);
+    if (DEBUG_SCENE_PAUSE_ON_LOAD.has(sceneId)) {
+      app.stepFrame(0);
+    }
   } else {
     app.loadBenchmarkCenterPour();
     currentSceneMode = "Center Pour";
+    currentSceneId = "center-pour";
     setSceneTab("main");
   }
   fixedStepSeconds = 1 / 60;
