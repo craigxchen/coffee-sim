@@ -203,6 +203,45 @@ fn water_diagnostics_object(
         diagnostics.hydrostatic_bottom_higher,
     )?;
     set_object(&obj, "hydrostaticPressure", &pressure)?;
+    set_number(
+        &obj,
+        "dissolvedSoluteMass",
+        diagnostics.dissolved_solute_mass,
+    )?;
+    set_number(&obj, "meanTds", diagnostics.mean_tds)?;
+    set_number(&obj, "cupWaterMass", diagnostics.cup_water_mass)?;
+    set_number(&obj, "cupSoluteMass", diagnostics.cup_solute_mass)?;
+    set_number(&obj, "cupTds", diagnostics.cup_tds)?;
+    set_number(&obj, "extractionYield", diagnostics.extraction_yield)?;
+    Ok(obj)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn metrics_snapshot_object(snapshot: mpm_3d::MetricsSnapshot) -> Result<js_sys::Object, JsValue> {
+    let obj = js_sys::Object::new();
+    set_number(&obj, "maxAbsDivergence", snapshot.max_abs_div)?;
+    set_u32(&obj, "fluidCellCount", snapshot.fluid_cells)?;
+    set_u32(&obj, "divClampFires", snapshot.div_clamp_fires)?;
+    set_u32(&obj, "pressureClampFires", snapshot.pressure_clamp_fires)?;
+    set_u32(&obj, "massOverflowFires", snapshot.mass_overflow_fires)?;
+    set_number(
+        &obj,
+        "projectionResidualMaxAbsDivergence",
+        snapshot.projection_residual_max_abs_div,
+    )?;
+    set_number(
+        &obj,
+        "projectionResidualMeanAbsDivergence",
+        snapshot.projection_residual_mean_abs_div,
+    )?;
+    set_u32(
+        &obj,
+        "projectionResidualCellCount",
+        snapshot.projection_residual_cells,
+    )?;
+    set_number(&obj, "meanTds", snapshot.mean_tds)?;
+    set_number(&obj, "cupTds", snapshot.cup_tds)?;
+    set_number(&obj, "extractionYield", snapshot.extraction_yield)?;
     Ok(obj)
 }
 
@@ -438,6 +477,20 @@ impl WasmSim3D {
         self.sim.refresh_metrics(&device, &queue).await
     }
 
+    #[wasm_bindgen(js_name = sampleMetrics)]
+    pub fn sample_metrics(&self, delay_frames: u32) -> js_sys::Promise {
+        let device = self.renderer.device().clone();
+        let queue = self.renderer.queue().clone();
+        let metrics = self.sim.metrics_buffer();
+        let has_bed = self.sim.settings().bed.is_some();
+        wasm_bindgen_futures::future_to_promise(async move {
+            let snapshot =
+                MpmSim3D::sample_metrics_after_delay(device, queue, metrics, has_bed, delay_frames)
+                    .await?;
+            Ok(metrics_snapshot_object(snapshot)?.into())
+        })
+    }
+
     #[wasm_bindgen(js_name = waterDiagnostics)]
     pub async fn water_diagnostics(&self) -> Result<JsValue, JsValue> {
         let device = self.renderer.device().clone();
@@ -469,6 +522,56 @@ impl WasmSim3D {
     #[wasm_bindgen(js_name = massOverflowFires)]
     pub fn mass_overflow_fires(&self) -> u32 {
         self.sim.latest_metrics().mass_overflow_fires
+    }
+
+    #[wasm_bindgen(js_name = projectionResidualMaxAbsDivergence)]
+    pub fn projection_residual_max_abs_divergence(&self) -> f32 {
+        self.sim.latest_metrics().projection_residual_max_abs_div
+    }
+
+    #[wasm_bindgen(js_name = projectionResidualMeanAbsDivergence)]
+    pub fn projection_residual_mean_abs_divergence(&self) -> f32 {
+        self.sim.latest_metrics().projection_residual_mean_abs_div
+    }
+
+    #[wasm_bindgen(js_name = projectionResidualCellCount)]
+    pub fn projection_residual_cell_count(&self) -> u32 {
+        self.sim.latest_metrics().projection_residual_cells
+    }
+
+    #[wasm_bindgen(js_name = lastPressureRbgsPairs)]
+    pub fn last_pressure_rbgs_pairs(&self) -> u32 {
+        self.sim.last_pressure_rbgs_pairs()
+    }
+
+    #[wasm_bindgen(js_name = setPressureResidualAdaptation)]
+    pub fn set_pressure_residual_adaptation(&mut self, target: f32, max_pairs: u32) {
+        self.sim.set_pressure_residual_adaptation(target, max_pairs);
+    }
+
+    #[wasm_bindgen(js_name = meanTds)]
+    pub fn mean_tds(&self) -> f32 {
+        self.sim.latest_metrics().mean_tds
+    }
+
+    #[wasm_bindgen(js_name = cupTds)]
+    pub fn cup_tds(&self) -> f32 {
+        self.sim.latest_metrics().cup_tds
+    }
+
+    #[wasm_bindgen(js_name = extractionYield)]
+    pub fn extraction_yield(&self) -> f32 {
+        self.sim.latest_metrics().extraction_yield
+    }
+
+    #[wasm_bindgen(js_name = estimatedCupTds)]
+    pub fn estimated_cup_tds(&self) -> f32 {
+        self.sim.estimated_cup_tds()
+    }
+
+    #[wasm_bindgen(js_name = estimatedExtractionYield)]
+    pub fn estimated_extraction_yield(&self) -> f32 {
+        self.sim.estimated_extraction_yield()
     }
 }
 

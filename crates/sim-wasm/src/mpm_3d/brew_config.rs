@@ -33,6 +33,12 @@ pub(crate) struct BrewConfig {
     pub filter_absorption_rate_s: f32,
     pub bed_compaction_rate: f32,
     pub bed_impact_rate: f32,
+    pub extractable_yield_fraction: f32,
+    pub fast_extractable_fraction: f32,
+    pub fast_extraction_rate_s: f32,
+    pub slow_extraction_rate_s: f32,
+    pub max_solute_concentration: f32,
+    pub pore_to_water_mass_transfer_rate_s: f32,
 }
 
 pub(crate) const DEFAULT_BREW: BrewConfig = BrewConfig {
@@ -68,6 +74,17 @@ pub(crate) const DEFAULT_BREW: BrewConfig = BrewConfig {
     filter_absorption_rate_s: 0.0,
     bed_compaction_rate: 5.5,
     bed_impact_rate: 8.0,
+    // Total soluble coffee is modeled as the extractable fraction of the dry
+    // dose. The fast reservoir approximates fines and broken surface cells;
+    // the slow reservoir approximates intragranular diffusion from kernels.
+    extractable_yield_fraction: 0.28,
+    fast_extractable_fraction: 0.30,
+    fast_extraction_rate_s: 0.18,
+    slow_extraction_rate_s: 0.018,
+    // Solute mass per water mass. This is a local pore-liquid cap, not the
+    // target cup TDS; advected water dilution keeps cup concentrations lower.
+    max_solute_concentration: 0.08,
+    pore_to_water_mass_transfer_rate_s: 4.0,
 };
 
 #[allow(dead_code)]
@@ -78,6 +95,10 @@ impl BrewConfig {
 
     pub(crate) const fn bed_sample_mass_g(self) -> f32 {
         self.coffee_dose_g / self.bed_particle_samples as f32
+    }
+
+    pub(crate) const fn bed_sample_extractable_mass_units(self) -> f32 {
+        self.bed_sample_mass_g() * self.extractable_yield_fraction * self.water_mass_units_per_ml
     }
 
     pub(crate) const fn bed_permeability_m2(self) -> f32 {
@@ -109,12 +130,18 @@ mod tests {
         assert!(DEFAULT_BREW.bed_sample_radius_dx > DEFAULT_BREW.water_sample_radius_dx);
         assert!(DEFAULT_BREW.bed_permeability_m2() > DEFAULT_BREW.min_bed_permeability_m2);
         assert!(DEFAULT_BREW.darcy_resistance_rate_s() > 0.0);
+        assert!((0.18..=0.34).contains(&DEFAULT_BREW.extractable_yield_fraction));
+        assert!((0.0..=1.0).contains(&DEFAULT_BREW.fast_extractable_fraction));
+        assert!(DEFAULT_BREW.fast_extraction_rate_s > DEFAULT_BREW.slow_extraction_rate_s);
+        assert!(DEFAULT_BREW.max_solute_concentration > 0.0);
+        assert!(DEFAULT_BREW.pore_to_water_mass_transfer_rate_s > 0.0);
     }
 
     #[test]
     fn default_particle_sampling_has_positive_masses() {
         assert!(DEFAULT_BREW.water_particle_mass_units() > 0.0);
         assert!(DEFAULT_BREW.bed_sample_mass_g() > 0.0);
+        assert!(DEFAULT_BREW.bed_sample_extractable_mass_units() > 0.0);
     }
 
     #[test]
