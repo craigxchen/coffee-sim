@@ -20,7 +20,7 @@ pub(crate) use filter::FilterConfig;
 pub(crate) use filter_mesh::{MAX_FILL_VERTEX_COUNT, MAX_RENDER_VERTEX_COUNT};
 
 use bed::{BedConfig, BedInit};
-use brew_config::DEFAULT_BREW;
+use brew_config::{kozeny_carman_permeability_m2, DEFAULT_BREW};
 use filter_mesh::FilterMesh;
 use inflow::{EmissionResult, InflowState, SpoutSettings, MASS_UNITS_PER_ML};
 use pipelines::MpmPipelines;
@@ -281,6 +281,234 @@ impl MpmSettings {
         settings.pressure_rbgs_pairs = 80;
         settings
     }
+
+    pub fn debug_off_center_filter_wall_pour() -> Self {
+        let mut settings = Self::default_v60();
+        if let Some(filter) = settings.filter.as_ref() {
+            let local_y = 1.35;
+            let wall_radius = filter.inner_radius_at_y(local_y);
+            settings.spout.origin = Vec3::new((wall_radius - 0.34).max(0.0), 7.1, 0.0);
+        }
+        settings.initial_water_speed_m_s = 0.28;
+        settings.spout.nozzle_radius = 0.15;
+        settings.spout.max_flow_rate_ml_s = 10.0;
+        settings.spout.max_exit_speed = units::sim_speed_from_meters_per_second(0.6);
+        settings.pressure_rbgs_pairs = 80;
+        settings
+    }
+
+    pub fn debug_seeded_paper_wall_sheet() -> Self {
+        let mut settings = Self::default_v60();
+        settings.initial_water_speed_m_s = 0.0;
+        settings.pressure_rbgs_pairs = 80;
+        settings
+    }
+
+    pub fn debug_filter_apex_drain() -> Self {
+        let mut settings = Self::default_v60();
+        settings.bed = None;
+        settings.initial_water_speed_m_s = 0.0;
+        settings.pressure_rbgs_pairs = 80;
+        settings
+    }
+
+    pub fn debug_cup_wall_floor_corner_contact() -> Self {
+        let mut settings = Self::cup_only_water_scene();
+        settings.initial_water_speed_m_s = 0.0;
+        settings.pressure_rbgs_pairs = 90;
+        settings
+    }
+
+    pub fn debug_asymmetric_cup_mound() -> Self {
+        let mut settings = Self::cup_only_water_scene();
+        settings.initial_water_speed_m_s = 0.0;
+        settings.pressure_rbgs_pairs = 90;
+        settings
+    }
+
+    pub fn debug_hydrostatic_column() -> Self {
+        let mut settings = Self::cup_only_water_scene();
+        settings.initial_water_speed_m_s = 0.0;
+        settings.pressure_rbgs_pairs = 100;
+        settings
+    }
+
+    pub fn debug_dam_break_slosh() -> Self {
+        let mut settings = Self::cup_only_water_scene();
+        settings.initial_water_speed_m_s = 0.0;
+        settings.pressure_rbgs_pairs = 90;
+        settings
+    }
+
+    pub fn debug_sparse_free_jet() -> Self {
+        let mut settings = Self::cup_only_water_scene();
+        settings.spout.origin = Vec3::new(0.0, 7.4, 0.0);
+        settings.spout.nozzle_radius = 0.07;
+        settings.spout.max_flow_rate_ml_s = 2.0;
+        settings.initial_water_speed_m_s = 0.18;
+        settings
+    }
+
+    pub fn debug_high_velocity_jet_impact() -> Self {
+        let mut settings = Self::cup_only_water_scene();
+        settings.spout.origin = Vec3::new(0.0, 6.9, 0.0);
+        settings.spout.nozzle_radius = 0.14;
+        settings.spout.max_flow_rate_ml_s = 14.0;
+        settings.spout.max_exit_speed = units::sim_speed_from_meters_per_second(0.65);
+        settings.initial_water_speed_m_s = 0.48;
+        settings.pressure_rbgs_pairs = 100;
+        settings
+    }
+
+    pub fn debug_uniform_bed_saturation() -> Self {
+        let mut settings = Self::default_v60();
+        settings.initial_water_speed_m_s = 0.0;
+        settings.pressure_rbgs_pairs = 80;
+        settings
+    }
+
+    pub fn debug_permeability_comparison() -> Self {
+        let mut settings = Self::default_v60();
+        if let Some(bed) = settings.bed.as_mut() {
+            bed.initial_permeability = kozeny_carman_permeability_m2(320.0, bed.initial_porosity);
+        }
+        settings.spout.origin = Vec3::new(0.0, 7.1, 0.0);
+        settings.initial_water_speed_m_s = 0.18;
+        settings.pressure_rbgs_pairs = 80;
+        settings
+    }
+
+    pub fn debug_particle_capacity_stress() -> Self {
+        let mut settings = Self::default_v60();
+        settings.max_particles = 32_000;
+        settings.spout.origin = Vec3::new(0.0, 7.1, 0.0);
+        settings.spout.nozzle_radius = 0.20;
+        settings.spout.max_flow_rate_ml_s = 18.0;
+        settings.spout.max_exit_speed = units::sim_speed_from_meters_per_second(0.65);
+        settings.initial_water_speed_m_s = 0.42;
+        settings.pressure_rbgs_pairs = 80;
+        settings
+    }
+
+    fn cup_only_water_scene() -> Self {
+        let mut settings = Self::benchmark_free_stream();
+        settings.filter = None;
+        settings.bed = None;
+        settings
+            .obstacles
+            .retain(|obstacle| matches!(obstacle, Obstacle::Cylinder { .. }));
+        settings
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DebugScene {
+    FilterWaterBlock,
+    OffCenterFilterWallPour,
+    SeededPaperWallSheet,
+    FilterApexDrain,
+    CupWallFloorCornerContact,
+    AsymmetricCupMoundSettle,
+    HydrostaticColumn,
+    DamBreakSlosh,
+    SparseFreeJet,
+    HighVelocityJetImpact,
+    UniformBedSaturation,
+    PermeabilityComparison,
+    ParticleCapacityStress,
+}
+
+impl DebugScene {
+    #[cfg(test)]
+    pub(crate) const ALL: [Self; 13] = [
+        Self::FilterWaterBlock,
+        Self::OffCenterFilterWallPour,
+        Self::SeededPaperWallSheet,
+        Self::FilterApexDrain,
+        Self::CupWallFloorCornerContact,
+        Self::AsymmetricCupMoundSettle,
+        Self::HydrostaticColumn,
+        Self::DamBreakSlosh,
+        Self::SparseFreeJet,
+        Self::HighVelocityJetImpact,
+        Self::UniformBedSaturation,
+        Self::PermeabilityComparison,
+        Self::ParticleCapacityStress,
+    ];
+
+    pub(crate) fn from_id(id: &str) -> Option<Self> {
+        match id {
+            "filter-water-block" => Some(Self::FilterWaterBlock),
+            "off-center-filter-wall-pour" => Some(Self::OffCenterFilterWallPour),
+            "seeded-paper-wall-sheet" => Some(Self::SeededPaperWallSheet),
+            "filter-apex-drain" => Some(Self::FilterApexDrain),
+            "cup-wall-floor-corner-contact" => Some(Self::CupWallFloorCornerContact),
+            "asymmetric-cup-mound-settle" => Some(Self::AsymmetricCupMoundSettle),
+            "hydrostatic-column" => Some(Self::HydrostaticColumn),
+            "dam-break-slosh" => Some(Self::DamBreakSlosh),
+            "sparse-free-jet" => Some(Self::SparseFreeJet),
+            "high-velocity-jet-impact" => Some(Self::HighVelocityJetImpact),
+            "uniform-bed-saturation" => Some(Self::UniformBedSaturation),
+            "permeability-comparison" => Some(Self::PermeabilityComparison),
+            "particle-capacity-stress" => Some(Self::ParticleCapacityStress),
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn id(self) -> &'static str {
+        match self {
+            Self::FilterWaterBlock => "filter-water-block",
+            Self::OffCenterFilterWallPour => "off-center-filter-wall-pour",
+            Self::SeededPaperWallSheet => "seeded-paper-wall-sheet",
+            Self::FilterApexDrain => "filter-apex-drain",
+            Self::CupWallFloorCornerContact => "cup-wall-floor-corner-contact",
+            Self::AsymmetricCupMoundSettle => "asymmetric-cup-mound-settle",
+            Self::HydrostaticColumn => "hydrostatic-column",
+            Self::DamBreakSlosh => "dam-break-slosh",
+            Self::SparseFreeJet => "sparse-free-jet",
+            Self::HighVelocityJetImpact => "high-velocity-jet-impact",
+            Self::UniformBedSaturation => "uniform-bed-saturation",
+            Self::PermeabilityComparison => "permeability-comparison",
+            Self::ParticleCapacityStress => "particle-capacity-stress",
+        }
+    }
+
+    pub(crate) fn settings(self) -> MpmSettings {
+        match self {
+            Self::FilterWaterBlock => MpmSettings::benchmark_filter_water_block(),
+            Self::OffCenterFilterWallPour => MpmSettings::debug_off_center_filter_wall_pour(),
+            Self::SeededPaperWallSheet => MpmSettings::debug_seeded_paper_wall_sheet(),
+            Self::FilterApexDrain => MpmSettings::debug_filter_apex_drain(),
+            Self::CupWallFloorCornerContact => MpmSettings::debug_cup_wall_floor_corner_contact(),
+            Self::AsymmetricCupMoundSettle => MpmSettings::debug_asymmetric_cup_mound(),
+            Self::HydrostaticColumn => MpmSettings::debug_hydrostatic_column(),
+            Self::DamBreakSlosh => MpmSettings::debug_dam_break_slosh(),
+            Self::SparseFreeJet => MpmSettings::debug_sparse_free_jet(),
+            Self::HighVelocityJetImpact => MpmSettings::debug_high_velocity_jet_impact(),
+            Self::UniformBedSaturation => MpmSettings::debug_uniform_bed_saturation(),
+            Self::PermeabilityComparison => MpmSettings::debug_permeability_comparison(),
+            Self::ParticleCapacityStress => MpmSettings::debug_particle_capacity_stress(),
+        }
+    }
+
+    pub(crate) fn seed(self, sim: &mut MpmSim3D, queue: &wgpu::Queue) {
+        match self {
+            Self::FilterWaterBlock => sim.seed_filter_water_block(queue),
+            Self::SeededPaperWallSheet => sim.seed_paper_wall_sheet(queue),
+            Self::FilterApexDrain => sim.seed_filter_apex_drain(queue),
+            Self::CupWallFloorCornerContact => sim.seed_cup_wall_floor_corner_contact(queue),
+            Self::AsymmetricCupMoundSettle => sim.seed_asymmetric_cup_mound(queue),
+            Self::HydrostaticColumn => sim.seed_hydrostatic_column(queue),
+            Self::DamBreakSlosh => sim.seed_dam_break_slosh(queue),
+            Self::HighVelocityJetImpact => sim.seed_high_velocity_jet_impact_pool(queue),
+            Self::UniformBedSaturation => sim.seed_uniform_bed_saturation(queue),
+            Self::OffCenterFilterWallPour
+            | Self::SparseFreeJet
+            | Self::PermeabilityComparison
+            | Self::ParticleCapacityStress => {}
+        }
+    }
 }
 
 fn v60_support_cone(filter: &FilterConfig) -> Obstacle {
@@ -310,6 +538,21 @@ fn cup_region(settings: &MpmSettings) -> Option<(f32, f32, f32)> {
                 bot_y,
                 ..
             } => Some((*radius, *top_y, *bot_y)),
+            _ => None,
+        })
+}
+
+fn cup_region_full(settings: &MpmSettings) -> Option<(Vec3, f32, f32, f32)> {
+    settings
+        .obstacles
+        .iter()
+        .find_map(|obstacle| match obstacle {
+            Obstacle::Cylinder {
+                center,
+                radius,
+                top_y,
+                bot_y,
+            } => Some((*center, *radius, *top_y, *bot_y)),
             _ => None,
         })
 }
@@ -437,7 +680,6 @@ impl MpmSim3D {
         let golden_angle = 2.399_963_1_f32;
 
         let mut particle_data: Vec<[f32; 8]> = Vec::new();
-        let mut affine_data: Vec<[f32; 12]> = Vec::new();
 
         let mut layer = 0_u32;
         let mut y = y_min;
@@ -463,12 +705,36 @@ impl MpmSim3D {
                 let x = filter.center.x + radius * angle.cos();
                 let z = filter.center.z + radius * angle.sin();
                 particle_data.push([x, y, z, 1.0, 0.0, 0.0, 0.0, particle_mass]);
-                affine_data.push([0.0; 12]);
             }
             layer += 1;
             y += spacing;
         }
 
+        self.write_seeded_water(queue, particle_data, particle_mass, 0.0);
+    }
+
+    fn write_seeded_water(
+        &mut self,
+        queue: &wgpu::Queue,
+        mut particle_data: Vec<[f32; 8]>,
+        particle_mass: f32,
+        exit_speed_m_s: f32,
+    ) {
+        let available = self.settings.max_particles.saturating_sub(self.num_bed) as usize;
+        particle_data.truncate(available);
+        if particle_data.is_empty() {
+            self.num_water = 0;
+            self.total_time = 0.0;
+            self.frame_emitted_mass = 0.0;
+            self.total_emitted_mass = 0.0;
+            self.frame_dropped_particles = 0;
+            self.total_dropped_particles = 0;
+            self.latest_metrics = MetricsSnapshot::default();
+            self.set_exit_speed_m_s(exit_speed_m_s);
+            return;
+        }
+
+        let affine_data = vec![[0.0; 12]; particle_data.len()];
         let particle_offset = (self.num_bed as u64) * 32;
         let affine_offset = (self.num_bed as u64) * 48;
         queue.write_buffer(
@@ -489,7 +755,327 @@ impl MpmSim3D {
         self.frame_dropped_particles = 0;
         self.total_dropped_particles = 0;
         self.latest_metrics = MetricsSnapshot::default();
-        self.set_exit_speed_m_s(0.0);
+        self.set_exit_speed_m_s(exit_speed_m_s);
+    }
+
+    fn water_seed_spacing(&self, scale: f32) -> f32 {
+        let [gx, _, _] = self.settings.grid_dims;
+        self.settings.bounds_size.x / gx as f32 * scale
+    }
+
+    fn seed_filter_disc_layers<F>(
+        &mut self,
+        queue: &wgpu::Queue,
+        y_min: f32,
+        y_max: f32,
+        mut radius_at_y: F,
+        velocity: Vec3,
+        exit_speed_m_s: f32,
+    ) where
+        F: FnMut(f32) -> f32,
+    {
+        let particle_mass = MASS_UNITS_PER_ML / inflow::PARTICLES_PER_ML;
+        let available = self.settings.max_particles.saturating_sub(self.num_bed) as usize;
+        let spacing = self.water_seed_spacing(0.86);
+        let golden_angle = 2.399_963_1_f32;
+        let mut particle_data = Vec::new();
+        let mut layer = 0_u32;
+        let mut y = y_min;
+
+        while y <= y_max && particle_data.len() < available {
+            let radius = radius_at_y(y).max(0.0);
+            let layer_area = std::f32::consts::PI * radius * radius;
+            let sample_area = spacing * spacing * 0.92;
+            let samples = (layer_area / sample_area).ceil().max(1.0) as u32;
+            let layer_rotation = layer as f32 * 0.618_034;
+            for i in 0..samples {
+                if particle_data.len() >= available {
+                    break;
+                }
+                let seed = layer.wrapping_mul(1_103_515_245).wrapping_add(i);
+                let radius_jitter =
+                    (deterministic_unit_float(seed ^ 0x9e37_79b9) - 0.5) * spacing * 0.24;
+                let angle_jitter = (deterministic_unit_float(seed ^ 0x85eb_ca6b) - 0.5) * 0.18;
+                let t = (i as f32 + 0.5) / samples as f32;
+                let radius_limit = (radius - spacing * 0.35).max(0.0);
+                let r = (radius * t.sqrt() + radius_jitter).clamp(0.0, radius_limit);
+                let angle = i as f32 * golden_angle + layer_rotation + angle_jitter;
+                particle_data.push([
+                    r * angle.cos(),
+                    y,
+                    r * angle.sin(),
+                    1.0,
+                    velocity.x,
+                    velocity.y,
+                    velocity.z,
+                    particle_mass,
+                ]);
+            }
+            layer += 1;
+            y += spacing;
+        }
+
+        self.write_seeded_water(queue, particle_data, particle_mass, exit_speed_m_s);
+    }
+
+    fn seed_cup_volume<F>(
+        &mut self,
+        queue: &wgpu::Queue,
+        y_min: f32,
+        y_max: f32,
+        mut include: F,
+        velocity: Vec3,
+        exit_speed_m_s: f32,
+    ) where
+        F: FnMut(Vec3) -> bool,
+    {
+        let Some((center, cup_radius, cup_top_y, cup_bot_y)) = cup_region_full(&self.settings)
+        else {
+            return;
+        };
+
+        let particle_mass = MASS_UNITS_PER_ML / inflow::PARTICLES_PER_ML;
+        let available = self.settings.max_particles.saturating_sub(self.num_bed) as usize;
+        let spacing = self.water_seed_spacing(0.88);
+        let radius = (cup_radius - spacing * 1.5).max(0.0);
+        let y_min = y_min.clamp(cup_bot_y + spacing, cup_top_y - spacing);
+        let y_max = y_max.clamp(y_min, cup_top_y - spacing);
+        let nx = ((radius * 2.0) / spacing).ceil() as i32;
+        let ny = ((y_max - y_min) / spacing).ceil().max(1.0) as i32;
+
+        let mut particle_data = Vec::new();
+        for iy in 0..ny {
+            if particle_data.len() >= available {
+                break;
+            }
+            let y = y_min + (iy as f32 + 0.5) * spacing;
+            for ix in 0..nx {
+                if particle_data.len() >= available {
+                    break;
+                }
+                let x = center.x - radius + (ix as f32 + 0.5) * spacing;
+                for iz in 0..nx {
+                    if particle_data.len() >= available {
+                        break;
+                    }
+                    let z = center.z - radius + (iz as f32 + 0.5) * spacing;
+                    let pos = Vec3::new(x, y, z);
+                    let radial_sq = (pos.x - center.x).powi(2) + (pos.z - center.z).powi(2);
+                    if radial_sq > radius * radius || !include(pos) {
+                        continue;
+                    }
+                    particle_data.push([
+                        pos.x,
+                        pos.y,
+                        pos.z,
+                        1.0,
+                        velocity.x,
+                        velocity.y,
+                        velocity.z,
+                        particle_mass,
+                    ]);
+                }
+            }
+        }
+
+        self.write_seeded_water(queue, particle_data, particle_mass, exit_speed_m_s);
+    }
+
+    pub fn seed_paper_wall_sheet(&mut self, queue: &wgpu::Queue) {
+        let Some(filter) = self.settings.filter.as_ref() else {
+            return;
+        };
+
+        let particle_mass = MASS_UNITS_PER_ML / inflow::PARTICLES_PER_ML;
+        let available = self.settings.max_particles.saturating_sub(self.num_bed) as usize;
+        let spacing = self.water_seed_spacing(0.86);
+        let wall_margin = spacing * 1.6;
+        let y_min = filter.center.y + 0.15;
+        let y_max = (filter.center.y + filter.top_y - spacing * 3.0).min(y_min + 2.25);
+        let arc_half_angle = 1.20_f32;
+        let mut particle_data = Vec::new();
+        let mut y = y_min;
+        let mut layer = 0_u32;
+
+        while y <= y_max && particle_data.len() < available {
+            let local_y = y - filter.center.y;
+            let wall_radius = filter.inner_radius_at_y(local_y);
+            let r_inner = (wall_radius - wall_margin).max(0.0);
+            let r_outer = (wall_radius - spacing * 0.55).max(r_inner);
+            let arc_len = (r_outer * arc_half_angle * 2.0).max(spacing);
+            let angle_samples = (arc_len / spacing).ceil().max(1.0) as u32;
+            let radial_samples = ((r_outer - r_inner) / spacing).ceil().max(1.0) as u32;
+
+            for ia in 0..angle_samples {
+                for ir in 0..radial_samples {
+                    if particle_data.len() >= available {
+                        break;
+                    }
+                    let seed = layer
+                        .wrapping_mul(1_664_525)
+                        .wrapping_add(ia * 31)
+                        .wrapping_add(ir);
+                    let angle_jitter = (deterministic_unit_float(seed ^ 0x85eb_ca6b) - 0.5) * 0.16;
+                    let radius_jitter =
+                        (deterministic_unit_float(seed ^ 0xc2b2_ae35) - 0.5) * spacing * 0.18;
+                    let angle = -arc_half_angle
+                        + (ia as f32 + 0.5) / angle_samples as f32 * arc_half_angle * 2.0
+                        + angle_jitter;
+                    let r = (r_inner
+                        + (ir as f32 + 0.5) / radial_samples as f32 * (r_outer - r_inner)
+                        + radius_jitter)
+                        .clamp(r_inner, r_outer);
+                    particle_data.push([
+                        filter.center.x + r * angle.cos(),
+                        y,
+                        filter.center.z + r * angle.sin(),
+                        1.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                        particle_mass,
+                    ]);
+                }
+            }
+            layer += 1;
+            y += spacing;
+        }
+
+        self.write_seeded_water(queue, particle_data, particle_mass, 0.0);
+    }
+
+    pub fn seed_filter_apex_drain(&mut self, queue: &wgpu::Queue) {
+        let Some(filter) = self.settings.filter.clone() else {
+            return;
+        };
+        let spacing = self.water_seed_spacing(0.86);
+        let y_min = filter.center.y + filter.bot_y + spacing * 3.0;
+        let y_max = (y_min + 1.9).min(filter.center.y + filter.top_y - spacing * 4.0);
+        self.seed_filter_disc_layers(
+            queue,
+            y_min,
+            y_max,
+            |y| {
+                let local_y = y - filter.center.y;
+                (filter.inner_radius_at_y(local_y) - spacing * 1.25)
+                    .max(0.0)
+                    .min(1.15)
+            },
+            Vec3::ZERO,
+            0.0,
+        );
+    }
+
+    pub fn seed_cup_wall_floor_corner_contact(&mut self, queue: &wgpu::Queue) {
+        let Some((center, radius, _, bot_y)) = cup_region_full(&self.settings) else {
+            return;
+        };
+        self.seed_cup_volume(
+            queue,
+            bot_y + 0.20,
+            bot_y + 1.20,
+            |pos| {
+                let dx = pos.x - center.x;
+                let dz = pos.z - center.z;
+                let radial = (dx * dx + dz * dz).sqrt();
+                let angle = dz.atan2(dx);
+                radial >= radius * 0.58 && angle.abs() <= 0.72
+            },
+            Vec3::ZERO,
+            0.0,
+        );
+    }
+
+    pub fn seed_asymmetric_cup_mound(&mut self, queue: &wgpu::Queue) {
+        let Some((_center, _radius, _, bot_y)) = cup_region_full(&self.settings) else {
+            return;
+        };
+        let mound_center = Vec3::new(0.95, bot_y + 1.10, -0.55);
+        self.seed_cup_volume(
+            queue,
+            bot_y + 0.25,
+            bot_y + 2.35,
+            |pos| {
+                let dx = (pos.x - mound_center.x) / 1.55;
+                let dy = (pos.y - mound_center.y) / 1.20;
+                let dz = (pos.z - mound_center.z) / 1.35;
+                dx * dx + dy * dy + dz * dz <= 1.0
+            },
+            Vec3::ZERO,
+            0.0,
+        );
+    }
+
+    pub fn seed_hydrostatic_column(&mut self, queue: &wgpu::Queue) {
+        let Some((center, _, _, bot_y)) = cup_region_full(&self.settings) else {
+            return;
+        };
+        self.seed_cup_volume(
+            queue,
+            bot_y + 0.25,
+            bot_y + 3.85,
+            |pos| {
+                let dx = pos.x - center.x;
+                let dz = pos.z - center.z;
+                dx * dx + dz * dz <= 1.05 * 1.05
+            },
+            Vec3::ZERO,
+            0.0,
+        );
+    }
+
+    pub fn seed_dam_break_slosh(&mut self, queue: &wgpu::Queue) {
+        let Some((center, _, _, bot_y)) = cup_region_full(&self.settings) else {
+            return;
+        };
+        self.seed_cup_volume(
+            queue,
+            bot_y + 0.25,
+            bot_y + 2.55,
+            |pos| pos.x < center.x - 0.20,
+            Vec3::ZERO,
+            0.0,
+        );
+    }
+
+    pub fn seed_high_velocity_jet_impact_pool(&mut self, queue: &wgpu::Queue) {
+        let Some((center, _, _, bot_y)) = cup_region_full(&self.settings) else {
+            return;
+        };
+        self.seed_cup_volume(
+            queue,
+            bot_y + 0.25,
+            bot_y + 1.25,
+            |pos| {
+                let dx = pos.x - center.x;
+                let dz = pos.z - center.z;
+                dx * dx + dz * dz <= 2.35 * 2.35
+            },
+            Vec3::ZERO,
+            self.settings.initial_water_speed_m_s,
+        );
+    }
+
+    pub fn seed_uniform_bed_saturation(&mut self, queue: &wgpu::Queue) {
+        let Some(bed) = self.settings.bed.clone() else {
+            return;
+        };
+        let spacing = self.water_seed_spacing(0.92);
+        let y_min = bed.center.y + bed.bot_y + spacing * 1.5;
+        let y_max = bed.center.y + bed.top_y + spacing * 1.5;
+        self.seed_filter_disc_layers(
+            queue,
+            y_min,
+            y_max,
+            |y| {
+                let height = (bed.top_y - bed.bot_y).max(1e-6);
+                let t = ((y - bed.center.y - bed.bot_y) / height).clamp(0.0, 1.0);
+                let bed_radius = bed.bot_radius + (bed.top_radius - bed.bot_radius) * t;
+                (bed_radius - spacing * 1.5).max(0.0)
+            },
+            Vec3::ZERO,
+            0.0,
+        );
     }
 
     fn water_diagnostics_from_particle_data(&self, data: &[f32]) -> WaterDiagnostics {
@@ -1390,6 +1976,156 @@ mod tests {
         assert!(s.bed.is_some());
         assert_eq!(s.initial_water_speed_m_s, 0.0);
         assert!(s.pressure_rbgs_pairs >= MpmSettings::default_v60().pressure_rbgs_pairs);
+    }
+
+    #[test]
+    fn debug_scene_catalog_ids_round_trip() {
+        let mut ids = Vec::new();
+        for scene in DebugScene::ALL {
+            let id = scene.id();
+            assert_eq!(DebugScene::from_id(id), Some(scene));
+            assert!(!ids.contains(&id), "duplicate debug scene id: {id}");
+            ids.push(id);
+        }
+        assert_eq!(ids.len(), 13);
+    }
+
+    #[test]
+    fn debug_scene_catalog_stays_in_sync_with_browser_ui() {
+        let html = include_str!("../../www-3d/index.html");
+        let js = include_str!("../../www-3d/main.js");
+
+        for scene in DebugScene::ALL {
+            let id = scene.id();
+            assert!(
+                html.contains(&format!("data-debug-scene=\"{id}\"")),
+                "missing debug scene button for {id}",
+            );
+            assert!(
+                js.contains(&format!("[\"{id}\",")),
+                "missing DEBUG_SCENE_LABELS entry for {id}",
+            );
+        }
+
+        assert_eq!(
+            html.matches("data-debug-scene=").count(),
+            DebugScene::ALL.len(),
+            "HTML should expose exactly the Rust debug-scene catalog",
+        );
+    }
+
+    #[test]
+    fn debug_scene_settings_match_expected_test_geometry() {
+        for scene in DebugScene::ALL {
+            let settings = scene.settings();
+            assert!(settings.grid_dims.iter().all(|dim| *dim > 0));
+            assert!(settings.max_particles > 0);
+
+            let bed_budget = settings
+                .bed
+                .as_ref()
+                .map(|bed| bed.num_particles)
+                .unwrap_or(0);
+            assert!(
+                settings.max_particles > bed_budget + 2_000,
+                "{} leaves too little water capacity",
+                scene.id(),
+            );
+
+            match scene {
+                DebugScene::FilterWaterBlock
+                | DebugScene::OffCenterFilterWallPour
+                | DebugScene::SeededPaperWallSheet
+                | DebugScene::UniformBedSaturation
+                | DebugScene::PermeabilityComparison
+                | DebugScene::ParticleCapacityStress => {
+                    assert!(
+                        settings.filter.is_some(),
+                        "{} needs filter geometry",
+                        scene.id()
+                    );
+                    assert!(settings.bed.is_some(), "{} needs bed geometry", scene.id());
+                }
+                DebugScene::FilterApexDrain => {
+                    assert!(settings.filter.is_some());
+                    assert!(settings.bed.is_none());
+                }
+                DebugScene::CupWallFloorCornerContact
+                | DebugScene::AsymmetricCupMoundSettle
+                | DebugScene::HydrostaticColumn
+                | DebugScene::DamBreakSlosh
+                | DebugScene::SparseFreeJet
+                | DebugScene::HighVelocityJetImpact => {
+                    assert!(
+                        settings.filter.is_none(),
+                        "{} should isolate cup water",
+                        scene.id()
+                    );
+                    assert!(
+                        settings.bed.is_none(),
+                        "{} should isolate cup water",
+                        scene.id()
+                    );
+                    assert!(
+                        cup_region(&settings).is_some(),
+                        "{} needs a cup",
+                        scene.id()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn debug_scene_inflow_defaults_match_scene_intent() {
+        for scene in [
+            DebugScene::FilterWaterBlock,
+            DebugScene::SeededPaperWallSheet,
+            DebugScene::FilterApexDrain,
+            DebugScene::CupWallFloorCornerContact,
+            DebugScene::AsymmetricCupMoundSettle,
+            DebugScene::HydrostaticColumn,
+            DebugScene::DamBreakSlosh,
+            DebugScene::UniformBedSaturation,
+        ] {
+            assert_eq!(
+                scene.settings().initial_water_speed_m_s,
+                0.0,
+                "{}",
+                scene.id()
+            );
+        }
+
+        assert!(
+            DebugScene::OffCenterFilterWallPour
+                .settings()
+                .initial_water_speed_m_s
+                > MpmSettings::default_v60().initial_water_speed_m_s
+        );
+        assert!(DebugScene::SparseFreeJet.settings().initial_water_speed_m_s > 0.0);
+        assert!(
+            DebugScene::HighVelocityJetImpact
+                .settings()
+                .initial_water_speed_m_s
+                > MpmSettings::default_v60().initial_water_speed_m_s
+        );
+        assert_eq!(
+            DebugScene::ParticleCapacityStress.settings().max_particles,
+            32_000
+        );
+
+        let default_perm = MpmSettings::default_v60()
+            .bed
+            .as_ref()
+            .expect("default bed")
+            .initial_permeability;
+        let comparison_perm = DebugScene::PermeabilityComparison
+            .settings()
+            .bed
+            .as_ref()
+            .expect("comparison bed")
+            .initial_permeability;
+        assert!(comparison_perm < default_perm);
     }
 
     #[test]
