@@ -12,8 +12,8 @@ High-level ownership:
 - `sim-wasm/src/renderer.rs`: render pipeline and camera controls
 - `sim-wasm/src/mpm_3d/*`: simulation state, passes, scene setup, tests
 - `sim-wasm/www-3d/*`: browser UI and scene controls
-
-The extraction model is documented in [`docs/EXTRACTION.md`](EXTRACTION.md).
+- `sim-wasm/www-3d/demo/*`: small baseline demo shell kept beside the primary app
+- `sim-wasm/www-3d/pkg/*`: generated `wasm-pack` browser package
 
 ## Authoritative State
 
@@ -36,16 +36,18 @@ Each frame is orchestrated by [`MpmSim3D::step_frame`](../crates/sim-wasm/src/mp
 Current pass shape:
 1. update uniforms and scene-dependent state
 2. emit inflow particles
-3. clear hot grid buffers
+3. clear metrics and hot grid buffers
 4. rebuild bed lookup / clear bed-coupling scratch as needed
 5. `p2g`
 6. `grid_update`
 7. `boundary_project`
 8. `classify_cells`
-9. pressure projection passes
-10. `g2p`
-11. bed-coupling / extraction-related passes
-12. `prepare_render`
+9. pressure projection and residual passes
+10. packing preparation/application for coffee particles
+11. viscosity preparation/application
+12. `g2p`
+13. bed coupling, extraction advection, and bed dynamics
+14. `prepare_render`
 
 Important invariant:
 - simulation passes own physical behavior
@@ -56,8 +58,14 @@ Important invariant:
 - `mod.rs`
   - top-level settings
   - scene presets
+  - debug-scene catalog and seed dispatch
   - per-frame orchestration
-  - buffer upload and readback helpers
+  - buffer upload, metrics, and water-diagnostics readback helpers
+- `brew_config.rs`
+  - default V60 recipe, particle sampling, permeability, and extraction
+    parameters
+- `units.rs`
+  - scene-unit to SI-unit calibration for length, gravity, velocity, and volume
 - `state.rs`
   - `MpmUniforms`
   - buffer allocation
@@ -107,27 +115,56 @@ Key ownership rule:
 ## Browser API Surface
 
 `WasmSim3D` currently exposes:
-- scene loading and reset
-- stepping
-- kettle-angle and spout controls
+- scene loading, debug-scene loading, and reset
+- fixed-step frame advancement
+- water velocity and spout-position controls
 - camera manipulation
-- simulation metrics for the UI/debug panel
+- particle counts, emission totals, and capacity counters
+- exact delayed GPU metrics sampling for the debug panel
+- async water diagnostics for scripted realism evaluation
+- pressure residual adaptation hooks
+- TDS and extraction-yield estimates
 
 The browser app in `www-3d/main.js` owns:
-- scene selection
+- main/debug scene selection
 - sidebar controls
 - animation loop
-- debug stats toggles
+- debug stats toggles and low-frequency metric sampling
+- scripted realism-evaluation plumbing on `window.__coffeeSim`
 
 The browser app must stay a thin controller over `WasmSim3D`, not a second simulation layer.
+
+## Scene Catalog
+
+Primary scenes:
+- Center Pour
+- Water Only
+
+Debug scenes exposed by both Rust and the browser UI:
+- Water Block
+- Off-Center Wall Pour
+- Paper-Wall Sheet
+- Filter Apex Drain
+- Cup Corner Contact
+- Asymmetric Mound
+- Hydrostatic Column
+- Dam Break Slosh
+- Sparse Free Jet
+- High-Velocity Impact
+- Uniform Bed Saturation
+- Permeability Stress
+- Capacity Stress
+
+Tests keep the Rust debug-scene catalog and browser buttons in sync.
 
 ## Current Invariants
 
 - `origin/main` is the authoritative mainline branch
 - the WebGPU app in `www-3d` is the primary product surface
 - tests in `physics_tests.rs` are the meaningful regression surface for the solver
-- `CHANGELOG.md` must track shipped or snapshot-worthy behavior changes
 - known realism gaps should be recorded explicitly rather than hidden behind heuristic tuning
+- generated `pkg` artifacts should only be edited or rebuilt when the task
+  explicitly requires a browser package update
 
 ## Known Architectural Gaps
 
@@ -136,5 +173,5 @@ The browser app must stay a thin controller over `WasmSim3D`, not a second simul
 - filter contact is still an approximation rather than a full contact solve
 - extraction is now particle-carried, but still uses coarse two-pool kinetics
   rather than calibrated grind-distribution chemistry
-
-For active planning and validation priorities, see [`docs/ROADMAP.md`](ROADMAP.md).
+- the recipe and material model are centralized in `brew_config.rs`, but there
+  is no user-facing recipe editor yet
