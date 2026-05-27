@@ -49,6 +49,7 @@ pub(crate) struct InflowState {
     flow_rate: f32,
     exit_speed: f32,
     accumulator: f32,
+    slug_sample_cursor: u64,
 }
 
 pub(crate) struct EmissionResult {
@@ -62,6 +63,7 @@ impl InflowState {
             flow_rate: 0.0,
             exit_speed: 0.0,
             accumulator: 0.0,
+            slug_sample_cursor: 0,
         };
         inflow.set_exit_speed(exit_speed);
         inflow
@@ -139,20 +141,21 @@ impl InflowState {
         let dir = spout.emission_direction();
         let emit_speed = self.exit_speed();
 
-        // Emit material samples across the 2D nozzle aperture with one shared
-        // vertical jet velocity. Flow rate controls sample count; the aperture
-        // radius controls only the initial cross-section.
+        // Emit material samples as coherent cylindrical slug layers: flow rate
+        // controls sample count, while the nozzle shape controls the repeating
+        // cross-section and the cursor preserves continuity across frames.
         let emit_origin = Vec3::new(
             spout.origin.x + dir.x * 0.18,
             spout.origin.y + dir.y * 0.18,
             spout.origin.z + dir.z * 0.18,
         );
+        let first_slug_sample = self.slug_sample_cursor;
 
         for i in 0..count {
-            let emission_age = aperture_emission_age(i, count, dt);
+            let slug_sample = first_slug_sample + i as u64;
+            let emission_age = slug_emission_age(slug_sample, first_slug_sample, count, dt);
             let vel = aperture_jet_velocity(dir, emit_speed);
-            let aperture_offset =
-                aperture_sample_offset(i, count, current_water, spout.nozzle_radius);
+            let aperture_offset = slug_sample_offset(slug_sample, spout.nozzle_radius);
             let pos = aperture_sample_position(emit_origin, aperture_offset, vel, emission_age);
 
             // Particle: pos(x,y,z,J), vel(vx,vy,vz,mass)
@@ -175,6 +178,7 @@ impl InflowState {
             affine_offset,
             bytemuck::cast_slice(&affine_data),
         );
+        self.slug_sample_cursor = self.slug_sample_cursor.wrapping_add(count as u64);
 
         EmissionResult {
             emitted: count,
@@ -187,9 +191,20 @@ fn aperture_jet_velocity(dir: Vec3, emit_speed: f32) -> Vec3 {
     dir * emit_speed
 }
 
-fn aperture_emission_age(local_index: u32, count: u32, dt: f32) -> f32 {
-    debug_assert!(local_index < count);
-    ((local_index as f32 + 0.5) / count as f32) * dt
+const SLUG_LAYER_SAMPLES: u64 = 7;
+const SLUG_LAYER_TWIST: f32 = 2.399_963_1;
+
+fn slug_emission_age(slug_sample: u64, first_slug_sample: u64, count: u32, dt: f32) -> f32 {
+    debug_assert!(count > 0);
+    debug_assert!(slug_sample >= first_slug_sample);
+    debug_assert!(slug_sample < first_slug_sample + count as u64);
+
+    let first_layer = slug_sample_layer(first_slug_sample);
+    let last_layer = slug_sample_layer(first_slug_sample + count as u64 - 1);
+    let layer_count = last_layer - first_layer + 1;
+    let local_layer = slug_sample_layer(slug_sample) - first_layer;
+
+    ((local_layer as f32 + 0.5) / layer_count as f32) * dt
 }
 
 fn aperture_sample_position(
@@ -205,38 +220,40 @@ fn aperture_sample_position(
     )
 }
 
-fn aperture_sample_offset(
-    local_index: u32,
-    batch_count: u32,
-    batch_seed: u32,
-    nozzle_radius: f32,
-) -> Vec3 {
-    debug_assert!(local_index < batch_count);
-    if batch_count % 2 == 1 && local_index == 0 {
+fn slug_sample_offset(slug_sample: u64, nozzle_radius: f32) -> Vec3 {
+    let slot = slug_sample % SLUG_LAYER_SAMPLES;
+    if slot == 0 {
         return Vec3::ZERO;
     }
 
-    let paired_index = if batch_count % 2 == 1 {
-        local_index - 1
-    } else {
-        local_index
-    };
-    let pair_index = paired_index / 2;
-    let pair_side = paired_index % 2;
-    let sample_key = batch_seed
+    let pair_slot = slot - 1;
+    let pair_index = pair_slot / 2;
+    let pair_side = pair_slot % 2;
+    let layer = slug_sample_layer(slug_sample);
+    let sample_key = (layer as u32)
         .wrapping_mul(0x9e37_79b9)
-        .wrapping_add(pair_index);
+        .wrapping_add(pair_index as u32);
     let angle_hash = hash_u32(sample_key ^ 0x85eb_ca6b);
     let radius_hash = hash_u32(sample_key ^ 0xc2b2_ae35);
+    let pair_angle =
+        slug_layer_phase(layer) + unit_float_from_hash(angle_hash) * std::f32::consts::TAU;
     let radial_fraction = unit_float_from_hash(radius_hash).max(0.12);
-    let theta = unit_float_from_hash(angle_hash) * std::f32::consts::TAU;
     let radius = nozzle_radius * radial_fraction.sqrt();
     let side = if pair_side == 0 { 1.0 } else { -1.0 };
+
     Vec3::new(
-        side * radius * theta.cos(),
+        side * radius * pair_angle.cos(),
         0.0,
-        side * radius * theta.sin(),
+        side * radius * pair_angle.sin(),
     )
+}
+
+fn slug_sample_layer(slug_sample: u64) -> u64 {
+    slug_sample / SLUG_LAYER_SAMPLES
+}
+
+fn slug_layer_phase(layer: u64) -> f32 {
+    (layer as f32 * SLUG_LAYER_TWIST).rem_euclid(std::f32::consts::TAU)
 }
 
 fn hash_u32(mut value: u32) -> u32 {
@@ -348,13 +365,13 @@ mod tests {
     }
 
     #[test]
-    fn aperture_samples_fill_nozzle_disk_without_vertical_offset() {
+    fn slug_samples_fill_nozzle_disk_without_vertical_offset() {
         let nozzle_radius = SpoutSettings::default().nozzle_radius;
 
         let mut max_x = 0.0_f32;
         let mut max_z = 0.0_f32;
-        for i in 0..32 {
-            let offset = aperture_sample_offset(i, 32, 17, nozzle_radius);
+        for i in 0..SLUG_LAYER_SAMPLES * 4 {
+            let offset = slug_sample_offset(i, nozzle_radius);
             assert!(offset.y.abs() < 1e-6);
             assert!(offset.length() <= nozzle_radius + 1e-6);
             max_x = max_x.max(offset.x.abs());
@@ -366,45 +383,39 @@ mod tests {
     }
 
     #[test]
-    fn aperture_sample_angles_do_not_advance_as_a_visible_spiral() {
+    fn slug_layers_twist_deterministically_along_the_stream() {
         let nozzle_radius = SpoutSettings::default().nozzle_radius;
-        let mut previous_angle = 0.0_f32;
-        let mut min_turn_delta = f32::MAX;
-        let mut max_turn_delta = 0.0_f32;
 
-        for i in (0..16).step_by(2) {
-            let offset = aperture_sample_offset(i, 16, 23, nozzle_radius);
-            let angle = offset.z.atan2(offset.x);
-            if i > 0 {
-                let mut delta = (angle - previous_angle).abs();
-                if delta > std::f32::consts::PI {
-                    delta = std::f32::consts::TAU - delta;
-                }
-                min_turn_delta = min_turn_delta.min(delta);
-                max_turn_delta = max_turn_delta.max(delta);
-            }
-            previous_angle = angle;
+        let first_layer_offset = slug_sample_offset(1, nozzle_radius);
+        let second_layer_offset = slug_sample_offset(SLUG_LAYER_SAMPLES + 1, nozzle_radius);
+        let repeat_first_layer_offset = slug_sample_offset(1, nozzle_radius);
+
+        let first_angle = first_layer_offset.z.atan2(first_layer_offset.x);
+        let second_angle = second_layer_offset.z.atan2(second_layer_offset.x);
+        let mut delta = (second_angle - first_angle).abs();
+        if delta > std::f32::consts::PI {
+            delta = std::f32::consts::TAU - delta;
         }
 
-        assert!(
-            max_turn_delta - min_turn_delta > 0.5,
-            "sequential aperture angles should be scrambled, not one fixed turn"
-        );
+        assert!(delta > 0.5);
+        assert!((repeat_first_layer_offset.x - first_layer_offset.x).abs() < 1e-6);
+        assert!((repeat_first_layer_offset.z - first_layer_offset.z).abs() < 1e-6);
     }
 
     #[test]
-    fn aperture_batches_have_zero_lateral_centroid() {
+    fn slug_layers_have_zero_lateral_centroid() {
         let nozzle_radius = SpoutSettings::default().nozzle_radius;
 
-        for count in 1..10 {
+        for layer in 0..4 {
             let mut sum = Vec3::ZERO;
-            for i in 0..count {
-                sum = sum + aperture_sample_offset(i, count, 101, nozzle_radius);
+            let layer_start = layer * SLUG_LAYER_SAMPLES;
+            for i in 0..SLUG_LAYER_SAMPLES {
+                sum = sum + slug_sample_offset(layer_start + i, nozzle_radius);
             }
 
             assert!(
                 sum.x.abs() < 1e-6 && sum.y.abs() < 1e-6 && sum.z.abs() < 1e-6,
-                "batch count {count} had lateral aperture bias: {sum:?}"
+                "slug layer {layer} had lateral aperture bias: {sum:?}"
             );
         }
     }
@@ -428,14 +439,29 @@ mod tests {
     #[test]
     fn emitted_samples_are_spaced_along_the_same_jet_axis() {
         let dt = 1.0 / 60.0;
-        let count = 6;
+        let count = (SLUG_LAYER_SAMPLES * 2) as u32;
+        let first_sample = 0;
         let mut previous_age = 0.0;
 
         for i in 0..count {
-            let age = aperture_emission_age(i, count, dt);
+            let age = slug_emission_age(first_sample + i as u64, first_sample, count, dt);
             assert!(age > 0.0 && age < dt);
-            assert!(age > previous_age);
+            assert!(age >= previous_age);
             previous_age = age;
         }
+    }
+
+    #[test]
+    fn emission_age_groups_samples_by_slug_layer() {
+        let dt = 1.0 / 60.0;
+        let count = (SLUG_LAYER_SAMPLES * 2) as u32;
+        let first_sample = 0;
+
+        let first_layer_age = slug_emission_age(0, first_sample, count, dt);
+        let same_layer_age = slug_emission_age(SLUG_LAYER_SAMPLES - 1, first_sample, count, dt);
+        let second_layer_age = slug_emission_age(SLUG_LAYER_SAMPLES, first_sample, count, dt);
+
+        assert!((same_layer_age - first_layer_age).abs() < 1e-6);
+        assert!(second_layer_age > first_layer_age);
     }
 }

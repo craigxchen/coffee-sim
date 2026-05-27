@@ -7,13 +7,18 @@ Mainline physics and documentation cleanup after the physics-mainline merge.
 What changed:
 - rewrote `README.md` around the current MPM browser app
 - added `docs/ARCHITECTURE.md` as the as-built implementation map
+- added a two-pool coffee extraction model with dissolved solute carried by
+  water particles and extraction-colored water rendering
+- changed the debug HUD to sample exact GPU extraction metrics at low frequency
+  with a short delayed readback, avoiding per-frame buffer mapping
 - consolidated active planning into `docs/ROADMAP.md`
 - removed stale branch-audit and historical issue files that no longer described `main`
 - merged the porous-bed physics mainline into `main`
 
 Known issues still open:
 - free water jet can still fragment unrealistically in mid-air
-- coffee-bed advection, grind-size distribution, and extraction color remain future work
+- coffee-bed advection and grind-size distribution remain future work
+- extraction rates are not yet calibrated against measured brew curves
 - filter contact is still an approximation rather than a full contact solve
 
 ## Demo v0 — Baseline MPM Pour-Over Prototype
