@@ -21,11 +21,14 @@ pub(crate) const SDF_RES: u32 = 128;
 
 /// Number of `u32` slots in the metrics buffer. Keep in sync with the indices
 /// in `shader.rs` (`METRIC_*_IDX`).
-pub(crate) const METRICS_SLOT_COUNT: usize = 8;
+pub(crate) const METRICS_SLOT_COUNT: usize = 10;
 /// Fixed-point scale used by the `MAX_ABS_DIV` slot — divergence is already a
 /// moderate-magnitude quantity, so a smaller scale keeps the atomic headroom
 /// comfortable while still giving useful resolution on the HUD.
 pub(crate) const METRICS_DIV_FP_SCALE: f32 = 1024.0;
+/// Higher-resolution fixed-point scale for read-only pressure convergence
+/// observability. This must not feed the solver's alpha/beta reductions.
+pub(crate) const METRICS_PRESSURE_RESIDUAL_FP_SCALE: f32 = 1024.0;
 
 const SDF_NO_CONSTRAINT: f32 = 999.0;
 #[repr(C)]
@@ -50,8 +53,8 @@ pub(crate) struct MpmUniforms {
     /// `divergence_store` / `pressure_store` and are derived per frame from the
     /// grid spacing and the velocity cap, not hardcoded.
     pub clamp_params: [f32; 4],
-    /// `[j_alpha, j_expand_alpha, max_rest_volume_fraction, _]` for the
-    /// volume/J-coupled pressure RHS.
+    /// `[j_compression_alpha, reserved, max_rest_volume_fraction, bed_surface_void_scale]`
+    /// for the volume/J-coupled pressure RHS.
     pub projection_params: [f32; 4],
 }
 
@@ -59,6 +62,7 @@ pub(crate) struct MpmBuffers {
     pub particles: wgpu::Buffer,
     pub affine: wgpu::Buffer,
     pub grid: wgpu::Buffer,
+    pub cg: wgpu::Buffer,
     pub grid_vel: wgpu::Buffer,
     pub bed_lookup: wgpu::Buffer,
     pub bed_delta: wgpu::Buffer,
@@ -74,9 +78,9 @@ pub(crate) struct MpmBuffers {
     /// shader. Populated every substep via atomics, cleared via
     /// `metrics_clear`.
     pub metrics: wgpu::Buffer,
-    /// MAP_READ staging buffer for async CPU readback of `metrics`. Kept in
-    /// place so the readback path can be rewired without reshaping
-    /// `MpmBuffers`; currently unread while `refresh_metrics` is stubbed.
+    /// Reserved MAP_READ staging buffer for async CPU readback experiments.
+    /// The browser-facing snapshot path uses a fresh staging buffer per
+    /// request so pending maps cannot race with later copies.
     #[allow(dead_code)]
     pub metrics_staging: wgpu::Buffer,
 }
@@ -106,6 +110,15 @@ impl MpmBuffers {
         let grid = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("mpm grid atomics"),
             size: (6 * total_cells * size_of::<i32>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        let cg = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("mpm pressure cg scratch"),
+            size: (total_cells * 16) as u64, // vec4<f32>: r, z, d, A*d
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -185,6 +198,7 @@ impl MpmBuffers {
             particles,
             affine,
             grid,
+            cg,
             grid_vel,
             bed_lookup,
             bed_delta,

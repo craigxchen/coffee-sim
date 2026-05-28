@@ -470,6 +470,33 @@ impl WasmSim3D {
     pub fn mass_overflow_fires(&self) -> u32 {
         self.sim.latest_metrics().mass_overflow_fires
     }
+
+    #[wasm_bindgen(js_name = pressureResidualInitial)]
+    pub fn pressure_residual_initial(&self) -> f32 {
+        self.sim.latest_metrics().pressure_residual_initial
+    }
+
+    #[wasm_bindgen(js_name = pressureResidualFinal)]
+    pub fn pressure_residual_final(&self) -> f32 {
+        self.sim.latest_metrics().pressure_residual_final
+    }
+
+    #[wasm_bindgen(js_name = pressureResidualRatio)]
+    pub fn pressure_residual_ratio(&self) -> f32 {
+        self.sim.latest_metrics().pressure_residual_ratio
+    }
+
+    #[wasm_bindgen(js_name = pressureResidualRatioPerIteration)]
+    pub fn pressure_residual_ratio_per_iteration(&self) -> f32 {
+        self.sim
+            .latest_metrics()
+            .pressure_residual_ratio_per_iteration
+    }
+
+    #[wasm_bindgen(js_name = pressureSolveIterations)]
+    pub fn pressure_solve_iterations(&self) -> u32 {
+        self.sim.latest_metrics().pressure_solve_iterations
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
