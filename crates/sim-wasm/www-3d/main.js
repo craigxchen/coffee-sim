@@ -1,4 +1,4 @@
-import init, { WasmSim3D } from "./pkg/coffee_sim_wasm.js?v=debug-scenes-2";
+import init, { WasmSim3D } from "./pkg/coffee_sim_wasm.js?v=debug-timeseries-5";
 
 const canvas = document.getElementById("sim-canvas");
 const viewCubeStage = document.getElementById("view-cube-stage");
@@ -43,6 +43,12 @@ const pressureDeltaLabel = document.getElementById("pressure-delta");
 const pressureStatusLabel = document.getElementById("pressure-status");
 const toggleDebugButton = document.getElementById("toggle-debug");
 const debugStats = document.getElementById("debug-stats");
+const timeseriesDrawer = document.getElementById("timeseries-drawer");
+const toggleTimeseriesButton = document.getElementById("toggle-timeseries");
+const toggleTimeseriesMenuButton = document.getElementById("toggle-timeseries-menu");
+const minimizeTimeseriesButton = document.getElementById("minimize-timeseries");
+const timeseriesMenu = document.getElementById("timeseries-menu");
+const timeseriesGrid = document.getElementById("timeseries-grid");
 
 // Throttle metrics readback — the staging-buffer map/unmap is cheap but still
 // costs a JS microtask. Refreshing every ~10 frames keeps the HUD responsive
@@ -50,9 +56,11 @@ const debugStats = document.getElementById("debug-stats");
 const METRICS_REFRESH_INTERVAL = 10;
 let metricsFrameCounter = 0;
 let metricsRefreshInFlight = false;
-const PRESSURE_DIAGNOSTICS_INTERVAL = 60;
-let pressureDiagnosticsFrameCounter = 0;
-let pressureDiagnosticsInFlight = false;
+const DIAGNOSTICS_REFRESH_INTERVAL = 60;
+let diagnosticsFrameCounter = DIAGNOSTICS_REFRESH_INTERVAL;
+let diagnosticsRefreshInFlight = false;
+const TIMESERIES_SAMPLE_INTERVAL = 6;
+const TIMESERIES_MAX_SAMPLES = 720;
 const AUTO_PAUSE_DELAY_MS = 30_000;
 
 let app;
@@ -106,7 +114,121 @@ const DEBUG_SCENE_PAUSE_ON_LOAD = new Set([
 let spoutX = 0.0;
 let spoutZ = 0.0;
 let spoutPlaneDragging = false;
+let latestWaterDiagnostics = null;
+let timeseriesFrameCounter = TIMESERIES_SAMPLE_INTERVAL;
+const timeseriesSamples = [];
+const integerFormatter = new Intl.NumberFormat();
+const TIMESERIES_CHARTS = [
+  {
+    key: "totalEnergy",
+    label: "Total Energy",
+    color: "#d9b36a",
+    value: (sample) => sample.totalEnergy,
+    format: formatCompact,
+  },
+  {
+    key: "kineticEnergy",
+    label: "Kinetic Energy",
+    color: "#e8796e",
+    value: (sample) => sample.kineticEnergy,
+    format: formatCompact,
+  },
+  {
+    key: "activeMassMl",
+    label: "Water mL",
+    color: "#65c4d8",
+    value: (sample) => sample.activeMassMl,
+    format: (value) => `${value.toFixed(1)}`,
+  },
+  {
+    key: "rmsSpeed",
+    label: "RMS Speed",
+    color: "#9ed37a",
+    value: (sample) => sample.rmsSpeedMetersPerSecond,
+    format: (value) => `${value.toFixed(3)}`,
+  },
+  {
+    key: "surfaceRms",
+    label: "Surface RMS",
+    color: "#bda3ff",
+    value: (sample) => sample.surfaceRmsMillimeters,
+    format: (value) => `${value.toFixed(1)} mm`,
+  },
+  {
+    key: "pressureDelta",
+    label: "Pressure dP",
+    color: "#f1a95c",
+    value: (sample) => sample.pressureDeltaPa,
+    format: (value) => `${value.toFixed(0)} Pa`,
+  },
+  {
+    key: "maxAbsDiv",
+    label: "Max |div u|",
+    color: "#7db7ff",
+    value: (sample) => sample.maxAbsDivergence,
+    format: (value) => value.toFixed(3),
+  },
+  {
+    key: "pressureResidualInitial",
+    label: "Initial Residual",
+    color: "#ffd166",
+    value: (sample) => sample.pressureResidualInitial,
+    format: formatCompact,
+  },
+  {
+    key: "pressureResidualFinal",
+    label: "Final Residual",
+    color: "#f7c548",
+    value: (sample) => sample.pressureResidualFinal,
+    format: formatCompact,
+  },
+  {
+    key: "pressureResidualRatio",
+    label: "Residual Ratio",
+    color: "#ffb86b",
+    value: (sample) => sample.pressureResidualRatio,
+    format: (value) => value.toPrecision(3),
+  },
+  {
+    key: "pressureResidualPerIteration",
+    label: "Ratio / Iter",
+    color: "#c28bff",
+    value: (sample) => sample.pressureResidualRatioPerIteration,
+    format: (value) => value.toPrecision(3),
+  },
+  {
+    key: "fluidCells",
+    label: "Fluid Cells",
+    color: "#72dfb9",
+    value: (sample) => sample.fluidCells,
+    format: (value) => integerFormatter.format(Math.round(value)),
+  },
+  {
+    key: "divClamp",
+    label: "Div Clamp",
+    color: "#cddc6c",
+    value: (sample) => sample.divClampFires,
+    format: (value) => integerFormatter.format(Math.round(value)),
+  },
+  {
+    key: "pressureClamp",
+    label: "Pressure Clamp",
+    color: "#ff8fb3",
+    value: (sample) => sample.pressureClampFires,
+    format: (value) => integerFormatter.format(Math.round(value)),
+  },
+  {
+    key: "massOverflow",
+    label: "Mass Overflow",
+    color: "#ffd166",
+    value: (sample) => sample.massOverflowFires,
+    format: (value) => integerFormatter.format(Math.round(value)),
+  },
+];
+const visibleTimeseriesKeys = new Set(TIMESERIES_CHARTS.map((definition) => definition.key));
 
+buildTimeseriesCharts();
+buildTimeseriesMenu();
 await init();
 app = await WasmSim3D.create(canvas);
 app.loadBenchmarkCenterPour();
@@ -117,13 +239,18 @@ applySpoutControls();
 resizeCanvas();
 syncSpoutControlSize();
 syncUi();
+resetTimeseries();
 requestAnimationFrame(animate);
 scheduleAutoPauseIfInactive();
 publishDebugHooks();
 
-window.addEventListener("resize", resizeCanvas);
+window.addEventListener("resize", () => {
+  resizeCanvas();
+  renderTimeseriesCharts();
+});
 if ("ResizeObserver" in window) {
   new ResizeObserver(syncSpoutControlSize).observe(spoutPlane);
+  new ResizeObserver(renderTimeseriesCharts).observe(timeseriesGrid);
 }
 
 toggleButton.addEventListener("click", () => {
@@ -134,12 +261,25 @@ resetButton.addEventListener("click", () => {
   reloadCurrentScene();
 });
 
+toggleTimeseriesButton.addEventListener("click", () => {
+  setTimeseriesDrawerExpanded(!timeseriesDrawer.classList.contains("is-open"));
+});
+
+toggleTimeseriesMenuButton.addEventListener("click", (event) => {
+  event.stopPropagation();
+  setTimeseriesMenuOpen(timeseriesMenu.hidden);
+});
+
+minimizeTimeseriesButton.addEventListener("click", () => {
+  setTimeseriesDrawerExpanded(false);
+});
+
 toggleDebugButton.addEventListener("click", () => {
   debugStats.classList.toggle("hidden");
   toggleDebugButton.textContent = debugStats.classList.contains("hidden")
     ? "Show Debug Stats"
     : "Hide Debug Stats";
-  pressureDiagnosticsFrameCounter = PRESSURE_DIAGNOSTICS_INTERVAL;
+  diagnosticsFrameCounter = DIAGNOSTICS_REFRESH_INTERVAL;
 });
 
 sceneMainTab.addEventListener("click", () => {
@@ -267,6 +407,17 @@ document.addEventListener("visibilitychange", () => {
   }
 });
 
+document.addEventListener("click", (event) => {
+  if (timeseriesMenu.hidden || event.target.closest(".timeseries-actions")) return;
+  setTimeseriesMenuOpen(false);
+});
+
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape") {
+    setTimeseriesMenuOpen(false);
+  }
+});
+
 function resizeCanvas() {
   const dpr = window.devicePixelRatio || 1;
   const rect = canvas.getBoundingClientRect();
@@ -294,6 +445,11 @@ function animate(timestamp) {
     return;
   }
 
+  if (metricsRefreshInFlight || diagnosticsRefreshInFlight) {
+    requestAnimationFrame(animate);
+    return;
+  }
+
   applyKeyboardPan(frameTime);
 
   if (!paused && skipStepOnce) {
@@ -305,9 +461,11 @@ function animate(timestamp) {
   app.render();
   updateViewCube();
   updateFps(frameTime);
-  maybeRefreshMetrics();
-  maybeRefreshPressureDiagnostics();
   syncUi();
+  maybeCollectTimeseriesSample();
+  if (!maybeRefreshMetrics()) {
+    maybeRefreshDiagnostics();
+  }
   requestAnimationFrame(animate);
 }
 
@@ -344,26 +502,67 @@ function clearAutoPauseTimer() {
 }
 
 function maybeRefreshMetrics() {
-  // Readback disabled — see the TODO on `refresh_metrics` in mod.rs.
-  // The shader-side metrics counters still run, they just aren't plumbed
-  // to the HUD. Leaving this helper wired up so the call site doesn't
-  // drift when we turn the readback back on.
+  if (metricsRefreshInFlight) return false;
+  metricsFrameCounter += 1;
+  if (metricsFrameCounter < METRICS_REFRESH_INTERVAL) return false;
+  metricsFrameCounter = 0;
+  metricsRefreshInFlight = true;
+  app.refreshMetrics()
+    .catch((error) => {
+      console.warn("Metrics readback failed", error);
+    })
+    .finally(() => {
+      releaseReadbackLock(() => {
+        metricsRefreshInFlight = false;
+      });
+    });
+  return true;
 }
 
-function maybeRefreshPressureDiagnostics() {
-  if (debugStats.classList.contains("hidden") || pressureDiagnosticsInFlight) return;
-  pressureDiagnosticsFrameCounter += 1;
-  if (pressureDiagnosticsFrameCounter < PRESSURE_DIAGNOSTICS_INTERVAL) return;
-  pressureDiagnosticsFrameCounter = 0;
-  pressureDiagnosticsInFlight = true;
+function maybeRefreshDiagnostics() {
+  if (diagnosticsRefreshInFlight) return false;
+  diagnosticsFrameCounter += 1;
+  if (diagnosticsFrameCounter < DIAGNOSTICS_REFRESH_INTERVAL) return false;
+  diagnosticsFrameCounter = 0;
+  diagnosticsRefreshInFlight = true;
   app.waterDiagnostics()
-    .then(updatePressureDiagnostics)
-    .catch(() => {
+    .then((diagnostics) => {
+      latestWaterDiagnostics = diagnostics;
+      updatePressureDiagnostics(diagnostics);
+    })
+    .catch((error) => {
+      console.warn("Water diagnostics readback failed", error);
+      latestWaterDiagnostics = null;
       pressureStatusLabel.textContent = "Readback failed";
     })
     .finally(() => {
-      pressureDiagnosticsInFlight = false;
+      releaseReadbackLock(() => {
+        diagnosticsRefreshInFlight = false;
+      });
     });
+  return true;
+}
+
+function releaseReadbackLock(release) {
+  requestAnimationFrame(() => {
+    requestAnimationFrame(release);
+  });
+}
+
+function setTimeseriesDrawerExpanded(expanded) {
+  timeseriesDrawer.classList.toggle("is-open", expanded);
+  toggleTimeseriesButton.setAttribute("aria-expanded", expanded ? "true" : "false");
+  if (!expanded) {
+    setTimeseriesMenuOpen(false);
+  }
+  if (expanded) {
+    renderTimeseriesCharts();
+  }
+}
+
+function setTimeseriesMenuOpen(open) {
+  timeseriesMenu.hidden = !open;
+  toggleTimeseriesMenuButton.setAttribute("aria-expanded", open ? "true" : "false");
 }
 
 function updatePressureDiagnostics(diagnostics) {
@@ -380,6 +579,233 @@ function updatePressureDiagnostics(diagnostics) {
   pressureBottomLabel.textContent = `${pressure.bottomPressurePa.toFixed(0)} Pa`;
   pressureDeltaLabel.textContent = `${pressure.deltaPressurePa.toFixed(0)} Pa`;
   pressureStatusLabel.textContent = pressure.bottomHigher ? "OK" : "Check";
+}
+
+function buildTimeseriesCharts() {
+  timeseriesGrid.textContent = "";
+  for (const definition of TIMESERIES_CHARTS) {
+    const card = document.createElement("div");
+    card.className = "timeseries-card";
+    card.dataset.timeseriesKey = definition.key;
+
+    const header = document.createElement("div");
+    header.className = "timeseries-card-header";
+
+    const title = document.createElement("span");
+    title.className = "timeseries-title";
+    title.textContent = definition.label;
+
+    const value = document.createElement("output");
+    value.className = "timeseries-value";
+    value.textContent = "n/a";
+
+    const chart = document.createElement("canvas");
+    chart.className = "timeseries-chart";
+    chart.setAttribute("aria-label", `${definition.label} history`);
+
+    header.append(title, value);
+    card.append(header, chart);
+    timeseriesGrid.append(card);
+
+    definition.canvas = chart;
+    definition.valueEl = value;
+    definition.card = card;
+  }
+}
+
+function buildTimeseriesMenu() {
+  timeseriesMenu.textContent = "";
+  for (const definition of TIMESERIES_CHARTS) {
+    const label = document.createElement("label");
+    label.className = "timeseries-menu-option";
+
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.checked = visibleTimeseriesKeys.has(definition.key);
+    checkbox.addEventListener("change", () => {
+      setTimeseriesChartVisible(definition.key, checkbox.checked);
+    });
+
+    const swatch = document.createElement("span");
+    swatch.className = "timeseries-menu-swatch";
+    swatch.style.backgroundColor = definition.color;
+
+    const text = document.createElement("span");
+    text.textContent = definition.label;
+
+    label.append(checkbox, swatch, text);
+    timeseriesMenu.append(label);
+  }
+}
+
+function setTimeseriesChartVisible(key, visible) {
+  if (visible) {
+    visibleTimeseriesKeys.add(key);
+  } else {
+    visibleTimeseriesKeys.delete(key);
+  }
+  renderTimeseriesCharts();
+}
+
+function resetTimeseries() {
+  timeseriesSamples.length = 0;
+  timeseriesFrameCounter = TIMESERIES_SAMPLE_INTERVAL;
+  latestWaterDiagnostics = null;
+  diagnosticsFrameCounter = DIAGNOSTICS_REFRESH_INTERVAL;
+  metricsFrameCounter = METRICS_REFRESH_INTERVAL;
+  if (app) {
+    collectTimeseriesSample();
+  } else {
+    renderTimeseriesCharts();
+  }
+}
+
+function maybeCollectTimeseriesSample() {
+  if (paused) return;
+  timeseriesFrameCounter += 1;
+  if (timeseriesFrameCounter < TIMESERIES_SAMPLE_INTERVAL) return;
+  timeseriesFrameCounter = 0;
+  collectTimeseriesSample();
+}
+
+function collectTimeseriesSample() {
+  const diagnostics = latestWaterDiagnostics;
+  const surface = diagnostics?.surface;
+  const pressure = diagnostics?.hydrostaticPressure;
+  timeseriesSamples.push({
+    timeSeconds: app.simTime(),
+    totalEnergy: diagnostics?.totalEnergy ?? NaN,
+    kineticEnergy: diagnostics?.kineticEnergy ?? NaN,
+    activeMassMl: diagnostics?.activeMassMl ?? NaN,
+    rmsSpeedMetersPerSecond: diagnostics?.rmsSpeedMetersPerSecond ?? NaN,
+    surfaceRmsMillimeters: surface ? surface.rmsMeters * 1000.0 : NaN,
+    pressureDeltaPa:
+      pressure && pressure.sampleCount > 0 ? pressure.deltaPressurePa : NaN,
+    maxAbsDivergence: app.maxAbsDivergence(),
+    pressureResidualInitial: optionalAppMetric("pressureResidualInitial"),
+    pressureResidualFinal: optionalAppMetric("pressureResidualFinal"),
+    pressureResidualRatio: optionalAppMetric("pressureResidualRatio"),
+    pressureResidualRatioPerIteration: optionalAppMetric("pressureResidualRatioPerIteration"),
+    pressureSolveIterations: optionalAppMetric("pressureSolveIterations"),
+    fluidCells: app.fluidCellCount(),
+    divClampFires: app.divClampFires(),
+    pressureClampFires: app.pressureClampFires(),
+    massOverflowFires: app.massOverflowFires(),
+  });
+  while (timeseriesSamples.length > TIMESERIES_MAX_SAMPLES) {
+    timeseriesSamples.shift();
+  }
+  renderTimeseriesCharts();
+}
+
+function optionalAppMetric(methodName) {
+  return typeof app[methodName] === "function" ? app[methodName]() : NaN;
+}
+
+function renderTimeseriesCharts() {
+  for (const definition of TIMESERIES_CHARTS) {
+    const visible = visibleTimeseriesKeys.has(definition.key);
+    definition.card.hidden = !visible;
+    if (!visible) continue;
+    const latest = latestFiniteTimeseriesValue(definition);
+    definition.valueEl.textContent = latest === null ? "n/a" : definition.format(latest);
+    drawSparkline(definition, latest);
+  }
+}
+
+function latestFiniteTimeseriesValue(definition) {
+  for (let i = timeseriesSamples.length - 1; i >= 0; i -= 1) {
+    const value = definition.value(timeseriesSamples[i]);
+    if (Number.isFinite(value)) return value;
+  }
+  return null;
+}
+
+function drawSparkline(definition, latest) {
+  const chart = definition.canvas;
+  const rect = chart.getBoundingClientRect();
+  const width = Math.max(1, Math.round(rect.width));
+  const height = Math.max(1, Math.round(rect.height));
+  const dpr = window.devicePixelRatio || 1;
+  const pixelWidth = Math.max(1, Math.round(width * dpr));
+  const pixelHeight = Math.max(1, Math.round(height * dpr));
+  if (chart.width !== pixelWidth || chart.height !== pixelHeight) {
+    chart.width = pixelWidth;
+    chart.height = pixelHeight;
+  }
+
+  const ctx = chart.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, width, height);
+  ctx.fillStyle = "rgba(9, 16, 19, 0.28)";
+  ctx.fillRect(0, 0, width, height);
+
+  const padX = 4;
+  const padY = 5;
+  const graphWidth = Math.max(1, width - padX * 2);
+  const graphHeight = Math.max(1, height - padY * 2);
+  ctx.strokeStyle = "rgba(233, 239, 230, 0.13)";
+  ctx.lineWidth = 1;
+  for (let i = 1; i <= 2; i += 1) {
+    const y = padY + (graphHeight * i) / 3;
+    ctx.beginPath();
+    ctx.moveTo(padX, y);
+    ctx.lineTo(width - padX, y);
+    ctx.stroke();
+  }
+
+  const points = [];
+  for (let i = 0; i < timeseriesSamples.length; i += 1) {
+    const value = definition.value(timeseriesSamples[i]);
+    if (Number.isFinite(value)) {
+      points.push({ index: i, value });
+    }
+  }
+  if (points.length === 0 || latest === null) return;
+
+  let min = points[0].value;
+  let max = points[0].value;
+  for (const point of points) {
+    min = Math.min(min, point.value);
+    max = Math.max(max, point.value);
+  }
+  min = Math.min(0, min);
+  if (Math.abs(max - min) < 1e-6) {
+    max += 1.0;
+  }
+  const sampleSpan = Math.max(1, timeseriesSamples.length - 1);
+  const yForValue = (value) =>
+    padY + graphHeight - ((value - min) / (max - min)) * graphHeight;
+
+  ctx.strokeStyle = definition.color;
+  ctx.lineWidth = 1.6;
+  ctx.beginPath();
+  for (let i = 0; i < points.length; i += 1) {
+    const x = padX + (points[i].index / sampleSpan) * graphWidth;
+    const y = yForValue(points[i].value);
+    if (i === 0) {
+      ctx.moveTo(x, y);
+    } else {
+      ctx.lineTo(x, y);
+    }
+  }
+  ctx.stroke();
+
+  const lastPoint = points[points.length - 1];
+  const lastX = padX + (lastPoint.index / sampleSpan) * graphWidth;
+  const lastY = yForValue(lastPoint.value);
+  ctx.fillStyle = definition.color;
+  ctx.beginPath();
+  ctx.arc(lastX, lastY, 2.2, 0, Math.PI * 2);
+  ctx.fill();
+}
+
+function formatCompact(value) {
+  const abs = Math.abs(value);
+  if (abs >= 1000) return value.toExponential(2);
+  if (abs >= 10) return value.toFixed(1);
+  if (abs >= 1) return value.toFixed(2);
+  return value.toPrecision(2);
 }
 
 function applyKeyboardPan(dt) {
@@ -467,6 +893,7 @@ function finishSceneLoad({ sceneId, label, tab, pausedOnLoad = false }) {
   setPaused(pausedOnLoad);
   lastFrameTime = 0;
   syncUi();
+  resetTimeseries();
 }
 
 function loadCenterPourScene() {
@@ -506,6 +933,7 @@ function reloadCurrentScene() {
     applySpoutControls();
     lastFrameTime = 0;
     syncUi();
+    resetTimeseries();
   }
 }
 

@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Coffee Sim | 3D Pourover</title>
-    <link rel="stylesheet" href="./styles.css?v=debug-scenes-2" />
+    <link rel="stylesheet" href="./styles.css?v=debug-timeseries-5" />
   </head>
   <body>
     <main class="layout">
@@ -225,6 +225,50 @@
         </div>
       </section>
     </main>
-    <script type="module" src="./main.js?v=debug-scenes-2"></script>
+    <aside id="timeseries-drawer" class="timeseries-drawer" aria-label="Timeseries debug metrics">
+      <button
+        id="toggle-timeseries"
+        class="timeseries-tab"
+        type="button"
+        aria-expanded="false"
+        aria-controls="timeseries-panel"
+      >
+        Timeseries
+      </button>
+      <div id="timeseries-panel" class="timeseries-drawer-panel">
+        <div class="timeseries-heading">
+          <span>Timeseries</span>
+          <div class="timeseries-actions">
+            <div class="timeseries-menu-wrap">
+              <button
+                id="toggle-timeseries-menu"
+                class="timeseries-icon-button"
+                type="button"
+                aria-label="Select timeseries"
+                aria-expanded="false"
+                aria-controls="timeseries-menu"
+              >
+                <span class="timeseries-menu-icon" aria-hidden="true"></span>
+              </button>
+              <div id="timeseries-menu" class="timeseries-menu-popover" hidden></div>
+            </div>
+            <button
+              id="minimize-timeseries"
+              class="timeseries-icon-button"
+              type="button"
+              aria-label="Minimize timeseries"
+            >
+              <span class="timeseries-minimize-icon" aria-hidden="true"></span>
+            </button>
+          </div>
+        </div>
+        <div
+          id="timeseries-grid"
+          class="timeseries-grid"
+          aria-label="Timeseries debug metrics"
+        ></div>
+      </div>
+    </aside>
+    <script type="module" src="./main.js?v=debug-timeseries-5"></script>
   </body>
 </html>
