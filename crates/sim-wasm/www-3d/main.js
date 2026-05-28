@@ -1,4 +1,4 @@
-import init, { WasmSim3D } from "./pkg/coffee_sim_wasm.js?v=exact-delayed-metrics-brew-color-main";
+import init, { WasmSim3D } from "./pkg/coffee_sim_wasm.js?v=webgpu-preflight-1";
 
 const canvas = document.getElementById("sim-canvas");
 const viewCubeStage = document.getElementById("view-cube-stage");
@@ -60,6 +60,7 @@ const timeseriesGrid = document.getElementById("timeseries-grid");
 const METRICS_SAMPLE_INTERVAL_FRAMES = 6;
 const METRICS_SAMPLE_DELAY_FRAMES = 4;
 const METRICS_MAX_PENDING_SAMPLES = 2;
+const REQUIRED_STORAGE_BUFFERS_PER_SHADER_STAGE = 10;
 let metricsFrameCounter = 0;
 const TIMESERIES_SAMPLE_INTERVAL = 6;
 const TIMESERIES_MAX_SAMPLES = 720;
@@ -230,195 +231,333 @@ const TIMESERIES_CHARTS = [
 ];
 const visibleTimeseriesKeys = new Set(TIMESERIES_CHARTS.map((definition) => definition.key));
 
-buildTimeseriesCharts();
-buildTimeseriesMenu();
-await init();
-app = await WasmSim3D.create(canvas);
-app.loadBenchmarkCenterPour();
-fixedStepSeconds = 1 / 60;
-syncControlDefaultsFromSim();
-applyWaterVelocityControl();
-applySpoutControls();
-resizeCanvas();
-syncSpoutControlSize();
-syncUi();
-resetTimeseries();
-requestAnimationFrame(animate);
-scheduleAutoPauseIfInactive();
-publishDebugHooks();
+bootstrap();
 
-window.addEventListener("resize", () => {
-  resizeCanvas();
-  renderTimeseriesCharts();
-});
-if ("ResizeObserver" in window) {
-  new ResizeObserver(syncSpoutControlSize).observe(spoutPlane);
-  new ResizeObserver(renderTimeseriesCharts).observe(timeseriesGrid);
+async function bootstrap() {
+  const webGpuError = await preflightWebGpu();
+  if (webGpuError) {
+    showStartupError(webGpuError);
+    return;
+  }
+
+  try {
+    buildTimeseriesCharts();
+    buildTimeseriesMenu();
+    await init();
+    app = await WasmSim3D.create(canvas);
+    app.loadBenchmarkCenterPour();
+    fixedStepSeconds = 1 / 60;
+    syncControlDefaultsFromSim();
+    applyWaterVelocityControl();
+    applySpoutControls();
+    resizeCanvas();
+    syncSpoutControlSize();
+    syncUi();
+    resetTimeseries();
+    requestAnimationFrame(animate);
+    scheduleAutoPauseIfInactive();
+    publishDebugHooks();
+  } catch (error) {
+    showStartupError({
+      title: "Could not start WebGPU",
+      message: startupErrorMessage(error),
+      detail: errorMessage(error),
+    });
+    console.error("Coffee Sim startup failed", error);
+    return;
+  }
+
+  window.addEventListener("resize", () => {
+    resizeCanvas();
+    renderTimeseriesCharts();
+  });
+  if ("ResizeObserver" in window) {
+    new ResizeObserver(syncSpoutControlSize).observe(spoutPlane);
+    new ResizeObserver(renderTimeseriesCharts).observe(timeseriesGrid);
+  }
+
+  toggleButton.addEventListener("click", () => {
+    setPaused(!paused);
+  });
+
+  resetButton.addEventListener("click", () => {
+    reloadCurrentScene();
+  });
+
+  toggleTimeseriesButton.addEventListener("click", () => {
+    setTimeseriesDrawerExpanded(!timeseriesDrawer.classList.contains("is-open"));
+  });
+
+  toggleTimeseriesMenuButton.addEventListener("click", (event) => {
+    event.stopPropagation();
+    setTimeseriesMenuOpen(timeseriesMenu.hidden);
+  });
+
+  minimizeTimeseriesButton.addEventListener("click", () => {
+    setTimeseriesDrawerExpanded(false);
+  });
+
+  toggleDebugButton.addEventListener("click", () => {
+    debugStats.classList.toggle("hidden");
+    toggleDebugButton.textContent = debugStats.classList.contains("hidden")
+      ? "Show Debug Stats"
+      : "Hide Debug Stats";
+  });
+
+  sceneMainTab.addEventListener("click", () => {
+    setSceneTab("main");
+  });
+
+  sceneDebugTab.addEventListener("click", () => {
+    setSceneTab("debug");
+  });
+
+  sceneFreeStreamButton.addEventListener("click", () => {
+    loadFreeStreamScene();
+  });
+
+  sceneCenterPourButton.addEventListener("click", () => {
+    loadCenterPourScene();
+  });
+
+  sceneDebugPanel.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-debug-scene]");
+    if (!button || !sceneDebugPanel.contains(button)) return;
+    loadDebugScene(button.dataset.debugScene);
+  });
+
+  waterVelocityInput.addEventListener("input", () => {
+    applyWaterVelocityControl();
+    syncUi();
+  });
+
+  spoutHeightInput.addEventListener("input", () => {
+    applySpoutControls();
+    syncUi();
+  });
+
+  spoutPlane.addEventListener("pointerdown", (e) => {
+    e.preventDefault();
+    spoutPlaneDragging = true;
+    spoutPlane.setPointerCapture(e.pointerId);
+    updateSpoutPlaneFromPointer(e);
+  });
+
+  spoutPlane.addEventListener("pointermove", (e) => {
+    if (!spoutPlaneDragging) return;
+    updateSpoutPlaneFromPointer(e);
+  });
+
+  spoutPlane.addEventListener("pointerup", (e) => {
+    spoutPlaneDragging = false;
+    if (spoutPlane.hasPointerCapture(e.pointerId)) {
+      spoutPlane.releasePointerCapture(e.pointerId);
+    }
+  });
+
+  spoutPlane.addEventListener("pointercancel", () => {
+    spoutPlaneDragging = false;
+  });
+
+  spoutPlane.addEventListener("keydown", (e) => {
+    const step = e.shiftKey ? SPOUT_STEP * 5.0 : SPOUT_STEP;
+    let nextX = spoutX;
+    let nextZ = spoutZ;
+    if (e.key === "ArrowLeft") nextX -= step;
+    else if (e.key === "ArrowRight") nextX += step;
+    else if (e.key === "ArrowDown") nextZ -= step;
+    else if (e.key === "ArrowUp") nextZ += step;
+    else return;
+
+    e.preventDefault();
+    setSpoutPlaneValue(nextX, nextZ);
+  });
+
+  canvas.addEventListener("contextmenu", (e) => e.preventDefault());
+
+  canvas.addEventListener("pointerdown", (e) => {
+    dragging = true;
+    lastClientX = e.clientX;
+    lastClientY = e.clientY;
+  });
+
+  canvas.addEventListener("pointermove", (e) => {
+    if (!dragging) return;
+    const dx = e.clientX - lastClientX;
+    const dy = e.clientY - lastClientY;
+    lastClientX = e.clientX;
+    lastClientY = e.clientY;
+    app.orbitCamera(dx, dy);
+  });
+
+  window.addEventListener("pointerup", () => {
+    dragging = false;
+  });
+
+  canvas.addEventListener(
+    "wheel",
+    (e) => {
+      e.preventDefault();
+      app.zoomCamera(e.deltaY);
+    },
+    { passive: false },
+  );
+
+  window.addEventListener("keydown", (e) => {
+    if (!PAN_CODES.has(e.code)) return;
+    heldKeys.add(e.code);
+  });
+
+  window.addEventListener("keyup", (e) => {
+    heldKeys.delete(e.code);
+  });
+
+  window.addEventListener("blur", () => {
+    heldKeys.clear();
+    scheduleAutoPauseIfInactive();
+  });
+
+  window.addEventListener("focus", () => {
+    clearAutoPauseTimer();
+  });
+
+  document.addEventListener("visibilitychange", () => {
+    if (isPageActive()) {
+      clearAutoPauseTimer();
+    } else {
+      scheduleAutoPauseIfInactive();
+    }
+  });
+
+  document.addEventListener("click", (event) => {
+    if (timeseriesMenu.hidden || event.target.closest(".timeseries-actions")) return;
+    setTimeseriesMenuOpen(false);
+  });
+
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") {
+      setTimeseriesMenuOpen(false);
+    }
+  });
 }
 
-toggleButton.addEventListener("click", () => {
-  setPaused(!paused);
-});
-
-resetButton.addEventListener("click", () => {
-  reloadCurrentScene();
-});
-
-toggleTimeseriesButton.addEventListener("click", () => {
-  setTimeseriesDrawerExpanded(!timeseriesDrawer.classList.contains("is-open"));
-});
-
-toggleTimeseriesMenuButton.addEventListener("click", (event) => {
-  event.stopPropagation();
-  setTimeseriesMenuOpen(timeseriesMenu.hidden);
-});
-
-minimizeTimeseriesButton.addEventListener("click", () => {
-  setTimeseriesDrawerExpanded(false);
-});
-
-toggleDebugButton.addEventListener("click", () => {
-  debugStats.classList.toggle("hidden");
-  toggleDebugButton.textContent = debugStats.classList.contains("hidden")
-    ? "Show Debug Stats"
-    : "Hide Debug Stats";
-});
-
-sceneMainTab.addEventListener("click", () => {
-  setSceneTab("main");
-});
-
-sceneDebugTab.addEventListener("click", () => {
-  setSceneTab("debug");
-});
-
-sceneFreeStreamButton.addEventListener("click", () => {
-  loadFreeStreamScene();
-});
-
-sceneCenterPourButton.addEventListener("click", () => {
-  loadCenterPourScene();
-});
-
-sceneDebugPanel.addEventListener("click", (event) => {
-  const button = event.target.closest("[data-debug-scene]");
-  if (!button || !sceneDebugPanel.contains(button)) return;
-  loadDebugScene(button.dataset.debugScene);
-});
-
-waterVelocityInput.addEventListener("input", () => {
-  applyWaterVelocityControl();
-  syncUi();
-});
-
-spoutHeightInput.addEventListener("input", () => {
-  applySpoutControls();
-  syncUi();
-});
-
-spoutPlane.addEventListener("pointerdown", (e) => {
-  e.preventDefault();
-  spoutPlaneDragging = true;
-  spoutPlane.setPointerCapture(e.pointerId);
-  updateSpoutPlaneFromPointer(e);
-});
-
-spoutPlane.addEventListener("pointermove", (e) => {
-  if (!spoutPlaneDragging) return;
-  updateSpoutPlaneFromPointer(e);
-});
-
-spoutPlane.addEventListener("pointerup", (e) => {
-  spoutPlaneDragging = false;
-  if (spoutPlane.hasPointerCapture(e.pointerId)) {
-    spoutPlane.releasePointerCapture(e.pointerId);
+async function preflightWebGpu() {
+  if (!window.isSecureContext) {
+    return {
+      title: "Secure connection required",
+      message: "This WebGPU simulation has to run from HTTPS or localhost.",
+    };
   }
-});
-
-spoutPlane.addEventListener("pointercancel", () => {
-  spoutPlaneDragging = false;
-});
-
-spoutPlane.addEventListener("keydown", (e) => {
-  const step = e.shiftKey ? SPOUT_STEP * 5.0 : SPOUT_STEP;
-  let nextX = spoutX;
-  let nextZ = spoutZ;
-  if (e.key === "ArrowLeft") nextX -= step;
-  else if (e.key === "ArrowRight") nextX += step;
-  else if (e.key === "ArrowDown") nextZ -= step;
-  else if (e.key === "ArrowUp") nextZ += step;
-  else return;
-
-  e.preventDefault();
-  setSpoutPlaneValue(nextX, nextZ);
-});
-
-canvas.addEventListener("contextmenu", (e) => e.preventDefault());
-
-canvas.addEventListener("pointerdown", (e) => {
-  dragging = true;
-  lastClientX = e.clientX;
-  lastClientY = e.clientY;
-});
-
-canvas.addEventListener("pointermove", (e) => {
-  if (!dragging) return;
-  const dx = e.clientX - lastClientX;
-  const dy = e.clientY - lastClientY;
-  lastClientX = e.clientX;
-  lastClientY = e.clientY;
-  app.orbitCamera(dx, dy);
-});
-
-window.addEventListener("pointerup", () => {
-  dragging = false;
-});
-
-canvas.addEventListener(
-  "wheel",
-  (e) => {
-    e.preventDefault();
-    app.zoomCamera(e.deltaY);
-  },
-  { passive: false },
-);
-
-window.addEventListener("keydown", (e) => {
-  if (!PAN_CODES.has(e.code)) return;
-  heldKeys.add(e.code);
-});
-
-window.addEventListener("keyup", (e) => {
-  heldKeys.delete(e.code);
-});
-
-window.addEventListener("blur", () => {
-  heldKeys.clear();
-  scheduleAutoPauseIfInactive();
-});
-
-window.addEventListener("focus", () => {
-  clearAutoPauseTimer();
-});
-
-document.addEventListener("visibilitychange", () => {
-  if (isPageActive()) {
-    clearAutoPauseTimer();
-  } else {
-    scheduleAutoPauseIfInactive();
+  if (!("gpu" in navigator)) {
+    return {
+      title: "WebGPU is not available",
+      message: unsupportedBrowserMessage(),
+    };
   }
-});
 
-document.addEventListener("click", (event) => {
-  if (timeseriesMenu.hidden || event.target.closest(".timeseries-actions")) return;
-  setTimeseriesMenuOpen(false);
-});
-
-document.addEventListener("keydown", (event) => {
-  if (event.key === "Escape") {
-    setTimeseriesMenuOpen(false);
+  let adapter;
+  try {
+    adapter = await navigator.gpu.requestAdapter({
+      powerPreference: "high-performance",
+    });
+  } catch (error) {
+    return {
+      title: "WebGPU adapter check failed",
+      message: startupErrorMessage(error),
+      detail: errorMessage(error),
+    };
   }
-});
+
+  if (!adapter) {
+    return {
+      title: "No WebGPU adapter found",
+      message: "Your browser exposes WebGPU, but it could not find a compatible GPU adapter for this page.",
+    };
+  }
+
+  const storageBufferLimit = adapter.limits?.maxStorageBuffersPerShaderStage ?? 0;
+  if (storageBufferLimit < REQUIRED_STORAGE_BUFFERS_PER_SHADER_STAGE) {
+    return {
+      title: "WebGPU limits are too low",
+      message:
+        `This simulation needs ${REQUIRED_STORAGE_BUFFERS_PER_SHADER_STAGE} storage buffers per shader stage, ` +
+        `but this browser/GPU exposes ${storageBufferLimit}. Try a current Chrome, Edge, or Safari build, ` +
+        "or a Firefox build/platform with full WebGPU enabled.",
+    };
+  }
+
+  return null;
+}
+
+function unsupportedBrowserMessage() {
+  if (isFirefox()) {
+    return "Firefox WebGPU support depends on your platform and version. Update Firefox, check that WebGPU is enabled, or try Chrome, Edge, or Safari for this simulation.";
+  }
+  return "This browser does not expose WebGPU yet. Try a current Chrome, Edge, Safari, or WebGPU-enabled Firefox build.";
+}
+
+function startupErrorMessage(error) {
+  const message = errorMessage(error);
+  if (/maxStorageBuffersPerShaderStage|max_storage_buffers_per_shader_stage|storage buffers/i.test(message)) {
+    return (
+      `This browser/GPU does not meet the ${REQUIRED_STORAGE_BUFFERS_PER_SHADER_STAGE}-storage-buffer WebGPU limit ` +
+      "used by the simulator. Try a current Chrome, Edge, or Safari build, or a Firefox build/platform with full WebGPU enabled."
+    );
+  }
+  if (/adapter|device|surface|webgpu|gpu/i.test(message)) {
+    return "The browser exposed WebGPU, but the GPU device could not be created for this simulation.";
+  }
+  return "The simulator failed during startup before the first frame could render.";
+}
+
+function errorMessage(error) {
+  if (error instanceof Error) return error.message;
+  if (typeof error === "string") return error;
+  return String(error ?? "Unknown error");
+}
+
+function isFirefox() {
+  return /\bFirefox\//.test(navigator.userAgent);
+}
+
+function showStartupError({ title, message, detail }) {
+  document.body.classList.add("sim-startup-failed");
+  for (const control of document.querySelectorAll("button, input")) {
+    control.disabled = true;
+  }
+  const panel = document.createElement("div");
+  panel.className = "startup-error";
+  panel.setAttribute("role", "status");
+  panel.setAttribute("aria-live", "polite");
+  panel.innerHTML = `
+    <div class="startup-error-card">
+      <p class="startup-error-eyebrow">Coffee Sim / WebGPU</p>
+      <h2>${escapeHtml(title)}</h2>
+      <p>${escapeHtml(message)}</p>
+      ${detail ? `<pre>${escapeHtml(detail)}</pre>` : ""}
+    </div>
+  `;
+  document.querySelector(".viewer")?.append(panel);
+}
+
+function escapeHtml(value) {
+  return String(value).replace(/[&<>"']/g, (char) => {
+    switch (char) {
+      case "&":
+        return "&amp;";
+      case "<":
+        return "&lt;";
+      case ">":
+        return "&gt;";
+      case "\"":
+        return "&quot;";
+      case "'":
+        return "&#39;";
+      default:
+        return char;
+    }
+  });
+}
 
 function resizeCanvas() {
   const dpr = window.devicePixelRatio || 1;
