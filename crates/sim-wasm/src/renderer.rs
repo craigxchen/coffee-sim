@@ -42,12 +42,14 @@ struct ParticleVertexInput {
     @location(1) world_position: vec3<f32>,
     @location(2) colour_t: f32,
     @location(3) radius: f32,
+    @location(4) brew_t: f32,
 };
 
 struct ParticleVertexOutput {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) local: vec2<f32>,
     @location(1) colour_t: f32,
+    @location(2) brew_t: f32,
 };
 
 @vertex
@@ -62,6 +64,7 @@ fn vs_main(input: ParticleVertexInput) -> ParticleVertexOutput {
     output.clip_position = uniforms.view_proj * vec4<f32>(world, 1.0);
     output.local = input.local;
     output.colour_t = input.colour_t;
+    output.brew_t = input.brew_t;
     return output;
 }
 
@@ -76,6 +79,14 @@ fn palette(colour_t: f32) -> vec3<f32> {
     let mid = vec3<f32>(0.10, 0.47, 0.74);
     let crest = vec3<f32>(0.87, 0.95, 0.98);
     return mix(mix(base, mid, clamp(colour_t, 0.0, 1.0)), crest, clamp(colour_t * 0.6, 0.0, 1.0));
+}
+
+fn coffee_tint(color: vec3<f32>, brew_t: f32) -> vec3<f32> {
+    let tint = clamp(brew_t, 0.0, 1.0);
+    let rich = clamp((brew_t - 0.55) * 1.4, 0.0, 1.0);
+    let brewed = vec3<f32>(0.50, 0.29, 0.11);
+    let dark = vec3<f32>(0.20, 0.10, 0.035);
+    return mix(mix(color, brewed, tint * 0.62), dark, rich * 0.35);
 }
 
 @fragment
@@ -94,7 +105,8 @@ fn fs_main(input: ParticleVertexOutput) -> @location(0) vec4<f32> {
     let light = normalize(-uniforms.light_dir.xyz);
     let diffuse = max(dot(normal, light), 0.0);
     let rim = pow(1.0 - sphere_z, 2.5);
-    let color = palette(input.colour_t) * (0.34 + diffuse * 0.9) + vec3<f32>(rim * 0.12);
+    let color = coffee_tint(palette(input.colour_t), input.brew_t) * (0.34 + diffuse * 0.9)
+        + vec3<f32>(rim * 0.12);
     let alpha = smoothstep(1.0, 0.82, radial);
     return vec4<f32>(color, alpha);
 }
@@ -176,13 +188,15 @@ struct ParticleVertexInput {
     @location(1) world_position: vec3<f32>,
     @location(2) colour_t: f32,
     @location(3) radius: f32,
+    @location(4) brew_t: f32,
 };
 
 struct ParticleVertexOutput {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) local: vec2<f32>,
     @location(1) colour_t: f32,
-    @location(2) visible: f32,
+    @location(2) brew_t: f32,
+    @location(3) visible: f32,
 };
 
 @vertex
@@ -223,6 +237,7 @@ fn vs_main(input: ParticleVertexInput) -> ParticleVertexOutput {
     );
     output.local = input.local;
     output.colour_t = input.colour_t;
+    output.brew_t = input.brew_t;
     output.visible = visible;
     return output;
 }
@@ -239,6 +254,14 @@ fn palette(colour_t: f32) -> vec3<f32> {
     return mix(water, fast, clamp(colour_t * 0.45, 0.0, 1.0));
 }
 
+fn coffee_tint(color: vec3<f32>, brew_t: f32) -> vec3<f32> {
+    let tint = clamp(brew_t, 0.0, 1.0);
+    let rich = clamp((brew_t - 0.55) * 1.4, 0.0, 1.0);
+    let brewed = vec3<f32>(0.50, 0.29, 0.11);
+    let dark = vec3<f32>(0.20, 0.10, 0.035);
+    return mix(mix(color, brewed, tint * 0.62), dark, rich * 0.35);
+}
+
 @fragment
 fn fs_main(input: ParticleVertexOutput) -> @location(0) vec4<f32> {
     if (input.visible < 0.5) {
@@ -249,7 +272,7 @@ fn fs_main(input: ParticleVertexOutput) -> @location(0) vec4<f32> {
         discard;
     }
     let alpha = smoothstep(1.0, 0.72, radial);
-    return vec4<f32>(palette(input.colour_t), alpha * 0.92);
+    return vec4<f32>(coffee_tint(palette(input.colour_t), input.brew_t), alpha * 0.92);
 }
 "#;
 
@@ -591,6 +614,11 @@ impl Renderer {
                                 shader_location: 3,
                                 format: wgpu::VertexFormat::Float32,
                             },
+                            wgpu::VertexAttribute {
+                                offset: 20,
+                                shader_location: 4,
+                                format: wgpu::VertexFormat::Float32,
+                            },
                         ],
                     },
                 ],
@@ -661,6 +689,11 @@ impl Renderer {
                                 wgpu::VertexAttribute {
                                     offset: 16,
                                     shader_location: 3,
+                                    format: wgpu::VertexFormat::Float32,
+                                },
+                                wgpu::VertexAttribute {
+                                    offset: 20,
+                                    shader_location: 4,
                                     format: wgpu::VertexFormat::Float32,
                                 },
                             ],

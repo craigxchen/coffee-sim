@@ -1,4 +1,4 @@
-import init, { WasmSim3D } from "./pkg/coffee_sim_wasm.js?v=debug-timeseries-7";
+import init, { WasmSim3D } from "./pkg/coffee_sim_wasm.js?v=exact-delayed-metrics-brew-color-main";
 
 const canvas = document.getElementById("sim-canvas");
 const viewCubeStage = document.getElementById("view-cube-stage");
@@ -34,13 +34,16 @@ const bedParticlesLabel = document.getElementById("bed-particles");
 const capacityUsedLabel = document.getElementById("capacity-used");
 const bedEnabledLabel = document.getElementById("bed-enabled");
 const maxAbsDivLabel = document.getElementById("max-abs-div");
+const projectionResidualMaxLabel = document.getElementById("projection-residual-max");
+const projectionResidualMeanLabel = document.getElementById("projection-residual-mean");
+const projectionResidualCellsLabel = document.getElementById("projection-residual-cells");
+const pressurePairsLabel = document.getElementById("pressure-pairs");
 const fluidCellsLabel = document.getElementById("fluid-cells");
 const divClampFiresLabel = document.getElementById("div-clamp-fires");
 const pressureClampFiresLabel = document.getElementById("pressure-clamp-fires");
 const massOverflowFiresLabel = document.getElementById("mass-overflow-fires");
-const pressureDepthLabel = document.getElementById("pressure-depth");
-const pressureBottomLabel = document.getElementById("pressure-bottom");
-const pressureDeltaLabel = document.getElementById("pressure-delta");
+const cupTdsLabel = document.getElementById("cup-tds");
+const extractionYieldLabel = document.getElementById("extraction-yield");
 const pressureStatusLabel = document.getElementById("pressure-status");
 const toggleDebugButton = document.getElementById("toggle-debug");
 const debugStats = document.getElementById("debug-stats");
@@ -51,17 +54,17 @@ const minimizeTimeseriesButton = document.getElementById("minimize-timeseries");
 const timeseriesMenu = document.getElementById("timeseries-menu");
 const timeseriesGrid = document.getElementById("timeseries-grid");
 
-// Throttle metrics readback — the staging-buffer map/unmap is cheap but still
-// costs a JS microtask. Refreshing every ~10 frames keeps the HUD responsive
-// without pinning the event loop.
-const METRICS_REFRESH_INTERVAL = 10;
+// Exact metrics telemetry uses a tiny GPU buffer, sampled at 10 Hz and mapped a
+// few frames later. The returned Promise does not hold a mutable WASM borrow, so
+// stepping and UI events keep running while the readback completes.
+const METRICS_SAMPLE_INTERVAL_FRAMES = 6;
+const METRICS_SAMPLE_DELAY_FRAMES = 4;
+const METRICS_MAX_PENDING_SAMPLES = 2;
 let metricsFrameCounter = 0;
-let metricsRefreshInFlight = false;
-const DIAGNOSTICS_REFRESH_INTERVAL = 60;
-let diagnosticsFrameCounter = DIAGNOSTICS_REFRESH_INTERVAL;
-let diagnosticsRefreshInFlight = false;
 const TIMESERIES_SAMPLE_INTERVAL = 6;
 const TIMESERIES_MAX_SAMPLES = 720;
+let metricsSamplesPending = 0;
+let latestExactMetrics = null;
 const AUTO_PAUSE_DELAY_MS = 30_000;
 
 let app;
@@ -115,7 +118,6 @@ const DEBUG_SCENE_PAUSE_ON_LOAD = new Set([
 let spoutX = 0.0;
 let spoutZ = 0.0;
 let spoutPlaneDragging = false;
-let latestWaterDiagnostics = null;
 let timeseriesFrameCounter = TIMESERIES_SAMPLE_INTERVAL;
 const timeseriesSamples = [];
 const integerFormatter = new Intl.NumberFormat();
@@ -280,7 +282,6 @@ toggleDebugButton.addEventListener("click", () => {
   toggleDebugButton.textContent = debugStats.classList.contains("hidden")
     ? "Show Debug Stats"
     : "Hide Debug Stats";
-  diagnosticsFrameCounter = DIAGNOSTICS_REFRESH_INTERVAL;
 });
 
 sceneMainTab.addEventListener("click", () => {
@@ -446,11 +447,6 @@ function animate(timestamp) {
     return;
   }
 
-  if (metricsRefreshInFlight || diagnosticsRefreshInFlight) {
-    requestAnimationFrame(animate);
-    return;
-  }
-
   applyKeyboardPan(frameTime);
 
   if (!paused && skipStepOnce) {
@@ -464,9 +460,8 @@ function animate(timestamp) {
   updateFps(wallFrameTime);
   syncUi();
   maybeCollectTimeseriesSample();
-  if (!maybeRefreshMetrics()) {
-    maybeRefreshDiagnostics();
-  }
+  maybeRefreshMetrics();
+  maybeRefreshPressureDiagnostics();
   requestAnimationFrame(animate);
 }
 
@@ -503,51 +498,34 @@ function clearAutoPauseTimer() {
 }
 
 function maybeRefreshMetrics() {
-  if (metricsRefreshInFlight) return false;
+  if (debugStats.classList.contains("hidden")) return;
   metricsFrameCounter += 1;
-  if (metricsFrameCounter < METRICS_REFRESH_INTERVAL) return false;
+  if (
+    metricsFrameCounter < METRICS_SAMPLE_INTERVAL_FRAMES
+    || metricsSamplesPending >= METRICS_MAX_PENDING_SAMPLES
+  ) {
+    return;
+  }
+
   metricsFrameCounter = 0;
-  metricsRefreshInFlight = true;
-  app.refreshMetrics()
-    .catch((error) => {
-      console.warn("Metrics readback failed", error);
-    })
-    .finally(() => {
-      releaseReadbackLock(() => {
-        metricsRefreshInFlight = false;
-      });
-    });
-  return true;
-}
-
-function maybeRefreshDiagnostics() {
-  if (diagnosticsRefreshInFlight) return false;
-  diagnosticsFrameCounter += 1;
-  if (diagnosticsFrameCounter < DIAGNOSTICS_REFRESH_INTERVAL) return false;
-  diagnosticsFrameCounter = 0;
-  diagnosticsRefreshInFlight = true;
-  app.waterDiagnostics()
-    .then((diagnostics) => {
-      latestWaterDiagnostics = diagnostics;
-      updatePressureDiagnostics(diagnostics);
+  metricsSamplesPending += 1;
+  app.sampleMetrics(METRICS_SAMPLE_DELAY_FRAMES)
+    .then((metrics) => {
+      latestExactMetrics = metrics;
     })
     .catch((error) => {
-      console.warn("Water diagnostics readback failed", error);
-      latestWaterDiagnostics = null;
-      pressureStatusLabel.textContent = "Readback failed";
+      console.warn("Coffee sim metrics refresh failed", error);
     })
     .finally(() => {
-      releaseReadbackLock(() => {
-        diagnosticsRefreshInFlight = false;
-      });
+      metricsSamplesPending = Math.max(0, metricsSamplesPending - 1);
     });
-  return true;
 }
 
-function releaseReadbackLock(release) {
-  requestAnimationFrame(() => {
-    requestAnimationFrame(release);
-  });
+function maybeRefreshPressureDiagnostics() {
+  if (debugStats.classList.contains("hidden")) return;
+  pressureStatusLabel.textContent = latestExactMetrics
+    ? "exact 10 Hz"
+    : "waiting";
 }
 
 function setTimeseriesDrawerExpanded(expanded) {
@@ -564,22 +542,6 @@ function setTimeseriesDrawerExpanded(expanded) {
 function setTimeseriesMenuOpen(open) {
   timeseriesMenu.hidden = !open;
   toggleTimeseriesMenuButton.setAttribute("aria-expanded", open ? "true" : "false");
-}
-
-function updatePressureDiagnostics(diagnostics) {
-  const pressure = diagnostics?.hydrostaticPressure;
-  if (!pressure || pressure.sampleCount <= 0 || pressure.depthMeters <= 0) {
-    pressureDepthLabel.textContent = "n/a";
-    pressureBottomLabel.textContent = "n/a";
-    pressureDeltaLabel.textContent = "n/a";
-    pressureStatusLabel.textContent = "n/a";
-    return;
-  }
-
-  pressureDepthLabel.textContent = `${(pressure.depthMeters * 1000).toFixed(1)} mm`;
-  pressureBottomLabel.textContent = `${pressure.bottomPressurePa.toFixed(0)} Pa`;
-  pressureDeltaLabel.textContent = `${pressure.deltaPressurePa.toFixed(0)} Pa`;
-  pressureStatusLabel.textContent = pressure.bottomHigher ? "OK" : "Check";
 }
 
 function buildTimeseriesCharts() {
@@ -651,9 +613,8 @@ function setTimeseriesChartVisible(key, visible) {
 function resetTimeseries() {
   timeseriesSamples.length = 0;
   timeseriesFrameCounter = TIMESERIES_SAMPLE_INTERVAL;
-  latestWaterDiagnostics = null;
-  diagnosticsFrameCounter = DIAGNOSTICS_REFRESH_INTERVAL;
-  metricsFrameCounter = METRICS_REFRESH_INTERVAL;
+  latestExactMetrics = null;
+  metricsFrameCounter = METRICS_SAMPLE_INTERVAL_FRAMES;
   if (app) {
     collectTimeseriesSample();
   } else {
@@ -670,37 +631,30 @@ function maybeCollectTimeseriesSample() {
 }
 
 function collectTimeseriesSample() {
-  const diagnostics = latestWaterDiagnostics;
-  const surface = diagnostics?.surface;
-  const pressure = diagnostics?.hydrostaticPressure;
+  const metrics = latestExactMetrics ?? {};
   timeseriesSamples.push({
     timeSeconds: app.simTime(),
-    totalEnergy: diagnostics?.totalEnergy ?? NaN,
-    kineticEnergy: diagnostics?.kineticEnergy ?? NaN,
-    activeMassMl: diagnostics?.activeMassMl ?? NaN,
-    rmsSpeedMetersPerSecond: diagnostics?.rmsSpeedMetersPerSecond ?? NaN,
-    surfaceRmsMillimeters: surface ? surface.rmsMeters * 1000.0 : NaN,
-    pressureDeltaPa:
-      pressure && pressure.sampleCount > 0 ? pressure.deltaPressurePa : NaN,
-    maxAbsDivergence: app.maxAbsDivergence(),
-    pressureResidualInitial: optionalAppMetric("pressureResidualInitial"),
-    pressureResidualFinal: optionalAppMetric("pressureResidualFinal"),
-    pressureResidualRatio: optionalAppMetric("pressureResidualRatio"),
-    pressureResidualRatioPerIteration: optionalAppMetric("pressureResidualRatioPerIteration"),
-    pressureSolveIterations: optionalAppMetric("pressureSolveIterations"),
-    fluidCells: app.fluidCellCount(),
-    divClampFires: app.divClampFires(),
-    pressureClampFires: app.pressureClampFires(),
-    massOverflowFires: app.massOverflowFires(),
+    totalEnergy: NaN,
+    kineticEnergy: NaN,
+    activeMassMl: NaN,
+    rmsSpeedMetersPerSecond: NaN,
+    surfaceRmsMillimeters: NaN,
+    pressureDeltaPa: NaN,
+    maxAbsDivergence: metrics.maxAbsDivergence ?? NaN,
+    pressureResidualInitial: NaN,
+    pressureResidualFinal: NaN,
+    pressureResidualRatio: NaN,
+    pressureResidualRatioPerIteration: NaN,
+    pressureSolveIterations: app.lastPressureRbgsPairs(),
+    fluidCells: metrics.fluidCellCount ?? NaN,
+    divClampFires: metrics.divClampFires ?? NaN,
+    pressureClampFires: metrics.pressureClampFires ?? NaN,
+    massOverflowFires: metrics.massOverflowFires ?? NaN,
   });
   while (timeseriesSamples.length > TIMESERIES_MAX_SAMPLES) {
     timeseriesSamples.shift();
   }
   renderTimeseriesCharts();
-}
-
-function optionalAppMetric(methodName) {
-  return typeof app[methodName] === "function" ? app[methodName]() : NaN;
 }
 
 function renderTimeseriesCharts() {
@@ -978,6 +932,7 @@ function clamp(value, min, max) {
 }
 
 function syncUi() {
+  const metrics = latestExactMetrics ?? {};
   particleLabel.textContent = new Intl.NumberFormat().format(app.particleCount());
   waterVelocityValue.textContent = `${app.waterVelocityMetersPerSecond().toFixed(2)} m/s`;
   spoutX = clamp(snap(app.spoutX()), SPOUT_X_MIN, SPOUT_X_MAX);
@@ -1002,11 +957,17 @@ function syncUi() {
     ? `${((usedParticles / maxParticles) * 100).toFixed(1)}%`
     : "0.0%";
   bedEnabledLabel.textContent = app.hasBed() ? "Yes" : "No";
-  maxAbsDivLabel.textContent = app.maxAbsDivergence().toFixed(3);
-  fluidCellsLabel.textContent = new Intl.NumberFormat().format(app.fluidCellCount());
-  divClampFiresLabel.textContent = new Intl.NumberFormat().format(app.divClampFires());
-  pressureClampFiresLabel.textContent = new Intl.NumberFormat().format(app.pressureClampFires());
-  massOverflowFiresLabel.textContent = new Intl.NumberFormat().format(app.massOverflowFires());
+  maxAbsDivLabel.textContent = (metrics.maxAbsDivergence ?? 0).toFixed(3);
+  projectionResidualMaxLabel.textContent = (metrics.projectionResidualMaxAbsDivergence ?? 0).toFixed(3);
+  projectionResidualMeanLabel.textContent = (metrics.projectionResidualMeanAbsDivergence ?? 0).toFixed(3);
+  projectionResidualCellsLabel.textContent = new Intl.NumberFormat().format(metrics.projectionResidualCellCount ?? 0);
+  pressurePairsLabel.textContent = new Intl.NumberFormat().format(app.lastPressureRbgsPairs());
+  fluidCellsLabel.textContent = new Intl.NumberFormat().format(metrics.fluidCellCount ?? 0);
+  divClampFiresLabel.textContent = new Intl.NumberFormat().format(metrics.divClampFires ?? 0);
+  pressureClampFiresLabel.textContent = new Intl.NumberFormat().format(metrics.pressureClampFires ?? 0);
+  massOverflowFiresLabel.textContent = new Intl.NumberFormat().format(metrics.massOverflowFires ?? 0);
+  cupTdsLabel.textContent = `${((metrics.cupTds ?? 0) * 100).toFixed(2)}%`;
+  extractionYieldLabel.textContent = `${((metrics.extractionYield ?? 0) * 100).toFixed(2)}%`;
 }
 
 function publishDebugHooks() {
@@ -1018,6 +979,9 @@ function publishDebugHooks() {
     isPaused: () => paused,
     loadDebugScene,
     debugScenes: Object.fromEntries(DEBUG_SCENE_LABELS),
+    setPressureResidualAdaptation: (target, maxPairs) => {
+      app.setPressureResidualAdaptation(target, maxPairs);
+    },
     stepFramesForEvaluation,
     sampleRealism: captureRealismSample,
     runRealismEvaluation,
