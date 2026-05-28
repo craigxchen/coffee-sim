@@ -1,4 +1,4 @@
-import init, { WasmSim3D } from "./pkg/coffee_sim_wasm.js?v=debug-timeseries-7";
+import init, { WasmSim3D } from "./pkg/coffee_sim_wasm.js?v=debug-timeseries-8";
 
 const canvas = document.getElementById("sim-canvas");
 const viewCubeStage = document.getElementById("view-cube-stage");
@@ -63,6 +63,7 @@ let diagnosticsRefreshInFlight = false;
 const TIMESERIES_SAMPLE_INTERVAL = 6;
 const TIMESERIES_MAX_SAMPLES = 720;
 const AUTO_PAUSE_DELAY_MS = 30_000;
+const ENABLE_LIVE_WATER_DIAGNOSTICS = false;
 
 let app;
 let paused = false;
@@ -446,11 +447,6 @@ function animate(timestamp) {
     return;
   }
 
-  if (metricsRefreshInFlight || diagnosticsRefreshInFlight) {
-    requestAnimationFrame(animate);
-    return;
-  }
-
   applyKeyboardPan(frameTime);
 
   if (!paused && skipStepOnce) {
@@ -503,6 +499,7 @@ function clearAutoPauseTimer() {
 }
 
 function maybeRefreshMetrics() {
+  if (!debugPanelVisible() && !timeseriesDrawerOpen()) return false;
   if (metricsRefreshInFlight) return false;
   metricsFrameCounter += 1;
   if (metricsFrameCounter < METRICS_REFRESH_INTERVAL) return false;
@@ -521,6 +518,11 @@ function maybeRefreshMetrics() {
 }
 
 function maybeRefreshDiagnostics() {
+  if (!debugPanelVisible() && !timeseriesDrawerOpen()) return false;
+  if (!ENABLE_LIVE_WATER_DIAGNOSTICS) {
+    pressureStatusLabel.textContent = "Live readback off";
+    return false;
+  }
   if (diagnosticsRefreshInFlight) return false;
   diagnosticsFrameCounter += 1;
   if (diagnosticsFrameCounter < DIAGNOSTICS_REFRESH_INTERVAL) return false;
@@ -548,6 +550,14 @@ function releaseReadbackLock(release) {
   requestAnimationFrame(() => {
     requestAnimationFrame(release);
   });
+}
+
+function debugPanelVisible() {
+  return !debugStats.classList.contains("hidden");
+}
+
+function timeseriesDrawerOpen() {
+  return timeseriesDrawer.classList.contains("is-open");
 }
 
 function setTimeseriesDrawerExpanded(expanded) {
@@ -662,7 +672,7 @@ function resetTimeseries() {
 }
 
 function maybeCollectTimeseriesSample() {
-  if (paused) return;
+  if (paused || !timeseriesDrawerOpen()) return;
   timeseriesFrameCounter += 1;
   if (timeseriesFrameCounter < TIMESERIES_SAMPLE_INTERVAL) return;
   timeseriesFrameCounter = 0;
