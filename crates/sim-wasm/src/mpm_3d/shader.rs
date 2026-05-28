@@ -2770,11 +2770,14 @@ fn prepare_render(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     var color_t = 0.0;
+    var brew_t = 0.0;
     var radius = water_particle_radius();
     if is_water_phase(phase) {
+        let speed = length(p.vel.xyz);
+        color_t = clamp(speed / 10.0, 0.0, 2.0);
         let solute_mass = max(affine[pid].col1.w, 0.0);
         let concentration = solute_mass / max(p.vel.w, 1e-6);
-        color_t = clamp(concentration / 0.018, 0.0, 2.0);
+        brew_t = clamp(concentration / 0.018, 0.0, 1.35);
         atomicAdd(
             &metrics[METRIC_ACTIVE_WATER_MASS_IDX],
             u32(clamp(p.vel.w * metrics_mass_fp_scale(), 0.0, f32(0xffffffffu))),
@@ -2810,7 +2813,7 @@ fn prepare_render(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     render_data[pid] = RenderParticle(
         vec4<f32>(p.pos.xyz, color_t),
-        vec4<f32>(radius, 0.0, 0.0, 0.0),
+        vec4<f32>(radius, brew_t, 0.0, 0.0),
     );
 }
 
