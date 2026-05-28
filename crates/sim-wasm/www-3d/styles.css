@@ -552,6 +552,79 @@ canvas {
   display: block;
 }
 
+body.sim-startup-failed .timeseries-drawer,
+body.sim-startup-failed .cross-section-overlay,
+body.sim-startup-failed .view-cube {
+  display: none;
+}
+
+body.sim-startup-failed canvas {
+  opacity: 0.12;
+}
+
+body.sim-startup-failed button,
+body.sim-startup-failed input {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.startup-error {
+  position: absolute;
+  inset: 0;
+  z-index: 20;
+  display: grid;
+  place-items: center;
+  padding: clamp(18px, 4vw, 48px);
+  background:
+    linear-gradient(rgba(9, 16, 19, 0.84), rgba(9, 16, 19, 0.90)),
+    radial-gradient(circle at 50% 20%, rgba(217, 179, 106, 0.13), transparent 42%);
+}
+
+.startup-error-card {
+  width: min(560px, 100%);
+  padding: clamp(20px, 3vw, 30px);
+  border: 1px solid rgba(217, 179, 106, 0.28);
+  border-radius: 8px;
+  background: rgba(16, 28, 31, 0.92);
+  box-shadow: 0 22px 52px rgba(0, 0, 0, 0.38);
+}
+
+.startup-error-eyebrow {
+  margin: 0 0 12px;
+  color: var(--accent);
+  font-size: 0.74rem;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+
+.startup-error-card h2 {
+  margin: 0;
+  font-size: clamp(1.45rem, 3vw, 2.1rem);
+  line-height: 1.1;
+}
+
+.startup-error-card p {
+  margin: 14px 0 0;
+  color: var(--muted);
+  font-size: 0.98rem;
+  line-height: 1.5;
+}
+
+.startup-error-card pre {
+  max-height: 160px;
+  margin: 16px 0 0;
+  padding: 12px;
+  overflow: auto;
+  border-radius: 6px;
+  border: 1px solid rgba(177, 200, 194, 0.16);
+  background: rgba(9, 16, 19, 0.62);
+  color: rgba(233, 239, 230, 0.78);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.72rem;
+  line-height: 1.45;
+  white-space: pre-wrap;
+}
+
 .cross-section-overlay {
   position: absolute;
   top: 16px;
