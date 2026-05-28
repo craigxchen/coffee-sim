@@ -13,8 +13,14 @@ pub(crate) struct MpmPipelines {
     pub viscosity_prepare: wgpu::ComputePipeline,
     pub viscosity_apply: wgpu::ComputePipeline,
     pub classify_cells: wgpu::ComputePipeline,
-    pub pressure_rbgs_red: wgpu::ComputePipeline,
-    pub pressure_rbgs_black: wgpu::ComputePipeline,
+    pub pressure_cg_init: wgpu::ComputePipeline,
+    pub pressure_cg_clear_reductions: wgpu::ComputePipeline,
+    pub pressure_cg_matvec: wgpu::ComputePipeline,
+    pub pressure_cg_apply_alpha: wgpu::ComputePipeline,
+    pub pressure_cg_update_dir: wgpu::ComputePipeline,
+    pub pressure_cg_finish_iteration: wgpu::ComputePipeline,
+    pub pressure_residual_clear: wgpu::ComputePipeline,
+    pub pressure_residual_measure: wgpu::ComputePipeline,
     pub project_pressure: wgpu::ComputePipeline,
     pub boundary_project: wgpu::ComputePipeline,
     pub packing_prepare: wgpu::ComputePipeline,
@@ -82,6 +88,8 @@ impl MpmPipelines {
                     },
                     count: None,
                 },
+                // 12: pressure CG scratch
+                storage_entry(12),
             ],
         });
 
@@ -137,6 +145,10 @@ impl MpmPipelines {
                     binding: 11,
                     resource: wgpu::BindingResource::TextureView(&buffers.sdf_class_view),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 12,
+                    resource: buffers.cg.as_entire_binding(),
+                },
             ],
         });
 
@@ -172,8 +184,14 @@ impl MpmPipelines {
             viscosity_prepare: make("viscosity_prepare"),
             viscosity_apply: make("viscosity_apply"),
             classify_cells: make("classify_cells"),
-            pressure_rbgs_red: make("pressure_rbgs_red"),
-            pressure_rbgs_black: make("pressure_rbgs_black"),
+            pressure_cg_init: make("pressure_cg_init"),
+            pressure_cg_clear_reductions: make("pressure_cg_clear_reductions"),
+            pressure_cg_matvec: make("pressure_cg_matvec"),
+            pressure_cg_apply_alpha: make("pressure_cg_apply_alpha"),
+            pressure_cg_update_dir: make("pressure_cg_update_dir"),
+            pressure_cg_finish_iteration: make("pressure_cg_finish_iteration"),
+            pressure_residual_clear: make("pressure_residual_clear"),
+            pressure_residual_measure: make("pressure_residual_measure"),
             project_pressure: make("project_pressure"),
             boundary_project: make("boundary_project"),
             packing_prepare: make("packing_prepare"),

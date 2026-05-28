@@ -35,9 +35,9 @@ pub(crate) const OBSTACLE_WALL_THICKNESS: f32 = 0.4;
 
 /// Device limits required by the MPM compute pipeline.
 ///
-/// The MPM bind group holds 9 storage buffers (particles, affine, grid,
-/// grid_vel, render_data, bed_extract, bed_lookup, bed_delta, metrics) plus
-/// one SDF texture. This stays within the 10-buffer cap that some WebGPU
+/// The MPM bind group holds 10 storage buffers (particles, affine, grid,
+/// grid_vel, render_data, bed_extract, bed_lookup, bed_delta, metrics, cg)
+/// plus one SDF texture. This stays within the 10-buffer cap that some WebGPU
 /// adapters enforce. Any
 /// `request_device` site that uses this pipeline must use these limits, and
 /// `mpm_pipelines_fit_within_required_limits` pins the invariant.
@@ -66,6 +66,17 @@ pub(crate) struct MetricsSnapshot {
     pub pressure_clamp_fires: u32,
     /// Number of P2G contributions that tripped the overflow probe.
     pub mass_overflow_fires: u32,
+    /// Initial pressure-solver residual norm for the most recent substep.
+    pub pressure_residual_initial: f32,
+    /// Final pressure-solver residual norm after the configured solve budget.
+    pub pressure_residual_final: f32,
+    /// `final / initial` residual norm. Values below 1 indicate convergence.
+    pub pressure_residual_ratio: f32,
+    /// Per-iteration residual reduction estimate, useful when comparing
+    /// solvers with different iteration budgets.
+    pub pressure_residual_ratio_per_iteration: f32,
+    /// Configured pressure-solver iteration count for the current scene.
+    pub pressure_solve_iterations: u32,
 }
 
 /// One-shot water-state readback used by the browser realism evaluator.
@@ -206,7 +217,7 @@ pub(crate) struct MpmSettings {
     pub bulk_modulus: f32,
     pub viscosity: f32,
     pub render_radius: f32,
-    pub pressure_rbgs_pairs: u32,
+    pub pressure_cg_iterations: u32,
     pub use_sdf_cache: bool,
     pub obstacles: Vec<Obstacle>,
     pub spout: SpoutSettings,
@@ -236,7 +247,7 @@ impl MpmSettings {
             bulk_modulus: 900.0,
             viscosity: DEFAULT_BREW.water_viscosity,
             render_radius: dx * 0.7,
-            pressure_rbgs_pairs: 40,
+            pressure_cg_iterations: 40,
             use_sdf_cache: true,
             obstacles: vec![
                 v60_support_cone(&filter),
@@ -258,11 +269,10 @@ impl MpmSettings {
         let mut settings = Self::default_v60();
         settings.bed = None;
         settings.spout.origin = Vec3::new(0.0, 6.8, 0.0);
-        // Free-water pools have no porous bed to dissipate pressure-solve
-        // residuals, so the water-only scene needs tighter projection
-        // convergence to keep the cup surface from settling into a lopsided
-        // heap.
-        settings.pressure_rbgs_pairs = 80;
+        // Match the default V60 pressure budget. The water-only scene has a
+        // large free surface; running far beyond useful CG convergence can
+        // amplify fixed-point reduction noise into visible spray.
+        settings.pressure_cg_iterations = 40;
         settings.initial_water_speed_m_s = DEFAULT_BREW.initial_water_speed_m_s;
         settings
     }
@@ -278,7 +288,7 @@ impl MpmSettings {
         let mut settings = Self::default_v60();
         settings.spout.origin = Vec3::new(0.0, 7.1, 0.0);
         settings.initial_water_speed_m_s = 0.0;
-        settings.pressure_rbgs_pairs = 80;
+        settings.pressure_cg_iterations = 80;
         settings
     }
 
@@ -293,14 +303,14 @@ impl MpmSettings {
         settings.spout.nozzle_radius = 0.15;
         settings.spout.max_flow_rate_ml_s = 10.0;
         settings.spout.max_exit_speed = units::sim_speed_from_meters_per_second(0.6);
-        settings.pressure_rbgs_pairs = 80;
+        settings.pressure_cg_iterations = 80;
         settings
     }
 
     pub fn debug_seeded_paper_wall_sheet() -> Self {
         let mut settings = Self::default_v60();
         settings.initial_water_speed_m_s = 0.0;
-        settings.pressure_rbgs_pairs = 80;
+        settings.pressure_cg_iterations = 80;
         settings
     }
 
@@ -308,35 +318,35 @@ impl MpmSettings {
         let mut settings = Self::default_v60();
         settings.bed = None;
         settings.initial_water_speed_m_s = 0.0;
-        settings.pressure_rbgs_pairs = 80;
+        settings.pressure_cg_iterations = 80;
         settings
     }
 
     pub fn debug_cup_wall_floor_corner_contact() -> Self {
         let mut settings = Self::cup_only_water_scene();
         settings.initial_water_speed_m_s = 0.0;
-        settings.pressure_rbgs_pairs = 90;
+        settings.pressure_cg_iterations = 90;
         settings
     }
 
     pub fn debug_asymmetric_cup_mound() -> Self {
         let mut settings = Self::cup_only_water_scene();
         settings.initial_water_speed_m_s = 0.0;
-        settings.pressure_rbgs_pairs = 90;
+        settings.pressure_cg_iterations = 90;
         settings
     }
 
     pub fn debug_hydrostatic_column() -> Self {
         let mut settings = Self::cup_only_water_scene();
         settings.initial_water_speed_m_s = 0.0;
-        settings.pressure_rbgs_pairs = 100;
+        settings.pressure_cg_iterations = 100;
         settings
     }
 
     pub fn debug_dam_break_slosh() -> Self {
         let mut settings = Self::cup_only_water_scene();
         settings.initial_water_speed_m_s = 0.0;
-        settings.pressure_rbgs_pairs = 90;
+        settings.pressure_cg_iterations = 90;
         settings
     }
 
@@ -356,14 +366,14 @@ impl MpmSettings {
         settings.spout.max_flow_rate_ml_s = 14.0;
         settings.spout.max_exit_speed = units::sim_speed_from_meters_per_second(0.65);
         settings.initial_water_speed_m_s = 0.48;
-        settings.pressure_rbgs_pairs = 100;
+        settings.pressure_cg_iterations = 100;
         settings
     }
 
     pub fn debug_uniform_bed_saturation() -> Self {
         let mut settings = Self::default_v60();
         settings.initial_water_speed_m_s = 0.0;
-        settings.pressure_rbgs_pairs = 80;
+        settings.pressure_cg_iterations = 80;
         settings
     }
 
@@ -374,7 +384,7 @@ impl MpmSettings {
         }
         settings.spout.origin = Vec3::new(0.0, 7.1, 0.0);
         settings.initial_water_speed_m_s = 0.18;
-        settings.pressure_rbgs_pairs = 80;
+        settings.pressure_cg_iterations = 80;
         settings
     }
 
@@ -386,7 +396,7 @@ impl MpmSettings {
         settings.spout.max_flow_rate_ml_s = 18.0;
         settings.spout.max_exit_speed = units::sim_speed_from_meters_per_second(0.65);
         settings.initial_water_speed_m_s = 0.42;
-        settings.pressure_rbgs_pairs = 80;
+        settings.pressure_cg_iterations = 80;
         settings
     }
 
@@ -1495,17 +1505,30 @@ impl MpmSim3D {
                 pass.set_pipeline(&self.pipelines.boundary_project);
                 pass.dispatch_workgroups(cell_wg, 1, 1);
 
-                // Pressure projection: classify cells, RBGS pressure
-                // solve, velocity correction, then re-project boundaries.
+                // Pressure projection: classify cells, solve the weighted
+                // Poisson system with Jacobi-preconditioned CG, correct grid
+                // velocity, then re-project boundaries.
                 pass.set_pipeline(&self.pipelines.classify_cells);
                 pass.dispatch_workgroups(cell_wg, 1, 1);
 
-                for _ in 0..self.settings.pressure_rbgs_pairs {
-                    pass.set_pipeline(&self.pipelines.pressure_rbgs_red);
+                pass.set_pipeline(&self.pipelines.pressure_cg_init);
+                pass.dispatch_workgroups(cell_wg, 1, 1);
+                for _ in 0..self.settings.pressure_cg_iterations {
+                    pass.set_pipeline(&self.pipelines.pressure_cg_clear_reductions);
+                    pass.dispatch_workgroups(1, 1, 1);
+                    pass.set_pipeline(&self.pipelines.pressure_cg_matvec);
                     pass.dispatch_workgroups(cell_wg, 1, 1);
-                    pass.set_pipeline(&self.pipelines.pressure_rbgs_black);
+                    pass.set_pipeline(&self.pipelines.pressure_cg_apply_alpha);
                     pass.dispatch_workgroups(cell_wg, 1, 1);
+                    pass.set_pipeline(&self.pipelines.pressure_cg_update_dir);
+                    pass.dispatch_workgroups(cell_wg, 1, 1);
+                    pass.set_pipeline(&self.pipelines.pressure_cg_finish_iteration);
+                    pass.dispatch_workgroups(1, 1, 1);
                 }
+                pass.set_pipeline(&self.pipelines.pressure_residual_clear);
+                pass.dispatch_workgroups(1, 1, 1);
+                pass.set_pipeline(&self.pipelines.pressure_residual_measure);
+                pass.dispatch_workgroups(cell_wg, 1, 1);
 
                 pass.set_pipeline(&self.pipelines.project_pressure);
                 pass.dispatch_workgroups(cell_wg, 1, 1);
@@ -1739,24 +1762,77 @@ impl MpmSim3D {
 
     /// Async staging-buffer readback for the GPU metrics counters.
     ///
-    /// Currently **disabled** — every form of the readback path we tried
-    /// (per-frame copy, inline copy-then-map, fire-and-forget map) freezes
-    /// the browser tab on the second or third call. The shader-side
-    /// instrumentation still runs and writes to the GPU `metrics` buffer on
-    /// every substep; only the CPU-side pull-back is gated off until we can
-    /// get a proper map/unmap lifecycle working.
-    ///
-    /// TODO(readback): reimplement using either
-    ///   1. a dedicated staging buffer per in-flight request + a small
-    ///      ring so a pending map never blocks a new copy, or
-    ///   2. `queue.on_submitted_work_done` as a gate before calling
-    ///      `map_async`, so the map only starts after GPU work drains.
+    /// Uses a fresh staging buffer per request so a pending browser-side map
+    /// never races with the next snapshot copy.
     #[cfg(target_arch = "wasm32")]
     pub async fn refresh_metrics(
         &mut self,
-        _device: &wgpu::Device,
-        _queue: &wgpu::Queue,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
     ) -> Result<(), JsValue> {
+        let metrics_size = (METRICS_SLOT_COUNT * std::mem::size_of::<u32>()) as u64;
+        let staging = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("mpm metrics snapshot staging"),
+            size: metrics_size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("mpm metrics snapshot readback"),
+        });
+        encoder.copy_buffer_to_buffer(&self.buffers.metrics, 0, &staging, 0, metrics_size);
+        queue.submit(Some(encoder.finish()));
+
+        let slice = staging.slice(..);
+        let promise = js_sys::Promise::new(&mut |resolve, reject| {
+            slice.map_async(wgpu::MapMode::Read, move |result| match result {
+                Ok(()) => {
+                    let _ = resolve.call0(&JsValue::NULL);
+                }
+                Err(err) => {
+                    let _ = reject.call1(
+                        &JsValue::NULL,
+                        &JsValue::from_str(&format!("metrics map failed: {err:?}")),
+                    );
+                }
+            });
+        });
+        wasm_bindgen_futures::JsFuture::from(promise).await?;
+
+        let view = slice.get_mapped_range();
+        let data = bytemuck::cast_slice::<u8, u32>(&view);
+        let final_pressure_rz = data.get(9).copied().unwrap_or(0) as f32
+            / state::METRICS_PRESSURE_RESIDUAL_FP_SCALE.max(1e-12);
+        let initial_pressure_rz = data.get(8).copied().unwrap_or(0) as f32
+            / state::METRICS_PRESSURE_RESIDUAL_FP_SCALE.max(1e-12);
+        let pressure_residual_initial = initial_pressure_rz.max(0.0).sqrt();
+        let pressure_residual_final = final_pressure_rz.max(0.0).sqrt();
+        let pressure_residual_ratio = if pressure_residual_initial > 1e-12 {
+            pressure_residual_final / pressure_residual_initial
+        } else {
+            0.0
+        };
+        let pressure_residual_ratio_per_iteration =
+            if self.settings.pressure_cg_iterations > 0 && pressure_residual_ratio > 0.0 {
+                pressure_residual_ratio.powf(1.0 / self.settings.pressure_cg_iterations as f32)
+            } else {
+                pressure_residual_ratio
+            };
+        self.latest_metrics = MetricsSnapshot {
+            max_abs_div: data.first().copied().unwrap_or(0) as f32 / METRICS_DIV_FP_SCALE,
+            fluid_cells: data.get(1).copied().unwrap_or(0),
+            div_clamp_fires: data.get(2).copied().unwrap_or(0),
+            pressure_clamp_fires: data.get(3).copied().unwrap_or(0),
+            mass_overflow_fires: data.get(4).copied().unwrap_or(0),
+            pressure_residual_initial,
+            pressure_residual_final,
+            pressure_residual_ratio,
+            pressure_residual_ratio_per_iteration,
+            pressure_solve_iterations: self.settings.pressure_cg_iterations,
+        };
+        drop(view);
+        staging.unmap();
         Ok(())
     }
 
@@ -1853,7 +1929,7 @@ impl MpmSim3D {
                 METRICS_DIV_FP_SCALE,
                 1.0 / METRICS_DIV_FP_SCALE,
             ],
-            projection_params: [32.0, 2.0, 1.20, DEFAULT_BREW.bed_surface_void_scale],
+            projection_params: [32.0, 0.0, 1.20, DEFAULT_BREW.bed_surface_void_scale],
         };
 
         queue.write_buffer(
@@ -1953,6 +2029,17 @@ mod tests {
     }
 
     #[test]
+    fn pressure_projection_uses_jacobi_preconditioned_cg() {
+        let shader = shader::MPM_COMPUTE_SHADER;
+        assert!(shader.contains("fn pressure_cg_init("));
+        assert!(shader.contains("fn pressure_cg_matvec("));
+        assert!(shader.contains("fn pressure_cg_apply_alpha("));
+        assert!(shader.contains("fn pressure_cg_update_dir("));
+        assert!(shader.contains("fn pressure_active_cell("));
+        assert!(!shader.contains("pressure_rbgs"));
+    }
+
+    #[test]
     fn default_v60_uses_gentle_vertical_water_speed() {
         let s = MpmSettings::default_v60();
         assert!(s.initial_water_speed_m_s <= 0.13);
@@ -1975,7 +2062,7 @@ mod tests {
         assert!(s.filter.is_some());
         assert!(s.bed.is_some());
         assert_eq!(s.initial_water_speed_m_s, 0.0);
-        assert!(s.pressure_rbgs_pairs >= MpmSettings::default_v60().pressure_rbgs_pairs);
+        assert!(s.pressure_cg_iterations >= MpmSettings::default_v60().pressure_cg_iterations);
     }
 
     #[test]

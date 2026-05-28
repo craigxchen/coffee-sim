@@ -2259,11 +2259,11 @@ fn fractional_free_surface_pressure_preserves_sparse_stream_velocity() {
     fn run_case(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        pressure_rbgs_pairs: u32,
+        pressure_cg_iterations: u32,
     ) -> (WaterVelocitySnapshot, WaterGridPackingSnapshot) {
         let mut settings = MpmSettings::benchmark_free_stream();
         settings.viscosity = 0.0;
-        settings.pressure_rbgs_pairs = pressure_rbgs_pairs;
+        settings.pressure_cg_iterations = pressure_cg_iterations;
         settings.spout.nozzle_radius = 0.45;
         settings.spout.max_flow_rate_ml_s = 1.2;
         settings.spout.origin = Vec3::new(0.0, 4.2, 0.0);
