@@ -191,7 +191,10 @@ fn aperture_jet_velocity(dir: Vec3, emit_speed: f32) -> Vec3 {
     dir * emit_speed
 }
 
-const SLUG_LAYER_SAMPLES: u64 = 7;
+const SLUG_LAYER_SAMPLES: u64 = 13;
+const SLUG_INNER_RADIUS_FRACTION: f32 = 0.38;
+const SLUG_MIDDLE_RADIUS_FRACTION: f32 = 0.62;
+const SLUG_OUTER_RADIUS_FRACTION: f32 = 0.84;
 const SLUG_LAYER_TWIST: f32 = 2.399_963_1;
 
 fn slug_emission_age(slug_sample: u64, first_slug_sample: u64, count: u32, dt: f32) -> f32 {
@@ -229,16 +232,16 @@ fn slug_sample_offset(slug_sample: u64, nozzle_radius: f32) -> Vec3 {
     let pair_slot = slot - 1;
     let pair_index = pair_slot / 2;
     let pair_side = pair_slot % 2;
-    let layer = slug_sample_layer(slug_sample);
-    let sample_key = (layer as u32)
-        .wrapping_mul(0x9e37_79b9)
-        .wrapping_add(pair_index as u32);
-    let angle_hash = hash_u32(sample_key ^ 0x85eb_ca6b);
-    let radius_hash = hash_u32(sample_key ^ 0xc2b2_ae35);
-    let pair_angle =
-        slug_layer_phase(layer) + unit_float_from_hash(angle_hash) * std::f32::consts::TAU;
-    let radial_fraction = unit_float_from_hash(radius_hash).max(0.12);
-    let radius = nozzle_radius * radial_fraction.sqrt();
+    let layer_phase = slug_layer_phase(slug_sample_layer(slug_sample));
+    let pair_angle = layer_phase + pair_index as f32 * (std::f32::consts::TAU / 6.0);
+    let radial_fraction = if pair_index < 2 {
+        SLUG_INNER_RADIUS_FRACTION
+    } else if pair_index < 4 {
+        SLUG_MIDDLE_RADIUS_FRACTION
+    } else {
+        SLUG_OUTER_RADIUS_FRACTION
+    };
+    let radius = nozzle_radius * radial_fraction;
     let side = if pair_side == 0 { 1.0 } else { -1.0 };
 
     Vec3::new(
@@ -254,18 +257,6 @@ fn slug_sample_layer(slug_sample: u64) -> u64 {
 
 fn slug_layer_phase(layer: u64) -> f32 {
     (layer as f32 * SLUG_LAYER_TWIST).rem_euclid(std::f32::consts::TAU)
-}
-
-fn hash_u32(mut value: u32) -> u32 {
-    value ^= value >> 16;
-    value = value.wrapping_mul(0x7feb_352d);
-    value ^= value >> 15;
-    value = value.wrapping_mul(0x846c_a68b);
-    value ^ (value >> 16)
-}
-
-fn unit_float_from_hash(hash: u32) -> f32 {
-    ((hash >> 8) as f32) * (1.0 / 16_777_216.0)
 }
 
 fn vertical_emission_direction() -> Vec3 {

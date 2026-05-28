@@ -706,11 +706,10 @@ fn sdf_class_is_solid(cell: vec3<i32>) -> bool {
 }
 
 fn is_fluid_kind(kind: i32) -> bool {
-    // Surface and bed-coupled cells must participate in the pressure solve so
+    // Surface and bed-coupled cells participate in the pressure solve so
     // hydrostatic pressure can build up in shallow puddles and water inside the
     // bed remains part of the incompressible solve. Surface/air faces are
-    // weighted by the cell's deposited liquid fraction in `pressure_update`
-    // instead of being treated as full-cell Dirichlet p=0 faces.
+    // weighted by the cell's deposited liquid fraction in `pressure_update`.
     return kind == CELL_INTERIOR_FLUID
         || kind == CELL_SURFACE_FLUID
         || kind == CELL_BED_COUPLED;
@@ -1872,22 +1871,16 @@ fn project_pressure(@builtin(global_invocation_id) gid: vec3<u32>) {
         self_fill,
     );
 
+    // Finite-volume pressure force from the two face pressures in each axis.
+    // This preserves the central gradient for full cells, while fractional
+    // free-surface faces only contribute through their face pressure blend.
     let grad_p = 0.5 * inv_dx() * vec3<f32>(
-        p_xp - p_xm,
-        p_yp - p_ym,
-        p_zp - p_zm,
+        (p_xp - p_here) + (p_here - p_xm),
+        (p_yp - p_here) + (p_here - p_ym),
+        (p_zp - p_here) + (p_here - p_zm),
     );
 
-    // Surface cells can be a small fractional spray footprint. Scale the
-    // pressure impulse by liquid fill so sparse free streams do not receive a
-    // full-cell lateral kick from a tiny asymmetric pressure stencil.
-    var pressure_impulse_scale = self_fill * self_fill * self_fill;
-    let deposited_fraction =
-        max(rest_volume_load(idx), current_volume_load(idx)) / max(dx() * dx() * dx(), 1e-8);
-    if kind != CELL_BED_COUPLED && deposited_fraction < 0.95 {
-        pressure_impulse_scale = 0.0;
-    }
-    var v = gv.xyz - dt() * grad_p * pressure_impulse_scale;
+    var v = gv.xyz - dt() * grad_p;
     if kind == CELL_BED_COUPLED {
         let bed_idx = bed_lookup_load(idx);
         if bed_idx >= 0 && u32(bed_idx) < num_bed() {
@@ -1964,13 +1957,57 @@ fn packing_pressure_or_mirror(cell: vec3<i32>, mirror_pressure: f32) -> f32 {
     return packing_pressure_load(ci);
 }
 
+fn is_packing_pressure_cell(idx: u32, kind: i32) -> bool {
+    if kind == CELL_INTERIOR_FLUID {
+        return true;
+    }
+    if kind != CELL_SURFACE_FLUID {
+        return false;
+    }
+
+    // A nearly full free-surface cell in a connected pool has a meaningful
+    // volumetric compression pressure. A sparse drip/splash cell is mostly air
+    // and should remain at atmospheric pressure.
+    if raw_liquid_fill_fraction(idx, kind) < 0.45 {
+        return false;
+    }
+
+    let iz_val = idx / (gx() * gy());
+    let rem = idx % (gx() * gy());
+    let iy_val = rem / gx();
+    let ix_val = rem % gx();
+    let offsets = array<vec3<i32>, 6>(
+        vec3<i32>(-1, 0, 0),
+        vec3<i32>(1, 0, 0),
+        vec3<i32>(0, -1, 0),
+        vec3<i32>(0, 1, 0),
+        vec3<i32>(0, 0, -1),
+        vec3<i32>(0, 0, 1),
+    );
+    var fluid_neighbor_count = 0u;
+    for (var n = 0u; n < 6u; n++) {
+        let neighbor = vec3<i32>(i32(ix_val), i32(iy_val), i32(iz_val)) + offsets[n];
+        if neighbor.x < 0 || neighbor.y < 0 || neighbor.z < 0
+            || u32(neighbor.x) >= gx() || u32(neighbor.y) >= gy() || u32(neighbor.z) >= gz() {
+            continue;
+        }
+        let neighbor_idx = cell_index(u32(neighbor.x), u32(neighbor.y), u32(neighbor.z));
+        if is_fluid_kind(cell_kind_load(neighbor_idx))
+            && grid_vel[neighbor_idx].w > occupancy_mass_threshold() {
+            fluid_neighbor_count += 1u;
+        }
+    }
+
+    return fluid_neighbor_count >= 3u;
+}
+
 @compute @workgroup_size(64)
 fn packing_prepare(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
     if idx >= total_cells() { return; }
 
     let kind = cell_kind_load(idx);
-    if !is_fluid_kind(kind) || kind == CELL_BED_COUPLED {
+    if !is_packing_pressure_cell(idx, kind) {
         packing_pressure_store(idx, 0.0);
         return;
     }
@@ -1994,7 +2031,7 @@ fn packing_apply(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     let kind = cell_kind_load(idx);
-    if !is_fluid_kind(kind) {
+    if !is_packing_pressure_cell(idx, kind) {
         return;
     }
 

@@ -1507,10 +1507,11 @@ impl MpmSim3D {
 
         let bottom_y = band_y_sums[bottom_band] / band_counts[bottom_band] as f32;
         let top_y = band_y_sums[top_band] / band_counts[top_band] as f32;
+        let pressure_surface_y = surface_y.max(top_y);
         let pressure_from_head = |y: f32| {
             WATER_DENSITY_KG_M3
                 * units::STANDARD_GRAVITY_M_S2
-                * ((surface_y - y).max(0.0) * units::METERS_PER_SIM_UNIT)
+                * ((pressure_surface_y - y).max(0.0) * units::METERS_PER_SIM_UNIT)
         };
         let top_pressure = pressure_from_head(top_y);
         let bottom_pressure = pressure_from_head(bottom_y);
@@ -1633,7 +1634,9 @@ impl MpmSim3D {
 
                 // Packing pressure reuses the projection scratch lanes before
                 // viscosity overwrites the grid momentum lanes with temporary
-                // FP-encoded velocity scratch.
+                // FP-encoded velocity scratch. The shader limits this corrective
+                // pressure to interior liquid so sparse free-surface drip cells
+                // keep atmospheric pressure instead of kicking the pool/head.
                 pass.set_pipeline(&self.pipelines.packing_prepare);
                 pass.dispatch_workgroups(cell_wg, 1, 1);
                 pass.set_pipeline(&self.pipelines.packing_apply);
