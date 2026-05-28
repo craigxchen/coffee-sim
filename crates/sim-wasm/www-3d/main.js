@@ -1,4 +1,4 @@
-import init, { WasmSim3D } from "./pkg/coffee_sim_wasm.js?v=debug-timeseries-5";
+import init, { WasmSim3D } from "./pkg/coffee_sim_wasm.js?v=debug-timeseries-6";
 
 const canvas = document.getElementById("sim-canvas");
 const viewCubeStage = document.getElementById("view-cube-stage");
@@ -23,6 +23,7 @@ const flowRateLabel = document.getElementById("flow-rate");
 const jetSpeedLabel = document.getElementById("jet-speed");
 const sceneModeLabel = document.getElementById("scene-mode");
 const stepModeLabel = document.getElementById("step-mode");
+const simHzLabel = document.getElementById("sim-hz");
 const simTimeLabel = document.getElementById("sim-time");
 const frameEmittedMassLabel = document.getElementById("frame-emitted-mass");
 const totalEmittedMassLabel = document.getElementById("total-emitted-mass");
@@ -460,7 +461,7 @@ function animate(timestamp) {
 
   app.render();
   updateViewCube();
-  updateFps(frameTime);
+  updateFps(wallFrameTime);
   syncUi();
   maybeCollectTimeseriesSample();
   if (!maybeRefreshMetrics()) {
@@ -828,6 +829,11 @@ function updateFps(frameTime) {
   fpsLabel.textContent = avg > 0 ? Math.round(1 / avg).toString() : "0";
 }
 
+function formatSimHz() {
+  if (!fixedStepSeconds) return "Real Time";
+  return `${Math.round(1 / fixedStepSeconds)}`;
+}
+
 function updateViewCube() {
   const yaw = app.cameraYaw();
   const pitch = app.cameraPitch();
@@ -981,7 +987,8 @@ function syncUi() {
   flowRateLabel.textContent = `${app.flowRate().toFixed(1)} mL/s`;
   jetSpeedLabel.textContent = `${app.exitSpeedMetersPerSecond().toFixed(2)} m/s`;
   sceneModeLabel.textContent = currentSceneMode;
-  stepModeLabel.textContent = fixedStepSeconds ? "Fixed 60 Hz" : "Real Time";
+  stepModeLabel.textContent = fixedStepSeconds ? "Fixed Step" : "Real Time";
+  simHzLabel.textContent = formatSimHz();
   simTimeLabel.textContent = `${app.simTime().toFixed(1)}s`;
   frameEmittedMassLabel.textContent = app.frameEmittedMl().toFixed(2);
   totalEmittedMassLabel.textContent = app.totalEmittedMl().toFixed(2);
