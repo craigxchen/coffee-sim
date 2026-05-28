@@ -1,4 +1,4 @@
-import init, { WasmSim3D } from "./pkg/coffee_sim_wasm.js?v=exact-delayed-metrics";
+import init, { WasmSim3D } from "./pkg/coffee_sim_wasm.js?v=exact-delayed-metrics-brew-color";
 
 const canvas = document.getElementById("sim-canvas");
 const viewCubeStage = document.getElementById("view-cube-stage");
