@@ -1,4 +1,4 @@
-import init, { WasmSim3D } from "./pkg/coffee_sim_wasm.js?v=debug-timeseries-6";
+import init, { WasmSim3D } from "./pkg/coffee_sim_wasm.js?v=debug-timeseries-7";
 
 const canvas = document.getElementById("sim-canvas");
 const viewCubeStage = document.getElementById("view-cube-stage");
