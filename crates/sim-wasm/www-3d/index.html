@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Coffee Sim | 3D Pourover</title>
-    <link rel="stylesheet" href="./styles.css?v=debug-timeseries-6" />
+    <link rel="stylesheet" href="./styles.css?v=debug-timeseries-7" />
   </head>
   <body>
     <main class="layout">
@@ -115,14 +115,6 @@
             <dt>FPS</dt>
             <dd id="fps">0</dd>
           </div>
-          <div>
-            <dt>Flow</dt>
-            <dd id="flow-rate">0.0 mL/s</dd>
-          </div>
-          <div>
-            <dt>Jet Speed</dt>
-            <dd id="jet-speed">0.00 m/s</dd>
-          </div>
         </dl>
         <button id="toggle-debug" class="toggle-debug">Show Debug Stats</button>
         <dl class="stats debug-stats hidden" id="debug-stats">
@@ -141,6 +133,14 @@
           <div>
             <dt>Sim Time</dt>
             <dd id="sim-time">0.0s</dd>
+          </div>
+          <div>
+            <dt>Flow</dt>
+            <dd id="flow-rate">0.0 mL/s</dd>
+          </div>
+          <div>
+            <dt>Jet Speed</dt>
+            <dd id="jet-speed">0.00 m/s</dd>
           </div>
           <div>
             <dt>Frame Emit mL</dt>
@@ -273,6 +273,6 @@
         ></div>
       </div>
     </aside>
-    <script type="module" src="./main.js?v=debug-timeseries-6"></script>
+    <script type="module" src="./main.js?v=debug-timeseries-7"></script>
   </body>
 </html>
