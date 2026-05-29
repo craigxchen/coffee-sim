@@ -16,6 +16,7 @@ struct MpmUniforms {
     sdf_params: vec4<f32>,
     bed_params: vec4<f32>,
     extraction_params: vec4<f32>,
+    solute_params: vec4<f32>,
     time_params: vec4<f32>,
     clamp_params: vec4<f32>,
     projection_params: vec4<f32>,
@@ -69,10 +70,19 @@ const METRIC_FLUID_CELLS_IDX: u32 = 1u;
 const METRIC_DIV_CLAMP_FIRES_IDX: u32 = 2u;
 const METRIC_PRESSURE_CLAMP_FIRES_IDX: u32 = 3u;
 const METRIC_MASS_OVERFLOW_FIRES_IDX: u32 = 4u;
+const METRIC_ACTIVE_WATER_MASS_IDX: u32 = 5u;
+const METRIC_ACTIVE_SOLUTE_MASS_IDX: u32 = 6u;
+const METRIC_CUP_WATER_MASS_IDX: u32 = 7u;
+const METRIC_CUP_SOLUTE_MASS_IDX: u32 = 8u;
+const METRIC_PROJECTION_RESIDUAL_MAX_IDX: u32 = 9u;
+const METRIC_PROJECTION_RESIDUAL_SUM_IDX: u32 = 10u;
+const METRIC_PROJECTION_RESIDUAL_CELLS_IDX: u32 = 11u;
 const BED_DELTA_WATER_LANE: u32 = 0u;
 const BED_DELTA_IMPULSE_X_LANE: u32 = 1u;
 const BED_DELTA_IMPULSE_Y_LANE: u32 = 2u;
 const BED_DELTA_IMPULSE_Z_LANE: u32 = 3u;
+const BED_DELTA_SOLUTE_AVAILABLE_LANE: u32 = 4u;
+const BED_DELTA_SOLUTE_DEPOSIT_LANE: u32 = 5u;
 const BED_REACTION_ALPHA: f32 = 0.04;
 const BED_REACTION_IMPULSE_CAP: f32 = 0.012;
 
@@ -96,6 +106,8 @@ fn nominal_mass() -> f32 { return u.fluid_params.z; }
 fn p_vol() -> f32 { return u.fluid_params.w; }
 fn fp_scale() -> f32 { return u.fp_params.x; }
 fn inv_fp_scale() -> f32 { return u.fp_params.y; }
+fn solute_fp_scale() -> f32 { return u.fp_params.x * 1024.0; }
+fn inv_solute_fp_scale() -> f32 { return u.fp_params.y / 1024.0; }
 fn vel_cap() -> f32 { return u.fp_params.z; }
 fn dripper_outlet_radius() -> f32 { return u.fp_params.w; }
 fn dripper_top_radius() -> f32 { return dripper_outlet_radius() + 4.2634315; }
@@ -113,11 +125,18 @@ fn extraction_rate() -> f32 { return u.extraction_params.x; }
 fn bed_compaction_rate() -> f32 { return u.extraction_params.y; }
 fn bed_damping() -> f32 { return u.extraction_params.z; }
 fn bed_impact() -> f32 { return u.extraction_params.w; }
+fn fast_extraction_rate() -> f32 { return u.solute_params.x; }
+fn slow_extraction_rate() -> f32 { return u.solute_params.y; }
+fn max_solute_concentration() -> f32 { return u.solute_params.z; }
+fn pore_to_water_mass_transfer_rate() -> f32 { return u.solute_params.w; }
 fn inactive_mass_threshold() -> f32 { return nominal_mass() * 0.10; }
 fn div_clamp_limit() -> f32 { return u.clamp_params.x; }
 fn pressure_clamp_limit() -> f32 { return u.clamp_params.y; }
 fn metrics_div_fp_scale() -> f32 { return u.clamp_params.z; }
 fn metrics_div_inv_fp_scale() -> f32 { return u.clamp_params.w; }
+fn metrics_residual_sum_fp_scale() -> f32 { return 16.0; }
+fn metrics_mass_fp_scale() -> f32 { return 1024.0; }
+fn metrics_solute_fp_scale() -> f32 { return 65536.0; }
 fn projection_j_alpha() -> f32 { return u.projection_params.x; }
 fn projection_j_expand_alpha() -> f32 { return u.projection_params.y; }
 fn projection_max_rest_volume_fraction() -> f32 { return u.projection_params.z; }
@@ -501,6 +520,60 @@ fn bed_water_delta_add(bed_idx: u32, amount: f32) {
     atomicAdd(&bed_delta[bed_delta_idx(BED_DELTA_WATER_LANE, bed_idx)], i32(amount * fp_scale()));
 }
 
+fn bed_solute_deposit_delta_add(bed_idx: u32, amount: f32) {
+    if amount <= 0.0 {
+        return;
+    }
+    atomicAdd(
+        &bed_delta[bed_delta_idx(BED_DELTA_SOLUTE_DEPOSIT_LANE, bed_idx)],
+        i32(amount * solute_fp_scale()),
+    );
+}
+
+fn bed_solute_available_store(bed_idx: u32, amount: f32) {
+    let fp_amount = i32(max(amount, 0.0) * solute_fp_scale());
+    atomicStore(&bed_delta[bed_delta_idx(BED_DELTA_SOLUTE_AVAILABLE_LANE, bed_idx)], fp_amount);
+}
+
+fn bed_solute_available_exchange(bed_idx: u32) -> f32 {
+    let fp_amount =
+        atomicExchange(&bed_delta[bed_delta_idx(BED_DELTA_SOLUTE_AVAILABLE_LANE, bed_idx)], 0);
+    return max(f32(fp_amount) * inv_solute_fp_scale(), 0.0);
+}
+
+fn bed_solute_deposit_exchange(bed_idx: u32) -> f32 {
+    let fp_amount =
+        atomicExchange(&bed_delta[bed_delta_idx(BED_DELTA_SOLUTE_DEPOSIT_LANE, bed_idx)], 0);
+    return max(f32(fp_amount) * inv_solute_fp_scale(), 0.0);
+}
+
+fn bed_solute_reserve(bed_idx: u32, requested: f32) -> f32 {
+    let request_fp = max(i32(max(requested, 0.0) * solute_fp_scale()), 0);
+    if request_fp <= 0 {
+        return 0.0;
+    }
+
+    let old_fp = atomicSub(
+        &bed_delta[bed_delta_idx(BED_DELTA_SOLUTE_AVAILABLE_LANE, bed_idx)],
+        request_fp,
+    );
+    if old_fp <= 0 {
+        atomicAdd(
+            &bed_delta[bed_delta_idx(BED_DELTA_SOLUTE_AVAILABLE_LANE, bed_idx)],
+            request_fp,
+        );
+        return 0.0;
+    }
+    if old_fp < request_fp {
+        atomicAdd(
+            &bed_delta[bed_delta_idx(BED_DELTA_SOLUTE_AVAILABLE_LANE, bed_idx)],
+            request_fp - old_fp,
+        );
+        return f32(old_fp) * inv_solute_fp_scale();
+    }
+    return f32(request_fp) * inv_solute_fp_scale();
+}
+
 fn bed_impulse_delta_add(bed_idx: u32, impulse: vec3<f32>) {
     let cap = nominal_mass() * vel_cap() * BED_REACTION_IMPULSE_CAP;
     let clamped = clamp(impulse, vec3<f32>(-cap), vec3<f32>(cap));
@@ -563,10 +636,18 @@ fn bed_impulse_delta_exchange(bed_idx: u32) -> vec3<f32> {
     return vec3<f32>(f32(ix), f32(iy), f32(iz)) * inv_fp_scale();
 }
 
-fn deposit_absorbed_bed_water(home_cell: vec3<i32>, home_bed_idx: i32, absorbed: f32) {
+fn deposit_absorbed_bed_water_and_solute(
+    home_cell: vec3<i32>,
+    home_bed_idx: i32,
+    absorbed: f32,
+    absorbed_solute: f32,
+) {
     let neighbor_share = absorbed * 0.35;
     let home_share = absorbed - neighbor_share;
+    let neighbor_solute_share = absorbed_solute * 0.35;
+    let home_solute_share = absorbed_solute - neighbor_solute_share;
     bed_water_delta_add(u32(home_bed_idx), home_share);
+    bed_solute_deposit_delta_add(u32(home_bed_idx), home_solute_share);
 
     let offsets = array<vec3<i32>, 6>(
         vec3<i32>(-1, 0, 0),
@@ -608,12 +689,15 @@ fn deposit_absorbed_bed_water(home_cell: vec3<i32>, home_bed_idx: i32, absorbed:
 
     if neighbor_count == 0u {
         bed_water_delta_add(u32(home_bed_idx), neighbor_share);
+        bed_solute_deposit_delta_add(u32(home_bed_idx), neighbor_solute_share);
         return;
     }
 
     let each_neighbor_share = neighbor_share / f32(neighbor_count);
+    let each_neighbor_solute_share = neighbor_solute_share / f32(neighbor_count);
     for (var i = 0u; i < neighbor_count; i++) {
         bed_water_delta_add(u32(neighbor_ids[i]), each_neighbor_share);
+        bed_solute_deposit_delta_add(u32(neighbor_ids[i]), each_neighbor_solute_share);
     }
 }
 
@@ -716,6 +800,98 @@ fn bed_pore_projection_target_divergence(
     target_div = max(target_div, overfill_fraction * overfill_response);
 
     return target_div;
+}
+
+fn projection_target_divergence_for_cell(
+    idx: u32,
+    kind: i32,
+    cell: vec3<i32>,
+    cell_center: vec3<f32>,
+) -> f32 {
+    let rest_volume = rest_volume_load(idx);
+    let current_volume = current_volume_load(idx);
+    var target_divergence = volume_projection_target_divergence(rest_volume, current_volume);
+    if kind == CELL_BED_COUPLED {
+        let bed_idx = bed_lookup_load(idx);
+        if bed_idx >= 0 && u32(bed_idx) < num_bed() {
+            let pore_target = bed_pore_projection_target_divergence(
+                u32(bed_idx),
+                cell_center,
+                rest_volume,
+                current_volume,
+            );
+            let porosity = clamp(bed_compacted_porosity(u32(bed_idx)), 0.08, 1.0);
+            let solid_fraction = 1.0 - porosity;
+            let solid_div = bed_velocity_divergence(cell);
+            target_divergence = (pore_target - solid_fraction * solid_div) / porosity;
+        }
+    }
+    return target_divergence;
+}
+
+fn velocity_divergence_with_solid_mirrors(
+    idx: u32,
+    cell: vec3<i32>,
+    cell_center: vec3<f32>,
+) -> f32 {
+    let self_vel = grid_vel[idx].xyz;
+    let dx_vec = dx();
+    var vxm = -self_vel.x;
+    var vxp = -self_vel.x;
+    var vym = -self_vel.y;
+    var vyp = -self_vel.y;
+    var vzm = -self_vel.z;
+    var vzp = -self_vel.z;
+    if cell.x > 0
+        && select(
+            sample_sdf(cell_center + vec3<f32>(-dx_vec, 0.0, 0.0)) >= 0.0,
+            !sdf_class_is_solid(cell + vec3<i32>(-1, 0, 0)),
+            use_sdf_cache(),
+        ) {
+        vxm = grid_vel[cell_index(u32(cell.x - 1), u32(cell.y), u32(cell.z))].x;
+    }
+    if u32(cell.x + 1) < gx()
+        && select(
+            sample_sdf(cell_center + vec3<f32>(dx_vec, 0.0, 0.0)) >= 0.0,
+            !sdf_class_is_solid(cell + vec3<i32>(1, 0, 0)),
+            use_sdf_cache(),
+        ) {
+        vxp = grid_vel[cell_index(u32(cell.x + 1), u32(cell.y), u32(cell.z))].x;
+    }
+    if cell.y > 0
+        && select(
+            sample_sdf(cell_center + vec3<f32>(0.0, -dx_vec, 0.0)) >= 0.0,
+            !sdf_class_is_solid(cell + vec3<i32>(0, -1, 0)),
+            use_sdf_cache(),
+        ) {
+        vym = grid_vel[cell_index(u32(cell.x), u32(cell.y - 1), u32(cell.z))].y;
+    }
+    if u32(cell.y + 1) < gy()
+        && select(
+            sample_sdf(cell_center + vec3<f32>(0.0, dx_vec, 0.0)) >= 0.0,
+            !sdf_class_is_solid(cell + vec3<i32>(0, 1, 0)),
+            use_sdf_cache(),
+        ) {
+        vyp = grid_vel[cell_index(u32(cell.x), u32(cell.y + 1), u32(cell.z))].y;
+    }
+    if cell.z > 0
+        && select(
+            sample_sdf(cell_center + vec3<f32>(0.0, 0.0, -dx_vec)) >= 0.0,
+            !sdf_class_is_solid(cell + vec3<i32>(0, 0, -1)),
+            use_sdf_cache(),
+        ) {
+        vzm = grid_vel[cell_index(u32(cell.x), u32(cell.y), u32(cell.z - 1))].z;
+    }
+    if u32(cell.z + 1) < gz()
+        && select(
+            sample_sdf(cell_center + vec3<f32>(0.0, 0.0, dx_vec)) >= 0.0,
+            !sdf_class_is_solid(cell + vec3<i32>(0, 0, 1)),
+            use_sdf_cache(),
+        ) {
+        vzp = grid_vel[cell_index(u32(cell.x), u32(cell.y), u32(cell.z + 1))].z;
+    }
+
+    return 0.5 * inv_dx() * ((vxp - vxm) + (vyp - vym) + (vzp - vzm));
 }
 
 fn world_to_cell(position: vec3<f32>) -> vec3<i32> {
@@ -1402,86 +1578,9 @@ fn classify_cells(@builtin(global_invocation_id) gid: vec3<u32>) {
     // writes cell_kind — reading a neighbor's kind here races against other
     // workgroups. The cached mask is generated from the same cell-center SDF
     // probe and avoids repeated texture interpolation in the hot path.
-    let self_vel = grid_vel[idx].xyz;
-    let dx_vec = dx();
-    var vxm = -self_vel.x;
-    var vxp = -self_vel.x;
-    var vym = -self_vel.y;
-    var vyp = -self_vel.y;
-    var vzm = -self_vel.z;
-    var vzp = -self_vel.z;
-    if ix_val > 0u
-        && select(
-            sample_sdf(cell_center + vec3<f32>(-dx_vec, 0.0, 0.0)) >= 0.0,
-            !sdf_class_is_solid(vec3<i32>(i32(ix_val) - 1, i32(iy_val), i32(iz_val))),
-            use_sdf_cache(),
-        ) {
-        vxm = grid_vel[cell_index(ix_val - 1u, iy_val, iz_val)].x;
-    }
-    if ix_val + 1u < gx()
-        && select(
-            sample_sdf(cell_center + vec3<f32>(dx_vec, 0.0, 0.0)) >= 0.0,
-            !sdf_class_is_solid(vec3<i32>(i32(ix_val) + 1, i32(iy_val), i32(iz_val))),
-            use_sdf_cache(),
-        ) {
-        vxp = grid_vel[cell_index(ix_val + 1u, iy_val, iz_val)].x;
-    }
-    if iy_val > 0u
-        && select(
-            sample_sdf(cell_center + vec3<f32>(0.0, -dx_vec, 0.0)) >= 0.0,
-            !sdf_class_is_solid(vec3<i32>(i32(ix_val), i32(iy_val) - 1, i32(iz_val))),
-            use_sdf_cache(),
-        ) {
-        vym = grid_vel[cell_index(ix_val, iy_val - 1u, iz_val)].y;
-    }
-    if iy_val + 1u < gy()
-        && select(
-            sample_sdf(cell_center + vec3<f32>(0.0, dx_vec, 0.0)) >= 0.0,
-            !sdf_class_is_solid(vec3<i32>(i32(ix_val), i32(iy_val) + 1, i32(iz_val))),
-            use_sdf_cache(),
-        ) {
-        vyp = grid_vel[cell_index(ix_val, iy_val + 1u, iz_val)].y;
-    }
-    if iz_val > 0u
-        && select(
-            sample_sdf(cell_center + vec3<f32>(0.0, 0.0, -dx_vec)) >= 0.0,
-            !sdf_class_is_solid(vec3<i32>(i32(ix_val), i32(iy_val), i32(iz_val) - 1)),
-            use_sdf_cache(),
-        ) {
-        vzm = grid_vel[cell_index(ix_val, iy_val, iz_val - 1u)].z;
-    }
-    if iz_val + 1u < gz()
-        && select(
-            sample_sdf(cell_center + vec3<f32>(0.0, 0.0, dx_vec)) >= 0.0,
-            !sdf_class_is_solid(vec3<i32>(i32(ix_val), i32(iy_val), i32(iz_val) + 1)),
-            use_sdf_cache(),
-        ) {
-        vzp = grid_vel[cell_index(ix_val, iy_val, iz_val + 1u)].z;
-    }
-
-    let div = 0.5 * inv_dx() * ((vxp - vxm) + (vyp - vym) + (vzp - vzm));
-    let rest_volume = rest_volume_load(idx);
-    let current_volume = current_volume_load(idx);
-    var target_divergence = volume_projection_target_divergence(rest_volume, current_volume);
-    if kind == CELL_BED_COUPLED {
-        let bed_idx = bed_lookup_load(idx);
-        if bed_idx >= 0 && u32(bed_idx) < num_bed() {
-            let pore_target = bed_pore_projection_target_divergence(
-                u32(bed_idx),
-                cell_center,
-                rest_volume,
-                current_volume,
-            );
-            let porosity = clamp(bed_compacted_porosity(u32(bed_idx)), 0.08, 1.0);
-            let solid_fraction = 1.0 - porosity;
-            let solid_div = bed_velocity_divergence(vec3<i32>(
-                i32(ix_val),
-                i32(iy_val),
-                i32(iz_val),
-            ));
-            target_divergence = (pore_target - solid_fraction * solid_div) / porosity;
-        }
-    }
+    let cell = vec3<i32>(i32(ix_val), i32(iy_val), i32(iz_val));
+    let div = velocity_divergence_with_solid_mirrors(idx, cell, cell_center);
+    let target_divergence = projection_target_divergence_for_cell(idx, kind, cell, cell_center);
     divergence_store(idx, div - target_divergence);
 
     // Observability: track the worst-case cell divergence and the fluid-cell
@@ -1669,6 +1768,40 @@ fn project_pressure(@builtin(global_invocation_id) gid: vec3<u32>) {
     grid_vel[idx] = vec4<f32>(v, gv.w);
 }
 
+// ── pressure_residual ──
+
+@compute @workgroup_size(64)
+fn pressure_residual(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if idx >= total_cells() { return; }
+
+    let kind = cell_kind_load(idx);
+    if !is_fluid_kind(kind) {
+        return;
+    }
+
+    let iz_val = idx / (gx() * gy());
+    let rem = idx % (gx() * gy());
+    let iy_val = rem / gx();
+    let ix_val = rem % gx();
+    let cell = vec3<i32>(i32(ix_val), i32(iy_val), i32(iz_val));
+    let cell_center = u.grid_origin.xyz
+        + (vec3<f32>(f32(ix_val), f32(iy_val), f32(iz_val)) + vec3<f32>(0.5)) * dx();
+
+    let div = velocity_divergence_with_solid_mirrors(idx, cell, cell_center);
+    let target_divergence = projection_target_divergence_for_cell(idx, kind, cell, cell_center);
+    let abs_residual = abs(div - target_divergence);
+    let fp_max = u32(clamp(abs_residual * metrics_div_fp_scale(), 0.0, f32(0x7fffffffu)));
+    let fp_sum = u32(clamp(
+        abs_residual * metrics_residual_sum_fp_scale(),
+        0.0,
+        f32(0xffffffffu),
+    ));
+    atomicMax(&metrics[METRIC_PROJECTION_RESIDUAL_MAX_IDX], fp_max);
+    atomicAdd(&metrics[METRIC_PROJECTION_RESIDUAL_SUM_IDX], fp_sum);
+    atomicAdd(&metrics[METRIC_PROJECTION_RESIDUAL_CELLS_IDX], 1u);
+}
+
 // ── packing pressure ──
 
 fn packing_pressure_or_mirror(cell: vec3<i32>, mirror_pressure: f32) -> f32 {
@@ -1817,11 +1950,13 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>) {
     let J_old = p.pos.w;
     let mass_p = p.vel.w;
     let phase = affine[pid].col0.w;
+    let solute_mass = max(affine[pid].col1.w, 0.0);
     if !is_water_phase(phase) {
         return;
     }
     if mass_p <= inactive_mass_threshold() {
         particles[pid].vel.w = 0.0;
+        affine[pid].col1.w = 0.0;
         return;
     }
 
@@ -2003,7 +2138,7 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>) {
     particles[pid].vel = vec4<f32>(new_v, mass_p);
 
     affine[pid].col0 = vec4<f32>(new_C0, phase);
-    affine[pid].col1 = vec4<f32>(new_C1, 0.0);
+    affine[pid].col1 = vec4<f32>(new_C1, solute_mass);
     affine[pid].col2 = vec4<f32>(new_C2, 0.0);
 }
 
@@ -2026,6 +2161,7 @@ fn bed_coupling(@builtin(global_invocation_id) gid: vec3<u32>) {
     if u32(cell.x) >= gx() || u32(cell.y) >= gy() || u32(cell.z) >= gz() { return; }
 
     var mass_p = particles[pid].vel.w;
+    var solute_mass = max(affine[pid].col1.w, 0.0);
     // Paper absorption is intentionally disabled by default until the paper
     // has finite retained-water storage and a release path. Keep the codepath
     // dormant for future work, but do not let the paper act as an infinite
@@ -2034,8 +2170,12 @@ fn bed_coupling(@builtin(global_invocation_id) gid: vec3<u32>) {
     if paper_weight > 1e-4 && filter_absorption_rate() > 0.0 {
         let paper_absorb_fraction = clamp(filter_absorption_rate() * paper_weight * dt(), 0.0, 0.04);
         let paper_absorbed = min(mass_p * paper_absorb_fraction, mass_p * 0.12);
+        let paper_solute_absorbed =
+            solute_mass * clamp(paper_absorbed / max(mass_p, 1e-6), 0.0, 1.0);
+        solute_mass = max(solute_mass - paper_solute_absorbed, 0.0);
         mass_p = max(mass_p - paper_absorbed, inactive_mass_threshold() * 1.25);
         particles[pid].vel = vec4<f32>(particles[pid].vel.xyz, mass_p);
+        affine[pid].col1.w = solute_mass;
     }
 
     let ci = cell_index(u32(cell.x), u32(cell.y), u32(cell.z));
@@ -2046,6 +2186,22 @@ fn bed_coupling(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     var be = bed_extract[u32(bed_idx)];
     let saturation = be.extract.w;
+
+    if saturation > 0.01 && be.extract.y > 1e-8 && mass_p > inactive_mass_threshold() {
+        let water_conc = solute_mass / max(mass_p, 1e-6);
+        let pore_conc = be.extract.y / max(be.bed.x, nominal_mass() * 0.25);
+        let target_conc = min(pore_conc, max_solute_concentration());
+        let transfer_alpha =
+            clamp(pore_to_water_mass_transfer_rate() * saturation * dt(), 0.0, 0.35);
+        let requested_solute =
+            max(target_conc - water_conc, 0.0) * mass_p * transfer_alpha;
+        let transferred_solute =
+            bed_solute_reserve(u32(bed_idx), min(requested_solute, be.extract.y));
+        if transferred_solute > 0.0 {
+            solute_mass += transferred_solute;
+            affine[pid].col1.w = solute_mass;
+        }
+    }
 
     let capacity = max(max_saturation() - be.bed.x, 0.0);
     if capacity <= 1e-6 {
@@ -2074,13 +2230,17 @@ fn bed_coupling(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
 
+    let absorbed_solute = solute_mass * clamp(absorbed / max(mass_p, 1e-6), 0.0, 1.0);
+    solute_mass = max(solute_mass - absorbed_solute, 0.0);
     let remaining = mass_p - absorbed;
     if remaining <= inactive_mass_threshold() {
         particles[pid].vel = vec4<f32>(vec3<f32>(0.0), 0.0);
+        affine[pid].col1.w = 0.0;
     } else {
         particles[pid].vel = vec4<f32>(particles[pid].vel.xyz, remaining);
+        affine[pid].col1.w = solute_mass;
     }
-    deposit_absorbed_bed_water(cell, bed_idx, absorbed);
+    deposit_absorbed_bed_water_and_solute(cell, bed_idx, absorbed, absorbed_solute);
 }
 
 // ── extraction_advect ──
@@ -2091,6 +2251,10 @@ fn extraction_advect(@builtin(global_invocation_id) gid: vec3<u32>) {
     if bid >= num_bed() { return; }
 
     var be = bed_extract[bid];
+    let remaining_available_solute = bed_solute_available_exchange(bid);
+    let deposited_solute = bed_solute_deposit_exchange(bid);
+    be.extract.y = min(be.extract.y, remaining_available_solute) + deposited_solute;
+
     let absorbed =
         f32(atomicExchange(&bed_delta[bed_delta_idx(BED_DELTA_WATER_LANE, bid)], 0))
             * inv_fp_scale();
@@ -2105,11 +2269,23 @@ fn extraction_advect(@builtin(global_invocation_id) gid: vec3<u32>) {
     let sat = be.extract.w;
 
     if sat > 0.01 {
-        let flux = extraction_rate() * be.extract.x * sat * dt();
-        be.extract.x = max(be.extract.x - flux, 0.0);
-        be.extract.y += flux;
+        let pore_conc = be.extract.y / max(be.bed.x, nominal_mass() * 0.25);
+        let solvent_drive = max(1.0 - pore_conc / max(max_solute_concentration(), 1e-6), 0.0);
+        let wet_contact = smoothstep(0.03, 0.55, sat);
+        let fast_flux = min(
+            be.extract.x,
+            fast_extraction_rate() * be.extract.x * wet_contact * solvent_drive * dt(),
+        );
+        let slow_flux = min(
+            be.extract.z,
+            slow_extraction_rate() * be.extract.z * wet_contact * solvent_drive * dt(),
+        );
+        be.extract.x = max(be.extract.x - fast_flux, 0.0);
+        be.extract.z = max(be.extract.z - slow_flux, 0.0);
+        be.extract.y += fast_flux + slow_flux;
     }
 
+    bed_solute_available_store(bid, be.extract.y);
     bed_extract[bid] = be;
 }
 
@@ -2384,8 +2560,32 @@ fn prepare_render(@builtin(global_invocation_id) gid: vec3<u32>) {
     var color_t = 0.0;
     var radius = water_particle_radius();
     if is_water_phase(phase) {
-        let speed = length(p.vel.xyz);
-        color_t = clamp(speed / 10.0, 0.0, 2.0);
+        let solute_mass = max(affine[pid].col1.w, 0.0);
+        let concentration = solute_mass / max(p.vel.w, 1e-6);
+        color_t = clamp(concentration / 0.018, 0.0, 2.0);
+        atomicAdd(
+            &metrics[METRIC_ACTIVE_WATER_MASS_IDX],
+            u32(clamp(p.vel.w * metrics_mass_fp_scale(), 0.0, f32(0xffffffffu))),
+        );
+        atomicAdd(
+            &metrics[METRIC_ACTIVE_SOLUTE_MASS_IDX],
+            u32(clamp(solute_mass * metrics_solute_fp_scale(), 0.0, f32(0xffffffffu))),
+        );
+        let cup_r = 3.0 + dx();
+        let in_cup =
+            dot(p.pos.xz, p.pos.xz) <= cup_r * cup_r
+            && p.pos.y <= -3.5 + dx()
+            && p.pos.y >= -8.0 - dx();
+        if in_cup {
+            atomicAdd(
+                &metrics[METRIC_CUP_WATER_MASS_IDX],
+                u32(clamp(p.vel.w * metrics_mass_fp_scale(), 0.0, f32(0xffffffffu))),
+            );
+            atomicAdd(
+                &metrics[METRIC_CUP_SOLUTE_MASS_IDX],
+                u32(clamp(solute_mass * metrics_solute_fp_scale(), 0.0, f32(0xffffffffu))),
+            );
+        }
     } else {
         let bed_idx = pid;
         var sat = 0.0;
@@ -2404,7 +2604,7 @@ fn prepare_render(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 // ── metrics_clear ──
 
-const METRICS_SLOT_COUNT: u32 = 8u;
+const METRICS_SLOT_COUNT: u32 = 12u;
 
 @compute @workgroup_size(8)
 fn metrics_clear(@builtin(global_invocation_id) gid: vec3<u32>) {
