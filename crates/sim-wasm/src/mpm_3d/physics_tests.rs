@@ -334,7 +334,7 @@ struct WaterVelocitySnapshot {
     momentum: [f32; 3],
 }
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 struct WaterColumnSnapshot {
     all_finite: bool,
     active_count: u32,
@@ -3405,32 +3405,95 @@ fn high_velocity_jet_impact_generates_more_upward_splash_than_gentle_impact() {
         return;
     };
 
-    fn run_case(
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
+    #[allow(dead_code)]
+    #[derive(Debug)]
+    struct SplashResponse {
+        final_column: WaterColumnSnapshot,
+        peak_column: WaterColumnSnapshot,
+        peak_upward_speed: f32,
+        peak_lifted_count: u32,
+        peak_lifted_mass: f32,
+        all_finite: bool,
+    }
+
+    fn ballistic_impact_time_s(
+        settings: &MpmSettings,
+        pool_top_y: f32,
         exit_speed_m_s: f32,
-    ) -> WaterColumnSnapshot {
+    ) -> f32 {
+        let emit_y = settings.spout.origin.y + settings.spout.emission_direction().y * 0.18;
+        let fall_distance = (emit_y - pool_top_y).max(0.0);
+        let v0 = units::sim_speed_from_meters_per_second(exit_speed_m_s).max(0.0);
+        let gravity = settings.gravity.abs().max(1e-6);
+        ((v0 * v0 + 2.0 * gravity * fall_distance).sqrt() - v0) / gravity
+    }
+
+    fn spline_support_response_stride_frames(settings: &MpmSettings) -> u32 {
+        let dx = grid_dx(settings);
+        let gravity = settings.gravity.abs().max(1e-6);
+        let support_width = 3.0 * dx;
+        let response_s = (2.0 * support_width / gravity).sqrt();
+        (response_s / TEST_FRAME_DT_S).ceil().max(1.0) as u32
+    }
+
+    fn run_case(device: &wgpu::Device, queue: &wgpu::Queue, exit_speed_m_s: f32) -> SplashResponse {
         let mut settings = MpmSettings::debug_high_velocity_jet_impact();
         settings.initial_water_speed_m_s = exit_speed_m_s;
         let dx = grid_dx(&settings);
         let (_, _, _, cup_bot_y) =
             cup_region_full(&settings).expect("high-velocity scene has a cup");
         let pool_top_y = cup_bot_y + 1.25;
+        let impact_time_s = ballistic_impact_time_s(&settings, pool_top_y, exit_speed_m_s);
+        let sample_stride = spline_support_response_stride_frames(&settings);
         let mut sim = MpmSim3D::new(device, queue, settings);
         sim.seed_high_velocity_jet_impact_pool(queue);
         sim.set_exit_speed_m_s(exit_speed_m_s);
 
-        for _ in 0..90 {
+        let mut final_column = None;
+        let mut peak_column = None;
+        let mut peak_upward_speed = 0.0_f32;
+        let mut peak_lifted_count = 0_u32;
+        let mut peak_lifted_mass = 0.0_f32;
+        let mut all_finite = true;
+
+        for frame in 0..90 {
             sim.step_frame(device, queue, TEST_FRAME_DT_S);
+            let frame_index = frame + 1;
+            let elapsed_s = frame_index as f32 * TEST_FRAME_DT_S;
+            if elapsed_s < impact_time_s && frame_index != 90 {
+                continue;
+            }
+            if frame_index % sample_stride != 0 && frame_index != 90 {
+                continue;
+            }
+
+            let column = readback_water_column_snapshot_in_y_range(
+                &sim,
+                device,
+                queue,
+                pool_top_y + dx * 0.50,
+                pool_top_y + dx * 12.0,
+            );
+            all_finite &= column.all_finite;
+            if column.max_upward_speed >= peak_upward_speed {
+                peak_upward_speed = column.max_upward_speed;
+                peak_column = Some(column);
+            }
+            peak_lifted_count = peak_lifted_count.max(column.active_count);
+            peak_lifted_mass = peak_lifted_mass.max(column.active_mass);
+            final_column = Some(column);
         }
 
-        readback_water_column_snapshot_in_y_range(
-            &sim,
-            device,
-            queue,
-            pool_top_y + dx * 0.50,
-            pool_top_y + dx * 12.0,
-        )
+        let final_column = final_column.expect("impact response should sample at least once");
+        let peak_column = peak_column.unwrap_or(final_column);
+        SplashResponse {
+            final_column,
+            peak_column,
+            peak_upward_speed,
+            peak_lifted_count,
+            peak_lifted_mass,
+            all_finite,
+        }
     }
 
     let gentle = run_case(&device, &queue, DEFAULT_BREW.gentle_pour_exit_speed_m_s);
@@ -3438,18 +3501,19 @@ fn high_velocity_jet_impact_generates_more_upward_splash_than_gentle_impact() {
 
     let settings = MpmSettings::debug_high_velocity_jet_impact();
     let speed_floor = speed_resolution_m_s(&settings, 90);
-    let gentle_upward_m_s = units::sim_speed_to_meters_per_second(gentle.max_upward_speed);
-    let high_upward_m_s = units::sim_speed_to_meters_per_second(high.max_upward_speed);
+    let gentle_upward_m_s = units::sim_speed_to_meters_per_second(gentle.peak_upward_speed);
+    let high_upward_m_s = units::sim_speed_to_meters_per_second(high.peak_upward_speed);
     assert!(
         gentle.all_finite && high.all_finite,
         "jet impact splash readback produced non-finite state: gentle={gentle:?} high={high:?}",
     );
     assert!(
-        high.active_count >= sampled_particle_count_threshold(),
+        high.peak_lifted_count >= sampled_particle_count_threshold(),
         "high-velocity impact did not lift enough water above the pool surface for a splash check: high={high:?}",
     );
     assert!(
-        high.active_mass > gentle.active_mass && high.active_count > gentle.active_count,
+        high.peak_lifted_mass > gentle.peak_lifted_mass
+            && high.peak_lifted_count > gentle.peak_lifted_count,
         "high-velocity impact should lift more water above the pool than gentle impact: \
          gentle={gentle:?} high={high:?}",
     );

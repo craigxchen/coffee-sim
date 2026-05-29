@@ -2293,6 +2293,24 @@ mod tests {
     }
 
     #[test]
+    fn default_v60_substeps_and_pressure_budget_survive_perf_cuts() {
+        let s = MpmSettings::default_v60();
+        let water_only = MpmSettings::benchmark_free_stream();
+        let dx = s.bounds_size.x / s.grid_dims[0] as f32;
+        let sub_dt = (1.0 / 60.0) / s.substeps.max(1) as f32;
+        let exit_displacement_per_substep = s.spout.max_exit_speed * sub_dt;
+
+        assert_eq!(s.substeps, 10);
+        assert!(
+            exit_displacement_per_substep <= dx,
+            "default spout motion should stay within one grid cell per substep: \
+             displacement={exit_displacement_per_substep} dx={dx}"
+        );
+        assert!(s.pressure_cg_iterations >= 32);
+        assert!(water_only.pressure_cg_iterations > s.pressure_cg_iterations);
+    }
+
+    #[test]
     fn filter_water_block_scene_keeps_filter_bed_and_disables_inflow() {
         let s = MpmSettings::benchmark_filter_water_block();
         assert!(s.filter.is_some());

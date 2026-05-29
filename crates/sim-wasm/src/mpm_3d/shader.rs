@@ -846,7 +846,6 @@ fn interior_pressure_has_continuum_support(cell: u32) -> bool {
         return false;
     }
 
-    let self_vel = grid_vel[cell].xyz;
     let offsets = array<vec3<i32>, 6>(
         vec3<i32>(-1, 0, 0),
         vec3<i32>(1, 0, 0),
@@ -874,8 +873,7 @@ fn interior_pressure_has_continuum_support(cell: u32) -> bool {
         }
 
         if offsets[n].y < 0 {
-            let neighbor_vel = grid_vel[neighbor_idx].xyz;
-            lower_hydro_support = lower_hydro_support || neighbor_vel.y >= self_vel.y;
+            lower_hydro_support = true;
         } else if offsets[n].y == 0 {
             lateral_fluid_faces += 1u;
         }
