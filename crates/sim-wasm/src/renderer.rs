@@ -73,8 +73,8 @@ fn palette(colour_t: f32) -> vec3<f32> {
         return mix(dry, wet, wetness);
     }
     let base = vec3<f32>(0.07, 0.20, 0.47);
-    let mid = vec3<f32>(0.10, 0.47, 0.74);
-    let crest = vec3<f32>(0.87, 0.95, 0.98);
+    let mid = vec3<f32>(0.58, 0.35, 0.16);
+    let crest = vec3<f32>(0.26, 0.12, 0.04);
     return mix(mix(base, mid, clamp(colour_t, 0.0, 1.0)), crest, clamp(colour_t * 0.6, 0.0, 1.0));
 }
 
@@ -235,8 +235,9 @@ fn palette(colour_t: f32) -> vec3<f32> {
         return mix(dry, wet, wetness);
     }
     let water = vec3<f32>(0.08, 0.34, 0.86);
-    let fast = vec3<f32>(0.74, 0.92, 1.0);
-    return mix(water, fast, clamp(colour_t * 0.45, 0.0, 1.0));
+    let brewed = vec3<f32>(0.58, 0.35, 0.16);
+    let dark = vec3<f32>(0.26, 0.12, 0.04);
+    return mix(mix(water, brewed, clamp(colour_t, 0.0, 1.0)), dark, clamp(colour_t * 0.6, 0.0, 1.0));
 }
 
 @fragment
