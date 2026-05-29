@@ -13,6 +13,8 @@ High-level ownership:
 - `sim-wasm/src/mpm_3d/*`: simulation state, passes, scene setup, tests
 - `sim-wasm/www-3d/*`: browser UI and scene controls
 
+The extraction model is documented in [`docs/EXTRACTION.md`](EXTRACTION.md).
+
 ## Authoritative State
 
 Simulation truth lives in the GPU simulation state, not the renderer.
@@ -48,6 +50,26 @@ Current pass shape:
 Important invariant:
 - simulation passes own physical behavior
 - UI, renderer, and debug HUD must not invent physical state
+- Genesis-inspired changes should enter as solver passes, metrics, or
+  particle/grid state changes; they should not be hidden in render code or UI
+  heuristics
+
+## Genesis-Informed Design Boundaries
+
+Genesis is useful as a source of solver patterns, not as a solver stack to
+port wholesale. For pour-over work:
+
+- DFSPH informs convergence metrics and adaptive projection decisions, while
+  `classify_cells`, RBGS pressure, and `project_pressure` remain the water
+  incompressibility path.
+- The particle emitter informs coherent inflow geometry. The browser-facing
+  kettle controls still feed `SpoutSettings` and `InflowState`.
+- PBD/XPBD informs local coffee-bed support and fines behavior. Bed particles
+  remain coffee-specific material samples, not a generic cloth/soft-body mesh.
+- Coupler structure informs clearer water-bed-filter impulse accounting. The
+  shared MPM grid and `bed_delta` buffers remain the exchange surface.
+- Contact-material ideas inform filter and dripper slip/softness parameters.
+  The SDF/analytic obstacle path remains the collision representation.
 
 ## Module Map
 
@@ -132,6 +154,7 @@ The browser app must stay a thin controller over `WasmSim3D`, not a second simul
 - free-flight jet cohesion is still weak
 - bed mechanics and bed hydraulics are still under active iteration
 - filter contact is still an approximation rather than a full contact solve
-- extraction remains provisional
+- extraction is now particle-carried, but still uses coarse two-pool kinetics
+  rather than calibrated grind-distribution chemistry
 
 For active planning and validation priorities, see [`docs/ROADMAP.md`](ROADMAP.md).

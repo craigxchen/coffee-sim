@@ -26,19 +26,26 @@ The active solver model is:
 - rendering stays downstream of particle state
 
 Current mainline already has finite pore capacity, Darcy/Brinkman resistance,
-bed compaction feedback, suspended coffee support, and a GPU cross-section view.
+bed compaction feedback, suspended coffee support, a GPU cross-section view,
+and particle-carried dissolved-solids extraction.
 
 ## Near-Term Physics Work
 
 Priority work:
 
+- add pressure residual/readback metrics so projection work is driven by
+  measured convergence rather than fixed iteration counts
+- make kettle inflow a coherent geometric slug across the nozzle aperture and
+  emission length, not independent per-particle jitter
 - improve coffee-particle advection so wet grounds are swept into flow instead
   of mostly moving aside from water
 - add grind-size distribution across coffee particles
 - let fines suspend and migrate more readily than coarse particles
+- add local bed/fines support constraints inspired by XPBD, scoped to coffee-bed
+  mechanics rather than a generic soft-body solver
 - couple local grind distribution and compaction to permeability
-- track dissolved/extracted coffee concentration on water particles and use it
-  for color
+- calibrate extraction rates against measured pour-over or espresso curves
+- add an outlet/cup accumulator for final beverage TDS and extraction yield
 
 Known solver gaps:
 
@@ -81,3 +88,27 @@ Deferred work:
 - timestamp-query profiling
 - adaptive substeps or pressure iterations based on measured residuals
 - settled-particle sleeping only after profiling identifies the bottleneck
+
+## Genesis-Informed Scope
+
+The Genesis engine is a broad robotics simulator. Its useful lessons for this
+project are the pieces that make a pour-over more physically coherent without
+turning `coffee-sim` into a general multi-solver engine:
+
+- use residual-driven fluid observability from DFSPH, but keep the WebGPU grid
+  pressure projection as the primary water solver
+- borrow geometric emitter structure for kettle streams, but keep flow-rate and
+  dose accounting in `inflow.rs`
+- borrow XPBD-style local constraints for wet grounds and fines, but scope them
+  to coffee-bed support, suspension, redeposition, and compaction
+- borrow explicit coupler boundaries for water-bed-filter exchange, but keep
+  simulation truth in the existing particle/grid buffers
+- borrow contact material parameters for filter/dripper behavior, but avoid a
+  generic rigid-body contact stack
+
+Out of scope unless a later profile or validation result proves otherwise:
+
+- a full SPH, PBD, FEM, SAP, or IPC solver port
+- robotics-style articulation coupling
+- broad force-field abstractions in production physics
+- differentiable checkpointing machinery

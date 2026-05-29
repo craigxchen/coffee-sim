@@ -238,13 +238,91 @@ fn readback_particle_data(
     data
 }
 
+fn readback_affine_data(
+    sim: &MpmSim3D,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    label: &str,
+) -> Vec<f32> {
+    let particle_count = (sim.num_water + sim.num_bed) as usize;
+    let affine_size = (particle_count * 48).max(4) as u64;
+
+    let staging = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(label),
+        size: affine_size,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("affine data readback"),
+    });
+    encoder.copy_buffer_to_buffer(&sim.buffers.affine, 0, &staging, 0, affine_size);
+    queue.submit(Some(encoder.finish()));
+
+    let slice = staging.slice(..);
+    let (tx, rx) = mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |result| {
+        tx.send(result).expect("affine data map callback");
+    });
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+    rx.recv()
+        .expect("affine data map recv")
+        .expect("affine data map");
+
+    let view = slice.get_mapped_range();
+    let data = cast_slice::<u8, f32>(&view).to_vec();
+    drop(view);
+    staging.unmap();
+    data
+}
+
+fn readback_bed_extract_data(
+    sim: &MpmSim3D,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    label: &str,
+) -> Vec<f32> {
+    let bed_size = (sim.num_bed as usize * 32).max(4) as u64;
+
+    let staging = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(label),
+        size: bed_size,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("bed extract data readback"),
+    });
+    encoder.copy_buffer_to_buffer(&sim.buffers.bed_extract, 0, &staging, 0, bed_size);
+    queue.submit(Some(encoder.finish()));
+
+    let slice = staging.slice(..);
+    let (tx, rx) = mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |result| {
+        tx.send(result).expect("bed extract data map callback");
+    });
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+    rx.recv()
+        .expect("bed extract data map recv")
+        .expect("bed extract data map");
+
+    let view = slice.get_mapped_range();
+    let data = cast_slice::<u8, f32>(&view).to_vec();
+    drop(view);
+    staging.unmap();
+    data
+}
+
 fn readback_water_diagnostics_snapshot(
     sim: &MpmSim3D,
     device: &wgpu::Device,
     queue: &wgpu::Queue,
 ) -> WaterDiagnostics {
     let data = readback_particle_data(sim, device, queue, "water diagnostics staging");
-    sim.water_diagnostics_from_particle_data(&data)
+    let affine = readback_affine_data(sim, device, queue, "water affine diagnostics staging");
+    sim.water_diagnostics_from_particle_data(&data, &affine)
 }
 
 fn readback_filter_contact_snapshot(
@@ -3005,6 +3083,65 @@ fn center_pour_filter_contact_has_no_side_jets() {
     assert!(
         contact.tangential_sheet_fraction < 0.04 && contact.max_tangential_speed_m_s < 0.20,
         "water formed a fast tangential sheet along the filter paper: {contact:?}",
+    );
+}
+
+#[test]
+fn saturated_bed_extracts_solute_into_mobile_water() {
+    let Some((device, queue)) = create_test_device() else {
+        eprintln!("skipping GPU test: no suitable adapter/device");
+        return;
+    };
+
+    let mut sim = MpmSim3D::new(&device, &queue, MpmSettings::debug_uniform_bed_saturation());
+    sim.seed_uniform_bed_saturation(&queue);
+
+    let initial_bed = readback_bed_extract_data(&sim, &device, &queue, "initial extraction bed");
+    let initial_extractable: f32 = (0..sim.num_bed as usize)
+        .map(|i| initial_bed[i * 8 + 4] + initial_bed[i * 8 + 6])
+        .sum();
+
+    for _ in 0..36 {
+        sim.step_frame(&device, &queue, 1.0 / 60.0);
+    }
+
+    let diagnostics = readback_water_diagnostics_snapshot(&sim, &device, &queue);
+    let final_bed = readback_bed_extract_data(&sim, &device, &queue, "final extraction bed");
+    let mut final_fast = 0.0_f32;
+    let mut final_dissolved = 0.0_f32;
+    let mut final_slow = 0.0_f32;
+    let mut all_finite = diagnostics.all_finite;
+    for i in 0..sim.num_bed as usize {
+        let fast = final_bed[i * 8 + 4];
+        let dissolved = final_bed[i * 8 + 5];
+        let slow = final_bed[i * 8 + 6];
+        all_finite &= fast.is_finite() && dissolved.is_finite() && slow.is_finite();
+        final_fast += fast;
+        final_dissolved += dissolved;
+        final_slow += slow;
+    }
+
+    let final_total_soluble =
+        final_fast + final_dissolved + final_slow + diagnostics.dissolved_solute_mass;
+
+    assert!(all_finite, "extraction state contained non-finite values");
+    assert!(
+        diagnostics.dissolved_solute_mass > 0.01,
+        "wet mobile water should carry extracted solute: {diagnostics:?}"
+    );
+    assert!(
+        final_fast + final_slow < initial_extractable,
+        "bed extractable reservoirs should deplete once saturated"
+    );
+    assert!(
+        final_total_soluble <= initial_extractable * 1.02,
+        "solute should not grow materially: initial={initial_extractable:.4} \
+         final={final_total_soluble:.4}"
+    );
+    assert!(
+        final_total_soluble >= initial_extractable * 0.90,
+        "solute should remain approximately conserved: initial={initial_extractable:.4} \
+         final={final_total_soluble:.4}"
     );
 }
 
