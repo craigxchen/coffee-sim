@@ -654,6 +654,25 @@ fn deterministic_unit_float(mut value: u32) -> f32 {
     value as f32 / u32::MAX as f32
 }
 
+fn filter_config_key(filter: &FilterConfig) -> u64 {
+    let mut key = 0xcbf2_9ce4_8422_2325u64;
+    for bits in [
+        filter.center.x.to_bits(),
+        filter.center.y.to_bits(),
+        filter.center.z.to_bits(),
+        filter.top_y.to_bits(),
+        filter.bot_y.to_bits(),
+        filter.top_radius.to_bits(),
+        filter.bot_radius.to_bits(),
+        filter.thickness.to_bits(),
+        filter.hole_radius.to_bits(),
+    ] {
+        key ^= u64::from(bits);
+        key = key.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    key
+}
+
 pub(crate) struct MpmSim3D {
     settings: MpmSettings,
     buffers: MpmBuffers,
@@ -1779,6 +1798,10 @@ impl MpmSim3D {
 
     pub fn filter_fill_vertices(&self) -> Option<&[[f32; 3]]> {
         self.filter_mesh.as_ref().map(|mesh| mesh.fill_vertices())
+    }
+
+    pub fn static_filter_mesh_key(&self) -> Option<u64> {
+        self.settings.filter.as_ref().map(filter_config_key)
     }
 
     pub fn settings(&self) -> &MpmSettings {
