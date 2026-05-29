@@ -21,11 +21,13 @@ pub(crate) const SDF_RES: u32 = 128;
 
 /// Number of `u32` slots in the metrics buffer. Keep in sync with the indices
 /// in `shader.rs` (`METRIC_*_IDX`).
-pub(crate) const METRICS_SLOT_COUNT: usize = 8;
+pub(crate) const METRICS_SLOT_COUNT: usize = 9;
 /// Fixed-point scale used by the `MAX_ABS_DIV` slot — divergence is already a
 /// moderate-magnitude quantity, so a smaller scale keeps the atomic headroom
 /// comfortable while still giving useful resolution on the HUD.
 pub(crate) const METRICS_DIV_FP_SCALE: f32 = 1024.0;
+pub(crate) const METRICS_MASS_FP_SCALE: f32 = 1024.0;
+pub(crate) const METRICS_SOLUTE_FP_SCALE: f32 = 65536.0;
 
 const SDF_NO_CONSTRAINT: f32 = 999.0;
 #[repr(C)]
@@ -44,6 +46,7 @@ pub(crate) struct MpmUniforms {
     pub sdf_params: [f32; 4],
     pub bed_params: [f32; 4],
     pub extraction_params: [f32; 4],
+    pub solute_params: [f32; 4],
     pub time_params: [f32; 4],
     /// `[div_clamp, pressure_clamp, metrics_div_fp_scale, metrics_div_inv_fp_scale]`.
     /// `div_clamp` and `pressure_clamp` feed the fixed-point bound checks in
@@ -99,7 +102,9 @@ impl MpmBuffers {
         let affine = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("mpm affine"),
             size: (max_p * 48) as u64, // 3 x vec4
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
 
@@ -124,11 +129,12 @@ impl MpmBuffers {
             mapped_at_creation: false,
         });
 
-        // Four atomic lanes per bed particle:
-        // retained water mass, then Darcy reaction impulse x/y/z.
+        // Six atomic lanes per bed particle:
+        // retained water mass, Darcy reaction impulse x/y/z, and solute
+        // availability/deposit lanes for mobile-water exchange.
         let bed_delta = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("mpm bed delta"),
-            size: (4 * max_p * size_of::<i32>()) as u64,
+            size: (6 * max_p * size_of::<i32>()) as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });

@@ -49,5 +49,6 @@ Open <http://localhost:8080>.
 ## More Info
 
 - [Architecture](docs/ARCHITECTURE.md)
+- [Extraction model](docs/EXTRACTION.md)
 - [Roadmap](docs/ROADMAP.md)
 - [Changelog](CHANGELOG.md)

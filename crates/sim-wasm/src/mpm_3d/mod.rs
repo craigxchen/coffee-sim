@@ -66,6 +66,9 @@ pub(crate) struct MetricsSnapshot {
     pub pressure_clamp_fires: u32,
     /// Number of P2G contributions that tripped the overflow probe.
     pub mass_overflow_fires: u32,
+    pub mean_tds: f32,
+    pub cup_tds: f32,
+    pub extraction_yield: f32,
 }
 
 /// One-shot water-state readback used by the browser realism evaluator.
@@ -123,6 +126,12 @@ pub(crate) struct WaterDiagnostics {
     pub hydrostatic_delta_pressure_pa: f32,
     pub hydrostatic_gradient_pa_per_m: f32,
     pub hydrostatic_bottom_higher: bool,
+    pub dissolved_solute_mass: f32,
+    pub mean_tds: f32,
+    pub cup_water_mass: f32,
+    pub cup_solute_mass: f32,
+    pub cup_tds: f32,
+    pub extraction_yield: f32,
 }
 
 impl Default for WaterDiagnostics {
@@ -175,6 +184,12 @@ impl Default for WaterDiagnostics {
             hydrostatic_delta_pressure_pa: 0.0,
             hydrostatic_gradient_pa_per_m: 0.0,
             hydrostatic_bottom_higher: false,
+            dissolved_solute_mass: 0.0,
+            mean_tds: 0.0,
+            cup_water_mass: 0.0,
+            cup_solute_mass: 0.0,
+            cup_tds: 0.0,
+            extraction_yield: 0.0,
         }
     }
 }
@@ -645,8 +660,9 @@ impl MpmSim3D {
             0,
             bytemuck::cast_slice(&cell_lookup),
         );
-        // Match the shader's four-lane bed_delta layout: water plus impulse xyz.
-        let zero_delta = vec![0_i32; self.settings.max_particles as usize * 4];
+        // Match the shader's six-lane bed_delta layout: water, impulse xyz,
+        // mobile solute availability, and solute deposited by absorbed water.
+        let zero_delta = vec![0_i32; self.settings.max_particles as usize * 6];
         queue.write_buffer(
             &self.buffers.bed_delta,
             0,
@@ -1078,7 +1094,11 @@ impl MpmSim3D {
         );
     }
 
-    fn water_diagnostics_from_particle_data(&self, data: &[f32]) -> WaterDiagnostics {
+    fn water_diagnostics_from_particle_data(
+        &self,
+        data: &[f32],
+        affine_data: &[f32],
+    ) -> WaterDiagnostics {
         const SURFACE_BINS: usize = 16;
 
         let [gx, _, _] = self.settings.grid_dims;
@@ -1094,7 +1114,7 @@ impl MpmSim3D {
 
         let start = self.num_bed as usize;
         let end = start + self.num_water as usize;
-        if data.len() < end * 8 {
+        if data.len() < end * 8 || affine_data.len() < end * 12 {
             diagnostics.all_finite = false;
             return diagnostics;
         }
@@ -1134,6 +1154,7 @@ impl MpmSim3D {
             let vy = data[base + 5];
             let vz = data[base + 6];
             let mass = data[base + 7];
+            let solute_mass = affine_data[i * 12 + 7].max(0.0);
 
             diagnostics.all_finite &= x.is_finite()
                 && y.is_finite()
@@ -1142,7 +1163,8 @@ impl MpmSim3D {
                 && vx.is_finite()
                 && vy.is_finite()
                 && vz.is_finite()
-                && mass.is_finite();
+                && mass.is_finite()
+                && solute_mass.is_finite();
 
             if mass <= inactive_thresh {
                 continue;
@@ -1160,6 +1182,7 @@ impl MpmSim3D {
 
             diagnostics.active_count += 1;
             diagnostics.active_mass += mass;
+            diagnostics.dissolved_solute_mass += solute_mass;
             diagnostics.rest_volume_ml += rest_volume * units::ML_PER_SIM_UNIT_CUBED;
             diagnostics.current_volume_ml += current_volume * units::ML_PER_SIM_UNIT_CUBED;
             diagnostics.kinetic_energy += 0.5 * mass * speed_sq;
@@ -1191,6 +1214,8 @@ impl MpmSim3D {
                     && y >= cup_bot_y - dx
                 {
                     diagnostics.pool_count += 1;
+                    diagnostics.cup_water_mass += mass;
+                    diagnostics.cup_solute_mass += solute_mass;
                     if r_sq <= cup_radius * cup_radius {
                         let bx =
                             (((x / cup_radius + 1.0) * 0.5) * SURFACE_BINS as f32).floor() as i32;
@@ -1213,6 +1238,19 @@ impl MpmSim3D {
         if diagnostics.active_count == 0 || diagnostics.active_mass <= 0.0 {
             return diagnostics;
         }
+
+        diagnostics.mean_tds =
+            diagnostics.dissolved_solute_mass / diagnostics.active_mass.max(1e-6);
+        diagnostics.cup_tds = diagnostics.cup_solute_mass / diagnostics.cup_water_mass.max(1e-6);
+        diagnostics.extraction_yield = self
+            .settings
+            .bed
+            .as_ref()
+            .map(|_| {
+                diagnostics.dissolved_solute_mass
+                    / (DEFAULT_BREW.coffee_dose_g * MASS_UNITS_PER_ML).max(1e-6)
+            })
+            .unwrap_or(0.0);
 
         diagnostics.centroid = centroid_sum / diagnostics.active_mass;
         diagnostics.min = min_pos;
@@ -1686,6 +1724,30 @@ impl MpmSim3D {
         self.total_dropped_particles
     }
 
+    pub fn estimated_extraction_yield(&self) -> f32 {
+        if self.settings.bed.is_none() {
+            return 0.0;
+        }
+        let wetting = (self.total_emitted_ml() / DEFAULT_BREW.target_bed_retention_ml.max(1e-6))
+            .clamp(0.0, 1.0);
+        let wet_contact = wetting * wetting * (3.0 - 2.0 * wetting);
+        let effective_time = self.total_time * wet_contact;
+        let fast = DEFAULT_BREW.fast_extractable_fraction
+            * (1.0 - (-DEFAULT_BREW.fast_extraction_rate_s * effective_time).exp());
+        let slow = (1.0 - DEFAULT_BREW.fast_extractable_fraction)
+            * (1.0 - (-DEFAULT_BREW.slow_extraction_rate_s * effective_time).exp());
+        DEFAULT_BREW.extractable_yield_fraction * (fast + slow)
+    }
+
+    pub fn estimated_cup_tds(&self) -> f32 {
+        if self.settings.bed.is_none() || self.total_emitted_mass <= 1e-6 {
+            return 0.0;
+        }
+        let extracted_mass =
+            self.estimated_extraction_yield() * DEFAULT_BREW.coffee_dose_g * MASS_UNITS_PER_ML;
+        extracted_mass / self.total_emitted_mass.max(1e-6)
+    }
+
     /// Last cached metrics snapshot. Populated by `refresh_metrics`; returns
     /// the zero default until the first successful readback.
     pub fn latest_metrics(&self) -> MetricsSnapshot {
@@ -1700,9 +1762,16 @@ impl MpmSim3D {
     ) -> Result<WaterDiagnostics, JsValue> {
         let particle_count = (self.num_water + self.num_bed) as usize;
         let particle_size = (particle_count * 32).max(4) as u64;
-        let staging = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("water diagnostics staging"),
+        let affine_size = (particle_count * 48).max(4) as u64;
+        let particle_staging = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("water diagnostics particle staging"),
             size: particle_size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let affine_staging = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("water diagnostics affine staging"),
+            size: affine_size,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
@@ -1710,12 +1779,27 @@ impl MpmSim3D {
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("water diagnostics readback"),
         });
-        encoder.copy_buffer_to_buffer(&self.buffers.particles, 0, &staging, 0, particle_size);
+        encoder.copy_buffer_to_buffer(
+            &self.buffers.particles,
+            0,
+            &particle_staging,
+            0,
+            particle_size,
+        );
+        encoder.copy_buffer_to_buffer(&self.buffers.affine, 0, &affine_staging, 0, affine_size);
         queue.submit(Some(encoder.finish()));
 
-        let slice = staging.slice(..);
+        let queue_done = js_sys::Promise::new(&mut |resolve, _reject| {
+            queue.on_submitted_work_done(move || {
+                let _ = resolve.call0(&JsValue::NULL);
+            });
+        });
+        wasm_bindgen_futures::JsFuture::from(queue_done).await?;
+
+        let particle_slice = particle_staging.slice(..);
+        let affine_slice = affine_staging.slice(..);
         let promise = js_sys::Promise::new(&mut |resolve, reject| {
-            slice.map_async(wgpu::MapMode::Read, move |result| match result {
+            particle_slice.map_async(wgpu::MapMode::Read, move |result| match result {
                 Ok(()) => {
                     let _ = resolve.call0(&JsValue::NULL);
                 }
@@ -1728,35 +1812,106 @@ impl MpmSim3D {
             });
         });
         wasm_bindgen_futures::JsFuture::from(promise).await?;
+        let promise = js_sys::Promise::new(&mut |resolve, reject| {
+            affine_slice.map_async(wgpu::MapMode::Read, move |result| match result {
+                Ok(()) => {
+                    let _ = resolve.call0(&JsValue::NULL);
+                }
+                Err(err) => {
+                    let _ = reject.call1(
+                        &JsValue::NULL,
+                        &JsValue::from_str(&format!(
+                            "water diagnostics affine map failed: {err:?}"
+                        )),
+                    );
+                }
+            });
+        });
+        wasm_bindgen_futures::JsFuture::from(promise).await?;
 
-        let view = slice.get_mapped_range();
-        let data = bytemuck::cast_slice::<u8, f32>(&view);
-        let diagnostics = self.water_diagnostics_from_particle_data(data);
-        drop(view);
-        staging.unmap();
+        let particle_view = particle_slice.get_mapped_range();
+        let particle_data = bytemuck::cast_slice::<u8, f32>(&particle_view);
+        let affine_view = affine_slice.get_mapped_range();
+        let affine_data = bytemuck::cast_slice::<u8, f32>(&affine_view);
+        let diagnostics = self.water_diagnostics_from_particle_data(particle_data, affine_data);
+        drop(affine_view);
+        affine_staging.unmap();
+        drop(particle_view);
+        particle_staging.unmap();
         Ok(diagnostics)
     }
 
     /// Async staging-buffer readback for the GPU metrics counters.
     ///
-    /// Currently **disabled** — every form of the readback path we tried
-    /// (per-frame copy, inline copy-then-map, fire-and-forget map) freezes
-    /// the browser tab on the second or third call. The shader-side
-    /// instrumentation still runs and writes to the GPU `metrics` buffer on
-    /// every substep; only the CPU-side pull-back is gated off until we can
-    /// get a proper map/unmap lifecycle working.
-    ///
-    /// TODO(readback): reimplement using either
-    ///   1. a dedicated staging buffer per in-flight request + a small
-    ///      ring so a pending map never blocks a new copy, or
-    ///   2. `queue.on_submitted_work_done` as a gate before calling
-    ///      `map_async`, so the map only starts after GPU work drains.
     #[cfg(target_arch = "wasm32")]
     pub async fn refresh_metrics(
         &mut self,
-        _device: &wgpu::Device,
-        _queue: &wgpu::Queue,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
     ) -> Result<(), JsValue> {
+        let metrics_size = (METRICS_SLOT_COUNT * std::mem::size_of::<u32>()) as u64;
+        let staging = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("mpm metrics one-shot staging"),
+            size: metrics_size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("mpm metrics readback"),
+        });
+        encoder.copy_buffer_to_buffer(&self.buffers.metrics, 0, &staging, 0, metrics_size);
+        queue.submit(Some(encoder.finish()));
+
+        let queue_done = js_sys::Promise::new(&mut |resolve, _reject| {
+            queue.on_submitted_work_done(move || {
+                let _ = resolve.call0(&JsValue::NULL);
+            });
+        });
+        wasm_bindgen_futures::JsFuture::from(queue_done).await?;
+
+        let slice = staging.slice(..);
+        let promise = js_sys::Promise::new(&mut |resolve, reject| {
+            slice.map_async(wgpu::MapMode::Read, move |result| match result {
+                Ok(()) => {
+                    let _ = resolve.call0(&JsValue::NULL);
+                }
+                Err(err) => {
+                    let _ = reject.call1(
+                        &JsValue::NULL,
+                        &JsValue::from_str(&format!("metrics map failed: {err:?}")),
+                    );
+                }
+            });
+        });
+        wasm_bindgen_futures::JsFuture::from(promise).await?;
+
+        let view = slice.get_mapped_range();
+        let raw = bytemuck::cast_slice::<u8, u32>(&view);
+        if raw.len() >= METRICS_SLOT_COUNT {
+            let active_water_mass = raw[5] as f32 / state::METRICS_MASS_FP_SCALE;
+            let active_solute_mass = raw[6] as f32 / state::METRICS_SOLUTE_FP_SCALE;
+            let cup_water_mass = raw[7] as f32 / state::METRICS_MASS_FP_SCALE;
+            let cup_solute_mass = raw[8] as f32 / state::METRICS_SOLUTE_FP_SCALE;
+            let extraction_yield = self
+                .settings
+                .bed
+                .as_ref()
+                .map(|_| active_solute_mass / (DEFAULT_BREW.coffee_dose_g * MASS_UNITS_PER_ML))
+                .unwrap_or(0.0);
+            self.latest_metrics = MetricsSnapshot {
+                max_abs_div: raw[0] as f32 / METRICS_DIV_FP_SCALE,
+                fluid_cells: raw[1],
+                div_clamp_fires: raw[2],
+                pressure_clamp_fires: raw[3],
+                mass_overflow_fires: raw[4],
+                mean_tds: active_solute_mass / active_water_mass.max(1e-6),
+                cup_tds: cup_solute_mass / cup_water_mass.max(1e-6),
+                extraction_yield,
+            };
+        }
+        drop(view);
+        staging.unmap();
         Ok(())
     }
 
@@ -1840,6 +1995,12 @@ impl MpmSim3D {
                 DEFAULT_BREW.bed_compaction_rate,
                 8.5,
                 DEFAULT_BREW.bed_impact_rate,
+            ],
+            solute_params: [
+                DEFAULT_BREW.fast_extraction_rate_s,
+                DEFAULT_BREW.slow_extraction_rate_s,
+                DEFAULT_BREW.max_solute_concentration,
+                DEFAULT_BREW.pore_to_water_mass_transfer_rate_s,
             ],
             time_params: [
                 self.total_time,

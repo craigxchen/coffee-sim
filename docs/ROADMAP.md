@@ -26,7 +26,8 @@ The active solver model is:
 - rendering stays downstream of particle state
 
 Current mainline already has finite pore capacity, Darcy/Brinkman resistance,
-bed compaction feedback, suspended coffee support, and a GPU cross-section view.
+bed compaction feedback, suspended coffee support, a GPU cross-section view,
+and particle-carried dissolved-solids extraction.
 
 ## Near-Term Physics Work
 
@@ -37,8 +38,8 @@ Priority work:
 - add grind-size distribution across coffee particles
 - let fines suspend and migrate more readily than coarse particles
 - couple local grind distribution and compaction to permeability
-- track dissolved/extracted coffee concentration on water particles and use it
-  for color
+- calibrate extraction rates against measured pour-over or espresso curves
+- add an outlet/cup accumulator for final beverage TDS and extraction yield
 
 Known solver gaps:
 
