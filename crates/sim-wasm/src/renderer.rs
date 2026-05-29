@@ -414,6 +414,7 @@ pub(crate) struct Renderer {
     filter_fill_vertex_count: u32,
     filter_vertex_buffer: wgpu::Buffer,
     filter_vertex_count: u32,
+    uploaded_filter_mesh_key: Option<u64>,
     depth_texture: wgpu::Texture,
     depth_view: wgpu::TextureView,
 }
@@ -979,6 +980,7 @@ impl Renderer {
             filter_fill_vertex_count,
             filter_vertex_buffer,
             filter_vertex_count,
+            uploaded_filter_mesh_key: None,
             depth_texture,
             depth_view,
         })
@@ -1034,6 +1036,42 @@ impl Renderer {
         let width = overlay_width_css * scale_x;
         let height = overlay_height_css * scale_y;
         Some((x, y, width, height, width / height.max(EPSILON)))
+    }
+
+    fn sync_filter_mesh_vertices(&mut self, simulation: &MpmSim3D) {
+        let mesh_key = simulation.static_filter_mesh_key();
+        if self.uploaded_filter_mesh_key == mesh_key {
+            return;
+        }
+
+        self.filter_fill_vertex_count = 0;
+        self.filter_vertex_count = 0;
+
+        if let Some(filter_vertices) = simulation.filter_fill_vertices() {
+            // Safety clamp: the GPU buffer is sized for `MAX_FILL_VERTEX_COUNT`
+            // at construction time. If the mesh ever produces more vertices
+            // than that (constants drifted), truncate rather than hit a driver
+            // validation error during `write_buffer`.
+            let count = filter_vertices.len().min(MAX_FILL_VERTEX_COUNT);
+            self.queue.write_buffer(
+                &self.filter_fill_vertex_buffer,
+                0,
+                bytemuck::cast_slice(&filter_vertices[..count]),
+            );
+            self.filter_fill_vertex_count = count as u32;
+        }
+
+        if let Some(filter_vertices) = simulation.filter_render_vertices() {
+            let count = filter_vertices.len().min(MAX_RENDER_VERTEX_COUNT);
+            self.queue.write_buffer(
+                &self.filter_vertex_buffer,
+                0,
+                bytemuck::cast_slice(&filter_vertices[..count]),
+            );
+            self.filter_vertex_count = count as u32;
+        }
+
+        self.uploaded_filter_mesh_key = mesh_key;
     }
 
     pub(crate) fn render_3d(
@@ -1113,29 +1151,7 @@ impl Renderer {
             bytemuck::bytes_of(&filter_uniforms),
         );
 
-        if let Some(filter_vertices) = simulation.filter_fill_vertices() {
-            // Safety clamp: the GPU buffer is sized for `MAX_FILL_VERTEX_COUNT`
-            // at construction time. If the mesh ever produces more vertices
-            // than that (constants drifted), truncate rather than hit a driver
-            // validation error during `write_buffer`.
-            let count = filter_vertices.len().min(MAX_FILL_VERTEX_COUNT);
-            self.queue.write_buffer(
-                &self.filter_fill_vertex_buffer,
-                0,
-                bytemuck::cast_slice(&filter_vertices[..count]),
-            );
-            self.filter_fill_vertex_count = count as u32;
-        }
-
-        if let Some(filter_vertices) = simulation.filter_render_vertices() {
-            let count = filter_vertices.len().min(MAX_RENDER_VERTEX_COUNT);
-            self.queue.write_buffer(
-                &self.filter_vertex_buffer,
-                0,
-                bytemuck::cast_slice(&filter_vertices[..count]),
-            );
-            self.filter_vertex_count = count as u32;
-        }
+        self.sync_filter_mesh_vertices(simulation);
 
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame)
