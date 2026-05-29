@@ -15,6 +15,7 @@ pub(crate) struct BedConfig {
     pub initial_porosity: f32,
     pub initial_permeability: f32,
     pub extractable_mass: f32,
+    pub fast_extractable_fraction: f32,
 }
 
 impl Default for BedConfig {
@@ -32,7 +33,8 @@ impl Default for BedConfig {
             num_particles: DEFAULT_BREW.bed_particle_samples,
             initial_porosity: DEFAULT_BREW.bed_porosity,
             initial_permeability: DEFAULT_BREW.bed_permeability_m2(),
-            extractable_mass: 0.15,
+            extractable_mass: DEFAULT_BREW.bed_sample_extractable_mass_units(),
+            fast_extractable_fraction: DEFAULT_BREW.fast_extractable_fraction,
         }
     }
 }
@@ -168,15 +170,18 @@ pub(crate) fn init_bed_particles(
                 // Phase=1.0 means bed particle.
                 affines.push([0.0, 0.0, 0.0, 1.0, x, y, z, 0.0, y, 0.0, 0.0, 0.0]);
                 // BedExtract: bed(pore_water, porosity, permeability, compaction),
-                //             extract(extractable, dissolved, temp, saturation)
+                //             extract(fast_extractable, dissolved, slow_extractable, saturation)
+                let fast_extractable =
+                    config.extractable_mass * config.fast_extractable_fraction.clamp(0.0, 1.0);
+                let slow_extractable = (config.extractable_mass - fast_extractable).max(0.0);
                 bed_extracts.push([
                     0.0,
                     config.initial_porosity,
                     config.initial_permeability,
                     0.0,
-                    config.extractable_mass,
+                    fast_extractable,
                     0.0,
-                    93.0,
+                    slow_extractable,
                     0.0,
                 ]);
             }
@@ -431,9 +436,12 @@ mod tests {
             assert!((extract[1] - cfg.initial_porosity).abs() < 1e-6);
             assert!((extract[2] - cfg.initial_permeability).abs() < 1e-6);
             assert_eq!(extract[3], 0.0);
-            // extract: extractable, dissolved, temp, saturation
-            assert!((extract[4] - cfg.extractable_mass).abs() < 1e-6);
+            // extract: fast_extractable, dissolved, slow_extractable, saturation
+            let fast = cfg.extractable_mass * cfg.fast_extractable_fraction;
+            let slow = cfg.extractable_mass - fast;
+            assert!((extract[4] - fast).abs() < 1e-6);
             assert_eq!(extract[5], 0.0);
+            assert!((extract[6] - slow).abs() < 1e-6);
             assert_eq!(extract[7], 0.0);
         }
     }

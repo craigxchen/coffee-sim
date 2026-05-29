@@ -13,6 +13,8 @@ High-level ownership:
 - `sim-wasm/src/mpm_3d/*`: simulation state, passes, scene setup, tests
 - `sim-wasm/www-3d/*`: browser UI and scene controls
 
+The extraction model is documented in [`docs/EXTRACTION.md`](EXTRACTION.md).
+
 ## Authoritative State
 
 Simulation truth lives in the GPU simulation state, not the renderer.
@@ -132,6 +134,7 @@ The browser app must stay a thin controller over `WasmSim3D`, not a second simul
 - free-flight jet cohesion is still weak
 - bed mechanics and bed hydraulics are still under active iteration
 - filter contact is still an approximation rather than a full contact solve
-- extraction remains provisional
+- extraction is now particle-carried, but still uses coarse two-pool kinetics
+  rather than calibrated grind-distribution chemistry
 
 For active planning and validation priorities, see [`docs/ROADMAP.md`](ROADMAP.md).
