@@ -21,7 +21,9 @@ pub(crate) const SDF_RES: u32 = 128;
 
 /// Number of `u32` slots in the metrics buffer. Keep in sync with the indices
 /// in `shader.rs` (`METRIC_*_IDX`).
-pub(crate) const METRICS_SLOT_COUNT: usize = 10;
+pub(crate) const METRICS_SLOT_COUNT: usize = 18;
+pub(crate) const METRIC_PRESSURE_ACTIVE_WORKGROUPS_X_IDX: usize = 11;
+pub(crate) const METRIC_GRID_ACTIVE_WORKGROUPS_X_IDX: usize = 15;
 /// Fixed-point scale used by the `MAX_ABS_DIV` slot — divergence is already a
 /// moderate-magnitude quantity, so a smaller scale keeps the atomic headroom
 /// comfortable while still giving useful resolution on the HUD.
@@ -73,6 +75,12 @@ pub(crate) struct MpmBuffers {
     pub render_data: wgpu::Buffer,
     pub bed_extract: wgpu::Buffer,
     pub uniform_buffer: wgpu::Buffer,
+    /// Indirect dispatch arguments for active pressure-cell kernels. Populated
+    /// from metrics slots after `pressure_active_finalize_dispatch`.
+    pub pressure_dispatch_args: wgpu::Buffer,
+    /// Indirect dispatch arguments for active grid-cell kernels. Populated
+    /// from metrics slots after `grid_active_finalize_dispatch`.
+    pub grid_dispatch_args: wgpu::Buffer,
     /// Compute-side scratch buffer for projection + overflow observability.
     /// Layout: `u32[METRICS_SLOT_COUNT]`. Indices match `METRIC_*_IDX` in the
     /// shader. Populated every substep via atomics, cleared via
@@ -90,6 +98,10 @@ impl MpmBuffers {
         let max_p = settings.max_particles as usize;
         let [gx, gy, gz] = settings.grid_dims;
         let total_cells = (gx * gy * gz) as usize;
+        debug_assert!(
+            total_cells <= 16_777_216,
+            "active cell ids are stored as exactly representable f32 values"
+        );
 
         let particles = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("mpm particles"),
@@ -118,7 +130,10 @@ impl MpmBuffers {
 
         let cg = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("mpm pressure cg scratch"),
-            size: (total_cells * 16) as u64, // vec4<f32>: r, z, d, A*d
+            // Three vec4 regions: per-cell CG state/cache, active pressure
+            // cell ids, then active grid cell ids. Cell ids are stored as
+            // exactly representable f32s to avoid another storage binding.
+            size: (3 * total_cells * 16) as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -172,6 +187,19 @@ impl MpmBuffers {
             mapped_at_creation: false,
         });
 
+        let pressure_dispatch_args = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("mpm active pressure dispatch args"),
+            size: (3 * size_of::<u32>()) as u64,
+            usage: wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let grid_dispatch_args = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("mpm active grid dispatch args"),
+            size: (3 * size_of::<u32>()) as u64,
+            usage: wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         let metrics_size = (METRICS_SLOT_COUNT * size_of::<u32>()) as u64;
         let metrics = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("mpm metrics"),
@@ -209,6 +237,8 @@ impl MpmBuffers {
             render_data,
             bed_extract,
             uniform_buffer,
+            pressure_dispatch_args,
+            grid_dispatch_args,
             metrics,
             metrics_staging,
         }

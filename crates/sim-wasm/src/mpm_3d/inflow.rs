@@ -114,18 +114,20 @@ impl InflowState {
         let particles_per_sec = self.flow_rate * PARTICLES_PER_ML;
         self.accumulator += particles_per_sec * dt;
         let requested = self.accumulator as u32;
-        let count = requested;
-        if count == 0 {
+        // Avoid true one-particle batches. A single centerline sample makes a
+        // sparse jet look like isolated fluid cells to the pressure solve;
+        // carrying that one sample into the next substep preserves mass while
+        // keeping ordinary odd multi-sample batches centered.
+        if requested < 2 {
             return EmissionResult {
                 emitted: 0,
                 dropped: 0,
             };
         }
-        self.accumulator -= count as f32;
-
         let total = current_water + current_bed;
         let available = max_particles.saturating_sub(total);
-        let count = count.min(available);
+        let count = non_singleton_emit_count(requested, available);
+        self.accumulator -= requested as f32;
         if count == 0 {
             return EmissionResult {
                 emitted: 0,
@@ -180,6 +182,14 @@ impl InflowState {
             emitted: count,
             dropped: requested.saturating_sub(count),
         }
+    }
+}
+
+fn non_singleton_emit_count(requested: u32, available: u32) -> u32 {
+    if requested < 2 || available < 2 {
+        0
+    } else {
+        requested.min(available)
     }
 }
 
@@ -407,6 +417,17 @@ mod tests {
                 "batch count {count} had lateral aperture bias: {sum:?}"
             );
         }
+    }
+
+    #[test]
+    fn non_singleton_emit_count_defers_singletons() {
+        assert_eq!(non_singleton_emit_count(0, 10), 0);
+        assert_eq!(non_singleton_emit_count(1, 10), 0);
+        assert_eq!(non_singleton_emit_count(2, 10), 2);
+        assert_eq!(non_singleton_emit_count(3, 10), 3);
+        assert_eq!(non_singleton_emit_count(5, 4), 4);
+        assert_eq!(non_singleton_emit_count(5, 3), 3);
+        assert_eq!(non_singleton_emit_count(5, 1), 0);
     }
 
     #[test]

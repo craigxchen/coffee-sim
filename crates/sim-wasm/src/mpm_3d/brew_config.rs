@@ -20,7 +20,6 @@ pub(crate) struct BrewConfig {
     pub gentle_pour_exit_speed_m_s: f32,
     pub high_pour_exit_speed_m_s: f32,
     pub initial_water_speed_m_s: f32,
-    pub water_viscosity: f32,
     pub water_kinematic_viscosity_m2_s: f32,
     pub min_bed_permeability_m2: f32,
     pub bed_absorption_rate: f32,
@@ -35,6 +34,8 @@ pub(crate) struct BrewConfig {
     pub bed_impact_rate: f32,
 }
 
+const VOLUME_CALIBRATION_WATER_PARTICLES_PER_ML: f32 = 320.0;
+
 pub(crate) const DEFAULT_BREW: BrewConfig = BrewConfig {
     // A modest single-cup V60 recipe. The water dose documents the intended
     // physical scale.
@@ -44,6 +45,8 @@ pub(crate) const DEFAULT_BREW: BrewConfig = BrewConfig {
     // Kozeny-Carman estimate, so finer grind lowers flow roughly with d^2.
     grind_diameter_um: 450.0,
     bed_porosity: 0.40,
+    // Preserve the calibrated sample density; runtime budgeting is enforced
+    // by the recipe cap instead of making each sample carry extra material.
     bed_particle_samples: 12_000,
     water_particles_per_ml: 320.0,
     water_mass_units_per_ml: 80.0,
@@ -53,7 +56,6 @@ pub(crate) const DEFAULT_BREW: BrewConfig = BrewConfig {
     gentle_pour_exit_speed_m_s: 0.12,
     high_pour_exit_speed_m_s: 0.45,
     initial_water_speed_m_s: 0.12,
-    water_viscosity: 1.2,
     water_kinematic_viscosity_m2_s: 1.0e-6,
     min_bed_permeability_m2: 1.0e-12,
     bed_absorption_rate: 1.6,
@@ -74,6 +76,10 @@ pub(crate) const DEFAULT_BREW: BrewConfig = BrewConfig {
 impl BrewConfig {
     pub(crate) const fn water_particle_mass_units(self) -> f32 {
         self.water_mass_units_per_ml / self.water_particles_per_ml
+    }
+
+    pub(crate) const fn water_particle_volume_scale(self) -> f32 {
+        VOLUME_CALIBRATION_WATER_PARTICLES_PER_ML / self.water_particles_per_ml
     }
 
     pub(crate) const fn bed_sample_mass_g(self) -> f32 {
@@ -115,6 +121,7 @@ mod tests {
     fn default_particle_sampling_has_positive_masses() {
         assert!(DEFAULT_BREW.water_particle_mass_units() > 0.0);
         assert!(DEFAULT_BREW.bed_sample_mass_g() > 0.0);
+        assert!(DEFAULT_BREW.water_particle_volume_scale() > 0.0);
     }
 
     #[test]
