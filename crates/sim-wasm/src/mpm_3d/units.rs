@@ -43,6 +43,10 @@ pub(crate) fn sim_speed_from_meters_per_second(speed: f32) -> f32 {
     speed * SIM_UNITS_PER_METER
 }
 
+pub(crate) const fn sim_kinematic_viscosity_from_m2_s(viscosity_m2_s: f32) -> f32 {
+    viscosity_m2_s * SIM_UNITS_PER_METER * SIM_UNITS_PER_METER
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -65,6 +69,13 @@ mod tests {
         assert!((sim_speed_from_meters_per_second(0.12) * METERS_PER_SIM_UNIT - 0.12).abs() < 1e-6);
         assert!(HIGH_POUR_EXIT_SPEED_M_S > GENTLE_POUR_EXIT_SPEED_M_S);
         assert!(HIGH_POUR_EXIT_SPEED_SIM_UNITS > GENTLE_POUR_EXIT_SPEED_SIM_UNITS);
+    }
+
+    #[test]
+    fn kinematic_viscosity_uses_squared_length_scale() {
+        let water_nu = 1.0e-6;
+        let sim_nu = sim_kinematic_viscosity_from_m2_s(water_nu);
+        assert!((sim_nu * METERS_PER_SIM_UNIT * METERS_PER_SIM_UNIT - water_nu).abs() < 1e-12);
     }
 
     #[test]

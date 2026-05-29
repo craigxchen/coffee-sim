@@ -75,6 +75,14 @@ const METRIC_CG_PAP_IDX: u32 = 6u;
 const METRIC_CG_NEW_RZ_IDX: u32 = 7u;
 const METRIC_PRESSURE_INITIAL_RZ_IDX: u32 = 8u;
 const METRIC_PRESSURE_FINAL_RZ_IDX: u32 = 9u;
+const METRIC_PRESSURE_ACTIVE_COUNT_IDX: u32 = 10u;
+const METRIC_PRESSURE_ACTIVE_WORKGROUPS_X_IDX: u32 = 11u;
+const METRIC_PRESSURE_ACTIVE_WORKGROUPS_Y_IDX: u32 = 12u;
+const METRIC_PRESSURE_ACTIVE_WORKGROUPS_Z_IDX: u32 = 13u;
+const METRIC_GRID_ACTIVE_COUNT_IDX: u32 = 14u;
+const METRIC_GRID_ACTIVE_WORKGROUPS_X_IDX: u32 = 15u;
+const METRIC_GRID_ACTIVE_WORKGROUPS_Y_IDX: u32 = 16u;
+const METRIC_GRID_ACTIVE_WORKGROUPS_Z_IDX: u32 = 17u;
 const BED_DELTA_WATER_LANE: u32 = 0u;
 const BED_DELTA_IMPULSE_X_LANE: u32 = 1u;
 const BED_DELTA_IMPULSE_Y_LANE: u32 = 2u;
@@ -166,8 +174,8 @@ fn grid_current_volume_idx(cell: u32) -> u32 { return 5u * total_cells() + cell;
 fn scratch_pressure_idx(cell: u32) -> u32 { return grid_mass_idx(cell); }
 fn scratch_div_idx(cell: u32) -> u32 { return grid_mom_x_idx(cell); }
 // Slot 2 (`grid_mom_y_idx`) is free after `grid_update` consumes p2g
-// momentum. It carries the temporary unilateral packing pressure before
-// viscosity reuses the momentum lanes as velocity scratch.
+// momentum. It carries pressure inv_diag during CG, then temporary unilateral
+// packing pressure after pressure projection.
 fn scratch_packing_idx(cell: u32) -> u32 { return grid_mom_y_idx(cell); }
 fn scratch_kind_idx(cell: u32) -> u32 { return grid_mom_z_idx(cell); }
 // A quadratic-B-spline particle deposits at most `nominal_mass * 0.75^3 ≈
@@ -186,6 +194,9 @@ const CELL_BED_COUPLED: i32 = 3;
 const CELL_SOLID: i32 = 4;
 const PHASE_WATER_MAX: f32 = 0.5;
 const PHASE_SUSPENDED_COFFEE: f32 = 2.0;
+const PRESSURE_REDUCE_WORKGROUP_SIZE: u32 = 64u;
+
+var<workgroup> pressure_reduce_values: array<f32, 64>;
 
 fn is_water_phase(phase: f32) -> bool {
     return phase < PHASE_WATER_MAX;
@@ -229,6 +240,66 @@ fn packing_pressure_store(cell: u32, value: f32) {
     atomicStore(&grid[scratch_packing_idx(cell)], i32(clamped * fp_scale()));
 }
 
+fn pressure_inv_diag_load(cell: u32) -> f32 {
+    return f32(atomicLoad(&grid[scratch_packing_idx(cell)])) * inv_fp_scale();
+}
+
+fn pressure_inv_diag_store(cell: u32, value: f32) {
+    atomicStore(&grid[scratch_packing_idx(cell)], i32(max(value, 0.0) * fp_scale()));
+}
+
+fn pressure_cached_active_cell(cell: u32) -> bool {
+    if grid_vel[cell].w <= occupancy_mass_threshold() {
+        return false;
+    }
+    return pressure_inv_diag_load(cell) > 0.0;
+}
+
+fn pressure_field_active_cell(cell: u32) -> bool {
+    if grid_vel[cell].w <= occupancy_mass_threshold() {
+        return false;
+    }
+
+    let iz_val = cell / (gx() * gy());
+    let rem = cell % (gx() * gy());
+    let iy_val = rem / gx();
+    let ix_val = rem % gx();
+    let kind = current_cell_kind(vec3<i32>(i32(ix_val), i32(iy_val), i32(iz_val)));
+    return pressure_active_cell(cell, kind);
+}
+
+fn active_pressure_list_idx(list_i: u32) -> u32 {
+    return total_cells() + list_i;
+}
+
+fn active_pressure_count() -> u32 {
+    return atomicLoad(&metrics[METRIC_PRESSURE_ACTIVE_COUNT_IDX]);
+}
+
+fn active_pressure_cell(list_i: u32) -> u32 {
+    return u32(cg[active_pressure_list_idx(list_i)].x);
+}
+
+fn active_pressure_cell_store(list_i: u32, cell: u32) {
+    cg[active_pressure_list_idx(list_i)] = vec4<f32>(f32(cell), 0.0, 0.0, 0.0);
+}
+
+fn active_grid_list_idx(list_i: u32) -> u32 {
+    return 2u * total_cells() + list_i;
+}
+
+fn active_grid_count() -> u32 {
+    return atomicLoad(&metrics[METRIC_GRID_ACTIVE_COUNT_IDX]);
+}
+
+fn active_grid_cell(list_i: u32) -> u32 {
+    return u32(cg[active_grid_list_idx(list_i)].x);
+}
+
+fn active_grid_cell_store(list_i: u32, cell: u32) {
+    cg[active_grid_list_idx(list_i)] = vec4<f32>(f32(cell), 0.0, 0.0, 0.0);
+}
+
 fn pressure_or_mirror(cell: vec3<i32>, mirror_pressure: f32) -> f32 {
     if cell.x < 0 || cell.y < 0 || cell.z < 0 {
         return mirror_pressure;
@@ -237,8 +308,11 @@ fn pressure_or_mirror(cell: vec3<i32>, mirror_pressure: f32) -> f32 {
         return mirror_pressure;
     }
     let ci = cell_index(u32(cell.x), u32(cell.y), u32(cell.z));
-    if is_solid_kind(cell_kind_load(ci)) {
+    if is_solid_kind(current_cell_kind(cell)) {
         return mirror_pressure;
+    }
+    if !pressure_field_active_cell(ci) {
+        return 0.0;
     }
     return pressure_load(ci);
 }
@@ -272,11 +346,7 @@ fn divergence_load(cell: u32) -> f32 {
 }
 
 fn velocity_scratch_load(cell: u32) -> vec3<f32> {
-    return vec3<f32>(
-        f32(atomicLoad(&grid[grid_mom_x_idx(cell)])) * inv_fp_scale(),
-        f32(atomicLoad(&grid[grid_mom_y_idx(cell)])) * inv_fp_scale(),
-        f32(atomicLoad(&grid[grid_mom_z_idx(cell)])) * inv_fp_scale(),
-    );
+    return cg[cell].xyz;
 }
 
 fn velocity_scratch_store(cell: u32, value: vec3<f32>) {
@@ -285,9 +355,12 @@ fn velocity_scratch_store(cell: u32, value: vec3<f32>) {
     if speed > vel_cap() {
         clamped = clamped * (vel_cap() / speed);
     }
-    atomicStore(&grid[grid_mom_x_idx(cell)], i32(clamped.x * fp_scale()));
-    atomicStore(&grid[grid_mom_y_idx(cell)], i32(clamped.y * fp_scale()));
-    atomicStore(&grid[grid_mom_z_idx(cell)], i32(clamped.z * fp_scale()));
+    let quantized = vec3<f32>(
+        f32(i32(clamped.x * fp_scale())) * inv_fp_scale(),
+        f32(i32(clamped.y * fp_scale())) * inv_fp_scale(),
+        f32(i32(clamped.z * fp_scale())) * inv_fp_scale(),
+    );
+    cg[cell] = vec4<f32>(quantized, 0.0);
 }
 
 fn rest_volume_load(cell: u32) -> f32 {
@@ -298,6 +371,11 @@ fn current_volume_load(cell: u32) -> f32 {
     return f32(atomicLoad(&grid[grid_current_volume_idx(cell)])) * inv_fp_scale();
 }
 
+fn deposited_liquid_fraction(cell: u32) -> f32 {
+    let cell_volume = max(dx() * dx() * dx(), 1e-8);
+    return max(rest_volume_load(cell), current_volume_load(cell)) / cell_volume;
+}
+
 fn raw_liquid_fill_fraction(cell: u32, kind: i32) -> f32 {
     if kind == CELL_INTERIOR_FLUID || kind == CELL_BED_COUPLED {
         return 1.0;
@@ -306,9 +384,7 @@ fn raw_liquid_fill_fraction(cell: u32, kind: i32) -> f32 {
         return 0.0;
     }
 
-    let cell_volume = max(dx() * dx() * dx(), 1e-8);
-    let deposited_fraction = max(rest_volume_load(cell), current_volume_load(cell)) / cell_volume;
-    return clamp(deposited_fraction, 0.0, 1.0);
+    return clamp(deposited_liquid_fraction(cell), 0.0, 1.0);
 }
 
 fn liquid_fill_fraction(cell: u32, kind: i32) -> f32 {
@@ -342,7 +418,7 @@ fn liquid_fill_fraction(cell: u32, kind: i32) -> f32 {
             continue;
         }
         let neighbor_idx = cell_index(u32(neighbor.x), u32(neighbor.y), u32(neighbor.z));
-        let neighbor_kind = cell_kind_load(neighbor_idx);
+        let neighbor_kind = current_cell_kind(neighbor);
         if !is_fluid_kind(neighbor_kind) {
             continue;
         }
@@ -372,6 +448,25 @@ fn pressure_face_weight(
     return min(self_fill, liquid_fill_fraction(neighbor_cell, neighbor_kind));
 }
 
+fn pressure_face_weight_cached(
+    self_kind: i32,
+    self_fill: f32,
+    neighbor_cell: u32,
+    neighbor_kind: i32,
+) -> f32 {
+    if is_solid_kind(neighbor_kind) {
+        return 0.0;
+    }
+    if self_kind == CELL_BED_COUPLED || neighbor_kind == CELL_BED_COUPLED {
+        return 1.0;
+    }
+    if !pressure_cached_active_cell(neighbor_cell) {
+        return self_fill;
+    }
+
+    return min(self_fill, liquid_fill_fraction(neighbor_cell, neighbor_kind));
+}
+
 fn pressure_weighted_or_mirror(
     cell: vec3<i32>,
     mirror_pressure: f32,
@@ -386,16 +481,16 @@ fn pressure_weighted_or_mirror(
     }
 
     let ci = cell_index(u32(cell.x), u32(cell.y), u32(cell.z));
-    let kind = cell_kind_load(ci);
+    let kind = current_cell_kind(cell);
     if is_solid_kind(kind) {
         return mirror_pressure;
     }
 
     var neighbor_pressure = 0.0;
-    if pressure_active_cell(ci, kind) {
+    if pressure_cached_active_cell(ci) {
         neighbor_pressure = pressure_load(ci);
     }
-    let face_weight = pressure_face_weight(self_kind, self_fill, ci, kind);
+    let face_weight = pressure_face_weight_cached(self_kind, self_fill, ci, kind);
     return mix(mirror_pressure, neighbor_pressure, face_weight);
 }
 
@@ -409,7 +504,7 @@ fn divergence_store(cell: u32, value: f32) {
 }
 
 fn bed_lookup_load(cell: u32) -> i32 {
-    return atomicLoad(&bed_lookup[cell]);
+    return atomicLoad(&bed_lookup[cell]) - 1;
 }
 
 fn is_valid_bed_solid_idx(bed_idx: i32) -> bool {
@@ -626,6 +721,9 @@ fn deposit_absorbed_bed_water(home_cell: vec3<i32>, home_bed_idx: i32, absorbed:
 }
 
 fn sdf_class_is_solid(cell: vec3<i32>) -> bool {
+    if use_sdf_cache() {
+        return textureLoad(sdf_class_tex, cell, 0).r != 0u;
+    }
     return sample_sdf(cell_center_from_cell(cell)) < 0.0;
 }
 
@@ -635,11 +733,59 @@ fn is_fluid_kind(kind: i32) -> bool {
         || kind == CELL_BED_COUPLED;
 }
 
-fn surface_pressure_has_continuum_support(cell: u32) -> bool {
+fn current_cell_kind(cell: vec3<i32>) -> i32 {
+    if cell.x < 0 || cell.y < 0 || cell.z < 0
+        || u32(cell.x) >= gx() || u32(cell.y) >= gy() || u32(cell.z) >= gz() {
+        return CELL_AIR;
+    }
+    if sdf_class_is_solid(cell) {
+        return CELL_SOLID;
+    }
+    let idx = cell_index(u32(cell.x), u32(cell.y), u32(cell.z));
+    if grid_vel[idx].w <= occupancy_mass_threshold() {
+        return CELL_AIR;
+    }
+    return cell_kind_load(idx);
+}
+
+fn floor_supported_surface_cell(cell: u32) -> bool {
+    let gv = grid_vel[cell];
+    let quasi_static_speed = sqrt(max(abs(gravity()) * dx(), 1e-8));
+    if length(gv.xyz) > quasi_static_speed {
+        return false;
+    }
+    if deposited_liquid_fraction(cell) < 1.0 {
+        return false;
+    }
+
     let iz_val = cell / (gx() * gy());
     let rem = cell % (gx() * gy());
     let iy_val = rem / gx();
     let ix_val = rem % gx();
+
+    let self_cell = vec3<i32>(i32(ix_val), i32(iy_val), i32(iz_val));
+    if iy_val > 0u {
+        let below = vec3<i32>(i32(ix_val), i32(iy_val) - 1, i32(iz_val));
+        let floor_band_top = cup_floor_y() + dx() * 2.0;
+        if cell_center_from_cell(self_cell).y <= floor_band_top && sdf_class_is_solid(below) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+fn surface_pressure_has_continuum_support(cell: u32) -> bool {
+    if floor_supported_surface_cell(cell) {
+        return true;
+    }
+
+    let iz_val = cell / (gx() * gy());
+    let rem = cell % (gx() * gy());
+    let iy_val = rem / gx();
+    let ix_val = rem % gx();
+    let self_cell = vec3<i32>(i32(ix_val), i32(iy_val), i32(iz_val));
+
     let offsets = array<vec3<i32>, 6>(
         vec3<i32>(-1, 0, 0),
         vec3<i32>(1, 0, 0),
@@ -649,33 +795,107 @@ fn surface_pressure_has_continuum_support(cell: u32) -> bool {
         vec3<i32>(0, 0, 1),
     );
 
+    var lower_fluid_support = false;
+    var lateral_fluid_faces = 0u;
+
     for (var n = 0u; n < 6u; n++) {
-        let neighbor = vec3<i32>(i32(ix_val), i32(iy_val), i32(iz_val)) + offsets[n];
+        let neighbor = self_cell + offsets[n];
         if neighbor.x < 0 || neighbor.y < 0 || neighbor.z < 0
             || u32(neighbor.x) >= gx() || u32(neighbor.y) >= gy() || u32(neighbor.z) >= gz() {
             continue;
         }
-        let neighbor_kind = cell_kind_load(cell_index(
-            u32(neighbor.x),
-            u32(neighbor.y),
-            u32(neighbor.z),
-        ));
+        let neighbor_kind = current_cell_kind(neighbor);
         if neighbor_kind == CELL_BED_COUPLED {
             return true;
         }
+        if is_fluid_kind(neighbor_kind) {
+            let neighbor_idx = cell_index(u32(neighbor.x), u32(neighbor.y), u32(neighbor.z));
+            if raw_liquid_fill_fraction(neighbor_idx, neighbor_kind) <= 0.0 {
+                continue;
+            }
+            if offsets[n].y < 0 {
+                lower_fluid_support = true;
+            } else if offsets[n].y == 0 {
+                lateral_fluid_faces += 1u;
+            }
+        }
     }
 
-    return false;
+    // A water-only free surface belongs to the continuum pressure domain once
+    // it is the boundary of a locally supported liquid volume: at least one
+    // fluid cell below carries hydrostatic support, and lateral fluid faces
+    // distinguish a pool/sheet surface from an isolated falling stream.
+    return lower_fluid_support && lateral_fluid_faces >= 2u;
+}
+
+fn interior_pressure_has_continuum_support(cell: u32) -> bool {
+    if deposited_liquid_fraction(cell) >= 1.0 || floor_supported_surface_cell(cell) {
+        return true;
+    }
+
+    let iz_val = cell / (gx() * gy());
+    let rem = cell % (gx() * gy());
+    let iy_val = rem / gx();
+    let ix_val = rem % gx();
+    let self_cell = vec3<i32>(i32(ix_val), i32(iy_val), i32(iz_val));
+    let self_center = cell_center_from_cell(self_cell);
+    // Under-filled interior cells need a receiving body of water, not merely
+    // other falling samples. The cup boundary is the water-only reservoir; bed
+    // support is handled separately through CELL_BED_COUPLED.
+    if self_center.y > -3.5 {
+        return false;
+    }
+
+    let self_vel = grid_vel[cell].xyz;
+    let offsets = array<vec3<i32>, 6>(
+        vec3<i32>(-1, 0, 0),
+        vec3<i32>(1, 0, 0),
+        vec3<i32>(0, -1, 0),
+        vec3<i32>(0, 1, 0),
+        vec3<i32>(0, 0, -1),
+        vec3<i32>(0, 0, 1),
+    );
+
+    var lower_hydro_support = false;
+    var lateral_fluid_faces = 0u;
+
+    for (var n = 0u; n < 6u; n++) {
+        let neighbor = self_cell + offsets[n];
+        if neighbor.x < 0 || neighbor.y < 0 || neighbor.z < 0
+            || u32(neighbor.x) >= gx() || u32(neighbor.y) >= gy() || u32(neighbor.z) >= gz() {
+            continue;
+        }
+
+        let neighbor_idx = cell_index(u32(neighbor.x), u32(neighbor.y), u32(neighbor.z));
+        let neighbor_kind = current_cell_kind(neighbor);
+        if !is_fluid_kind(neighbor_kind)
+            || raw_liquid_fill_fraction(neighbor_idx, neighbor_kind) <= 0.0 {
+            continue;
+        }
+
+        if offsets[n].y < 0 {
+            let neighbor_vel = grid_vel[neighbor_idx].xyz;
+            lower_hydro_support = lower_hydro_support || neighbor_vel.y >= self_vel.y;
+        } else if offsets[n].y == 0 {
+            lateral_fluid_faces += 1u;
+        }
+    }
+
+    return lower_hydro_support && lateral_fluid_faces >= 2u;
 }
 
 fn pressure_active_cell(cell: u32, kind: i32) -> bool {
-    // Surface cells are part of the liquid domain. Their air-facing pressure
-    // boundary is atmospheric (p=0), handled by `pressure_face_weight` and
-    // `pressure_weighted_or_mirror`. Only activate them at the porous bed
-    // interface; isolated falling streams are particle-resolved free surfaces,
-    // not a connected incompressible pressure domain.
-    return kind == CELL_INTERIOR_FLUID
+    // Surface cells are part of the liquid domain when they have continuum
+    // support from the porous bed or a solid floor under gravity. Isolated
+    // falling streams remain particle-resolved free surfaces instead of being
+    // promoted into a pressure domain.
+    return (kind == CELL_INTERIOR_FLUID && interior_pressure_has_continuum_support(cell))
         || kind == CELL_BED_COUPLED
+        || (kind == CELL_SURFACE_FLUID && surface_pressure_has_continuum_support(cell));
+}
+
+fn packing_active_cell(cell: u32, kind: i32) -> bool {
+    return kind == CELL_INTERIOR_FLUID
         || (kind == CELL_SURFACE_FLUID && surface_pressure_has_continuum_support(cell));
 }
 
@@ -1231,6 +1451,8 @@ fn grid_update(@builtin(global_invocation_id) gid: vec3<u32>) {
     if mass < 1e-6 {
         return;
     }
+    let active_slot = atomicAdd(&metrics[METRIC_GRID_ACTIVE_COUNT_IDX], 1u);
+    active_grid_cell_store(active_slot, idx);
 
     var v = vec3<f32>(
         f32(atomicLoad(&grid[grid_mom_x_idx(idx)])) * inv_fp / mass,
@@ -1248,12 +1470,25 @@ fn grid_update(@builtin(global_invocation_id) gid: vec3<u32>) {
     grid_vel[idx] = vec4<f32>(v, mass);
 }
 
+@compute @workgroup_size(1)
+fn grid_active_finalize_dispatch(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if gid.x != 0u { return; }
+    let count = active_grid_count();
+    atomicStore(
+        &metrics[METRIC_GRID_ACTIVE_WORKGROUPS_X_IDX],
+        max((count + PRESSURE_REDUCE_WORKGROUP_SIZE - 1u) / PRESSURE_REDUCE_WORKGROUP_SIZE, 1u),
+    );
+    atomicStore(&metrics[METRIC_GRID_ACTIVE_WORKGROUPS_Y_IDX], 1u);
+    atomicStore(&metrics[METRIC_GRID_ACTIVE_WORKGROUPS_Z_IDX], 1u);
+}
+
 // ── viscosity ──
 
 @compute @workgroup_size(64)
 fn viscosity_prepare(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
-    if idx >= total_cells() { return; }
+    let list_i = gid.x;
+    if list_i >= active_grid_count() { return; }
+    let idx = active_grid_cell(list_i);
 
     let gv = grid_vel[idx];
     if gv.w <= occupancy_mass_threshold() || viscosity() <= 0.0 {
@@ -1267,7 +1502,7 @@ fn viscosity_prepare(@builtin(global_invocation_id) gid: vec3<u32>) {
     let ix_val = rem % gx();
     let v_here = gv.xyz;
     let kind = cell_kind_load(idx);
-    if !is_viscous_kind(kind) || !pressure_active_cell(idx, kind) {
+    if !is_viscous_kind(kind) {
         velocity_scratch_store(idx, v_here);
         return;
     }
@@ -1338,8 +1573,9 @@ fn viscosity_prepare(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 @compute @workgroup_size(64)
 fn viscosity_apply(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
-    if idx >= total_cells() { return; }
+    let list_i = gid.x;
+    if list_i >= active_grid_count() { return; }
+    let idx = active_grid_cell(list_i);
 
     let mass = grid_vel[idx].w;
     if mass <= occupancy_mass_threshold() {
@@ -1354,8 +1590,9 @@ fn viscosity_apply(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 @compute @workgroup_size(64)
 fn classify_cells(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
-    if idx >= total_cells() { return; }
+    let list_i = gid.x;
+    if list_i >= active_grid_count() { return; }
+    let idx = active_grid_cell(list_i);
 
     let mass = grid_vel[idx].w;
     pressure_store(idx, 0.0);
@@ -1376,13 +1613,7 @@ fn classify_cells(@builtin(global_invocation_id) gid: vec3<u32>) {
     // with a Neumann BC (∂p/∂n = 0) via the ghost-mirror trick in
     // pressure_update / project_pressure, instead of the Dirichlet p=0
     // they'd get if lumped with air.
-    let cell_center = u.grid_origin.xyz
-        + (vec3<f32>(f32(ix_val), f32(iy_val), f32(iz_val)) + vec3<f32>(0.5)) * dx();
-    let self_is_solid = select(
-        sample_sdf(cell_center) < 0.0,
-        sdf_class_is_solid(vec3<i32>(i32(ix_val), i32(iy_val), i32(iz_val))),
-        use_sdf_cache(),
-    );
+    let self_is_solid = sdf_class_is_solid(vec3<i32>(i32(ix_val), i32(iy_val), i32(iz_val)));
     if self_is_solid {
         atomicStore(&grid[scratch_kind_idx(idx)], CELL_SOLID);
         divergence_store(idx, 0.0);
@@ -1449,7 +1680,6 @@ fn classify_cells(@builtin(global_invocation_id) gid: vec3<u32>) {
     // workgroups. The cached mask is generated from the same cell-center SDF
     // probe and avoids repeated texture interpolation in the hot path.
     let self_vel = grid_vel[idx].xyz;
-    let dx_vec = dx();
     var vxm = -self_vel.x;
     var vxp = -self_vel.x;
     var vym = -self_vel.y;
@@ -1457,56 +1687,32 @@ fn classify_cells(@builtin(global_invocation_id) gid: vec3<u32>) {
     var vzm = -self_vel.z;
     var vzp = -self_vel.z;
     if ix_val > 0u
-        && select(
-            sample_sdf(cell_center + vec3<f32>(-dx_vec, 0.0, 0.0)) >= 0.0,
-            !sdf_class_is_solid(vec3<i32>(i32(ix_val) - 1, i32(iy_val), i32(iz_val))),
-            use_sdf_cache(),
-        ) {
+        && !sdf_class_is_solid(vec3<i32>(i32(ix_val) - 1, i32(iy_val), i32(iz_val))) {
         let neighbor = grid_vel[cell_index(ix_val - 1u, iy_val, iz_val)];
         vxm = select(self_vel.x, neighbor.x, neighbor.w > occupancy_mass_threshold());
     }
     if ix_val + 1u < gx()
-        && select(
-            sample_sdf(cell_center + vec3<f32>(dx_vec, 0.0, 0.0)) >= 0.0,
-            !sdf_class_is_solid(vec3<i32>(i32(ix_val) + 1, i32(iy_val), i32(iz_val))),
-            use_sdf_cache(),
-        ) {
+        && !sdf_class_is_solid(vec3<i32>(i32(ix_val) + 1, i32(iy_val), i32(iz_val))) {
         let neighbor = grid_vel[cell_index(ix_val + 1u, iy_val, iz_val)];
         vxp = select(self_vel.x, neighbor.x, neighbor.w > occupancy_mass_threshold());
     }
     if iy_val > 0u
-        && select(
-            sample_sdf(cell_center + vec3<f32>(0.0, -dx_vec, 0.0)) >= 0.0,
-            !sdf_class_is_solid(vec3<i32>(i32(ix_val), i32(iy_val) - 1, i32(iz_val))),
-            use_sdf_cache(),
-        ) {
+        && !sdf_class_is_solid(vec3<i32>(i32(ix_val), i32(iy_val) - 1, i32(iz_val))) {
         let neighbor = grid_vel[cell_index(ix_val, iy_val - 1u, iz_val)];
         vym = select(self_vel.y, neighbor.y, neighbor.w > occupancy_mass_threshold());
     }
     if iy_val + 1u < gy()
-        && select(
-            sample_sdf(cell_center + vec3<f32>(0.0, dx_vec, 0.0)) >= 0.0,
-            !sdf_class_is_solid(vec3<i32>(i32(ix_val), i32(iy_val) + 1, i32(iz_val))),
-            use_sdf_cache(),
-        ) {
+        && !sdf_class_is_solid(vec3<i32>(i32(ix_val), i32(iy_val) + 1, i32(iz_val))) {
         let neighbor = grid_vel[cell_index(ix_val, iy_val + 1u, iz_val)];
         vyp = select(self_vel.y, neighbor.y, neighbor.w > occupancy_mass_threshold());
     }
     if iz_val > 0u
-        && select(
-            sample_sdf(cell_center + vec3<f32>(0.0, 0.0, -dx_vec)) >= 0.0,
-            !sdf_class_is_solid(vec3<i32>(i32(ix_val), i32(iy_val), i32(iz_val) - 1)),
-            use_sdf_cache(),
-        ) {
+        && !sdf_class_is_solid(vec3<i32>(i32(ix_val), i32(iy_val), i32(iz_val) - 1)) {
         let neighbor = grid_vel[cell_index(ix_val, iy_val, iz_val - 1u)];
         vzm = select(self_vel.z, neighbor.z, neighbor.w > occupancy_mass_threshold());
     }
     if iz_val + 1u < gz()
-        && select(
-            sample_sdf(cell_center + vec3<f32>(0.0, 0.0, dx_vec)) >= 0.0,
-            !sdf_class_is_solid(vec3<i32>(i32(ix_val), i32(iy_val), i32(iz_val) + 1)),
-            use_sdf_cache(),
-        ) {
+        && !sdf_class_is_solid(vec3<i32>(i32(ix_val), i32(iy_val), i32(iz_val) + 1)) {
         let neighbor = grid_vel[cell_index(ix_val, iy_val, iz_val + 1u)];
         vzp = select(self_vel.z, neighbor.z, neighbor.w > occupancy_mass_threshold());
     }
@@ -1533,11 +1739,7 @@ fn pressure_projection_target_divergence(
 ) -> f32 {
     let rest_volume = rest_volume_load(idx);
     let current_volume = current_volume_load(idx);
-    var target_divergence = select(
-        0.0,
-        volume_projection_target_divergence(rest_volume, current_volume),
-        kind != CELL_SURFACE_FLUID,
-    );
+    var target_divergence = volume_projection_target_divergence(rest_volume, current_volume);
     if kind == CELL_BED_COUPLED {
         let bed_idx = bed_lookup_load(idx);
         if bed_idx >= 0 && u32(bed_idx) < num_bed() {
@@ -1588,7 +1790,7 @@ fn pressure_linear_system_cell(idx: u32) -> vec2<f32> {
         }
 
         let neighbor_idx = cell_index(u32(neighbor.x), u32(neighbor.y), u32(neighbor.z));
-        let neighbor_kind = cell_kind_load(neighbor_idx);
+        let neighbor_kind = current_cell_kind(neighbor);
 
         // Solid neighbor → Neumann BC via ghost-mirror (p_ghost = p_here).
         // The standard 7-point Laplacian with a mirror ghost drops the
@@ -1625,7 +1827,7 @@ fn pressure_apply_search_direction(idx: u32) -> vec2<f32> {
     let ix_val = rem % gx();
 
     let kind = cell_kind_load(idx);
-    if !pressure_active_cell(idx, kind) {
+    if pressure_inv_diag_load(idx) <= 0.0 {
         return vec2<f32>(0.0);
     }
 
@@ -1650,17 +1852,17 @@ fn pressure_apply_search_direction(idx: u32) -> vec2<f32> {
         }
 
         let neighbor_idx = cell_index(u32(neighbor.x), u32(neighbor.y), u32(neighbor.z));
-        let neighbor_kind = cell_kind_load(neighbor_idx);
+        let neighbor_kind = current_cell_kind(neighbor);
         if is_solid_kind(neighbor_kind) {
             continue;
         }
 
-        let face_weight = pressure_face_weight(kind, self_fill, neighbor_idx, neighbor_kind);
+        let face_weight = pressure_face_weight_cached(kind, self_fill, neighbor_idx, neighbor_kind);
         if face_weight <= 0.0 {
             continue;
         }
 
-        if pressure_active_cell(neighbor_idx, neighbor_kind) {
+        if pressure_cached_active_cell(neighbor_idx) {
             let delta = d_here - cg[neighbor_idx].z;
             q += face_weight * delta;
             energy += 0.5 * face_weight * delta * delta;
@@ -1675,12 +1877,14 @@ fn pressure_apply_search_direction(idx: u32) -> vec2<f32> {
 
 @compute @workgroup_size(64)
 fn pressure_cg_init(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
-    if idx >= total_cells() { return; }
+    let list_i = gid.x;
+    if list_i >= active_grid_count() { return; }
+    let idx = active_grid_cell(list_i);
 
     let kind = cell_kind_load(idx);
     if !pressure_active_cell(idx, kind) {
         pressure_store(idx, 0.0);
+        pressure_inv_diag_store(idx, 0.0);
         cg[idx] = vec4<f32>(0.0);
         return;
     }
@@ -1690,18 +1894,35 @@ fn pressure_cg_init(@builtin(global_invocation_id) gid: vec3<u32>) {
     let r = system.y;
     if diag <= 1e-6 {
         pressure_store(idx, 0.0);
+        pressure_inv_diag_store(idx, 0.0);
         cg[idx] = vec4<f32>(0.0);
         return;
     }
 
-    let z = r / diag;
+    let inv_diag = 1.0 / diag;
+    let z = r * inv_diag;
     pressure_store(idx, 0.0);
+    pressure_inv_diag_store(idx, inv_diag);
     cg[idx] = vec4<f32>(r, z, z, 0.0);
+    let active_slot = atomicAdd(&metrics[METRIC_PRESSURE_ACTIVE_COUNT_IDX], 1u);
+    active_pressure_cell_store(active_slot, idx);
     let rz = max(r * z, 0.0);
     let rz_fixed = u32(clamp(rz * cg_dot_fp_scale(), 0.0, f32(0xffffffffu)));
     let observed_rz_fixed = u32(clamp(rz * pressure_residual_fp_scale(), 0.0, f32(0xffffffffu)));
     atomicAdd(&metrics[METRIC_CG_RZ_IDX], rz_fixed);
     atomicAdd(&metrics[METRIC_PRESSURE_INITIAL_RZ_IDX], observed_rz_fixed);
+}
+
+@compute @workgroup_size(1)
+fn pressure_active_finalize_dispatch(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if gid.x != 0u { return; }
+    let count = active_pressure_count();
+    atomicStore(
+        &metrics[METRIC_PRESSURE_ACTIVE_WORKGROUPS_X_IDX],
+        max((count + PRESSURE_REDUCE_WORKGROUP_SIZE - 1u) / PRESSURE_REDUCE_WORKGROUP_SIZE, 1u),
+    );
+    atomicStore(&metrics[METRIC_PRESSURE_ACTIVE_WORKGROUPS_Y_IDX], 1u);
+    atomicStore(&metrics[METRIC_PRESSURE_ACTIVE_WORKGROUPS_Z_IDX], 1u);
 }
 
 fn pressure_cg_converged(old_rz: f32) -> bool {
@@ -1719,70 +1940,96 @@ fn pressure_cg_clear_reductions(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 
 @compute @workgroup_size(64)
-fn pressure_cg_matvec(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
-    if idx >= total_cells() { return; }
-
-    let old_rz = f32(atomicLoad(&metrics[METRIC_CG_RZ_IDX])) * cg_dot_inv_fp_scale();
-    if pressure_cg_converged(old_rz) {
-        cg[idx].w = 0.0;
-        return;
+fn pressure_cg_matvec(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+) {
+    let list_i = gid.x;
+    var contribution = 0.0;
+    if list_i < active_pressure_count() {
+        let idx = active_pressure_cell(list_i);
+        let old_rz = f32(atomicLoad(&metrics[METRIC_CG_RZ_IDX])) * cg_dot_inv_fp_scale();
+        if pressure_cg_converged(old_rz) {
+            cg[idx].w = 0.0;
+        } else {
+            let applied = pressure_apply_search_direction(idx);
+            cg[idx].w = applied.x;
+            contribution = max(applied.y, 0.0);
+        }
     }
 
-    let applied = pressure_apply_search_direction(idx);
-    cg[idx].w = applied.x;
-    atomicAdd(
-        &metrics[METRIC_CG_PAP_IDX],
-        u32(clamp(max(applied.y, 0.0) * cg_dot_fp_scale(), 0.0, f32(0xffffffffu))),
-    );
+    pressure_reduce_values[lid.x] = contribution;
+    workgroupBarrier();
+    for (var stride = PRESSURE_REDUCE_WORKGROUP_SIZE / 2u; stride > 0u; stride = stride / 2u) {
+        if lid.x < stride {
+            pressure_reduce_values[lid.x] += pressure_reduce_values[lid.x + stride];
+        }
+        workgroupBarrier();
+    }
+    if lid.x == 0u && pressure_reduce_values[0] > 0.0 {
+        atomicAdd(
+            &metrics[METRIC_CG_PAP_IDX],
+            u32(clamp(pressure_reduce_values[0] * cg_dot_fp_scale(), 0.0, f32(0xffffffffu))),
+        );
+    }
 }
 
 @compute @workgroup_size(64)
-fn pressure_cg_apply_alpha(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
-    if idx >= total_cells() { return; }
-
-    let kind = cell_kind_load(idx);
-    if !pressure_active_cell(idx, kind) {
-        return;
+fn pressure_cg_apply_alpha(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+) {
+    let list_i = gid.x;
+    var contribution = 0.0;
+    if list_i < active_pressure_count() {
+        let idx = active_pressure_cell(list_i);
+        let inv_diag = pressure_inv_diag_load(idx);
+        if inv_diag > 0.0 {
+            let old_rz = f32(atomicLoad(&metrics[METRIC_CG_RZ_IDX])) * cg_dot_inv_fp_scale();
+            let p_ap = f32(atomicLoad(&metrics[METRIC_CG_PAP_IDX])) * cg_dot_inv_fp_scale();
+            if !pressure_cg_converged(old_rz) && p_ap > max(old_rz * 1e-5, 1e-8) {
+                let alpha = old_rz / p_ap;
+                // A Jacobi-preconditioned graph Laplacian has O(1) stable CG
+                // steps. A much larger alpha means the fixed-point global
+                // reductions have reached a numerically singular search
+                // direction; stop instead of injecting a late pressure impulse
+                // into free-surface particles.
+                if alpha <= 12.0 {
+                    let c = cg[idx];
+                    let p_new = pressure_load(idx) + alpha * c.z;
+                    let r_new = c.x - alpha * c.w;
+                    let z_new = r_new * inv_diag;
+                    pressure_store(idx, p_new);
+                    cg[idx] = vec4<f32>(r_new, z_new, c.z, c.w);
+                    contribution = max(r_new * z_new, 0.0);
+                }
+            }
+        }
     }
 
-    let old_rz = f32(atomicLoad(&metrics[METRIC_CG_RZ_IDX])) * cg_dot_inv_fp_scale();
-    let p_ap = f32(atomicLoad(&metrics[METRIC_CG_PAP_IDX])) * cg_dot_inv_fp_scale();
-    if pressure_cg_converged(old_rz) || p_ap <= max(old_rz * 1e-5, 1e-8) {
-        return;
+    pressure_reduce_values[lid.x] = contribution;
+    workgroupBarrier();
+    for (var stride = PRESSURE_REDUCE_WORKGROUP_SIZE / 2u; stride > 0u; stride = stride / 2u) {
+        if lid.x < stride {
+            pressure_reduce_values[lid.x] += pressure_reduce_values[lid.x + stride];
+        }
+        workgroupBarrier();
     }
-
-    let alpha = old_rz / p_ap;
-    // A Jacobi-preconditioned graph Laplacian has O(1) stable CG steps. A
-    // much larger alpha means the fixed-point global reductions have reached a
-    // numerically singular search direction; stop instead of injecting a late
-    // pressure impulse into free-surface particles.
-    if alpha > 12.0 {
-        return;
+    if lid.x == 0u && pressure_reduce_values[0] > 0.0 {
+        atomicAdd(
+            &metrics[METRIC_CG_NEW_RZ_IDX],
+            u32(clamp(pressure_reduce_values[0] * cg_dot_fp_scale(), 0.0, f32(0xffffffffu))),
+        );
     }
-    let c = cg[idx];
-    let p_new = pressure_load(idx) + alpha * c.z;
-    let r_new = c.x - alpha * c.w;
-    let system = pressure_linear_system_cell(idx);
-    let z_new = select(0.0, r_new / system.x, system.x > 1e-6);
-    pressure_store(idx, p_new);
-    cg[idx] = vec4<f32>(r_new, z_new, c.z, c.w);
-
-    let rz = max(r_new * z_new, 0.0);
-    atomicAdd(
-        &metrics[METRIC_CG_NEW_RZ_IDX],
-        u32(clamp(rz * cg_dot_fp_scale(), 0.0, f32(0xffffffffu))),
-    );
 }
 
 @compute @workgroup_size(64)
 fn pressure_cg_update_dir(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
-    if idx >= total_cells() { return; }
+    let list_i = gid.x;
+    if list_i >= active_pressure_count() { return; }
 
-    let kind = cell_kind_load(idx);
-    if !pressure_active_cell(idx, kind) {
+    let idx = active_pressure_cell(list_i);
+    if pressure_inv_diag_load(idx) <= 0.0 {
         return;
     }
 
@@ -1817,11 +2064,11 @@ fn pressure_residual_clear(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 @compute @workgroup_size(64)
 fn pressure_residual_measure(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
-    if idx >= total_cells() { return; }
+    let list_i = gid.x;
+    if list_i >= active_pressure_count() { return; }
 
-    let kind = cell_kind_load(idx);
-    if !pressure_active_cell(idx, kind) {
+    let idx = active_pressure_cell(list_i);
+    if pressure_inv_diag_load(idx) <= 0.0 {
         return;
     }
 
@@ -1837,14 +2084,15 @@ fn pressure_residual_measure(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 @compute @workgroup_size(64)
 fn project_pressure(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
-    if idx >= total_cells() { return; }
+    let list_i = gid.x;
+    if list_i >= active_pressure_count() { return; }
 
+    let idx = active_pressure_cell(list_i);
     let gv = grid_vel[idx];
     if gv.w < 1e-6 { return; }
 
     let kind = cell_kind_load(idx);
-    if !pressure_active_cell(idx, kind) {
+    if pressure_inv_diag_load(idx) <= 0.0 {
         return;
     }
 
@@ -1934,7 +2182,7 @@ fn packing_pressure_or_mirror(cell: vec3<i32>, mirror_pressure: f32) -> f32 {
     }
 
     let ci = cell_index(u32(cell.x), u32(cell.y), u32(cell.z));
-    let kind = cell_kind_load(ci);
+    let kind = current_cell_kind(cell);
     if is_solid_kind(kind) {
         return mirror_pressure;
     }
@@ -1946,14 +2194,16 @@ fn packing_pressure_or_mirror(cell: vec3<i32>, mirror_pressure: f32) -> f32 {
 
 @compute @workgroup_size(64)
 fn packing_prepare(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
-    if idx >= total_cells() { return; }
+    let list_i = gid.x;
+    if list_i >= active_grid_count() { return; }
+    let idx = active_grid_cell(list_i);
 
     let kind = cell_kind_load(idx);
-    // This explicit packing pressure is a dense-cell correction. Free-surface
-    // pressure should remain atmospheric; treating sparse surface cells as
-    // overpacked material creates droplet-launching penalty impulses.
-    if kind != CELL_INTERIOR_FLUID {
+    // This explicit packing pressure is a dense-cell correction. Sparse
+    // free-surface pressure remains atmospheric; only floor-supported surface
+    // cells get the correction so a settled pool cannot represent its support
+    // purely as particle compression.
+    if !packing_active_cell(idx, kind) {
         packing_pressure_store(idx, 0.0);
         return;
     }
@@ -1968,8 +2218,9 @@ fn packing_prepare(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 @compute @workgroup_size(64)
 fn packing_apply(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
-    if idx >= total_cells() { return; }
+    let list_i = gid.x;
+    if list_i >= active_grid_count() { return; }
+    let idx = active_grid_cell(list_i);
 
     let gv = grid_vel[idx];
     if gv.w <= occupancy_mass_threshold() {
@@ -1977,7 +2228,7 @@ fn packing_apply(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     let kind = cell_kind_load(idx);
-    if kind != CELL_INTERIOR_FLUID {
+    if !packing_active_cell(idx, kind) {
         return;
     }
 
@@ -2013,8 +2264,9 @@ fn packing_apply(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 @compute @workgroup_size(64)
 fn boundary_project(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
-    if idx >= total_cells() { return; }
+    let list_i = gid.x;
+    if list_i >= active_grid_count() { return; }
+    let idx = active_grid_cell(list_i);
 
     let gv = grid_vel[idx];
     if gv.w < 1e-6 { return; }
@@ -2661,22 +2913,13 @@ fn prepare_render(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 // ── metrics_clear ──
 
-const METRICS_SLOT_COUNT: u32 = 10u;
+const METRICS_SLOT_COUNT: u32 = 18u;
 
 @compute @workgroup_size(8)
 fn metrics_clear(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
     if idx >= METRICS_SLOT_COUNT { return; }
     atomicStore(&metrics[idx], 0u);
-}
-
-// ── bed_lookup_clear ──
-
-@compute @workgroup_size(64)
-fn bed_lookup_clear(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
-    if idx >= total_cells() { return; }
-    atomicStore(&bed_lookup[idx], -1);
 }
 
 // ── bed_lookup_scatter ──
@@ -2703,7 +2946,7 @@ fn bed_lookup_scatter(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     let pos = particles[pid].pos.xyz;
     let cell = world_to_cell(pos);
-    let id = i32(bid);
+    let id = i32(bid + 1u);
 
     for (var di = -1; di <= 1; di++) {
         for (var dj = -1; dj <= 1; dj++) {

@@ -74,6 +74,12 @@ fn water_diagnostics_object(
     set_number(&obj, "kineticEnergy", diagnostics.kinetic_energy)?;
     set_number(
         &obj,
+        "gravitationalPotentialEnergy",
+        diagnostics.gravitational_potential_energy,
+    )?;
+    set_number(&obj, "totalEnergy", diagnostics.total_energy)?;
+    set_number(
+        &obj,
         "rmsSpeedMetersPerSecond",
         diagnostics.rms_speed * mpm_3d::units::METERS_PER_SIM_UNIT,
     )?;
@@ -428,22 +434,25 @@ impl WasmSim3D {
     }
 
     #[wasm_bindgen(js_name = refreshMetrics)]
-    pub async fn refresh_metrics(&mut self) -> Result<(), JsValue> {
-        // Clone the internal Arc-backed `wgpu::Device` / `wgpu::Queue` so we
-        // can hold them across the await point without overlapping
-        // `&mut self.sim`. The clones are cheap — just `Arc::clone` under
-        // the hood.
+    pub fn refresh_metrics(&self) -> js_sys::Promise {
+        let readback = self.sim.metrics_readback();
         let device = self.renderer.device().clone();
         let queue = self.renderer.queue().clone();
-        self.sim.refresh_metrics(&device, &queue).await
+        wasm_bindgen_futures::future_to_promise(async move {
+            readback.read(device, queue).await?;
+            Ok(JsValue::UNDEFINED)
+        })
     }
 
     #[wasm_bindgen(js_name = waterDiagnostics)]
-    pub async fn water_diagnostics(&self) -> Result<JsValue, JsValue> {
+    pub fn water_diagnostics(&self) -> js_sys::Promise {
+        let readback = self.sim.water_diagnostics_readback();
         let device = self.renderer.device().clone();
         let queue = self.renderer.queue().clone();
-        let diagnostics = self.sim.water_diagnostics(&device, &queue).await?;
-        Ok(water_diagnostics_object(diagnostics)?.into())
+        wasm_bindgen_futures::future_to_promise(async move {
+            let diagnostics = readback.read(device, queue).await?;
+            Ok(water_diagnostics_object(diagnostics)?.into())
+        })
     }
 
     #[wasm_bindgen(js_name = maxAbsDivergence)]
@@ -469,6 +478,16 @@ impl WasmSim3D {
     #[wasm_bindgen(js_name = massOverflowFires)]
     pub fn mass_overflow_fires(&self) -> u32 {
         self.sim.latest_metrics().mass_overflow_fires
+    }
+
+    #[wasm_bindgen(js_name = pressureActiveCellCount)]
+    pub fn pressure_active_cell_count(&self) -> u32 {
+        self.sim.latest_metrics().pressure_active_cells
+    }
+
+    #[wasm_bindgen(js_name = gridActiveCellCount)]
+    pub fn grid_active_cell_count(&self) -> u32 {
+        self.sim.latest_metrics().grid_active_cells
     }
 
     #[wasm_bindgen(js_name = pressureResidualInitial)]

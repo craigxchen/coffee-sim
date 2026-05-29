@@ -8,6 +8,11 @@ on:
         type: string
         required: false
         default: "600"
+      pressure_cg_iterations:
+        description: "Pressure-CG iterations per substep for long-horizon diagnostics; increase for local quality sweeps."
+        type: string
+        required: false
+        default: "24"
   schedule:
     - cron: "0 9 * * *"
 
@@ -24,6 +29,7 @@ env:
   WGPU_BACKEND: vulkan
   COFFEE_SIM_LONG_SETTLE_FRAMES: ${{ inputs.settle_frames || '600' }}
   COFFEE_SIM_LONG_SETTLE_LOG_FRAMES: "120"
+  COFFEE_SIM_LONG_HORIZON_PRESSURE_CG_ITERATIONS: ${{ inputs.pressure_cg_iterations || '24' }}
   COFFEE_SIM_SHAPE_SETTLE_FRAMES: "240"
 
 jobs:
