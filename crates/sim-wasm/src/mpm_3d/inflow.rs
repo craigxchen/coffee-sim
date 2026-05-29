@@ -228,6 +228,11 @@ fn aperture_sample_offset(
         .wrapping_add(pair_index);
     let angle_hash = hash_u32(sample_key ^ 0x85eb_ca6b);
     let radius_hash = hash_u32(sample_key ^ 0xc2b2_ae35);
+    // Push samples off the dead-center axis. Without this floor a single
+    // sample at the exact origin pins the jet to a one-particle-wide column
+    // and visible ringing develops along the central streamline. Sampling
+    // uniformly in area (sqrt of the fraction) then keeps the disk coverage
+    // even outside the small inner exclusion.
     let radial_fraction = unit_float_from_hash(radius_hash).max(0.12);
     let theta = unit_float_from_hash(angle_hash) * std::f32::consts::TAU;
     let radius = nozzle_radius * radial_fraction.sqrt();
@@ -410,7 +415,10 @@ mod tests {
     }
 
     #[test]
-    fn emission_age_backdates_samples_downstream() {
+    fn emission_age_advects_samples_along_jet_axis() {
+        // Samples are forward-extrapolated by `emission_age * velocity`, so
+        // larger ages land further along the jet (downward, for the default
+        // vertical spout). Lateral coordinates are untouched.
         let dir = SpoutSettings::default().emission_direction();
         let velocity = aperture_jet_velocity(dir, 12.0);
         let origin = Vec3::new(0.0, 7.0, 0.0);
