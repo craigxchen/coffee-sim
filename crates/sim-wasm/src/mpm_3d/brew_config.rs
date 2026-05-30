@@ -45,10 +45,11 @@ pub(crate) const DEFAULT_BREW: BrewConfig = BrewConfig {
     // Kozeny-Carman estimate, so finer grind lowers flow roughly with d^2.
     grind_diameter_um: 450.0,
     bed_porosity: 0.40,
-    // Preserve the calibrated sample density; runtime budgeting is enforced
-    // by the recipe cap instead of making each sample carry extra material.
+    // Keep the bed shape resolution, but run water as coarse-grained
+    // realtime samples. Mass and represented rest volume scale per particle
+    // so a fixed milliliter pour carries the same fluid amount.
     bed_particle_samples: 12_000,
-    water_particles_per_ml: 320.0,
+    water_particles_per_ml: 160.0,
     water_mass_units_per_ml: 80.0,
     water_sample_radius_dx: 0.18,
     bed_sample_radius_dx: 0.62,
@@ -125,16 +126,17 @@ mod tests {
     }
 
     #[test]
-    fn default_water_sampling_preserves_calibrated_density() {
+    fn default_water_sampling_preserves_recipe_mass_and_volume_density() {
         let represented_mass_per_ml =
             DEFAULT_BREW.water_particle_mass_units() * DEFAULT_BREW.water_particles_per_ml;
+        let represented_volume_samples_per_ml =
+            DEFAULT_BREW.water_particle_volume_scale() * DEFAULT_BREW.water_particles_per_ml;
 
-        assert_eq!(
-            DEFAULT_BREW.water_particles_per_ml,
-            VOLUME_CALIBRATION_WATER_PARTICLES_PER_ML
-        );
-        assert_eq!(DEFAULT_BREW.water_particle_volume_scale(), 1.0);
         assert!((represented_mass_per_ml - DEFAULT_BREW.water_mass_units_per_ml).abs() <= 1e-6);
+        assert!(
+            (represented_volume_samples_per_ml - VOLUME_CALIBRATION_WATER_PARTICLES_PER_ML).abs()
+                <= 1e-6
+        );
     }
 
     #[test]
