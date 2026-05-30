@@ -320,6 +320,19 @@ fn active_grid_cell_store(list_i: u32, cell: u32) {
     cg[active_grid_list_idx(list_i)] = vec4<f32>(f32(cell), 0.0, 0.0, 0.0);
 }
 
+// Per-cell cached liquid fill fraction (region 4 of `cg`). Assembled once in
+// `pressure_linear_system_cell` (init) so the matvec reads neighbours' fill as
+// a single load instead of re-running the 6-neighbour scan every iteration.
+fn cg_fill_idx(cell: u32) -> u32 {
+    return 3u * total_cells() + cell;
+}
+fn cg_fill_store(cell: u32, value: f32) {
+    cg[cg_fill_idx(cell)] = vec4<f32>(value, 0.0, 0.0, 0.0);
+}
+fn cg_fill_load(cell: u32) -> f32 {
+    return cg[cg_fill_idx(cell)].x;
+}
+
 fn pressure_or_mirror(cell: vec3<i32>, mirror_pressure: f32) -> f32 {
     if cell.x < 0 || cell.y < 0 || cell.z < 0 {
         return mirror_pressure;
@@ -485,6 +498,30 @@ fn pressure_face_weight_cached(
     }
 
     return min(self_fill, liquid_fill_fraction(neighbor_cell, neighbor_kind));
+}
+
+// Identical to `pressure_face_weight_cached` but reads the neighbour's liquid
+// fill fraction from the per-cell cache (`cg_fill_load`) instead of recomputing
+// the 6-neighbour scan. The cache is populated in init for every active
+// pressure cell, which is exactly the set this branch reads (the
+// `pressure_cached_active_cell` neighbours), so the result is identical.
+fn pressure_face_weight_fillcached(
+    self_kind: i32,
+    self_fill: f32,
+    neighbor_cell: u32,
+    neighbor_kind: i32,
+) -> f32 {
+    if is_solid_kind(neighbor_kind) {
+        return 0.0;
+    }
+    if self_kind == CELL_BED_COUPLED || neighbor_kind == CELL_BED_COUPLED {
+        return 1.0;
+    }
+    if !pressure_cached_active_cell(neighbor_cell) {
+        return self_fill;
+    }
+
+    return min(self_fill, cg_fill_load(neighbor_cell));
 }
 
 fn pressure_weighted_or_mirror(
@@ -1789,6 +1826,10 @@ fn pressure_linear_system_cell(idx: u32) -> vec2<f32> {
 
     var diag = 0.0;
     let self_fill = liquid_fill_fraction(idx, kind);
+    // Cache this cell's fill for the matvec (read as a neighbour every CG
+    // iteration). The init pass finishes before the matvec pass, so the cache
+    // is fully populated for every active pressure cell by the time it is read.
+    cg_fill_store(idx, self_fill);
     let offsets = array<vec3<i32>, 6>(
         vec3<i32>(-1, 0, 0),
         vec3<i32>(1, 0, 0),
@@ -1849,7 +1890,7 @@ fn pressure_apply_search_direction(idx: u32) -> vec2<f32> {
         return vec2<f32>(0.0);
     }
 
-    let self_fill = liquid_fill_fraction(idx, kind);
+    let self_fill = cg_fill_load(idx);
     let d_here = cg[idx].z;
     var q = 0.0;
     var energy = 0.0;
@@ -1875,7 +1916,7 @@ fn pressure_apply_search_direction(idx: u32) -> vec2<f32> {
             continue;
         }
 
-        let face_weight = pressure_face_weight_cached(kind, self_fill, neighbor_idx, neighbor_kind);
+        let face_weight = pressure_face_weight_fillcached(kind, self_fill, neighbor_idx, neighbor_kind);
         if face_weight <= 0.0 {
             continue;
         }

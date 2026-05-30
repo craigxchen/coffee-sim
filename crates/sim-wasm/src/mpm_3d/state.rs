@@ -139,10 +139,12 @@ impl MpmBuffers {
 
         let cg = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("mpm pressure cg scratch"),
-            // Three vec4 regions: per-cell CG state/cache, active pressure
-            // cell ids, then active grid cell ids. Cell ids are stored as
-            // exactly representable f32s to avoid another storage binding.
-            size: (3 * total_cells * 16) as u64,
+            // Four vec4 regions: per-cell CG state/cache, active pressure cell
+            // ids, active grid cell ids, then a per-cell cached operator field
+            // (liquid fill fraction, assembled once in init so the matvec does
+            // not re-scan it every iteration). Cell ids are stored as exactly
+            // representable f32s to avoid another storage binding.
+            size: (4 * total_cells * 16) as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
