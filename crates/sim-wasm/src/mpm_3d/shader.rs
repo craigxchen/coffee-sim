@@ -505,6 +505,13 @@ fn pressure_face_weight_cached(
 // the 6-neighbour scan. The cache is populated in init for every active
 // pressure cell, which is exactly the set this branch reads (the
 // `pressure_cached_active_cell` neighbours), so the result is identical.
+//
+// Invariant this relies on: init caches `liquid_fill_fraction(cell,
+// cell_kind_load(cell))`, while the matvec wants it evaluated at
+// `current_cell_kind(neighbour)`. Those kinds are equal for the cached set
+// because `classify_cells` runs immediately before `pressure_cg_init` over the
+// same active-grid list, so the stored kind matches the live SDF/occupancy
+// classification. Keep classify → init adjacent in the dispatch order.
 fn pressure_face_weight_fillcached(
     self_kind: i32,
     self_fill: f32,
