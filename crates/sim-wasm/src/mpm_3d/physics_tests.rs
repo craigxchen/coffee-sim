@@ -2203,14 +2203,19 @@ fn bed_settling_stability() {
         "dry bed collapsed to a near-point: {:?}",
         snapshot
     );
+    // Strict bounds: a quiescent, settled bed must stay strictly inside the J
+    // clamp band — sitting *on* the clamp means the bed is over-compressed/
+    // expanded right up to the safety rail, which the non-strict form silently
+    // accepts. Strictness still permits any stiffness tuning that keeps a
+    // settled bed off the rail (the physically expected state).
     assert!(
-        snapshot.min_j >= PARTICLE_J_MIN,
-        "dry bed over-compressed during settle: {:?}",
+        snapshot.min_j > PARTICLE_J_MIN,
+        "dry bed over-compressed during settle (riding the J clamp): {:?}",
         snapshot
     );
     assert!(
-        snapshot.max_j <= PARTICLE_J_MAX,
-        "dry bed over-expanded during settle: {:?}",
+        snapshot.max_j < PARTICLE_J_MAX,
+        "dry bed over-expanded during settle (riding the J clamp): {:?}",
         snapshot
     );
 }
@@ -2248,7 +2253,7 @@ fn bed_long_run_creep_is_bounded_without_water() {
         late
     );
     assert!(
-        late.min_j >= PARTICLE_J_MIN,
+        late.min_j > PARTICLE_J_MIN,
         "dry bed hit the compaction clamp during long-run settle: {:?}",
         late
     );
