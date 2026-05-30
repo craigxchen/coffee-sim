@@ -90,6 +90,28 @@ const BED_DELTA_IMPULSE_Z_LANE: u32 = 3u;
 const BED_REACTION_ALPHA: f32 = 0.04;
 const BED_REACTION_IMPULSE_CAP: f32 = 0.012;
 
+// ── Pressure CG solver tuning ──
+// These guardrails exist because the CG inner products (r·z, pᵀAp) are
+// accumulated into u32 atomics — integer-quantized, which loses exact CG
+// conjugacy. The alpha cap and the beta clamp/restart compensate for that lost
+// conjugacy and are LOAD-BEARING: GPU regression tests diverge if they are
+// loosened. Centralized here so the solver's fragile knobs are legible in one
+// place. The principled fix for the fragility is float reductions instead of
+// fixed-point atomics, after which most of these could be relaxed or removed.
+const PRESSURE_MIN_DIAGONAL: f32 = 1e-6;   // drop isolated cells (no fluid faces) from the solve
+const CG_CONVERGENCE_REL_TOL: f32 = 1e-4;  // converged when weighted residual drops 4 orders vs initial
+const CG_RZ_ABS_FLOOR: f32 = 1e-8;         // absolute residual floor for near-zero baselines
+const CG_ALPHA_GATE_REL: f32 = 1e-5;       // skip the step when pᵀAp is tiny vs old_rz (near-singular direction)
+const CG_RZ_DIVIDE_EPS: f32 = 1e-12;       // divide-by-zero guard for beta = new_rz / old_rz
+const CG_MAX_ALPHA: f32 = 12.0;            // step-length cap; alpha ≫ 1 means a quantization-singular direction
+const CG_MAX_BETA: f32 = 0.95;             // cap direction-history reuse against quantization-inflated beta
+const CG_BETA_RESTART_RATIO: f32 = 0.98;   // restart as steepest descent when the residual stops shrinking
+
+// ── Free-surface / continuum classification ──
+const MIN_LATERAL_FLUID_FACES: u32 = 2u;   // ≥2 filled lateral neighbours required to join the pressure domain
+const CUP_RIM_Y: f32 = -3.5;               // cup mouth plane (matches the cup obstacle top_y); cells above stay particle-resolved
+const DENSE_CELL_MASS_FACTOR: f32 = 4.0;   // grid mass (× nominal) that counts as a "dense" / well-packed cell
+
 // ── Helpers ──
 
 fn gx() -> u32 { return u.grid_dims.x; }
@@ -823,7 +845,7 @@ fn surface_pressure_has_continuum_support(cell: u32) -> bool {
     // it is the boundary of a locally supported liquid volume: at least one
     // fluid cell below carries hydrostatic support, and lateral fluid faces
     // distinguish a pool/sheet surface from an isolated falling stream.
-    return lower_fluid_support && lateral_fluid_faces >= 2u;
+    return lower_fluid_support && lateral_fluid_faces >= MIN_LATERAL_FLUID_FACES;
 }
 
 fn interior_pressure_has_continuum_support(cell: u32) -> bool {
@@ -840,7 +862,7 @@ fn interior_pressure_has_continuum_support(cell: u32) -> bool {
     // Under-filled interior cells need a receiving body of water, not merely
     // other falling samples. The cup boundary is the water-only reservoir; bed
     // support is handled separately through CELL_BED_COUPLED.
-    if self_center.y > -3.5 {
+    if self_center.y > CUP_RIM_Y {
         return false;
     }
 
@@ -877,7 +899,7 @@ fn interior_pressure_has_continuum_support(cell: u32) -> bool {
         }
     }
 
-    return lower_hydro_support && lateral_fluid_faces >= 2u;
+    return lower_hydro_support && lateral_fluid_faces >= MIN_LATERAL_FLUID_FACES;
 }
 
 fn pressure_active_cell(cell: u32, kind: i32) -> bool {
@@ -1004,7 +1026,7 @@ fn sample_sdf(position: vec3<f32>) -> f32 {
         result = cone_radius - length(position.xz) - obstacle_wall_half_thickness();
     }
 
-    let cup_top_y = -3.5;
+    let cup_top_y = CUP_RIM_Y;
     let cup_bot_y = -8.0;
     if position.y <= cup_top_y {
         let radial_sd = 3.0 - length(position.xz);
@@ -1189,7 +1211,7 @@ fn resolve_scene_obstacles(position: vec3<f32>, velocity: vec3<f32>, is_bed: boo
     // effective fluid surface is inset by half the obstacle wall thickness. Keep
     // this analytic guard on the same surface so floor/wall contacts cannot
     // create a second visible boundary layer.
-    if out_pos.y <= -3.5 {
+    if out_pos.y <= CUP_RIM_Y {
         let cup_radius = 3.0 - obstacle_wall_half_thickness() - contact_offset();
         let cup_contact = resolve_radial_barrier(out_pos, out_vel, vec2<f32>(0.0, 0.0), cup_radius);
         out_pos = cup_contact.pos;
@@ -1888,7 +1910,7 @@ fn pressure_cg_init(@builtin(global_invocation_id) gid: vec3<u32>) {
     let system = pressure_linear_system_cell(idx);
     let diag = system.x;
     let r = system.y;
-    if diag <= 1e-6 {
+    if diag <= PRESSURE_MIN_DIAGONAL {
         pressure_store(idx, 0.0);
         pressure_inv_diag_store(idx, 0.0);
         cg[idx] = vec4<f32>(0.0);
@@ -1924,7 +1946,7 @@ fn pressure_active_finalize_dispatch(@builtin(global_invocation_id) gid: vec3<u3
 fn pressure_cg_converged(old_rz: f32) -> bool {
     let initial_rz =
         f32(atomicLoad(&metrics[METRIC_PRESSURE_INITIAL_RZ_IDX])) / pressure_residual_fp_scale();
-    let converged_rz = max(initial_rz * 1e-4, 1e-8);
+    let converged_rz = max(initial_rz * CG_CONVERGENCE_REL_TOL, CG_RZ_ABS_FLOOR);
     return old_rz <= converged_rz;
 }
 
@@ -1976,14 +1998,14 @@ fn pressure_cg_apply_alpha(
         if inv_diag > 0.0 {
             let old_rz = f32(atomicLoad(&metrics[METRIC_CG_RZ_IDX]));
             let p_ap = f32(atomicLoad(&metrics[METRIC_CG_PAP_IDX]));
-            if !pressure_cg_converged(old_rz) && p_ap > max(old_rz * 1e-5, 1e-8) {
+            if !pressure_cg_converged(old_rz) && p_ap > max(old_rz * CG_ALPHA_GATE_REL, CG_RZ_ABS_FLOOR) {
                 let alpha = old_rz / p_ap;
                 // A Jacobi-preconditioned graph Laplacian has O(1) stable CG
                 // steps. A much larger alpha means the fixed-point global
                 // reductions have reached a numerically singular search
                 // direction; stop instead of injecting a late pressure impulse
                 // into free-surface particles.
-                if alpha <= 12.0 {
+                if alpha <= CG_MAX_ALPHA {
                     let c = cg[idx];
                     let p_new = pressure_load(idx) + alpha * c.z;
                     let r_new = c.x - alpha * c.w;
@@ -2027,12 +2049,12 @@ fn pressure_cg_update_dir(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
     let new_rz = f32(atomicLoad(&metrics[METRIC_CG_NEW_RZ_IDX]));
-    let beta_raw = select(0.0, new_rz / old_rz, old_rz > 1e-12);
+    let beta_raw = select(0.0, new_rz / old_rz, old_rz > CG_RZ_DIVIDE_EPS);
     // Fixed-point reductions and changing free-surface stencils can lose CG
     // conjugacy. Restart as preconditioned steepest descent when the weighted
     // residual grows; otherwise the next direction can keep feeding the same
     // pressure error back into the liquid head.
-    let beta = select(clamp(beta_raw, 0.0, 0.95), 0.0, new_rz > old_rz * 0.98);
+    let beta = select(clamp(beta_raw, 0.0, CG_MAX_BETA), 0.0, new_rz > old_rz * CG_BETA_RESTART_RATIO);
     let c = cg[idx];
     cg[idx] = vec4<f32>(c.x, c.y, c.y + beta * c.z, c.w);
 }
@@ -2395,9 +2417,9 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>) {
         new_C2 *= inv_supported;
     }
     let in_cup_volume =
-        xp.y < -3.5 && dot(xp.xz, xp.xz) < (3.0 + contact_offset()) * (3.0 + contact_offset());
+        xp.y < CUP_RIM_Y && dot(xp.xz, xp.xz) < (3.0 + contact_offset()) * (3.0 + contact_offset());
     let dense_support_ratio =
-        clamp(local_grid_mass / max(nominal_mass() * 4.0, 1e-6), 0.0, 1.0);
+        clamp(local_grid_mass / max(nominal_mass() * DENSE_CELL_MASS_FACTOR, 1e-6), 0.0, 1.0);
     // Use the particle's interpolation stencil rather than a single home-cell
     // bed lookup so particles exiting the coffee bed do not toggle abruptly
     // between porous and airborne transfer behavior at cell boundaries.
@@ -2431,7 +2453,7 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>) {
     // support is low compared with a compact fluid region.
     let airborne = porous_overlap <= 0.05 && sample_sdf(xp) > contact_offset() * 2.0;
     if airborne {
-        let dense_mass = nominal_mass() * 4.0;
+        let dense_mass = nominal_mass() * DENSE_CELL_MASS_FACTOR;
         let density_ratio = clamp(local_grid_mass / max(dense_mass, 1e-6), 0.0, 1.0);
         j_update_support = min(j_update_support, density_ratio);
         let ballistic_v = vec3<f32>(p.vel.x, p.vel.y + gravity() * dt(), p.vel.z);
