@@ -577,34 +577,7 @@ fn readback_water_particle_volume_snapshot(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
 ) -> WaterParticleVolumeSnapshot {
-    let particle_count = (sim.num_water + sim.num_bed) as usize;
-    let particle_size = (particle_count * 32).max(4) as u64;
-
-    let staging = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("water particle volume staging"),
-        size: particle_size,
-        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-        mapped_at_creation: false,
-    });
-
-    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-        label: Some("water particle volume readback"),
-    });
-    encoder.copy_buffer_to_buffer(&sim.buffers.particles, 0, &staging, 0, particle_size);
-    queue.submit(Some(encoder.finish()));
-
-    let slice = staging.slice(..);
-    let (tx, rx) = mpsc::channel();
-    slice.map_async(wgpu::MapMode::Read, move |result| {
-        tx.send(result).expect("water particle volume map callback");
-    });
-    let _ = device.poll(wgpu::PollType::wait_indefinitely());
-    rx.recv()
-        .expect("water particle volume map recv")
-        .expect("water particle volume map");
-
-    let view = slice.get_mapped_range();
-    let data = cast_slice::<u8, f32>(&view);
+    let data = readback_particle_data(sim, device, queue, "water particle volume staging");
 
     let particle_vol = water_particle_rest_volume(&sim.settings);
     let nominal_mass = nominal_water_particle_mass();
@@ -648,8 +621,6 @@ fn readback_water_particle_volume_snapshot(
             max_j = j;
         }
     }
-    drop(view);
-    staging.unmap();
 
     let n = active_count.max(1) as f64;
     WaterParticleVolumeSnapshot {
@@ -669,34 +640,7 @@ fn readback_water_grid_packing_snapshot(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
 ) -> WaterGridPackingSnapshot {
-    let particle_count = (sim.num_water + sim.num_bed) as usize;
-    let particle_size = (particle_count * 32).max(4) as u64;
-
-    let staging = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("water grid packing staging"),
-        size: particle_size,
-        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-        mapped_at_creation: false,
-    });
-
-    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-        label: Some("water grid packing readback"),
-    });
-    encoder.copy_buffer_to_buffer(&sim.buffers.particles, 0, &staging, 0, particle_size);
-    queue.submit(Some(encoder.finish()));
-
-    let slice = staging.slice(..);
-    let (tx, rx) = mpsc::channel();
-    slice.map_async(wgpu::MapMode::Read, move |result| {
-        tx.send(result).expect("water grid packing map callback");
-    });
-    let _ = device.poll(wgpu::PollType::wait_indefinitely());
-    rx.recv()
-        .expect("water grid packing map recv")
-        .expect("water grid packing map");
-
-    let view = slice.get_mapped_range();
-    let data = cast_slice::<u8, f32>(&view);
+    let data = readback_particle_data(sim, device, queue, "water grid packing staging");
 
     let [gx, gy, gz] = sim.settings.grid_dims;
     let dx = sim.settings.bounds_size.x / gx as f32;
@@ -787,9 +731,6 @@ fn readback_water_grid_packing_snapshot(
         }
     }
 
-    drop(view);
-    staging.unmap();
-
     let mut deposited_rest_volume = 0.0_f32;
     let mut deposited_current_volume = 0.0_f32;
     let mut max_rest_fraction = 0.0_f32;
@@ -856,34 +797,7 @@ fn readback_water_velocity_snapshot_in_y_range(
     y_min: f32,
     y_max: f32,
 ) -> WaterVelocitySnapshot {
-    let particle_count = (sim.num_water + sim.num_bed) as usize;
-    let particle_size = (particle_count * 32).max(4) as u64;
-
-    let staging = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("water velocity staging"),
-        size: particle_size,
-        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-        mapped_at_creation: false,
-    });
-
-    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-        label: Some("water velocity readback"),
-    });
-    encoder.copy_buffer_to_buffer(&sim.buffers.particles, 0, &staging, 0, particle_size);
-    queue.submit(Some(encoder.finish()));
-
-    let slice = staging.slice(..);
-    let (tx, rx) = mpsc::channel();
-    slice.map_async(wgpu::MapMode::Read, move |result| {
-        tx.send(result).expect("water velocity map callback");
-    });
-    let _ = device.poll(wgpu::PollType::wait_indefinitely());
-    rx.recv()
-        .expect("water velocity map recv")
-        .expect("water velocity map");
-
-    let view = slice.get_mapped_range();
-    let data = cast_slice::<u8, f32>(&view);
+    let data = readback_particle_data(sim, device, queue, "water velocity staging");
 
     let inactive_thresh = inactive_water_mass_threshold();
     let start = sim.num_bed as usize;
@@ -925,8 +839,6 @@ fn readback_water_velocity_snapshot_in_y_range(
         momentum[1] += mass * vy;
         momentum[2] += mass * vz;
     }
-    drop(view);
-    staging.unmap();
 
     let n = active_count.max(1) as f32;
     WaterVelocitySnapshot {

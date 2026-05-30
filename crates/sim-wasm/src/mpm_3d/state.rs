@@ -22,7 +22,16 @@ pub(crate) const SDF_RES: u32 = 128;
 /// Number of `u32` slots in the metrics buffer. Keep in sync with the indices
 /// in `shader.rs` (`METRIC_*_IDX`).
 pub(crate) const METRICS_SLOT_COUNT: usize = 18;
+pub(crate) const METRIC_MAX_ABS_DIV_IDX: usize = 0;
+pub(crate) const METRIC_FLUID_CELLS_IDX: usize = 1;
+pub(crate) const METRIC_DIV_CLAMP_FIRES_IDX: usize = 2;
+pub(crate) const METRIC_PRESSURE_CLAMP_FIRES_IDX: usize = 3;
+pub(crate) const METRIC_MASS_OVERFLOW_FIRES_IDX: usize = 4;
+pub(crate) const METRIC_PRESSURE_INITIAL_RZ_IDX: usize = 8;
+pub(crate) const METRIC_PRESSURE_FINAL_RZ_IDX: usize = 9;
+pub(crate) const METRIC_PRESSURE_ACTIVE_COUNT_IDX: usize = 10;
 pub(crate) const METRIC_PRESSURE_ACTIVE_WORKGROUPS_X_IDX: usize = 11;
+pub(crate) const METRIC_GRID_ACTIVE_COUNT_IDX: usize = 14;
 pub(crate) const METRIC_GRID_ACTIVE_WORKGROUPS_X_IDX: usize = 15;
 /// Fixed-point scale used by the `MAX_ABS_DIV` slot — divergence is already a
 /// moderate-magnitude quantity, so a smaller scale keeps the atomic headroom

@@ -1,4 +1,4 @@
-import init, { WasmSim3D } from "./pkg/coffee_sim_wasm.js?v=debug-timeseries-7";
+import init, { WasmSim3D } from "./pkg/coffee_sim_wasm.js?v=perf-60hz-2";
 
 const canvas = document.getElementById("sim-canvas");
 const viewCubeStage = document.getElementById("view-cube-stage");
@@ -62,6 +62,8 @@ let diagnosticsFrameCounter = DIAGNOSTICS_REFRESH_INTERVAL;
 let diagnosticsRefreshInFlight = false;
 const TIMESERIES_SAMPLE_INTERVAL = 6;
 const TIMESERIES_MAX_SAMPLES = 720;
+const HUD_REFRESH_INTERVAL = 6;
+const MAX_RENDER_DPR = 1.0;
 const AUTO_PAUSE_DELAY_MS = 30_000;
 
 let app;
@@ -117,6 +119,7 @@ let spoutZ = 0.0;
 let spoutPlaneDragging = false;
 let latestWaterDiagnostics = null;
 let timeseriesFrameCounter = TIMESERIES_SAMPLE_INTERVAL;
+let hudFrameCounter = HUD_REFRESH_INTERVAL;
 const timeseriesSamples = [];
 const integerFormatter = new Intl.NumberFormat();
 const TIMESERIES_CHARTS = [
@@ -420,7 +423,7 @@ document.addEventListener("keydown", (event) => {
 });
 
 function resizeCanvas() {
-  const dpr = window.devicePixelRatio || 1;
+  const dpr = Math.min(window.devicePixelRatio || 1, MAX_RENDER_DPR);
   const rect = canvas.getBoundingClientRect();
   canvas.width = Math.round(rect.width * dpr);
   canvas.height = Math.round(rect.height * dpr);
@@ -462,7 +465,7 @@ function animate(timestamp) {
   app.render();
   updateViewCube();
   updateFps(wallFrameTime);
-  syncUi();
+  maybeSyncUi();
   maybeCollectTimeseriesSample();
   if (!maybeRefreshMetrics()) {
     maybeRefreshDiagnostics();
@@ -503,6 +506,7 @@ function clearAutoPauseTimer() {
 }
 
 function maybeRefreshMetrics() {
+  if (!debugPanelVisible() && !timeseriesDrawerOpen()) return false;
   if (metricsRefreshInFlight) return false;
   metricsFrameCounter += 1;
   if (metricsFrameCounter < METRICS_REFRESH_INTERVAL) return false;
@@ -521,6 +525,7 @@ function maybeRefreshMetrics() {
 }
 
 function maybeRefreshDiagnostics() {
+  if (!debugPanelVisible() && !timeseriesDrawerOpen()) return false;
   if (diagnosticsRefreshInFlight) return false;
   diagnosticsFrameCounter += 1;
   if (diagnosticsFrameCounter < DIAGNOSTICS_REFRESH_INTERVAL) return false;
@@ -550,6 +555,14 @@ function releaseReadbackLock(release) {
   });
 }
 
+function debugPanelVisible() {
+  return !debugStats.classList.contains("hidden");
+}
+
+function timeseriesDrawerOpen() {
+  return timeseriesDrawer.classList.contains("is-open");
+}
+
 function setTimeseriesDrawerExpanded(expanded) {
   timeseriesDrawer.classList.toggle("is-open", expanded);
   toggleTimeseriesButton.setAttribute("aria-expanded", expanded ? "true" : "false");
@@ -557,7 +570,11 @@ function setTimeseriesDrawerExpanded(expanded) {
     setTimeseriesMenuOpen(false);
   }
   if (expanded) {
-    renderTimeseriesCharts();
+    if (app) {
+      collectTimeseriesSample();
+    } else {
+      renderTimeseriesCharts();
+    }
   }
 }
 
@@ -662,7 +679,7 @@ function resetTimeseries() {
 }
 
 function maybeCollectTimeseriesSample() {
-  if (paused) return;
+  if (paused || !timeseriesDrawerOpen()) return;
   timeseriesFrameCounter += 1;
   if (timeseriesFrameCounter < TIMESERIES_SAMPLE_INTERVAL) return;
   timeseriesFrameCounter = 0;
@@ -699,11 +716,19 @@ function collectTimeseriesSample() {
   renderTimeseriesCharts();
 }
 
+function maybeSyncUi() {
+  hudFrameCounter += 1;
+  if (hudFrameCounter < HUD_REFRESH_INTERVAL) return;
+  hudFrameCounter = 0;
+  syncUi();
+}
+
 function optionalAppMetric(methodName) {
   return typeof app[methodName] === "function" ? app[methodName]() : NaN;
 }
 
 function renderTimeseriesCharts() {
+  if (!timeseriesDrawerOpen()) return;
   for (const definition of TIMESERIES_CHARTS) {
     const visible = visibleTimeseriesKeys.has(definition.key);
     definition.card.hidden = !visible;
@@ -727,7 +752,7 @@ function drawSparkline(definition, latest) {
   const rect = chart.getBoundingClientRect();
   const width = Math.max(1, Math.round(rect.width));
   const height = Math.max(1, Math.round(rect.height));
-  const dpr = window.devicePixelRatio || 1;
+  const dpr = Math.min(window.devicePixelRatio || 1, MAX_RENDER_DPR);
   const pixelWidth = Math.max(1, Math.round(width * dpr));
   const pixelHeight = Math.max(1, Math.round(height * dpr));
   if (chart.width !== pixelWidth || chart.height !== pixelHeight) {
@@ -978,7 +1003,7 @@ function clamp(value, min, max) {
 }
 
 function syncUi() {
-  particleLabel.textContent = new Intl.NumberFormat().format(app.particleCount());
+  particleLabel.textContent = integerFormatter.format(app.particleCount());
   waterVelocityValue.textContent = `${app.waterVelocityMetersPerSecond().toFixed(2)} m/s`;
   spoutX = clamp(snap(app.spoutX()), SPOUT_X_MIN, SPOUT_X_MAX);
   spoutZ = clamp(snap(app.spoutZ()), SPOUT_Z_MIN, SPOUT_Z_MAX);
@@ -992,10 +1017,10 @@ function syncUi() {
   simTimeLabel.textContent = `${app.simTime().toFixed(1)}s`;
   frameEmittedMassLabel.textContent = app.frameEmittedMl().toFixed(2);
   totalEmittedMassLabel.textContent = app.totalEmittedMl().toFixed(2);
-  frameDroppedEmissionLabel.textContent = new Intl.NumberFormat().format(app.frameDroppedParticles());
-  totalDroppedEmissionLabel.textContent = new Intl.NumberFormat().format(app.totalDroppedParticles());
-  waterSlotsLabel.textContent = new Intl.NumberFormat().format(app.waterSlotsUsed());
-  bedParticlesLabel.textContent = new Intl.NumberFormat().format(app.bedParticleCount());
+  frameDroppedEmissionLabel.textContent = integerFormatter.format(app.frameDroppedParticles());
+  totalDroppedEmissionLabel.textContent = integerFormatter.format(app.totalDroppedParticles());
+  waterSlotsLabel.textContent = integerFormatter.format(app.waterSlotsUsed());
+  bedParticlesLabel.textContent = integerFormatter.format(app.bedParticleCount());
   const maxParticles = app.maxParticles();
   const usedParticles = app.particleCount();
   capacityUsedLabel.textContent = maxParticles > 0
@@ -1003,10 +1028,10 @@ function syncUi() {
     : "0.0%";
   bedEnabledLabel.textContent = app.hasBed() ? "Yes" : "No";
   maxAbsDivLabel.textContent = app.maxAbsDivergence().toFixed(3);
-  fluidCellsLabel.textContent = new Intl.NumberFormat().format(app.fluidCellCount());
-  divClampFiresLabel.textContent = new Intl.NumberFormat().format(app.divClampFires());
-  pressureClampFiresLabel.textContent = new Intl.NumberFormat().format(app.pressureClampFires());
-  massOverflowFiresLabel.textContent = new Intl.NumberFormat().format(app.massOverflowFires());
+  fluidCellsLabel.textContent = integerFormatter.format(app.fluidCellCount());
+  divClampFiresLabel.textContent = integerFormatter.format(app.divClampFires());
+  pressureClampFiresLabel.textContent = integerFormatter.format(app.pressureClampFires());
+  massOverflowFiresLabel.textContent = integerFormatter.format(app.massOverflowFires());
 }
 
 function publishDebugHooks() {

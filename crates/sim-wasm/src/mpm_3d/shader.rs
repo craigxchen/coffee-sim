@@ -132,8 +132,6 @@ fn div_clamp_limit() -> f32 { return u.clamp_params.x; }
 fn pressure_clamp_limit() -> f32 { return u.clamp_params.y; }
 fn metrics_div_fp_scale() -> f32 { return u.clamp_params.z; }
 fn metrics_div_inv_fp_scale() -> f32 { return u.clamp_params.w; }
-fn cg_dot_fp_scale() -> f32 { return 1.0; }
-fn cg_dot_inv_fp_scale() -> f32 { return 1.0; }
 fn pressure_residual_fp_scale() -> f32 { return 1024.0; }
 fn projection_j_alpha() -> f32 { return u.projection_params.x; }
 fn projection_max_rest_volume_fraction() -> f32 { return u.projection_params.z; }
@@ -1905,7 +1903,7 @@ fn pressure_cg_init(@builtin(global_invocation_id) gid: vec3<u32>) {
     let active_slot = atomicAdd(&metrics[METRIC_PRESSURE_ACTIVE_COUNT_IDX], 1u);
     active_pressure_cell_store(active_slot, idx);
     let rz = max(r * z, 0.0);
-    let rz_fixed = u32(clamp(rz * cg_dot_fp_scale(), 0.0, f32(0xffffffffu)));
+    let rz_fixed = u32(clamp(rz, 0.0, f32(0xffffffffu)));
     let observed_rz_fixed = u32(clamp(rz * pressure_residual_fp_scale(), 0.0, f32(0xffffffffu)));
     atomicAdd(&metrics[METRIC_CG_RZ_IDX], rz_fixed);
     atomicAdd(&metrics[METRIC_PRESSURE_INITIAL_RZ_IDX], observed_rz_fixed);
@@ -1930,13 +1928,6 @@ fn pressure_cg_converged(old_rz: f32) -> bool {
     return old_rz <= converged_rz;
 }
 
-@compute @workgroup_size(1)
-fn pressure_cg_clear_reductions(@builtin(global_invocation_id) gid: vec3<u32>) {
-    if gid.x != 0u { return; }
-    atomicStore(&metrics[METRIC_CG_PAP_IDX], 0u);
-    atomicStore(&metrics[METRIC_CG_NEW_RZ_IDX], 0u);
-}
-
 @compute @workgroup_size(64)
 fn pressure_cg_matvec(
     @builtin(global_invocation_id) gid: vec3<u32>,
@@ -1946,7 +1937,7 @@ fn pressure_cg_matvec(
     var contribution = 0.0;
     if list_i < active_pressure_count() {
         let idx = active_pressure_cell(list_i);
-        let old_rz = f32(atomicLoad(&metrics[METRIC_CG_RZ_IDX])) * cg_dot_inv_fp_scale();
+        let old_rz = f32(atomicLoad(&metrics[METRIC_CG_RZ_IDX]));
         if pressure_cg_converged(old_rz) {
             cg[idx].w = 0.0;
         } else {
@@ -1967,7 +1958,7 @@ fn pressure_cg_matvec(
     if lid.x == 0u && pressure_reduce_values[0] > 0.0 {
         atomicAdd(
             &metrics[METRIC_CG_PAP_IDX],
-            u32(clamp(pressure_reduce_values[0] * cg_dot_fp_scale(), 0.0, f32(0xffffffffu))),
+            u32(clamp(pressure_reduce_values[0], 0.0, f32(0xffffffffu))),
         );
     }
 }
@@ -1983,8 +1974,8 @@ fn pressure_cg_apply_alpha(
         let idx = active_pressure_cell(list_i);
         let inv_diag = pressure_inv_diag_load(idx);
         if inv_diag > 0.0 {
-            let old_rz = f32(atomicLoad(&metrics[METRIC_CG_RZ_IDX])) * cg_dot_inv_fp_scale();
-            let p_ap = f32(atomicLoad(&metrics[METRIC_CG_PAP_IDX])) * cg_dot_inv_fp_scale();
+            let old_rz = f32(atomicLoad(&metrics[METRIC_CG_RZ_IDX]));
+            let p_ap = f32(atomicLoad(&metrics[METRIC_CG_PAP_IDX]));
             if !pressure_cg_converged(old_rz) && p_ap > max(old_rz * 1e-5, 1e-8) {
                 let alpha = old_rz / p_ap;
                 // A Jacobi-preconditioned graph Laplacian has O(1) stable CG
@@ -2016,7 +2007,7 @@ fn pressure_cg_apply_alpha(
     if lid.x == 0u && pressure_reduce_values[0] > 0.0 {
         atomicAdd(
             &metrics[METRIC_CG_NEW_RZ_IDX],
-            u32(clamp(pressure_reduce_values[0] * cg_dot_fp_scale(), 0.0, f32(0xffffffffu))),
+            u32(clamp(pressure_reduce_values[0], 0.0, f32(0xffffffffu))),
         );
     }
 }
@@ -2031,11 +2022,11 @@ fn pressure_cg_update_dir(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
 
-    let old_rz = f32(atomicLoad(&metrics[METRIC_CG_RZ_IDX])) * cg_dot_inv_fp_scale();
+    let old_rz = f32(atomicLoad(&metrics[METRIC_CG_RZ_IDX]));
     if pressure_cg_converged(old_rz) {
         return;
     }
-    let new_rz = f32(atomicLoad(&metrics[METRIC_CG_NEW_RZ_IDX])) * cg_dot_inv_fp_scale();
+    let new_rz = f32(atomicLoad(&metrics[METRIC_CG_NEW_RZ_IDX]));
     let beta_raw = select(0.0, new_rz / old_rz, old_rz > 1e-12);
     // Fixed-point reductions and changing free-surface stencils can lose CG
     // conjugacy. Restart as preconditioned steepest descent when the weighted
@@ -2052,12 +2043,6 @@ fn pressure_cg_finish_iteration(@builtin(global_invocation_id) gid: vec3<u32>) {
     atomicStore(&metrics[METRIC_CG_RZ_IDX], atomicLoad(&metrics[METRIC_CG_NEW_RZ_IDX]));
     atomicStore(&metrics[METRIC_CG_PAP_IDX], 0u);
     atomicStore(&metrics[METRIC_CG_NEW_RZ_IDX], 0u);
-}
-
-@compute @workgroup_size(1)
-fn pressure_residual_clear(@builtin(global_invocation_id) gid: vec3<u32>) {
-    if gid.x != 0u { return; }
-    atomicStore(&metrics[METRIC_PRESSURE_FINAL_RZ_IDX], 0u);
 }
 
 @compute @workgroup_size(64)
