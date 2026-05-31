@@ -50,6 +50,8 @@ pub(crate) struct InflowState {
     exit_speed: f32,
     accumulator: f32,
     slug_sample_cursor: u64,
+    last_emit_origin: Option<Vec3>,
+    seconds_since_emit: f32,
 }
 
 pub(crate) struct EmissionResult {
@@ -64,6 +66,8 @@ impl InflowState {
             exit_speed: 0.0,
             accumulator: 0.0,
             slug_sample_cursor: 0,
+            last_emit_origin: None,
+            seconds_since_emit: 0.0,
         };
         inflow.set_exit_speed(exit_speed);
         inflow
@@ -107,6 +111,8 @@ impl InflowState {
 
         if self.flow_rate < 1e-6 {
             self.accumulator = 0.0;
+            self.last_emit_origin = None;
+            self.seconds_since_emit = 0.0;
             return EmissionResult {
                 emitted: 0,
                 dropped: 0,
@@ -115,19 +121,19 @@ impl InflowState {
 
         let particles_per_sec = self.flow_rate * PARTICLES_PER_ML;
         self.accumulator += particles_per_sec * dt;
+        self.seconds_since_emit += dt;
         let requested = self.accumulator as u32;
-        let count = requested;
-        if count == 0 {
+        if requested < 2 {
             return EmissionResult {
                 emitted: 0,
                 dropped: 0,
             };
         }
-        self.accumulator -= count as f32;
 
         let total = current_water + current_bed;
         let available = max_particles.saturating_sub(total);
-        let count = count.min(available);
+        let count = non_singleton_emit_count(requested, available);
+        self.accumulator -= requested as f32;
         if count == 0 {
             return EmissionResult {
                 emitted: 0,
@@ -149,14 +155,20 @@ impl InflowState {
             spout.origin.y + dir.y * 0.18,
             spout.origin.z + dir.z * 0.18,
         );
+        let nozzle_velocity = self
+            .last_emit_origin
+            .map(|previous| (emit_origin - previous) / self.seconds_since_emit.max(1e-6))
+            .unwrap_or(Vec3::ZERO);
         let first_slug_sample = self.slug_sample_cursor;
 
         for i in 0..count {
             let slug_sample = first_slug_sample + i as u64;
             let emission_age = slug_emission_age(slug_sample, first_slug_sample, count, dt);
-            let vel = aperture_jet_velocity(dir, emit_speed);
+            let jet_velocity = aperture_jet_velocity(dir, emit_speed);
+            let vel = jet_velocity + nozzle_velocity;
             let aperture_offset = slug_sample_offset(slug_sample, spout.nozzle_radius);
-            let pos = aperture_sample_position(emit_origin, aperture_offset, vel, emission_age);
+            let pos =
+                aperture_sample_position(emit_origin, aperture_offset, jet_velocity, emission_age);
 
             // Particle: pos(x,y,z,J), vel(vx,vy,vz,mass)
             particle_data.push([pos.x, pos.y, pos.z, 1.0, vel.x, vel.y, vel.z, particle_mass]);
@@ -179,12 +191,22 @@ impl InflowState {
             bytemuck::cast_slice(&affine_data),
         );
         self.slug_sample_cursor = self.slug_sample_cursor.wrapping_add(count as u64);
+        self.last_emit_origin = Some(emit_origin);
+        self.seconds_since_emit = 0.0;
 
         EmissionResult {
             emitted: count,
             dropped: requested.saturating_sub(count),
         }
     }
+}
+
+fn non_singleton_emit_count(requested: u32, available: u32) -> u32 {
+    if requested < 2 || available < 2 {
+        return 0;
+    }
+
+    requested.min(available)
 }
 
 fn aperture_jet_velocity(dir: Vec3, emit_speed: f32) -> Vec3 {
@@ -319,6 +341,15 @@ mod tests {
 
         assert!((inflow.exit_speed() - spout.max_exit_speed).abs() < 1e-6);
         assert!(inflow.flow_rate() <= spout.max_flow_rate_ml_s);
+    }
+
+    #[test]
+    fn non_singleton_emit_count_defers_singletons() {
+        assert_eq!(non_singleton_emit_count(0, 10), 0);
+        assert_eq!(non_singleton_emit_count(1, 10), 0);
+        assert_eq!(non_singleton_emit_count(2, 1), 0);
+        assert_eq!(non_singleton_emit_count(2, 10), 2);
+        assert_eq!(non_singleton_emit_count(5, 3), 3);
     }
 
     #[test]

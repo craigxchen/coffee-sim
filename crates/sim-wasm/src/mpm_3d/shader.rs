@@ -53,15 +53,17 @@ struct ContactResult {
 @group(0) @binding(0) var<uniform> u: MpmUniforms;
 @group(0) @binding(1) var<storage, read_write> particles: array<Particle>;
 @group(0) @binding(2) var<storage, read_write> affine: array<AffineC>;
-@group(0) @binding(3) var<storage, read_write> grid: array<atomic<i32>>;
-@group(0) @binding(4) var<storage, read_write> grid_vel: array<vec4<f32>>;
-@group(0) @binding(5) var sdf_texture: texture_3d<f32>;
-@group(0) @binding(6) var<storage, read_write> render_data: array<RenderParticle>;
-@group(0) @binding(7) var<storage, read_write> bed_extract: array<BedExtract>;
-@group(0) @binding(8) var<storage, read_write> bed_lookup: array<atomic<i32>>;
-@group(0) @binding(9) var<storage, read_write> bed_delta: array<atomic<i32>>;
-@group(0) @binding(10) var<storage, read_write> metrics: array<atomic<u32>>;
-@group(0) @binding(11) var sdf_class_tex: texture_3d<u32>;
+@group(0) @binding(3) var<storage, read_write> water_hash: array<atomic<i32>>;
+@group(0) @binding(4) var<storage, read_write> grid: array<atomic<i32>>;
+@group(0) @binding(5) var<storage, read_write> grid_vel: array<vec4<f32>>;
+@group(0) @binding(6) var sdf_texture: texture_3d<f32>;
+@group(0) @binding(7) var<storage, read_write> render_data: array<RenderParticle>;
+@group(0) @binding(8) var<storage, read_write> bed_extract: array<BedExtract>;
+@group(0) @binding(9) var<storage, read_write> bed_lookup: array<atomic<i32>>;
+@group(0) @binding(10) var<storage, read_write> bed_delta: array<atomic<i32>>;
+@group(0) @binding(11) var<storage, read_write> metrics: array<atomic<u32>>;
+@group(0) @binding(12) var sdf_class_tex: texture_3d<u32>;
+@group(0) @binding(13) var<storage, read_write> pressure_indirect: array<atomic<i32>>;
 
 // Metrics slot layout — keep in sync with `METRICS_SLOT_COUNT` in state.rs.
 const OBSTACLE_WALL_THICKNESS: f32 = 0.4;
@@ -92,10 +94,12 @@ fn gx() -> u32 { return u.grid_dims.x; }
 fn gy() -> u32 { return u.grid_dims.y; }
 fn gz() -> u32 { return u.grid_dims.z; }
 fn total_cells() -> u32 { return u.grid_dims.w; }
+fn num_water() -> u32 { return u.counts.x; }
 fn num_bed() -> u32 { return u.counts.y; }
 fn max_particles() -> u32 { return u.counts.z; }
 fn num_particles() -> u32 { return u.counts.x + u.counts.y; }
-fn use_sdf_cache() -> bool { return u.counts.w > 0u; }
+fn use_sdf_cache() -> bool { return (u.counts.w & 1u) != 0u; }
+fn collect_metrics() -> bool { return (u.counts.w & 2u) != 0u; }
 fn dt() -> f32 { return u.sim_params.x; }
 fn gravity() -> f32 { return u.sim_params.y; }
 fn dx() -> f32 { return u.sim_params.z; }
@@ -195,8 +199,16 @@ const CELL_SURFACE_FLUID: i32 = 1;
 const CELL_INTERIOR_FLUID: i32 = 2;
 const CELL_BED_COUPLED: i32 = 3;
 const CELL_SOLID: i32 = 4;
+const PARTICLE_OBJECT_WATER: f32 = 0.0;
+const PARTICLE_OBJECT_COFFEE_BED: f32 = 1.0;
+const PARTICLE_OBJECT_COFFEE_SUSPENDED: f32 = 2.0;
 const PHASE_WATER_MAX: f32 = 0.5;
-const PHASE_SUSPENDED_COFFEE: f32 = 2.0;
+const PHASE_SUSPENDED_COFFEE: f32 = PARTICLE_OBJECT_COFFEE_SUSPENDED;
+const DFSPH_MAX_NEIGHBORS_PER_CELL: u32 = 96u;
+const DFSPH_EPS: f32 = 1e-5;
+const DFSPH_DENSITY_ERROR_FRACTION: f32 = 0.012;
+const DFSPH_DIVERGENCE_ERROR: f32 = 0.02;
+const DFSPH_CORRECTION_SPEED_CAP: f32 = 0.08;
 
 fn is_water_phase(phase: f32) -> bool {
     return phase < PHASE_WATER_MAX;
@@ -210,6 +222,112 @@ fn is_suspended_coffee_phase(phase: f32) -> bool {
     return phase >= 1.5;
 }
 
+fn water_hash_slots() -> u32 {
+    return total_cells() + max_particles();
+}
+
+fn water_hash_head_idx(cell: u32) -> u32 {
+    return cell;
+}
+
+fn water_hash_next_idx(pid: u32) -> u32 {
+    return total_cells() + pid;
+}
+
+fn pressure_tile_size() -> u32 {
+    return 4u;
+}
+
+fn pressure_tile_dims() -> vec3<u32> {
+    let tile = pressure_tile_size();
+    return vec3<u32>(
+        (gx() + tile - 1u) / tile,
+        (gy() + tile - 1u) / tile,
+        (gz() + tile - 1u) / tile,
+    );
+}
+
+fn pressure_tile_count() -> u32 {
+    let dims = pressure_tile_dims();
+    return dims.x * dims.y * dims.z;
+}
+
+fn pressure_tile_counter_idx() -> u32 {
+    return pressure_tile_count();
+}
+
+fn pressure_tile_list_idx(slot: u32) -> u32 {
+    return pressure_tile_count() + 1u + slot;
+}
+
+fn pressure_tile_id_from_cell(ix_val: u32, iy_val: u32, iz_val: u32) -> u32 {
+    let tile = pressure_tile_size();
+    let dims = pressure_tile_dims();
+    let tx = ix_val / tile;
+    let ty = iy_val / tile;
+    let tz = iz_val / tile;
+    return tz * dims.x * dims.y + ty * dims.x + tx;
+}
+
+fn dfsph_support_radius() -> f32 {
+    return dx() * 1.85;
+}
+
+fn dfsph_particle_volume(pid: u32) -> f32 {
+    return p_vol() * particles[pid].vel.w / max(nominal_mass(), 1e-6);
+}
+
+fn dfsph_density_ratio(pid: u32) -> f32 {
+    return max(affine[pid].col2.z, 0.05);
+}
+
+fn dfsph_factor(pid: u32) -> f32 {
+    return affine[pid].col2.x;
+}
+
+fn dfsph_density_scratch(pid: u32) -> f32 {
+    return affine[pid].col2.y;
+}
+
+fn dfsph_store_aux(pid: u32, factor: f32, density_scratch: f32) {
+    affine[pid].col2 = vec4<f32>(factor, density_scratch, affine[pid].col2.z, affine[pid].col2.w);
+}
+
+fn dfsph_store_state(pid: u32, factor: f32, density_scratch: f32, density_ratio: f32) {
+    affine[pid].col2 = vec4<f32>(factor, density_scratch, density_ratio, affine[pid].col2.w);
+}
+
+fn cubic_kernel(r_norm: f32) -> f32 {
+    let h = dfsph_support_radius();
+    let q = r_norm / h;
+    if q > 1.0 {
+        return 0.0;
+    }
+    let k = 8.0 / 3.141592653589793 / (h * h * h);
+    if q <= 0.5 {
+        let q2 = q * q;
+        return k * (6.0 * q2 * q - 6.0 * q2 + 1.0);
+    }
+    let one_minus_q = 1.0 - q;
+    return 2.0 * k * one_minus_q * one_minus_q * one_minus_q;
+}
+
+fn cubic_kernel_grad(r: vec3<f32>) -> vec3<f32> {
+    let r_norm = length(r);
+    let h = dfsph_support_radius();
+    let q = r_norm / h;
+    if r_norm <= 1e-5 || q > 1.0 {
+        return vec3<f32>(0.0);
+    }
+    let k = 8.0 / 3.141592653589793 / (h * h * h);
+    let grad_q = r / (r_norm * h);
+    if q <= 0.5 {
+        return 6.0 * k * q * (3.0 * q - 2.0) * grad_q;
+    }
+    let one_minus_q = 1.0 - q;
+    return -6.0 * k * one_minus_q * one_minus_q * grad_q;
+}
+
 fn cell_kind_load(cell: u32) -> i32 {
     return atomicLoad(&grid[scratch_kind_idx(cell)]);
 }
@@ -221,7 +339,7 @@ fn pressure_load(cell: u32) -> f32 {
 fn pressure_store(cell: u32, value: f32) {
     let limit = pressure_clamp_limit();
     let clamped = clamp(value, -limit, limit);
-    if clamped != value {
+    if collect_metrics() && clamped != value {
         atomicAdd(&metrics[METRIC_PRESSURE_CLAMP_FIRES_IDX], 1u);
     }
     atomicStore(&grid[scratch_pressure_idx(cell)], i32(clamped * fp_scale()));
@@ -234,7 +352,7 @@ fn packing_pressure_load(cell: u32) -> f32 {
 fn packing_pressure_store(cell: u32, value: f32) {
     let limit = pressure_clamp_limit();
     let clamped = clamp(value, 0.0, limit);
-    if clamped != value {
+    if collect_metrics() && clamped != value {
         atomicAdd(&metrics[METRIC_PRESSURE_CLAMP_FIRES_IDX], 1u);
     }
     atomicStore(&grid[scratch_packing_idx(cell)], i32(clamped * fp_scale()));
@@ -309,24 +427,27 @@ fn current_volume_load(cell: u32) -> f32 {
     return f32(atomicLoad(&grid[grid_current_volume_idx(cell)])) * inv_fp_scale();
 }
 
+fn deposited_liquid_fraction(cell: u32) -> f32 {
+    let cell_volume = max(dx() * dx() * dx(), 1e-8);
+    return clamp(max(rest_volume_load(cell), current_volume_load(cell)) / cell_volume, 0.0, 1.0);
+}
+
 fn raw_liquid_fill_fraction(cell: u32, kind: i32) -> f32 {
-    if kind == CELL_INTERIOR_FLUID || kind == CELL_BED_COUPLED {
+    if kind == CELL_BED_COUPLED {
         return 1.0;
     }
-    if kind != CELL_SURFACE_FLUID {
+    if kind != CELL_INTERIOR_FLUID && kind != CELL_SURFACE_FLUID {
         return 0.0;
     }
 
-    let cell_volume = max(dx() * dx() * dx(), 1e-8);
-    let deposited_fraction = max(rest_volume_load(cell), current_volume_load(cell)) / cell_volume;
-    return clamp(deposited_fraction, 0.0, 1.0);
+    return deposited_liquid_fraction(cell);
 }
 
 fn liquid_fill_fraction(cell: u32, kind: i32) -> f32 {
-    if kind == CELL_INTERIOR_FLUID || kind == CELL_BED_COUPLED {
+    if kind == CELL_BED_COUPLED {
         return 1.0;
     }
-    if kind != CELL_SURFACE_FLUID {
+    if kind != CELL_INTERIOR_FLUID && kind != CELL_SURFACE_FLUID {
         return 0.0;
     }
 
@@ -413,7 +534,7 @@ fn pressure_weighted_or_mirror(
 fn divergence_store(cell: u32, value: f32) {
     let limit = div_clamp_limit();
     let clamped = clamp(value, -limit, limit);
-    if clamped != value {
+    if collect_metrics() && clamped != value {
         atomicAdd(&metrics[METRIC_DIV_CLAMP_FIRES_IDX], 1u);
     }
     atomicStore(&grid[scratch_div_idx(cell)], i32(clamped * fp_scale()));
@@ -702,7 +823,7 @@ fn deposit_absorbed_bed_water_and_solute(
 }
 
 fn sdf_class_is_solid(cell: vec3<i32>) -> bool {
-    return sample_sdf(cell_center_from_cell(cell)) < 0.0;
+    return sample_sdf(cell_center_from_cell(cell)) < contact_offset();
 }
 
 fn is_fluid_kind(kind: i32) -> bool {
@@ -850,7 +971,7 @@ fn velocity_divergence_with_solid_mirrors(
     var vzp = -self_vel.z;
     if cell.x > 0
         && select(
-            sample_sdf(cell_center + vec3<f32>(-dx_vec, 0.0, 0.0)) >= 0.0,
+            sample_sdf(cell_center + vec3<f32>(-dx_vec, 0.0, 0.0)) >= contact_offset(),
             !sdf_class_is_solid(cell + vec3<i32>(-1, 0, 0)),
             use_sdf_cache(),
         ) {
@@ -858,7 +979,7 @@ fn velocity_divergence_with_solid_mirrors(
     }
     if u32(cell.x + 1) < gx()
         && select(
-            sample_sdf(cell_center + vec3<f32>(dx_vec, 0.0, 0.0)) >= 0.0,
+            sample_sdf(cell_center + vec3<f32>(dx_vec, 0.0, 0.0)) >= contact_offset(),
             !sdf_class_is_solid(cell + vec3<i32>(1, 0, 0)),
             use_sdf_cache(),
         ) {
@@ -866,7 +987,7 @@ fn velocity_divergence_with_solid_mirrors(
     }
     if cell.y > 0
         && select(
-            sample_sdf(cell_center + vec3<f32>(0.0, -dx_vec, 0.0)) >= 0.0,
+            sample_sdf(cell_center + vec3<f32>(0.0, -dx_vec, 0.0)) >= contact_offset(),
             !sdf_class_is_solid(cell + vec3<i32>(0, -1, 0)),
             use_sdf_cache(),
         ) {
@@ -874,7 +995,7 @@ fn velocity_divergence_with_solid_mirrors(
     }
     if u32(cell.y + 1) < gy()
         && select(
-            sample_sdf(cell_center + vec3<f32>(0.0, dx_vec, 0.0)) >= 0.0,
+            sample_sdf(cell_center + vec3<f32>(0.0, dx_vec, 0.0)) >= contact_offset(),
             !sdf_class_is_solid(cell + vec3<i32>(0, 1, 0)),
             use_sdf_cache(),
         ) {
@@ -882,7 +1003,7 @@ fn velocity_divergence_with_solid_mirrors(
     }
     if cell.z > 0
         && select(
-            sample_sdf(cell_center + vec3<f32>(0.0, 0.0, -dx_vec)) >= 0.0,
+            sample_sdf(cell_center + vec3<f32>(0.0, 0.0, -dx_vec)) >= contact_offset(),
             !sdf_class_is_solid(cell + vec3<i32>(0, 0, -1)),
             use_sdf_cache(),
         ) {
@@ -890,7 +1011,7 @@ fn velocity_divergence_with_solid_mirrors(
     }
     if u32(cell.z + 1) < gz()
         && select(
-            sample_sdf(cell_center + vec3<f32>(0.0, 0.0, dx_vec)) >= 0.0,
+            sample_sdf(cell_center + vec3<f32>(0.0, 0.0, dx_vec)) >= contact_offset(),
             !sdf_class_is_solid(cell + vec3<i32>(0, 0, 1)),
             use_sdf_cache(),
         ) {
@@ -958,6 +1079,74 @@ fn sdf_gradient(position: vec3<f32>) -> vec3<f32> {
     return g / len;
 }
 
+fn apply_contact_friction(
+    velocity: vec3<f32>,
+    normal: vec3<f32>,
+    normal_impulse_speed: f32,
+) -> vec3<f32> {
+    let vt = velocity - normal * dot(velocity, normal);
+    let vt_len = length(vt);
+    if vt_len <= 1e-6 {
+        return velocity;
+    }
+    let friction_impulse = min(friction() * max(normal_impulse_speed, 0.0), vt_len);
+    return velocity - vt * (friction_impulse / vt_len);
+}
+
+fn apply_wall_viscous_shear(
+    position: vec3<f32>,
+    velocity: vec3<f32>,
+    continuum_support: f32,
+) -> vec3<f32> {
+    let sdf_val = sample_sdf(position);
+    let wall_gap = sdf_val - contact_offset();
+    let normal = sdf_gradient(position);
+    if length(normal) <= 1e-6 {
+        return velocity;
+    }
+
+    let side_wall = abs(normal.y) < 0.5;
+    let cup_radius = 3.0 - obstacle_wall_half_thickness() - contact_offset();
+    let cup_side_gap = cup_radius - length(position.xz);
+    let cup_floor_side_corner =
+        position.y <= -3.5
+        && cup_side_gap >= -contact_offset()
+        && cup_side_gap < dfsph_support_radius() * 2.5;
+    if !side_wall && !cup_floor_side_corner {
+        return velocity;
+    }
+
+    let support = clamp(continuum_support, 0.0, 1.0);
+    let wall_reach = select(
+        mix(max(water_particle_radius(), contact_offset()), dfsph_support_radius() * 2.5, support),
+        dfsph_support_radius() * 2.5,
+        side_wall,
+    );
+    if wall_gap >= wall_reach {
+        return velocity;
+    }
+
+    let vt = velocity - normal * dot(velocity, normal);
+    let vt_len = length(vt);
+    if vt_len <= 1e-6 {
+        return velocity;
+    }
+
+    let resolved_distance = max(max(wall_gap, 0.0), contact_offset());
+    let shear_distance = select(resolved_distance, contact_offset() * 0.41, side_wall);
+    let viscous_scale = select(support, 1.0, side_wall);
+    let wall_viscosity = min(viscosity(), p_vol() / max(dx(), 1e-6));
+    let viscous_rate = wall_viscosity * viscous_scale / max(shear_distance * shear_distance, 1e-6);
+    let inertial_rate = select(
+        0.0,
+        friction() * vt_len / max(dfsph_support_radius(), 1e-6),
+        side_wall,
+    );
+    let shear_rate = viscous_rate + inertial_rate;
+    let alpha = clamp(shear_rate * dt(), 0.0, 0.14);
+    return velocity - vt * alpha;
+}
+
 fn resolve_radial_barrier(
     position: vec3<f32>,
     velocity: vec3<f32>,
@@ -971,15 +1160,16 @@ fn resolve_radial_barrier(
     let r = length(radial);
     if r > max_radius && r > 1e-6 {
         let outward = radial / r;
+        let normal = vec3<f32>(outward.x, 0.0, outward.y);
+        let penetration_speed = (r - max_radius) / max(dt(), 1e-6);
         out_pos.x = center.x + outward.x * max_radius;
         out_pos.z = center.y + outward.y * max_radius;
 
         let vn = dot(out_vel.xz, outward);
         if vn > 0.0 {
-            let tangential = out_vel.xz - outward * vn;
-            out_vel.x = tangential.x * (1.0 - friction() * 0.35);
-            out_vel.z = tangential.y * (1.0 - friction() * 0.35);
+            out_vel -= normal * vn;
         }
+        out_vel = apply_contact_friction(out_vel, normal, max(vn, penetration_speed));
     }
 
     return ContactResult(out_pos, out_vel);
@@ -1004,18 +1194,21 @@ fn resolve_conical_barrier(
         let sdf_val = cone_radius - r;
         if sdf_val < contact_offset() {
             let n = normalize(vec3<f32>(-outward.x, slope, -outward.y));
+            let penetration_speed = (contact_offset() - sdf_val) / max(dt(), 1e-6);
             out_pos += n * (contact_offset() - sdf_val);
 
             let vn = dot(out_vel, n);
             let radial_v = dot(out_vel.xz, outward);
             if vn < 0.0 && radial_v > 0.0 {
-                out_vel = out_vel - n * vn * (1.0 + restitution());
-                let vt = out_vel - n * dot(out_vel, n);
-                let vt_len = length(vt);
-                if vt_len > 1e-6 {
-                    let friction_impulse = min(friction() * abs(vn), vt_len);
-                    out_vel = out_vel - vt * (friction_impulse / vt_len);
-                }
+                let normal_impulse_speed = -vn * (1.0 + restitution());
+                out_vel = out_vel + n * normal_impulse_speed;
+                out_vel = apply_contact_friction(
+                    out_vel,
+                    n,
+                    max(normal_impulse_speed, penetration_speed),
+                );
+            } else {
+                out_vel = apply_contact_friction(out_vel, n, penetration_speed);
             }
         }
     }
@@ -1240,22 +1433,25 @@ fn resolve_sdf_contact(position: vec3<f32>, velocity: vec3<f32>, is_bed: bool) -
     if sdf_val < contact_offset() {
         let n = sdf_gradient(out_pos);
         if length(n) > 1e-6 {
+            let penetration_speed = (contact_offset() - sdf_val) / max(dt(), 1e-6);
             out_pos += n * (contact_offset() - sdf_val);
             let vn = dot(out_vel, n);
             if vn < 0.0 {
-                out_vel = out_vel - n * vn * (1.0 + restitution());
-                let vt = out_vel - n * dot(out_vel, n);
-                let vt_len = length(vt);
-                if vt_len > 1e-6 {
-                    let friction_impulse = min(friction() * abs(vn), vt_len);
-                    out_vel = out_vel - vt * (friction_impulse / vt_len);
-                }
+                let normal_impulse_speed = -vn * (1.0 + restitution());
+                out_vel = out_vel + n * normal_impulse_speed;
+                out_vel = apply_contact_friction(
+                    out_vel,
+                    n,
+                    max(normal_impulse_speed, penetration_speed),
+                );
+            } else {
+                out_vel = apply_contact_friction(out_vel, n, penetration_speed);
             }
         }
     }
 
     let hard_contact = resolve_scene_obstacles(out_pos, out_vel, is_bed);
-    return ContactResult(hard_contact.pos, hard_contact.vel);
+    return hard_contact;
 }
 
 fn filter_paper_absorption_weight(position: vec3<f32>) -> f32 {
@@ -1290,6 +1486,454 @@ fn filter_paper_absorption_weight(position: vec3<f32>) -> f32 {
     return clamp(max(side_weight, lip_weight), 0.0, 1.0);
 }
 
+// ── DFSPH water ──
+
+@compute @workgroup_size(64)
+fn water_hash_clear(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if idx >= water_hash_slots() { return; }
+    atomicStore(&water_hash[idx], -1);
+}
+
+fn water_particle_id(local_water_id: u32) -> u32 {
+    return num_bed() + local_water_id;
+}
+
+@compute @workgroup_size(64)
+fn water_hash_scatter(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if gid.x >= num_water() { return; }
+    let pid = water_particle_id(gid.x);
+    if pid >= num_particles() { return; }
+    if !is_water_phase(affine[pid].col0.w) || particles[pid].vel.w <= inactive_mass_threshold() {
+        return;
+    }
+
+    let cell = world_to_cell(particles[pid].pos.xyz);
+    if cell.x < 0 || cell.y < 0 || cell.z < 0 { return; }
+    if u32(cell.x) >= gx() || u32(cell.y) >= gy() || u32(cell.z) >= gz() { return; }
+
+    let ci = cell_index(u32(cell.x), u32(cell.y), u32(cell.z));
+    let pid_i = i32(pid);
+    let head_idx = water_hash_head_idx(ci);
+    let next_idx = water_hash_next_idx(pid);
+    var attempts = 0u;
+    loop {
+        var prev = -1;
+        var curr = atomicLoad(&water_hash[head_idx]);
+        var guard = 0u;
+        loop {
+            if curr < 0 || curr >= pid_i || guard >= 4096u {
+                break;
+            }
+            prev = curr;
+            curr = atomicLoad(&water_hash[water_hash_next_idx(u32(curr))]);
+            guard = guard + 1u;
+        }
+
+        atomicStore(&water_hash[next_idx], curr);
+        if prev < 0 {
+            let exchange = atomicCompareExchangeWeak(&water_hash[head_idx], curr, pid_i);
+            if exchange.exchanged {
+                break;
+            }
+        } else {
+            let exchange = atomicCompareExchangeWeak(
+                &water_hash[water_hash_next_idx(u32(prev))],
+                curr,
+                pid_i,
+            );
+            if exchange.exchanged {
+                break;
+            }
+        }
+
+        attempts = attempts + 1u;
+        if attempts > 4096u {
+            let old_head = atomicExchange(&water_hash[head_idx], pid_i);
+            atomicStore(&water_hash[next_idx], old_head);
+            break;
+        }
+    }
+}
+
+@compute @workgroup_size(64)
+fn dfsph_density_factor(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if gid.x >= num_water() { return; }
+    let pid = water_particle_id(gid.x);
+    if pid >= num_particles() { return; }
+    if !is_water_phase(affine[pid].col0.w) || particles[pid].vel.w <= inactive_mass_threshold() {
+        return;
+    }
+
+    let xp = particles[pid].pos.xyz;
+    let home = world_to_cell(xp);
+    var density = dfsph_particle_volume(pid) * cubic_kernel(0.0);
+    var grad_i = vec3<f32>(0.0);
+    var sum_grad = 0.0;
+
+    for (var oz = -1i; oz <= 1i; oz = oz + 1i) {
+        for (var oy = -1i; oy <= 1i; oy = oy + 1i) {
+            for (var ox = -1i; ox <= 1i; ox = ox + 1i) {
+                let cell = home + vec3<i32>(ox, oy, oz);
+                if cell.x < 0 || cell.y < 0 || cell.z < 0 { continue; }
+                if u32(cell.x) >= gx() || u32(cell.y) >= gy() || u32(cell.z) >= gz() { continue; }
+                let ci = cell_index(u32(cell.x), u32(cell.y), u32(cell.z));
+                var neighbor_pid = atomicLoad(&water_hash[water_hash_head_idx(ci)]);
+                var guard = 0u;
+                loop {
+                    if neighbor_pid < 0 || guard >= DFSPH_MAX_NEIGHBORS_PER_CELL { break; }
+                    let j = u32(neighbor_pid);
+                    if j != pid && j < num_particles()
+                        && is_water_phase(affine[j].col0.w)
+                        && particles[j].vel.w > inactive_mass_threshold() {
+                        let r = xp - particles[j].pos.xyz;
+                        let r_len = length(r);
+                        if r_len <= dfsph_support_radius() {
+                            let volume_j = dfsph_particle_volume(j);
+                            density += volume_j * cubic_kernel(r_len);
+                            let grad_j = -volume_j * cubic_kernel_grad(r);
+                            grad_i -= grad_j;
+                            sum_grad += dot(grad_j, grad_j);
+                        }
+                    }
+                    neighbor_pid = atomicLoad(&water_hash[water_hash_next_idx(j)]);
+                    guard = guard + 1u;
+                }
+            }
+        }
+    }
+
+    sum_grad += dot(grad_i, grad_i);
+    var factor = 0.0;
+    if sum_grad > 1e-6 {
+        factor = -1.0 / sum_grad;
+    }
+    let density_ratio = max(density, 0.05);
+    particles[pid].pos = vec4<f32>(xp, clamp_particle_j(1.0 / density_ratio));
+    dfsph_store_state(pid, factor, 0.0, density_ratio);
+}
+
+@compute @workgroup_size(64)
+fn dfsph_divergence_estimate(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if gid.x >= num_water() { return; }
+    let pid = water_particle_id(gid.x);
+    if pid >= num_particles() { return; }
+    if !is_water_phase(affine[pid].col0.w) || particles[pid].vel.w <= inactive_mass_threshold() {
+        return;
+    }
+
+    let xp = particles[pid].pos.xyz;
+    let vi = particles[pid].vel.xyz;
+    let home = world_to_cell(xp);
+    var density_dot = 0.0;
+    var neighbors = 0u;
+
+    for (var oz = -1i; oz <= 1i; oz = oz + 1i) {
+        for (var oy = -1i; oy <= 1i; oy = oy + 1i) {
+            for (var ox = -1i; ox <= 1i; ox = ox + 1i) {
+                let cell = home + vec3<i32>(ox, oy, oz);
+                if cell.x < 0 || cell.y < 0 || cell.z < 0 { continue; }
+                if u32(cell.x) >= gx() || u32(cell.y) >= gy() || u32(cell.z) >= gz() { continue; }
+                let ci = cell_index(u32(cell.x), u32(cell.y), u32(cell.z));
+                var neighbor_pid = atomicLoad(&water_hash[water_hash_head_idx(ci)]);
+                var guard = 0u;
+                loop {
+                    if neighbor_pid < 0 || guard >= DFSPH_MAX_NEIGHBORS_PER_CELL { break; }
+                    let j = u32(neighbor_pid);
+                    if j != pid && j < num_particles()
+                        && is_water_phase(affine[j].col0.w)
+                        && particles[j].vel.w > inactive_mass_threshold() {
+                        let r = xp - particles[j].pos.xyz;
+                        if length(r) <= dfsph_support_radius() {
+                            density_dot += dfsph_particle_volume(j)
+                                * dot(vi - particles[j].vel.xyz, cubic_kernel_grad(r));
+                            neighbors = neighbors + 1u;
+                        }
+                    }
+                    neighbor_pid = atomicLoad(&water_hash[water_hash_next_idx(j)]);
+                    guard = guard + 1u;
+                }
+            }
+        }
+    }
+
+    if neighbors < 4u {
+        density_dot = 0.0;
+    }
+    dfsph_store_aux(
+        pid,
+        dfsph_factor(pid),
+        max(density_dot - DFSPH_DIVERGENCE_ERROR / max(dt(), 1e-6), 0.0),
+    );
+}
+
+@compute @workgroup_size(64)
+fn dfsph_divergence_solve(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if gid.x >= num_water() { return; }
+    let pid = water_particle_id(gid.x);
+    if pid >= num_particles() { return; }
+    if !is_water_phase(affine[pid].col0.w) || particles[pid].vel.w <= inactive_mass_threshold() {
+        return;
+    }
+
+    let xp = particles[pid].pos.xyz;
+    let home = world_to_cell(xp);
+    let k_i = dfsph_density_scratch(pid) * dfsph_factor(pid);
+    var dv = vec3<f32>(0.0);
+
+    for (var oz = -1i; oz <= 1i; oz = oz + 1i) {
+        for (var oy = -1i; oy <= 1i; oy = oy + 1i) {
+            for (var ox = -1i; ox <= 1i; ox = ox + 1i) {
+                let cell = home + vec3<i32>(ox, oy, oz);
+                if cell.x < 0 || cell.y < 0 || cell.z < 0 { continue; }
+                if u32(cell.x) >= gx() || u32(cell.y) >= gy() || u32(cell.z) >= gz() { continue; }
+                let ci = cell_index(u32(cell.x), u32(cell.y), u32(cell.z));
+                var neighbor_pid = atomicLoad(&water_hash[water_hash_head_idx(ci)]);
+                var guard = 0u;
+                loop {
+                    if neighbor_pid < 0 || guard >= DFSPH_MAX_NEIGHBORS_PER_CELL { break; }
+                    let j = u32(neighbor_pid);
+                    if j != pid && j < num_particles()
+                        && is_water_phase(affine[j].col0.w)
+                        && particles[j].vel.w > inactive_mass_threshold() {
+                        let r = xp - particles[j].pos.xyz;
+                        if length(r) <= dfsph_support_radius() {
+                            let k_j = dfsph_density_scratch(j) * dfsph_factor(j);
+                            let k_sum = k_i + k_j;
+                            if abs(k_sum) > DFSPH_EPS {
+                                let grad_j = -dfsph_particle_volume(j) * cubic_kernel_grad(r);
+                                dv -= k_sum * grad_j;
+                            }
+                        }
+                    }
+                    neighbor_pid = atomicLoad(&water_hash[water_hash_next_idx(j)]);
+                    guard = guard + 1u;
+                }
+            }
+        }
+    }
+
+    let max_dv = vel_cap() * DFSPH_CORRECTION_SPEED_CAP;
+    let dv_len = length(dv);
+    if dv_len > max_dv {
+        dv *= max_dv / dv_len;
+    }
+    var vel = particles[pid].vel.xyz + dv;
+    let speed = length(vel);
+    if speed > vel_cap() {
+        vel *= vel_cap() / speed;
+    }
+    particles[pid].vel = vec4<f32>(vel, particles[pid].vel.w);
+}
+
+@compute @workgroup_size(64)
+fn dfsph_predict_nonpressure(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if gid.x >= num_water() { return; }
+    let pid = water_particle_id(gid.x);
+    if pid >= num_particles() { return; }
+    if !is_water_phase(affine[pid].col0.w) || particles[pid].vel.w <= inactive_mass_threshold() {
+        return;
+    }
+
+    let xp = particles[pid].pos.xyz;
+    let vi = particles[pid].vel.xyz;
+    let home = world_to_cell(xp);
+    var acc = vec3<f32>(0.0);
+
+    for (var oz = -1i; oz <= 1i; oz = oz + 1i) {
+        for (var oy = -1i; oy <= 1i; oy = oy + 1i) {
+            for (var ox = -1i; ox <= 1i; ox = ox + 1i) {
+                let cell = home + vec3<i32>(ox, oy, oz);
+                if cell.x < 0 || cell.y < 0 || cell.z < 0 { continue; }
+                if u32(cell.x) >= gx() || u32(cell.y) >= gy() || u32(cell.z) >= gz() { continue; }
+                let ci = cell_index(u32(cell.x), u32(cell.y), u32(cell.z));
+                var neighbor_pid = atomicLoad(&water_hash[water_hash_head_idx(ci)]);
+                var guard = 0u;
+                loop {
+                    if neighbor_pid < 0 || guard >= DFSPH_MAX_NEIGHBORS_PER_CELL { break; }
+                    let j = u32(neighbor_pid);
+                    if j != pid && j < num_particles()
+                        && is_water_phase(affine[j].col0.w)
+                        && particles[j].vel.w > inactive_mass_threshold() {
+                        let r = xp - particles[j].pos.xyz;
+                        let r2 = dot(r, r);
+                        if r2 <= dfsph_support_radius() * dfsph_support_radius() {
+                            let viscosity_rate = viscosity() / max(dx() * dx(), 1e-6);
+                            acc += (particles[j].vel.xyz - vi)
+                                * cubic_kernel(sqrt(r2))
+                                * dfsph_particle_volume(j)
+                                * viscosity_rate;
+                        }
+                    }
+                    neighbor_pid = atomicLoad(&water_hash[water_hash_next_idx(j)]);
+                    guard = guard + 1u;
+                }
+            }
+        }
+    }
+
+    var vel = vi + acc * dt();
+    let cell = world_to_cell(xp);
+    if cell.x >= 0 && cell.y >= 0 && cell.z >= 0
+        && u32(cell.x) < gx() && u32(cell.y) < gy() && u32(cell.z) < gz() {
+        let ci = cell_index(u32(cell.x), u32(cell.y), u32(cell.z));
+        let bed_idx = bed_lookup_load(ci);
+        if num_bed() > 0u && is_valid_bed_solid_idx(bed_idx) {
+            let bed_v = particles[u32(bed_idx)].vel.xyz;
+            let permeability_m2 = bed_compacted_permeability(u32(bed_idx));
+            let darcy_rate =
+                water_kinematic_viscosity_m2_s() / max(permeability_m2, min_bed_permeability_m2());
+            let damping = 1.0 / (1.0 + max(darcy_rate * dt() * 0.65, 0.0));
+            let before = vel;
+            vel = bed_v + (vel - bed_v) * damping;
+            bed_impulse_delta_add_neighborhood(
+                cell,
+                -particles[pid].vel.w * (vel - before) * BED_REACTION_ALPHA,
+            );
+        }
+    }
+
+    let speed = length(vel);
+    if speed > vel_cap() {
+        vel *= vel_cap() / speed;
+    }
+    particles[pid].vel = vec4<f32>(vel, particles[pid].vel.w);
+}
+
+@compute @workgroup_size(64)
+fn dfsph_density_star(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if gid.x >= num_water() { return; }
+    let pid = water_particle_id(gid.x);
+    if pid >= num_particles() { return; }
+    if !is_water_phase(affine[pid].col0.w) || particles[pid].vel.w <= inactive_mass_threshold() {
+        return;
+    }
+
+    let xp = particles[pid].pos.xyz;
+    let vi = particles[pid].vel.xyz;
+    let home = world_to_cell(xp);
+    var delta = 0.0;
+
+    for (var oz = -1i; oz <= 1i; oz = oz + 1i) {
+        for (var oy = -1i; oy <= 1i; oy = oy + 1i) {
+            for (var ox = -1i; ox <= 1i; ox = ox + 1i) {
+                let cell = home + vec3<i32>(ox, oy, oz);
+                if cell.x < 0 || cell.y < 0 || cell.z < 0 { continue; }
+                if u32(cell.x) >= gx() || u32(cell.y) >= gy() || u32(cell.z) >= gz() { continue; }
+                let ci = cell_index(u32(cell.x), u32(cell.y), u32(cell.z));
+                var neighbor_pid = atomicLoad(&water_hash[water_hash_head_idx(ci)]);
+                var guard = 0u;
+                loop {
+                    if neighbor_pid < 0 || guard >= DFSPH_MAX_NEIGHBORS_PER_CELL { break; }
+                    let j = u32(neighbor_pid);
+                    if j != pid && j < num_particles()
+                        && is_water_phase(affine[j].col0.w)
+                        && particles[j].vel.w > inactive_mass_threshold() {
+                        let r = xp - particles[j].pos.xyz;
+                        if length(r) <= dfsph_support_radius() {
+                            delta += dfsph_particle_volume(j)
+                                * dot(vi - particles[j].vel.xyz, cubic_kernel_grad(r));
+                        }
+                    }
+                    neighbor_pid = atomicLoad(&water_hash[water_hash_next_idx(j)]);
+                    guard = guard + 1u;
+                }
+            }
+        }
+    }
+
+    let density_star = max(dfsph_density_ratio(pid) + dt() * delta, 1.0);
+    dfsph_store_aux(pid, dfsph_factor(pid), density_star);
+}
+
+@compute @workgroup_size(64)
+fn dfsph_density_solve(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if gid.x >= num_water() { return; }
+    let pid = water_particle_id(gid.x);
+    if pid >= num_particles() { return; }
+    if !is_water_phase(affine[pid].col0.w) || particles[pid].vel.w <= inactive_mass_threshold() {
+        return;
+    }
+
+    let xp = particles[pid].pos.xyz;
+    let home = world_to_cell(xp);
+    let b_i = max(dfsph_density_scratch(pid) - 1.0 - DFSPH_DENSITY_ERROR_FRACTION, 0.0);
+    let k_i = b_i * dfsph_factor(pid) / max(dt() * dt(), 1e-6);
+    var dv = vec3<f32>(0.0);
+
+    for (var oz = -1i; oz <= 1i; oz = oz + 1i) {
+        for (var oy = -1i; oy <= 1i; oy = oy + 1i) {
+            for (var ox = -1i; ox <= 1i; ox = ox + 1i) {
+                let cell = home + vec3<i32>(ox, oy, oz);
+                if cell.x < 0 || cell.y < 0 || cell.z < 0 { continue; }
+                if u32(cell.x) >= gx() || u32(cell.y) >= gy() || u32(cell.z) >= gz() { continue; }
+                let ci = cell_index(u32(cell.x), u32(cell.y), u32(cell.z));
+                var neighbor_pid = atomicLoad(&water_hash[water_hash_head_idx(ci)]);
+                var guard = 0u;
+                loop {
+                    if neighbor_pid < 0 || guard >= DFSPH_MAX_NEIGHBORS_PER_CELL { break; }
+                    let j = u32(neighbor_pid);
+                    if j != pid && j < num_particles()
+                        && is_water_phase(affine[j].col0.w)
+                        && particles[j].vel.w > inactive_mass_threshold() {
+                        let r = xp - particles[j].pos.xyz;
+                        if length(r) <= dfsph_support_radius() {
+                            let b_j =
+                                max(dfsph_density_scratch(j) - 1.0 - DFSPH_DENSITY_ERROR_FRACTION, 0.0);
+                            let k_j = b_j * dfsph_factor(j) / max(dt() * dt(), 1e-6);
+                            let k_sum = k_i + k_j;
+                            if abs(k_sum) > DFSPH_EPS {
+                                let grad_j = -dfsph_particle_volume(j) * cubic_kernel_grad(r);
+                                dv -= dt() * k_sum * grad_j;
+                            }
+                        }
+                    }
+                    neighbor_pid = atomicLoad(&water_hash[water_hash_next_idx(j)]);
+                    guard = guard + 1u;
+                }
+            }
+        }
+    }
+
+    let max_dv = vel_cap() * DFSPH_CORRECTION_SPEED_CAP;
+    let dv_len = length(dv);
+    if dv_len > max_dv {
+        dv *= max_dv / dv_len;
+    }
+    var vel = particles[pid].vel.xyz + dv;
+    let speed = length(vel);
+    if speed > vel_cap() {
+        vel *= vel_cap() / speed;
+    }
+    particles[pid].vel = vec4<f32>(vel, particles[pid].vel.w);
+}
+
+@compute @workgroup_size(64)
+fn dfsph_integrate(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let pid = gid.x;
+    if pid >= num_particles() { return; }
+    if !is_water_phase(affine[pid].col0.w) || particles[pid].vel.w <= inactive_mass_threshold() {
+        return;
+    }
+
+    let p = particles[pid];
+    var vel = p.vel.xyz;
+    var new_pos = p.pos.xyz + vel * dt();
+    var contact = resolve_sdf_contact(mix(p.pos.xyz, new_pos, 0.5), vel, false);
+    vel = contact.vel;
+    contact = resolve_sdf_contact(new_pos, vel, false);
+    new_pos = contact.pos;
+    vel = contact.vel;
+
+    let margin = dx() * 0.5;
+    let lo = u.grid_origin.xyz + vec3<f32>(margin);
+    let hi = u.bounds_max.xyz - vec3<f32>(margin);
+    new_pos = clamp(new_pos, lo, hi);
+
+    particles[pid].pos = vec4<f32>(new_pos, p.pos.w);
+    particles[pid].vel = vec4<f32>(vel, p.vel.w);
+}
+
 // ── clear_grid ──
 
 @compute @workgroup_size(64)
@@ -1310,7 +1954,8 @@ fn clear_grid(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 @compute @workgroup_size(64)
 fn p2g(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let pid = gid.x;
+    if gid.x >= num_water() { return; }
+    let pid = water_particle_id(gid.x);
     if pid >= num_particles() { return; }
 
     let p = particles[pid];
@@ -1387,9 +2032,9 @@ fn p2g(@builtin(global_invocation_id) gid: vec3<u32>) {
                 let mom_x_fp = mom.x * fp;
                 let mom_y_fp = mom.y * fp;
                 let mom_z_fp = mom.z * fp;
-                if abs(mass_fp) > limit_m || abs(mom_x_fp) > limit_m
+                if collect_metrics() && (abs(mass_fp) > limit_m || abs(mom_x_fp) > limit_m
                     || abs(mom_y_fp) > limit_m || abs(mom_z_fp) > limit_m
-                    || abs(rest_volume_fp) > limit_m || abs(current_volume_fp) > limit_m {
+                    || abs(rest_volume_fp) > limit_m || abs(current_volume_fp) > limit_m) {
                     atomicAdd(&metrics[METRIC_MASS_OVERFLOW_FIRES_IDX], 1u);
                 }
                 atomicAdd(&grid[grid_mass_idx(ci)], i32(mass_fp));
@@ -1407,7 +2052,10 @@ fn p2g(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 @compute @workgroup_size(64)
 fn grid_update(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
+    grid_update_idx(gid.x);
+}
+
+fn grid_update_idx(idx: u32) {
     if idx >= total_cells() { return; }
 
     let inv_fp = inv_fp_scale();
@@ -1467,7 +2115,21 @@ fn viscosity_prepare(@builtin(global_invocation_id) gid: vec3<u32>) {
     var neighbor_velocity_sum = vec3<f32>(0.0);
     var neighbor_weight_sum = 0.0;
     var fluid_neighbor_count = 0u;
+    var wall_support_weight = 0.0;
     let wall_viscosity_weight = 1.0;
+
+    let cell = vec3<i32>(i32(ix_val), i32(iy_val), i32(iz_val));
+    let cell_center = cell_center_from_cell(cell);
+    let sdf_val = sample_sdf(cell_center);
+    let wall_gap = sdf_val - contact_offset();
+    let normal = sdf_gradient(cell_center);
+    let cup_side_wall = cell_center.y <= -3.5 && abs(normal.y) < 0.5;
+    if cup_side_wall && wall_gap >= 0.0 {
+        let wall_reach = dfsph_support_radius() * 2.5;
+        let wall_fraction = clamp(1.0 - wall_gap / max(wall_reach, 1e-6), 0.0, 1.0);
+        wall_support_weight = wall_fraction;
+        neighbor_weight_sum += wall_support_weight;
+    }
 
     let offsets = array<vec3<i32>, 6>(
         vec3<i32>(-1, 0, 0),
@@ -1508,7 +2170,7 @@ fn viscosity_prepare(@builtin(global_invocation_id) gid: vec3<u32>) {
         fluid_neighbor_count += 1u;
     }
 
-    if fluid_neighbor_count < 3u || neighbor_weight_sum <= 1e-6 {
+    if (fluid_neighbor_count < 3u && wall_support_weight <= 1e-6) || neighbor_weight_sum <= 1e-6 {
         velocity_scratch_store(idx, v_here);
         return;
     }
@@ -1532,11 +2194,52 @@ fn viscosity_apply(@builtin(global_invocation_id) gid: vec3<u32>) {
     grid_vel[idx] = vec4<f32>(velocity_scratch_load(idx), mass);
 }
 
+// ── active pressure tiles ──
+
+@compute @workgroup_size(64)
+fn active_tile_clear(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    let tile_count = pressure_tile_count();
+    let counter_idx = pressure_tile_counter_idx();
+    if idx < tile_count {
+        atomicStore(&water_hash[idx], 0);
+    }
+    if idx == counter_idx {
+        atomicStore(&water_hash[idx], 0);
+    }
+    if idx == 0u {
+        atomicStore(&pressure_indirect[0], 0);
+    } else if idx == 1u || idx == 2u {
+        atomicStore(&pressure_indirect[idx], 1);
+    }
+}
+
+@compute @workgroup_size(64)
+fn active_tile_compact(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let tile_id = gid.x;
+    if tile_id >= pressure_tile_count() { return; }
+    if atomicLoad(&water_hash[tile_id]) == 0 {
+        return;
+    }
+
+    let slot = u32(atomicAdd(&water_hash[pressure_tile_counter_idx()], 1));
+    atomicStore(&water_hash[pressure_tile_list_idx(slot)], i32(tile_id));
+    atomicMax(&pressure_indirect[0], i32(slot + 1u));
+}
+
+fn mark_pressure_tile(ix_val: u32, iy_val: u32, iz_val: u32) {
+    let tile_id = pressure_tile_id_from_cell(ix_val, iy_val, iz_val);
+    atomicStore(&water_hash[tile_id], 1);
+}
+
 // ── classify_cells ──
 
 @compute @workgroup_size(64)
 fn classify_cells(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
+    classify_cells_idx(gid.x);
+}
+
+fn classify_cells_idx(idx: u32) {
     if idx >= total_cells() { return; }
 
     let mass = grid_vel[idx].w;
@@ -1551,17 +2254,15 @@ fn classify_cells(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     // SDF solid classification. Sign convention (see state.rs
     // `generate_sdf_data`):
-    //   sdf > 0  → open fluid domain (inside the cup)
-    //   sdf = 0  → on the wall surface
-    //   sdf < 0  → inside wall material or exterior ambient space
-    // Marking sdf<0 cells as CELL_SOLID lets the pressure solve treat them
-    // with a Neumann BC (∂p/∂n = 0) via the ghost-mirror trick in
-    // pressure_update / project_pressure, instead of the Dirichlet p=0
-    // they'd get if lumped with air.
+    //   sdf >= contact_offset  → open fluid domain (inside the cup)
+    //   sdf < contact_offset   → contact wall or exterior ambient space
+    // Cells inside the contact offset are treated as solid so pressure,
+    // viscosity, and particle transfer all share the same no-flow wall used by
+    // particle contact.
     let cell_center = u.grid_origin.xyz
         + (vec3<f32>(f32(ix_val), f32(iy_val), f32(iz_val)) + vec3<f32>(0.5)) * dx();
     let self_is_solid = select(
-        sample_sdf(cell_center) < 0.0,
+        sample_sdf(cell_center) < contact_offset(),
         sdf_class_is_solid(vec3<i32>(i32(ix_val), i32(iy_val), i32(iz_val))),
         use_sdf_cache(),
     );
@@ -1578,7 +2279,7 @@ fn classify_cells(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     let bed_idx_here = bed_lookup_load(idx);
-    if bed_idx_here >= 0 {
+    if num_bed() > 0u && bed_idx_here >= 0 {
         atomicStore(&grid[scratch_kind_idx(idx)], CELL_BED_COUPLED);
     } else {
         let offsets = array<vec3<i32>, 6>(
@@ -1617,6 +2318,7 @@ fn classify_cells(@builtin(global_invocation_id) gid: vec3<u32>) {
         divergence_store(idx, 0.0);
         return;
     }
+    mark_pressure_tile(ix_val, iy_val, iz_val);
 
     // Central-difference divergence using cell-centered velocities. No-flow
     // boundaries (off-grid faces and CELL_SOLID neighbors) use a ghost-mirror
@@ -1642,7 +2344,7 @@ fn classify_cells(@builtin(global_invocation_id) gid: vec3<u32>) {
     var vzp = -self_vel.z;
     if ix_val > 0u
         && select(
-            sample_sdf(cell_center + vec3<f32>(-dx_vec, 0.0, 0.0)) >= 0.0,
+            sample_sdf(cell_center + vec3<f32>(-dx_vec, 0.0, 0.0)) >= contact_offset(),
             !sdf_class_is_solid(vec3<i32>(i32(ix_val) - 1, i32(iy_val), i32(iz_val))),
             use_sdf_cache(),
         ) {
@@ -1650,7 +2352,7 @@ fn classify_cells(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     if ix_val + 1u < gx()
         && select(
-            sample_sdf(cell_center + vec3<f32>(dx_vec, 0.0, 0.0)) >= 0.0,
+            sample_sdf(cell_center + vec3<f32>(dx_vec, 0.0, 0.0)) >= contact_offset(),
             !sdf_class_is_solid(vec3<i32>(i32(ix_val) + 1, i32(iy_val), i32(iz_val))),
             use_sdf_cache(),
         ) {
@@ -1658,7 +2360,7 @@ fn classify_cells(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     if iy_val > 0u
         && select(
-            sample_sdf(cell_center + vec3<f32>(0.0, -dx_vec, 0.0)) >= 0.0,
+            sample_sdf(cell_center + vec3<f32>(0.0, -dx_vec, 0.0)) >= contact_offset(),
             !sdf_class_is_solid(vec3<i32>(i32(ix_val), i32(iy_val) - 1, i32(iz_val))),
             use_sdf_cache(),
         ) {
@@ -1666,7 +2368,7 @@ fn classify_cells(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     if iy_val + 1u < gy()
         && select(
-            sample_sdf(cell_center + vec3<f32>(0.0, dx_vec, 0.0)) >= 0.0,
+            sample_sdf(cell_center + vec3<f32>(0.0, dx_vec, 0.0)) >= contact_offset(),
             !sdf_class_is_solid(vec3<i32>(i32(ix_val), i32(iy_val) + 1, i32(iz_val))),
             use_sdf_cache(),
         ) {
@@ -1674,7 +2376,7 @@ fn classify_cells(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     if iz_val > 0u
         && select(
-            sample_sdf(cell_center + vec3<f32>(0.0, 0.0, -dx_vec)) >= 0.0,
+            sample_sdf(cell_center + vec3<f32>(0.0, 0.0, -dx_vec)) >= contact_offset(),
             !sdf_class_is_solid(vec3<i32>(i32(ix_val), i32(iy_val), i32(iz_val) - 1)),
             use_sdf_cache(),
         ) {
@@ -1682,7 +2384,7 @@ fn classify_cells(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     if iz_val + 1u < gz()
         && select(
-            sample_sdf(cell_center + vec3<f32>(0.0, 0.0, dx_vec)) >= 0.0,
+            sample_sdf(cell_center + vec3<f32>(0.0, 0.0, dx_vec)) >= contact_offset(),
             !sdf_class_is_solid(vec3<i32>(i32(ix_val), i32(iy_val), i32(iz_val) + 1)),
             use_sdf_cache(),
         ) {
@@ -1714,13 +2416,15 @@ fn classify_cells(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     divergence_store(idx, div - target_divergence);
 
-    // Observability: track the worst-case cell divergence and the fluid-cell
-    // footprint of the active substep. `atomicMax` on u32 gives the peak FP
-    // encoding; the HUD decodes via `METRICS_DIV_FP_SCALE`.
-    let abs_div = abs(div);
-    let fp_div = u32(clamp(abs_div * metrics_div_fp_scale(), 0.0, f32(0x7fffffffu)));
-    atomicMax(&metrics[METRIC_MAX_ABS_DIV_IDX], fp_div);
-    atomicAdd(&metrics[METRIC_FLUID_CELLS_IDX], 1u);
+    if collect_metrics() {
+        // Observability: track the worst-case cell divergence and the
+        // fluid-cell footprint of the active substep. `atomicMax` on u32 gives
+        // the peak FP encoding; the HUD decodes via `METRICS_DIV_FP_SCALE`.
+        let abs_div = abs(div);
+        let fp_div = u32(clamp(abs_div * metrics_div_fp_scale(), 0.0, f32(0x7fffffffu)));
+        atomicMax(&metrics[METRIC_MAX_ABS_DIV_IDX], fp_div);
+        atomicAdd(&metrics[METRIC_FLUID_CELLS_IDX], 1u);
+    }
 }
 
 // ── pressure_rbgs ──
@@ -1809,11 +2513,48 @@ fn pressure_rbgs_black(@builtin(global_invocation_id) gid: vec3<u32>) {
     pressure_update(idx, 1u);
 }
 
-// ── project_pressure ──
+fn pressure_tile_cell_idx(tile_slot: u32, local_id: u32) -> u32 {
+    let tile_id = u32(atomicLoad(&water_hash[pressure_tile_list_idx(tile_slot)]));
+    let tile = pressure_tile_size();
+    let dims = pressure_tile_dims();
+    let tx = tile_id % dims.x;
+    let ty = (tile_id / dims.x) % dims.y;
+    let tz = tile_id / (dims.x * dims.y);
+    let lx = local_id % tile;
+    let ly = (local_id / tile) % tile;
+    let lz = local_id / (tile * tile);
+    let ix_val = tx * tile + lx;
+    let iy_val = ty * tile + ly;
+    let iz_val = tz * tile + lz;
+    if ix_val >= gx() || iy_val >= gy() || iz_val >= gz() {
+        return total_cells();
+    }
+    return cell_index(ix_val, iy_val, iz_val);
+}
 
 @compute @workgroup_size(64)
-fn project_pressure(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
+fn pressure_rbgs_red_tiles(
+    @builtin(workgroup_id) workgroup_id: vec3<u32>,
+    @builtin(local_invocation_id) local_id: vec3<u32>,
+) {
+    let idx = pressure_tile_cell_idx(workgroup_id.x, local_id.x);
+    if idx >= total_cells() { return; }
+    pressure_update(idx, 0u);
+}
+
+@compute @workgroup_size(64)
+fn pressure_rbgs_black_tiles(
+    @builtin(workgroup_id) workgroup_id: vec3<u32>,
+    @builtin(local_invocation_id) local_id: vec3<u32>,
+) {
+    let idx = pressure_tile_cell_idx(workgroup_id.x, local_id.x);
+    if idx >= total_cells() { return; }
+    pressure_update(idx, 1u);
+}
+
+// ── project_pressure ──
+
+fn project_pressure_idx(idx: u32) {
     if idx >= total_cells() { return; }
 
     let gv = grid_vel[idx];
@@ -1902,11 +2643,14 @@ fn project_pressure(@builtin(global_invocation_id) gid: vec3<u32>) {
     grid_vel[idx] = vec4<f32>(v, gv.w);
 }
 
+@compute @workgroup_size(64)
+fn project_pressure(@builtin(global_invocation_id) gid: vec3<u32>) {
+    project_pressure_idx(gid.x);
+}
+
 // ── pressure_residual ──
 
-@compute @workgroup_size(64)
-fn pressure_residual(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
+fn pressure_residual_idx(idx: u32) {
     if idx >= total_cells() { return; }
 
     let kind = cell_kind_load(idx);
@@ -1934,6 +2678,19 @@ fn pressure_residual(@builtin(global_invocation_id) gid: vec3<u32>) {
     atomicMax(&metrics[METRIC_PROJECTION_RESIDUAL_MAX_IDX], fp_max);
     atomicAdd(&metrics[METRIC_PROJECTION_RESIDUAL_SUM_IDX], fp_sum);
     atomicAdd(&metrics[METRIC_PROJECTION_RESIDUAL_CELLS_IDX], 1u);
+}
+
+@compute @workgroup_size(64)
+fn pressure_residual(@builtin(global_invocation_id) gid: vec3<u32>) {
+    pressure_residual_idx(gid.x);
+}
+
+@compute @workgroup_size(64)
+fn pressure_residual_tiles(
+    @builtin(workgroup_id) workgroup_id: vec3<u32>,
+    @builtin(local_invocation_id) local_id: vec3<u32>,
+) {
+    pressure_residual_idx(pressure_tile_cell_idx(workgroup_id.x, local_id.x));
 }
 
 // ── packing pressure ──
@@ -2001,9 +2758,7 @@ fn is_packing_pressure_cell(idx: u32, kind: i32) -> bool {
     return fluid_neighbor_count >= 3u;
 }
 
-@compute @workgroup_size(64)
-fn packing_prepare(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
+fn packing_prepare_idx(idx: u32) {
     if idx >= total_cells() { return; }
 
     let kind = cell_kind_load(idx);
@@ -2020,9 +2775,7 @@ fn packing_prepare(@builtin(global_invocation_id) gid: vec3<u32>) {
     packing_pressure_store(idx, bulk_K() * overpack);
 }
 
-@compute @workgroup_size(64)
-fn packing_apply(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
+fn packing_apply_idx(idx: u32) {
     if idx >= total_cells() { return; }
 
     let gv = grid_vel[idx];
@@ -2063,11 +2816,30 @@ fn packing_apply(@builtin(global_invocation_id) gid: vec3<u32>) {
     grid_vel[idx] = vec4<f32>(v, gv.w);
 }
 
+@compute @workgroup_size(64)
+fn packing_prepare_tiles(
+    @builtin(workgroup_id) workgroup_id: vec3<u32>,
+    @builtin(local_invocation_id) local_id: vec3<u32>,
+) {
+    packing_prepare_idx(pressure_tile_cell_idx(workgroup_id.x, local_id.x));
+}
+
+@compute @workgroup_size(64)
+fn packing_apply_tiles(
+    @builtin(workgroup_id) workgroup_id: vec3<u32>,
+    @builtin(local_invocation_id) local_id: vec3<u32>,
+) {
+    packing_apply_idx(pressure_tile_cell_idx(workgroup_id.x, local_id.x));
+}
+
 // ── boundary_project ──
 
 @compute @workgroup_size(64)
 fn boundary_project(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
+    boundary_project_idx(gid.x);
+}
+
+fn boundary_project_idx(idx: u32) {
     if idx >= total_cells() { return; }
 
     let gv = grid_vel[idx];
@@ -2088,16 +2860,20 @@ fn boundary_project(@builtin(global_invocation_id) gid: vec3<u32>) {
     let sdf_val = sample_sdf(cell_pos);
     if sdf_val < contact_offset() {
         let n = sdf_gradient(cell_pos);
-        let vn = dot(v, n);
-        if vn < 0.0 {
-            v = v - n * vn * (1.0 + restitution());
-            // Friction: reduce tangential component
-            let vt = v - n * dot(v, n);
-            let vt_len = length(vt);
-            if vt_len > 1e-6 {
-                let friction_impulse = min(friction() * abs(vn), vt_len);
-                v = v - vt * (friction_impulse / vt_len);
+        if length(n) > 1e-6 {
+            let vn = dot(v, n);
+            if vn < 0.0 {
+                v = v - n * vn * (1.0 + restitution());
+                // Impact friction: reduce tangential component in proportion
+                // to the normal impulse.
+                let vt = v - n * dot(v, n);
+                let vt_len = length(vt);
+                if vt_len > 1e-6 {
+                    let friction_impulse = min(friction() * abs(vn), vt_len);
+                    v = v - vt * (friction_impulse / vt_len);
+                }
             }
+
         }
     }
 
@@ -2120,7 +2896,8 @@ fn boundary_project(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 @compute @workgroup_size(64)
 fn g2p(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let pid = gid.x;
+    if gid.x >= num_water() { return; }
+    let pid = water_particle_id(gid.x);
     if pid >= num_particles() { return; }
 
     let p = particles[pid];
@@ -2162,6 +2939,7 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>) {
     var new_C2 = vec3<f32>(0.0);
     var supported_weight = 0.0;
     var local_grid_mass = 0.0;
+    var local_fluid_mass = 0.0;
     var bed_overlap_weight = 0.0;
     var bed_velocity_sum = vec3<f32>(0.0);
     var bed_permeability_sum = 0.0;
@@ -2192,6 +2970,14 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>) {
                     new_C2 += w * B * grid_v * dpos.z;
                     supported_weight += w;
                     local_grid_mass += w * grid_mass;
+                    local_fluid_mass += w * grid_mass;
+                } else if sdf_class_is_solid(cell) {
+                    // Empty stencil nodes inside a solid boundary are
+                    // stationary wall support, not free air. Counting them as
+                    // support prevents cup-wall particles from entering the
+                    // sparse-stream ballistic preservation path.
+                    supported_weight += w;
+                    local_grid_mass += w * nominal_mass();
                 }
                 let bed_idx = bed_lookup_load(ci);
                 if num_bed() > 0u && is_valid_bed_solid_idx(bed_idx) {
@@ -2218,7 +3004,7 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>) {
     let in_cup_volume =
         xp.y < -3.5 && dot(xp.xz, xp.xz) < (3.0 + contact_offset()) * (3.0 + contact_offset());
     let dense_support_ratio =
-        clamp(local_grid_mass / max(nominal_mass() * 4.0, 1e-6), 0.0, 1.0);
+        clamp(local_fluid_mass / max(nominal_mass() * 4.0, 1e-6), 0.0, 1.0);
     // Use the particle's interpolation stencil rather than a single home-cell
     // bed lookup so particles exiting the coffee bed do not toggle abruptly
     // between porous and airborne transfer behavior at cell boundaries.
@@ -2264,6 +3050,14 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>) {
         new_C0 *= affine_damp;
         new_C1 *= affine_damp;
         new_C2 *= affine_damp;
+
+        if !in_cup_volume {
+            let ballistic_speed = length(ballistic_v) * 1.06;
+            let feedback_speed = length(new_v);
+            if feedback_speed > ballistic_speed {
+                new_v *= ballistic_speed / max(feedback_speed, 1e-6);
+            }
+        }
     }
 
     if porous_overlap > 1e-4 {
@@ -2301,10 +3095,11 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>) {
     // collision pass so the dripper wall behaves like a hard barrier.
     let mid_pos = mix(xp, new_pos, 0.5);
     var contact = resolve_sdf_contact(mid_pos, new_v, false);
-    new_v = contact.vel;
+    new_v = apply_wall_viscous_shear(contact.pos, contact.vel, dense_support_ratio);
     contact = resolve_sdf_contact(new_pos, new_v, false);
     new_pos = contact.pos;
     new_v = contact.vel;
+    new_v = apply_wall_viscous_shear(new_pos, new_v, dense_support_ratio);
 
     // Clamp to domain
     let margin = dx() * 0.5;
@@ -2605,7 +3400,7 @@ fn bed_dynamics(@builtin(global_invocation_id) gid: vec3<u32>) {
             let final_contact = resolve_sdf_contact(suspended_pos, suspended_v, true);
             suspended_pos = final_contact.pos;
             suspended_v = final_contact.vel;
-            phase = 1.0;
+            phase = PARTICLE_OBJECT_COFFEE_BED;
         }
         affine[pid].col0 = vec4<f32>(affine[pid].col0.xyz, phase);
         affine[pid].col1 = vec4<f32>(suspended_pos, 0.0);
@@ -2778,28 +3573,30 @@ fn prepare_render(@builtin(global_invocation_id) gid: vec3<u32>) {
         let solute_mass = max(affine[pid].col1.w, 0.0);
         let concentration = solute_mass / max(p.vel.w, 1e-6);
         brew_t = clamp(concentration / 0.018, 0.0, 1.35);
-        atomicAdd(
-            &metrics[METRIC_ACTIVE_WATER_MASS_IDX],
-            u32(clamp(p.vel.w * metrics_mass_fp_scale(), 0.0, f32(0xffffffffu))),
-        );
-        atomicAdd(
-            &metrics[METRIC_ACTIVE_SOLUTE_MASS_IDX],
-            u32(clamp(solute_mass * metrics_solute_fp_scale(), 0.0, f32(0xffffffffu))),
-        );
-        let cup_r = 3.0 + dx();
-        let in_cup =
-            dot(p.pos.xz, p.pos.xz) <= cup_r * cup_r
-            && p.pos.y <= -3.5 + dx()
-            && p.pos.y >= -8.0 - dx();
-        if in_cup {
+        if collect_metrics() {
             atomicAdd(
-                &metrics[METRIC_CUP_WATER_MASS_IDX],
+                &metrics[METRIC_ACTIVE_WATER_MASS_IDX],
                 u32(clamp(p.vel.w * metrics_mass_fp_scale(), 0.0, f32(0xffffffffu))),
             );
             atomicAdd(
-                &metrics[METRIC_CUP_SOLUTE_MASS_IDX],
+                &metrics[METRIC_ACTIVE_SOLUTE_MASS_IDX],
                 u32(clamp(solute_mass * metrics_solute_fp_scale(), 0.0, f32(0xffffffffu))),
             );
+            let cup_r = 3.0 + dx();
+            let in_cup =
+                dot(p.pos.xz, p.pos.xz) <= cup_r * cup_r
+                && p.pos.y <= -3.5 + dx()
+                && p.pos.y >= -8.0 - dx();
+            if in_cup {
+                atomicAdd(
+                    &metrics[METRIC_CUP_WATER_MASS_IDX],
+                    u32(clamp(p.vel.w * metrics_mass_fp_scale(), 0.0, f32(0xffffffffu))),
+                );
+                atomicAdd(
+                    &metrics[METRIC_CUP_SOLUTE_MASS_IDX],
+                    u32(clamp(solute_mass * metrics_solute_fp_scale(), 0.0, f32(0xffffffffu))),
+                );
+            }
         }
     } else {
         let bed_idx = pid;

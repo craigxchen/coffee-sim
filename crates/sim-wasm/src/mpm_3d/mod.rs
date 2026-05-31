@@ -37,9 +37,9 @@ pub(crate) const OBSTACLE_WALL_THICKNESS: f32 = 0.4;
 
 /// Device limits required by the MPM compute pipeline.
 ///
-/// The MPM bind group holds 9 storage buffers (particles, affine, grid,
-/// grid_vel, render_data, bed_extract, bed_lookup, bed_delta, metrics) plus
-/// one SDF texture. This stays within the 10-buffer cap that some WebGPU
+/// The MPM/DFSPH bind group holds 10 storage buffers (particles, affine,
+/// water_hash, grid, grid_vel, render_data, bed_extract, bed_lookup, bed_delta,
+/// metrics) plus one SDF texture. This stays within the 10-buffer cap that some WebGPU
 /// adapters enforce. Any
 /// `request_device` site that uses this pipeline must use these limits, and
 /// `mpm_pipelines_fit_within_required_limits` pins the invariant.
@@ -303,12 +303,12 @@ pub(crate) struct MpmSettings {
 
 impl MpmSettings {
     pub fn default_v60() -> Self {
-        let bounds_size = Vec3::new(14.0, 20.0, 14.0);
+        let bounds_size = Vec3::new(12.6, 20.0, 12.6);
         // Ensure uniform cell spacing: derive gy from dx = bounds_x / gx
-        let gx = 80u32;
+        let gx = 72u32;
         let dx = bounds_size.x / gx as f32;
         let gy = (bounds_size.y / dx).ceil() as u32;
-        let gz = 80u32;
+        let gz = 72u32;
         let grid_dims = [gx, gy, gz];
         let filter = FilterConfig::default();
         let bed = BedConfig::seated_in_filter(&filter);
@@ -320,7 +320,9 @@ impl MpmSettings {
             substeps: 10,
             gravity: units::EARTH_GRAVITY_SIM_UNITS,
             bulk_modulus: 900.0,
-            viscosity: DEFAULT_BREW.water_viscosity,
+            viscosity: units::sim_kinematic_viscosity_from_m2_s(
+                DEFAULT_BREW.water_kinematic_viscosity_m2_s,
+            ),
             render_radius: dx * 0.7,
             pressure_rbgs_pairs: 40,
             pressure_residual_target: 0.0,
@@ -350,7 +352,8 @@ impl MpmSettings {
         // residuals, so the water-only scene needs tighter projection
         // convergence to keep the cup surface from settling into a lopsided
         // heap.
-        settings.pressure_rbgs_pairs = 80;
+        settings.pressure_rbgs_pairs = 140;
+        settings.pressure_rbgs_max_pairs = settings.pressure_rbgs_pairs;
         settings.initial_water_speed_m_s = DEFAULT_BREW.initial_water_speed_m_s;
         settings
     }
@@ -401,28 +404,28 @@ impl MpmSettings {
     }
 
     pub fn debug_cup_wall_floor_corner_contact() -> Self {
-        let mut settings = Self::cup_only_water_scene();
+        let mut settings = Self::wide_cup_only_water_scene();
         settings.initial_water_speed_m_s = 0.0;
         settings.pressure_rbgs_pairs = 90;
         settings
     }
 
     pub fn debug_asymmetric_cup_mound() -> Self {
-        let mut settings = Self::cup_only_water_scene();
+        let mut settings = Self::wide_cup_only_water_scene();
         settings.initial_water_speed_m_s = 0.0;
         settings.pressure_rbgs_pairs = 90;
         settings
     }
 
     pub fn debug_hydrostatic_column() -> Self {
-        let mut settings = Self::cup_only_water_scene();
+        let mut settings = Self::wide_cup_only_water_scene();
         settings.initial_water_speed_m_s = 0.0;
         settings.pressure_rbgs_pairs = 100;
         settings
     }
 
     pub fn debug_dam_break_slosh() -> Self {
-        let mut settings = Self::cup_only_water_scene();
+        let mut settings = Self::wide_cup_only_water_scene();
         settings.initial_water_speed_m_s = 0.0;
         settings.pressure_rbgs_pairs = 90;
         settings
@@ -485,6 +488,17 @@ impl MpmSettings {
         settings
             .obstacles
             .retain(|obstacle| matches!(obstacle, Obstacle::Cylinder { .. }));
+        settings
+    }
+
+    fn wide_cup_only_water_scene() -> Self {
+        let mut settings = Self::cup_only_water_scene();
+        let dx = settings.bounds_size.x / settings.grid_dims[0] as f32;
+        settings.bounds_size.x = 14.0;
+        settings.bounds_size.z = 14.0;
+        settings.grid_dims[0] = (settings.bounds_size.x / dx).round() as u32;
+        settings.grid_dims[1] = (settings.bounds_size.y / dx).ceil() as u32;
+        settings.grid_dims[2] = (settings.bounds_size.z / dx).round() as u32;
         settings
     }
 }
@@ -654,6 +668,14 @@ fn deterministic_unit_float(mut value: u32) -> f32 {
     value as f32 / u32::MAX as f32
 }
 
+fn water_particle_rest_volume(dx: f32) -> f32 {
+    dx * dx * dx * 0.25
+}
+
+fn water_seed_spacing_for_fill(dx: f32, target_fill_fraction: f32) -> f32 {
+    (water_particle_rest_volume(dx) / target_fill_fraction.max(1e-6)).cbrt()
+}
+
 pub(crate) struct MpmSim3D {
     settings: MpmSettings,
     buffers: MpmBuffers,
@@ -669,6 +691,7 @@ pub(crate) struct MpmSim3D {
     total_dropped_particles: u32,
     last_pressure_rbgs_pairs: u32,
     latest_metrics: MetricsSnapshot,
+    metrics_enabled: bool,
 }
 
 impl MpmSim3D {
@@ -696,6 +719,7 @@ impl MpmSim3D {
             total_dropped_particles: 0,
             last_pressure_rbgs_pairs: 0,
             latest_metrics: MetricsSnapshot::default(),
+            metrics_enabled: true,
         };
 
         sim.init_bed(queue);
@@ -851,9 +875,10 @@ impl MpmSim3D {
         self.set_exit_speed_m_s(exit_speed_m_s);
     }
 
-    fn water_seed_spacing(&self, scale: f32) -> f32 {
+    fn water_seed_spacing(&self, target_fill_fraction: f32) -> f32 {
         let [gx, _, _] = self.settings.grid_dims;
-        self.settings.bounds_size.x / gx as f32 * scale
+        let dx = self.settings.bounds_size.x / gx as f32;
+        water_seed_spacing_for_fill(dx, target_fill_fraction)
     }
 
     fn seed_filter_disc_layers<F>(
@@ -1180,7 +1205,7 @@ impl MpmSim3D {
 
         let [gx, _, _] = self.settings.grid_dims;
         let dx = self.settings.bounds_size.x / gx as f32;
-        let particle_vol = dx * dx * dx * 0.25;
+        let particle_vol = water_particle_rest_volume(dx);
         let nominal_mass = MASS_UNITS_PER_ML / inflow::PARTICLES_PER_ML;
         let inactive_thresh = nominal_mass * 0.1;
         let mut diagnostics = WaterDiagnostics {
@@ -1535,7 +1560,7 @@ impl MpmSim3D {
         self.frame_emitted_mass = 0.0;
         self.frame_dropped_particles = 0;
 
-        for _ in 0..substeps {
+        for substep_idx in 0..substeps {
             // Emit new particles
             let EmissionResult { emitted, dropped } = self.inflow.emit_particles(
                 queue,
@@ -1566,9 +1591,25 @@ impl MpmSim3D {
                 * self.settings.grid_dims[2];
             let num_particles = self.num_water + self.num_bed;
             let cell_wg = dispatch_size(total_cells, NUM_THREADS);
+            let water_hash_wg = dispatch_size(total_cells + num_particles, NUM_THREADS);
+            let pressure_tile_size = 4_u32;
+            let pressure_tile_dims = [
+                self.settings.grid_dims[0].div_ceil(pressure_tile_size),
+                self.settings.grid_dims[1].div_ceil(pressure_tile_size),
+                self.settings.grid_dims[2].div_ceil(pressure_tile_size),
+            ];
+            let pressure_tile_count =
+                pressure_tile_dims[0] * pressure_tile_dims[1] * pressure_tile_dims[2];
+            let active_tile_scratch_slots = pressure_tile_count * 2 + 1;
+            debug_assert!(active_tile_scratch_slots <= total_cells + self.settings.max_particles);
+            let active_tile_clear_wg = dispatch_size(pressure_tile_count + 1, NUM_THREADS);
+            let active_tile_compact_wg = dispatch_size(pressure_tile_count, NUM_THREADS);
+            let water_wg = dispatch_size(self.num_water, NUM_THREADS);
             let particle_wg = dispatch_size(num_particles, NUM_THREADS);
             let bed_wg = dispatch_size(self.num_bed, NUM_THREADS);
-
+            let needs_bed_coupling =
+                self.num_bed > 0 || DEFAULT_BREW.filter_absorption_rate_s > 0.0;
+            let collect_metrics = self.collect_metrics_this_substep();
             let metrics_wg = dispatch_size(METRICS_SLOT_COUNT as u32, 8);
 
             let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -1584,7 +1625,7 @@ impl MpmSim3D {
                 pass.set_bind_group(0, &self.pipelines.bind_group, &[]);
 
                 // 1a. metrics_clear (fresh per-substep observability counters)
-                if metrics_wg > 0 {
+                if collect_metrics && metrics_wg > 0 {
                     pass.set_pipeline(&self.pipelines.metrics_clear);
                     pass.dispatch_workgroups(metrics_wg, 1, 1);
                 }
@@ -1592,55 +1633,106 @@ impl MpmSim3D {
                 // 1b. bed_lookup_clear + scatter: rebuild the spatial index
                 // so classify_cells / bed_coupling / g2p see current
                 // bed-particle positions.
-                pass.set_pipeline(&self.pipelines.bed_lookup_clear);
-                pass.dispatch_workgroups(cell_wg, 1, 1);
                 if bed_wg > 0 {
+                    pass.set_pipeline(&self.pipelines.bed_lookup_clear);
+                    pass.dispatch_workgroups(cell_wg, 1, 1);
                     pass.set_pipeline(&self.pipelines.bed_lookup_scatter);
                     pass.dispatch_workgroups(bed_wg, 1, 1);
                 }
 
-                // 2. p2g
-                if particle_wg > 0 {
-                    pass.set_pipeline(&self.pipelines.p2g);
-                    pass.dispatch_workgroups(particle_wg, 1, 1);
+                // 2. DFSPH water pressure correction. Coffee/bed particles
+                // remain in the existing bed/MPM support path; water uses the
+                // hash for SPH neighbors before the grid transfer couples it
+                // back to the coffee bed and boundaries.
+                if water_wg > 0 {
+                    pass.set_pipeline(&self.pipelines.water_hash_clear);
+                    pass.dispatch_workgroups(water_hash_wg, 1, 1);
+                    pass.set_pipeline(&self.pipelines.water_hash_scatter);
+                    pass.dispatch_workgroups(water_wg, 1, 1);
+                    pass.set_pipeline(&self.pipelines.dfsph_density_factor);
+                    pass.dispatch_workgroups(water_wg, 1, 1);
+                    for _ in 0..1 {
+                        pass.set_pipeline(&self.pipelines.dfsph_divergence_estimate);
+                        pass.dispatch_workgroups(water_wg, 1, 1);
+                        pass.set_pipeline(&self.pipelines.dfsph_divergence_solve);
+                        pass.dispatch_workgroups(water_wg, 1, 1);
+                    }
+                    pass.set_pipeline(&self.pipelines.dfsph_predict_nonpressure);
+                    pass.dispatch_workgroups(water_wg, 1, 1);
+                    for _ in 0..2 {
+                        pass.set_pipeline(&self.pipelines.dfsph_density_star);
+                        pass.dispatch_workgroups(water_wg, 1, 1);
+                        pass.set_pipeline(&self.pipelines.dfsph_density_solve);
+                        pass.dispatch_workgroups(water_wg, 1, 1);
+                    }
                 }
 
-                // 3. grid_update
+                // 3. p2g: rebuild a grid view of the DFSPH water for pressure
+                // observability, bed support, and coffee-bed coupling.
+                if water_wg > 0 {
+                    pass.set_pipeline(&self.pipelines.p2g);
+                    pass.dispatch_workgroups(water_wg, 1, 1);
+                }
+
+                // 4. grid_update
                 pass.set_pipeline(&self.pipelines.grid_update);
                 pass.dispatch_workgroups(cell_wg, 1, 1);
 
-                // 4. boundary_project
+                // 5. boundary_project
                 pass.set_pipeline(&self.pipelines.boundary_project);
                 pass.dispatch_workgroups(cell_wg, 1, 1);
 
-                // Pressure projection: classify cells, RBGS pressure
-                // solve, velocity correction, then re-project boundaries.
+                // Pressure projection: classify cells, RBGS pressure solve,
+                // sparse velocity correction, then re-project boundaries.
+                pass.set_pipeline(&self.pipelines.active_tile_clear);
+                pass.set_bind_group(0, &self.pipelines.active_tile_bind_group, &[]);
+                pass.dispatch_workgroups(active_tile_clear_wg, 1, 1);
                 pass.set_pipeline(&self.pipelines.classify_cells);
+                pass.set_bind_group(0, &self.pipelines.bind_group, &[]);
                 pass.dispatch_workgroups(cell_wg, 1, 1);
 
+                drop(pass);
+
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("mpm active pressure tiles"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.pipelines.active_tile_compact);
+                pass.set_bind_group(0, &self.pipelines.active_tile_bind_group, &[]);
+                pass.dispatch_workgroups(active_tile_compact_wg, 1, 1);
+
+                drop(pass);
+
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("mpm pressure solve"),
+                    timestamp_writes: None,
+                });
+                pass.set_bind_group(0, &self.pipelines.bind_group, &[]);
                 for _ in 0..pressure_pairs {
-                    pass.set_pipeline(&self.pipelines.pressure_rbgs_red);
-                    pass.dispatch_workgroups(cell_wg, 1, 1);
-                    pass.set_pipeline(&self.pipelines.pressure_rbgs_black);
-                    pass.dispatch_workgroups(cell_wg, 1, 1);
+                    pass.set_pipeline(&self.pipelines.pressure_rbgs_red_tiles);
+                    pass.dispatch_workgroups_indirect(&self.buffers.pressure_indirect, 0);
+                    pass.set_pipeline(&self.pipelines.pressure_rbgs_black_tiles);
+                    pass.dispatch_workgroups_indirect(&self.buffers.pressure_indirect, 0);
                 }
 
                 pass.set_pipeline(&self.pipelines.project_pressure);
                 pass.dispatch_workgroups(cell_wg, 1, 1);
                 pass.set_pipeline(&self.pipelines.boundary_project);
                 pass.dispatch_workgroups(cell_wg, 1, 1);
-                pass.set_pipeline(&self.pipelines.pressure_residual);
-                pass.dispatch_workgroups(cell_wg, 1, 1);
+                if collect_metrics {
+                    pass.set_pipeline(&self.pipelines.pressure_residual_tiles);
+                    pass.dispatch_workgroups_indirect(&self.buffers.pressure_indirect, 0);
+                }
 
                 // Packing pressure reuses the projection scratch lanes before
                 // viscosity overwrites the grid momentum lanes with temporary
                 // FP-encoded velocity scratch. The shader limits this corrective
                 // pressure to interior liquid so sparse free-surface drip cells
                 // keep atmospheric pressure instead of kicking the pool/head.
-                pass.set_pipeline(&self.pipelines.packing_prepare);
-                pass.dispatch_workgroups(cell_wg, 1, 1);
-                pass.set_pipeline(&self.pipelines.packing_apply);
-                pass.dispatch_workgroups(cell_wg, 1, 1);
+                pass.set_pipeline(&self.pipelines.packing_prepare_tiles);
+                pass.dispatch_workgroups_indirect(&self.buffers.pressure_indirect, 0);
+                pass.set_pipeline(&self.pipelines.packing_apply_tiles);
+                pass.dispatch_workgroups_indirect(&self.buffers.pressure_indirect, 0);
                 pass.set_pipeline(&self.pipelines.boundary_project);
                 pass.dispatch_workgroups(cell_wg, 1, 1);
 
@@ -1655,15 +1747,16 @@ impl MpmSim3D {
                 pass.set_pipeline(&self.pipelines.boundary_project);
                 pass.dispatch_workgroups(cell_wg, 1, 1);
 
-                // 6. g2p
-                if particle_wg > 0 {
+                // 6. g2p: transfer the DFSPH-corrected grid state back to
+                // water particles and perform the existing boundary advection.
+                if water_wg > 0 {
                     pass.set_pipeline(&self.pipelines.g2p);
-                    pass.dispatch_workgroups(particle_wg, 1, 1);
+                    pass.dispatch_workgroups(water_wg, 1, 1);
                 }
 
-                // 7. bed_coupling (after g2p so absorption uses projected
+                // 7. bed_coupling (after g2p so absorption uses current
                 //    velocities and remains the sole bed storage transfer)
-                if particle_wg > 0 {
+                if needs_bed_coupling && particle_wg > 0 {
                     pass.set_pipeline(&self.pipelines.bed_coupling);
                     pass.dispatch_workgroups(particle_wg, 1, 1);
                 }
@@ -1681,7 +1774,7 @@ impl MpmSim3D {
                 }
 
                 // 10. prepare_render
-                if particle_wg > 0 {
+                if substep_idx + 1 == substeps && particle_wg > 0 {
                     pass.set_pipeline(&self.pipelines.prepare_render);
                     pass.dispatch_workgroups(particle_wg, 1, 1);
                 }
@@ -1788,6 +1881,24 @@ impl MpmSim3D {
     pub fn set_pressure_residual_adaptation(&mut self, target: f32, max_pairs: u32) {
         self.settings.pressure_residual_target = target.max(0.0);
         self.settings.pressure_rbgs_max_pairs = max_pairs.max(self.settings.pressure_rbgs_pairs);
+        if self.settings.pressure_residual_target > 0.0 {
+            self.metrics_enabled = true;
+        }
+    }
+
+    pub fn set_metrics_enabled(&mut self, enabled: bool) {
+        self.metrics_enabled = enabled;
+        if !enabled {
+            self.latest_metrics = MetricsSnapshot::default();
+        }
+    }
+
+    fn collect_metrics_this_substep(&self) -> bool {
+        self.metrics_enabled || self.settings.pressure_residual_target > 0.0
+    }
+
+    pub fn metrics_collection_enabled(&self) -> bool {
+        self.collect_metrics_this_substep()
     }
 
     fn pressure_rbgs_pairs_for_substep(&self) -> u32 {
@@ -2069,7 +2180,7 @@ impl MpmSim3D {
         let dx = bs.x / gx as f32;
         let inv_dx = 1.0 / dx;
         let initial_particle_mass = MASS_UNITS_PER_ML / inflow::PARTICLES_PER_ML;
-        let particle_vol = dx * dx * dx * 0.25;
+        let particle_vol = water_particle_rest_volume(dx);
         let bed_capacity_per_particle = if self.num_bed > 0 {
             TARGET_BED_RETENTION_ML * MASS_UNITS_PER_ML / self.num_bed as f32
         } else {
@@ -2087,13 +2198,21 @@ impl MpmSim3D {
         // tighter physical bound, so we rely on the counter to flag saturation.
         let pressure_clamp = FP_VALUE_LIMIT - 1.0;
 
+        let mut runtime_flags = 0_u32;
+        if self.settings.use_sdf_cache {
+            runtime_flags |= 1;
+        }
+        if self.collect_metrics_this_substep() {
+            runtime_flags |= 2;
+        }
+
         let uniforms = MpmUniforms {
             grid_dims: [gx, gy, gz, total_cells],
             counts: [
                 self.num_water,
                 self.num_bed,
                 self.settings.max_particles,
-                u32::from(self.settings.use_sdf_cache),
+                runtime_flags,
             ],
             sim_params: [dt, self.settings.gravity, dx, inv_dx],
             grid_origin: [-bs.x * 0.5, -bs.y * 0.5, -bs.z * 0.5, 0.0],
@@ -2242,7 +2361,7 @@ mod tests {
         assert!(shader::MPM_COMPUTE_SHADER
             .contains("Use analytic obstacles for live contact and pressure classification"));
         assert!(shader::MPM_COMPUTE_SHADER
-            .contains("return sample_sdf(cell_center_from_cell(cell)) < 0.0;"));
+            .contains("return sample_sdf(cell_center_from_cell(cell)) < contact_offset();"));
         assert!(shader::MPM_COMPUTE_SHADER
             .contains("(dripper_top_radius() - dripper_outlet_radius()) / cone_height"));
         assert!(shader::MPM_COMPUTE_SHADER.contains("fn viscosity_prepare("));
@@ -2275,6 +2394,45 @@ mod tests {
         inflow.update(&s.spout);
         assert!(inflow.exit_speed() * units::METERS_PER_SIM_UNIT <= 0.13);
         assert!(s.spout.max_exit_speed * units::METERS_PER_SIM_UNIT <= 0.50);
+    }
+
+    #[test]
+    fn default_v60_uses_physical_viscosity_and_full_pressure_budget() {
+        let s = MpmSettings::default_v60();
+        let expected_viscosity =
+            units::sim_kinematic_viscosity_from_m2_s(DEFAULT_BREW.water_kinematic_viscosity_m2_s);
+
+        assert_eq!(s.substeps, 10);
+        assert!(s.pressure_rbgs_pairs >= 40);
+        assert!(s.pressure_rbgs_max_pairs >= s.pressure_rbgs_pairs);
+        assert!((s.viscosity - expected_viscosity).abs() < 1e-8);
+        let free_stream = MpmSettings::benchmark_free_stream();
+        assert!(free_stream.pressure_rbgs_pairs > s.pressure_rbgs_pairs);
+        assert!(free_stream.pressure_rbgs_max_pairs >= free_stream.pressure_rbgs_pairs);
+    }
+
+    #[test]
+    fn cup_debug_domains_match_scene_dynamics() {
+        let compact = MpmSettings::debug_high_velocity_jet_impact();
+        let wide = MpmSettings::debug_dam_break_slosh();
+        let dx = MpmSettings::default_v60().bounds_size.x
+            / MpmSettings::default_v60().grid_dims[0] as f32;
+
+        assert!(compact.bounds_size.x < wide.bounds_size.x);
+        assert!((compact.bounds_size.x / compact.grid_dims[0] as f32 - dx).abs() < 1e-6);
+        assert!((wide.bounds_size.x / wide.grid_dims[0] as f32 - dx).abs() < 1e-6);
+    }
+
+    #[test]
+    fn seeded_water_spacing_represents_requested_rest_volume_fraction() {
+        let s = MpmSettings::default_v60();
+        let dx = s.bounds_size.x / s.grid_dims[0] as f32;
+        let target_fill = 0.88;
+        let spacing = water_seed_spacing_for_fill(dx, target_fill);
+        let represented_fill = water_particle_rest_volume(dx) / spacing.powi(3);
+
+        assert!((represented_fill - target_fill).abs() < 1e-5);
+        assert!(spacing < dx);
     }
 
     #[test]

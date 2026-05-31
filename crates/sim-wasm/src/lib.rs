@@ -40,6 +40,17 @@ fn set_bool(obj: &js_sys::Object, key: &str, value: bool) -> Result<(), JsValue>
 }
 
 #[cfg(target_arch = "wasm32")]
+async fn wait_for_queue(queue: &wgpu::Queue) -> Result<(), JsValue> {
+    let queue_done = js_sys::Promise::new(&mut |resolve, _reject| {
+        queue.on_submitted_work_done(move || {
+            let _ = resolve.call0(&JsValue::NULL);
+        });
+    });
+    wasm_bindgen_futures::JsFuture::from(queue_done).await?;
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
 fn set_object(obj: &js_sys::Object, key: &str, value: &js_sys::Object) -> Result<(), JsValue> {
     js_sys::Reflect::set(obj, &JsValue::from_str(key), value).map(|_| ())
 }
@@ -253,6 +264,7 @@ pub struct WasmSim3D {
     sim: MpmSim3D,
     renderer: Renderer,
     camera: OrbitCamera,
+    metrics_enabled: bool,
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -263,19 +275,23 @@ impl WasmSim3D {
         console_error_panic_hook::set_once();
 
         let settings = MpmSettings::default_v60();
-        let renderer = Renderer::new(canvas, &settings).await?;
-        let sim = MpmSim3D::new(renderer.device(), renderer.queue(), settings);
+        let mut renderer = Renderer::new(canvas, &settings).await?;
+        let mut sim = MpmSim3D::new(renderer.device(), renderer.queue(), settings);
+        sim.set_metrics_enabled(false);
+        renderer.sync_filter_mesh(&sim);
         let camera = OrbitCamera::new(sim.settings().bounds_size);
         Ok(Self {
             sim,
             renderer,
             camera,
+            metrics_enabled: false,
         })
     }
 
     pub fn reset(&mut self) {
         self.sim
             .reset(self.renderer.queue(), self.renderer.device());
+        self.renderer.sync_filter_mesh(&self.sim);
         self.camera = OrbitCamera::new(self.sim.settings().bounds_size);
     }
 
@@ -380,6 +396,16 @@ impl WasmSim3D {
             .resize_with_css_size(width, height, css_width, css_height);
     }
 
+    #[wasm_bindgen(js_name = setCrossSectionEnabled)]
+    pub fn set_cross_section_enabled(&mut self, enabled: bool) {
+        self.renderer.set_cross_section_enabled(enabled);
+    }
+
+    #[wasm_bindgen(js_name = crossSectionEnabled)]
+    pub fn cross_section_enabled(&self) -> bool {
+        self.renderer.cross_section_enabled()
+    }
+
     #[wasm_bindgen(js_name = orbitCamera)]
     pub fn orbit_camera(&mut self, delta_x: f32, delta_y: f32) {
         self.camera.orbit(delta_x, delta_y);
@@ -474,6 +500,10 @@ impl WasmSim3D {
         // the hood.
         let device = self.renderer.device().clone();
         let queue = self.renderer.queue().clone();
+        if !self.sim.metrics_collection_enabled() {
+            wait_for_queue(&queue).await?;
+            return Ok(());
+        }
         self.sim.refresh_metrics(&device, &queue).await
     }
 
@@ -547,6 +577,15 @@ impl WasmSim3D {
     #[wasm_bindgen(js_name = setPressureResidualAdaptation)]
     pub fn set_pressure_residual_adaptation(&mut self, target: f32, max_pairs: u32) {
         self.sim.set_pressure_residual_adaptation(target, max_pairs);
+        if target > 0.0 {
+            self.metrics_enabled = true;
+        }
+    }
+
+    #[wasm_bindgen(js_name = setMetricsEnabled)]
+    pub fn set_metrics_enabled(&mut self, enabled: bool) {
+        self.metrics_enabled = enabled;
+        self.sim.set_metrics_enabled(enabled);
     }
 
     #[wasm_bindgen(js_name = meanTds)]
@@ -579,6 +618,8 @@ impl WasmSim3D {
 impl WasmSim3D {
     fn rebuild_with_settings(&mut self, settings: MpmSettings) {
         self.sim = MpmSim3D::new(self.renderer.device(), self.renderer.queue(), settings);
+        self.sim.set_metrics_enabled(self.metrics_enabled);
+        self.renderer.sync_filter_mesh(&self.sim);
         self.camera = OrbitCamera::new(self.sim.settings().bounds_size);
     }
 }
