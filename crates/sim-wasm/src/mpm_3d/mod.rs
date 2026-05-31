@@ -1547,9 +1547,8 @@ async fn map_read_buffer<R>(
         mapped_at_creation: false,
     });
 
-    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-        label: Some(label),
-    });
+    let mut encoder =
+        device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some(label) });
     encoder.copy_buffer_to_buffer(source, 0, &staging, 0, size);
     queue.submit(Some(encoder.finish()));
 
@@ -1648,9 +1647,18 @@ impl MetricsReadback {
                 / METRICS_DIV_FP_SCALE,
             fluid_cells: data.get(METRIC_FLUID_CELLS_IDX).copied().unwrap_or(0),
             div_clamp_fires: data.get(METRIC_DIV_CLAMP_FIRES_IDX).copied().unwrap_or(0),
-            pressure_clamp_fires: data.get(METRIC_PRESSURE_CLAMP_FIRES_IDX).copied().unwrap_or(0),
-            mass_overflow_fires: data.get(METRIC_MASS_OVERFLOW_FIRES_IDX).copied().unwrap_or(0),
-            pressure_active_cells: data.get(METRIC_PRESSURE_ACTIVE_COUNT_IDX).copied().unwrap_or(0),
+            pressure_clamp_fires: data
+                .get(METRIC_PRESSURE_CLAMP_FIRES_IDX)
+                .copied()
+                .unwrap_or(0),
+            mass_overflow_fires: data
+                .get(METRIC_MASS_OVERFLOW_FIRES_IDX)
+                .copied()
+                .unwrap_or(0),
+            pressure_active_cells: data
+                .get(METRIC_PRESSURE_ACTIVE_COUNT_IDX)
+                .copied()
+                .unwrap_or(0),
             grid_active_cells: data.get(METRIC_GRID_ACTIVE_COUNT_IDX).copied().unwrap_or(0),
             pressure_residual_initial,
             pressure_residual_final,
@@ -1820,6 +1828,12 @@ impl MpmSim3D {
                     timestamp_writes: None,
                 });
                 pass.set_bind_group(0, &self.pipelines.bind_group, &[]);
+                // Warm-start residual: r0 = b - A·p0 with p0 = persistent
+                // previous-substep pressure. Runs over the now-finalized active
+                // pressure list so inv_diag and the active set match the CG
+                // iterations. Seeds CG_RZ / INITIAL_RZ for the nonzero guess.
+                pass.set_pipeline(&self.pipelines.pressure_cg_warmstart);
+                pass.dispatch_workgroups_indirect(&self.buffers.pressure_dispatch_args, 0);
                 for _ in 0..self.settings.pressure_cg_iterations {
                     pass.set_pipeline(&self.pipelines.pressure_cg_matvec);
                     pass.dispatch_workgroups_indirect(&self.buffers.pressure_dispatch_args, 0);
@@ -1929,6 +1943,13 @@ impl MpmSim3D {
         // Rebuild the CPU filter mesh so reset/scene changes keep render
         // geometry aligned with the active filter config.
         self.filter_mesh = self.settings.filter.as_ref().map(FilterMesh::new);
+        // Drop any persistent warm-start pressure so a reset cold-starts CG
+        // instead of seeding the first new substep with stale pressure.
+        queue.write_buffer(
+            &self.buffers.cg,
+            0,
+            &vec![0u8; self.buffers.cg.size() as usize],
+        );
         self.init_bed(queue);
     }
 

@@ -1924,6 +1924,113 @@ fn hydrostatic_column_pressure_increases_with_depth() {
     );
 }
 
+// Zero the persistent warm-start pressure region (region 5 of `cg`, starting at
+// 4 * total_cells vec4s) so the next substep cold-starts CG. This mirrors the
+// shader index scheme `cg_persistent_pressure_idx(cell) = 4 * total_cells +
+// cell` and lets the test force a cold start without a production toggle.
+fn clear_warmstart_pressure_region(sim: &MpmSim3D, queue: &wgpu::Queue) {
+    let total_cells =
+        (sim.settings.grid_dims[0] * sim.settings.grid_dims[1] * sim.settings.grid_dims[2]) as u64;
+    let region_offset = 4 * total_cells * 16; // 4 vec4 regions before it
+    let region_size = (total_cells * 16) as usize;
+    queue.write_buffer(&sim.buffers.cg, region_offset, &vec![0u8; region_size]);
+}
+
+// Warm-starting the pressure CG from the previous substep's converged pressure
+// must reach a strictly lower residual than a cold start under the same small
+// fixed iteration budget, once the pool's active set is established. We run two
+// identical settled hydrostatic columns with substeps=1 (so cross-frame
+// persistence is the only warm-start channel) and a tiny CG budget, then for
+// many frames compare the absolute final residual: the cold sim has its
+// persistent pressure wiped before every frame; the warm sim keeps it.
+#[test]
+fn warm_start_reaches_lower_pressure_residual_than_cold_start() {
+    let Some((device, queue)) = create_test_device() else {
+        eprintln!("skipping: no GPU adapter");
+        return;
+    };
+
+    let mut settings = MpmSettings::debug_hydrostatic_column();
+    // One substep per frame isolates the cross-substep warm-start.
+    settings.substeps = 1;
+
+    let make_sim = |settings: MpmSettings| {
+        let mut sim = MpmSim3D::new(&device, &queue, settings);
+        sim.set_exit_speed_m_s(0.0);
+        sim.seed_hydrostatic_column(&queue);
+        sim
+    };
+
+    let mut warm = make_sim(settings.clone());
+    let mut cold = make_sim(settings.clone());
+
+    // Settle both with a healthy budget so the active set and pressure field
+    // reach a near-converged steady state. The warm sim's persistent store now
+    // holds a good pressure field; the cold sim's is wiped each frame anyway.
+    for _ in 0..60 {
+        warm.step_frame(&device, &queue, TEST_FRAME_DT_S);
+        clear_warmstart_pressure_region(&cold, &queue);
+        cold.step_frame(&device, &queue, TEST_FRAME_DT_S);
+    }
+
+    // Drop to a tiny budget: now a single CG step can only crawl, so the
+    // quality of the initial guess dominates the residual reached.
+    warm.settings.pressure_cg_iterations = 1;
+    cold.settings.pressure_cg_iterations = 1;
+
+    // Measure the absolute final residual over a window and average to ride out
+    // the f32-reduction non-determinism in the GPU residual metrics.
+    let samples = 48;
+    let mut warm_final = 0.0f32;
+    let mut cold_final = 0.0f32;
+    let mut warm_initial = 0.0f32;
+    let mut cold_initial = 0.0f32;
+    for _ in 0..samples {
+        warm.step_frame(&device, &queue, TEST_FRAME_DT_S);
+        let w = readback_pressure_residual_snapshot(&warm, &device, &queue);
+        warm_final += w.final_;
+        warm_initial += w.initial;
+
+        clear_warmstart_pressure_region(&cold, &queue);
+        cold.step_frame(&device, &queue, TEST_FRAME_DT_S);
+        let c = readback_pressure_residual_snapshot(&cold, &device, &queue);
+        cold_final += c.final_;
+        cold_initial += c.initial;
+    }
+    warm_final /= samples as f32;
+    cold_final /= samples as f32;
+    warm_initial /= samples as f32;
+    cold_initial /= samples as f32;
+
+    eprintln!(
+        "warm-start: mean initial_residual={warm_initial:.6} final_residual={warm_final:.6}; \
+         cold-start: mean initial_residual={cold_initial:.6} final_residual={cold_final:.6}; \
+         final ratio warm/cold={:.4}",
+        warm_final / cold_final.max(1e-12),
+    );
+
+    assert!(
+        warm_initial.is_finite()
+            && cold_initial.is_finite()
+            && warm_final.is_finite()
+            && cold_final.is_finite(),
+        "residual measurements must be finite: warm_initial={warm_initial} cold_initial={cold_initial} \
+         warm_final={warm_final} cold_final={cold_final}",
+    );
+    // Primary success criterion: under the same tiny CG budget, warm-start ends
+    // at a lower absolute residual than cold-start once the pool is established.
+    // (The per-substep RHS b is rebuilt from freshly advected divergence each
+    // step, so the warm initial residual is reduced but not driven to zero; the
+    // decisive, stable signal is the lower converged residual, logged above.)
+    assert!(
+        warm_final < cold_final * 0.9,
+        "warm-start should reach a clearly lower final residual than cold-start \
+         under the same {} CG iteration(s): warm_final={warm_final:.6} \
+         cold_final={cold_final:.6}",
+        warm.settings.pressure_cg_iterations,
+    );
+}
+
 #[test]
 fn closed_cup_mechanical_energy_does_not_increase_without_inflow() {
     let Some((device, queue)) = create_test_device() else {
