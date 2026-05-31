@@ -288,7 +288,7 @@ async function bootstrap() {
   });
 
   toggleTimeseriesButton.addEventListener("click", () => {
-    setTimeseriesDrawerExpanded(!timeseriesDrawer.classList.contains("is-open"));
+    setTimeseriesDrawerExpanded(!timeseriesDrawerOpen());
   });
 
   toggleTimeseriesMenuButton.addEventListener("click", (event) => {
@@ -302,9 +302,9 @@ async function bootstrap() {
 
   toggleDebugButton.addEventListener("click", () => {
     debugStats.classList.toggle("hidden");
-    toggleDebugButton.textContent = debugStats.classList.contains("hidden")
-      ? "Show Debug Stats"
-      : "Hide Debug Stats";
+    toggleDebugButton.textContent = debugPanelVisible()
+      ? "Hide Debug Stats"
+      : "Show Debug Stats";
   });
 
   sceneMainTab.addEventListener("click", () => {
@@ -562,8 +562,12 @@ function escapeHtml(value) {
   });
 }
 
+function renderDpr() {
+  return Math.min(window.devicePixelRatio || 1, MAX_RENDER_DPR);
+}
+
 function resizeCanvas() {
-  const dpr = Math.min(window.devicePixelRatio || 1, MAX_RENDER_DPR);
+  const dpr = renderDpr();
   const rect = canvas.getBoundingClientRect();
   canvas.width = Math.round(rect.width * dpr);
   canvas.height = Math.round(rect.height * dpr);
@@ -685,11 +689,15 @@ function setTimeseriesDrawerExpanded(expanded) {
     setTimeseriesMenuOpen(false);
   }
   if (expanded) {
-    if (app) {
-      collectTimeseriesSample();
-    } else {
-      renderTimeseriesCharts();
-    }
+    refreshTimeseries();
+  }
+}
+
+function refreshTimeseries() {
+  if (app) {
+    collectTimeseriesSample();
+  } else {
+    renderTimeseriesCharts();
   }
 }
 
@@ -769,11 +777,7 @@ function resetTimeseries() {
   timeseriesFrameCounter = TIMESERIES_SAMPLE_INTERVAL;
   latestExactMetrics = null;
   metricsFrameCounter = METRICS_SAMPLE_INTERVAL_FRAMES;
-  if (app) {
-    collectTimeseriesSample();
-  } else {
-    renderTimeseriesCharts();
-  }
+  refreshTimeseries();
 }
 
 function maybeCollectTimeseriesSample() {
@@ -843,7 +847,7 @@ function drawSparkline(definition, latest) {
   const rect = chart.getBoundingClientRect();
   const width = Math.max(1, Math.round(rect.width));
   const height = Math.max(1, Math.round(rect.height));
-  const dpr = Math.min(window.devicePixelRatio || 1, MAX_RENDER_DPR);
+  const dpr = renderDpr();
   const pixelWidth = Math.max(1, Math.round(width * dpr));
   const pixelHeight = Math.max(1, Math.round(height * dpr));
   if (chart.width !== pixelWidth || chart.height !== pixelHeight) {
@@ -1094,13 +1098,16 @@ function clamp(value, min, max) {
 }
 
 function syncUi() {
-  const metrics = latestExactMetrics ?? {};
   particleLabel.textContent = integerFormatter.format(app.particleCount());
   waterVelocityValue.textContent = `${app.waterVelocityMetersPerSecond().toFixed(2)} m/s`;
   spoutX = clamp(snap(app.spoutX()), SPOUT_X_MIN, SPOUT_X_MAX);
   spoutZ = clamp(snap(app.spoutZ()), SPOUT_Z_MIN, SPOUT_Z_MAX);
   spoutHeightValue.textContent = app.spoutY().toFixed(1);
   updateSpoutPlaneUi();
+  // The remaining labels live in the (default-hidden) debug-stats panel. Skip
+  // their ~20 wasm-boundary reads while that panel is closed.
+  if (!debugPanelVisible()) return;
+  const metrics = latestExactMetrics ?? {};
   flowRateLabel.textContent = `${app.flowRate().toFixed(1)} mL/s`;
   jetSpeedLabel.textContent = `${app.exitSpeedMetersPerSecond().toFixed(2)} m/s`;
   sceneModeLabel.textContent = currentSceneMode;
