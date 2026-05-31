@@ -111,6 +111,9 @@ const CG_BETA_RESTART_RATIO: f32 = 0.98;   // restart as steepest descent when t
 const MIN_LATERAL_FLUID_FACES: u32 = 2u;   // ≥2 filled lateral neighbours required to join the pressure domain
 const CUP_RIM_Y: f32 = -3.5;               // cup mouth plane (matches the cup obstacle top_y); cells above stay particle-resolved
 const DENSE_CELL_MASS_FACTOR: f32 = 4.0;   // grid mass (× nominal) that counts as a "dense" / well-packed cell
+// Smagorinsky LES coefficient for the sub-grid eddy viscosity — the one knob
+// that sets how fast sheared/sloshing flow dissipates. Standard range 0.1–0.2.
+const SMAGORINSKY_C: f32 = 0.15;
 
 // ── Helpers ──
 
@@ -331,6 +334,174 @@ fn cg_fill_store(cell: u32, value: f32) {
 }
 fn cg_fill_load(cell: u32) -> f32 {
     return cg[cg_fill_idx(cell)].x;
+}
+
+// Region 4 of `cg`: persistent cell-center pressure. Survives across substeps
+// (the `cg` buffer is never in the per-substep clear set), so the CG can
+// warm-start from the previous substep's converged pressure.
+fn cg_persist_pressure_idx(cell: u32) -> u32 {
+    return 4u * total_cells() + cell;
+}
+fn persist_pressure_store(cell: u32, value: f32) {
+    cg[cg_persist_pressure_idx(cell)] = vec4<f32>(value, 0.0, 0.0, 0.0);
+}
+fn persist_pressure_load(cell: u32) -> f32 {
+    return cg[cg_persist_pressure_idx(cell)].x;
+}
+
+// ── Staggered grid: velocity on NODES, pressure on CELL CENTERS ──
+// A pressure cell with index `c` is the dual point at world
+// `origin + (vec3(c) + 0.5) * dx` (see `cell_center_from_cell`). Its 8 corner
+// NODES are `c + (a,b,d)` for a,b,d in {0,1}; conversely a node `n`'s 8
+// surrounding cells are `n - (a,b,d)`. The divergence (node velocity -> cell)
+// and gradient (cell pressure -> node) are built from this one incidence so
+// they are exact transposes (energy-orthogonal projection, no checkerboard).
+// `staggered_node_in_bounds` guards corners/cells that fall off the node grid.
+fn node_in_bounds(n: vec3<i32>) -> bool {
+    return n.x >= 0 && n.y >= 0 && n.z >= 0
+        && u32(n.x) < gx() && u32(n.y) < gy() && u32(n.z) < gz();
+}
+
+// A pressure cell `c` is geometrically valid iff all 8 of its corner nodes are
+// in-bounds, i.e. `cx<gx-1, cy<gy-1, cz<gz-1` and `c>=0`. Cells touching the
+// upper boundary are ghost/inactive.
+fn staggered_cell_in_bounds(c: vec3<i32>) -> bool {
+    return c.x >= 0 && c.y >= 0 && c.z >= 0
+        && u32(c.x) + 1u < gx() && u32(c.y) + 1u < gy() && u32(c.z) + 1u < gz();
+}
+
+// Per-NODE liquid weight w_n ∈ [0,1] folded identically into D, A = D·Dᵀ and
+// G = -Dᵀ so they stay exact transposes. It is the mean liquid fill of the
+// node's surrounding fluid cells (air/solid cells count as 0 fill). A node deep
+// inside a pool gets w_n ≈ 1; a node on the edge of a sparse falling stream gets
+// a small w_n, which suppresses the pressure gradient there and stops the
+// projection from converting axial stream momentum into spurious lateral motion.
+// Computable in every pass (reads only cell kinds + deposited volume), so D
+// (classify), A (CG) and G (project) all see the same weight.
+fn staggered_node_fill_weight(n: vec3<i32>) -> f32 {
+    var sum = 0.0;
+    for (var a = 0; a <= 1; a++) {
+        for (var b = 0; b <= 1; b++) {
+            for (var d = 0; d <= 1; d++) {
+                let c = n - vec3<i32>(a, b, d);
+                if !staggered_cell_in_bounds(c) {
+                    continue;
+                }
+                let kind = current_cell_kind(c);
+                if !is_fluid_kind(kind) {
+                    continue;
+                }
+                let ci = cell_index(u32(c.x), u32(c.y), u32(c.z));
+                sum += raw_liquid_fill_fraction(ci, kind);
+            }
+        }
+    }
+    let mean_fill = clamp(sum / 8.0, 0.0, 1.0);
+    // Sharpen the rolloff so sparse free-surface nodes (mostly air neighbours)
+    // are strongly de-weighted while pool-interior nodes stay near 1. Cubing the
+    // mean fill keeps the same single w_n in D, A and G (still exact transposes),
+    // but pushes a half-air stream-edge node from ~0.4 down to ~0.06.
+    return mean_fill * mean_fill * mean_fill;
+}
+
+// Pressure of a surrounding cell of a node, for the gradient G = -Dᵀ. Only
+// ACTIVE FLUID cells are rows of D, so only they contribute to the transpose;
+// every other cell (air = Dirichlet, solid/off-grid = excluded by the node-level
+// Neumann v·n = 0) contributes 0. Returning 0 here — rather than a cell-level
+// mirror — is what makes G exactly -Dᵀ: the Neumann wall is enforced at the
+// solid NODES inside D (`staggered_corner_vel_component` → 0), not by mirroring a
+// solid cell's pressure. Keeping G a pure transpose is what guarantees the
+// projection is energy-orthogonal (the KEY free-surface energy gate).
+fn staggered_cell_pressure(c: vec3<i32>) -> f32 {
+    if !staggered_cell_in_bounds(c) {
+        return 0.0;
+    }
+    if sdf_class_is_solid(c) {
+        return 0.0;
+    }
+    let ci = cell_index(u32(c.x), u32(c.y), u32(c.z));
+    if pressure_cached_active_cell(ci) {
+        return pressure_load(ci);
+    }
+    return 0.0;
+}
+
+// Staggered DIVERGENCE at cell center `c` from the velocities of its 8 corner
+// NODES `c + (a,b,d)`. Per axis the +face (a/b/d = 1) minus the −face (= 0).
+// Scale `inv_dx * 0.25`. D must be a fixed LINEAR map on the node velocity
+// vector so that A = D·Dᵀ and G = −Dᵀ hold exactly: each in-bounds, non-solid
+// corner node contributes its OWN velocity component (linear in V); a solid or
+// off-grid corner contributes 0 (Neumann wall v·n = 0). The energy-orthogonality
+// of the resulting projection — not an air-velocity substitution — is what stops
+// the free surface from injecting kinetic energy.
+fn staggered_cell_divergence(c: vec3<i32>) -> f32 {
+    var dvx = 0.0;
+    var dvy = 0.0;
+    var dvz = 0.0;
+    for (var b = 0; b <= 1; b++) {
+        for (var d = 0; d <= 1; d++) {
+            // x faces: high corner (a=1) minus low corner (a=0).
+            dvx += staggered_corner_vel_component(c + vec3<i32>(1, b, d), 0)
+                 - staggered_corner_vel_component(c + vec3<i32>(0, b, d), 0);
+            // y faces: group over (a, d).
+            dvy += staggered_corner_vel_component(c + vec3<i32>(b, 1, d), 1)
+                 - staggered_corner_vel_component(c + vec3<i32>(b, 0, d), 1);
+            // z faces: group over (a, b).
+            dvz += staggered_corner_vel_component(c + vec3<i32>(b, d, 1), 2)
+                 - staggered_corner_vel_component(c + vec3<i32>(b, d, 0), 2);
+        }
+    }
+    return inv_dx() * 0.25 * (dvx + dvy + dvz);
+}
+
+// Normal velocity component of a corner node for the divergence stencil, scaled
+// by the per-node liquid weight w_n. Off-grid or solid → 0 (Neumann wall).
+// Otherwise w_n · (node velocity component). The w_n factor is the SAME one A and
+// G use, so D stays linear and A = D·Dᵀ, G = −Dᵀ hold exactly.
+fn staggered_corner_vel_component(n: vec3<i32>, axis: i32) -> f32 {
+    if !node_in_bounds(n) {
+        return 0.0;
+    }
+    if sdf_class_is_solid(n) {
+        return 0.0;
+    }
+    let ni = cell_index(u32(n.x), u32(n.y), u32(n.z));
+    let nv = grid_vel[ni];
+    let w = staggered_node_fill_weight(n);
+    if axis == 0 {
+        return w * nv.x;
+    } else if axis == 1 {
+        return w * nv.y;
+    }
+    return w * nv.z;
+}
+
+// Staggered GRADIENT at node `n`, the negative transpose of the divergence
+// (G = -Dᵀ). For axis x: cells on the +x side of n (c.x = n.x) minus cells on
+// the −x side (c.x = n.x-1), grouped over the other two axes. Scale inv_dx*0.25.
+// Only active fluid cells contribute (see `staggered_cell_pressure`); air and
+// solid cells contribute 0, so G is exactly -Dᵀ.
+fn staggered_node_gradient(n: vec3<i32>) -> vec3<f32> {
+    var gx_acc = 0.0;
+    var gy_acc = 0.0;
+    var gz_acc = 0.0;
+    for (var b = 0; b <= 1; b++) {
+        for (var d = 0; d <= 1; d++) {
+            // x: +x side (a=0) minus −x side (a=1).
+            gx_acc += staggered_cell_pressure(n - vec3<i32>(0, b, d))
+                    - staggered_cell_pressure(n - vec3<i32>(1, b, d));
+            // y: +y side minus −y side, grouped over (a,d).
+            gy_acc += staggered_cell_pressure(n - vec3<i32>(b, 0, d))
+                    - staggered_cell_pressure(n - vec3<i32>(b, 1, d));
+            // z: +z side minus −z side, grouped over (a,b).
+            gz_acc += staggered_cell_pressure(n - vec3<i32>(b, d, 0))
+                    - staggered_cell_pressure(n - vec3<i32>(b, d, 1));
+        }
+    }
+    // The whole node gradient carries the per-node weight w_n (every D[·,n] does),
+    // so G = -Dᵀ exactly and sparse-stream boundary nodes get a weak gradient.
+    let w = staggered_node_fill_weight(n);
+    return w * inv_dx() * 0.25 * vec3<f32>(gx_acc, gy_acc, gz_acc);
 }
 
 fn pressure_or_mirror(cell: vec3<i32>, mirror_pressure: f32) -> f32 {
@@ -1576,7 +1747,6 @@ fn viscosity_prepare(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
 
-    let alpha = clamp(viscosity() * dt() / max(dx() * dx(), 1e-6), 0.0, 0.14);
     var neighbor_velocity_sum = vec3<f32>(0.0);
     var neighbor_weight_sum = 0.0;
     var fluid_neighbor_count = 0u;
@@ -1629,6 +1799,25 @@ fn viscosity_prepare(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     let neighbor_average = neighbor_velocity_sum / neighbor_weight_sum;
+    // Strain-dependent effective viscosity. Water's molecular ν (the
+    // `viscosity()` uniform) is microscopic, so on its own this diffusion does
+    // nothing and a sloshing pool never settles. The real dissipation at this
+    // resolution is *turbulent* — energy cascades to sub-grid eddies we cannot
+    // resolve — and the sub-grid model for it is the Smagorinsky eddy viscosity
+    // nu_t = (Cs * dx)^2 * |S|, with |S| the local strain rate estimated from
+    // the cell↔neighbour-average velocity difference (a one-cell |grad v|).
+    // This is large in shear/boundary layers (where turbulence dissipates) and
+    // ~0 in coherent flow, so it settles the sloshing pool WITHOUT damping the
+    // laminar pour stream — something no constant ν can do (only the strain
+    // rate distinguishes them). `alpha` (the diffusion number) is still clamped
+    // to 0.14 < 1/(2d) = 1/6, the explicit-diffusion CFL stability limit.
+    let strain_rate = length(v_here - neighbor_average) / max(dx(), 1e-6);
+    let eddy_viscosity = (SMAGORINSKY_C * dx()) * (SMAGORINSKY_C * dx()) * strain_rate;
+    let alpha = clamp(
+        (viscosity() + eddy_viscosity) * dt() / max(dx() * dx(), 1e-6),
+        0.0,
+        0.14,
+    );
     let blend = clamp(alpha * neighbor_weight_sum, 0.0, 0.65);
     velocity_scratch_store(idx, mix(v_here, neighbor_average, blend));
 }
@@ -1729,57 +1918,18 @@ fn classify_cells(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
 
-    // Central-difference divergence using cell-centered velocities. No-flow
-    // boundaries (off-grid faces and CELL_SOLID neighbors) use a ghost-mirror
-    // on the normal velocity component: v_ghost.n = -v_self.n. Open air
-    // neighbors use a same-velocity ghost instead; a free surface may move
-    // through air, so an empty neighboring cell must not look like a stationary
-    // incompressible neighbor and inject pressure into sparse falling streams.
-    //
-    // Neighbor-solid detection samples the static SDF directly rather than
-    // calling cell_kind_load, because classify_cells is the dispatch that
-    // writes cell_kind — reading a neighbor's kind here races against other
-    // workgroups. The cached mask is generated from the same cell-center SDF
-    // probe and avoids repeated texture interpolation in the hot path.
-    let self_vel = grid_vel[idx].xyz;
-    var vxm = -self_vel.x;
-    var vxp = -self_vel.x;
-    var vym = -self_vel.y;
-    var vyp = -self_vel.y;
-    var vzm = -self_vel.z;
-    var vzp = -self_vel.z;
-    if ix_val > 0u
-        && !sdf_class_is_solid(vec3<i32>(i32(ix_val) - 1, i32(iy_val), i32(iz_val))) {
-        let neighbor = grid_vel[cell_index(ix_val - 1u, iy_val, iz_val)];
-        vxm = select(self_vel.x, neighbor.x, neighbor.w > occupancy_mass_threshold());
+    // Staggered divergence at the CELL CENTER of cell `idx` (the cell whose
+    // lowest corner is node `idx`) from its 8 corner-node velocities. D is a
+    // fixed linear map (solid/off-grid corner → 0, Neumann v·n=0); it pairs with
+    // the gradient G = -Dᵀ in project_pressure and the Laplacian A = D·Dᵀ in the
+    // CG so the projection is energy-orthogonal. A cell touching the upper node
+    // boundary (cx=gx-1 etc.) is a ghost cell with no full corner set → div 0.
+    let cell = vec3<i32>(i32(ix_val), i32(iy_val), i32(iz_val));
+    if !staggered_cell_in_bounds(cell) {
+        divergence_store(idx, 0.0);
+        return;
     }
-    if ix_val + 1u < gx()
-        && !sdf_class_is_solid(vec3<i32>(i32(ix_val) + 1, i32(iy_val), i32(iz_val))) {
-        let neighbor = grid_vel[cell_index(ix_val + 1u, iy_val, iz_val)];
-        vxp = select(self_vel.x, neighbor.x, neighbor.w > occupancy_mass_threshold());
-    }
-    if iy_val > 0u
-        && !sdf_class_is_solid(vec3<i32>(i32(ix_val), i32(iy_val) - 1, i32(iz_val))) {
-        let neighbor = grid_vel[cell_index(ix_val, iy_val - 1u, iz_val)];
-        vym = select(self_vel.y, neighbor.y, neighbor.w > occupancy_mass_threshold());
-    }
-    if iy_val + 1u < gy()
-        && !sdf_class_is_solid(vec3<i32>(i32(ix_val), i32(iy_val) + 1, i32(iz_val))) {
-        let neighbor = grid_vel[cell_index(ix_val, iy_val + 1u, iz_val)];
-        vyp = select(self_vel.y, neighbor.y, neighbor.w > occupancy_mass_threshold());
-    }
-    if iz_val > 0u
-        && !sdf_class_is_solid(vec3<i32>(i32(ix_val), i32(iy_val), i32(iz_val) - 1)) {
-        let neighbor = grid_vel[cell_index(ix_val, iy_val, iz_val - 1u)];
-        vzm = select(self_vel.z, neighbor.z, neighbor.w > occupancy_mass_threshold());
-    }
-    if iz_val + 1u < gz()
-        && !sdf_class_is_solid(vec3<i32>(i32(ix_val), i32(iy_val), i32(iz_val) + 1)) {
-        let neighbor = grid_vel[cell_index(ix_val, iy_val, iz_val + 1u)];
-        vzp = select(self_vel.z, neighbor.z, neighbor.w > occupancy_mass_threshold());
-    }
-
-    let div = 0.5 * inv_dx() * ((vxp - vxm) + (vyp - vym) + (vzp - vzm));
+    let div = staggered_cell_divergence(cell);
     divergence_store(idx, div);
 
     // Observability: track the worst-case cell divergence and the fluid-cell
@@ -1820,6 +1970,88 @@ fn pressure_projection_target_divergence(
     return target_divergence;
 }
 
+// Is corner node `n` a valid (in-bounds, non-solid) divergence node? Solid /
+// off-grid corners have D[·,n] = 0 (Neumann wall), so they drop from A = D·Dᵀ.
+fn staggered_div_node_valid(n: vec3<i32>) -> bool {
+    return node_in_bounds(n) && !sdf_class_is_solid(n);
+}
+
+// Sign of D[c,n] per axis: +1 if node n is the high corner of cell c on that
+// axis (n - c = 1), −1 if the low corner (n - c = 0). D[c,n].axis = 0.25*sign.
+fn staggered_div_sign(c: vec3<i32>, n: vec3<i32>) -> vec3<f32> {
+    let r = vec3<f32>(n - c); // each component is 0 or 1
+    return 2.0 * r - vec3<f32>(1.0);
+}
+
+// Diagonal of A = D·Dᵀ at cell c: Σ_n D[c,n]·D[c,n] over the 8 corner nodes.
+// Each valid corner contributes 0.0625 * (1 + 1 + 1) = 0.1875; solid/off-grid
+// corners contribute 0. So diag ∈ {0 .. 1.5}.
+fn staggered_laplacian_diag(c: vec3<i32>) -> f32 {
+    var diag = 0.0;
+    for (var a = 0; a <= 1; a++) {
+        for (var b = 0; b <= 1; b++) {
+            for (var d = 0; d <= 1; d++) {
+                let n = c + vec3<i32>(a, b, d);
+                if !staggered_div_node_valid(n) {
+                    continue;
+                }
+                let s = staggered_div_sign(c, n);
+                let w = staggered_node_fill_weight(n);
+                diag += 0.0625 * w * w * dot(s, s);
+            }
+        }
+    }
+    return diag;
+}
+
+// (A·d)_c for A = D·Dᵀ, reading the CG search direction d[c'] = cg[c'].z for the
+// active fluid cells c' that share a corner node with c. Built literally as
+// Σ_n Σ_c' D[c,n]·D[c',n]·d[c'] (loop c's 8 corner nodes; for each valid node
+// loop its 8 surrounding cells), so A is symmetric and equals D·Dᵀ exactly. The
+// self term (c' = c) gives the diagonal; inactive (air/solid) c' contribute 0
+// (Dirichlet p=0 / node-level Neumann), matching G = -Dᵀ in project_pressure.
+fn staggered_laplacian_apply_d(c: vec3<i32>, d_self: f32) -> f32 {
+    var q = 0.0;
+    for (var a = 0; a <= 1; a++) {
+        for (var b = 0; b <= 1; b++) {
+            for (var dd = 0; dd <= 1; dd++) {
+                let n = c + vec3<i32>(a, b, dd);
+                if !staggered_div_node_valid(n) {
+                    continue;
+                }
+                let w = staggered_node_fill_weight(n);
+                // Both D[c,n] and D[c',n] carry w_n, so the node contributes w_n².
+                let s_cn = 0.25 * w * staggered_div_sign(c, n);
+                // n's 8 surrounding cells c' = n - (a',b',d').
+                for (var a2 = 0; a2 <= 1; a2++) {
+                    for (var b2 = 0; b2 <= 1; b2++) {
+                        for (var d2 = 0; d2 <= 1; d2++) {
+                            let cp = n - vec3<i32>(a2, b2, d2);
+                            var d_cp = 0.0;
+                            if all(cp == c) {
+                                d_cp = d_self;
+                            } else if staggered_cell_in_bounds(cp) && !sdf_class_is_solid(cp) {
+                                let cpi = cell_index(u32(cp.x), u32(cp.y), u32(cp.z));
+                                if pressure_cached_active_cell(cpi) {
+                                    d_cp = cg[cpi].z;
+                                }
+                            }
+                            if d_cp == 0.0 {
+                                continue;
+                            }
+                            // s_cn already carries one w_n; the shared node's w_n²
+                            // is completed by the second factor here.
+                            let s_cpn = 0.25 * w * staggered_div_sign(cp, n);
+                            q += dot(s_cn, s_cpn) * d_cp;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return q;
+}
+
 fn pressure_linear_system_cell(idx: u32) -> vec2<f32> {
     let iz_val = idx / (gx() * gy());
     let rem = idx % (gx() * gy());
@@ -1831,56 +2063,25 @@ fn pressure_linear_system_cell(idx: u32) -> vec2<f32> {
         return vec2<f32>(0.0);
     }
 
-    var diag = 0.0;
+    let cell = vec3<i32>(i32(ix_val), i32(iy_val), i32(iz_val));
     let self_fill = liquid_fill_fraction(idx, kind);
     // Cache this cell's fill for the matvec (read as a neighbour every CG
     // iteration). The init pass finishes before the matvec pass, so the cache
     // is fully populated for every active pressure cell by the time it is read.
     cg_fill_store(idx, self_fill);
-    let offsets = array<vec3<i32>, 6>(
-        vec3<i32>(-1, 0, 0),
-        vec3<i32>(1, 0, 0),
-        vec3<i32>(0, -1, 0),
-        vec3<i32>(0, 1, 0),
-        vec3<i32>(0, 0, -1),
-        vec3<i32>(0, 0, 1),
-    );
 
-    for (var n = 0u; n < 6u; n++) {
-        let neighbor = vec3<i32>(i32(ix_val), i32(iy_val), i32(iz_val)) + offsets[n];
-        // Off-grid neighbors act as Neumann (no-flow) — skip from both
-        // numerator and denominator. Preserves existing behavior.
-        if neighbor.x < 0 || neighbor.y < 0 || neighbor.z < 0
-            || u32(neighbor.x) >= gx() || u32(neighbor.y) >= gy() || u32(neighbor.z) >= gz() {
-            continue;
-        }
+    // Diagonal of A = D·Dᵀ (staggered Laplacian) at this cell.
+    let diag = staggered_laplacian_diag(cell);
 
-        let neighbor_idx = cell_index(u32(neighbor.x), u32(neighbor.y), u32(neighbor.z));
-        let neighbor_kind = current_cell_kind(neighbor);
-
-        // Solid neighbor → Neumann BC via ghost-mirror (p_ghost = p_here).
-        // The standard 7-point Laplacian with a mirror ghost drops the
-        // solid face from both the numerator and denominator of the
-        // averaging update, so we `continue` before touching neighbor_count.
-        if is_solid_kind(neighbor_kind) {
-            continue;
-        }
-
-        let face_weight = pressure_face_weight(kind, self_fill, neighbor_idx, neighbor_kind);
-        if face_weight <= 0.0 {
-            continue;
-        }
-
-        diag += face_weight;
-    }
-
-    let cell = vec3<i32>(i32(ix_val), i32(iy_val), i32(iz_val));
     let target_divergence = pressure_projection_target_divergence(
         idx,
         kind,
         cell,
         cell_center_from_cell(cell),
     );
+    // A·p = -(div - target)/dt. The implemented A is the dimensionless graph
+    // operator (no inv_dx²), while `divergence_load` carries inv_dx, so scale the
+    // RHS by dx² to match the pressure_load/gradient units (grad = inv_dx·...).
     let rhs = -dx() * dx() * (divergence_load(idx) - target_divergence) * self_fill
         / max(dt(), 1e-6);
     return vec2<f32>(diag, rhs);
@@ -1892,52 +2093,16 @@ fn pressure_apply_search_direction(idx: u32) -> vec2<f32> {
     let iy_val = rem / gx();
     let ix_val = rem % gx();
 
-    let kind = cell_kind_load(idx);
     if pressure_inv_diag_load(idx) <= 0.0 {
         return vec2<f32>(0.0);
     }
 
-    let self_fill = cg_fill_load(idx);
+    let cell = vec3<i32>(i32(ix_val), i32(iy_val), i32(iz_val));
     let d_here = cg[idx].z;
-    var q = 0.0;
-    var energy = 0.0;
-    let offsets = array<vec3<i32>, 6>(
-        vec3<i32>(-1, 0, 0),
-        vec3<i32>(1, 0, 0),
-        vec3<i32>(0, -1, 0),
-        vec3<i32>(0, 1, 0),
-        vec3<i32>(0, 0, -1),
-        vec3<i32>(0, 0, 1),
-    );
-
-    for (var n = 0u; n < 6u; n++) {
-        let neighbor = vec3<i32>(i32(ix_val), i32(iy_val), i32(iz_val)) + offsets[n];
-        if neighbor.x < 0 || neighbor.y < 0 || neighbor.z < 0
-            || u32(neighbor.x) >= gx() || u32(neighbor.y) >= gy() || u32(neighbor.z) >= gz() {
-            continue;
-        }
-
-        let neighbor_idx = cell_index(u32(neighbor.x), u32(neighbor.y), u32(neighbor.z));
-        let neighbor_kind = current_cell_kind(neighbor);
-        if is_solid_kind(neighbor_kind) {
-            continue;
-        }
-
-        let face_weight = pressure_face_weight_fillcached(kind, self_fill, neighbor_idx, neighbor_kind);
-        if face_weight <= 0.0 {
-            continue;
-        }
-
-        if pressure_cached_active_cell(neighbor_idx) {
-            let delta = d_here - cg[neighbor_idx].z;
-            q += face_weight * delta;
-            energy += 0.5 * face_weight * delta * delta;
-        } else {
-            q += face_weight * d_here;
-            energy += face_weight * d_here * d_here;
-        }
-    }
-
+    // q = (A·d)_c; the global reduction wants p_ap = dᵀA d = Σ_c d_c·q_c, so this
+    // cell contributes d_c·q_c (full quadratic form; A SPD ⇒ contribution ≥ 0).
+    let q = staggered_laplacian_apply_d(cell, d_here);
+    let energy = d_here * q;
     return vec2<f32>(q, energy);
 }
 
@@ -2003,18 +2168,22 @@ fn pressure_cg_matvec(
     @builtin(global_invocation_id) gid: vec3<u32>,
     @builtin(local_invocation_id) lid: vec3<u32>,
 ) {
+    // Self-terminating solve: once the weighted residual is below the
+    // convergence threshold every remaining CG iteration is a no-op. Exit
+    // before the workgroup reduction so an over-provisioned iteration budget
+    // costs almost nothing. `pressure_cg_converged` reads one uniform metric,
+    // so the whole workgroup returns together — no barrier divergence.
+    if pressure_cg_converged(f32(atomicLoad(&metrics[METRIC_CG_RZ_IDX]))) {
+        return;
+    }
+
     let list_i = gid.x;
     var contribution = 0.0;
     if list_i < active_pressure_count() {
         let idx = active_pressure_cell(list_i);
-        let old_rz = f32(atomicLoad(&metrics[METRIC_CG_RZ_IDX]));
-        if pressure_cg_converged(old_rz) {
-            cg[idx].w = 0.0;
-        } else {
-            let applied = pressure_apply_search_direction(idx);
-            cg[idx].w = applied.x;
-            contribution = max(applied.y, 0.0);
-        }
+        let applied = pressure_apply_search_direction(idx);
+        cg[idx].w = applied.x;
+        contribution = max(applied.y, 0.0);
     }
 
     pressure_reduce_values[lid.x] = contribution;
@@ -2038,6 +2207,12 @@ fn pressure_cg_apply_alpha(
     @builtin(global_invocation_id) gid: vec3<u32>,
     @builtin(local_invocation_id) lid: vec3<u32>,
 ) {
+    // Mirror the matvec's self-termination (see pressure_cg_matvec): skip the
+    // whole iteration cheaply once converged.
+    if pressure_cg_converged(f32(atomicLoad(&metrics[METRIC_CG_RZ_IDX]))) {
+        return;
+    }
+
     let list_i = gid.x;
     var contribution = 0.0;
     if list_i < active_pressure_count() {
@@ -2046,7 +2221,7 @@ fn pressure_cg_apply_alpha(
         if inv_diag > 0.0 {
             let old_rz = f32(atomicLoad(&metrics[METRIC_CG_RZ_IDX]));
             let p_ap = f32(atomicLoad(&metrics[METRIC_CG_PAP_IDX]));
-            if !pressure_cg_converged(old_rz) && p_ap > max(old_rz * CG_ALPHA_GATE_REL, CG_RZ_ABS_FLOOR) {
+            if p_ap > max(old_rz * CG_ALPHA_GATE_REL, CG_RZ_ABS_FLOOR) {
                 let alpha = old_rz / p_ap;
                 // A Jacobi-preconditioned graph Laplacian has O(1) stable CG
                 // steps. A much larger alpha means the fixed-point global
@@ -2135,88 +2310,79 @@ fn pressure_residual_measure(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 // ── project_pressure ──
 
+// project_pressure now iterates NODES (the active-grid list). At each node it
+// applies the staggered pressure gradient G = -Dᵀ (built from the 8 surrounding
+// cell pressures) to the node velocity: v = grid_vel[node] - dt*grad. Because G
+// is the exact transpose of the divergence and A = D·Dᵀ, the projection is
+// energy-orthogonal — it removes divergence without injecting kinetic energy at
+// the free surface. Bed Darcy/reaction coupling is applied afterwards in the
+// separate `project_bed_darcy` pass (it is a per-cell continuum effect, not part
+// of the gradient correction).
 @compute @workgroup_size(64)
 fn project_pressure(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let list_i = gid.x;
+    if list_i >= active_grid_count() { return; }
+
+    let idx = active_grid_cell(list_i);
+    let gv = grid_vel[idx];
+    if gv.w < 1e-6 { return; }
+
+    let iz_val = idx / (gx() * gy());
+    let rem = idx % (gx() * gy());
+    let iy_val = rem / gx();
+    let ix_val = rem % gx();
+    let node = vec3<i32>(i32(ix_val), i32(iy_val), i32(iz_val));
+
+    // Solid nodes are pinned by the boundary projection; the pressure gradient
+    // must not move them. (They also carry no fluid mass, but guard explicitly.)
+    if sdf_class_is_solid(node) {
+        return;
+    }
+
+    let grad_p = staggered_node_gradient(node);
+    var v = gv.xyz - dt() * grad_p;
+
+    let speed = length(v);
+    if speed > vel_cap() {
+        v = v * (vel_cap() / speed);
+    }
+    grid_vel[idx] = vec4<f32>(v, gv.w);
+}
+
+// Bed Darcy damping + reaction impulse, split out of project_pressure so the
+// gradient correction can iterate nodes. Iterates the active pressure CELLS and
+// runs only on CELL_BED_COUPLED cells, reading the just-projected node velocity.
+// Behavior matches the old in-line block (it only depended on grid_vel[cell] and
+// the bed state, never on the pressure gradient itself).
+@compute @workgroup_size(64)
+fn project_bed_darcy(@builtin(global_invocation_id) gid: vec3<u32>) {
     let list_i = gid.x;
     if list_i >= active_pressure_count() { return; }
 
     let idx = active_pressure_cell(list_i);
     let gv = grid_vel[idx];
     if gv.w < 1e-6 { return; }
-
+    if pressure_inv_diag_load(idx) <= 0.0 { return; }
     let kind = cell_kind_load(idx);
-    if pressure_inv_diag_load(idx) <= 0.0 {
-        return;
-    }
+    if kind != CELL_BED_COUPLED { return; }
+
+    let bed_idx = bed_lookup_load(idx);
+    if bed_idx < 0 || u32(bed_idx) >= num_bed() { return; }
 
     let iz_val = idx / (gx() * gy());
     let rem = idx % (gx() * gy());
     let iy_val = rem / gx();
     let ix_val = rem % gx();
+    let bed_cell = vec3<i32>(i32(ix_val), i32(iy_val), i32(iz_val));
 
-    let p_here = pressure_load(idx);
-    let self_fill = liquid_fill_fraction(idx, kind);
-    let cell = vec3<i32>(i32(ix_val), i32(iy_val), i32(iz_val));
-    // Solid/off-grid neighbors keep the mirror pressure, while air and fluid
-    // faces blend toward the neighboring pressure by the liquid face weight.
-    let p_xm = pressure_weighted_or_mirror(
-        cell + vec3<i32>(-1, 0, 0),
-        p_here,
-        kind,
-        self_fill,
-    );
-    let p_xp = pressure_weighted_or_mirror(
-        cell + vec3<i32>(1, 0, 0),
-        p_here,
-        kind,
-        self_fill,
-    );
-    let p_ym = pressure_weighted_or_mirror(
-        cell + vec3<i32>(0, -1, 0),
-        p_here,
-        kind,
-        self_fill,
-    );
-    let p_yp = pressure_weighted_or_mirror(
-        cell + vec3<i32>(0, 1, 0),
-        p_here,
-        kind,
-        self_fill,
-    );
-    let p_zm = pressure_weighted_or_mirror(
-        cell + vec3<i32>(0, 0, -1),
-        p_here,
-        kind,
-        self_fill,
-    );
-    let p_zp = pressure_weighted_or_mirror(
-        cell + vec3<i32>(0, 0, 1),
-        p_here,
-        kind,
-        self_fill,
-    );
+    let permeability_m2 = bed_compacted_permeability(u32(bed_idx));
+    let darcy_rate = water_kinematic_viscosity_m2_s() / permeability_m2;
+    let darcy_damping = 1.0 / (1.0 + max(darcy_rate * dt(), 0.0));
+    let bed_v = bed_matrix_velocity_cell(bed_cell);
+    var v = bed_v + (gv.xyz - bed_v) * darcy_damping;
+    let water_impulse = gv.w * (v - gv.xyz);
+    bed_impulse_delta_add_neighborhood(bed_cell, -water_impulse * BED_REACTION_ALPHA);
 
-    let grad_p = 0.5 * inv_dx() * vec3<f32>(
-        p_xp - p_xm,
-        p_yp - p_ym,
-        p_zp - p_zm,
-    );
-
-    var v = gv.xyz - dt() * grad_p;
-    if kind == CELL_BED_COUPLED {
-        let bed_idx = bed_lookup_load(idx);
-        if bed_idx >= 0 && u32(bed_idx) < num_bed() {
-            let permeability_m2 = bed_compacted_permeability(u32(bed_idx));
-            let darcy_rate = water_kinematic_viscosity_m2_s() / permeability_m2;
-            let darcy_damping = 1.0 / (1.0 + max(darcy_rate * dt(), 0.0));
-            let bed_cell = vec3<i32>(i32(ix_val), i32(iy_val), i32(iz_val));
-            let bed_v = bed_matrix_velocity_cell(bed_cell);
-            let v_before_darcy = v;
-            v = bed_v + (v - bed_v) * darcy_damping;
-            let water_impulse = gv.w * (v - v_before_darcy);
-            bed_impulse_delta_add_neighborhood(bed_cell, -water_impulse * BED_REACTION_ALPHA);
-        }
-    }
     let speed = length(v);
     if speed > vel_cap() {
         v = v * (vel_cap() / speed);
@@ -2464,13 +2630,15 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>) {
         new_C1 *= inv_supported;
         new_C2 *= inv_supported;
     }
-    let in_cup_volume =
-        xp.y < CUP_RIM_Y && dot(xp.xz, xp.xz) < (3.0 + contact_offset()) * (3.0 + contact_offset());
-    let dense_support_ratio =
-        clamp(local_grid_mass / max(nominal_mass() * DENSE_CELL_MASS_FACTOR, 1e-6), 0.0, 1.0);
-    // Use the particle's interpolation stencil rather than a single home-cell
-    // bed lookup so particles exiting the coffee bed do not toggle abruptly
-    // between porous and airborne transfer behavior at cell boundaries.
+    // Pure APIC (IMPM step 5): the particle velocity and the affine matrix C are
+    // both interpolated directly from the divergence-free projected grid velocity
+    // v^{n+1}. No FLIP blend and no ballistic-preservation cascade — with the
+    // projection done correctly as the last grid op, incompressible motion is
+    // carried by the affine modes without needing per-region momentum patches.
+
+    // Bed/porous transfer (Darcy drag) — genuine physics, kept as-is. Use the
+    // particle's interpolation stencil rather than a single home-cell bed lookup
+    // so particles exiting the bed do not toggle abruptly at cell boundaries.
     let porous_overlap = clamp(bed_overlap_weight, 0.0, 1.0);
     var particle_bed_v = vec3<f32>(0.0);
     var particle_bed_permeability = min_bed_permeability_m2();
@@ -2478,41 +2646,6 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>) {
         let inv_bed_overlap = 1.0 / bed_overlap_weight;
         particle_bed_v = bed_velocity_sum * inv_bed_overlap;
         particle_bed_permeability = max(bed_permeability_sum * inv_bed_overlap, min_bed_permeability_m2());
-    }
-    if support_ratio < 0.999 {
-        let ballistic_v = vec3<f32>(p.vel.x, p.vel.y + gravity() * dt(), p.vel.z);
-        let free_preserve_gain = select(1.35, 1.15, in_cup_volume);
-        let free_preserve_cap = select(0.995, 0.95, in_cup_volume);
-        let preserve_gain = mix(free_preserve_gain, 0.18, porous_overlap);
-        let preserve_cap = mix(free_preserve_cap, 0.16, porous_overlap);
-        let dense_pool_damping = mix(1.0, 0.12, dense_support_ratio);
-        let preserve =
-            clamp((1.0 - support_ratio) * preserve_gain * dense_pool_damping, 0.0, preserve_cap);
-        new_v = mix(new_v, ballistic_v, preserve);
-        let affine_damp = 1.0 - preserve * 0.75;
-        new_C0 *= affine_damp;
-        new_C1 *= affine_damp;
-        new_C2 *= affine_damp;
-    }
-
-    // Even with full stencil support, a thin free stream below the dripper can be
-    // severely under-dense. PIC/APIC transfer then numerically diffuses momentum.
-    // Preserve more ballistic motion when the particle is airborne and local mass
-    // support is low compared with a compact fluid region.
-    let airborne = porous_overlap <= 0.05 && sample_sdf(xp) > contact_offset() * 2.0;
-    if airborne {
-        let dense_mass = nominal_mass() * DENSE_CELL_MASS_FACTOR;
-        let density_ratio = clamp(local_grid_mass / max(dense_mass, 1e-6), 0.0, 1.0);
-        j_update_support = min(j_update_support, density_ratio);
-        let ballistic_v = vec3<f32>(p.vel.x, p.vel.y + gravity() * dt(), p.vel.z);
-        let preserve_gain = select(0.98, 0.72, in_cup_volume);
-        let preserve_cap = select(0.98, 0.88, in_cup_volume);
-        let preserve = clamp((1.0 - density_ratio) * preserve_gain, 0.0, preserve_cap);
-        new_v = mix(new_v, ballistic_v, preserve);
-        let affine_damp = 1.0 - preserve * 0.65;
-        new_C0 *= affine_damp;
-        new_C1 *= affine_damp;
-        new_C2 *= affine_damp;
     }
 
     if porous_overlap > 1e-4 {

@@ -1,4 +1,4 @@
-import init, { WasmSim3D } from "./pkg/coffee_sim_wasm.js?v=perf-60hz-2";
+import init, { WasmSim3D } from "./pkg/coffee_sim_wasm.js?v=staggered-1";
 
 const canvas = document.getElementById("sim-canvas");
 const viewCubeStage = document.getElementById("view-cube-stage");
@@ -437,6 +437,42 @@ function syncSpoutControlSize() {
   spoutPlane.parentElement.style.setProperty("--spout-plane-size", `${rect.width}px`);
 }
 
+// --- Adaptive CG iteration controller ---
+// Pick the per-substep CG iteration count that drives the pressure residual to
+// ADAPT_TARGET_RATIO, derived from the measured per-iteration convergence rate
+// (residual_ratio = perIter ^ iters). Spends iterations on hard, active-pour
+// solves and backs off when the pool settles. Needs the metrics readback
+// running, which is gated behind the debug/timeseries panel — keep one open for
+// live adaptation; otherwise the count holds at its last adapted value.
+const ADAPT_INTERVAL = 12;
+const ADAPT_MIN_ITERS = 4;
+// NOTE: capped conservatively on purpose. The solve *can* self-terminate at a
+// tight residual (the in-shader gating + near-free early-returns support a much
+// larger budget), but driving the residual far down currently amplifies a
+// free-surface energy-injection bug that ejects the pour to the speed cap. Keep
+// this modest until the collocated-grid projection is made energy-orthogonal.
+const ADAPT_MAX_ITERS = 40;
+const ADAPT_TARGET_RATIO = 0.05;
+let adaptFrameCounter = 0;
+let adaptiveIterations = 0;
+function maybeAdaptIterations() {
+  if (!app) return;
+  adaptFrameCounter += 1;
+  if (adaptFrameCounter < ADAPT_INTERVAL) return;
+  adaptFrameCounter = 0;
+  const perIter = app.pressureResidualRatioPerIteration();
+  if (!(perIter > 0)) return; // no residual sample yet
+  const needed =
+    perIter >= 1.0
+      ? ADAPT_MAX_ITERS // not converging: throw the budget at it
+      : Math.ceil(Math.log(ADAPT_TARGET_RATIO) / Math.log(perIter));
+  const next = Math.max(ADAPT_MIN_ITERS, Math.min(ADAPT_MAX_ITERS, needed));
+  if (next !== adaptiveIterations) {
+    adaptiveIterations = next;
+    app.setPressureCgIterations(next);
+  }
+}
+
 function animate(timestamp) {
   if (!lastFrameTime) lastFrameTime = timestamp;
 
@@ -470,6 +506,7 @@ function animate(timestamp) {
   if (!maybeRefreshMetrics()) {
     maybeRefreshDiagnostics();
   }
+  maybeAdaptIterations();
   requestAnimationFrame(animate);
 }
 
