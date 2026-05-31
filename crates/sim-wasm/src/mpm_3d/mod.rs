@@ -13,6 +13,8 @@ pub(crate) mod inflow;
 #[cfg(test)]
 mod physics_tests;
 mod pipelines;
+#[cfg(test)]
+mod profiler;
 mod shader;
 mod state;
 pub(crate) mod units;
