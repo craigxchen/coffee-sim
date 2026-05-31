@@ -265,10 +265,22 @@ impl MpmSettings {
             substeps: 8,
             gravity: units::EARTH_GRAVITY_SIM_UNITS,
             bulk_modulus: 900.0,
+            // Molecular base ν (also used for the physical Darcy drag). The
+            // grid-scale dissipation that actually settles the pool comes from
+            // the strain-dependent eddy viscosity in `viscosity_prepare` (a
+            // constant ν can't both settle the pool and preserve the laminar
+            // stream — only the strain rate distinguishes them).
             viscosity: units::sim_kinematic_viscosity_from_m2_s(
                 DEFAULT_BREW.water_kinematic_viscosity_m2_s,
             ),
             render_radius: dx * 0.7,
+            // Conservative per-substep CG budget. The in-shader convergence
+            // gating (pressure_cg_matvec) will self-terminate earlier if the
+            // residual threshold is met, and over-provisioned iterations are
+            // near-free uniform early-returns — but cranking this higher
+            // currently amplifies a free-surface energy-injection bug (the
+            // collocated-grid projection is not energy-orthogonal at fractional
+            // air faces), so it stays low until that projection is fixed.
             pressure_cg_iterations: 4,
             use_sdf_cache: true,
             obstacles: vec![
@@ -1787,13 +1799,36 @@ impl MpmSim3D {
                 });
                 pass.set_bind_group(0, &self.pipelines.bind_group, &[]);
 
-                // 4. boundary_project
+                // 4. boundary_project (BC on the gravity-predicted velocity)
                 pass.set_pipeline(&self.pipelines.boundary_project);
                 pass.dispatch_workgroups_indirect(&self.buffers.grid_dispatch_args, 0);
 
-                // Pressure projection: classify cells, solve the weighted
-                // Poisson system with Jacobi-preconditioned CG, correct grid
-                // velocity, then re-project boundaries.
+                // Cell classification (kinds) — needed by the predictor forces.
+                pass.set_pipeline(&self.pipelines.classify_cells);
+                pass.dispatch_workgroups_indirect(&self.buffers.grid_dispatch_args, 0);
+
+                // Predictor (IMPM step 2): apply ALL non-pressure forces —
+                // viscosity then packing — to build the intermediate velocity v*
+                // BEFORE the Poisson solve. This way the pressure projection is
+                // the final grid op and G2P reads a strictly divergence-free
+                // field (these used to run AFTER the projection, re-introducing
+                // divergence — the source of the over-damped/"slime" look).
+                for _ in 0..VISCOSITY_SOLVER_ITERATIONS {
+                    pass.set_pipeline(&self.pipelines.viscosity_prepare);
+                    pass.dispatch_workgroups_indirect(&self.buffers.grid_dispatch_args, 0);
+                    pass.set_pipeline(&self.pipelines.viscosity_apply);
+                    pass.dispatch_workgroups_indirect(&self.buffers.grid_dispatch_args, 0);
+                }
+                pass.set_pipeline(&self.pipelines.packing_prepare);
+                pass.dispatch_workgroups_indirect(&self.buffers.grid_dispatch_args, 0);
+                pass.set_pipeline(&self.pipelines.packing_apply);
+                pass.dispatch_workgroups_indirect(&self.buffers.grid_dispatch_args, 0);
+                pass.set_pipeline(&self.pipelines.boundary_project);
+                pass.dispatch_workgroups_indirect(&self.buffers.grid_dispatch_args, 0);
+
+                // Re-run classification to recompute the divergence (the Poisson
+                // RHS) from the full predictor velocity v*, then assemble the
+                // linear system. (Kinds are unchanged; this just refreshes b.)
                 pass.set_pipeline(&self.pipelines.classify_cells);
                 pass.dispatch_workgroups_indirect(&self.buffers.grid_dispatch_args, 0);
 
@@ -1833,33 +1868,23 @@ impl MpmSim3D {
                 pass.set_pipeline(&self.pipelines.pressure_residual_measure);
                 pass.dispatch_workgroups_indirect(&self.buffers.pressure_dispatch_args, 0);
 
+                // Corrector (IMPM step 4): project_pressure is the LAST grid
+                // operation before G2P, so the velocity particles read is
+                // strictly divergence-free. It now iterates NODES (the staggered
+                // gradient applies to node velocities), so it dispatches over the
+                // active-GRID list. Solid-wall Neumann (v·n = 0) lives in the
+                // divergence stencil (solid corner nodes contribute 0), and the
+                // particle-level SDF contact in g2p backs up penetration, so no
+                // post-projection boundary/diffusion pass is applied — those
+                // would re-introduce the divergence the solve just removed.
                 pass.set_pipeline(&self.pipelines.project_pressure);
+                pass.dispatch_workgroups_indirect(&self.buffers.grid_dispatch_args, 0);
+
+                // Bed Darcy/reaction coupling, split out of project_pressure
+                // (per-cell continuum effect). Iterates the active pressure CELLS
+                // and reads the just-projected node velocities.
+                pass.set_pipeline(&self.pipelines.project_bed_darcy);
                 pass.dispatch_workgroups_indirect(&self.buffers.pressure_dispatch_args, 0);
-                pass.set_pipeline(&self.pipelines.boundary_project);
-                pass.dispatch_workgroups_indirect(&self.buffers.grid_dispatch_args, 0);
-
-                // Packing pressure reuses the projection scratch lanes.
-                // Viscosity writes temporary velocities into the CG scratch
-                // region after pressure projection is done.
-                pass.set_pipeline(&self.pipelines.packing_prepare);
-                pass.dispatch_workgroups_indirect(&self.buffers.grid_dispatch_args, 0);
-                pass.set_pipeline(&self.pipelines.packing_apply);
-                pass.dispatch_workgroups_indirect(&self.buffers.grid_dispatch_args, 0);
-                pass.set_pipeline(&self.pipelines.boundary_project);
-                pass.dispatch_workgroups_indirect(&self.buffers.grid_dispatch_args, 0);
-
-                // Viscosity is split after the pressure and packing
-                // projections so neither correction can immediately
-                // reintroduce the high-frequency pool velocities that
-                // diffusion just removed.
-                for _ in 0..VISCOSITY_SOLVER_ITERATIONS {
-                    pass.set_pipeline(&self.pipelines.viscosity_prepare);
-                    pass.dispatch_workgroups_indirect(&self.buffers.grid_dispatch_args, 0);
-                    pass.set_pipeline(&self.pipelines.viscosity_apply);
-                    pass.dispatch_workgroups_indirect(&self.buffers.grid_dispatch_args, 0);
-                }
-                pass.set_pipeline(&self.pipelines.boundary_project);
-                pass.dispatch_workgroups_indirect(&self.buffers.grid_dispatch_args, 0);
 
                 // 6. g2p
                 if particle_wg > 0 {
@@ -1941,6 +1966,12 @@ impl MpmSim3D {
     pub fn set_spout_position(&mut self, x: f32, y: f32, z: f32) {
         self.settings.spout.translate_origin_to(Vec3::new(x, y, z));
         self.inflow.update(&self.settings.spout);
+    }
+
+    /// Runtime knob for the adaptive solver controller. Clamped to a sane band;
+    /// the per-substep CG loop reads `settings.pressure_cg_iterations` fresh.
+    pub fn set_pressure_cg_iterations(&mut self, iterations: u32) {
+        self.settings.pressure_cg_iterations = iterations.clamp(4, 256);
     }
 
     pub fn spout_position(&self) -> Vec3 {
@@ -2148,7 +2179,12 @@ impl MpmSim3D {
                 METRICS_DIV_FP_SCALE,
                 1.0 / METRICS_DIV_FP_SCALE,
             ],
-            projection_params: [32.0, 0.0, 1.20, DEFAULT_BREW.bed_surface_void_scale],
+            // DIAGNOSTIC: projection_j_alpha 32.0 -> 0.0 to disable the volume/
+            // density-correction source term. This isolates whether the donut
+            // fountain comes from that source (high-gain compression-as-
+            // expansion at the hydrostatic bottom) vs. the under-converged
+            // ∇·v=0 projection. Restore a tuned value once confirmed.
+            projection_params: [0.0, 0.0, 1.20, DEFAULT_BREW.bed_surface_void_scale],
         };
 
         queue.write_buffer(

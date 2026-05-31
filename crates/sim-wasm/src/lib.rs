@@ -292,6 +292,11 @@ impl WasmSim3D {
         self.sim.set_spout_position(x, y, z);
     }
 
+    #[wasm_bindgen(js_name = setPressureCgIterations)]
+    pub fn set_pressure_cg_iterations(&mut self, iterations: u32) {
+        self.sim.set_pressure_cg_iterations(iterations);
+    }
+
     #[wasm_bindgen(js_name = waterVelocityMetersPerSecond)]
     pub fn water_velocity_m_s(&self) -> f32 {
         self.sim.exit_speed_m_s()
