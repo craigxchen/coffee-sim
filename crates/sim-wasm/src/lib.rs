@@ -315,6 +315,46 @@ impl WasmSim3D {
             .step_frame(self.renderer.device(), self.renderer.queue(), frame_time);
     }
 
+    #[wasm_bindgen(js_name = stepSubstep)]
+    pub fn step_substep(&mut self) {
+        self.sim
+            .step_substep(self.renderer.device(), self.renderer.queue());
+    }
+
+    #[wasm_bindgen(js_name = gridDimX)]
+    pub fn grid_dim_x(&self) -> u32 {
+        self.sim.settings().grid_dims[0]
+    }
+
+    #[wasm_bindgen(js_name = gridDimY)]
+    pub fn grid_dim_y(&self) -> u32 {
+        self.sim.settings().grid_dims[1]
+    }
+
+    #[wasm_bindgen(js_name = gridDimZ)]
+    pub fn grid_dim_z(&self) -> u32 {
+        self.sim.settings().grid_dims[2]
+    }
+
+    /// Read back the solver pressure field on one z-slice for debug
+    /// visualization. Resolves to a `Float32Array` of `gridDimX * gridDimY`
+    /// values in solver pressure units, row-major (`value[iy * gx + ix]`).
+    ///
+    /// Returns a `Promise` built from cloned GPU handles (not a borrow of
+    /// `self`), so the render loop can keep driving the simulation while the
+    /// readback is in flight. Mirrors `sampleMetrics`.
+    #[wasm_bindgen(js_name = pressureSlice)]
+    pub fn pressure_slice(&self, z: u32) -> js_sys::Promise {
+        let device = self.renderer.device().clone();
+        let queue = self.renderer.queue().clone();
+        let grid = self.sim.grid_buffer();
+        let [gx, gy, gz] = self.sim.settings().grid_dims;
+        wasm_bindgen_futures::future_to_promise(async move {
+            let values = MpmSim3D::read_pressure_slice(device, queue, grid, gx, gy, gz, z).await?;
+            Ok(js_sys::Float32Array::from(values.as_slice()).into())
+        })
+    }
+
     #[wasm_bindgen(js_name = setWaterVelocityMetersPerSecond)]
     pub fn set_water_velocity_m_s(&mut self, speed_m_s: f32) {
         self.sim.set_exit_speed_m_s(speed_m_s);

@@ -1,12 +1,9 @@
-import init, { WasmSim3D } from "./pkg/coffee_sim_wasm.js?v=webgpu-preflight-1";
+import init, { WasmSim3D } from "./pkg/coffee_sim_wasm.js?v=debug-mode-2";
 
 const canvas = document.getElementById("sim-canvas");
 const viewCubeStage = document.getElementById("view-cube-stage");
 const toggleButton = document.getElementById("toggle");
 const resetButton = document.getElementById("reset");
-const sceneMainTab = document.getElementById("scene-tab-main");
-const sceneDebugTab = document.getElementById("scene-tab-debug");
-const sceneMainPanel = document.getElementById("scene-panel-main");
 const sceneDebugPanel = document.getElementById("scene-panel-debug");
 const sceneFreeStreamButton = document.getElementById("scene-free-stream");
 const sceneCenterPourButton = document.getElementById("scene-center-pour");
@@ -19,34 +16,19 @@ const spoutHeightInput = document.getElementById("spout-height");
 const spoutHeightValue = document.getElementById("spout-height-value");
 const particleLabel = document.getElementById("particles");
 const fpsLabel = document.getElementById("fps");
-const flowRateLabel = document.getElementById("flow-rate");
-const jetSpeedLabel = document.getElementById("jet-speed");
-const sceneModeLabel = document.getElementById("scene-mode");
-const stepModeLabel = document.getElementById("step-mode");
-const simHzLabel = document.getElementById("sim-hz");
 const simTimeLabel = document.getElementById("sim-time");
-const frameEmittedMassLabel = document.getElementById("frame-emitted-mass");
-const totalEmittedMassLabel = document.getElementById("total-emitted-mass");
-const frameDroppedEmissionLabel = document.getElementById("frame-dropped-emission");
-const totalDroppedEmissionLabel = document.getElementById("total-dropped-emission");
-const waterSlotsLabel = document.getElementById("water-slots");
-const bedParticlesLabel = document.getElementById("bed-particles");
-const capacityUsedLabel = document.getElementById("capacity-used");
-const bedEnabledLabel = document.getElementById("bed-enabled");
 const maxAbsDivLabel = document.getElementById("max-abs-div");
-const projectionResidualMaxLabel = document.getElementById("projection-residual-max");
 const projectionResidualMeanLabel = document.getElementById("projection-residual-mean");
-const projectionResidualCellsLabel = document.getElementById("projection-residual-cells");
 const pressurePairsLabel = document.getElementById("pressure-pairs");
 const fluidCellsLabel = document.getElementById("fluid-cells");
-const divClampFiresLabel = document.getElementById("div-clamp-fires");
-const pressureClampFiresLabel = document.getElementById("pressure-clamp-fires");
-const massOverflowFiresLabel = document.getElementById("mass-overflow-fires");
-const cupTdsLabel = document.getElementById("cup-tds");
-const extractionYieldLabel = document.getElementById("extraction-yield");
-const pressureStatusLabel = document.getElementById("pressure-status");
-const toggleDebugButton = document.getElementById("toggle-debug");
-const debugStats = document.getElementById("debug-stats");
+const toggleDebugModeButton = document.getElementById("toggle-debug-mode");
+const debugPanel = document.getElementById("debug-panel");
+const stepSubstepButton = document.getElementById("step-substep");
+const stepFrameButton = document.getElementById("step-frame");
+const pressureCanvas = document.getElementById("pressure-canvas");
+const pressureSliceInput = document.getElementById("pressure-slice");
+const pressureSliceValue = document.getElementById("pressure-slice-value");
+const pressureRangeLabel = document.getElementById("pressure-range");
 const timeseriesDrawer = document.getElementById("timeseries-drawer");
 const toggleTimeseriesButton = document.getElementById("toggle-timeseries");
 const toggleTimeseriesMenuButton = document.getElementById("toggle-timeseries-menu");
@@ -70,6 +52,7 @@ const AUTO_PAUSE_DELAY_MS = 30_000;
 
 let app;
 let paused = false;
+let debugMode = false;
 let autoPauseTimer = 0;
 let lastFrameTime = 0;
 let skipStepOnce = false;
@@ -243,11 +226,15 @@ async function bootstrap() {
   try {
     buildTimeseriesCharts();
     buildTimeseriesMenu();
-    await init();
+    // Pass an explicit, versioned wasm URL. The wasm-pack glue otherwise fetches
+    // `coffee_sim_wasm_bg.wasm` with no query string, so browsers cache the
+    // binary indefinitely and keep running stale code across rebuilds.
+    await init(new URL("./pkg/coffee_sim_wasm_bg.wasm?v=debug-mode-2", import.meta.url));
     app = await WasmSim3D.create(canvas);
     app.loadBenchmarkCenterPour();
     fixedStepSeconds = 1 / 60;
     syncControlDefaultsFromSim();
+    initPressureSliceControl();
     applyWaterVelocityControl();
     applySpoutControls();
     resizeCanvas();
@@ -297,19 +284,21 @@ async function bootstrap() {
     setTimeseriesDrawerExpanded(false);
   });
 
-  toggleDebugButton.addEventListener("click", () => {
-    debugStats.classList.toggle("hidden");
-    toggleDebugButton.textContent = debugStats.classList.contains("hidden")
-      ? "Show Debug Stats"
-      : "Hide Debug Stats";
+  toggleDebugModeButton.addEventListener("click", () => {
+    setDebugMode(!debugMode);
   });
 
-  sceneMainTab.addEventListener("click", () => {
-    setSceneTab("main");
+  stepSubstepButton.addEventListener("click", () => {
+    stepOnce(() => app.stepSubstep());
   });
 
-  sceneDebugTab.addEventListener("click", () => {
-    setSceneTab("debug");
+  stepFrameButton.addEventListener("click", () => {
+    stepOnce(() => app.stepFrame(1 / 60));
+  });
+
+  pressureSliceInput.addEventListener("input", () => {
+    pressureSliceValue.textContent = pressureSliceInput.value;
+    refreshPressureSlice();
   });
 
   sceneFreeStreamButton.addEventListener("click", () => {
@@ -600,7 +589,6 @@ function animate(timestamp) {
   syncUi();
   maybeCollectTimeseriesSample();
   maybeRefreshMetrics();
-  maybeRefreshPressureDiagnostics();
   requestAnimationFrame(animate);
 }
 
@@ -637,7 +625,7 @@ function clearAutoPauseTimer() {
 }
 
 function maybeRefreshMetrics() {
-  if (debugStats.classList.contains("hidden")) return;
+  if (!timeseriesDrawer.classList.contains("is-open")) return;
   metricsFrameCounter += 1;
   if (
     metricsFrameCounter < METRICS_SAMPLE_INTERVAL_FRAMES
@@ -658,13 +646,6 @@ function maybeRefreshMetrics() {
     .finally(() => {
       metricsSamplesPending = Math.max(0, metricsSamplesPending - 1);
     });
-}
-
-function maybeRefreshPressureDiagnostics() {
-  if (debugStats.classList.contains("hidden")) return;
-  pressureStatusLabel.textContent = latestExactMetrics
-    ? "exact 10 Hz"
-    : "waiting";
 }
 
 function setTimeseriesDrawerExpanded(expanded) {
@@ -922,11 +903,6 @@ function updateFps(frameTime) {
   fpsLabel.textContent = avg > 0 ? Math.round(1 / avg).toString() : "0";
 }
 
-function formatSimHz() {
-  if (!fixedStepSeconds) return "Real Time";
-  return `${Math.round(1 / fixedStepSeconds)}`;
-}
-
 function updateViewCube() {
   const yaw = app.cameraYaw();
   const pitch = app.cameraPitch();
@@ -969,14 +945,10 @@ function applySpoutControls() {
 function applySceneControls() {
 }
 
-function setSceneTab(tabName) {
-  const debugSelected = tabName === "debug";
-  sceneMainTab.classList.toggle("is-active", !debugSelected);
-  sceneDebugTab.classList.toggle("is-active", debugSelected);
-  sceneMainTab.setAttribute("aria-selected", debugSelected ? "false" : "true");
-  sceneDebugTab.setAttribute("aria-selected", debugSelected ? "true" : "false");
-  sceneMainPanel.hidden = debugSelected;
-  sceneDebugPanel.hidden = !debugSelected;
+function setSceneTab() {
+  // Scene tabs were removed when the debug UI was unified into debug mode; the
+  // debug scenes now live in the debug panel. Kept as a no-op so the scene
+  // loaders below don't each need to change.
 }
 
 function finishSceneLoad({ sceneId, label, tab, pausedOnLoad = false }) {
@@ -993,6 +965,10 @@ function finishSceneLoad({ sceneId, label, tab, pausedOnLoad = false }) {
   lastFrameTime = 0;
   syncUi();
   resetTimeseries();
+  if (debugMode) {
+    setPaused(true);
+    refreshDebugView();
+  }
 }
 
 function loadCenterPourScene() {
@@ -1033,6 +1009,10 @@ function reloadCurrentScene() {
     lastFrameTime = 0;
     syncUi();
     resetTimeseries();
+    if (debugMode) {
+      setPaused(true);
+      refreshDebugView();
+    }
   }
 }
 
@@ -1078,35 +1058,117 @@ function syncUi() {
   spoutZ = clamp(snap(app.spoutZ()), SPOUT_Z_MIN, SPOUT_Z_MAX);
   spoutHeightValue.textContent = app.spoutY().toFixed(1);
   updateSpoutPlaneUi();
-  flowRateLabel.textContent = `${app.flowRate().toFixed(1)} mL/s`;
-  jetSpeedLabel.textContent = `${app.exitSpeedMetersPerSecond().toFixed(2)} m/s`;
-  sceneModeLabel.textContent = currentSceneMode;
-  stepModeLabel.textContent = fixedStepSeconds ? "Fixed Step" : "Real Time";
-  simHzLabel.textContent = formatSimHz();
+  // Compact solver metrics for debug mode. Divergence/residual/fluid-cell
+  // values come from the latest GPU metrics snapshot; sim time and pressure
+  // pairs are cheap synchronous getters.
   simTimeLabel.textContent = `${app.simTime().toFixed(1)}s`;
-  frameEmittedMassLabel.textContent = app.frameEmittedMl().toFixed(2);
-  totalEmittedMassLabel.textContent = app.totalEmittedMl().toFixed(2);
-  frameDroppedEmissionLabel.textContent = new Intl.NumberFormat().format(app.frameDroppedParticles());
-  totalDroppedEmissionLabel.textContent = new Intl.NumberFormat().format(app.totalDroppedParticles());
-  waterSlotsLabel.textContent = new Intl.NumberFormat().format(app.waterSlotsUsed());
-  bedParticlesLabel.textContent = new Intl.NumberFormat().format(app.bedParticleCount());
-  const maxParticles = app.maxParticles();
-  const usedParticles = app.particleCount();
-  capacityUsedLabel.textContent = maxParticles > 0
-    ? `${((usedParticles / maxParticles) * 100).toFixed(1)}%`
-    : "0.0%";
-  bedEnabledLabel.textContent = app.hasBed() ? "Yes" : "No";
   maxAbsDivLabel.textContent = (metrics.maxAbsDivergence ?? 0).toFixed(3);
-  projectionResidualMaxLabel.textContent = (metrics.projectionResidualMaxAbsDivergence ?? 0).toFixed(3);
   projectionResidualMeanLabel.textContent = (metrics.projectionResidualMeanAbsDivergence ?? 0).toFixed(3);
-  projectionResidualCellsLabel.textContent = new Intl.NumberFormat().format(metrics.projectionResidualCellCount ?? 0);
   pressurePairsLabel.textContent = new Intl.NumberFormat().format(app.lastPressureRbgsPairs());
   fluidCellsLabel.textContent = new Intl.NumberFormat().format(metrics.fluidCellCount ?? 0);
-  divClampFiresLabel.textContent = new Intl.NumberFormat().format(metrics.divClampFires ?? 0);
-  pressureClampFiresLabel.textContent = new Intl.NumberFormat().format(metrics.pressureClampFires ?? 0);
-  massOverflowFiresLabel.textContent = new Intl.NumberFormat().format(metrics.massOverflowFires ?? 0);
-  cupTdsLabel.textContent = `${((metrics.cupTds ?? 0) * 100).toFixed(2)}%`;
-  extractionYieldLabel.textContent = `${((metrics.extractionYield ?? 0) * 100).toFixed(2)}%`;
+}
+
+function setDebugMode(on) {
+  debugMode = on;
+  debugPanel.classList.toggle("hidden", !on);
+  toggleDebugModeButton.textContent = on ? "Exit Debug Mode" : "Enter Debug Mode";
+  if (on) {
+    // Pause so the user can step through the algorithm.
+    setPaused(true);
+    refreshDebugView();
+  } else {
+    // Always resume on exit so the scene being debugged keeps running.
+    setPaused(false);
+  }
+}
+
+// Advance the (paused) sim by one unit, then refresh render, metrics, and the
+// pressure visualization. `step` runs either one substep or one full frame.
+async function stepOnce(step) {
+  setPaused(true);
+  step();
+  app.render();
+  await refreshDebugView();
+}
+
+async function refreshDebugView() {
+  syncUi();
+  await refreshPressureSlice();
+  // Conflict-free metrics readback: app.sampleMetrics captures cloned GPU
+  // handles instead of borrowing the WASM object across the await, so the
+  // render loop keeps running while the snapshot resolves.
+  app.sampleMetrics(METRICS_SAMPLE_DELAY_FRAMES)
+    .then((metrics) => {
+      latestExactMetrics = metrics;
+      syncUi();
+    })
+    .catch(() => {});
+}
+
+function initPressureSliceControl() {
+  const gz = app.gridDimZ();
+  const center = Math.floor(gz / 2);
+  pressureSliceInput.max = String(Math.max(0, gz - 1));
+  pressureSliceInput.value = String(center);
+  pressureSliceValue.textContent = String(center);
+}
+
+async function refreshPressureSlice() {
+  if (!app) return;
+  const z = Number(pressureSliceInput.value);
+  const data = await app.pressureSlice(z);
+  drawPressureGrid(data);
+}
+
+// Render one z-slice of the solver pressure field as a heat map. Warm = positive
+// pressure, cool = negative, dark ~ zero. Grid row iy=0 is the bottom of the
+// domain, so rows are drawn flipped to keep "up" up.
+function drawPressureGrid(data) {
+  const gx = app.gridDimX();
+  const gy = app.gridDimY();
+  if (data.length < gx * gy) return;
+
+  let amp = 0;
+  let min = 0;
+  let max = 0;
+  for (let i = 0; i < data.length; i += 1) {
+    amp = Math.max(amp, Math.abs(data[i]));
+    min = Math.min(min, data[i]);
+    max = Math.max(max, data[i]);
+  }
+
+  pressureCanvas.width = gx;
+  pressureCanvas.height = gy;
+  const ctx = pressureCanvas.getContext("2d");
+  const image = ctx.createImageData(gx, gy);
+  for (let iy = 0; iy < gy; iy += 1) {
+    const srcRow = iy * gx;
+    const dstRow = (gy - 1 - iy) * gx;
+    for (let ix = 0; ix < gx; ix += 1) {
+      const [r, g, b] = pressureColor(data[srcRow + ix], amp);
+      const p = (dstRow + ix) * 4;
+      image.data[p] = r;
+      image.data[p + 1] = g;
+      image.data[p + 2] = b;
+      image.data[p + 3] = 255;
+    }
+  }
+  ctx.putImageData(image, 0, 0);
+  pressureRangeLabel.textContent = `${formatCompact(min)} … ${formatCompact(max)}`;
+}
+
+function pressureColor(value, amp) {
+  if (amp <= 0) return [12, 18, 22];
+  const t = clamp(value / amp, -1, 1);
+  if (t >= 0) {
+    return [lerp(14, 240, t), lerp(18, 150, t), lerp(22, 60, t)];
+  }
+  const s = -t;
+  return [lerp(14, 70, s), lerp(18, 170, s), lerp(22, 230, s)];
+}
+
+function lerp(a, b, t) {
+  return Math.round(a + (b - a) * t);
 }
 
 function publishDebugHooks() {
