@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Coffee Sim | 3D Pourover</title>
-    <link rel="stylesheet" href="./styles.css?v=webgpu-preflight-1" />
+    <link rel="stylesheet" href="./styles.css?v=debug-mode-2" />
   </head>
   <body>
     <main class="layout">
@@ -23,52 +23,9 @@
           <div class="slider-field">
             <span>Scenes</span>
           </div>
-          <div class="scene-tabs" role="tablist" aria-label="Scene groups">
-            <button
-              id="scene-tab-main"
-              class="scene-tab is-active"
-              type="button"
-              role="tab"
-              aria-selected="true"
-              aria-controls="scene-panel-main"
-            >
-              Scenes
-            </button>
-            <button
-              id="scene-tab-debug"
-              class="scene-tab"
-              type="button"
-              role="tab"
-              aria-selected="false"
-              aria-controls="scene-panel-debug"
-            >
-              Debug Scenes
-            </button>
-          </div>
-          <div id="scene-panel-main" class="scene-panel controls" role="tabpanel" aria-labelledby="scene-tab-main">
+          <div id="scene-panel-main" class="scene-panel controls">
             <button id="scene-center-pour">Center Pour</button>
             <button id="scene-free-stream">Water Only</button>
-          </div>
-          <div
-            id="scene-panel-debug"
-            class="scene-panel controls debug-scene-grid"
-            role="tabpanel"
-            aria-labelledby="scene-tab-debug"
-            hidden
-          >
-            <button data-debug-scene="filter-water-block">Water Block</button>
-            <button data-debug-scene="off-center-filter-wall-pour">Off-Center Wall Pour</button>
-            <button data-debug-scene="seeded-paper-wall-sheet">Paper-Wall Sheet</button>
-            <button data-debug-scene="filter-apex-drain">Filter Apex Drain</button>
-            <button data-debug-scene="cup-wall-floor-corner-contact">Cup Corner Contact</button>
-            <button data-debug-scene="asymmetric-cup-mound-settle">Asymmetric Mound</button>
-            <button data-debug-scene="hydrostatic-column">Hydrostatic Column</button>
-            <button data-debug-scene="dam-break-slosh">Dam Break Slosh</button>
-            <button data-debug-scene="sparse-free-jet">Sparse Free Jet</button>
-            <button data-debug-scene="high-velocity-jet-impact">High-Velocity Impact</button>
-            <button data-debug-scene="uniform-bed-saturation">Uniform Bed Saturation</button>
-            <button data-debug-scene="permeability-comparison">Permeability Stress</button>
-            <button data-debug-scene="particle-capacity-stress">Capacity Stress</button>
           </div>
         </div>
         <div class="control-panel">
@@ -116,125 +73,65 @@
             <dd id="fps">0</dd>
           </div>
         </dl>
-        <button id="toggle-debug" class="toggle-debug">Show Debug Stats</button>
-        <dl class="stats debug-stats hidden" id="debug-stats">
-          <div>
-            <dt>Scene</dt>
-            <dd id="scene-mode">Center Pour</dd>
+        <button id="toggle-debug-mode" class="toggle-debug">Enter Debug Mode</button>
+        <div id="debug-panel" class="debug-panel hidden">
+          <div class="controls">
+            <button id="step-substep">Step Substep</button>
+            <button id="step-frame">Step Frame</button>
           </div>
-          <div>
-            <dt>Step Mode</dt>
-            <dd id="step-mode">Fixed Step</dd>
+          <div class="pressure-viz">
+            <div class="slider-field">
+              <span>Pressure Grid</span>
+              <output id="pressure-range">n/a</output>
+            </div>
+            <canvas id="pressure-canvas" class="pressure-canvas"></canvas>
+            <label class="slider-field" for="pressure-slice">
+              <span>Slice z</span>
+              <output id="pressure-slice-value">0</output>
+            </label>
+            <input id="pressure-slice" type="range" min="0" max="79" step="1" value="40" />
           </div>
-          <div>
-            <dt>Sim Hz</dt>
-            <dd id="sim-hz">60</dd>
+          <dl class="stats debug-stats" id="debug-metrics">
+            <div>
+              <dt>Sim Time</dt>
+              <dd id="sim-time">0.0s</dd>
+            </div>
+            <div>
+              <dt>Max |div u|</dt>
+              <dd id="max-abs-div">0.000</dd>
+            </div>
+            <div>
+              <dt>Proj Residual</dt>
+              <dd id="projection-residual-mean">0.000</dd>
+            </div>
+            <div>
+              <dt>Pressure Pairs</dt>
+              <dd id="pressure-pairs">0</dd>
+            </div>
+            <div>
+              <dt>Fluid Cells</dt>
+              <dd id="fluid-cells">0</dd>
+            </div>
+          </dl>
+          <div class="slider-field">
+            <span>Debug Scenes</span>
           </div>
-          <div>
-            <dt>Sim Time</dt>
-            <dd id="sim-time">0.0s</dd>
+          <div id="scene-panel-debug" class="scene-panel controls debug-scene-grid">
+            <button data-debug-scene="filter-water-block">Water Block</button>
+            <button data-debug-scene="off-center-filter-wall-pour">Off-Center Wall Pour</button>
+            <button data-debug-scene="seeded-paper-wall-sheet">Paper-Wall Sheet</button>
+            <button data-debug-scene="filter-apex-drain">Filter Apex Drain</button>
+            <button data-debug-scene="cup-wall-floor-corner-contact">Cup Corner Contact</button>
+            <button data-debug-scene="asymmetric-cup-mound-settle">Asymmetric Mound</button>
+            <button data-debug-scene="hydrostatic-column">Hydrostatic Column</button>
+            <button data-debug-scene="dam-break-slosh">Dam Break Slosh</button>
+            <button data-debug-scene="sparse-free-jet">Sparse Free Jet</button>
+            <button data-debug-scene="high-velocity-jet-impact">High-Velocity Impact</button>
+            <button data-debug-scene="uniform-bed-saturation">Uniform Bed Saturation</button>
+            <button data-debug-scene="permeability-comparison">Permeability Stress</button>
+            <button data-debug-scene="particle-capacity-stress">Capacity Stress</button>
           </div>
-          <div>
-            <dt>Flow</dt>
-            <dd id="flow-rate">0.0 mL/s</dd>
-          </div>
-          <div>
-            <dt>Jet Speed</dt>
-            <dd id="jet-speed">0.00 m/s</dd>
-          </div>
-          <div>
-            <dt>Frame Emit mL</dt>
-            <dd id="frame-emitted-mass">0.00</dd>
-          </div>
-          <div>
-            <dt>Total Emit mL</dt>
-            <dd id="total-emitted-mass">0.00</dd>
-          </div>
-          <div>
-            <dt>Frame Dropped</dt>
-            <dd id="frame-dropped-emission">0</dd>
-          </div>
-          <div>
-            <dt>Total Dropped</dt>
-            <dd id="total-dropped-emission">0</dd>
-          </div>
-          <div>
-            <dt>Water Slots</dt>
-            <dd id="water-slots">0</dd>
-          </div>
-          <div>
-            <dt>Bed Particles</dt>
-            <dd id="bed-particles">0</dd>
-          </div>
-          <div>
-            <dt>Capacity Used</dt>
-            <dd id="capacity-used">0.0%</dd>
-          </div>
-          <div>
-            <dt>Bed Enabled</dt>
-            <dd id="bed-enabled">Yes</dd>
-          </div>
-          <div>
-            <dt>Max |div u|</dt>
-            <dd id="max-abs-div">0.000</dd>
-          </div>
-          <div>
-            <dt>Proj Residual Max</dt>
-            <dd id="projection-residual-max">0.000</dd>
-          </div>
-          <div>
-            <dt>Proj Residual Mean</dt>
-            <dd id="projection-residual-mean">0.000</dd>
-          </div>
-          <div>
-            <dt>Proj Residual Cells</dt>
-            <dd id="projection-residual-cells">0</dd>
-          </div>
-          <div>
-            <dt>Pressure Pairs</dt>
-            <dd id="pressure-pairs">0</dd>
-          </div>
-          <div>
-            <dt>Fluid Cells</dt>
-            <dd id="fluid-cells">0</dd>
-          </div>
-          <div>
-            <dt>Div Clamp Fires</dt>
-            <dd id="div-clamp-fires">0</dd>
-          </div>
-          <div>
-            <dt>Pressure Clamp Fires</dt>
-            <dd id="pressure-clamp-fires">0</dd>
-          </div>
-          <div>
-            <dt>Mass Overflow Fires</dt>
-            <dd id="mass-overflow-fires">0</dd>
-          </div>
-          <div>
-            <dt>Cup TDS</dt>
-            <dd id="cup-tds">0.00%</dd>
-          </div>
-          <div>
-            <dt>Yield</dt>
-            <dd id="extraction-yield">0.00%</dd>
-          </div>
-          <div>
-            <dt>Pressure Depth</dt>
-            <dd id="pressure-depth">n/a</dd>
-          </div>
-          <div>
-            <dt>Bottom Pressure</dt>
-            <dd id="pressure-bottom">n/a</dd>
-          </div>
-          <div>
-            <dt>Pressure Delta</dt>
-            <dd id="pressure-delta">n/a</dd>
-          </div>
-          <div>
-            <dt>Hydrostatic Check</dt>
-            <dd id="pressure-status">n/a</dd>
-          </div>
-        </dl>
+        </div>
       </section>
       <section class="viewer">
         <canvas id="sim-canvas"></canvas>
@@ -297,6 +194,6 @@
         ></div>
       </div>
     </aside>
-    <script type="module" src="./main.js?v=webgpu-preflight-1"></script>
+    <script type="module" src="./main.js?v=debug-mode-2"></script>
   </body>
 </html>

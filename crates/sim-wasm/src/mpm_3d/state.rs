@@ -126,7 +126,11 @@ impl MpmBuffers {
         let grid = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("mpm grid atomics"),
             size: (6 * total_cells * size_of::<i32>()) as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            // COPY_SRC lets debug mode read the pressure scratch lane (slot 0)
+            // back to the CPU for visualization.
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
 

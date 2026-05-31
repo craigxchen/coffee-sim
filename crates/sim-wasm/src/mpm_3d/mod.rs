@@ -1536,6 +1536,33 @@ impl MpmSim3D {
         self.frame_dropped_particles = 0;
 
         for _ in 0..substeps {
+            self.run_substep(device, queue, sub_dt);
+        }
+
+        // The metrics staging copy used to happen here every frame, but that
+        // races against the async `map_async` in `refresh_metrics` — the next
+        // frame's copy would try to write into a buffer that was still in a
+        // pending-map state, and wgpu panics. The copy now lives inside
+        // `refresh_metrics` itself, which keeps the staging buffer idle
+        // between snapshot requests.
+
+        // The filter mesh is static CPU render geometry, not solver state, so
+        // there is no per-frame mesh work here.
+    }
+
+    /// Advance exactly one MPM substep. Drives both the per-frame loop above
+    /// and the debug-mode single-step control. The substep dt matches a
+    /// 60 Hz frame split into `substeps`.
+    pub fn step_substep(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        let substeps = self.settings.substeps.max(1);
+        let sub_dt = (1.0 / 60.0) / substeps as f32;
+        self.frame_emitted_mass = 0.0;
+        self.frame_dropped_particles = 0;
+        self.run_substep(device, queue, sub_dt);
+    }
+
+    fn run_substep(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, sub_dt: f32) {
+        {
             // Emit new particles
             let EmissionResult { emitted, dropped } = self.inflow.emit_particles(
                 queue,
@@ -1690,16 +1717,6 @@ impl MpmSim3D {
 
             self.total_time += sub_dt;
         }
-
-        // The metrics staging copy used to happen here every frame, but that
-        // races against the async `map_async` in `refresh_metrics` — the next
-        // frame's copy would try to write into a buffer that was still in a
-        // pending-map state, and wgpu panics. The copy now lives inside
-        // `refresh_metrics` itself, which keeps the staging buffer idle
-        // between snapshot requests.
-
-        // The filter mesh is static CPU render geometry, not solver state, so
-        // there is no per-frame mesh work here.
     }
 
     pub fn reset(&mut self, queue: &wgpu::Queue, _device: &wgpu::Device) {
@@ -2005,6 +2022,81 @@ impl MpmSim3D {
         drop(particle_view);
         particle_staging.unmap();
         Ok(diagnostics)
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub fn grid_buffer(&self) -> wgpu::Buffer {
+        self.buffers.grid.clone()
+    }
+
+    /// Read back one z-slice (an x/y plane) of the solver pressure field for
+    /// debug visualization. After a step the grid's slot-0 scratch lane holds
+    /// the last substep's pressure (fixed-point i32), and a fixed-z slice is a
+    /// contiguous block of `gx * gy` cells. Returns decoded pressure in solver
+    /// units, row-major as `value[iy * gx + ix]`.
+    ///
+    /// Takes owned `device`/`queue`/`grid` clones rather than borrowing `self`,
+    /// so the borrow is not held across the await. That keeps the per-frame
+    /// render loop free to call into the simulation while the readback is in
+    /// flight (mirrors `sample_metrics_after_delay`).
+    #[cfg(target_arch = "wasm32")]
+    pub async fn read_pressure_slice(
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+        grid: wgpu::Buffer,
+        gx: u32,
+        gy: u32,
+        gz: u32,
+        z: u32,
+    ) -> Result<Vec<f32>, JsValue> {
+        let z = z.min(gz.saturating_sub(1));
+        let slice_cells = (gx * gy) as u64;
+        let size = (slice_cells * std::mem::size_of::<i32>() as u64).max(4);
+        let offset = z as u64 * slice_cells * std::mem::size_of::<i32>() as u64;
+
+        let staging = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("pressure slice staging"),
+            size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("pressure slice readback"),
+        });
+        encoder.copy_buffer_to_buffer(&grid, offset, &staging, 0, size);
+        queue.submit(Some(encoder.finish()));
+
+        let queue_done = js_sys::Promise::new(&mut |resolve, _reject| {
+            queue.on_submitted_work_done(move || {
+                let _ = resolve.call0(&JsValue::NULL);
+            });
+        });
+        wasm_bindgen_futures::JsFuture::from(queue_done).await?;
+
+        let slice = staging.slice(..);
+        let promise = js_sys::Promise::new(&mut |resolve, reject| {
+            slice.map_async(wgpu::MapMode::Read, move |result| match result {
+                Ok(()) => {
+                    let _ = resolve.call0(&JsValue::NULL);
+                }
+                Err(err) => {
+                    let _ = reject.call1(
+                        &JsValue::NULL,
+                        &JsValue::from_str(&format!("pressure slice map failed: {err:?}")),
+                    );
+                }
+            });
+        });
+        wasm_bindgen_futures::JsFuture::from(promise).await?;
+
+        let view = slice.get_mapped_range();
+        let raw = bytemuck::cast_slice::<u8, i32>(&view);
+        let inv = 1.0 / FP_SCALE;
+        let values: Vec<f32> = raw.iter().map(|&v| v as f32 * inv).collect();
+        drop(view);
+        staging.unmap();
+        Ok(values)
     }
 
     /// Async staging-buffer readback for the GPU metrics counters.
