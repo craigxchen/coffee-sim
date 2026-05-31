@@ -1,4 +1,4 @@
-import init, { WasmSim3D } from "./pkg/coffee_sim_wasm.js?v=webgpu-preflight-1";
+import init, { WasmSim3D } from "./pkg/coffee_sim_wasm.js?v=xpbd-stepfix-1";
 
 const canvas = document.getElementById("sim-canvas");
 const viewCubeStage = document.getElementById("view-cube-stage");
@@ -72,6 +72,8 @@ let app;
 let paused = false;
 let autoPauseTimer = 0;
 let lastFrameTime = 0;
+let lastAnimationTickMs = 0;
+let fallbackAnimationTimer = 0;
 let skipStepOnce = false;
 let evaluationActive = false;
 let fpsWindow = [];
@@ -244,19 +246,27 @@ async function bootstrap() {
     buildTimeseriesCharts();
     buildTimeseriesMenu();
     await init();
+    document.body.dataset.startupStage = "wasm-init";
     app = await WasmSim3D.create(canvas);
+    document.body.dataset.startupStage = "sim-created";
     app.loadBenchmarkCenterPour();
+    document.body.dataset.startupStage = "scene-loaded";
     fixedStepSeconds = 1 / 60;
     syncControlDefaultsFromSim();
     applyWaterVelocityControl();
     applySpoutControls();
     resizeCanvas();
     syncSpoutControlSize();
+    setPaused(true);
     syncUi();
     resetTimeseries();
-    requestAnimationFrame(animate);
-    scheduleAutoPauseIfInactive();
+    document.body.dataset.startupStage = "ui-synced";
     publishDebugHooks();
+    document.body.dataset.startupStage = "hooks-published";
+    requestAnimationFrame(animate);
+    startFallbackAnimationTimer();
+    scheduleAutoPauseIfInactive();
+    document.body.dataset.startupStage = "running";
   } catch (error) {
     showStartupError({
       title: "Could not start WebGPU",
@@ -575,6 +585,7 @@ function syncSpoutControlSize() {
 }
 
 function animate(timestamp) {
+  lastAnimationTickMs = performance.now();
   if (!lastFrameTime) lastFrameTime = timestamp;
 
   const wallFrameTime = Math.min((timestamp - lastFrameTime) / 1000, 0.05);
@@ -591,17 +602,47 @@ function animate(timestamp) {
   if (!paused && skipStepOnce) {
     skipStepOnce = false;
   } else if (!paused) {
-    app.stepFrame(frameTime);
+    try {
+      app.stepFrame(frameTime);
+    } catch (error) {
+      document.body.dataset.stepError = errorMessage(error);
+      setPaused(true);
+    }
   }
 
-  app.render();
+  try {
+    app.render();
+  } catch (error) {
+    document.body.dataset.renderError = errorMessage(error);
+    console.warn("Coffee Sim render failed", error);
+  }
   updateViewCube();
   updateFps(wallFrameTime);
-  syncUi();
+  try {
+    syncUi();
+  } catch (error) {
+    document.body.dataset.syncError = errorMessage(error);
+    throw error;
+  }
   maybeCollectTimeseriesSample();
   maybeRefreshMetrics();
   maybeRefreshPressureDiagnostics();
   requestAnimationFrame(animate);
+}
+
+function startFallbackAnimationTimer() {
+  if (fallbackAnimationTimer) return;
+  document.body.dataset.fallbackAnimation = "started";
+  fallbackAnimationTimer = window.setInterval(() => {
+    document.body.dataset.fallbackAnimation = "tick";
+    if (performance.now() - lastAnimationTickMs < 250) return;
+    try {
+      animate(performance.now());
+    } catch (error) {
+      document.body.dataset.loopError = errorMessage(error);
+      console.warn("Coffee Sim animation fallback failed", error);
+    }
+  }, 100);
 }
 
 function setPaused(nextPaused) {

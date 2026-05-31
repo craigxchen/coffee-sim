@@ -8,10 +8,15 @@ use web_sys::HtmlCanvasElement;
 
 use coffee_sim_core::Vec3;
 
-use crate::mpm_3d::{
-    MpmSettings, MpmSim3D, Obstacle, CONTACT_OFFSET, MAX_FILL_VERTEX_COUNT,
-    MAX_RENDER_VERTEX_COUNT, OBSTACLE_WALL_THICKNESS,
+use crate::app_sim::AppSim;
+use crate::boundaries::{
+    cup::CupConfig,
+    filter::{MAX_FILL_VERTEX_COUNT, MAX_RENDER_VERTEX_COUNT},
 };
+use crate::scene::SimSettings;
+
+const CONTACT_OFFSET: f32 = 0.05;
+const OBSTACLE_WALL_THICKNESS: f32 = 0.4;
 
 const EPSILON: f32 = 1e-6;
 const CROSS_SECTION_ASPECT: f32 = 1.38;
@@ -421,7 +426,7 @@ pub(crate) struct Renderer {
 impl Renderer {
     pub(crate) async fn new(
         canvas: HtmlCanvasElement,
-        settings: &MpmSettings,
+        settings: &SimSettings,
     ) -> Result<Self, JsValue> {
         let width = canvas.width().max(1);
         let height = canvas.height().max(1);
@@ -443,7 +448,7 @@ impl Renderer {
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("coffee-sim device"),
                 required_features: wgpu::Features::empty(),
-                required_limits: crate::mpm_3d::required_limits(),
+                required_limits: wgpu::Limits::default(),
                 memory_hints: wgpu::MemoryHints::Performance,
                 trace: wgpu::Trace::default(),
                 experimental_features: wgpu::ExperimentalFeatures::disabled(),
@@ -1038,7 +1043,7 @@ impl Renderer {
 
     pub(crate) fn render_3d(
         &mut self,
-        simulation: &MpmSim3D,
+        simulation: &AppSim,
         camera: OrbitCamera,
     ) -> Result<(), JsValue> {
         if self.config.width == 0 || self.config.height == 0 {
@@ -1262,7 +1267,7 @@ impl Renderer {
     }
 }
 
-fn build_world_axes(settings: &MpmSettings) -> Vec<AxisVertex> {
+fn build_world_axes(settings: &SimSettings) -> Vec<AxisVertex> {
     let origin = cup_bottom_origin(settings);
     let mut verts = Vec::new();
     push_axis(
@@ -1292,22 +1297,14 @@ fn build_world_axes(settings: &MpmSettings) -> Vec<AxisVertex> {
     verts
 }
 
-fn cup_bottom_origin(settings: &MpmSettings) -> Vec3 {
-    settings
-        .obstacles
-        .iter()
-        .find_map(|obstacle| match obstacle {
-            Obstacle::Cylinder { center, bot_y, .. } => {
-                let half_thickness = OBSTACLE_WALL_THICKNESS * 0.5;
-                Some(Vec3::new(
-                    center.x,
-                    center.y + bot_y + half_thickness + CONTACT_OFFSET,
-                    center.z,
-                ))
-            }
-            _ => None,
-        })
-        .unwrap_or(Vec3::ZERO)
+fn cup_bottom_origin(_settings: &SimSettings) -> Vec3 {
+    let cup = CupConfig::default();
+    let half_thickness = OBSTACLE_WALL_THICKNESS * 0.5;
+    Vec3::new(
+        cup.center.x,
+        cup.center.y + cup.bot_y + half_thickness + CONTACT_OFFSET,
+        cup.center.z,
+    )
 }
 
 fn push_axis(
@@ -1360,120 +1357,115 @@ fn push_axis_line(verts: &mut Vec<AxisVertex>, start: Vec3, end: Vec3, color: [f
     });
 }
 
-fn build_wireframe(settings: &MpmSettings) -> Vec<[f32; 3]> {
+fn build_wireframe(settings: &SimSettings) -> Vec<[f32; 3]> {
     let segments = 32;
     let verticals = 16;
     let mut verts = Vec::new();
 
-    for obs in &settings.obstacles {
-        match obs {
-            Obstacle::TruncatedCone {
-                center,
-                top_radius,
-                bot_radius,
-                top_y,
-                bot_y,
-            } => {
-                let rings = 8;
-                for ring in 0..=rings {
-                    let t = ring as f32 / rings as f32;
-                    let y = center.y + bot_y + (top_y - bot_y) * t;
-                    let r = bot_radius + (top_radius - bot_radius) * t;
-                    push_ring(&mut verts, center.x, y, center.z, r, segments);
-                }
-                for i in 0..verticals {
-                    let a = 2.0 * PI * i as f32 / verticals as f32;
-                    verts.push([
-                        center.x + top_radius * a.cos(),
-                        center.y + top_y,
-                        center.z + top_radius * a.sin(),
-                    ]);
-                    verts.push([
-                        center.x + bot_radius * a.cos(),
-                        center.y + bot_y,
-                        center.z + bot_radius * a.sin(),
-                    ]);
-                }
-            }
-            Obstacle::Cylinder {
-                center,
-                radius,
-                top_y,
-                bot_y,
-            } => {
-                let rings = 4;
-                let half_thickness = OBSTACLE_WALL_THICKNESS * 0.5;
-                let inner_radius = (radius - half_thickness).max(0.0);
-                let outer_radius = radius + half_thickness;
-                let inner_floor_y = center.y + bot_y + half_thickness;
-                let outer_floor_y = center.y + bot_y - half_thickness;
-                let top_y = center.y + top_y;
-                for ring in 0..=rings {
-                    let t = ring as f32 / rings as f32;
-                    let y = inner_floor_y + (top_y - inner_floor_y) * t;
-                    push_ring(&mut verts, center.x, y, center.z, inner_radius, segments);
-                    push_ring(&mut verts, center.x, y, center.z, outer_radius, segments);
-                }
-                push_ring(
-                    &mut verts,
-                    center.x,
-                    outer_floor_y,
-                    center.z,
-                    outer_radius,
-                    segments,
-                );
-                push_ring(
-                    &mut verts,
-                    center.x,
-                    inner_floor_y,
-                    center.z,
-                    inner_radius,
-                    segments,
-                );
-                push_ring(
-                    &mut verts,
-                    center.x,
-                    inner_floor_y,
-                    center.z,
-                    outer_radius,
-                    segments,
-                );
+    if let Some(filter) = &settings.filter {
+        let center = filter.center;
+        let top_radius = filter.top_radius;
+        let bot_radius = filter.bot_radius;
+        let top_y = filter.top_y;
+        let bot_y = filter.bot_y;
+        let rings = 8;
+        for ring in 0..=rings {
+            let t = ring as f32 / rings as f32;
+            let y = center.y + bot_y + (top_y - bot_y) * t;
+            let r = bot_radius + (top_radius - bot_radius) * t;
+            push_ring(&mut verts, center.x, y, center.z, r, segments);
+        }
+        for i in 0..verticals {
+            let a = 2.0 * PI * i as f32 / verticals as f32;
+            verts.push([
+                center.x + top_radius * a.cos(),
+                center.y + top_y,
+                center.z + top_radius * a.sin(),
+            ]);
+            verts.push([
+                center.x + bot_radius * a.cos(),
+                center.y + bot_y,
+                center.z + bot_radius * a.sin(),
+            ]);
+        }
+    }
+    {
+        let cup = CupConfig::default();
+        let center = cup.center;
+        let radius = cup.radius;
+        let top_y = cup.top_y;
+        let bot_y = cup.bot_y;
+        let rings = 4;
+        let half_thickness = OBSTACLE_WALL_THICKNESS * 0.5;
+        let inner_radius = (radius - half_thickness).max(0.0);
+        let outer_radius = radius + half_thickness;
+        let inner_floor_y = center.y + bot_y + half_thickness;
+        let outer_floor_y = center.y + bot_y - half_thickness;
+        let top_y = center.y + top_y;
+        for ring in 0..=rings {
+            let t = ring as f32 / rings as f32;
+            let y = inner_floor_y + (top_y - inner_floor_y) * t;
+            push_ring(&mut verts, center.x, y, center.z, inner_radius, segments);
+            push_ring(&mut verts, center.x, y, center.z, outer_radius, segments);
+        }
+        push_ring(
+            &mut verts,
+            center.x,
+            outer_floor_y,
+            center.z,
+            outer_radius,
+            segments,
+        );
+        push_ring(
+            &mut verts,
+            center.x,
+            inner_floor_y,
+            center.z,
+            inner_radius,
+            segments,
+        );
+        push_ring(
+            &mut verts,
+            center.x,
+            inner_floor_y,
+            center.z,
+            outer_radius,
+            segments,
+        );
 
-                for i in 0..verticals {
-                    let a = 2.0 * PI * i as f32 / verticals as f32;
-                    let (sin_a, cos_a) = a.sin_cos();
-                    verts.push([
-                        center.x + outer_radius * cos_a,
-                        top_y,
-                        center.z + outer_radius * sin_a,
-                    ]);
-                    verts.push([
-                        center.x + outer_radius * cos_a,
-                        outer_floor_y,
-                        center.z + outer_radius * sin_a,
-                    ]);
-                    verts.push([
-                        center.x + inner_radius * cos_a,
-                        top_y,
-                        center.z + inner_radius * sin_a,
-                    ]);
-                    verts.push([
-                        center.x + inner_radius * cos_a,
-                        inner_floor_y,
-                        center.z + inner_radius * sin_a,
-                    ]);
-                    verts.push([
-                        center.x + inner_radius * cos_a,
-                        inner_floor_y,
-                        center.z + inner_radius * sin_a,
-                    ]);
-                    verts.push([
-                        center.x + outer_radius * cos_a,
-                        inner_floor_y,
-                        center.z + outer_radius * sin_a,
-                    ]);
-                }
-            }
+        for i in 0..verticals {
+            let a = 2.0 * PI * i as f32 / verticals as f32;
+            let (sin_a, cos_a) = a.sin_cos();
+            verts.push([
+                center.x + outer_radius * cos_a,
+                top_y,
+                center.z + outer_radius * sin_a,
+            ]);
+            verts.push([
+                center.x + outer_radius * cos_a,
+                outer_floor_y,
+                center.z + outer_radius * sin_a,
+            ]);
+            verts.push([
+                center.x + inner_radius * cos_a,
+                top_y,
+                center.z + inner_radius * sin_a,
+            ]);
+            verts.push([
+                center.x + inner_radius * cos_a,
+                inner_floor_y,
+                center.z + inner_radius * sin_a,
+            ]);
+            verts.push([
+                center.x + inner_radius * cos_a,
+                inner_floor_y,
+                center.z + inner_radius * sin_a,
+            ]);
+            verts.push([
+                center.x + outer_radius * cos_a,
+                inner_floor_y,
+                center.z + outer_radius * sin_a,
+            ]);
         }
     }
 
@@ -1490,7 +1482,7 @@ fn push_ring(verts: &mut Vec<[f32; 3]>, cx: f32, y: f32, cz: f32, r: f32, segmen
     }
 }
 
-fn push_spout_wireframe(verts: &mut Vec<[f32; 3]>, settings: &MpmSettings) {
+fn push_spout_wireframe(verts: &mut Vec<[f32; 3]>, settings: &SimSettings) {
     let spout = settings.spout;
     let direction = spout.direction.normalized();
     let base = spout.origin - direction * spout.stem_length;
