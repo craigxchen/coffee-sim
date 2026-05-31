@@ -333,6 +333,23 @@ fn cg_fill_load(cell: u32) -> f32 {
     return cg[cg_fill_idx(cell)].x;
 }
 
+// Per-cell persistent pressure (region 5 of `cg`). Unlike the `grid` pressure
+// scratch lane, the `cg` buffer is never cleared between substeps, so this
+// region carries the converged pressure from one substep to the next and seeds
+// the CG warm-start. Stored as a plain f32 in `.x`. Written back from the
+// solved pressure in `pressure_residual_measure`; zeroed in `pressure_cg_init`
+// for any grid-active cell that is not pressure-active this substep so a cell
+// that goes inactive and later reactivates restarts from p0 = 0.
+fn cg_persistent_pressure_idx(cell: u32) -> u32 {
+    return 4u * total_cells() + cell;
+}
+fn cg_persistent_pressure_store(cell: u32, value: f32) {
+    cg[cg_persistent_pressure_idx(cell)] = vec4<f32>(value, 0.0, 0.0, 0.0);
+}
+fn cg_persistent_pressure_load(cell: u32) -> f32 {
+    return cg[cg_persistent_pressure_idx(cell)].x;
+}
+
 fn pressure_or_mirror(cell: vec3<i32>, mirror_pressure: f32) -> f32 {
     if cell.x < 0 || cell.y < 0 || cell.z < 0 {
         return mirror_pressure;
@@ -1941,6 +1958,60 @@ fn pressure_apply_search_direction(idx: u32) -> vec2<f32> {
     return vec2<f32>(q, energy);
 }
 
+// A·p0 for the warm-start residual r0 = b - A·p0. This is the EXACT same
+// 7-point weighted graph-Laplacian operator as `pressure_apply_search_direction`
+// (diagonal Σ fw, off-diagonal -fw to active fluid neighbours, mirror Neumann
+// for solid/off-grid faces, p_nbr = 0 Dirichlet for inactive fluid/air faces),
+// but evaluated on the persistent warm-start pressure field instead of the CG
+// search direction. Run after `pressure_cg_init` has populated inv_diag for the
+// whole active set, so `pressure_cached_active_cell` matches the iteration-time
+// operator with no read/write race.
+fn pressure_warmstart_ap(idx: u32, p_here: f32) -> f32 {
+    let iz_val = idx / (gx() * gy());
+    let rem = idx % (gx() * gy());
+    let iy_val = rem / gx();
+    let ix_val = rem % gx();
+
+    let kind = cell_kind_load(idx);
+    let self_fill = cg_fill_load(idx);
+    var ap = 0.0;
+    let offsets = array<vec3<i32>, 6>(
+        vec3<i32>(-1, 0, 0),
+        vec3<i32>(1, 0, 0),
+        vec3<i32>(0, -1, 0),
+        vec3<i32>(0, 1, 0),
+        vec3<i32>(0, 0, -1),
+        vec3<i32>(0, 0, 1),
+    );
+
+    for (var n = 0u; n < 6u; n++) {
+        let neighbor = vec3<i32>(i32(ix_val), i32(iy_val), i32(iz_val)) + offsets[n];
+        if neighbor.x < 0 || neighbor.y < 0 || neighbor.z < 0
+            || u32(neighbor.x) >= gx() || u32(neighbor.y) >= gy() || u32(neighbor.z) >= gz() {
+            continue;
+        }
+
+        let neighbor_idx = cell_index(u32(neighbor.x), u32(neighbor.y), u32(neighbor.z));
+        let neighbor_kind = current_cell_kind(neighbor);
+        if is_solid_kind(neighbor_kind) {
+            continue;
+        }
+
+        let face_weight = pressure_face_weight_fillcached(kind, self_fill, neighbor_idx, neighbor_kind);
+        if face_weight <= 0.0 {
+            continue;
+        }
+
+        if pressure_cached_active_cell(neighbor_idx) {
+            ap += face_weight * (p_here - cg_persistent_pressure_load(neighbor_idx));
+        } else {
+            ap += face_weight * p_here;
+        }
+    }
+
+    return ap;
+}
+
 @compute @workgroup_size(64)
 fn pressure_cg_init(@builtin(global_invocation_id) gid: vec3<u32>) {
     let list_i = gid.x;
@@ -1952,26 +2023,59 @@ fn pressure_cg_init(@builtin(global_invocation_id) gid: vec3<u32>) {
         pressure_store(idx, 0.0);
         pressure_inv_diag_store(idx, 0.0);
         cg[idx] = vec4<f32>(0.0);
+        // Drop this cell's warm-start history so it restarts from p0 = 0 if it
+        // becomes pressure-active again in a later substep.
+        cg_persistent_pressure_store(idx, 0.0);
         return;
     }
 
     let system = pressure_linear_system_cell(idx);
     let diag = system.x;
-    let r = system.y;
+    let b = system.y;
     if diag <= PRESSURE_MIN_DIAGONAL {
         pressure_store(idx, 0.0);
         pressure_inv_diag_store(idx, 0.0);
         cg[idx] = vec4<f32>(0.0);
+        cg_persistent_pressure_store(idx, 0.0);
         return;
     }
 
     let inv_diag = 1.0 / diag;
-    let z = r * inv_diag;
-    pressure_store(idx, 0.0);
+    // Warm-start guess p0 = persistent pressure from the previous substep
+    // (0 for newly-active cells, whose persistent slot was cleared while
+    // inactive). Clamp to the pressure limit so a stale guess can't seed an
+    // out-of-range field. Store the live pressure to p0 and stash the RHS b in
+    // cg[idx].x; the residual r0 = b - A·p0 and z0/d0 are formed in the
+    // following warm-start pass once inv_diag is set for the whole active set.
+    let limit = pressure_clamp_limit();
+    let p0 = clamp(cg_persistent_pressure_load(idx), -limit, limit);
+    pressure_store(idx, p0);
     pressure_inv_diag_store(idx, inv_diag);
-    cg[idx] = vec4<f32>(r, z, z, 0.0);
+    cg[idx] = vec4<f32>(b, 0.0, 0.0, 0.0);
     let active_slot = atomicAdd(&metrics[METRIC_PRESSURE_ACTIVE_COUNT_IDX], 1u);
     active_pressure_cell_store(active_slot, idx);
+}
+
+// Warm-start residual pass: r0 = b - A·p0, z0 = inv_diag·r0, d0 = z0, and the
+// initial weighted residual rz0 = Σ r0·z0. Runs over the active pressure list
+// (so inv_diag and the active set are fully populated and the operator matches
+// the CG iterations exactly). For a cold start (p0 = 0) this reduces to the old
+// behaviour r0 = b, z0 = inv_diag·b. INITIAL_RZ / CG_RZ are seeded here.
+@compute @workgroup_size(64)
+fn pressure_cg_warmstart(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let list_i = gid.x;
+    if list_i >= active_pressure_count() { return; }
+    let idx = active_pressure_cell(list_i);
+
+    let inv_diag = pressure_inv_diag_load(idx);
+    if inv_diag <= 0.0 { return; }
+
+    let b = cg[idx].x;
+    let p0 = pressure_load(idx);
+    let ap0 = pressure_warmstart_ap(idx, p0);
+    let r = b - ap0;
+    let z = r * inv_diag;
+    cg[idx] = vec4<f32>(r, z, z, 0.0);
     let rz = max(r * z, 0.0);
     let rz_fixed = u32(clamp(rz, 0.0, f32(0xffffffffu)));
     let observed_rz_fixed = u32(clamp(rz * pressure_residual_fp_scale(), 0.0, f32(0xffffffffu)));
@@ -2131,6 +2235,11 @@ fn pressure_residual_measure(@builtin(global_invocation_id) gid: vec3<u32>) {
         &metrics[METRIC_PRESSURE_FINAL_RZ_IDX],
         u32(clamp(rz * pressure_residual_fp_scale(), 0.0, f32(0xffffffffu))),
     );
+
+    // Persist the converged pressure so the next substep warm-starts from it.
+    // project_pressure (which runs after this pass) only reads the pressure
+    // field to correct velocity, so pressure_load(idx) is final here.
+    cg_persistent_pressure_store(idx, pressure_load(idx));
 }
 
 // ── project_pressure ──
