@@ -274,13 +274,11 @@ impl MpmSettings {
                 DEFAULT_BREW.water_kinematic_viscosity_m2_s,
             ),
             render_radius: dx * 0.7,
-            // Conservative per-substep CG budget. The in-shader convergence
-            // gating (pressure_cg_matvec) will self-terminate earlier if the
-            // residual threshold is met, and over-provisioned iterations are
-            // near-free uniform early-returns — but cranking this higher
-            // currently amplifies a free-surface energy-injection bug (the
-            // collocated-grid projection is not energy-orthogonal at fractional
-            // air faces), so it stays low until that projection is fixed.
+            // Per-substep CG budget. NOTE: the staggered 27-point D·Dᵀ Laplacian
+            // currently DIVERGES on a high-flow pour (residual grows with
+            // iterations, pressure clamps fire) — the operator is not behaving
+            // SPD there, a matvec/active-set bug still to be tracked down. Until
+            // then, more iterations make the pour worse, so keep this low.
             pressure_cg_iterations: 4,
             use_sdf_cache: true,
             obstacles: vec![
@@ -1559,9 +1557,8 @@ async fn map_read_buffer<R>(
         mapped_at_creation: false,
     });
 
-    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-        label: Some(label),
-    });
+    let mut encoder =
+        device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some(label) });
     encoder.copy_buffer_to_buffer(source, 0, &staging, 0, size);
     queue.submit(Some(encoder.finish()));
 
@@ -1660,9 +1657,18 @@ impl MetricsReadback {
                 / METRICS_DIV_FP_SCALE,
             fluid_cells: data.get(METRIC_FLUID_CELLS_IDX).copied().unwrap_or(0),
             div_clamp_fires: data.get(METRIC_DIV_CLAMP_FIRES_IDX).copied().unwrap_or(0),
-            pressure_clamp_fires: data.get(METRIC_PRESSURE_CLAMP_FIRES_IDX).copied().unwrap_or(0),
-            mass_overflow_fires: data.get(METRIC_MASS_OVERFLOW_FIRES_IDX).copied().unwrap_or(0),
-            pressure_active_cells: data.get(METRIC_PRESSURE_ACTIVE_COUNT_IDX).copied().unwrap_or(0),
+            pressure_clamp_fires: data
+                .get(METRIC_PRESSURE_CLAMP_FIRES_IDX)
+                .copied()
+                .unwrap_or(0),
+            mass_overflow_fires: data
+                .get(METRIC_MASS_OVERFLOW_FIRES_IDX)
+                .copied()
+                .unwrap_or(0),
+            pressure_active_cells: data
+                .get(METRIC_PRESSURE_ACTIVE_COUNT_IDX)
+                .copied()
+                .unwrap_or(0),
             grid_active_cells: data.get(METRIC_GRID_ACTIVE_COUNT_IDX).copied().unwrap_or(0),
             pressure_residual_initial,
             pressure_residual_final,

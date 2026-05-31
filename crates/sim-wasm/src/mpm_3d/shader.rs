@@ -109,6 +109,7 @@ const CG_BETA_RESTART_RATIO: f32 = 0.98;   // restart as steepest descent when t
 
 // ── Free-surface / continuum classification ──
 const MIN_LATERAL_FLUID_FACES: u32 = 2u;   // ≥2 filled lateral neighbours required to join the pressure domain
+const SURFACE_FREEFALL_SPEED: f32 = -10.0; // a surface cell falling faster than this (sim units/s downward) is treated as a ballistic free-stream, not a pressure-domain surface
 const CUP_RIM_Y: f32 = -3.5;               // cup mouth plane (matches the cup obstacle top_y); cells above stay particle-resolved
 const DENSE_CELL_MASS_FACTOR: f32 = 4.0;   // grid mass (× nominal) that counts as a "dense" / well-packed cell
 // Smagorinsky LES coefficient for the sub-grid eddy viscosity — the one knob
@@ -1060,7 +1061,20 @@ fn surface_pressure_has_continuum_support(cell: u32) -> bool {
     // it is the boundary of a locally supported liquid volume: at least one
     // fluid cell below carries hydrostatic support, and lateral fluid faces
     // distinguish a pool/sheet surface from an isolated falling stream.
-    return lower_fluid_support && lateral_fluid_faces >= MIN_LATERAL_FLUID_FACES;
+    //
+    // BUT fluid-below is NOT floor support: a free-FALLING column self-satisfies
+    // it (the column continues below, and a 2+-wide column has lateral fluid
+    // faces), which wrongly promoted the laminar pour into the pressure domain.
+    // The staggered free-surface gradient then sprayed it sideways (ejecting the
+    // pour out of the domain → no particles on screen). A genuine free-falling
+    // stream is ballistic (no solid reaction), so additionally require that it
+    // is NOT in fast free-fall to join the pressure domain; a settled/decelerated
+    // pool surface (small downward speed) still qualifies. The pool BULK stays
+    // incompressible via the interior-cell projection regardless.
+    let falling = grid_vel[cell].y < SURFACE_FREEFALL_SPEED;
+    return lower_fluid_support
+        && lateral_fluid_faces >= MIN_LATERAL_FLUID_FACES
+        && !falling;
 }
 
 fn interior_pressure_has_continuum_support(cell: u32) -> bool {
