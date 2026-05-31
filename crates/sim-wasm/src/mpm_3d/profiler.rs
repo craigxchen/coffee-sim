@@ -584,6 +584,10 @@ struct FrameTimings {
     gpu_passes_sum: Stat,
     /// Submit -> GPU-done wall time (per frame, summed over substeps).
     gpu_wait: Stat,
+    /// GPU time in `gpu_wait` not attributed to a timed pass: grid clears,
+    /// inter-pass gaps, query resolve/copy, and scheduling slack. Makes the
+    /// breakdown self-checking: `gpu_passes_sum + gpu_unattributed` ~= `gpu_wait`.
+    gpu_unattributed: Stat,
     cpu_emit: Stat,
     cpu_uniforms: Stat,
     cpu_encode: Stat,
@@ -705,6 +709,7 @@ fn profile_mpm_pipeline() {
     let mut wall_ms = Vec::with_capacity(measured as usize);
     let mut gpu_passes_sum = Vec::with_capacity(measured as usize);
     let mut gpu_wait = Vec::with_capacity(measured as usize);
+    let mut gpu_unattributed = Vec::with_capacity(measured as usize);
     let mut cpu_emit = Vec::with_capacity(measured as usize);
     let mut cpu_uniforms = Vec::with_capacity(measured as usize);
     let mut cpu_encode = Vec::with_capacity(measured as usize);
@@ -721,6 +726,7 @@ fn profile_mpm_pipeline() {
         wall_ms.push(ms(t));
         gpu_passes_sum.push(sums.gpu_passes_ms);
         gpu_wait.push(sums.gpu_wait_ms);
+        gpu_unattributed.push((sums.gpu_wait_ms - sums.gpu_passes_ms).max(0.0));
         cpu_emit.push(sums.cpu_emit_ms);
         cpu_uniforms.push(sums.cpu_uniforms_ms);
         cpu_encode.push(sums.cpu_encode_ms);
@@ -769,6 +775,7 @@ fn profile_mpm_pipeline() {
         instrumented_wall: Stat::from_samples(wall_ms),
         gpu_passes_sum: Stat::from_samples(gpu_passes_sum),
         gpu_wait: Stat::from_samples(gpu_wait),
+        gpu_unattributed: Stat::from_samples(gpu_unattributed),
         cpu_emit: Stat::from_samples(cpu_emit),
         cpu_uniforms: Stat::from_samples(cpu_uniforms),
         cpu_encode: Stat::from_samples(cpu_encode),
@@ -846,18 +853,28 @@ fn profile_mpm_pipeline() {
         "production step_frame: {:.3} ms/frame (p95 {:.3})",
         report.frame_timings.production_frame.mean_ms, report.frame_timings.production_frame.p95_ms,
     );
-    println!(
-        "instrumented GPU passes sum: {:.3} ms/frame\n",
-        report.frame_timings.gpu_passes_sum.mean_ms,
-    );
-    println!(
-        "{:<20} {:>10} {:>8} {:>9}",
-        "pass", "ms/frame", "%gpu", "passes/f"
-    );
-    for pass in &report.gpu_passes {
+    if report.metadata.timestamps_supported {
         println!(
-            "{:<20} {:>10.3} {:>7.1}% {:>9.0}",
-            pass.label, pass.mean_ms, pass.share_of_gpu_pct, pass.passes_per_frame
+            "instrumented GPU passes sum: {:.3} ms/frame  (+ {:.3} unattributed = {:.3} gpu_wait)\n",
+            report.frame_timings.gpu_passes_sum.mean_ms,
+            report.frame_timings.gpu_unattributed.mean_ms,
+            report.frame_timings.gpu_wait.mean_ms,
+        );
+        println!(
+            "{:<20} {:>10} {:>8} {:>9}",
+            "pass", "ms/frame", "%gpu", "passes/f"
+        );
+        for pass in &report.gpu_passes {
+            println!(
+                "{:<20} {:>10.3} {:>7.1}% {:>9.0}",
+                pass.label, pass.mean_ms, pass.share_of_gpu_pct, pass.passes_per_frame
+            );
+        }
+    } else {
+        println!(
+            "GPU timestamps unavailable on this adapter - no per-pass breakdown. \
+             GPU time (submit -> done): {:.3} ms/frame\n",
+            report.frame_timings.gpu_wait.mean_ms,
         );
     }
     println!("\nJSON written to: {}", path.display());
