@@ -3,7 +3,7 @@ use std::mem::size_of;
 use bytemuck::{Pod, Zeroable};
 use coffee_sim_core::Vec3;
 
-use super::{units, MpmSettings, Obstacle, OBSTACLE_WALL_THICKNESS};
+use super::{units, MpmSettings, Obstacle, CONTACT_OFFSET, OBSTACLE_WALL_THICKNESS};
 
 // FP_SCALE derivation: 2^18 = 262144. With particle_mass=1.0, max ~50 particles
 // contributing per cell (quadratic B-spline, max weight 0.5625), worst-case mass
@@ -76,6 +76,8 @@ pub(crate) struct MpmUniforms {
 pub(crate) struct MpmBuffers {
     pub particles: wgpu::Buffer,
     pub affine: wgpu::Buffer,
+    pub water_hash: wgpu::Buffer,
+    pub pressure_indirect: wgpu::Buffer,
     pub grid: wgpu::Buffer,
     pub grid_vel: wgpu::Buffer,
     pub bed_lookup: wgpu::Buffer,
@@ -120,6 +122,23 @@ impl MpmBuffers {
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_DST
                 | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        let water_hash_slots = total_cells + max_p;
+        let water_hash = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("dfsph water hash"),
+            size: (water_hash_slots * size_of::<i32>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let pressure_indirect = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("pressure tile indirect args"),
+            size: (3 * size_of::<i32>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::INDIRECT
+                | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
 
@@ -205,6 +224,8 @@ impl MpmBuffers {
         Self {
             particles,
             affine,
+            water_hash,
+            pressure_indirect,
             grid,
             grid_vel,
             bed_lookup,
@@ -359,7 +380,9 @@ fn generate_sdf_class_data(settings: &MpmSettings, sdf_data: &[f32]) -> Vec<u8> 
                     origin.z + (iz as f32 + 0.5) * dx,
                 );
                 let idx = (iz * gx * gy + iy * gx + ix) as usize;
-                out[idx] = u8::from(sample_sdf_from_data(settings, sdf_data, cell_center) < 0.0);
+                out[idx] = u8::from(
+                    sample_sdf_from_data(settings, sdf_data, cell_center) < CONTACT_OFFSET,
+                );
             }
         }
     }
@@ -483,7 +506,8 @@ mod tests {
                         origin.y + (iy as f32 + 0.5) * dx,
                         origin.z + (iz as f32 + 0.5) * dx,
                     );
-                    let live = sample_sdf_from_data(&settings, &sdf_data, cell_center) < 0.0;
+                    let live =
+                        sample_sdf_from_data(&settings, &sdf_data, cell_center) < CONTACT_OFFSET;
                     let idx = (iz * gx * gy + iy * gx + ix) as usize;
                     assert_eq!(sdf_class[idx] != 0, live, "mismatch at ({ix},{iy},{iz})");
                 }

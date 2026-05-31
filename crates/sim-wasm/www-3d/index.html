@@ -18,6 +18,10 @@
         <div class="controls">
           <button id="toggle">Pause</button>
           <button id="reset">Reset</button>
+          <label class="toggle-field" for="cross-section-toggle">
+            <input id="cross-section-toggle" type="checkbox" />
+            <span>Cross-Section</span>
+          </label>
         </div>
         <div class="control-panel">
           <div class="slider-field">
@@ -238,7 +242,7 @@
       </section>
       <section class="viewer">
         <canvas id="sim-canvas"></canvas>
-        <div class="cross-section-overlay" aria-hidden="true">
+        <div id="cross-section-overlay" class="cross-section-overlay" aria-hidden="true" hidden>
           <span>Center Cross-Section</span>
         </div>
         <div class="view-cube" role="img" aria-label="Camera orientation">

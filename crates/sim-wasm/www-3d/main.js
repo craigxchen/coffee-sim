@@ -4,6 +4,8 @@ const canvas = document.getElementById("sim-canvas");
 const viewCubeStage = document.getElementById("view-cube-stage");
 const toggleButton = document.getElementById("toggle");
 const resetButton = document.getElementById("reset");
+const crossSectionToggle = document.getElementById("cross-section-toggle");
+const crossSectionOverlay = document.getElementById("cross-section-overlay");
 const sceneMainTab = document.getElementById("scene-tab-main");
 const sceneDebugTab = document.getElementById("scene-tab-debug");
 const sceneMainPanel = document.getElementById("scene-panel-main");
@@ -61,6 +63,7 @@ const METRICS_SAMPLE_INTERVAL_FRAMES = 6;
 const METRICS_SAMPLE_DELAY_FRAMES = 4;
 const METRICS_MAX_PENDING_SAMPLES = 2;
 const REQUIRED_STORAGE_BUFFERS_PER_SHADER_STAGE = 10;
+const HUD_SYNC_INTERVAL_SECONDS = 0.10;
 let metricsFrameCounter = 0;
 const TIMESERIES_SAMPLE_INTERVAL = 6;
 const TIMESERIES_MAX_SAMPLES = 720;
@@ -75,6 +78,7 @@ let lastFrameTime = 0;
 let skipStepOnce = false;
 let evaluationActive = false;
 let fpsWindow = [];
+let hudSyncElapsedSeconds = HUD_SYNC_INTERVAL_SECONDS;
 let dragging = false;
 let lastClientX = 0;
 let lastClientY = 0;
@@ -250,6 +254,8 @@ async function bootstrap() {
     syncControlDefaultsFromSim();
     applyWaterVelocityControl();
     applySpoutControls();
+    applyCrossSectionControl();
+    syncMetricsCollection();
     resizeCanvas();
     syncSpoutControlSize();
     syncUi();
@@ -284,6 +290,10 @@ async function bootstrap() {
     reloadCurrentScene();
   });
 
+  crossSectionToggle.addEventListener("change", () => {
+    applyCrossSectionControl();
+  });
+
   toggleTimeseriesButton.addEventListener("click", () => {
     setTimeseriesDrawerExpanded(!timeseriesDrawer.classList.contains("is-open"));
   });
@@ -302,6 +312,7 @@ async function bootstrap() {
     toggleDebugButton.textContent = debugStats.classList.contains("hidden")
       ? "Show Debug Stats"
       : "Hide Debug Stats";
+    syncMetricsCollection();
   });
 
   sceneMainTab.addEventListener("click", () => {
@@ -597,7 +608,11 @@ function animate(timestamp) {
   app.render();
   updateViewCube();
   updateFps(wallFrameTime);
-  syncUi();
+  hudSyncElapsedSeconds += wallFrameTime;
+  if (hudSyncElapsedSeconds >= HUD_SYNC_INTERVAL_SECONDS || paused) {
+    hudSyncElapsedSeconds = 0;
+    syncUi();
+  }
   maybeCollectTimeseriesSample();
   maybeRefreshMetrics();
   maybeRefreshPressureDiagnostics();
@@ -610,6 +625,7 @@ function setPaused(nextPaused) {
   if (!paused) {
     lastFrameTime = 0;
     fpsWindow = [];
+    hudSyncElapsedSeconds = HUD_SYNC_INTERVAL_SECONDS;
     skipStepOnce = true;
   }
 }
@@ -658,6 +674,17 @@ function maybeRefreshMetrics() {
     .finally(() => {
       metricsSamplesPending = Math.max(0, metricsSamplesPending - 1);
     });
+}
+
+function syncMetricsCollection() {
+  const enabled = !debugStats.classList.contains("hidden");
+  app.setMetricsEnabled(enabled);
+  if (!enabled) {
+    latestExactMetrics = null;
+    metricsSamplesPending = 0;
+    metricsFrameCounter = 0;
+    pressureStatusLabel.textContent = "n/a";
+  }
 }
 
 function maybeRefreshPressureDiagnostics() {
@@ -966,6 +993,12 @@ function applySpoutControls() {
   );
 }
 
+function applyCrossSectionControl() {
+  const enabled = crossSectionToggle.checked;
+  app.setCrossSectionEnabled(enabled);
+  crossSectionOverlay.hidden = !enabled;
+}
+
 function applySceneControls() {
 }
 
@@ -1072,7 +1105,8 @@ function clamp(value, min, max) {
 
 function syncUi() {
   const metrics = latestExactMetrics ?? {};
-  particleLabel.textContent = new Intl.NumberFormat().format(app.particleCount());
+  const usedParticles = app.particleCount();
+  particleLabel.textContent = integerFormatter.format(usedParticles);
   waterVelocityValue.textContent = `${app.waterVelocityMetersPerSecond().toFixed(2)} m/s`;
   spoutX = clamp(snap(app.spoutX()), SPOUT_X_MIN, SPOUT_X_MAX);
   spoutZ = clamp(snap(app.spoutZ()), SPOUT_Z_MIN, SPOUT_Z_MAX);
@@ -1086,12 +1120,11 @@ function syncUi() {
   simTimeLabel.textContent = `${app.simTime().toFixed(1)}s`;
   frameEmittedMassLabel.textContent = app.frameEmittedMl().toFixed(2);
   totalEmittedMassLabel.textContent = app.totalEmittedMl().toFixed(2);
-  frameDroppedEmissionLabel.textContent = new Intl.NumberFormat().format(app.frameDroppedParticles());
-  totalDroppedEmissionLabel.textContent = new Intl.NumberFormat().format(app.totalDroppedParticles());
-  waterSlotsLabel.textContent = new Intl.NumberFormat().format(app.waterSlotsUsed());
-  bedParticlesLabel.textContent = new Intl.NumberFormat().format(app.bedParticleCount());
+  frameDroppedEmissionLabel.textContent = integerFormatter.format(app.frameDroppedParticles());
+  totalDroppedEmissionLabel.textContent = integerFormatter.format(app.totalDroppedParticles());
+  waterSlotsLabel.textContent = integerFormatter.format(app.waterSlotsUsed());
+  bedParticlesLabel.textContent = integerFormatter.format(app.bedParticleCount());
   const maxParticles = app.maxParticles();
-  const usedParticles = app.particleCount();
   capacityUsedLabel.textContent = maxParticles > 0
     ? `${((usedParticles / maxParticles) * 100).toFixed(1)}%`
     : "0.0%";
@@ -1099,12 +1132,12 @@ function syncUi() {
   maxAbsDivLabel.textContent = (metrics.maxAbsDivergence ?? 0).toFixed(3);
   projectionResidualMaxLabel.textContent = (metrics.projectionResidualMaxAbsDivergence ?? 0).toFixed(3);
   projectionResidualMeanLabel.textContent = (metrics.projectionResidualMeanAbsDivergence ?? 0).toFixed(3);
-  projectionResidualCellsLabel.textContent = new Intl.NumberFormat().format(metrics.projectionResidualCellCount ?? 0);
-  pressurePairsLabel.textContent = new Intl.NumberFormat().format(app.lastPressureRbgsPairs());
-  fluidCellsLabel.textContent = new Intl.NumberFormat().format(metrics.fluidCellCount ?? 0);
-  divClampFiresLabel.textContent = new Intl.NumberFormat().format(metrics.divClampFires ?? 0);
-  pressureClampFiresLabel.textContent = new Intl.NumberFormat().format(metrics.pressureClampFires ?? 0);
-  massOverflowFiresLabel.textContent = new Intl.NumberFormat().format(metrics.massOverflowFires ?? 0);
+  projectionResidualCellsLabel.textContent = integerFormatter.format(metrics.projectionResidualCellCount ?? 0);
+  pressurePairsLabel.textContent = integerFormatter.format(app.lastPressureRbgsPairs());
+  fluidCellsLabel.textContent = integerFormatter.format(metrics.fluidCellCount ?? 0);
+  divClampFiresLabel.textContent = integerFormatter.format(metrics.divClampFires ?? 0);
+  pressureClampFiresLabel.textContent = integerFormatter.format(metrics.pressureClampFires ?? 0);
+  massOverflowFiresLabel.textContent = integerFormatter.format(metrics.massOverflowFires ?? 0);
   cupTdsLabel.textContent = `${((metrics.cupTds ?? 0) * 100).toFixed(2)}%`;
   extractionYieldLabel.textContent = `${((metrics.extractionYield ?? 0) * 100).toFixed(2)}%`;
 }
@@ -1120,6 +1153,13 @@ function publishDebugHooks() {
     debugScenes: Object.fromEntries(DEBUG_SCENE_LABELS),
     setPressureResidualAdaptation: (target, maxPairs) => {
       app.setPressureResidualAdaptation(target, maxPairs);
+    },
+    setMetricsEnabled: (enabled) => {
+      app.setMetricsEnabled(enabled);
+    },
+    setCrossSectionEnabled: (enabled) => {
+      crossSectionToggle.checked = enabled;
+      applyCrossSectionControl();
     },
     stepFramesForEvaluation,
     sampleRealism: captureRealismSample,

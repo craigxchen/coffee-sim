@@ -20,7 +20,6 @@ pub(crate) struct BrewConfig {
     pub gentle_pour_exit_speed_m_s: f32,
     pub high_pour_exit_speed_m_s: f32,
     pub initial_water_speed_m_s: f32,
-    pub water_viscosity: f32,
     pub water_kinematic_viscosity_m2_s: f32,
     pub min_bed_permeability_m2: f32,
     pub bed_absorption_rate: f32,
@@ -59,7 +58,6 @@ pub(crate) const DEFAULT_BREW: BrewConfig = BrewConfig {
     gentle_pour_exit_speed_m_s: 0.12,
     high_pour_exit_speed_m_s: 0.45,
     initial_water_speed_m_s: 0.12,
-    water_viscosity: 1.2,
     water_kinematic_viscosity_m2_s: 1.0e-6,
     min_bed_permeability_m2: 1.0e-12,
     bed_absorption_rate: 1.6,
@@ -142,6 +140,17 @@ mod tests {
         assert!(DEFAULT_BREW.water_particle_mass_units() > 0.0);
         assert!(DEFAULT_BREW.bed_sample_mass_g() > 0.0);
         assert!(DEFAULT_BREW.bed_sample_extractable_mass_units() > 0.0);
+    }
+
+    #[test]
+    fn default_water_sampling_preserves_calibrated_density() {
+        assert_eq!(DEFAULT_BREW.water_particles_per_ml, 320.0);
+        assert!(
+            (DEFAULT_BREW.water_particle_mass_units() * DEFAULT_BREW.water_particles_per_ml
+                - DEFAULT_BREW.water_mass_units_per_ml)
+                .abs()
+                < 1e-6
+        );
     }
 
     #[test]

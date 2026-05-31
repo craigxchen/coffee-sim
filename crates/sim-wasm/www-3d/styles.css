@@ -60,6 +60,27 @@ h1 {
 .controls {
   display: flex;
   gap: 8px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.toggle-field {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 38px;
+  padding: 0 10px;
+  border: 1px solid var(--panel-border);
+  border-radius: 10px;
+  background: rgba(9, 16, 19, 0.22);
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+
+.toggle-field input {
+  width: 15px;
+  height: 15px;
+  accent-color: var(--gold);
 }
 
 .scene-tabs {
@@ -641,6 +662,10 @@ body.sim-startup-failed input {
     inset 0 0 0 1px rgba(9, 16, 19, 0.82),
     0 0 0 1px rgba(0, 0, 0, 0.52),
     0 10px 30px rgba(0, 0, 0, 0.22);
+}
+
+.cross-section-overlay[hidden] {
+  display: none;
 }
 
 .cross-section-overlay span {

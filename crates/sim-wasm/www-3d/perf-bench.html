@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Coffee Sim | Perf Bench</title>
+    <style>
+      body {
+        margin: 0;
+        background: #0b1718;
+        color: #e9f2ed;
+        font: 14px system-ui, sans-serif;
+      }
+
+      canvas {
+        display: block;
+        width: 960px;
+        height: 640px;
+        max-width: 100vw;
+        max-height: 70vh;
+      }
+
+      pre {
+        margin: 0;
+        padding: 16px;
+        white-space: pre-wrap;
+      }
+    </style>
+  </head>
+  <body>
+    <canvas id="bench-canvas" width="960" height="640"></canvas>
+    <pre id="output">Running...</pre>
+    <script type="module">
+      import init, { WasmSim3D } from "./pkg/coffee_sim_wasm.js";
+
+      const output = document.getElementById("output");
+      const canvas = document.getElementById("bench-canvas");
+      const params = new URLSearchParams(location.search);
+      const frames = Number(params.get("frames") ?? 60);
+      const warmupFrames = Number(params.get("warmup") ?? 12);
+      const crossSectionEnabled = params.get("crossSection") === "1";
+      const metricsEnabled = params.get("metrics") === "1";
+
+      function write(value) {
+        output.textContent = JSON.stringify(value, null, 2);
+      }
+
+      async function drain(app) {
+        try {
+          await app.refreshMetrics();
+        } catch (error) {
+          console.warn("Metrics drain failed", error);
+        }
+      }
+
+      async function runScene(app, name, load) {
+        load();
+        app.resizeWithCssSize(canvas.width, canvas.height, 960, 640);
+        for (let i = 0; i < warmupFrames; i += 1) {
+          app.stepFrame(1 / 60);
+          app.render();
+        }
+        await drain(app);
+
+        const start = performance.now();
+        for (let i = 0; i < frames; i += 1) {
+          app.stepFrame(1 / 60);
+          app.render();
+        }
+        await drain(app);
+        const elapsedMs = performance.now() - start;
+
+        return {
+          scene: name,
+          frames,
+          elapsedMs,
+          fps: frames * 1000 / elapsedMs,
+          particles: app.particleCount(),
+          pressurePairs: app.lastPressureRbgsPairs(),
+        };
+      }
+
+      try {
+        await init();
+        const app = await WasmSim3D.create(canvas);
+        app.setCrossSectionEnabled(crossSectionEnabled);
+        app.setMetricsEnabled(metricsEnabled);
+        const results = [];
+        results.push(await runScene(app, "Center Pour", () => app.loadBenchmarkCenterPour()));
+        results.push(await runScene(app, "Water Only", () => app.loadBenchmarkFreeStream()));
+        results.push(await runScene(app, "High-Velocity Impact", () => app.loadDebugScene("high-velocity-jet-impact")));
+        write({ frames, warmupFrames, crossSectionEnabled, metricsEnabled, hidden: document.hidden, results });
+      } catch (error) {
+        write({ error: String(error), stack: error?.stack ?? null });
+      }
+    </script>
+  </body>
+</html>

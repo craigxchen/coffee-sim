@@ -414,6 +414,7 @@ pub(crate) struct Renderer {
     filter_fill_vertex_count: u32,
     filter_vertex_buffer: wgpu::Buffer,
     filter_vertex_count: u32,
+    show_cross_section: bool,
     depth_texture: wgpu::Texture,
     depth_view: wgpu::TextureView,
 }
@@ -979,6 +980,7 @@ impl Renderer {
             filter_fill_vertex_count,
             filter_vertex_buffer,
             filter_vertex_count,
+            show_cross_section: false,
             depth_texture,
             depth_view,
         })
@@ -990,6 +992,40 @@ impl Renderer {
 
     pub(crate) fn queue(&self) -> &wgpu::Queue {
         &self.queue
+    }
+
+    pub(crate) fn sync_filter_mesh(&mut self, simulation: &MpmSim3D) {
+        if let Some(filter_vertices) = simulation.filter_fill_vertices() {
+            let count = filter_vertices.len().min(MAX_FILL_VERTEX_COUNT);
+            self.queue.write_buffer(
+                &self.filter_fill_vertex_buffer,
+                0,
+                bytemuck::cast_slice(&filter_vertices[..count]),
+            );
+            self.filter_fill_vertex_count = count as u32;
+        } else {
+            self.filter_fill_vertex_count = 0;
+        }
+
+        if let Some(filter_vertices) = simulation.filter_render_vertices() {
+            let count = filter_vertices.len().min(MAX_RENDER_VERTEX_COUNT);
+            self.queue.write_buffer(
+                &self.filter_vertex_buffer,
+                0,
+                bytemuck::cast_slice(&filter_vertices[..count]),
+            );
+            self.filter_vertex_count = count as u32;
+        } else {
+            self.filter_vertex_count = 0;
+        }
+    }
+
+    pub(crate) fn set_cross_section_enabled(&mut self, enabled: bool) {
+        self.show_cross_section = enabled;
+    }
+
+    pub(crate) fn cross_section_enabled(&self) -> bool {
+        self.show_cross_section
     }
 
     pub(crate) fn resize(&mut self, width: u32, height: u32) {
@@ -1071,70 +1107,56 @@ impl Renderer {
             bytemuck::bytes_of(&particle_uniforms),
         );
 
-        let cross_section_viewport = self.cross_section_viewport();
-        let cross_section_aspect = cross_section_viewport
-            .map(|(_, _, width, height, _)| width / height.max(EPSILON))
-            .unwrap_or(CROSS_SECTION_ASPECT);
-        let cross_section_uniforms = CrossSectionUniforms {
-            bounds: cross_section_world_bounds(cross_section_aspect),
-            params: [0.0, 0.28, 1.0, 0.0],
+        let cross_section_viewport = if self.show_cross_section {
+            self.cross_section_viewport()
+        } else {
+            None
         };
-        self.queue.write_buffer(
-            &self.cross_section_uniform_buffer,
-            0,
-            bytemuck::bytes_of(&cross_section_uniforms),
-        );
-
-        // Update cone uniforms
-        let cone_uniforms = ConeUniforms {
-            view_proj,
-            color: [0.95, 0.90, 0.78, 0.35],
-        };
-        self.queue.write_buffer(
-            &self.cone_uniform_buffer,
-            0,
-            bytemuck::bytes_of(&cone_uniforms),
-        );
-
-        let axis_uniforms = AxisUniforms { view_proj };
-        self.queue.write_buffer(
-            &self.axis_uniform_buffer,
-            0,
-            bytemuck::bytes_of(&axis_uniforms),
-        );
-
-        let filter_uniforms = ConeUniforms {
-            view_proj,
-            color: [0.96, 0.93, 0.85, 0.42],
-        };
-        self.queue.write_buffer(
-            &self.filter_uniform_buffer,
-            0,
-            bytemuck::bytes_of(&filter_uniforms),
-        );
-
-        if let Some(filter_vertices) = simulation.filter_fill_vertices() {
-            // Safety clamp: the GPU buffer is sized for `MAX_FILL_VERTEX_COUNT`
-            // at construction time. If the mesh ever produces more vertices
-            // than that (constants drifted), truncate rather than hit a driver
-            // validation error during `write_buffer`.
-            let count = filter_vertices.len().min(MAX_FILL_VERTEX_COUNT);
+        if let Some((_, _, width, height, _)) = cross_section_viewport {
+            let cross_section_aspect = width / height.max(EPSILON);
+            let cross_section_uniforms = CrossSectionUniforms {
+                bounds: cross_section_world_bounds(cross_section_aspect),
+                params: [0.0, 0.28, 1.0, 0.0],
+            };
             self.queue.write_buffer(
-                &self.filter_fill_vertex_buffer,
+                &self.cross_section_uniform_buffer,
                 0,
-                bytemuck::cast_slice(&filter_vertices[..count]),
+                bytemuck::bytes_of(&cross_section_uniforms),
             );
-            self.filter_fill_vertex_count = count as u32;
         }
 
-        if let Some(filter_vertices) = simulation.filter_render_vertices() {
-            let count = filter_vertices.len().min(MAX_RENDER_VERTEX_COUNT);
+        // Update cone uniforms
+        if self.cone_vertex_count > 0 {
+            let cone_uniforms = ConeUniforms {
+                view_proj,
+                color: [0.95, 0.90, 0.78, 0.35],
+            };
             self.queue.write_buffer(
-                &self.filter_vertex_buffer,
+                &self.cone_uniform_buffer,
                 0,
-                bytemuck::cast_slice(&filter_vertices[..count]),
+                bytemuck::bytes_of(&cone_uniforms),
             );
-            self.filter_vertex_count = count as u32;
+        }
+
+        if self.axis_vertex_count > 0 {
+            let axis_uniforms = AxisUniforms { view_proj };
+            self.queue.write_buffer(
+                &self.axis_uniform_buffer,
+                0,
+                bytemuck::bytes_of(&axis_uniforms),
+            );
+        }
+
+        if self.filter_fill_vertex_count > 0 || self.filter_vertex_count > 0 {
+            let filter_uniforms = ConeUniforms {
+                view_proj,
+                color: [0.96, 0.93, 0.85, 0.42],
+            };
+            self.queue.write_buffer(
+                &self.filter_uniform_buffer,
+                0,
+                bytemuck::bytes_of(&filter_uniforms),
+            );
         }
 
         let frame = match self.surface.get_current_texture() {
