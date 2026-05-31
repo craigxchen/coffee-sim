@@ -1,0 +1,209 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="1260" viewBox="0 0 1800 1260" role="img" aria-labelledby="title desc">
+  <title id="title">Coffee Sim Development Progress Graph</title>
+  <desc id="desc">Functional block graph and development lane graph for the Coffee Sim codebase as of 2026-05-31.</desc>
+  <defs>
+    <marker id="arrow" markerWidth="14" markerHeight="10" refX="12" refY="5" orient="auto" markerUnits="strokeWidth">
+      <path d="M 0 0 L 14 5 L 0 10 z" fill="#475569"/>
+    </marker>
+    <marker id="hotArrow" markerWidth="14" markerHeight="10" refX="12" refY="5" orient="auto" markerUnits="strokeWidth">
+      <path d="M 0 0 L 14 5 L 0 10 z" fill="#c2410c"/>
+    </marker>
+    <style>
+      .bg { fill: #f8fafc; }
+      .panel { fill: #ffffff; stroke: #d7dee8; stroke-width: 2; rx: 18; }
+      .title { font: 700 34px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #111827; }
+      .subtitle { font: 500 17px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #475569; }
+      .section { font: 700 22px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #0f172a; }
+      .label { font: 700 16px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #0f172a; }
+      .small { font: 500 13px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #334155; }
+      .tiny { font: 600 11px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #475569; }
+      .tag { font: 700 12px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; fill: #1f2937; }
+      .code { font: 650 12px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; fill: #334155; }
+      .box { stroke-width: 2; rx: 14; }
+      .stable { fill: #eaf8ec; stroke: #4d9d57; }
+      .active { fill: #e8f3ff; stroke: #3b82c4; }
+      .hot { fill: #ffe8d7; stroke: #d96b1f; }
+      .debug { fill: #f0ebff; stroke: #7c67cc; }
+      .parked { fill: #f1f5f9; stroke: #94a3b8; }
+      .risk { fill: #fff1f2; stroke: #e11d48; }
+      .merged { fill: #edfdf5; stroke: #0f9f6e; }
+      .arrow { fill: none; stroke: #475569; stroke-width: 2.5; marker-end: url(#arrow); }
+      .hotline { fill: none; stroke: #c2410c; stroke-width: 3.5; marker-end: url(#hotArrow); }
+      .dash { fill: none; stroke: #64748b; stroke-width: 2.2; stroke-dasharray: 8 7; marker-end: url(#arrow); }
+      .note { fill: #fffbeb; stroke: #f59e0b; stroke-width: 1.5; rx: 12; }
+    </style>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1800" height="1260"/>
+
+  <text class="title" x="60" y="62">Coffee Sim Codebase Progress Graph</text>
+  <text class="subtitle" x="60" y="92">Functional blocks, current change hotspots, and commit tags. Snapshot: 2026-05-31.</text>
+
+  <rect class="panel" x="40" y="125" width="1720" height="575"/>
+  <text class="section" x="70" y="165">1. Runtime Functional Blocks</text>
+  <text class="small" x="70" y="190">Orange blocks are the hottest change zones. Blue blocks are active surfaces. Green is stable support. Purple is observability/tooling.</text>
+
+  <!-- Functional graph nodes -->
+  <rect class="box stable" x="85" y="275" width="210" height="92"/>
+  <text class="label" x="105" y="305">CORE</text>
+  <text class="small" x="105" y="329">Vec3 / math types</text>
+  <text class="code" x="105" y="351">sim-core/src/*</text>
+
+  <rect class="box active" x="380" y="215" width="265" height="138"/>
+  <text class="label" x="400" y="246">UI</text>
+  <text class="small" x="400" y="270">Browser shell, controls, stats</text>
+  <text class="tag" x="400" y="296">WEBPERF-455 DBG-41e</text>
+  <text class="tag" x="400" y="317">DFSPH-480 T1-382</text>
+  <text class="code" x="400" y="339">www-3d/*</text>
+
+  <rect class="box active" x="380" y="390" width="265" height="112"/>
+  <text class="label" x="400" y="421">API</text>
+  <text class="small" x="400" y="445">WASM facade, scene calls</text>
+  <text class="tag" x="400" y="471">JCG-6a2 DFSPH-480 DBG-41e</text>
+  <text class="code" x="400" y="493">src/lib.rs</text>
+
+  <rect class="box hot" x="735" y="300" width="285" height="150"/>
+  <text class="label" x="755" y="330">ORCH</text>
+  <text class="small" x="755" y="354">MpmSim3D scenes and pass order</text>
+  <text class="tag" x="755" y="380">JCG/P60/WS/T1</text>
+  <text class="tag" x="755" y="401">DFSPH GEN DRY</text>
+  <text class="code" x="755" y="426">mpm_3d/mod.rs</text>
+
+  <rect class="box active" x="735" y="515" width="285" height="112"/>
+  <text class="label" x="755" y="546">CFG</text>
+  <text class="small" x="755" y="570">Brew config, units, inflow</text>
+  <text class="tag" x="755" y="596">P60 DFSPH GEN POUR</text>
+  <text class="code" x="755" y="618">brew_config / units / inflow</text>
+
+  <rect class="box active" x="1088" y="190" width="280" height="112"/>
+  <text class="label" x="1108" y="221">STATE + PIPES</text>
+  <text class="small" x="1108" y="245">Buffers, bind groups, passes</text>
+  <text class="tag" x="1108" y="271">JCG WS T1 DFSPH</text>
+  <text class="code" x="1108" y="293">state.rs / pipelines.rs</text>
+
+  <rect class="box hot" x="1088" y="335" width="280" height="150"/>
+  <text class="label" x="1108" y="365">SHADER</text>
+  <text class="small" x="1108" y="389">Pressure, viscosity, bed coupling</text>
+  <text class="tag" x="1108" y="415">highest churn</text>
+  <text class="tag" x="1108" y="436">JCG-6a2 WS-f7c T1-ddc</text>
+  <text class="tag" x="1108" y="457">T1-382 DFSPH-480</text>
+
+  <rect class="box active" x="1088" y="525" width="280" height="112"/>
+  <text class="label" x="1108" y="556">BED</text>
+  <text class="small" x="1108" y="580">Coffee/filter geometry and state</text>
+  <text class="tag" x="1108" y="606">GEN DRY GRIND</text>
+  <text class="code" x="1108" y="628">bed / filter / filter_mesh</text>
+
+  <rect class="box active" x="1460" y="215" width="225" height="112"/>
+  <text class="label" x="1480" y="246">RENDER</text>
+  <text class="small" x="1480" y="270">Particles, camera, mesh</text>
+  <text class="tag" x="1480" y="296">WEBPERF DFSPH DRY</text>
+
+  <rect class="box debug" x="1460" y="365" width="225" height="112"/>
+  <text class="label" x="1480" y="396">TEST / PROF</text>
+  <text class="small" x="1480" y="420">Regression and profiling</text>
+  <text class="tag" x="1480" y="446">MAIN-95b T1 WS GEN</text>
+
+  <rect class="box debug" x="1460" y="515" width="225" height="112"/>
+  <text class="label" x="1480" y="546">DOC</text>
+  <text class="small" x="1480" y="570">Architecture and branch audit</text>
+  <text class="tag" x="1480" y="596">DOC-7ac + this graph</text>
+
+  <!-- Functional graph arrows -->
+  <path class="arrow" d="M 295 320 C 330 320 340 447 380 447"/>
+  <path class="arrow" d="M 645 284 C 685 284 695 342 735 356"/>
+  <path class="arrow" d="M 645 446 C 685 446 695 398 735 386"/>
+  <path class="hotline" d="M 1020 360 C 1050 342 1060 265 1088 246"/>
+  <path class="hotline" d="M 1020 386 C 1055 386 1060 405 1088 410"/>
+  <path class="arrow" d="M 1020 575 C 1050 575 1060 575 1088 575"/>
+  <path class="arrow" d="M 1368 410 C 1410 405 1420 290 1460 275"/>
+  <path class="dash" d="M 1368 445 C 1410 450 1420 430 1460 425"/>
+  <path class="dash" d="M 1020 425 C 1240 665 1300 580 1460 570"/>
+  <path class="arrow" d="M 512 353 C 512 368 512 375 512 390"/>
+  <path class="arrow" d="M 878 450 C 878 485 878 495 878 515"/>
+
+  <rect class="note" x="80" y="590" width="560" height="84"/>
+  <text class="label" x="102" y="620">Current center of gravity</text>
+  <text class="small" x="102" y="644">Pressure solver migration lives mostly in ORCH + SHADER + GPU buffers/pipelines.</text>
+  <text class="small" x="102" y="662">Physics tests and profiler/debug tools are the main feedback loop.</text>
+
+  <rect class="panel" x="40" y="735" width="1720" height="455"/>
+  <text class="section" x="70" y="775">2. Development Lanes and Progress</text>
+  <text class="small" x="70" y="800">Commit tags show where each lane is changing the functional blocks above.</text>
+
+  <!-- Dev lane nodes -->
+  <rect class="box merged" x="80" y="890" width="210" height="98"/>
+  <text class="label" x="102" y="920">main</text>
+  <text class="tag" x="102" y="945">c9f01f8</text>
+  <text class="small" x="102" y="969">profiler PR merged</text>
+
+  <rect class="box hot" x="360" y="870" width="230" height="128"/>
+  <text class="label" x="382" y="900">JCG base</text>
+  <text class="tag" x="382" y="925">JCG-6a2 0ff ca5</text>
+  <text class="small" x="382" y="949">RBGS -> Jacobi-CG</text>
+  <text class="small" x="382" y="971">Blocks: API ORCH GPU TEST</text>
+
+  <rect class="box hot" x="665" y="870" width="230" height="128"/>
+  <text class="label" x="687" y="900">60 Hz tuning</text>
+  <text class="tag" x="687" y="925">P60-474 ea6 f04 908</text>
+  <text class="small" x="687" y="949">realtime tuning, constants</text>
+  <text class="small" x="687" y="971">test cleanup and guardrails</text>
+
+  <rect class="box hot" x="970" y="870" width="230" height="128"/>
+  <text class="label" x="992" y="900">Warm-start</text>
+  <text class="tag" x="992" y="925">WS-581 7e6 f7c</text>
+  <text class="small" x="992" y="949">fill cache + persistent pressure</text>
+  <text class="small" x="992" y="971">status: promising, isolated</text>
+
+  <rect class="box risk" x="1275" y="850" width="260" height="160"/>
+  <text class="label" x="1297" y="880">Tier 1 physics frontier</text>
+  <text class="tag" x="1297" y="905">T1-ddc T1-382</text>
+  <text class="small" x="1297" y="929">staggered pressure + eddy viscosity</text>
+  <text class="small" x="1297" y="953">freefall guard added</text>
+  <text class="small" x="1297" y="977">risk: high-flow residual growth</text>
+  <text class="small" x="1297" y="999">not ready for main</text>
+
+  <path class="hotline" d="M 290 940 C 322 940 328 934 360 934"/>
+  <path class="hotline" d="M 590 934 C 624 934 631 934 665 934"/>
+  <path class="hotline" d="M 895 934 C 929 934 936 934 970 934"/>
+  <path class="hotline" d="M 1200 934 C 1235 934 1240 930 1275 930"/>
+
+  <rect class="box active" x="360" y="1038" width="250" height="98"/>
+  <text class="label" x="382" y="1068">Web perf</text>
+  <text class="tag" x="382" y="1093">WEBPERF-17d 455</text>
+  <text class="small" x="382" y="1117">UI and render-loop overhead</text>
+
+  <rect class="box debug" x="665" y="1038" width="250" height="98"/>
+  <text class="label" x="687" y="1068">Pressure debug mode</text>
+  <text class="tag" x="687" y="1093">DBG-41e</text>
+  <text class="small" x="687" y="1117">slice readback + substep UI</text>
+
+  <rect class="box active" x="970" y="1038" width="250" height="98"/>
+  <text class="label" x="992" y="1068">DFSPH water</text>
+  <text class="tag" x="992" y="1093">DFSPH-480</text>
+  <text class="small" x="992" y="1117">broad alternate water solver</text>
+
+  <rect class="box parked" x="1275" y="1038" width="260" height="98"/>
+  <text class="label" x="1297" y="1068">Parked experiments</text>
+  <text class="tag" x="1297" y="1093">GEN-* DRY-* GRIND-*</text>
+  <text class="small" x="1297" y="1117">reference branches; cherry-pick only</text>
+
+  <path class="arrow" d="M 185 988 L 185 1020 L 485 1020 L 485 1038"/>
+  <path class="arrow" d="M 185 988 L 185 1020 L 790 1020 L 790 1038"/>
+  <path class="arrow" d="M 185 988 L 185 1020 L 1095 1020 L 1095 1038"/>
+  <path class="dash" d="M 185 988 L 185 1020 L 1405 1020 L 1405 1038"/>
+
+  <!-- Legend -->
+  <rect class="stable" x="80" y="115" width="18" height="18" rx="3"/>
+  <text class="tiny" x="106" y="129">stable support</text>
+  <rect class="active" x="215" y="115" width="18" height="18" rx="3"/>
+  <text class="tiny" x="241" y="129">active branch work</text>
+  <rect class="hot" x="370" y="115" width="18" height="18" rx="3"/>
+  <text class="tiny" x="396" y="129">hot solver path</text>
+  <rect class="risk" x="510" y="115" width="18" height="18" rx="3"/>
+  <text class="tiny" x="536" y="129">known risk / not ready</text>
+  <rect class="debug" x="690" y="115" width="18" height="18" rx="3"/>
+  <text class="tiny" x="716" y="129">debug / docs / profiler</text>
+
+  <text class="tiny" x="80" y="1225">Generated from docs/DEV_PROGRESS_GRAPH.md and current branch audit. File: docs/assets/dev-progress-graph.svg</text>
+</svg>
