@@ -259,6 +259,8 @@ struct ProfilerCliArgs {
     output: Option<PathBuf>,
     cg_iterations: Option<u32>,
     dry_run: Option<bool>,
+    list_solvers: bool,
+    help: bool,
 }
 
 impl ProfilerCliArgs {
@@ -329,6 +331,8 @@ impl ProfilerCliArgs {
                 "out" | "output" => "--out".to_string(),
                 "cg_iterations" | "cg-iterations" => "--cg-iterations".to_string(),
                 "dry_run" | "dry-run" => "--dry-run".to_string(),
+                "list_solvers" | "list-solvers" => "--list-solvers".to_string(),
+                "help" => "--help".to_string(),
                 _ => flag,
             };
             let mut take_value = |name: &str| -> Result<String, String> {
@@ -371,11 +375,13 @@ impl ProfilerCliArgs {
                             .unwrap_or(true),
                     );
                 }
+                "--list-solvers" => parsed.list_solvers = true,
+                "--help" | "-h" => parsed.help = true,
                 other => {
                     return Err(format!(
                         "unknown profiler option '{other}'; supported options: \
-                         --scene, --solver, --solvers, --pressure-operator, --warmup, --frames, --cal, --out, --cg-iterations, --dry-run, \
-                         or kwargs scene=, solver=, solvers=, pressure_operator=, warmup=, frames=, cal=, out=, cg_iterations=, dry_run="
+                         --scene, --solver, --solvers, --pressure-operator, --warmup, --frames, --cal, --out, --cg-iterations, --dry-run, --list-solvers, --help, \
+                         or kwargs scene=, solver=, solvers=, pressure_operator=, warmup=, frames=, cal=, out=, cg_iterations=, dry_run=, list_solvers=, help="
                     ));
                 }
             }
@@ -394,6 +400,8 @@ impl ProfilerCliArgs {
         self.output = other.output.or(self.output.take());
         self.cg_iterations = other.cg_iterations.or(self.cg_iterations);
         self.dry_run = other.dry_run.or(self.dry_run);
+        self.list_solvers = other.list_solvers || self.list_solvers;
+        self.help = other.help || self.help;
     }
 }
 
@@ -1774,6 +1782,35 @@ fn runnable_solver_specs() -> Vec<SolverSpec> {
     SolverSpec::runnable_specs()
 }
 
+fn solver_list_summary() -> String {
+    let mut summary = String::from("available profiler solvers:\n");
+    for solver in runnable_solver_specs() {
+        summary.push_str("  ");
+        summary.push_str(&solver.to_string());
+        summary.push('\n');
+    }
+    summary.push_str("  all\n");
+    summary
+}
+
+fn profiler_usage() -> &'static str {
+    "usage: profile_solvers [OPTIONS]\n\
+\n\
+Options:\n\
+  --scene <center_pour|free_stream|water_block>\n\
+  --solver <SOLVER>          Run one solver, or all\n\
+  --solvers <A,B|all>        Run multiple solvers\n\
+  --pressure-operator <collocated|staggered>\n\
+  --warmup <N> --frames <N> --cal <N>\n\
+  --out <PATH>\n\
+  --cg-iterations <N>\n\
+  --dry-run[=true|false]     Print the resolved run plan without GPU work\n\
+  --list-solvers             Print available solver specs\n\
+  -h, --help                 Print this help\n\
+\n\
+Kwargs are also accepted, e.g. scene=center_pour solvers=all frames=30.\n"
+}
+
 fn xpbd_profiler_timestamp_query_capacity(substeps: u32) -> u32 {
     let xpbd_passes = xpbd_profiled_gpu_passes_per_substep();
     let shared_tail_passes = 7;
@@ -1946,6 +1983,22 @@ fn profiler_cli_args_parse_key_value_and_separate_forms() {
     assert_eq!(args.calibration, Some(4));
     assert_eq!(args.output, Some(PathBuf::from("target/profile.json")));
     assert_eq!(args.cg_iterations, Some(5));
+}
+
+#[test]
+fn profiler_cli_discovery_flags_do_not_need_gpu() {
+    let args = ProfilerCliArgs::parse(["--list-solvers", "--help"]).expect("profiler args parse");
+    assert!(args.list_solvers);
+    assert!(args.help);
+
+    let solvers = solver_list_summary();
+    assert!(solvers.contains("mpm:rbgs"));
+    assert!(solvers.contains("mpm:jacobi-cg"));
+    assert!(solvers.contains("mpm:sparse-cg"));
+    assert!(solvers.contains("dfsph"));
+    assert!(solvers.contains("xpbd:gpu"));
+    assert!(solvers.contains("all"));
+    assert!(profiler_usage().contains("--solvers <A,B|all>"));
 }
 
 #[test]
@@ -2845,6 +2898,14 @@ fn profile_solver_backend(
 
 pub fn run_profile_from_env_args() {
     let cli = ProfilerCliArgs::from_env_args();
+    if cli.help {
+        print!("{}", profiler_usage());
+        return;
+    }
+    if cli.list_solvers {
+        print!("{}", solver_list_summary());
+        return;
+    }
     let selection = ProfileSelection::from_cli(&cli);
     if cli.dry_run.unwrap_or(false) {
         print!("{}", selection.dry_run_summary());

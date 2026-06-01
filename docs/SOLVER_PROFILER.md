@@ -19,6 +19,7 @@ cargo run -p coffee-sim-wasm --features native-profiler --bin profile_solvers --
   --scene center_pour --solvers all --frames 120 --warmup 60 --cal 30
 cargo run -p coffee-sim-wasm --features native-profiler --bin profile_solvers -- \
   --scene center_pour --solvers all --frames 120 --warmup 60 --cal 30 --dry-run
+cargo run -p coffee-sim-wasm --features native-profiler --bin profile_solvers -- --list-solvers
 COFFEE_SIM_PROFILE_ARGS="scene=center_pour solvers=all frames=120 warmup=60 cal=30" \
   cargo test -p coffee-sim-wasm --lib --release profile_mpm_pipeline -- --ignored --nocapture
 COFFEE_SIM_PROFILE_ARGS="--scene water_block --solver mpm:sparse-cg --pressure-operator collocated" \
