@@ -214,8 +214,8 @@ impl MpmPipelines {
                     pressure_cg_sparse_matvec: make("pressure_cg_sparse_matvec"),
                     pressure_cg_sparse_apply_alpha: make("pressure_cg_sparse_apply_alpha"),
                     pressure_cg_sparse_update_dir: make("pressure_cg_sparse_update_dir"),
-                    project_pressure: make("project_pressure"),
-                    pressure_residual: make("pressure_residual"),
+                    project_pressure: make("project_pressure_active"),
+                    pressure_residual: make("pressure_residual_active"),
                 },
                 staged_staggered: StagedStaggeredPressurePipelines {
                     classify_cells: make("classify_cells_staggered"),
