@@ -2329,11 +2329,24 @@ fn profiler_report_verifier_accepts_same_scene_solver_set() {
             scene: "water_block".to_string(),
             solvers: vec!["mpm-rbgs".to_string(), "xpbd-gpu".to_string()],
             reports: 2,
+            comparison: vec![
+                ReportComparison {
+                    solver: "mpm-rbgs".to_string(),
+                    production_mean_ms: 11.0,
+                    gpu_passes_mean_ms: 8.0,
+                },
+                ReportComparison {
+                    solver: "xpbd-gpu".to_string(),
+                    production_mean_ms: 12.0,
+                    gpu_passes_mean_ms: 9.0,
+                },
+            ],
         }
     );
     assert!(verification
         .summary()
         .contains("verified 2 profile reports"));
+    assert!(verification.summary().contains("production_ms"));
     assert_eq!(
         output_path_for_solver(&base, SolverSpec::mpm(PressureSolverKind::Rbgs), true),
         PathBuf::from("target/profile-mpm-rbgs.json")
@@ -2455,6 +2468,8 @@ fn minimal_profile_report_json(
         multiple_outputs: selection.multiple_outputs,
     };
     let settings = settings_for_solver(solver, &run);
+    let production_mean_ms = 10.0 + ordinal as f64;
+    let gpu_passes_mean_ms = 7.0 + ordinal as f64;
     serde_json::json!({
         "schema_version": 2,
         "metadata": {
@@ -2474,7 +2489,14 @@ fn minimal_profile_report_json(
                 "multiple_outputs": selection.multiple_outputs
             }
         },
-        "frame_timings": {},
+        "frame_timings": {
+            "production_frame": {
+                "mean_ms": production_mean_ms
+            },
+            "gpu_passes_sum": {
+                "mean_ms": gpu_passes_mean_ms
+            }
+        },
         "gpu_passes": [],
         "bottlenecks": []
     })
@@ -3039,21 +3061,45 @@ impl ProfileSelection {
     }
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug, PartialEq)]
 struct ReportVerification {
     scene: String,
     solvers: Vec<String>,
     reports: usize,
+    comparison: Vec<ReportComparison>,
+}
+
+#[derive(Debug, PartialEq)]
+struct ReportComparison {
+    solver: String,
+    production_mean_ms: f64,
+    gpu_passes_mean_ms: f64,
 }
 
 impl ReportVerification {
     fn summary(&self) -> String {
-        format!(
+        let mut summary = format!(
             "verified {} profile reports for scene {}: {}\n",
             self.reports,
             self.scene,
             self.solvers.join(", ")
-        )
+        );
+        if !self.comparison.is_empty() {
+            use std::fmt::Write as _;
+            let _ = writeln!(
+                summary,
+                "{:<18} {:>14} {:>14}",
+                "solver", "production_ms", "gpu_passes_ms"
+            );
+            for row in &self.comparison {
+                let _ = writeln!(
+                    summary,
+                    "{:<18} {:>14.3} {:>14.3}",
+                    row.solver, row.production_mean_ms, row.gpu_passes_mean_ms
+                );
+            }
+        }
+        summary
     }
 }
 
@@ -3069,6 +3115,7 @@ fn validate_report_values(
         ));
     }
 
+    let mut comparison = Vec::with_capacity(reports.len());
     for (index, (solver, value)) in reports.iter().enumerate() {
         let expected_solver = selection.solvers[index];
         if *solver != expected_solver {
@@ -3161,12 +3208,18 @@ fn validate_report_values(
             "metadata.substeps_per_frame",
             serde_json::json!(expected_settings.substeps.max(1)),
         )?;
+        comparison.push(ReportComparison {
+            solver: solver.id(),
+            production_mean_ms: json_path_f64(value, "frame_timings.production_frame.mean_ms")?,
+            gpu_passes_mean_ms: json_path_f64(value, "frame_timings.gpu_passes_sum.mean_ms")?,
+        });
     }
 
     Ok(ReportVerification {
         scene: selection.scene.to_string(),
         solvers: selection.solver_ids.clone(),
         reports: reports.len(),
+        comparison,
     })
 }
 
@@ -3183,6 +3236,12 @@ fn assert_json_eq(value: &Value, path: &str, expected: Value) -> Result<(), Stri
 fn json_path<'a>(value: &'a Value, path: &str) -> Option<&'a Value> {
     path.split('.')
         .try_fold(value, |current, key| current.get(key))
+}
+
+fn json_path_f64(value: &Value, path: &str) -> Result<f64, String> {
+    json_path(value, path)
+        .and_then(Value::as_f64)
+        .ok_or_else(|| format!("missing numeric JSON path {path}"))
 }
 
 struct ProfilerDeviceContext<'a> {
