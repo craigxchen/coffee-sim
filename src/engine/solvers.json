@@ -1,0 +1,14 @@
+{
+  "noop_a": {
+    "name": "No-op A",
+    "paradigm": "PositionBased",
+    "owns_grid": false,
+    "stability": "Unconditional"
+  },
+  "noop_b": {
+    "name": "No-op B",
+    "paradigm": "ForceBased",
+    "owns_grid": true,
+    "stability": { "CflLimited": { "c": 0.5 } }
+  }
+}
