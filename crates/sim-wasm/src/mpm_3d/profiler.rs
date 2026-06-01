@@ -2307,10 +2307,37 @@ fn profiler_mpm_cg_defaults_to_scene_cg_budget() {
     let settings = settings_for_solver_with_base(
         SolverSpec::mpm(PressureSolverKind::SparseCg),
         &run,
-        scene_settings,
+        scene_settings.clone(),
     );
     assert_eq!(settings.pressure_rbgs_pairs, 12);
     assert_eq!(settings.pressure_cg_iterations, 34);
+
+    let rbgs_metadata = dry_run_solver_metadata(
+        SolverSpec::mpm(PressureSolverKind::Rbgs),
+        &settings_for_solver_with_base(
+            SolverSpec::mpm(PressureSolverKind::Rbgs),
+            &run,
+            scene_settings.clone(),
+        ),
+    );
+    let sparse_metadata =
+        dry_run_solver_metadata(SolverSpec::mpm(PressureSolverKind::SparseCg), &settings);
+    assert_eq!(
+        rbgs_metadata
+            .pressure
+            .as_ref()
+            .expect("rbgs metadata")
+            .iterations_per_substep,
+        12
+    );
+    assert_eq!(
+        sparse_metadata
+            .pressure
+            .as_ref()
+            .expect("sparse cg metadata")
+            .iterations_per_substep,
+        34
+    );
 }
 
 #[test]
@@ -3014,7 +3041,7 @@ fn dry_run_solver_metadata(solver: SolverSpec, settings: &MpmSettings) -> Solver
             pressure: Some(PressureSolverMetadata {
                 kind: pressure.to_string(),
                 operator: settings.pressure_operator.to_string(),
-                iterations_per_substep: settings.pressure_cg_iterations,
+                iterations_per_substep: pressure_iterations_for_settings(pressure, settings),
             }),
             dfsph: None,
             xpbd: None,
@@ -3028,7 +3055,10 @@ fn dry_run_solver_metadata(solver: SolverSpec, settings: &MpmSettings) -> Solver
                 density_iterations_per_substep: 2,
                 grid_pressure_kind: settings.pressure_solver.to_string(),
                 grid_pressure_operator: settings.pressure_operator.to_string(),
-                grid_pressure_iterations_per_substep: settings.pressure_cg_iterations,
+                grid_pressure_iterations_per_substep: pressure_iterations_for_settings(
+                    settings.pressure_solver,
+                    settings,
+                ),
             }),
             xpbd: None,
         },
@@ -3041,6 +3071,15 @@ fn dry_run_solver_metadata(solver: SolverSpec, settings: &MpmSettings) -> Solver
                 constraint_iterations_per_substep: XPBD_CONSTRAINT_ITERATIONS,
             }),
         },
+    }
+}
+
+fn pressure_iterations_for_settings(pressure: PressureSolverKind, settings: &MpmSettings) -> u32 {
+    match pressure {
+        PressureSolverKind::Rbgs => settings.pressure_rbgs_pairs,
+        PressureSolverKind::JacobiCg | PressureSolverKind::SparseCg => {
+            settings.pressure_cg_iterations
+        }
     }
 }
 
