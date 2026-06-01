@@ -627,6 +627,8 @@ fn step_frame_dfsph_instrumented(
 
         let t = Instant::now();
         sim.write_uniforms(queue, sub_dt);
+        let pressure_pairs = sim.pressure_rbgs_pairs_for_substep();
+        sim.last_pressure_rbgs_pairs = pressure_pairs;
         sums.cpu_uniforms_ms += ms(t);
 
         let total_cells =
@@ -639,6 +641,12 @@ fn step_frame_dfsph_instrumented(
         };
         let water_hash_wg = dispatch_size(total_cells + sim.settings.max_particles, NUM_THREADS);
         let water_wg = dispatch_size(sim.num_water, NUM_THREADS);
+        let pressure_ctx = PressureContext {
+            kind: sim.settings.pressure_solver,
+            cell_wg: dispatch.cell_wg,
+            rbgs_pairs: pressure_pairs,
+            cg_iterations: sim.settings.pressure_cg_iterations,
+        };
 
         let t_encode = Instant::now();
         let mut rec = FrameRecorder::new(timer);
@@ -772,6 +780,77 @@ fn step_frame_dfsph_instrumented(
             mpm_bg,
             MpmPassLabel::GridUpdate,
             &common.grid_update,
+            MpmDispatch::Direct(dispatch.cell_wg),
+        );
+        timed_pass(
+            &mut encoder,
+            &mut rec,
+            mpm_bg,
+            MpmPassLabel::BoundaryProject,
+            &common.boundary_project,
+            MpmDispatch::Direct(dispatch.cell_wg),
+        );
+        timed_pass(
+            &mut encoder,
+            &mut rec,
+            mpm_bg,
+            MpmPassLabel::PressureClassify,
+            sim.pipelines
+                .pressure
+                .classify_pipeline_for(pressure_ctx.kind),
+            MpmDispatch::Direct(dispatch.cell_wg),
+        );
+        {
+            let timestamp_writes = rec.writes_mpm(MpmPassLabel::PressureSolve);
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some(MpmPassLabel::PressureSolve.display()),
+                timestamp_writes,
+            });
+            pass.set_bind_group(0, mpm_bg, &[]);
+            sim.pipelines.pressure.encode_solve(&mut pass, pressure_ctx);
+        }
+        timed_pass(
+            &mut encoder,
+            &mut rec,
+            mpm_bg,
+            MpmPassLabel::PressureProject,
+            sim.pipelines
+                .pressure
+                .project_pipeline_for(pressure_ctx.kind),
+            MpmDispatch::Direct(dispatch.cell_wg),
+        );
+        timed_pass(
+            &mut encoder,
+            &mut rec,
+            mpm_bg,
+            MpmPassLabel::BoundaryProject,
+            &common.boundary_project,
+            MpmDispatch::Direct(dispatch.cell_wg),
+        );
+        timed_pass(
+            &mut encoder,
+            &mut rec,
+            mpm_bg,
+            MpmPassLabel::PressureResidual,
+            sim.pipelines
+                .pressure
+                .residual_pipeline_for(pressure_ctx.kind),
+            MpmDispatch::Direct(dispatch.cell_wg),
+        );
+        timed_pass(
+            &mut encoder,
+            &mut rec,
+            mpm_bg,
+            MpmPassLabel::PackingPrepare,
+            &common.packing_prepare,
+            MpmDispatch::Direct(dispatch.cell_wg),
+        );
+        timed_pass(
+            &mut encoder,
+            &mut rec,
+            mpm_bg,
+            MpmPassLabel::PackingApply,
+            &common.packing_apply,
             MpmDispatch::Direct(dispatch.cell_wg),
         );
         timed_pass(
@@ -955,6 +1034,8 @@ struct DfsphSolverMetadata {
     kind: String,
     divergence_iterations_per_substep: u32,
     density_iterations_per_substep: u32,
+    grid_pressure_kind: String,
+    grid_pressure_iterations_per_substep: u32,
 }
 
 #[derive(Serialize)]
@@ -1082,11 +1163,13 @@ fn profile_solver_specs() -> Vec<SolverSpec> {
     if let Ok(value) = std::env::var("COFFEE_SIM_PROFILE_SOLVERS") {
         let trimmed = value.trim();
         if trimmed.eq_ignore_ascii_case("all") {
-            return PressureSolverKind::ALL
+            let mut specs: Vec<_> = PressureSolverKind::ALL
                 .iter()
                 .copied()
                 .map(SolverSpec::mpm)
                 .collect();
+            specs.push(SolverSpec::Dfsph);
+            return specs;
         }
         return trimmed
             .split(',')
@@ -1580,7 +1663,7 @@ fn profile_dfsph_solver(
     }
     bottlenecks.push(
         "DFSPH backend profiles GPU water pressure correction plus the shared MPM grid/bed/render tail; \
-         tiled pressure projection from codex/dfsph-water remains a follow-up before adding it to `all`."
+         tiled pressure projection from codex/dfsph-water remains a future sparse optimization."
             .to_string(),
     );
 
@@ -1608,10 +1691,15 @@ fn profile_dfsph_solver(
                     kind: "water".to_string(),
                     divergence_iterations_per_substep: 1,
                     density_iterations_per_substep: 2,
+                    grid_pressure_kind: sim.pressure_solver_kind().to_string(),
+                    grid_pressure_iterations_per_substep: sim
+                        .pressure_solver_iterations_per_substep(),
                 }),
                 xpbd: None,
             },
-            pressure_rbgs_pairs: 0,
+            pressure_rbgs_pairs: sim
+                .last_pressure_rbgs_pairs
+                .max(sim.settings.pressure_rbgs_pairs),
             water_particles_start,
             water_particles_end,
             bed_particles,
