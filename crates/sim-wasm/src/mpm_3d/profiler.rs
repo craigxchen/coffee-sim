@@ -15,7 +15,7 @@
 //!
 //! Tunable via environment variables:
 //! - `COFFEE_SIM_PROFILE_SCENE`   scene preset: `center_pour` (default) | `free_stream` | `water_block`
-//! - `COFFEE_SIM_PROFILE_SOLVER`  solver spec: `rbgs` (default) | `mpm:jacobi-cg` | `mpm:sparse-cg` | `dfsph`
+//! - `COFFEE_SIM_PROFILE_SOLVER`  solver spec: `rbgs` (default) | `mpm:jacobi-cg` | `mpm:sparse-cg` | `dfsph` | `xpbd`
 //! - `COFFEE_SIM_PROFILE_SOLVERS` comma-separated runnable solver specs, or `all`
 //! - `COFFEE_SIM_PROFILE_CG_ITERATIONS` CG iterations per substep (defaults to scene RBGS pairs)
 //! - `COFFEE_SIM_PROFILE_WARMUP`  frames to run before measuring (default 60)
@@ -51,6 +51,7 @@ use serde::Serialize;
 use super::inflow::{EmissionResult, MASS_UNITS_PER_ML, PARTICLES_PER_ML};
 use super::pressure::{PressureContext, PressureSolverKind};
 use super::state::{METRICS_SLOT_COUNT, NUM_THREADS};
+use super::xpbd::XpbdPipelines;
 use super::{
     dispatch_size, encode_mpm_substep_schedule, required_limits, MpmDispatch, MpmDispatchSizes,
     MpmPassLabel, MpmScheduleOp, MpmSettings, MpmSim3D, MIN_TIMESTAMP_QUERY_CAPACITY,
@@ -60,6 +61,7 @@ const DEFAULT_WARMUP_FRAMES: u32 = 60;
 const DEFAULT_MEASURED_FRAMES: u32 = 120;
 const DEFAULT_CALIBRATION_FRAMES: u32 = 30;
 const FRAME_DT: f32 = 1.0 / 60.0;
+const XPBD_CONSTRAINT_ITERATIONS: u32 = 6;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SimulationBackendKind {
@@ -956,6 +958,203 @@ fn step_frame_dfsph_instrumented(
     sums
 }
 
+fn step_frame_xpbd_instrumented(
+    sim: &mut MpmSim3D,
+    xpbd: &XpbdPipelines,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    dt: f32,
+    timer: Option<&GpuTimer>,
+) -> FrameSums {
+    let dt = dt.min(1.0 / 30.0);
+    let substeps = sim.settings.substeps.max(1);
+    let sub_dt = dt / substeps as f32;
+    let mass_per_particle = MASS_UNITS_PER_ML / PARTICLES_PER_ML;
+    let mut sums = FrameSums::default();
+
+    for substep_idx in 0..substeps {
+        let t = Instant::now();
+        let EmissionResult { emitted, .. } = sim.inflow.emit_particles(
+            queue,
+            &sim.buffers,
+            &sim.settings.spout,
+            sub_dt,
+            mass_per_particle,
+            sim.num_water,
+            sim.num_bed,
+            sim.settings.max_particles,
+        );
+        sim.num_water += emitted;
+        sums.cpu_emit_ms += ms(t);
+
+        let t = Instant::now();
+        sim.write_uniforms(queue, sub_dt);
+        sums.cpu_uniforms_ms += ms(t);
+
+        let total_cells =
+            sim.settings.grid_dims[0] * sim.settings.grid_dims[1] * sim.settings.grid_dims[2];
+        let dispatch = MpmDispatchSizes {
+            cell_wg: dispatch_size(total_cells, NUM_THREADS),
+            particle_wg: dispatch_size(sim.num_water + sim.num_bed, NUM_THREADS),
+            bed_wg: dispatch_size(sim.num_bed, NUM_THREADS),
+            metrics_wg: dispatch_size(METRICS_SLOT_COUNT as u32, 8),
+        };
+        let hash_wg = dispatch_size(total_cells + sim.settings.max_particles, NUM_THREADS);
+        let water_wg = dispatch_size(sim.num_water, NUM_THREADS);
+
+        let t_encode = Instant::now();
+        let mut rec = FrameRecorder::new(timer);
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("xpbd profiled step"),
+        });
+        let common = &sim.pipelines.common;
+        let mpm_bg = &sim.pipelines.bind_group;
+        if dispatch.metrics_wg > 0 {
+            timed_pass(
+                &mut encoder,
+                &mut rec,
+                mpm_bg,
+                MpmPassLabel::MetricsClear,
+                &common.metrics_clear,
+                MpmDispatch::Direct(dispatch.metrics_wg),
+            );
+        }
+        timed_pass(
+            &mut encoder,
+            &mut rec,
+            mpm_bg,
+            MpmPassLabel::BedLookupClear,
+            &common.bed_lookup_clear,
+            MpmDispatch::Direct(dispatch.cell_wg),
+        );
+        if dispatch.bed_wg > 0 {
+            timed_pass(
+                &mut encoder,
+                &mut rec,
+                mpm_bg,
+                MpmPassLabel::BedLookupScatter,
+                &common.bed_lookup_scatter,
+                MpmDispatch::Direct(dispatch.bed_wg),
+            );
+        }
+
+        if water_wg > 0 {
+            timed_profile_pass(
+                &mut encoder,
+                &mut rec,
+                &xpbd.bind_group,
+                ProfilePassLabel::new("xpbd.predict", "xpbd_predict", "xpbd"),
+                &xpbd.predict,
+                water_wg,
+            );
+            timed_profile_pass(
+                &mut encoder,
+                &mut rec,
+                &xpbd.bind_group,
+                ProfilePassLabel::new("xpbd.hash_clear", "xpbd_hash_clear", "xpbd"),
+                &xpbd.hash_clear,
+                hash_wg,
+            );
+            timed_profile_pass(
+                &mut encoder,
+                &mut rec,
+                &xpbd.bind_group,
+                ProfilePassLabel::new("xpbd.hash_scatter", "xpbd_hash_scatter", "xpbd"),
+                &xpbd.hash_scatter,
+                water_wg,
+            );
+            for _ in 0..XPBD_CONSTRAINT_ITERATIONS {
+                timed_profile_pass(
+                    &mut encoder,
+                    &mut rec,
+                    &xpbd.bind_group,
+                    ProfilePassLabel::new("xpbd.solve_density", "xpbd_solve_density", "xpbd"),
+                    &xpbd.solve_density,
+                    water_wg,
+                );
+                timed_profile_pass(
+                    &mut encoder,
+                    &mut rec,
+                    &xpbd.bind_group,
+                    ProfilePassLabel::new("xpbd.solve_bounds", "xpbd_solve_bounds", "xpbd"),
+                    &xpbd.solve_bounds,
+                    water_wg,
+                );
+            }
+            timed_profile_pass(
+                &mut encoder,
+                &mut rec,
+                &xpbd.bind_group,
+                ProfilePassLabel::new("xpbd.velocity_update", "xpbd_velocity_update", "xpbd"),
+                &xpbd.velocity_update,
+                water_wg,
+            );
+        }
+
+        if dispatch.particle_wg > 0 {
+            timed_pass(
+                &mut encoder,
+                &mut rec,
+                mpm_bg,
+                MpmPassLabel::BedCoupling,
+                &common.bed_coupling,
+                MpmDispatch::Direct(dispatch.particle_wg),
+            );
+        }
+        if dispatch.bed_wg > 0 {
+            timed_pass(
+                &mut encoder,
+                &mut rec,
+                mpm_bg,
+                MpmPassLabel::ExtractionAdvect,
+                &common.extraction_advect,
+                MpmDispatch::Direct(dispatch.bed_wg),
+            );
+            timed_pass(
+                &mut encoder,
+                &mut rec,
+                mpm_bg,
+                MpmPassLabel::BedDynamics,
+                &common.bed_dynamics,
+                MpmDispatch::Direct(dispatch.bed_wg),
+            );
+        }
+        if substep_idx + 1 == substeps && dispatch.particle_wg > 0 {
+            timed_pass(
+                &mut encoder,
+                &mut rec,
+                mpm_bg,
+                MpmPassLabel::PrepareRender,
+                &common.prepare_render,
+                MpmDispatch::Direct(dispatch.particle_wg),
+            );
+        }
+
+        let used = rec.next;
+        if let Some(t) = timer {
+            encoder.resolve_query_set(&t.query_set, 0..used, &t.resolve_buf, 0);
+            encoder.copy_buffer_to_buffer(&t.resolve_buf, 0, &t.read_buf, 0, (used as u64) * 8);
+        }
+        sums.cpu_encode_ms += ms(t_encode);
+
+        let t_submit = Instant::now();
+        queue.submit(Some(encoder.finish()));
+        sums.cpu_submit_ms += ms(t_submit);
+
+        let t_wait = Instant::now();
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        sums.gpu_wait_ms += ms(t_wait);
+
+        if let Some(t) = timer {
+            fold_timestamp_scopes(&mut sums, t, device, &rec);
+        }
+
+        sim.total_time += sub_dt;
+    }
+
+    sums
+}
+
 fn ms(start: Instant) -> f64 {
     start.elapsed().as_secs_f64() * 1000.0
 }
@@ -1041,6 +1240,7 @@ struct DfsphSolverMetadata {
 #[derive(Serialize)]
 struct XpbdSolverMetadata {
     kind: String,
+    constraint_iterations_per_substep: u32,
 }
 
 #[derive(Serialize)]
@@ -1190,6 +1390,13 @@ fn runnable_solver_specs() -> Vec<SolverSpec> {
     specs
 }
 
+fn xpbd_profiler_timestamp_query_capacity(substeps: u32) -> u32 {
+    let xpbd_passes = 4 + XPBD_CONSTRAINT_ITERATIONS * 2;
+    let shared_tail_passes = 7;
+    let passes_per_substep = xpbd_passes + shared_tail_passes;
+    (substeps.max(1) * passes_per_substep * 2).max(MIN_TIMESTAMP_QUERY_CAPACITY)
+}
+
 fn output_path() -> PathBuf {
     if let Ok(p) = std::env::var("COFFEE_SIM_PROFILE_OUT") {
         return PathBuf::from(p);
@@ -1259,7 +1466,7 @@ fn profiler_all_expands_to_runnable_gpu_solver_specs() {
         !runnable_solver_specs()
             .iter()
             .any(|solver| matches!(solver, SolverSpec::Xpbd { .. })),
-        "XPBD branch currently has stub GPU kernels and must not be in `all`"
+        "XPBD GPU path must stay out of `all` until its physics and browser parity are validated"
     );
 }
 
@@ -1739,6 +1946,183 @@ fn profile_dfsph_solver(
     print_report_summary(&path, &report);
 }
 
+fn profile_xpbd_solver(
+    ctx: &ProfilerDeviceContext<'_>,
+    run: &ProfilerRunConfig<'_>,
+    solver: SolverSpec,
+    kind: XpbdSolverKind,
+) {
+    let settings = run.scene.mpm_settings();
+    let grid_dims = settings.grid_dims;
+    let total_cells = grid_dims[0] * grid_dims[1] * grid_dims[2];
+    let max_particles = settings.max_particles;
+    let substeps = settings.substeps.max(1);
+    let mut sim = MpmSim3D::new(ctx.device, ctx.queue, settings);
+    let xpbd = XpbdPipelines::new(ctx.device, &sim.buffers);
+
+    for _ in 0..run.warmup {
+        step_frame_xpbd_instrumented(&mut sim, &xpbd, ctx.device, ctx.queue, FRAME_DT, None);
+    }
+    let _ = ctx.device.poll(wgpu::PollType::wait_indefinitely());
+
+    let bed_particles = sim.num_bed;
+    let mut production_ms = Vec::with_capacity(run.calibration as usize);
+    for _ in 0..run.calibration {
+        let t = Instant::now();
+        step_frame_xpbd_instrumented(&mut sim, &xpbd, ctx.device, ctx.queue, FRAME_DT, None);
+        let _ = ctx.device.poll(wgpu::PollType::wait_indefinitely());
+        production_ms.push(ms(t));
+    }
+
+    let query_capacity = xpbd_profiler_timestamp_query_capacity(substeps);
+    let timer = ctx
+        .timestamps_supported
+        .then(|| GpuTimer::new(ctx.device, ctx.period_ns, query_capacity));
+    let mut wall_ms = Vec::with_capacity(run.measured as usize);
+    let mut gpu_passes_sum = Vec::with_capacity(run.measured as usize);
+    let mut gpu_wait = Vec::with_capacity(run.measured as usize);
+    let mut gpu_unattributed = Vec::with_capacity(run.measured as usize);
+    let mut cpu_emit = Vec::with_capacity(run.measured as usize);
+    let mut cpu_uniforms = Vec::with_capacity(run.measured as usize);
+    let mut cpu_encode = Vec::with_capacity(run.measured as usize);
+    let mut cpu_submit = Vec::with_capacity(run.measured as usize);
+    let mut per_label: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+    let mut label_dispatch_count: BTreeMap<String, u64> = BTreeMap::new();
+    let mut label_meta: BTreeMap<String, ProfilePassMeta> = BTreeMap::new();
+
+    let water_particles_start = sim.num_water;
+    for _ in 0..run.measured {
+        let t = Instant::now();
+        let sums = step_frame_xpbd_instrumented(
+            &mut sim,
+            &xpbd,
+            ctx.device,
+            ctx.queue,
+            FRAME_DT,
+            timer.as_ref(),
+        );
+        wall_ms.push(ms(t));
+        gpu_passes_sum.push(sums.gpu_passes_ms);
+        gpu_wait.push(sums.gpu_wait_ms);
+        gpu_unattributed.push((sums.gpu_wait_ms - sums.gpu_passes_ms).max(0.0));
+        cpu_emit.push(sums.cpu_emit_ms);
+        cpu_uniforms.push(sums.cpu_uniforms_ms);
+        cpu_encode.push(sums.cpu_encode_ms);
+        cpu_submit.push(sums.cpu_submit_ms);
+        for (label, value) in sums.per_label_ms {
+            per_label.entry(label).or_default().push(value);
+        }
+        for (label, count) in sums.per_label_count {
+            *label_dispatch_count.entry(label).or_insert(0) += count as u64;
+        }
+        for (label, meta) in sums.per_label_meta {
+            label_meta.entry(label).or_insert(meta);
+        }
+    }
+    let water_particles_end = sim.num_water;
+
+    let total_pass_mean: f64 = per_label
+        .values()
+        .map(|v| v.iter().sum::<f64>() / v.len().max(1) as f64)
+        .sum();
+    let mut gpu_passes: Vec<PassStat> = per_label
+        .into_iter()
+        .map(|(label, samples)| {
+            let stat = Stat::from_samples(samples);
+            let passes =
+                *label_dispatch_count.get(&label).unwrap_or(&0) as f64 / run.measured.max(1) as f64;
+            let meta = label_meta
+                .get(&label)
+                .expect("profile label metadata recorded with samples");
+            PassStat {
+                label,
+                display_label: meta.display.clone(),
+                category: meta.category.clone(),
+                passes_per_frame: passes,
+                share_of_gpu_pct: if total_pass_mean > 0.0 {
+                    stat.mean_ms / total_pass_mean * 100.0
+                } else {
+                    0.0
+                },
+                mean_ms: stat.mean_ms,
+                min_ms: stat.min_ms,
+                max_ms: stat.max_ms,
+                p50_ms: stat.p50_ms,
+                p95_ms: stat.p95_ms,
+                total_ms: stat.total_ms,
+            }
+        })
+        .collect();
+    gpu_passes.sort_by(|a, b| b.mean_ms.total_cmp(&a.mean_ms));
+
+    let frame_timings = FrameTimings {
+        production_frame: Stat::from_samples(production_ms),
+        instrumented_wall: Stat::from_samples(wall_ms),
+        gpu_passes_sum: Stat::from_samples(gpu_passes_sum),
+        gpu_wait: Stat::from_samples(gpu_wait),
+        gpu_unattributed: Stat::from_samples(gpu_unattributed),
+        cpu_emit: Stat::from_samples(cpu_emit),
+        cpu_uniforms: Stat::from_samples(cpu_uniforms),
+        cpu_encode: Stat::from_samples(cpu_encode),
+        cpu_submit: Stat::from_samples(cpu_submit),
+    };
+
+    let mut bottlenecks = Vec::new();
+    for pass in gpu_passes.iter().take(5) {
+        bottlenecks.push(format!(
+            "{}: {:.3} ms/frame ({:.1}% of GPU pass time, {:.0} passes/frame)",
+            pass.label, pass.mean_ms, pass.share_of_gpu_pct, pass.passes_per_frame
+        ));
+    }
+    bottlenecks.push(
+        "XPBD backend uses GPU prediction, spatial hash, density constraints, bounds constraints, \
+         and velocity update over the shared particle buffers; it remains excluded from `all` until \
+         its physics and parity against the app path are validated."
+            .to_string(),
+    );
+
+    let report = ProfileReport {
+        schema_version: 2,
+        metadata: Metadata {
+            scene: run.scene.to_string(),
+            adapter: ctx.info.name.clone(),
+            backend: format!("{:?}", ctx.info.backend),
+            device_type: format!("{:?}", ctx.info.device_type),
+            timestamps_supported: ctx.timestamps_supported,
+            timestamp_period_ns: ctx.period_ns,
+            warmup_frames: run.warmup,
+            measured_frames: run.measured,
+            calibration_frames: run.calibration,
+            substeps_per_frame: substeps,
+            frame_dt_s: FRAME_DT,
+            grid_dims,
+            total_cells,
+            max_particles,
+            solver: SolverMetadata {
+                backend: solver.backend().to_string(),
+                pressure: None,
+                dfsph: None,
+                xpbd: Some(XpbdSolverMetadata {
+                    kind: kind.to_string(),
+                    constraint_iterations_per_substep: XPBD_CONSTRAINT_ITERATIONS,
+                }),
+            },
+            pressure_rbgs_pairs: 0,
+            water_particles_start,
+            water_particles_end,
+            bed_particles,
+            total_particles_end: water_particles_end + bed_particles,
+        },
+        frame_timings,
+        gpu_passes,
+        bottlenecks,
+    };
+
+    let path = output_path_for_solver(run.base_output_path, solver, run.multiple_outputs);
+    write_report(&path, &report);
+    print_report_summary(&path, &report);
+}
+
 #[test]
 #[ignore = "profiling harness; run explicitly with --ignored --release"]
 fn profile_mpm_pipeline() {
@@ -1809,11 +2193,9 @@ fn profile_mpm_pipeline() {
             SolverSpec::Dfsph => {
                 profile_dfsph_solver(&device_ctx, &run, solver);
             }
-            SolverSpec::Xpbd { .. } => panic!(
-                "XPBD profiler backend is registered but not yet ported into \
-                 codex/modular-solver-profiler; xpbd-solver-rewrite currently \
-                 contains stub GPU kernels, so implement real GPU passes before profiling it"
-            ),
+            SolverSpec::Xpbd { solver: kind } => {
+                profile_xpbd_solver(&device_ctx, &run, solver, kind);
+            }
         }
     }
 }
