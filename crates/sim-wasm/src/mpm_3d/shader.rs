@@ -2809,6 +2809,40 @@ fn pressure_residual(@builtin(global_invocation_id) gid: vec3<u32>) {
     pressure_cg_persistent_pressure_store(idx, pressure_load(idx));
 }
 
+@compute @workgroup_size(64)
+fn pressure_residual_staggered(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if idx >= total_cells() { return; }
+
+    let kind = cell_kind_load(idx);
+    if !pressure_cg_is_active(idx) {
+        return;
+    }
+
+    let iz_val = idx / (gx() * gy());
+    let rem = idx % (gx() * gy());
+    let iy_val = rem / gx();
+    let ix_val = rem % gx();
+    let cell = vec3<i32>(i32(ix_val), i32(iy_val), i32(iz_val));
+    if !staggered_pressure_cell_in_bounds(cell) {
+        return;
+    }
+
+    let div = staggered_pressure_cell_divergence(cell);
+    let target_divergence = staggered_pressure_projection_target_divergence(idx, kind, cell);
+    let abs_residual = abs(div - target_divergence);
+    let fp_max = u32(clamp(abs_residual * metrics_div_fp_scale(), 0.0, f32(0x7fffffffu)));
+    let fp_sum = u32(clamp(
+        abs_residual * metrics_residual_sum_fp_scale(),
+        0.0,
+        f32(0xffffffffu),
+    ));
+    atomicMax(&metrics[METRIC_PROJECTION_RESIDUAL_MAX_IDX], fp_max);
+    atomicAdd(&metrics[METRIC_PROJECTION_RESIDUAL_SUM_IDX], fp_sum);
+    atomicAdd(&metrics[METRIC_PROJECTION_RESIDUAL_CELLS_IDX], 1u);
+    pressure_cg_persistent_pressure_store(idx, pressure_load(idx));
+}
+
 // ── packing pressure ──
 
 fn packing_pressure_or_mirror(cell: vec3<i32>, mirror_pressure: f32) -> f32 {
@@ -3771,6 +3805,7 @@ mod tests {
     fn staged_staggered_pressure_helpers_are_present() {
         assert!(MPM_COMPUTE_SHADER.contains("fn classify_cells_staggered("));
         assert!(MPM_COMPUTE_SHADER.contains("fn project_pressure_staggered("));
+        assert!(MPM_COMPUTE_SHADER.contains("fn pressure_residual_staggered("));
         assert!(MPM_COMPUTE_SHADER.contains("fn staggered_pressure_cell_divergence("));
         assert!(MPM_COMPUTE_SHADER.contains("fn staggered_pressure_node_gradient("));
         assert!(MPM_COMPUTE_SHADER.contains("fn staggered_pressure_node_fill_weight("));
