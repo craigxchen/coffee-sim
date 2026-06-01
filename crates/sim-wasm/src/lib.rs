@@ -1,7 +1,11 @@
-#![cfg_attr(test, allow(dead_code))]
+#![cfg_attr(any(test, feature = "native-profiler"), allow(dead_code))]
+#![cfg_attr(
+    feature = "native-profiler",
+    allow(clippy::manual_clamp, clippy::too_many_arguments)
+)]
 
-#[cfg(any(target_arch = "wasm32", test))]
-pub(crate) mod mpm_3d;
+#[cfg(any(target_arch = "wasm32", test, feature = "native-profiler"))]
+pub mod mpm_3d;
 #[cfg(target_arch = "wasm32")]
 mod renderer;
 

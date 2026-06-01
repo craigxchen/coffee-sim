@@ -8,12 +8,15 @@ the ignored Rust test:
 cargo test -p coffee-sim-wasm --lib --release profile_mpm_pipeline -- --ignored --nocapture
 ```
 
-Runtime selection can come from `COFFEE_SIM_PROFILE_ARGS` or individual
-environment variables. `COFFEE_SIM_PROFILE_ARGS` accepts CLI-style flags or
-kwargs-style key/value pairs. Cargo's test harness rejects unknown arguments
-after `--`, so prefer the environment form for profiler runs. Examples:
+Runtime selection can come from a native profiler binary, `COFFEE_SIM_PROFILE_ARGS`,
+or individual environment variables. `COFFEE_SIM_PROFILE_ARGS` accepts CLI-style
+flags or kwargs-style key/value pairs. Cargo's test harness rejects unknown
+arguments after `--`, so use the feature-gated binary for real command-line
+selection and the environment form for ignored-test runs. Examples:
 
 ```text
+cargo run -p coffee-sim-wasm --features native-profiler --bin profile_solvers -- \
+  --scene center_pour --solvers all --frames 120 --warmup 60 --cal 30
 COFFEE_SIM_PROFILE_ARGS="scene=center_pour solvers=all frames=120 warmup=60 cal=30" \
   cargo test -p coffee-sim-wasm --lib --release profile_mpm_pipeline -- --ignored --nocapture
 COFFEE_SIM_PROFILE_ARGS="--scene water_block --solver mpm:sparse-cg --pressure-operator collocated" \

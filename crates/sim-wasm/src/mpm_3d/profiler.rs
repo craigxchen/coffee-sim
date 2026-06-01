@@ -44,7 +44,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::mpsc;
 use std::time::Instant;
@@ -267,12 +267,17 @@ impl ProfilerCliArgs {
             cli.merge(Self::parse(value.split_whitespace()).unwrap_or_else(|err| panic!("{err}")));
         }
 
-        let mut args = std::env::args().skip(1).peekable();
+        let raw_args = std::env::args().skip(1).collect::<Vec<_>>();
+        let mut args = raw_args.iter();
         while let Some(arg) = args.next() {
             if arg == "--profile" || arg == "--profile-args" {
                 cli.merge(Self::parse(args).unwrap_or_else(|err| panic!("{err}")));
-                break;
+                return cli;
             }
+        }
+
+        if !cfg!(test) && !raw_args.is_empty() {
+            cli.merge(Self::parse(raw_args).unwrap_or_else(|err| panic!("{err}")));
         }
 
         cli
@@ -1748,9 +1753,9 @@ fn output_path(cli: &ProfilerCliArgs) -> PathBuf {
     ))
 }
 
-fn output_path_for_solver(base: &PathBuf, solver: SolverSpec, multiple: bool) -> PathBuf {
+fn output_path_for_solver(base: &Path, solver: SolverSpec, multiple: bool) -> PathBuf {
     if !multiple {
-        return base.clone();
+        return base.to_path_buf();
     }
     let stem = base
         .file_stem()
@@ -2072,7 +2077,7 @@ struct ProfilerDeviceContext<'a> {
     period_ns: f32,
 }
 
-fn write_report(path: &PathBuf, report: &ProfileReport) {
+fn write_report(path: &Path, report: &ProfileReport) {
     let json = serde_json::to_string_pretty(report).expect("serialize report");
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).expect("create output dir");
@@ -2080,7 +2085,7 @@ fn write_report(path: &PathBuf, report: &ProfileReport) {
     std::fs::write(path, json).expect("write profile json");
 }
 
-fn print_report_summary(path: &PathBuf, report: &ProfileReport) {
+fn print_report_summary(path: &Path, report: &ProfileReport) {
     let solver_kind = report
         .metadata
         .solver
@@ -2451,9 +2456,8 @@ fn profile_solver_backend(
     print_report_summary(&path, &report);
 }
 
-#[test]
-#[ignore = "profiling harness; run explicitly with --ignored --release"]
-fn profile_mpm_pipeline() {
+pub fn run_profile_from_env_args() {
+    let cli = ProfilerCliArgs::from_env_args();
     let Some(adapter) = request_adapter() else {
         eprintln!("profile_mpm_pipeline: no GPU adapter available; skipping.");
         return;
@@ -2478,7 +2482,6 @@ fn profile_mpm_pipeline() {
     .expect("request profiler device");
 
     let info = adapter.get_info();
-    let cli = ProfilerCliArgs::from_env_args();
     let scene = cli
         .scene
         .clone()
@@ -2552,4 +2555,10 @@ fn profile_mpm_pipeline() {
     for &solver in &solvers {
         solver.profile(&device_ctx, &run);
     }
+}
+
+#[test]
+#[ignore = "profiling harness; run explicitly with --ignored --release"]
+fn profile_mpm_pipeline() {
+    run_profile_from_env_args();
 }
