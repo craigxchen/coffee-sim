@@ -1390,6 +1390,15 @@ struct XpbdSolverMetadata {
     constraint_iterations_per_substep: u32,
 }
 
+#[derive(Clone, Debug, Serialize)]
+struct SolverRunMetadata {
+    requested: Vec<String>,
+    current: String,
+    ordinal: usize,
+    count: usize,
+    multiple_outputs: bool,
+}
+
 #[derive(Serialize)]
 struct Metadata {
     scene: String,
@@ -1407,6 +1416,7 @@ struct Metadata {
     total_cells: u32,
     max_particles: u32,
     solver: SolverMetadata,
+    solver_run: SolverRunMetadata,
     pressure_rbgs_pairs: u32,
     water_particles_start: u32,
     water_particles_end: u32,
@@ -1793,6 +1803,58 @@ fn profiler_cli_solver_overrides_expand_to_specs() {
 }
 
 #[test]
+fn profiler_output_path_for_solver_keeps_multi_solver_outputs_distinct() {
+    let base = PathBuf::from("target/coffee-sim-profile.json");
+    assert_eq!(
+        output_path_for_solver(&base, SolverSpec::Dfsph, false),
+        base
+    );
+    assert_eq!(
+        output_path_for_solver(&base, SolverSpec::Dfsph, true),
+        PathBuf::from("target/coffee-sim-profile-dfsph.json")
+    );
+    assert_eq!(
+        output_path_for_solver(
+            &base,
+            SolverSpec::Xpbd {
+                solver: XpbdSolverKind::Gpu
+            },
+            true,
+        ),
+        PathBuf::from("target/coffee-sim-profile-xpbd-gpu.json")
+    );
+}
+
+#[test]
+fn profiler_solver_run_metadata_records_requested_same_scene_set() {
+    let base = PathBuf::from("target/profile.json");
+    let solvers = vec![
+        SolverSpec::mpm(PressureSolverKind::Rbgs),
+        SolverSpec::Dfsph,
+        SolverSpec::Xpbd {
+            solver: XpbdSolverKind::Gpu,
+        },
+    ];
+    let run = ProfilerRunConfig {
+        scene: ProfileScene::CenterPour,
+        warmup: 1,
+        measured: 1,
+        calibration: 1,
+        cg_iterations: None,
+        solver_ids: solvers.iter().copied().map(SolverSpec::id).collect(),
+        base_output_path: &base,
+        multiple_outputs: true,
+    };
+
+    let metadata = solver_run_metadata(&run, SolverSpec::Dfsph);
+    assert_eq!(metadata.requested, vec!["mpm-rbgs", "dfsph", "xpbd-gpu"]);
+    assert_eq!(metadata.current, "dfsph");
+    assert_eq!(metadata.ordinal, 2);
+    assert_eq!(metadata.count, 3);
+    assert!(metadata.multiple_outputs);
+}
+
+#[test]
 fn profiler_scenes_parse_shared_profile_scene_ids() {
     assert_eq!(
         "center_pour".parse::<ProfileScene>(),
@@ -1815,6 +1877,7 @@ struct ProfilerRunConfig<'a> {
     measured: u32,
     calibration: u32,
     cg_iterations: Option<u32>,
+    solver_ids: Vec<String>,
     base_output_path: &'a PathBuf,
     multiple_outputs: bool,
 }
@@ -1900,6 +1963,23 @@ fn print_report_summary(path: &PathBuf, report: &ProfileReport) {
         );
     }
     println!("\nJSON written to: {}", path.display());
+}
+
+fn solver_run_metadata(run: &ProfilerRunConfig<'_>, solver: SolverSpec) -> SolverRunMetadata {
+    let current = solver.id();
+    let ordinal = run
+        .solver_ids
+        .iter()
+        .position(|id| id == &current)
+        .map(|index| index + 1)
+        .unwrap_or(1);
+    SolverRunMetadata {
+        requested: run.solver_ids.clone(),
+        current,
+        ordinal,
+        count: run.solver_ids.len(),
+        multiple_outputs: run.multiple_outputs,
+    }
 }
 
 fn profile_mpm_solver(
@@ -1997,6 +2077,7 @@ fn profile_mpm_solver(
                 dfsph: None,
                 xpbd: None,
             },
+            solver_run: solver_run_metadata(run, solver),
             pressure_rbgs_pairs,
             water_particles_start,
             water_particles_end,
@@ -2096,6 +2177,7 @@ fn profile_dfsph_solver(
                 }),
                 xpbd: None,
             },
+            solver_run: solver_run_metadata(run, solver),
             pressure_rbgs_pairs: sim
                 .last_pressure_rbgs_pairs
                 .max(sim.settings.pressure_rbgs_pairs),
@@ -2198,6 +2280,7 @@ fn profile_xpbd_solver(
                     constraint_iterations_per_substep: XPBD_CONSTRAINT_ITERATIONS,
                 }),
             },
+            solver_run: solver_run_metadata(run, solver),
             pressure_rbgs_pairs: 0,
             water_particles_start,
             water_particles_end,
@@ -2250,6 +2333,11 @@ fn profile_mpm_pipeline() {
         .parse::<ProfileScene>()
         .unwrap_or_else(|err| panic!("{err}"));
     let solvers = profile_solver_specs(&cli);
+    let solver_ids = solvers
+        .iter()
+        .copied()
+        .map(SolverSpec::id)
+        .collect::<Vec<_>>();
     let warmup = cli
         .warmup
         .or_else(|| env_u32("COFFEE_SIM_PROFILE_WARMUP"))
@@ -2288,6 +2376,7 @@ fn profile_mpm_pipeline() {
         cg_iterations: cli
             .cg_iterations
             .or_else(|| env_u32("COFFEE_SIM_PROFILE_CG_ITERATIONS")),
+        solver_ids,
         base_output_path: &base_output_path,
         multiple_outputs,
     };
