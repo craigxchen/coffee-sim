@@ -53,7 +53,7 @@ use super::pressure::{PressureContext, PressureSolverKind};
 use super::state::{METRICS_SLOT_COUNT, NUM_THREADS};
 use super::{
     dispatch_size, encode_mpm_substep_schedule, required_limits, MpmDispatch, MpmDispatchSizes,
-    MpmPassLabel, MpmScheduleOp, MpmSettings, MpmSim3D,
+    MpmPassLabel, MpmScheduleOp, MpmSettings, MpmSim3D, MIN_TIMESTAMP_QUERY_CAPACITY,
 };
 
 const DEFAULT_WARMUP_FRAMES: u32 = 60;
@@ -286,6 +286,14 @@ struct ProfilePassLabel {
 }
 
 impl ProfilePassLabel {
+    fn new(id: &'static str, display: &'static str, category: &'static str) -> Self {
+        Self {
+            id: id.to_string(),
+            display: display.to_string(),
+            category: category.to_string(),
+        }
+    }
+
     fn mpm(label: MpmPassLabel) -> Self {
         Self {
             id: label.id().to_string(),
@@ -375,6 +383,26 @@ fn timed_pass(
             pass.dispatch_workgroups_indirect(buffer, offset);
         }
     }
+}
+
+/// Encode one timed single-pipeline compute pass with a solver-neutral label.
+fn timed_profile_pass(
+    encoder: &mut wgpu::CommandEncoder,
+    rec: &mut FrameRecorder<'_>,
+    bind_group: &wgpu::BindGroup,
+    label: ProfilePassLabel,
+    pipeline: &wgpu::ComputePipeline,
+    workgroups: u32,
+) {
+    let pass_label = label.display.clone();
+    let timestamp_writes = rec.writes(label);
+    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        label: Some(pass_label.as_str()),
+        timestamp_writes,
+    });
+    pass.set_bind_group(0, bind_group, &[]);
+    pass.set_pipeline(pipeline);
+    pass.dispatch_workgroups(workgroups, 1, 1);
 }
 
 // ── Per-frame accumulators ──
@@ -547,6 +575,172 @@ fn step_frame_instrumented(
     sums
 }
 
+fn fold_timestamp_scopes(
+    sums: &mut FrameSums,
+    timer: &GpuTimer,
+    device: &wgpu::Device,
+    rec: &FrameRecorder<'_>,
+) {
+    let ticks = timer.read_ticks(device, rec.next);
+    for (label, b, e) in &rec.scopes {
+        let delta = ticks[*e as usize].saturating_sub(ticks[*b as usize]);
+        let pass_ms = delta as f64 * timer.period_ns as f64 / 1.0e6;
+        sums.per_label_meta
+            .entry(label.id.clone())
+            .or_insert_with(|| ProfilePassMeta {
+                display: label.display.clone(),
+                category: label.category.clone(),
+            });
+        *sums.per_label_ms.entry(label.id.clone()).or_insert(0.0) += pass_ms;
+        *sums.per_label_count.entry(label.id.clone()).or_insert(0) += 1;
+        sums.gpu_passes_ms += pass_ms;
+    }
+}
+
+fn step_frame_dfsph_instrumented(
+    sim: &mut MpmSim3D,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    dt: f32,
+    timer: Option<&GpuTimer>,
+) -> FrameSums {
+    let dt = dt.min(1.0 / 30.0);
+    let substeps = sim.settings.substeps.max(1);
+    let sub_dt = dt / substeps as f32;
+    let mass_per_particle = MASS_UNITS_PER_ML / PARTICLES_PER_ML;
+    let mut sums = FrameSums::default();
+
+    for _ in 0..substeps {
+        let t = Instant::now();
+        let EmissionResult { emitted, .. } = sim.inflow.emit_particles(
+            queue,
+            &sim.buffers,
+            &sim.settings.spout,
+            sub_dt,
+            mass_per_particle,
+            sim.num_water,
+            sim.num_bed,
+            sim.settings.max_particles,
+        );
+        sim.num_water += emitted;
+        sums.cpu_emit_ms += ms(t);
+
+        let t = Instant::now();
+        sim.write_uniforms(queue, sub_dt);
+        sums.cpu_uniforms_ms += ms(t);
+
+        let total_cells =
+            sim.settings.grid_dims[0] * sim.settings.grid_dims[1] * sim.settings.grid_dims[2];
+        let water_hash_wg = dispatch_size(total_cells + sim.settings.max_particles, NUM_THREADS);
+        let water_wg = dispatch_size(sim.num_water, NUM_THREADS);
+
+        let t_encode = Instant::now();
+        let mut rec = FrameRecorder::new(timer);
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("dfsph profiled step"),
+        });
+        let dfsph = &sim.pipelines.dfsph;
+        timed_profile_pass(
+            &mut encoder,
+            &mut rec,
+            &dfsph.bind_group,
+            ProfilePassLabel::new("dfsph.hash_clear", "dfsph_hash_clear", "dfsph"),
+            &dfsph.water_hash_clear,
+            water_hash_wg,
+        );
+        if water_wg > 0 {
+            timed_profile_pass(
+                &mut encoder,
+                &mut rec,
+                &dfsph.bind_group,
+                ProfilePassLabel::new("dfsph.hash_scatter", "dfsph_hash_scatter", "dfsph"),
+                &dfsph.water_hash_scatter,
+                water_wg,
+            );
+            timed_profile_pass(
+                &mut encoder,
+                &mut rec,
+                &dfsph.bind_group,
+                ProfilePassLabel::new("dfsph.density_factor", "dfsph_density_factor", "dfsph"),
+                &dfsph.density_factor,
+                water_wg,
+            );
+            timed_profile_pass(
+                &mut encoder,
+                &mut rec,
+                &dfsph.bind_group,
+                ProfilePassLabel::new(
+                    "dfsph.divergence_estimate",
+                    "dfsph_divergence_estimate",
+                    "dfsph",
+                ),
+                &dfsph.divergence_estimate,
+                water_wg,
+            );
+            timed_profile_pass(
+                &mut encoder,
+                &mut rec,
+                &dfsph.bind_group,
+                ProfilePassLabel::new("dfsph.divergence_solve", "dfsph_divergence_solve", "dfsph"),
+                &dfsph.divergence_solve,
+                water_wg,
+            );
+            timed_profile_pass(
+                &mut encoder,
+                &mut rec,
+                &dfsph.bind_group,
+                ProfilePassLabel::new(
+                    "dfsph.predict_nonpressure",
+                    "dfsph_predict_nonpressure",
+                    "dfsph",
+                ),
+                &dfsph.predict_nonpressure,
+                water_wg,
+            );
+            for _ in 0..2 {
+                timed_profile_pass(
+                    &mut encoder,
+                    &mut rec,
+                    &dfsph.bind_group,
+                    ProfilePassLabel::new("dfsph.density_star", "dfsph_density_star", "dfsph"),
+                    &dfsph.density_star,
+                    water_wg,
+                );
+                timed_profile_pass(
+                    &mut encoder,
+                    &mut rec,
+                    &dfsph.bind_group,
+                    ProfilePassLabel::new("dfsph.density_solve", "dfsph_density_solve", "dfsph"),
+                    &dfsph.density_solve,
+                    water_wg,
+                );
+            }
+        }
+        let used = rec.next;
+        if let Some(t) = timer {
+            encoder.resolve_query_set(&t.query_set, 0..used, &t.resolve_buf, 0);
+            encoder.copy_buffer_to_buffer(&t.resolve_buf, 0, &t.read_buf, 0, (used as u64) * 8);
+        }
+        sums.cpu_encode_ms += ms(t_encode);
+
+        let t_submit = Instant::now();
+        queue.submit(Some(encoder.finish()));
+        sums.cpu_submit_ms += ms(t_submit);
+
+        let t_wait = Instant::now();
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        sums.gpu_wait_ms += ms(t_wait);
+
+        if let Some(t) = timer {
+            fold_timestamp_scopes(&mut sums, t, device, &rec);
+        }
+
+        sim.total_time += sub_dt;
+    }
+
+    sums
+}
+
 fn ms(start: Instant) -> f64 {
     start.elapsed().as_secs_f64() * 1000.0
 }
@@ -609,6 +803,8 @@ struct SolverMetadata {
     #[serde(skip_serializing_if = "Option::is_none")]
     pressure: Option<PressureSolverMetadata>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    dfsph: Option<DfsphSolverMetadata>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     xpbd: Option<XpbdSolverMetadata>,
 }
 
@@ -616,6 +812,13 @@ struct SolverMetadata {
 struct PressureSolverMetadata {
     kind: String,
     iterations_per_substep: u32,
+}
+
+#[derive(Serialize)]
+struct DfsphSolverMetadata {
+    kind: String,
+    divergence_iterations_per_substep: u32,
+    density_iterations_per_substep: u32,
 }
 
 #[derive(Serialize)]
@@ -870,6 +1073,14 @@ fn print_report_summary(path: &PathBuf, report: &ProfileReport) {
             report
                 .metadata
                 .solver
+                .dfsph
+                .as_ref()
+                .map(|dfsph| dfsph.kind.as_str())
+        })
+        .or_else(|| {
+            report
+                .metadata
+                .solver
                 .xpbd
                 .as_ref()
                 .map(|xpbd| xpbd.kind.as_str())
@@ -1088,9 +1299,183 @@ fn profile_mpm_solver(
                     kind: sim.pressure_solver_kind().to_string(),
                     iterations_per_substep: sim.pressure_solver_iterations_per_substep(),
                 }),
+                dfsph: None,
                 xpbd: None,
             },
             pressure_rbgs_pairs,
+            water_particles_start,
+            water_particles_end,
+            bed_particles,
+            total_particles_end: water_particles_end + bed_particles,
+        },
+        frame_timings,
+        gpu_passes,
+        bottlenecks,
+    };
+
+    let path = output_path_for_solver(run.base_output_path, solver, run.multiple_outputs);
+    write_report(&path, &report);
+    print_report_summary(&path, &report);
+}
+
+fn profile_dfsph_solver(
+    ctx: &ProfilerDeviceContext<'_>,
+    run: &ProfilerRunConfig<'_>,
+    solver: SolverSpec,
+) {
+    let settings = run.scene.mpm_settings();
+    let grid_dims = settings.grid_dims;
+    let total_cells = grid_dims[0] * grid_dims[1] * grid_dims[2];
+    let max_particles = settings.max_particles;
+    let substeps = settings.substeps.max(1);
+    let mut sim = MpmSim3D::new(ctx.device, ctx.queue, settings);
+
+    for _ in 0..run.warmup {
+        step_frame_dfsph_instrumented(&mut sim, ctx.device, ctx.queue, FRAME_DT, None);
+    }
+    let _ = ctx.device.poll(wgpu::PollType::wait_indefinitely());
+
+    let bed_particles = sim.num_bed;
+    let mut production_ms = Vec::with_capacity(run.calibration as usize);
+    for _ in 0..run.calibration {
+        let t = Instant::now();
+        step_frame_dfsph_instrumented(&mut sim, ctx.device, ctx.queue, FRAME_DT, None);
+        let _ = ctx.device.poll(wgpu::PollType::wait_indefinitely());
+        production_ms.push(ms(t));
+    }
+
+    let timer = ctx
+        .timestamps_supported
+        .then(|| GpuTimer::new(ctx.device, ctx.period_ns, MIN_TIMESTAMP_QUERY_CAPACITY));
+    let mut wall_ms = Vec::with_capacity(run.measured as usize);
+    let mut gpu_passes_sum = Vec::with_capacity(run.measured as usize);
+    let mut gpu_wait = Vec::with_capacity(run.measured as usize);
+    let mut gpu_unattributed = Vec::with_capacity(run.measured as usize);
+    let mut cpu_emit = Vec::with_capacity(run.measured as usize);
+    let mut cpu_uniforms = Vec::with_capacity(run.measured as usize);
+    let mut cpu_encode = Vec::with_capacity(run.measured as usize);
+    let mut cpu_submit = Vec::with_capacity(run.measured as usize);
+    let mut per_label: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+    let mut label_dispatch_count: BTreeMap<String, u64> = BTreeMap::new();
+    let mut label_meta: BTreeMap<String, ProfilePassMeta> = BTreeMap::new();
+
+    let water_particles_start = sim.num_water;
+    for _ in 0..run.measured {
+        let t = Instant::now();
+        let sums = step_frame_dfsph_instrumented(
+            &mut sim,
+            ctx.device,
+            ctx.queue,
+            FRAME_DT,
+            timer.as_ref(),
+        );
+        wall_ms.push(ms(t));
+        gpu_passes_sum.push(sums.gpu_passes_ms);
+        gpu_wait.push(sums.gpu_wait_ms);
+        gpu_unattributed.push((sums.gpu_wait_ms - sums.gpu_passes_ms).max(0.0));
+        cpu_emit.push(sums.cpu_emit_ms);
+        cpu_uniforms.push(sums.cpu_uniforms_ms);
+        cpu_encode.push(sums.cpu_encode_ms);
+        cpu_submit.push(sums.cpu_submit_ms);
+        for (label, value) in sums.per_label_ms {
+            per_label.entry(label).or_default().push(value);
+        }
+        for (label, count) in sums.per_label_count {
+            *label_dispatch_count.entry(label).or_insert(0) += count as u64;
+        }
+        for (label, meta) in sums.per_label_meta {
+            label_meta.entry(label).or_insert(meta);
+        }
+    }
+    let water_particles_end = sim.num_water;
+
+    let total_pass_mean: f64 = per_label
+        .values()
+        .map(|v| v.iter().sum::<f64>() / v.len().max(1) as f64)
+        .sum();
+    let mut gpu_passes: Vec<PassStat> = per_label
+        .into_iter()
+        .map(|(label, samples)| {
+            let stat = Stat::from_samples(samples);
+            let passes =
+                *label_dispatch_count.get(&label).unwrap_or(&0) as f64 / run.measured.max(1) as f64;
+            let meta = label_meta
+                .get(&label)
+                .expect("profile label metadata recorded with samples");
+            PassStat {
+                label,
+                display_label: meta.display.clone(),
+                category: meta.category.clone(),
+                passes_per_frame: passes,
+                share_of_gpu_pct: if total_pass_mean > 0.0 {
+                    stat.mean_ms / total_pass_mean * 100.0
+                } else {
+                    0.0
+                },
+                mean_ms: stat.mean_ms,
+                min_ms: stat.min_ms,
+                max_ms: stat.max_ms,
+                p50_ms: stat.p50_ms,
+                p95_ms: stat.p95_ms,
+                total_ms: stat.total_ms,
+            }
+        })
+        .collect();
+    gpu_passes.sort_by(|a, b| b.mean_ms.total_cmp(&a.mean_ms));
+
+    let frame_timings = FrameTimings {
+        production_frame: Stat::from_samples(production_ms),
+        instrumented_wall: Stat::from_samples(wall_ms),
+        gpu_passes_sum: Stat::from_samples(gpu_passes_sum),
+        gpu_wait: Stat::from_samples(gpu_wait),
+        gpu_unattributed: Stat::from_samples(gpu_unattributed),
+        cpu_emit: Stat::from_samples(cpu_emit),
+        cpu_uniforms: Stat::from_samples(cpu_uniforms),
+        cpu_encode: Stat::from_samples(cpu_encode),
+        cpu_submit: Stat::from_samples(cpu_submit),
+    };
+
+    let mut bottlenecks = Vec::new();
+    for pass in gpu_passes.iter().take(5) {
+        bottlenecks.push(format!(
+            "{}: {:.3} ms/frame ({:.1}% of GPU pass time, {:.0} passes/frame)",
+            pass.label, pass.mean_ms, pass.share_of_gpu_pct, pass.passes_per_frame
+        ));
+    }
+    bottlenecks.push(
+        "DFSPH backend currently profiles the GPU water pressure-correction sequence; \
+         hybrid grid tail integration remains a follow-up before adding it to `all`."
+            .to_string(),
+    );
+
+    let report = ProfileReport {
+        schema_version: 2,
+        metadata: Metadata {
+            scene: run.scene.to_string(),
+            adapter: ctx.info.name.clone(),
+            backend: format!("{:?}", ctx.info.backend),
+            device_type: format!("{:?}", ctx.info.device_type),
+            timestamps_supported: ctx.timestamps_supported,
+            timestamp_period_ns: ctx.period_ns,
+            warmup_frames: run.warmup,
+            measured_frames: run.measured,
+            calibration_frames: run.calibration,
+            substeps_per_frame: substeps,
+            frame_dt_s: FRAME_DT,
+            grid_dims,
+            total_cells,
+            max_particles,
+            solver: SolverMetadata {
+                backend: solver.backend().to_string(),
+                pressure: None,
+                dfsph: Some(DfsphSolverMetadata {
+                    kind: "water".to_string(),
+                    divergence_iterations_per_substep: 1,
+                    density_iterations_per_substep: 2,
+                }),
+                xpbd: None,
+            },
+            pressure_rbgs_pairs: 0,
             water_particles_start,
             water_particles_end,
             bed_particles,
@@ -1173,11 +1558,9 @@ fn profile_mpm_pipeline() {
             SolverSpec::Mpm { pressure } => {
                 profile_mpm_solver(&device_ctx, &run, solver, pressure);
             }
-            SolverSpec::Dfsph => panic!(
-                "DFSPH profiler backend is registered but not yet ported into \
-                 codex/modular-solver-profiler; integrate codex/dfsph-water state, \
-                 pipelines, and schedule before profiling it"
-            ),
+            SolverSpec::Dfsph => {
+                profile_dfsph_solver(&device_ctx, &run, solver);
+            }
             SolverSpec::Xpbd { .. } => panic!(
                 "XPBD profiler backend is registered but not yet ported into \
                  codex/modular-solver-profiler; integrate xpbd-solver-rewrite \
