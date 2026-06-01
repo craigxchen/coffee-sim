@@ -2324,6 +2324,60 @@ fn profiler_report_verifier_accepts_same_scene_solver_set() {
 }
 
 #[test]
+fn profiler_report_verifier_reads_expected_output_files() {
+    let base = PathBuf::from(format!(
+        "target/profiler-verify-read-{}.json",
+        std::process::id()
+    ));
+    let args = ProfilerCliArgs::from_env_and_args(
+        None,
+        [
+            "--scene",
+            "water_block",
+            "--solvers",
+            "mpm:rbgs,xpbd:gpu",
+            "--frames",
+            "3",
+            "--warmup",
+            "2",
+            "--cal",
+            "1",
+            "--out",
+            base.to_str().expect("utf8 test path"),
+        ],
+        true,
+    );
+    let selection = ProfileSelection::from_cli_with_env(&args, |_| None);
+    let mut written_paths = Vec::new();
+    for (index, &solver) in selection.solvers.iter().enumerate() {
+        let path = output_path_for_solver(&selection.base_output_path, solver, true);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create verifier test output dir");
+        }
+        std::fs::write(
+            &path,
+            serde_json::to_string(&minimal_profile_report_json(&selection, solver, index + 1))
+                .expect("serialize minimal report"),
+        )
+        .expect("write verifier test report");
+        written_paths.push(path);
+    }
+
+    let verification = selection
+        .verify_reports()
+        .expect("file-backed reports verify");
+    assert_eq!(verification.reports, 2);
+    assert_eq!(
+        verification.solvers,
+        vec!["mpm-rbgs".to_string(), "xpbd-gpu".to_string()]
+    );
+
+    for path in written_paths {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+#[test]
 fn profiler_report_verifier_rejects_mixed_scene_reports() {
     let base = PathBuf::from("target/profile.json");
     let args = ProfilerCliArgs::from_env_and_args(
