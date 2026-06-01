@@ -2526,12 +2526,20 @@ fn pressure_cg_init(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
 
-    pressure_store(idx, 0.0);
+    // Warm-start from the previous frame's solution (like
+    // pressure_cg_init_staggered): pressure_cg_warmstart reads this back as x0,
+    // forms r = b - A x0, and owns the initial r*z metric, so init must not add
+    // r*z here too (that double-counts METRIC_CG_RZ_IDX and doubles the first
+    // CG step).
+    let p0 = clamp(
+        pressure_cg_persistent_pressure_load(idx),
+        -pressure_clamp_limit(),
+        pressure_clamp_limit(),
+    );
+    pressure_store(idx, p0);
     pressure_cg_state_store(idx, vec4<f32>(rhs, z, z, 0.0));
     let active_slot = atomicAdd(&metrics[METRIC_PRESSURE_ACTIVE_COUNT_IDX], 1u);
     pressure_cg_active_cell_list_store(active_slot, idx);
-    pressure_cg_dot_add(METRIC_CG_RZ_IDX, rhs * z);
-    pressure_cg_dot_add(METRIC_PRESSURE_INITIAL_RZ_IDX, rhs * z);
 }
 
 @compute @workgroup_size(64)
