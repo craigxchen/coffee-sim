@@ -258,6 +258,7 @@ struct ProfilerCliArgs {
     calibration: Option<u32>,
     output: Option<PathBuf>,
     cg_iterations: Option<u32>,
+    dry_run: bool,
 }
 
 impl ProfilerCliArgs {
@@ -327,6 +328,7 @@ impl ProfilerCliArgs {
                 "cal" | "calibration" => "--cal".to_string(),
                 "out" | "output" => "--out".to_string(),
                 "cg_iterations" | "cg-iterations" => "--cg-iterations".to_string(),
+                "dry_run" | "dry-run" => "--dry-run".to_string(),
                 _ => flag,
             };
             let mut take_value = |name: &str| -> Result<String, String> {
@@ -360,11 +362,18 @@ impl ProfilerCliArgs {
                         &take_value("--cg-iterations")?,
                     )?);
                 }
+                "--dry-run" => {
+                    parsed.dry_run = inline_value
+                        .as_deref()
+                        .map(parse_bool)
+                        .transpose()?
+                        .unwrap_or(true);
+                }
                 other => {
                     return Err(format!(
                         "unknown profiler option '{other}'; supported options: \
-                         --scene, --solver, --solvers, --pressure-operator, --warmup, --frames, --cal, --out, --cg-iterations, \
-                         or kwargs scene=, solver=, solvers=, pressure_operator=, warmup=, frames=, cal=, out=, cg_iterations="
+                         --scene, --solver, --solvers, --pressure-operator, --warmup, --frames, --cal, --out, --cg-iterations, --dry-run, \
+                         or kwargs scene=, solver=, solvers=, pressure_operator=, warmup=, frames=, cal=, out=, cg_iterations=, dry_run="
                     ));
                 }
             }
@@ -382,6 +391,7 @@ impl ProfilerCliArgs {
         self.calibration = other.calibration.or(self.calibration);
         self.output = other.output.or(self.output.take());
         self.cg_iterations = other.cg_iterations.or(self.cg_iterations);
+        self.dry_run = other.dry_run || self.dry_run;
     }
 }
 
@@ -391,6 +401,16 @@ fn parse_positive_u32(name: &str, value: &str) -> Result<u32, String> {
         .ok()
         .filter(|value| *value > 0)
         .ok_or_else(|| format!("{name} must be a positive integer, got '{value}'"))
+}
+
+fn parse_bool(value: &str) -> Result<bool, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        other => Err(format!(
+            "--dry-run must be a boolean when a value is provided, got '{other}'"
+        )),
+    }
 }
 
 fn env_u32(name: &str) -> Option<u32> {
@@ -1937,6 +1957,7 @@ fn profiler_cli_args_parse_kwargs_forms() {
         "calibration=8",
         "output=target/profile.json",
         "cg_iterations=9",
+        "dry_run=true",
     ])
     .expect("profiler kwargs parse");
 
@@ -1948,6 +1969,7 @@ fn profiler_cli_args_parse_kwargs_forms() {
     assert_eq!(args.calibration, Some(8));
     assert_eq!(args.output, Some(PathBuf::from("target/profile.json")));
     assert_eq!(args.cg_iterations, Some(9));
+    assert!(args.dry_run);
 }
 
 #[test]
@@ -2014,6 +2036,45 @@ fn profiler_env_solver_selection_uses_same_scene_path() {
         PathBuf::from("target/env-profile.json")
     );
     assert!(selection.multiple_outputs);
+}
+
+#[test]
+fn profiler_dry_run_summary_lists_all_solver_outputs_and_scene_settings() {
+    let args = ProfilerCliArgs::from_env_and_args(
+        None,
+        [
+            "--scene",
+            "center_pour",
+            "--solvers",
+            "all",
+            "--frames",
+            "1",
+            "--warmup",
+            "1",
+            "--cal",
+            "1",
+            "--out",
+            "target/dry-profile.json",
+            "--dry-run",
+        ],
+        true,
+    );
+    assert!(args.dry_run);
+
+    let selection = ProfileSelection::from_cli_with_env(&args, |_| None);
+    let summary = selection.dry_run_summary();
+
+    assert!(summary.contains("coffee-sim profiler dry run"));
+    assert!(summary.contains("scene: center_pour"));
+    assert!(summary.contains("solvers: mpm-rbgs, mpm-jacobi-cg, mpm-sparse-cg, dfsph, xpbd-gpu"));
+    assert!(summary.contains("target/dry-profile-mpm-rbgs.json"));
+    assert!(summary.contains("target/dry-profile-mpm-jacobi-cg.json"));
+    assert!(summary.contains("target/dry-profile-mpm-sparse-cg.json"));
+    assert!(summary.contains("target/dry-profile-dfsph.json"));
+    assert!(summary.contains("target/dry-profile-xpbd-gpu.json"));
+    assert!(summary.contains("grid=80x115x80"));
+    assert!(summary.contains("rbgs_pairs=40"));
+    assert!(summary.contains("cg_iterations=40"));
 }
 
 #[test]
@@ -2326,6 +2387,58 @@ impl ProfileSelection {
             base_output_path,
             multiple_outputs,
         }
+    }
+
+    fn dry_run_summary(&self) -> String {
+        let mut summary = String::new();
+        use std::fmt::Write as _;
+
+        let solver_ids = self
+            .solvers
+            .iter()
+            .copied()
+            .map(SolverSpec::id)
+            .collect::<Vec<_>>();
+        let _ = writeln!(summary, "coffee-sim profiler dry run");
+        let _ = writeln!(summary, "scene: {}", self.scene);
+        let _ = writeln!(summary, "solvers: {}", solver_ids.join(", "));
+        let _ = writeln!(summary, "pressure_operator: {}", self.pressure_operator);
+        let _ = writeln!(
+            summary,
+            "frames: warmup={} measured={} calibration={}",
+            self.warmup, self.measured, self.calibration
+        );
+        let _ = writeln!(summary, "base_output: {}", self.base_output_path.display());
+        let run = ProfilerRunConfig {
+            scene: self.scene,
+            warmup: self.warmup,
+            measured: self.measured,
+            calibration: self.calibration,
+            cg_iterations: self.cg_iterations,
+            pressure_operator: self.pressure_operator,
+            solver_ids,
+            base_output_path: &self.base_output_path,
+            multiple_outputs: self.multiple_outputs,
+        };
+        for &solver in &self.solvers {
+            let settings = settings_for_solver(solver, &run);
+            let output =
+                output_path_for_solver(&self.base_output_path, solver, self.multiple_outputs);
+            let _ = writeln!(
+                summary,
+                "- {} output={} grid={}x{}x{} substeps={} max_particles={} rbgs_pairs={} cg_iterations={}",
+                solver,
+                output.display(),
+                settings.grid_dims[0],
+                settings.grid_dims[1],
+                settings.grid_dims[2],
+                settings.substeps,
+                settings.max_particles,
+                settings.pressure_rbgs_pairs,
+                settings.pressure_cg_iterations
+            );
+        }
+        summary
     }
 }
 
@@ -2719,6 +2832,10 @@ fn profile_solver_backend(
 pub fn run_profile_from_env_args() {
     let cli = ProfilerCliArgs::from_env_args();
     let selection = ProfileSelection::from_cli(&cli);
+    if cli.dry_run {
+        print!("{}", selection.dry_run_summary());
+        return;
+    }
     let Some(adapter) = request_adapter() else {
         eprintln!("profile_mpm_pipeline: no GPU adapter available; skipping.");
         return;
