@@ -857,6 +857,7 @@ pub(crate) struct MpmSim3D {
 
 fn encode_mpm_substep_schedule<'a, RunOp>(
     pipelines: &'a MpmPipelines,
+    buffers: &'a MpmBuffers,
     dispatch: MpmDispatchSizes,
     pressure_ctx: PressureContext,
     mut run_op: RunOp,
@@ -912,11 +913,9 @@ fn encode_mpm_substep_schedule<'a, RunOp>(
         pipelines.pressure.classify_pipeline_for(pressure_ctx.kind),
         dispatch.cell_wg,
     );
-    run_op(MpmScheduleOp::PressureSolve {
-        label: MpmPassLabel::PressureSolve,
-        pressure: &pipelines.pressure,
-        ctx: pressure_ctx,
-    });
+    pipelines
+        .pressure
+        .encode_solve_ops(buffers, pressure_ctx, &mut run_op);
     run_pipeline!(
         MpmPassLabel::PressureProject,
         pipelines.pressure.project_pipeline_for(pressure_ctx.kind),
@@ -1977,9 +1976,15 @@ impl MpmSim3D {
             encoder.clear_buffer(&self.buffers.grid, 0, None);
             encoder.clear_buffer(&self.buffers.grid_vel, 0, None);
             let mut ops = Vec::new();
-            encode_mpm_substep_schedule(&self.pipelines, dispatch, pressure_ctx, |op| {
-                ops.push(op);
-            });
+            encode_mpm_substep_schedule(
+                &self.pipelines,
+                &self.buffers,
+                dispatch,
+                pressure_ctx,
+                |op| {
+                    ops.push(op);
+                },
+            );
             encode_mpm_schedule_production(&mut encoder, &self.pipelines.bind_group, &ops);
             queue.submit(Some(encoder.finish()));
 
@@ -2132,11 +2137,19 @@ impl MpmSim3D {
 
     #[cfg(test)]
     pub(crate) fn profiler_timestamp_query_capacity(&self) -> u32 {
+        let pressure_ctx = PressureContext {
+            kind: self.settings.pressure_solver,
+            cell_wg: 0,
+            rbgs_pairs: self
+                .last_pressure_rbgs_pairs
+                .max(self.settings.pressure_rbgs_pairs),
+            cg_iterations: self.settings.pressure_cg_iterations,
+        };
         let scopes = COMMON_TIMED_SCOPES_PER_SUBSTEP
             + self
                 .pipelines
                 .pressure
-                .estimated_timestamp_scopes_for(self.settings.pressure_solver);
+                .estimated_timestamp_scopes(pressure_ctx);
         ((scopes * 2) + 8).max(MIN_TIMESTAMP_QUERY_CAPACITY)
     }
 

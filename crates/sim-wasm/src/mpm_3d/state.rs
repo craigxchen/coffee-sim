@@ -21,7 +21,7 @@ pub(crate) const SDF_RES: u32 = 128;
 
 /// Number of `u32` slots in the metrics buffer. Keep in sync with the indices
 /// in `shader.rs` (`METRIC_*_IDX`).
-pub(crate) const METRICS_SLOT_COUNT: usize = 18;
+pub(crate) const METRICS_SLOT_COUNT: usize = 21;
 pub(crate) const METRIC_MAX_ABS_DIV_IDX: usize = 0;
 pub(crate) const METRIC_FLUID_CELLS_IDX: usize = 1;
 pub(crate) const METRIC_DIV_CLAMP_FIRES_IDX: usize = 2;
@@ -40,6 +40,9 @@ pub(crate) const METRIC_CG_NEW_RZ_IDX: usize = 14;
 pub(crate) const METRIC_PRESSURE_INITIAL_RZ_IDX: usize = 15;
 pub(crate) const METRIC_PRESSURE_FINAL_RZ_IDX: usize = 16;
 pub(crate) const METRIC_PRESSURE_ACTIVE_COUNT_IDX: usize = 17;
+pub(crate) const METRIC_PRESSURE_ACTIVE_WORKGROUPS_X_IDX: usize = 18;
+pub(crate) const METRIC_PRESSURE_ACTIVE_WORKGROUPS_Y_IDX: usize = 19;
+pub(crate) const METRIC_PRESSURE_ACTIVE_WORKGROUPS_Z_IDX: usize = 20;
 /// Fixed-point scale used by the `MAX_ABS_DIV` slot — divergence is already a
 /// moderate-magnitude quantity, so a smaller scale keeps the atomic headroom
 /// comfortable while still giving useful resolution on the HUD.
@@ -95,6 +98,8 @@ pub(crate) struct MpmBuffers {
     pub render_data: wgpu::Buffer,
     pub bed_extract: wgpu::Buffer,
     pub uniform_buffer: wgpu::Buffer,
+    /// Indirect dispatch arguments for compact pressure-cell kernels.
+    pub pressure_dispatch_args: wgpu::Buffer,
     /// Compute-side scratch buffer for projection + overflow observability.
     /// Layout: `u32[METRICS_SLOT_COUNT]`. Indices match `METRIC_*_IDX` in the
     /// shader. Populated every substep via atomics, cleared via
@@ -201,6 +206,13 @@ impl MpmBuffers {
             mapped_at_creation: false,
         });
 
+        let pressure_dispatch_args = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("mpm active pressure dispatch args"),
+            size: (3 * size_of::<u32>()) as u64,
+            usage: wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         let metrics_size = (METRICS_SLOT_COUNT * size_of::<u32>()) as u64;
         let metrics = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("mpm metrics"),
@@ -238,6 +250,7 @@ impl MpmBuffers {
             render_data,
             bed_extract,
             uniform_buffer,
+            pressure_dispatch_args,
             metrics,
             metrics_staging,
         }

@@ -84,6 +84,9 @@ const METRIC_CG_NEW_RZ_IDX: u32 = 14u;
 const METRIC_PRESSURE_INITIAL_RZ_IDX: u32 = 15u;
 const METRIC_PRESSURE_FINAL_RZ_IDX: u32 = 16u;
 const METRIC_PRESSURE_ACTIVE_COUNT_IDX: u32 = 17u;
+const METRIC_PRESSURE_ACTIVE_WORKGROUPS_X_IDX: u32 = 18u;
+const METRIC_PRESSURE_ACTIVE_WORKGROUPS_Y_IDX: u32 = 19u;
+const METRIC_PRESSURE_ACTIVE_WORKGROUPS_Z_IDX: u32 = 20u;
 const BED_DELTA_WATER_LANE: u32 = 0u;
 const BED_DELTA_IMPULSE_X_LANE: u32 = 1u;
 const BED_DELTA_IMPULSE_Y_LANE: u32 = 2u;
@@ -193,11 +196,17 @@ fn scratch_kind_idx(cell: u32) -> u32 { return grid_mom_z_idx(cell); }
 fn pressure_cg_active_list_idx(cell: u32) -> u32 { return total_cells() + cell; }
 fn pressure_cg_state_load(cell: u32) -> vec4<f32> { return cg[cell]; }
 fn pressure_cg_state_store(cell: u32, value: vec4<f32>) { cg[cell] = value; }
+fn pressure_cg_active_cell(list_i: u32) -> u32 {
+    return u32(cg[pressure_cg_active_list_idx(list_i)].x);
+}
+fn pressure_cg_active_cell_list_store(list_i: u32, cell: u32) {
+    cg[pressure_cg_active_list_idx(list_i)] = vec4<f32>(f32(cell), 0.0, 0.0, 0.0);
+}
 fn pressure_cg_active_cell_store(cell: u32, is_active: bool) {
-    cg[pressure_cg_active_list_idx(cell)] = vec4<f32>(select(0.0, 1.0, is_active), 0.0, 0.0, 0.0);
+    cg[2u * total_cells() + cell] = vec4<f32>(select(0.0, 1.0, is_active), 0.0, 0.0, 0.0);
 }
 fn pressure_cg_is_active(cell: u32) -> bool {
-    return cg[pressure_cg_active_list_idx(cell)].x > 0.5;
+    return cg[2u * total_cells() + cell].x > 0.5;
 }
 fn pressure_cg_dot_add(metric_idx: u32, value: f32) {
     let fixed = u32(clamp(max(value, 0.0) * cg_dot_fp_scale(), 0.0, f32(0xffffffffu)));
@@ -1910,9 +1919,10 @@ fn pressure_cg_init(@builtin(global_invocation_id) gid: vec3<u32>) {
     let r = rhs - diag_lhs.y;
     let z = r / diag_lhs.x;
     pressure_cg_state_store(idx, vec4<f32>(r, z, z, 0.0));
+    let active_slot = atomicAdd(&metrics[METRIC_PRESSURE_ACTIVE_COUNT_IDX], 1u);
+    pressure_cg_active_cell_list_store(active_slot, idx);
     pressure_cg_dot_add(METRIC_CG_RZ_IDX, r * z);
     pressure_cg_dot_add(METRIC_PRESSURE_INITIAL_RZ_IDX, r * z);
-    atomicAdd(&metrics[METRIC_PRESSURE_ACTIVE_COUNT_IDX], 1u);
 }
 
 @compute @workgroup_size(64)
@@ -1968,6 +1978,63 @@ fn pressure_cg_finish_iteration(@builtin(global_invocation_id) gid: vec3<u32>) {
     atomicStore(&metrics[METRIC_PRESSURE_FINAL_RZ_IDX], new_rz);
     atomicStore(&metrics[METRIC_CG_PAP_IDX], 0u);
     atomicStore(&metrics[METRIC_CG_NEW_RZ_IDX], 0u);
+}
+
+@compute @workgroup_size(1)
+fn pressure_active_finalize_dispatch(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if gid.x > 0u { return; }
+    let count = atomicLoad(&metrics[METRIC_PRESSURE_ACTIVE_COUNT_IDX]);
+    let workgroups = (count + 63u) / 64u;
+    atomicStore(&metrics[METRIC_PRESSURE_ACTIVE_WORKGROUPS_X_IDX], workgroups);
+    atomicStore(&metrics[METRIC_PRESSURE_ACTIVE_WORKGROUPS_Y_IDX], 1u);
+    atomicStore(&metrics[METRIC_PRESSURE_ACTIVE_WORKGROUPS_Z_IDX], 1u);
+}
+
+@compute @workgroup_size(64)
+fn pressure_cg_sparse_matvec(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let list_i = gid.x;
+    if list_i >= atomicLoad(&metrics[METRIC_PRESSURE_ACTIVE_COUNT_IDX]) { return; }
+    let idx = pressure_cg_active_cell(list_i);
+    let state = pressure_cg_state_load(idx);
+    let diag_lhs = pressure_cg_diag_and_lhs(idx, state.z);
+    let ap = diag_lhs.y;
+    pressure_cg_state_store(idx, vec4<f32>(state.x, state.y, state.z, ap));
+    pressure_cg_dot_add(METRIC_CG_PAP_IDX, state.z * ap);
+}
+
+@compute @workgroup_size(64)
+fn pressure_cg_sparse_apply_alpha(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let list_i = gid.x;
+    if list_i >= atomicLoad(&metrics[METRIC_PRESSURE_ACTIVE_COUNT_IDX]) { return; }
+    let idx = pressure_cg_active_cell(list_i);
+
+    let rz = f32(atomicLoad(&metrics[METRIC_CG_RZ_IDX])) * cg_dot_inv_fp_scale();
+    let pap = f32(atomicLoad(&metrics[METRIC_CG_PAP_IDX])) * cg_dot_inv_fp_scale();
+    if rz <= 1e-12 || pap <= max(rz * 1e-6, 1e-12) {
+        return;
+    }
+
+    let alpha = rz / pap;
+    let state = pressure_cg_state_load(idx);
+    pressure_store(idx, pressure_load(idx) + alpha * state.z);
+    let r_new = state.x - alpha * state.w;
+    let diag = max(pressure_cg_diag_and_lhs(idx, state.z).x, 1e-6);
+    let z_new = r_new / diag;
+    pressure_cg_state_store(idx, vec4<f32>(r_new, z_new, state.z, state.w));
+    pressure_cg_dot_add(METRIC_CG_NEW_RZ_IDX, r_new * z_new);
+}
+
+@compute @workgroup_size(64)
+fn pressure_cg_sparse_update_dir(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let list_i = gid.x;
+    if list_i >= atomicLoad(&metrics[METRIC_PRESSURE_ACTIVE_COUNT_IDX]) { return; }
+    let idx = pressure_cg_active_cell(list_i);
+
+    let rz = f32(atomicLoad(&metrics[METRIC_CG_RZ_IDX])) * cg_dot_inv_fp_scale();
+    let new_rz = f32(atomicLoad(&metrics[METRIC_CG_NEW_RZ_IDX])) * cg_dot_inv_fp_scale();
+    let beta = select(0.0, new_rz / rz, rz > 1e-12);
+    let state = pressure_cg_state_load(idx);
+    pressure_cg_state_store(idx, vec4<f32>(state.x, state.y, state.y + beta * state.z, state.w));
 }
 
 // ── project_pressure ──
@@ -2980,7 +3047,7 @@ fn prepare_render(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 // ── metrics_clear ──
 
-const METRICS_SLOT_COUNT: u32 = 18u;
+const METRICS_SLOT_COUNT: u32 = 21u;
 
 @compute @workgroup_size(8)
 fn metrics_clear(@builtin(global_invocation_id) gid: vec3<u32>) {
