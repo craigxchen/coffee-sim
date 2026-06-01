@@ -262,12 +262,29 @@ struct ProfilerCliArgs {
 
 impl ProfilerCliArgs {
     fn from_env_args() -> Self {
+        let profile_args = std::env::var("COFFEE_SIM_PROFILE_ARGS").ok();
+        let raw_args = std::env::args().skip(1).collect::<Vec<_>>();
+        Self::from_env_and_args(profile_args.as_deref(), raw_args, !cfg!(test))
+    }
+
+    fn from_env_and_args<I, S>(
+        profile_args: Option<&str>,
+        process_args: I,
+        accept_raw_process_args: bool,
+    ) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
         let mut cli = Self::default();
-        if let Ok(value) = std::env::var("COFFEE_SIM_PROFILE_ARGS") {
+        if let Some(value) = profile_args {
             cli.merge(Self::parse(value.split_whitespace()).unwrap_or_else(|err| panic!("{err}")));
         }
 
-        let raw_args = std::env::args().skip(1).collect::<Vec<_>>();
+        let raw_args = process_args
+            .into_iter()
+            .map(|arg| arg.as_ref().to_string())
+            .collect::<Vec<_>>();
         let mut args = raw_args.iter();
         while let Some(arg) = args.next() {
             if arg == "--profile" || arg == "--profile-args" {
@@ -276,7 +293,7 @@ impl ProfilerCliArgs {
             }
         }
 
-        if !cfg!(test) && !raw_args.is_empty() {
+        if accept_raw_process_args && !raw_args.is_empty() {
             cli.merge(Self::parse(raw_args).unwrap_or_else(|err| panic!("{err}")));
         }
 
@@ -377,10 +394,11 @@ fn parse_positive_u32(name: &str, value: &str) -> Result<u32, String> {
 }
 
 fn env_u32(name: &str) -> Option<u32> {
-    std::env::var(name)
-        .ok()
-        .and_then(|v| v.parse::<u32>().ok())
-        .filter(|v| *v > 0)
+    env_u32_value(std::env::var(name).ok())
+}
+
+fn env_u32_value(value: Option<String>) -> Option<u32> {
+    value.and_then(|v| v.parse::<u32>().ok()).filter(|v| *v > 0)
 }
 
 fn parse_solver_specs(value: &str) -> Vec<SolverSpec> {
@@ -1917,6 +1935,61 @@ fn profiler_cli_args_parse_kwargs_forms() {
 }
 
 #[test]
+fn profiler_native_raw_cli_args_select_all_solvers_on_one_scene() {
+    let args = ProfilerCliArgs::from_env_and_args(
+        None,
+        [
+            "--scene",
+            "water_block",
+            "--solvers",
+            "all",
+            "--frames",
+            "3",
+            "--warmup",
+            "2",
+            "--cal",
+            "1",
+            "--out",
+            "target/native-profile.json",
+        ],
+        true,
+    );
+    let selection = ProfileSelection::from_cli_with_env(&args, |_| None);
+
+    assert_eq!(selection.scene, ProfileScene::WaterBlock);
+    assert_eq!(selection.solvers, runnable_solver_specs());
+    assert_eq!(
+        selection.solver_ids,
+        runnable_solver_specs()
+            .into_iter()
+            .map(SolverSpec::id)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(selection.warmup, 2);
+    assert_eq!(selection.measured, 3);
+    assert_eq!(selection.calibration, 1);
+    assert_eq!(
+        selection.base_output_path,
+        PathBuf::from("target/native-profile.json")
+    );
+    assert!(selection.multiple_outputs);
+}
+
+#[test]
+fn profiler_harness_args_require_profile_sentinel() {
+    let ignored_harness_args =
+        ProfilerCliArgs::from_env_and_args(None, ["--solver", "xpbd:gpu"], false);
+    assert!(ignored_harness_args.solver.is_none());
+
+    let forwarded_args = ProfilerCliArgs::from_env_and_args(
+        None,
+        ["profile_mpm_pipeline", "--profile", "--solver", "xpbd:gpu"],
+        false,
+    );
+    assert_eq!(forwarded_args.solver.as_deref(), Some("xpbd:gpu"));
+}
+
+#[test]
 fn profiler_cli_solver_overrides_expand_to_specs() {
     let args = ProfilerCliArgs::parse(["--solvers", "mpm:jacobi-cg,dfsph,xpbd"])
         .expect("profiler args parse");
@@ -2084,10 +2157,24 @@ struct ProfileSelection {
 
 impl ProfileSelection {
     fn from_cli(cli: &ProfilerCliArgs) -> Self {
+        Self::from_cli_with_env(cli, |name| std::env::var(name).ok())
+    }
+
+    fn from_cli_with_env<F>(cli: &ProfilerCliArgs, mut get_env: F) -> Self
+    where
+        F: FnMut(&str) -> Option<String>,
+    {
+        let scene_env = get_env("COFFEE_SIM_PROFILE_SCENE");
+        let pressure_operator_env = get_env("COFFEE_SIM_PROFILE_PRESSURE_OPERATOR");
+        let warmup_env = get_env("COFFEE_SIM_PROFILE_WARMUP");
+        let frames_env = get_env("COFFEE_SIM_PROFILE_FRAMES");
+        let calibration_env = get_env("COFFEE_SIM_PROFILE_CAL");
+        let cg_iterations_env = get_env("COFFEE_SIM_PROFILE_CG_ITERATIONS");
+
         let scene = cli
             .scene
             .clone()
-            .or_else(|| std::env::var("COFFEE_SIM_PROFILE_SCENE").ok())
+            .or(scene_env)
             .unwrap_or_else(|| "center_pour".into())
             .parse::<ProfileScene>()
             .unwrap_or_else(|err| panic!("{err}"));
@@ -2095,7 +2182,7 @@ impl ProfileSelection {
         let pressure_operator = cli
             .pressure_operator
             .clone()
-            .or_else(|| std::env::var("COFFEE_SIM_PROFILE_PRESSURE_OPERATOR").ok())
+            .or(pressure_operator_env)
             .unwrap_or_else(|| PressureOperatorKind::Collocated.to_string())
             .parse::<PressureOperatorKind>()
             .unwrap_or_else(|err| panic!("{err}"));
@@ -2112,15 +2199,15 @@ impl ProfileSelection {
             .collect::<Vec<_>>();
         let warmup = cli
             .warmup
-            .or_else(|| env_u32("COFFEE_SIM_PROFILE_WARMUP"))
+            .or_else(|| env_u32_value(warmup_env))
             .unwrap_or(DEFAULT_WARMUP_FRAMES);
         let measured = cli
             .measured
-            .or_else(|| env_u32("COFFEE_SIM_PROFILE_FRAMES"))
+            .or_else(|| env_u32_value(frames_env))
             .unwrap_or(DEFAULT_MEASURED_FRAMES);
         let calibration = cli
             .calibration
-            .or_else(|| env_u32("COFFEE_SIM_PROFILE_CAL"))
+            .or_else(|| env_u32_value(calibration_env))
             .unwrap_or(DEFAULT_CALIBRATION_FRAMES);
         let base_output_path = output_path(cli);
         let multiple_outputs = solvers.len() > 1;
@@ -2134,7 +2221,7 @@ impl ProfileSelection {
             calibration,
             cg_iterations: cli
                 .cg_iterations
-                .or_else(|| env_u32("COFFEE_SIM_PROFILE_CG_ITERATIONS")),
+                .or_else(|| env_u32_value(cg_iterations_env)),
             base_output_path,
             multiple_outputs,
         }
