@@ -915,7 +915,7 @@ fn encode_mpm_substep_schedule<'a, RunOp>(
 
     run_pipeline!(
         MpmPassLabel::PressureClassify,
-        pipelines.pressure.classify_pipeline_for(pressure_ctx.kind),
+        pipelines.pressure.classify_pipeline_for(pressure_ctx),
         dispatch.cell_wg,
     );
     pipelines
@@ -923,7 +923,7 @@ fn encode_mpm_substep_schedule<'a, RunOp>(
         .encode_solve_ops(buffers, pressure_ctx, &mut run_op);
     run_pipeline!(
         MpmPassLabel::PressureProject,
-        pipelines.pressure.project_pipeline_for(pressure_ctx.kind),
+        pipelines.pressure.project_pipeline_for(pressure_ctx),
         dispatch.cell_wg,
     );
     run_pipeline!(
@@ -933,7 +933,7 @@ fn encode_mpm_substep_schedule<'a, RunOp>(
     );
     run_pipeline!(
         MpmPassLabel::PressureResidual,
-        pipelines.pressure.residual_pipeline_for(pressure_ctx.kind),
+        pipelines.pressure.residual_pipeline_for(pressure_ctx),
         dispatch.cell_wg,
     );
 
@@ -1970,6 +1970,7 @@ impl MpmSim3D {
             };
             let pressure_ctx = PressureContext {
                 kind: self.settings.pressure_solver,
+                operator: self.settings.pressure_operator,
                 cell_wg: dispatch.cell_wg,
                 rbgs_pairs: pressure_pairs,
                 cg_iterations: self.settings.pressure_cg_iterations,
@@ -2142,6 +2143,7 @@ impl MpmSim3D {
             .pressure
             .iterations_per_substep(PressureContext {
                 kind: self.settings.pressure_solver,
+                operator: self.settings.pressure_operator,
                 cell_wg: 0,
                 rbgs_pairs: self
                     .last_pressure_rbgs_pairs
@@ -2154,6 +2156,7 @@ impl MpmSim3D {
     pub(crate) fn profiler_timestamp_query_capacity(&self) -> u32 {
         let pressure_ctx = PressureContext {
             kind: self.settings.pressure_solver,
+            operator: self.settings.pressure_operator,
             cell_wg: 0,
             rbgs_pairs: self
                 .last_pressure_rbgs_pairs

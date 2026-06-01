@@ -96,6 +96,7 @@ impl FromStr for PressureOperatorKind {
 #[derive(Clone, Copy)]
 pub(crate) struct PressureContext {
     pub kind: PressureSolverKind,
+    pub operator: PressureOperatorKind,
     pub cell_wg: u32,
     pub rbgs_pairs: u32,
     pub cg_iterations: u32,
@@ -115,30 +116,39 @@ impl PressurePipelines {
         }
     }
 
-    pub(crate) fn classify_pipeline_for(&self, kind: PressureSolverKind) -> &wgpu::ComputePipeline {
-        match kind {
-            PressureSolverKind::Rbgs => &self.rbgs.classify_cells,
-            PressureSolverKind::JacobiCg | PressureSolverKind::SparseCg => {
-                &self.jacobi_cg.classify_cells
+    pub(crate) fn classify_pipeline_for(&self, ctx: PressureContext) -> &wgpu::ComputePipeline {
+        match (ctx.operator, ctx.kind) {
+            (PressureOperatorKind::Collocated, PressureSolverKind::Rbgs) => {
+                &self.rbgs.classify_cells
             }
+            (
+                PressureOperatorKind::Collocated,
+                PressureSolverKind::JacobiCg | PressureSolverKind::SparseCg,
+            ) => &self.jacobi_cg.classify_cells,
         }
     }
 
-    pub(crate) fn project_pipeline_for(&self, kind: PressureSolverKind) -> &wgpu::ComputePipeline {
-        match kind {
-            PressureSolverKind::Rbgs => &self.rbgs.project_pressure,
-            PressureSolverKind::JacobiCg | PressureSolverKind::SparseCg => {
-                &self.jacobi_cg.project_pressure
+    pub(crate) fn project_pipeline_for(&self, ctx: PressureContext) -> &wgpu::ComputePipeline {
+        match (ctx.operator, ctx.kind) {
+            (PressureOperatorKind::Collocated, PressureSolverKind::Rbgs) => {
+                &self.rbgs.project_pressure
             }
+            (
+                PressureOperatorKind::Collocated,
+                PressureSolverKind::JacobiCg | PressureSolverKind::SparseCg,
+            ) => &self.jacobi_cg.project_pressure,
         }
     }
 
-    pub(crate) fn residual_pipeline_for(&self, kind: PressureSolverKind) -> &wgpu::ComputePipeline {
-        match kind {
-            PressureSolverKind::Rbgs => &self.rbgs.pressure_residual,
-            PressureSolverKind::JacobiCg | PressureSolverKind::SparseCg => {
-                &self.jacobi_cg.pressure_residual
+    pub(crate) fn residual_pipeline_for(&self, ctx: PressureContext) -> &wgpu::ComputePipeline {
+        match (ctx.operator, ctx.kind) {
+            (PressureOperatorKind::Collocated, PressureSolverKind::Rbgs) => {
+                &self.rbgs.pressure_residual
             }
+            (
+                PressureOperatorKind::Collocated,
+                PressureSolverKind::JacobiCg | PressureSolverKind::SparseCg,
+            ) => &self.jacobi_cg.pressure_residual,
         }
     }
 

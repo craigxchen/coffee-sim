@@ -652,6 +652,7 @@ fn step_frame_instrumented(
         };
         let pressure_ctx = PressureContext {
             kind: sim.settings.pressure_solver,
+            operator: sim.settings.pressure_operator,
             cell_wg: dispatch.cell_wg,
             rbgs_pairs: pressure_pairs,
             cg_iterations: sim.settings.pressure_cg_iterations,
@@ -819,6 +820,7 @@ fn step_frame_dfsph_instrumented(
         let water_wg = dispatch_size(sim.num_water, NUM_THREADS);
         let pressure_ctx = PressureContext {
             kind: sim.settings.pressure_solver,
+            operator: sim.settings.pressure_operator,
             cell_wg: dispatch.cell_wg,
             rbgs_pairs: pressure_pairs,
             cg_iterations: sim.settings.pressure_cg_iterations,
@@ -971,9 +973,7 @@ fn step_frame_dfsph_instrumented(
             &mut rec,
             mpm_bg,
             MpmPassLabel::PressureClassify,
-            sim.pipelines
-                .pressure
-                .classify_pipeline_for(pressure_ctx.kind),
+            sim.pipelines.pressure.classify_pipeline_for(pressure_ctx),
             MpmDispatch::Direct(dispatch.cell_wg),
         );
         {
@@ -990,9 +990,7 @@ fn step_frame_dfsph_instrumented(
             &mut rec,
             mpm_bg,
             MpmPassLabel::PressureProject,
-            sim.pipelines
-                .pressure
-                .project_pipeline_for(pressure_ctx.kind),
+            sim.pipelines.pressure.project_pipeline_for(pressure_ctx),
             MpmDispatch::Direct(dispatch.cell_wg),
         );
         timed_pass(
@@ -1008,9 +1006,7 @@ fn step_frame_dfsph_instrumented(
             &mut rec,
             mpm_bg,
             MpmPassLabel::PressureResidual,
-            sim.pipelines
-                .pressure
-                .residual_pipeline_for(pressure_ctx.kind),
+            sim.pipelines.pressure.residual_pipeline_for(pressure_ctx),
             MpmDispatch::Direct(dispatch.cell_wg),
         );
         timed_pass(
