@@ -2,10 +2,10 @@
 
 This branch makes the headless profiler select a solver at runtime instead of
 hard-coding one pressure path in the harness. The profiler entrypoint is still
-the ignored Rust test:
+the solver-neutral ignored Rust test:
 
 ```text
-cargo test -p coffee-sim-wasm --lib --release profile_mpm_pipeline -- --ignored --nocapture
+cargo test -p coffee-sim-wasm --lib --release profile_solvers -- --ignored --nocapture
 ```
 
 Runtime selection can come from a native profiler binary, `COFFEE_SIM_PROFILE_ARGS`,
@@ -21,9 +21,9 @@ cargo run -p coffee-sim-wasm --features native-profiler --bin profile_solvers --
   --scene center_pour --solvers all --frames 120 --warmup 60 --cal 30 --dry-run
 cargo run -p coffee-sim-wasm --features native-profiler --bin profile_solvers -- --list-solvers
 COFFEE_SIM_PROFILE_ARGS="scene=center_pour solvers=all frames=120 warmup=60 cal=30" \
-  cargo test -p coffee-sim-wasm --lib --release profile_mpm_pipeline -- --ignored --nocapture
+  cargo test -p coffee-sim-wasm --lib --release profile_solvers -- --ignored --nocapture
 COFFEE_SIM_PROFILE_ARGS="--scene water_block --solver mpm:sparse-cg --pressure-operator collocated" \
-  cargo test -p coffee-sim-wasm --lib --release profile_mpm_pipeline -- --ignored --nocapture
+  cargo test -p coffee-sim-wasm --lib --release profile_solvers -- --ignored --nocapture
 ```
 
 Runnable solver specs are:
