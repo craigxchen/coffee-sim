@@ -26,10 +26,6 @@ pub(crate) struct CommonPipelines {
     pub boundary_project: wgpu::ComputePipeline,
     pub packing_prepare: wgpu::ComputePipeline,
     pub packing_apply: wgpu::ComputePipeline,
-    #[allow(dead_code)]
-    pub packing_prepare_tiles: wgpu::ComputePipeline,
-    #[allow(dead_code)]
-    pub packing_apply_tiles: wgpu::ComputePipeline,
     pub g2p: wgpu::ComputePipeline,
     pub bed_coupling: wgpu::ComputePipeline,
     pub extraction_advect: wgpu::ComputePipeline,
@@ -95,8 +91,6 @@ impl MpmPipelines {
                 },
                 // 12: pressure CG scratch/state
                 storage_entry(12),
-                // 13: DFSPH active pressure-tile flags/list scratch.
-                storage_entry(13),
             ],
         });
 
@@ -156,10 +150,6 @@ impl MpmPipelines {
                     binding: 12,
                     resource: buffers.cg.as_entire_binding(),
                 },
-                wgpu::BindGroupEntry {
-                    binding: 13,
-                    resource: buffers.water_hash.as_entire_binding(),
-                },
             ],
         });
 
@@ -198,8 +188,6 @@ impl MpmPipelines {
                 boundary_project: make("boundary_project"),
                 packing_prepare: make("packing_prepare"),
                 packing_apply: make("packing_apply"),
-                packing_prepare_tiles: make("packing_prepare_tiles"),
-                packing_apply_tiles: make("packing_apply_tiles"),
                 g2p: make("g2p"),
                 bed_coupling: make("bed_coupling"),
                 extraction_advect: make("extraction_advect"),
@@ -211,11 +199,8 @@ impl MpmPipelines {
                     classify_cells: make("classify_cells"),
                     pressure_rbgs_red: make("pressure_rbgs_red"),
                     pressure_rbgs_black: make("pressure_rbgs_black"),
-                    pressure_rbgs_red_tiles: make("pressure_rbgs_red_tiles"),
-                    pressure_rbgs_black_tiles: make("pressure_rbgs_black_tiles"),
                     project_pressure: make("project_pressure"),
                     pressure_residual: make("pressure_residual"),
-                    pressure_residual_tiles: make("pressure_residual_tiles"),
                 },
                 jacobi_cg: JacobiCgPressureSolver {
                     classify_cells: make("classify_cells"),
