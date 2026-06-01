@@ -3,8 +3,7 @@
 //! The `xpbd-solver-rewrite` branch defines an XPBD backend shape, but its
 //! checked-in WGSL entry points are stubs. This module starts the GPU port in
 //! the modular profiler branch with real compute kernels over the existing MPM
-//! particle buffers. It is not wired into the runnable profiler set until the
-//! schedule is complete enough to compare honestly with MPM and DFSPH.
+//! particle buffers, and is exposed to the profiler as the `xpbd:gpu` backend.
 
 use super::state::MpmBuffers;
 

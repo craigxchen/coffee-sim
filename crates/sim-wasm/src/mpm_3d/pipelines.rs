@@ -219,6 +219,8 @@ impl MpmPipelines {
                 },
                 staged_staggered: StagedStaggeredPressurePipelines {
                     classify_cells: make("classify_cells_staggered"),
+                    pressure_cg_init: make("pressure_cg_init_staggered"),
+                    pressure_cg_matvec: make("pressure_cg_matvec_staggered"),
                     project_pressure: make("project_pressure_staggered"),
                     pressure_residual: make("pressure_residual_staggered"),
                 },

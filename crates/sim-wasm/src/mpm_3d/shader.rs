@@ -2519,6 +2519,42 @@ fn pressure_cg_init(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 
 @compute @workgroup_size(64)
+fn pressure_cg_init_staggered(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if idx >= total_cells() { return; }
+
+    if !pressure_cg_is_active(idx) {
+        pressure_store(idx, 0.0);
+        pressure_cg_state_store(idx, vec4<f32>(0.0));
+        pressure_cg_fill_store(idx, 0.0);
+        pressure_cg_persistent_pressure_store(idx, 0.0);
+        return;
+    }
+
+    let system = staggered_pressure_linear_system_cell(idx);
+    let diag = system.x;
+    let rhs = system.y;
+    if diag <= PRESSURE_MIN_DIAGONAL {
+        pressure_store(idx, 0.0);
+        pressure_cg_state_store(idx, vec4<f32>(0.0));
+        pressure_cg_fill_store(idx, 0.0);
+        pressure_cg_persistent_pressure_store(idx, 0.0);
+        pressure_cg_active_cell_store(idx, false);
+        return;
+    }
+
+    let p0 = clamp(
+        pressure_cg_persistent_pressure_load(idx),
+        -pressure_clamp_limit(),
+        pressure_clamp_limit(),
+    );
+    pressure_store(idx, p0);
+    pressure_cg_state_store(idx, vec4<f32>(rhs, 0.0, 0.0, 0.0));
+    let active_slot = atomicAdd(&metrics[METRIC_PRESSURE_ACTIVE_COUNT_IDX], 1u);
+    pressure_cg_active_cell_list_store(active_slot, idx);
+}
+
+@compute @workgroup_size(64)
 fn pressure_cg_warmstart(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
     if idx >= total_cells() || !pressure_cg_is_active(idx) { return; }
@@ -2551,6 +2587,18 @@ fn pressure_cg_matvec(@builtin(global_invocation_id) gid: vec3<u32>) {
     let ap = diag_lhs.y;
     pressure_cg_state_store(idx, vec4<f32>(state.x, state.y, state.z, ap));
     pressure_cg_dot_add(METRIC_CG_PAP_IDX, state.z * ap);
+}
+
+@compute @workgroup_size(64)
+fn pressure_cg_matvec_staggered(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if idx >= total_cells() || !pressure_cg_is_active(idx) { return; }
+
+    let state = pressure_cg_state_load(idx);
+    let applied = staggered_pressure_apply_search_direction(idx);
+    let ap = applied.x;
+    pressure_cg_state_store(idx, vec4<f32>(state.x, state.y, state.z, ap));
+    pressure_cg_dot_add(METRIC_CG_PAP_IDX, applied.y);
 }
 
 @compute @workgroup_size(64)
@@ -3804,6 +3852,8 @@ mod tests {
     #[test]
     fn staged_staggered_pressure_helpers_are_present() {
         assert!(MPM_COMPUTE_SHADER.contains("fn classify_cells_staggered("));
+        assert!(MPM_COMPUTE_SHADER.contains("fn pressure_cg_init_staggered("));
+        assert!(MPM_COMPUTE_SHADER.contains("fn pressure_cg_matvec_staggered("));
         assert!(MPM_COMPUTE_SHADER.contains("fn project_pressure_staggered("));
         assert!(MPM_COMPUTE_SHADER.contains("fn pressure_residual_staggered("));
         assert!(MPM_COMPUTE_SHADER.contains("fn staggered_pressure_cell_divergence("));

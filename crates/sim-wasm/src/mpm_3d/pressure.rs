@@ -159,10 +159,20 @@ impl PressurePipelines {
     }
 
     pub(crate) fn encode_solve(&self, pass: &mut wgpu::ComputePass<'_>, ctx: PressureContext) {
-        match ctx.kind {
-            PressureSolverKind::Rbgs => self.rbgs.encode_solve(pass, ctx),
-            PressureSolverKind::JacobiCg => self.jacobi_cg.encode_solve(pass, ctx),
-            PressureSolverKind::SparseCg => self.jacobi_cg.encode_sparse_solve(pass, ctx),
+        match (ctx.operator, ctx.kind) {
+            (_, PressureSolverKind::Rbgs) => self.rbgs.encode_solve(pass, ctx),
+            (PressureOperatorKind::Collocated, PressureSolverKind::JacobiCg) => {
+                self.jacobi_cg.encode_solve(pass, ctx)
+            }
+            (PressureOperatorKind::Collocated, PressureSolverKind::SparseCg) => {
+                self.jacobi_cg.encode_sparse_solve(pass, ctx)
+            }
+            (PressureOperatorKind::Staggered, PressureSolverKind::JacobiCg) => self
+                .staged_staggered
+                .encode_cg_solve(pass, ctx, &self.jacobi_cg),
+            (PressureOperatorKind::Staggered, PressureSolverKind::SparseCg) => {
+                self.jacobi_cg.encode_sparse_solve(pass, ctx)
+            }
         }
     }
 
@@ -174,11 +184,16 @@ impl PressurePipelines {
     ) where
         RunOp: FnMut(MpmScheduleOp<'a>),
     {
-        match ctx.kind {
-            PressureSolverKind::SparseCg => {
+        match (ctx.operator, ctx.kind) {
+            (PressureOperatorKind::Collocated, PressureSolverKind::SparseCg)
+            | (PressureOperatorKind::Staggered, PressureSolverKind::SparseCg) => {
                 self.jacobi_cg.encode_sparse_solve_ops(buffers, ctx, run_op)
             }
-            PressureSolverKind::Rbgs | PressureSolverKind::JacobiCg => {
+            (PressureOperatorKind::Staggered, PressureSolverKind::JacobiCg) => self
+                .staged_staggered
+                .encode_cg_solve_ops(ctx, &self.jacobi_cg, run_op),
+            (_, PressureSolverKind::Rbgs)
+            | (PressureOperatorKind::Collocated, PressureSolverKind::JacobiCg) => {
                 run_op(MpmScheduleOp::PressureSolve {
                     label: MpmPassLabel::PressureSolve,
                     pressure: self,
@@ -218,8 +233,78 @@ pub(crate) struct RbgsPressureSolver {
 
 pub(crate) struct StagedStaggeredPressurePipelines {
     pub(crate) classify_cells: wgpu::ComputePipeline,
+    pub(crate) pressure_cg_init: wgpu::ComputePipeline,
+    pub(crate) pressure_cg_matvec: wgpu::ComputePipeline,
     pub(crate) project_pressure: wgpu::ComputePipeline,
     pub(crate) pressure_residual: wgpu::ComputePipeline,
+}
+
+impl StagedStaggeredPressurePipelines {
+    pub(crate) fn encode_cg_solve(
+        &self,
+        pass: &mut wgpu::ComputePass<'_>,
+        ctx: PressureContext,
+        common: &JacobiCgPressureSolver,
+    ) {
+        pass.set_pipeline(&self.pressure_cg_init);
+        pass.dispatch_workgroups(ctx.cell_wg, 1, 1);
+        pass.set_pipeline(&common.pressure_cg_warmstart);
+        pass.dispatch_workgroups(ctx.cell_wg, 1, 1);
+
+        for _ in 0..ctx.cg_iterations {
+            pass.set_pipeline(&self.pressure_cg_matvec);
+            pass.dispatch_workgroups(ctx.cell_wg, 1, 1);
+            pass.set_pipeline(&common.pressure_cg_apply_alpha);
+            pass.dispatch_workgroups(ctx.cell_wg, 1, 1);
+            pass.set_pipeline(&common.pressure_cg_update_dir);
+            pass.dispatch_workgroups(ctx.cell_wg, 1, 1);
+            pass.set_pipeline(&common.pressure_cg_finish_iteration);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+    }
+
+    pub(crate) fn encode_cg_solve_ops<'a, RunOp>(
+        &'a self,
+        ctx: PressureContext,
+        common: &'a JacobiCgPressureSolver,
+        mut run_op: RunOp,
+    ) where
+        RunOp: FnMut(MpmScheduleOp<'a>),
+    {
+        run_op(MpmScheduleOp::Pipeline {
+            label: MpmPassLabel::PressureSolve,
+            pipeline: &self.pressure_cg_init,
+            dispatch: MpmDispatch::Direct(ctx.cell_wg),
+        });
+        run_op(MpmScheduleOp::Pipeline {
+            label: MpmPassLabel::PressureSolve,
+            pipeline: &common.pressure_cg_warmstart,
+            dispatch: MpmDispatch::Direct(ctx.cell_wg),
+        });
+
+        for _ in 0..ctx.cg_iterations {
+            run_op(MpmScheduleOp::Pipeline {
+                label: MpmPassLabel::PressureSolve,
+                pipeline: &self.pressure_cg_matvec,
+                dispatch: MpmDispatch::Direct(ctx.cell_wg),
+            });
+            run_op(MpmScheduleOp::Pipeline {
+                label: MpmPassLabel::PressureSolve,
+                pipeline: &common.pressure_cg_apply_alpha,
+                dispatch: MpmDispatch::Direct(ctx.cell_wg),
+            });
+            run_op(MpmScheduleOp::Pipeline {
+                label: MpmPassLabel::PressureSolve,
+                pipeline: &common.pressure_cg_update_dir,
+                dispatch: MpmDispatch::Direct(ctx.cell_wg),
+            });
+            run_op(MpmScheduleOp::Pipeline {
+                label: MpmPassLabel::PressureSolve,
+                pipeline: &common.pressure_cg_finish_iteration,
+                dispatch: MpmDispatch::Direct(1),
+            });
+        }
+    }
 }
 
 impl RbgsPressureSolver {
