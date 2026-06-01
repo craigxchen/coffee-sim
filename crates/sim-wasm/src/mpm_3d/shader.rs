@@ -96,6 +96,15 @@ const BED_DELTA_SOLUTE_DEPOSIT_LANE: u32 = 5u;
 const BED_REACTION_ALPHA: f32 = 0.04;
 const BED_REACTION_IMPULSE_CAP: f32 = 0.012;
 
+// Pressure-domain guardrails. Sparse free-falling cells are particle-resolved;
+// only locally supported continuum cells join the grid pressure solve.
+const PRESSURE_MIN_DIAGONAL: f32 = 1.0e-6;
+const PRESSURE_STORABLE_FRACTION: f32 = 0.5;
+const MIN_LATERAL_FLUID_FACES: u32 = 2u;
+const SURFACE_FREEFALL_SPEED: f32 = -10.0;
+const CUP_RIM_Y: f32 = -3.5;
+const DENSE_CELL_MASS_FACTOR: f32 = 4.0;
+
 // ── Helpers ──
 
 fn gx() -> u32 { return u.grid_dims.x; }
@@ -769,6 +778,150 @@ fn sdf_class_is_solid(cell: vec3<i32>) -> bool {
     return sample_sdf(cell_center_from_cell(cell)) < 0.0;
 }
 
+fn current_cell_kind(cell: vec3<i32>) -> i32 {
+    if cell.x < 0 || cell.y < 0 || cell.z < 0
+        || u32(cell.x) >= gx() || u32(cell.y) >= gy() || u32(cell.z) >= gz() {
+        return CELL_SOLID;
+    }
+    if sdf_class_is_solid(cell) {
+        return CELL_SOLID;
+    }
+    let idx = cell_index(u32(cell.x), u32(cell.y), u32(cell.z));
+    if grid_vel[idx].w <= occupancy_mass_threshold() {
+        return CELL_AIR;
+    }
+    return cell_kind_load(idx);
+}
+
+fn deposited_liquid_fraction(cell: u32) -> f32 {
+    let cell_volume = max(dx() * dx() * dx(), 1.0e-8);
+    return clamp(max(rest_volume_load(cell), current_volume_load(cell)) / cell_volume, 0.0, 1.0);
+}
+
+fn floor_supported_surface_cell(cell: u32) -> bool {
+    let gv = grid_vel[cell];
+    let quasi_static_speed = sqrt(max(abs(gravity()) * dx(), 1.0e-8));
+    if length(gv.xyz) > quasi_static_speed || deposited_liquid_fraction(cell) < 1.0 {
+        return false;
+    }
+
+    let iz_val = cell / (gx() * gy());
+    let rem = cell % (gx() * gy());
+    let iy_val = rem / gx();
+    let ix_val = rem % gx();
+    if iy_val == 0u {
+        return false;
+    }
+
+    let self_cell = vec3<i32>(i32(ix_val), i32(iy_val), i32(iz_val));
+    let below = vec3<i32>(i32(ix_val), i32(iy_val) - 1, i32(iz_val));
+    let floor_band_top = cup_floor_y() + dx() * 2.0;
+    return cell_center_from_cell(self_cell).y <= floor_band_top && sdf_class_is_solid(below);
+}
+
+fn surface_pressure_has_continuum_support(cell: u32) -> bool {
+    if floor_supported_surface_cell(cell) {
+        return true;
+    }
+
+    let iz_val = cell / (gx() * gy());
+    let rem = cell % (gx() * gy());
+    let iy_val = rem / gx();
+    let ix_val = rem % gx();
+    let self_cell = vec3<i32>(i32(ix_val), i32(iy_val), i32(iz_val));
+    let offsets = array<vec3<i32>, 6>(
+        vec3<i32>(-1, 0, 0),
+        vec3<i32>(1, 0, 0),
+        vec3<i32>(0, -1, 0),
+        vec3<i32>(0, 1, 0),
+        vec3<i32>(0, 0, -1),
+        vec3<i32>(0, 0, 1),
+    );
+
+    var lower_fluid_support = false;
+    var lateral_fluid_faces = 0u;
+    for (var n = 0u; n < 6u; n++) {
+        let neighbor = self_cell + offsets[n];
+        if neighbor.x < 0 || neighbor.y < 0 || neighbor.z < 0
+            || u32(neighbor.x) >= gx() || u32(neighbor.y) >= gy() || u32(neighbor.z) >= gz() {
+            continue;
+        }
+        let neighbor_kind = current_cell_kind(neighbor);
+        if neighbor_kind == CELL_BED_COUPLED {
+            return true;
+        }
+        if is_fluid_kind(neighbor_kind) {
+            let neighbor_idx = cell_index(u32(neighbor.x), u32(neighbor.y), u32(neighbor.z));
+            if raw_liquid_fill_fraction(neighbor_idx, neighbor_kind) <= 0.0 {
+                continue;
+            }
+            if offsets[n].y < 0 {
+                lower_fluid_support = true;
+            } else if offsets[n].y == 0 {
+                lateral_fluid_faces += 1u;
+            }
+        }
+    }
+
+    let falling = grid_vel[cell].y < SURFACE_FREEFALL_SPEED;
+    return lower_fluid_support
+        && lateral_fluid_faces >= MIN_LATERAL_FLUID_FACES
+        && !falling;
+}
+
+fn interior_pressure_has_continuum_support(cell: u32) -> bool {
+    if deposited_liquid_fraction(cell) >= 1.0 || floor_supported_surface_cell(cell) {
+        return true;
+    }
+
+    let iz_val = cell / (gx() * gy());
+    let rem = cell % (gx() * gy());
+    let iy_val = rem / gx();
+    let ix_val = rem % gx();
+    let self_cell = vec3<i32>(i32(ix_val), i32(iy_val), i32(iz_val));
+    if cell_center_from_cell(self_cell).y > CUP_RIM_Y {
+        return false;
+    }
+
+    let offsets = array<vec3<i32>, 6>(
+        vec3<i32>(-1, 0, 0),
+        vec3<i32>(1, 0, 0),
+        vec3<i32>(0, -1, 0),
+        vec3<i32>(0, 1, 0),
+        vec3<i32>(0, 0, -1),
+        vec3<i32>(0, 0, 1),
+    );
+
+    var lower_hydro_support = false;
+    var lateral_fluid_faces = 0u;
+    for (var n = 0u; n < 6u; n++) {
+        let neighbor = self_cell + offsets[n];
+        if neighbor.x < 0 || neighbor.y < 0 || neighbor.z < 0
+            || u32(neighbor.x) >= gx() || u32(neighbor.y) >= gy() || u32(neighbor.z) >= gz() {
+            continue;
+        }
+        let neighbor_idx = cell_index(u32(neighbor.x), u32(neighbor.y), u32(neighbor.z));
+        let neighbor_kind = current_cell_kind(neighbor);
+        if !is_fluid_kind(neighbor_kind)
+            || raw_liquid_fill_fraction(neighbor_idx, neighbor_kind) <= 0.0 {
+            continue;
+        }
+        if offsets[n].y < 0 {
+            lower_hydro_support = true;
+        } else if offsets[n].y == 0 {
+            lateral_fluid_faces += 1u;
+        }
+    }
+
+    return lower_hydro_support && lateral_fluid_faces >= MIN_LATERAL_FLUID_FACES;
+}
+
+fn pressure_active_cell(cell: u32, kind: i32) -> bool {
+    return (kind == CELL_INTERIOR_FLUID && interior_pressure_has_continuum_support(cell))
+        || kind == CELL_BED_COUPLED
+        || (kind == CELL_SURFACE_FLUID && surface_pressure_has_continuum_support(cell));
+}
+
 fn is_fluid_kind(kind: i32) -> bool {
     // Surface and bed-coupled cells participate in the pressure solve so
     // hydrostatic pressure can build up in shallow puddles and water inside the
@@ -989,7 +1142,7 @@ fn sample_sdf(position: vec3<f32>) -> f32 {
         result = cone_radius - length(position.xz) - obstacle_wall_half_thickness();
     }
 
-    let cup_top_y = -3.5;
+    let cup_top_y = CUP_RIM_Y;
     let cup_bot_y = -8.0;
     if position.y <= cup_top_y {
         let radial_sd = 3.0 - length(position.xz);
@@ -1174,7 +1327,7 @@ fn resolve_scene_obstacles(position: vec3<f32>, velocity: vec3<f32>, is_bed: boo
     // effective fluid surface is inset by half the obstacle wall thickness. Keep
     // this analytic guard on the same surface so floor/wall contacts cannot
     // create a second visible boundary layer.
-    if out_pos.y <= -3.5 {
+    if out_pos.y <= CUP_RIM_Y {
         let cup_radius = 3.0 - obstacle_wall_half_thickness() - contact_offset();
         let cup_contact = resolve_radial_barrier(out_pos, out_vel, vec2<f32>(0.0, 0.0), cup_radius);
         out_pos = cup_contact.pos;
@@ -1679,7 +1832,7 @@ fn classify_cells(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     let kind = cell_kind_load(idx);
-    pressure_cg_active_cell_store(idx, is_fluid_kind(kind));
+    pressure_cg_active_cell_store(idx, pressure_active_cell(idx, kind));
     if !is_fluid_kind(kind) {
         divergence_store(idx, 0.0);
         return;
@@ -1802,7 +1955,7 @@ fn pressure_update(idx: u32, target_parity: u32) {
     }
 
     let kind = cell_kind_load(idx);
-    if !is_fluid_kind(kind) {
+    if !pressure_cg_is_active(idx) {
         pressure_store(idx, 0.0);
         return;
     }
@@ -2030,7 +2183,7 @@ fn pressure_cg_init(@builtin(global_invocation_id) gid: vec3<u32>) {
     pressure_cg_fill_store(idx, self_fill);
     let rhs = -dx() * dx() * divergence_load(idx) * self_fill / max(dt(), 1e-6);
     let diag = pressure_cg_uncached_diag(idx, self_fill);
-    if diag <= 0.0 {
+    if diag <= PRESSURE_MIN_DIAGONAL {
         pressure_store(idx, 0.0);
         pressure_cg_state_store(idx, vec4<f32>(0.0));
         pressure_cg_fill_store(idx, 0.0);
@@ -2059,8 +2212,15 @@ fn pressure_cg_warmstart(@builtin(global_invocation_id) gid: vec3<u32>) {
     let p0 = pressure_load(idx);
     let ap0 = pressure_cg_warmstart_lhs(idx, p0);
     let r = b - ap0;
-    let diag = max(pressure_cg_diag_and_lhs(idx, 0.0).x, 1e-6);
+    let diag = max(pressure_cg_diag_and_lhs(idx, 0.0).x, PRESSURE_MIN_DIAGONAL);
     let z = r / diag;
+    if abs(z) > pressure_clamp_limit() * PRESSURE_STORABLE_FRACTION {
+        pressure_store(idx, 0.0);
+        pressure_cg_state_store(idx, vec4<f32>(0.0));
+        pressure_cg_persistent_pressure_store(idx, 0.0);
+        pressure_cg_active_cell_store(idx, false);
+        return;
+    }
     pressure_cg_state_store(idx, vec4<f32>(r, z, z, 0.0));
     pressure_cg_dot_add(METRIC_CG_RZ_IDX, r * z);
     pressure_cg_dot_add(METRIC_PRESSURE_INITIAL_RZ_IDX, r * z);
@@ -2189,7 +2349,7 @@ fn project_pressure(@builtin(global_invocation_id) gid: vec3<u32>) {
     if gv.w < 1e-6 { return; }
 
     let kind = cell_kind_load(idx);
-    if !is_fluid_kind(kind) {
+    if !pressure_cg_is_active(idx) {
         return;
     }
 
@@ -2279,7 +2439,7 @@ fn pressure_residual(@builtin(global_invocation_id) gid: vec3<u32>) {
     if idx >= total_cells() { return; }
 
     let kind = cell_kind_load(idx);
-    if !is_fluid_kind(kind) {
+    if !pressure_cg_is_active(idx) {
         return;
     }
 
@@ -2586,9 +2746,9 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>) {
         new_C2 *= inv_supported;
     }
     let in_cup_volume =
-        xp.y < -3.5 && dot(xp.xz, xp.xz) < (3.0 + contact_offset()) * (3.0 + contact_offset());
+        xp.y < CUP_RIM_Y && dot(xp.xz, xp.xz) < (3.0 + contact_offset()) * (3.0 + contact_offset());
     let dense_support_ratio =
-        clamp(local_grid_mass / max(nominal_mass() * 4.0, 1e-6), 0.0, 1.0);
+        clamp(local_grid_mass / max(nominal_mass() * DENSE_CELL_MASS_FACTOR, 1e-6), 0.0, 1.0);
     // Use the particle's interpolation stencil rather than a single home-cell
     // bed lookup so particles exiting the coffee bed do not toggle abruptly
     // between porous and airborne transfer behavior at cell boundaries.
@@ -2622,7 +2782,7 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>) {
     // support is low compared with a compact fluid region.
     let airborne = porous_overlap <= 0.05 && sample_sdf(xp) > contact_offset() * 2.0;
     if airborne {
-        let dense_mass = nominal_mass() * 4.0;
+        let dense_mass = nominal_mass() * DENSE_CELL_MASS_FACTOR;
         let density_ratio = clamp(local_grid_mass / max(dense_mass, 1e-6), 0.0, 1.0);
         j_update_support = min(j_update_support, density_ratio);
         let ballistic_v = vec3<f32>(p.vel.x, p.vel.y + gravity() * dt(), p.vel.z);
@@ -3159,7 +3319,7 @@ fn prepare_render(@builtin(global_invocation_id) gid: vec3<u32>) {
         let cup_r = 3.0 + dx();
         let in_cup =
             dot(p.pos.xz, p.pos.xz) <= cup_r * cup_r
-            && p.pos.y <= -3.5 + dx()
+            && p.pos.y <= CUP_RIM_Y + dx()
             && p.pos.y >= -8.0 - dx();
         if in_cup {
             atomicAdd(
