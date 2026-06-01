@@ -19,6 +19,11 @@ pub(crate) struct DfsphPipelines {
     pub water_hash_clear: wgpu::ComputePipeline,
     pub water_hash_scatter: wgpu::ComputePipeline,
     pub density_factor: wgpu::ComputePipeline,
+    pub divergence_estimate: wgpu::ComputePipeline,
+    pub divergence_solve: wgpu::ComputePipeline,
+    pub predict_nonpressure: wgpu::ComputePipeline,
+    pub density_star: wgpu::ComputePipeline,
+    pub density_solve: wgpu::ComputePipeline,
     pub active_tile_bind_group: wgpu::BindGroup,
 }
 
@@ -128,6 +133,11 @@ impl DfsphPipelines {
             water_hash_clear: make("water_hash_clear"),
             water_hash_scatter: make("water_hash_scatter"),
             density_factor: make("dfsph_density_factor"),
+            divergence_estimate: make("dfsph_divergence_estimate"),
+            divergence_solve: make("dfsph_divergence_solve"),
+            predict_nonpressure: make("dfsph_predict_nonpressure"),
+            density_star: make("dfsph_density_star"),
+            density_solve: make("dfsph_density_solve"),
             active_tile_bind_group,
         }
     }
@@ -185,6 +195,9 @@ struct AffineC {
 
 const DFSPH_MAX_NEIGHBORS_PER_CELL: u32 = 4096u;
 const DFSPH_EPS: f32 = 1.0e-6;
+const DFSPH_DENSITY_ERROR_FRACTION: f32 = 0.01;
+const DFSPH_DIVERGENCE_ERROR: f32 = 0.01;
+const DFSPH_CORRECTION_SPEED_CAP: f32 = 0.35;
 
 fn gx() -> u32 { return u.grid_dims.x; }
 fn gy() -> u32 { return u.grid_dims.y; }
@@ -196,7 +209,10 @@ fn max_particles() -> u32 { return u.counts.z; }
 fn num_particles() -> u32 { return u.counts.x + u.counts.y; }
 fn dx() -> f32 { return u.sim_params.z; }
 fn inv_dx() -> f32 { return u.sim_params.w; }
+fn dt() -> f32 { return u.sim_params.x; }
+fn viscosity() -> f32 { return u.fluid_params.y; }
 fn p_vol() -> f32 { return u.fluid_params.w; }
+fn vel_cap() -> f32 { return u.fp_params.z; }
 
 fn water_hash_slots() -> u32 {
     return total_cells() + max_particles();
@@ -236,6 +252,28 @@ fn dfsph_support_radius() -> f32 {
 
 fn dfsph_particle_volume(pid: u32) -> f32 {
     return p_vol() * max(particles[pid].vel.w, 0.0);
+}
+
+fn dfsph_factor(pid: u32) -> f32 {
+    return affine[pid].col2.w;
+}
+
+fn dfsph_density_scratch(pid: u32) -> f32 {
+    return affine[pid].col1.w;
+}
+
+fn dfsph_density_ratio(pid: u32) -> f32 {
+    return particles[pid].pos.w;
+}
+
+fn dfsph_store_aux(pid: u32, factor: f32, density_scratch: f32) {
+    affine[pid].col1 = vec4<f32>(affine[pid].col1.xyz, density_scratch);
+    affine[pid].col2 = vec4<f32>(affine[pid].col2.xyz, factor);
+}
+
+fn dfsph_store_state(pid: u32, factor: f32, density_scratch: f32, density_ratio: f32) {
+    dfsph_store_aux(pid, factor, density_scratch);
+    particles[pid].pos = vec4<f32>(particles[pid].pos.xyz, density_ratio);
 }
 
 fn cubic_kernel(r: f32) -> f32 {
@@ -334,8 +372,282 @@ fn dfsph_density_factor(@builtin(global_invocation_id) gid: vec3<u32>) {
     if sum_grad > DFSPH_EPS {
         factor = -1.0 / sum_grad;
     }
-    affine[pid].col1.w = density;
-    affine[pid].col2.w = factor;
+    dfsph_store_state(pid, factor, 0.0, max(density, 0.05));
+}
+
+@compute @workgroup_size(64)
+fn dfsph_divergence_estimate(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if gid.x >= num_water() { return; }
+    let pid = water_particle_id(gid.x);
+    if pid >= num_particles() { return; }
+    if !is_water_phase(affine[pid].col0.w) || particles[pid].vel.w <= inactive_mass_threshold() {
+        return;
+    }
+
+    let xp = particles[pid].pos.xyz;
+    let vi = particles[pid].vel.xyz;
+    let home = world_to_cell(xp);
+    var density_dot = 0.0;
+    var neighbors = 0u;
+
+    for (var oz = -1i; oz <= 1i; oz = oz + 1i) {
+        for (var oy = -1i; oy <= 1i; oy = oy + 1i) {
+            for (var ox = -1i; ox <= 1i; ox = ox + 1i) {
+                let cell = home + vec3<i32>(ox, oy, oz);
+                if cell.x < 0 || cell.y < 0 || cell.z < 0 { continue; }
+                if u32(cell.x) >= gx() || u32(cell.y) >= gy() || u32(cell.z) >= gz() { continue; }
+                let ci = cell_index(u32(cell.x), u32(cell.y), u32(cell.z));
+                var neighbor_pid = atomicLoad(&water_hash[water_hash_head_idx(ci)]);
+                var guard = 0u;
+                loop {
+                    if neighbor_pid < 0 || guard >= DFSPH_MAX_NEIGHBORS_PER_CELL { break; }
+                    let j = u32(neighbor_pid);
+                    if j != pid && j < num_particles()
+                        && is_water_phase(affine[j].col0.w)
+                        && particles[j].vel.w > inactive_mass_threshold() {
+                        let r = xp - particles[j].pos.xyz;
+                        if length(r) <= dfsph_support_radius() {
+                            density_dot += dfsph_particle_volume(j)
+                                * dot(vi - particles[j].vel.xyz, cubic_kernel_grad(r));
+                            neighbors = neighbors + 1u;
+                        }
+                    }
+                    neighbor_pid = atomicLoad(&water_hash[water_hash_next_idx(j)]);
+                    guard = guard + 1u;
+                }
+            }
+        }
+    }
+
+    if neighbors < 4u {
+        density_dot = 0.0;
+    }
+    dfsph_store_aux(
+        pid,
+        dfsph_factor(pid),
+        max(density_dot - DFSPH_DIVERGENCE_ERROR / max(dt(), 1e-6), 0.0),
+    );
+}
+
+@compute @workgroup_size(64)
+fn dfsph_divergence_solve(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if gid.x >= num_water() { return; }
+    let pid = water_particle_id(gid.x);
+    if pid >= num_particles() { return; }
+    if !is_water_phase(affine[pid].col0.w) || particles[pid].vel.w <= inactive_mass_threshold() {
+        return;
+    }
+
+    let xp = particles[pid].pos.xyz;
+    let home = world_to_cell(xp);
+    let k_i = dfsph_density_scratch(pid) * dfsph_factor(pid);
+    var dv = vec3<f32>(0.0);
+
+    for (var oz = -1i; oz <= 1i; oz = oz + 1i) {
+        for (var oy = -1i; oy <= 1i; oy = oy + 1i) {
+            for (var ox = -1i; ox <= 1i; ox = ox + 1i) {
+                let cell = home + vec3<i32>(ox, oy, oz);
+                if cell.x < 0 || cell.y < 0 || cell.z < 0 { continue; }
+                if u32(cell.x) >= gx() || u32(cell.y) >= gy() || u32(cell.z) >= gz() { continue; }
+                let ci = cell_index(u32(cell.x), u32(cell.y), u32(cell.z));
+                var neighbor_pid = atomicLoad(&water_hash[water_hash_head_idx(ci)]);
+                var guard = 0u;
+                loop {
+                    if neighbor_pid < 0 || guard >= DFSPH_MAX_NEIGHBORS_PER_CELL { break; }
+                    let j = u32(neighbor_pid);
+                    if j != pid && j < num_particles()
+                        && is_water_phase(affine[j].col0.w)
+                        && particles[j].vel.w > inactive_mass_threshold() {
+                        let r = xp - particles[j].pos.xyz;
+                        if length(r) <= dfsph_support_radius() {
+                            let k_j = dfsph_density_scratch(j) * dfsph_factor(j);
+                            let k_sum = k_i + k_j;
+                            if abs(k_sum) > DFSPH_EPS {
+                                let grad_j = -dfsph_particle_volume(j) * cubic_kernel_grad(r);
+                                dv -= k_sum * grad_j;
+                            }
+                        }
+                    }
+                    neighbor_pid = atomicLoad(&water_hash[water_hash_next_idx(j)]);
+                    guard = guard + 1u;
+                }
+            }
+        }
+    }
+
+    let max_dv = vel_cap() * DFSPH_CORRECTION_SPEED_CAP;
+    let dv_len = length(dv);
+    if dv_len > max_dv {
+        dv *= max_dv / dv_len;
+    }
+    var vel = particles[pid].vel.xyz + dv;
+    let speed = length(vel);
+    if speed > vel_cap() {
+        vel *= vel_cap() / speed;
+    }
+    particles[pid].vel = vec4<f32>(vel, particles[pid].vel.w);
+}
+
+@compute @workgroup_size(64)
+fn dfsph_predict_nonpressure(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if gid.x >= num_water() { return; }
+    let pid = water_particle_id(gid.x);
+    if pid >= num_particles() { return; }
+    if !is_water_phase(affine[pid].col0.w) || particles[pid].vel.w <= inactive_mass_threshold() {
+        return;
+    }
+
+    let xp = particles[pid].pos.xyz;
+    let vi = particles[pid].vel.xyz;
+    let home = world_to_cell(xp);
+    var acc = vec3<f32>(0.0);
+
+    for (var oz = -1i; oz <= 1i; oz = oz + 1i) {
+        for (var oy = -1i; oy <= 1i; oy = oy + 1i) {
+            for (var ox = -1i; ox <= 1i; ox = ox + 1i) {
+                let cell = home + vec3<i32>(ox, oy, oz);
+                if cell.x < 0 || cell.y < 0 || cell.z < 0 { continue; }
+                if u32(cell.x) >= gx() || u32(cell.y) >= gy() || u32(cell.z) >= gz() { continue; }
+                let ci = cell_index(u32(cell.x), u32(cell.y), u32(cell.z));
+                var neighbor_pid = atomicLoad(&water_hash[water_hash_head_idx(ci)]);
+                var guard = 0u;
+                loop {
+                    if neighbor_pid < 0 || guard >= DFSPH_MAX_NEIGHBORS_PER_CELL { break; }
+                    let j = u32(neighbor_pid);
+                    if j != pid && j < num_particles()
+                        && is_water_phase(affine[j].col0.w)
+                        && particles[j].vel.w > inactive_mass_threshold() {
+                        let r = xp - particles[j].pos.xyz;
+                        let r2 = dot(r, r);
+                        if r2 <= dfsph_support_radius() * dfsph_support_radius() {
+                            let viscosity_rate = viscosity() / max(dx() * dx(), 1e-6);
+                            acc += (particles[j].vel.xyz - vi)
+                                * cubic_kernel(sqrt(r2))
+                                * dfsph_particle_volume(j)
+                                * viscosity_rate;
+                        }
+                    }
+                    neighbor_pid = atomicLoad(&water_hash[water_hash_next_idx(j)]);
+                    guard = guard + 1u;
+                }
+            }
+        }
+    }
+
+    var vel = vi + acc * dt();
+    let speed = length(vel);
+    if speed > vel_cap() {
+        vel *= vel_cap() / speed;
+    }
+    particles[pid].vel = vec4<f32>(vel, particles[pid].vel.w);
+}
+
+@compute @workgroup_size(64)
+fn dfsph_density_star(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if gid.x >= num_water() { return; }
+    let pid = water_particle_id(gid.x);
+    if pid >= num_particles() { return; }
+    if !is_water_phase(affine[pid].col0.w) || particles[pid].vel.w <= inactive_mass_threshold() {
+        return;
+    }
+
+    let xp = particles[pid].pos.xyz;
+    let vi = particles[pid].vel.xyz;
+    let home = world_to_cell(xp);
+    var delta = 0.0;
+
+    for (var oz = -1i; oz <= 1i; oz = oz + 1i) {
+        for (var oy = -1i; oy <= 1i; oy = oy + 1i) {
+            for (var ox = -1i; ox <= 1i; ox = ox + 1i) {
+                let cell = home + vec3<i32>(ox, oy, oz);
+                if cell.x < 0 || cell.y < 0 || cell.z < 0 { continue; }
+                if u32(cell.x) >= gx() || u32(cell.y) >= gy() || u32(cell.z) >= gz() { continue; }
+                let ci = cell_index(u32(cell.x), u32(cell.y), u32(cell.z));
+                var neighbor_pid = atomicLoad(&water_hash[water_hash_head_idx(ci)]);
+                var guard = 0u;
+                loop {
+                    if neighbor_pid < 0 || guard >= DFSPH_MAX_NEIGHBORS_PER_CELL { break; }
+                    let j = u32(neighbor_pid);
+                    if j != pid && j < num_particles()
+                        && is_water_phase(affine[j].col0.w)
+                        && particles[j].vel.w > inactive_mass_threshold() {
+                        let r = xp - particles[j].pos.xyz;
+                        if length(r) <= dfsph_support_radius() {
+                            delta += dfsph_particle_volume(j)
+                                * dot(vi - particles[j].vel.xyz, cubic_kernel_grad(r));
+                        }
+                    }
+                    neighbor_pid = atomicLoad(&water_hash[water_hash_next_idx(j)]);
+                    guard = guard + 1u;
+                }
+            }
+        }
+    }
+
+    let density_star = max(dfsph_density_ratio(pid) + dt() * delta, 1.0);
+    dfsph_store_aux(pid, dfsph_factor(pid), density_star);
+}
+
+@compute @workgroup_size(64)
+fn dfsph_density_solve(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if gid.x >= num_water() { return; }
+    let pid = water_particle_id(gid.x);
+    if pid >= num_particles() { return; }
+    if !is_water_phase(affine[pid].col0.w) || particles[pid].vel.w <= inactive_mass_threshold() {
+        return;
+    }
+
+    let xp = particles[pid].pos.xyz;
+    let home = world_to_cell(xp);
+    let b_i = max(dfsph_density_scratch(pid) - 1.0 - DFSPH_DENSITY_ERROR_FRACTION, 0.0);
+    let k_i = b_i * dfsph_factor(pid) / max(dt() * dt(), 1e-6);
+    var dv = vec3<f32>(0.0);
+
+    for (var oz = -1i; oz <= 1i; oz = oz + 1i) {
+        for (var oy = -1i; oy <= 1i; oy = oy + 1i) {
+            for (var ox = -1i; ox <= 1i; ox = ox + 1i) {
+                let cell = home + vec3<i32>(ox, oy, oz);
+                if cell.x < 0 || cell.y < 0 || cell.z < 0 { continue; }
+                if u32(cell.x) >= gx() || u32(cell.y) >= gy() || u32(cell.z) >= gz() { continue; }
+                let ci = cell_index(u32(cell.x), u32(cell.y), u32(cell.z));
+                var neighbor_pid = atomicLoad(&water_hash[water_hash_head_idx(ci)]);
+                var guard = 0u;
+                loop {
+                    if neighbor_pid < 0 || guard >= DFSPH_MAX_NEIGHBORS_PER_CELL { break; }
+                    let j = u32(neighbor_pid);
+                    if j != pid && j < num_particles()
+                        && is_water_phase(affine[j].col0.w)
+                        && particles[j].vel.w > inactive_mass_threshold() {
+                        let r = xp - particles[j].pos.xyz;
+                        if length(r) <= dfsph_support_radius() {
+                            let b_j =
+                                max(dfsph_density_scratch(j) - 1.0 - DFSPH_DENSITY_ERROR_FRACTION, 0.0);
+                            let k_j = b_j * dfsph_factor(j) / max(dt() * dt(), 1e-6);
+                            let k_sum = k_i + k_j;
+                            if abs(k_sum) > DFSPH_EPS {
+                                let grad_j = -dfsph_particle_volume(j) * cubic_kernel_grad(r);
+                                dv -= dt() * k_sum * grad_j;
+                            }
+                        }
+                    }
+                    neighbor_pid = atomicLoad(&water_hash[water_hash_next_idx(j)]);
+                    guard = guard + 1u;
+                }
+            }
+        }
+    }
+
+    let max_dv = vel_cap() * DFSPH_CORRECTION_SPEED_CAP;
+    let dv_len = length(dv);
+    if dv_len > max_dv {
+        dv *= max_dv / dv_len;
+    }
+    var vel = particles[pid].vel.xyz + dv;
+    let speed = length(vel);
+    if speed > vel_cap() {
+        vel *= vel_cap() / speed;
+    }
+    particles[pid].vel = vec4<f32>(vel, particles[pid].vel.w);
 }
 "#;
 
@@ -355,5 +667,10 @@ mod tests {
         assert!(entry_names.contains(&"water_hash_clear"));
         assert!(entry_names.contains(&"water_hash_scatter"));
         assert!(entry_names.contains(&"dfsph_density_factor"));
+        assert!(entry_names.contains(&"dfsph_divergence_estimate"));
+        assert!(entry_names.contains(&"dfsph_divergence_solve"));
+        assert!(entry_names.contains(&"dfsph_predict_nonpressure"));
+        assert!(entry_names.contains(&"dfsph_density_star"));
+        assert!(entry_names.contains(&"dfsph_density_solve"));
     }
 }
