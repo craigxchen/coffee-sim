@@ -2069,6 +2069,78 @@ struct ProfilerRunConfig<'a> {
     multiple_outputs: bool,
 }
 
+struct ProfileSelection {
+    scene: ProfileScene,
+    solvers: Vec<SolverSpec>,
+    pressure_operator: PressureOperatorKind,
+    solver_ids: Vec<String>,
+    warmup: u32,
+    measured: u32,
+    calibration: u32,
+    cg_iterations: Option<u32>,
+    base_output_path: PathBuf,
+    multiple_outputs: bool,
+}
+
+impl ProfileSelection {
+    fn from_cli(cli: &ProfilerCliArgs) -> Self {
+        let scene = cli
+            .scene
+            .clone()
+            .or_else(|| std::env::var("COFFEE_SIM_PROFILE_SCENE").ok())
+            .unwrap_or_else(|| "center_pour".into())
+            .parse::<ProfileScene>()
+            .unwrap_or_else(|err| panic!("{err}"));
+        let solvers = profile_solver_specs(cli);
+        let pressure_operator = cli
+            .pressure_operator
+            .clone()
+            .or_else(|| std::env::var("COFFEE_SIM_PROFILE_PRESSURE_OPERATOR").ok())
+            .unwrap_or_else(|| PressureOperatorKind::Collocated.to_string())
+            .parse::<PressureOperatorKind>()
+            .unwrap_or_else(|err| panic!("{err}"));
+        for solver in &solvers {
+            assert!(
+                solver.supports_pressure_operator(pressure_operator),
+                "solver '{solver}' does not support pressure_operator='{pressure_operator}'; use mpm:jacobi-cg for the staggered operator"
+            );
+        }
+        let solver_ids = solvers
+            .iter()
+            .copied()
+            .map(SolverSpec::id)
+            .collect::<Vec<_>>();
+        let warmup = cli
+            .warmup
+            .or_else(|| env_u32("COFFEE_SIM_PROFILE_WARMUP"))
+            .unwrap_or(DEFAULT_WARMUP_FRAMES);
+        let measured = cli
+            .measured
+            .or_else(|| env_u32("COFFEE_SIM_PROFILE_FRAMES"))
+            .unwrap_or(DEFAULT_MEASURED_FRAMES);
+        let calibration = cli
+            .calibration
+            .or_else(|| env_u32("COFFEE_SIM_PROFILE_CAL"))
+            .unwrap_or(DEFAULT_CALIBRATION_FRAMES);
+        let base_output_path = output_path(cli);
+        let multiple_outputs = solvers.len() > 1;
+        Self {
+            scene,
+            solvers,
+            pressure_operator,
+            solver_ids,
+            warmup,
+            measured,
+            calibration,
+            cg_iterations: cli
+                .cg_iterations
+                .or_else(|| env_u32("COFFEE_SIM_PROFILE_CG_ITERATIONS")),
+            base_output_path,
+            multiple_outputs,
+        }
+    }
+}
+
 struct ProfilerDeviceContext<'a> {
     device: &'a wgpu::Device,
     queue: &'a wgpu::Queue,
@@ -2458,6 +2530,7 @@ fn profile_solver_backend(
 
 pub fn run_profile_from_env_args() {
     let cli = ProfilerCliArgs::from_env_args();
+    let selection = ProfileSelection::from_cli(&cli);
     let Some(adapter) = request_adapter() else {
         eprintln!("profile_mpm_pipeline: no GPU adapter available; skipping.");
         return;
@@ -2482,46 +2555,6 @@ pub fn run_profile_from_env_args() {
     .expect("request profiler device");
 
     let info = adapter.get_info();
-    let scene = cli
-        .scene
-        .clone()
-        .or_else(|| std::env::var("COFFEE_SIM_PROFILE_SCENE").ok())
-        .unwrap_or_else(|| "center_pour".into())
-        .parse::<ProfileScene>()
-        .unwrap_or_else(|err| panic!("{err}"));
-    let solvers = profile_solver_specs(&cli);
-    let pressure_operator = cli
-        .pressure_operator
-        .clone()
-        .or_else(|| std::env::var("COFFEE_SIM_PROFILE_PRESSURE_OPERATOR").ok())
-        .unwrap_or_else(|| PressureOperatorKind::Collocated.to_string())
-        .parse::<PressureOperatorKind>()
-        .unwrap_or_else(|err| panic!("{err}"));
-    for solver in &solvers {
-        assert!(
-            solver.supports_pressure_operator(pressure_operator),
-            "solver '{solver}' does not support pressure_operator='{pressure_operator}'; use mpm:jacobi-cg for the staggered operator"
-        );
-    }
-    let solver_ids = solvers
-        .iter()
-        .copied()
-        .map(SolverSpec::id)
-        .collect::<Vec<_>>();
-    let warmup = cli
-        .warmup
-        .or_else(|| env_u32("COFFEE_SIM_PROFILE_WARMUP"))
-        .unwrap_or(DEFAULT_WARMUP_FRAMES);
-    let measured = cli
-        .measured
-        .or_else(|| env_u32("COFFEE_SIM_PROFILE_FRAMES"))
-        .unwrap_or(DEFAULT_MEASURED_FRAMES);
-    let calibration = cli
-        .calibration
-        .or_else(|| env_u32("COFFEE_SIM_PROFILE_CAL"))
-        .unwrap_or(DEFAULT_CALIBRATION_FRAMES);
-    let base_output_path = output_path(&cli);
-    let multiple_outputs = solvers.len() > 1;
     let period_ns = queue.get_timestamp_period();
 
     if !timestamps_supported {
@@ -2539,20 +2572,18 @@ pub fn run_profile_from_env_args() {
         period_ns,
     };
     let run = ProfilerRunConfig {
-        scene,
-        warmup,
-        measured,
-        calibration,
-        cg_iterations: cli
-            .cg_iterations
-            .or_else(|| env_u32("COFFEE_SIM_PROFILE_CG_ITERATIONS")),
-        pressure_operator,
-        solver_ids,
-        base_output_path: &base_output_path,
-        multiple_outputs,
+        scene: selection.scene,
+        warmup: selection.warmup,
+        measured: selection.measured,
+        calibration: selection.calibration,
+        cg_iterations: selection.cg_iterations,
+        pressure_operator: selection.pressure_operator,
+        solver_ids: selection.solver_ids,
+        base_output_path: &selection.base_output_path,
+        multiple_outputs: selection.multiple_outputs,
     };
 
-    for &solver in &solvers {
+    for &solver in &selection.solvers {
         solver.profile(&device_ctx, &run);
     }
 }
