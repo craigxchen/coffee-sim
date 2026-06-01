@@ -20,6 +20,8 @@ mod profiler;
 mod shader;
 mod state;
 pub(crate) mod units;
+#[cfg(test)]
+mod xpbd;
 
 pub(crate) use filter::FilterConfig;
 #[cfg(target_arch = "wasm32")]
