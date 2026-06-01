@@ -18,6 +18,8 @@ selection and the environment form for ignored-test runs. Examples:
 cargo run -p coffee-sim-wasm --features native-profiler --bin profile_solvers -- \
   --scene center_pour --solvers all --frames 120 --warmup 60 --cal 30
 cargo run -p coffee-sim-wasm --features native-profiler --bin profile_solvers -- \
+  --scene center_pour --solvers all --frames 120 --warmup 60 --cal 30 --require-gpu
+cargo run -p coffee-sim-wasm --features native-profiler --bin profile_solvers -- \
   --scene center_pour --solvers all --frames 120 --warmup 60 --cal 30 --dry-run
 cargo run -p coffee-sim-wasm --features native-profiler --bin profile_solvers -- \
   --scene center_pour --solvers all --frames 120 --warmup 60 --cal 30 --dry-run-json
@@ -27,6 +29,11 @@ COFFEE_SIM_PROFILE_ARGS="scene=center_pour solvers=all frames=120 warmup=60 cal=
 COFFEE_SIM_PROFILE_ARGS="--scene water_block --solver mpm:sparse-cg --pressure-operator collocated" \
   cargo test -p coffee-sim-wasm --lib --release profile_solvers -- --ignored --nocapture
 ```
+
+Use `--require-gpu`, `require_gpu=true`, or
+`COFFEE_SIM_PROFILE_REQUIRE_GPU=true` for measurement gates. Without it, a host
+with no native adapter prints a skip message so regular non-GPU development
+does not fail.
 
 Runnable solver specs are:
 
