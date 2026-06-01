@@ -676,6 +676,255 @@ fn profiler_solver_specs_parse_backend_qualified_values() {
     assert_eq!("dfsph:water".parse::<SolverSpec>(), Ok(SolverSpec::Dfsph));
 }
 
+struct ProfilerRunConfig<'a> {
+    scene: &'a str,
+    warmup: u32,
+    measured: u32,
+    calibration: u32,
+    base_output_path: &'a PathBuf,
+    multiple_outputs: bool,
+}
+
+struct ProfilerDeviceContext<'a> {
+    device: &'a wgpu::Device,
+    queue: &'a wgpu::Queue,
+    info: &'a wgpu::AdapterInfo,
+    timestamps_supported: bool,
+    period_ns: f32,
+}
+
+fn write_report(path: &PathBuf, report: &ProfileReport) {
+    let json = serde_json::to_string_pretty(report).expect("serialize report");
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).expect("create output dir");
+    }
+    std::fs::write(path, json).expect("write profile json");
+}
+
+fn print_report_summary(path: &PathBuf, report: &ProfileReport) {
+    println!(
+        "\n=== {} profile ({}, pressure solver: {}) ===",
+        report.metadata.solver.backend, report.metadata.scene, report.metadata.solver.pressure.kind
+    );
+    println!(
+        "adapter: {} [{}] | cells: {} | particles: {} water + {} bed",
+        report.metadata.adapter,
+        report.metadata.backend,
+        report.metadata.total_cells,
+        report.metadata.water_particles_end,
+        report.metadata.bed_particles,
+    );
+    println!(
+        "production step_frame: {:.3} ms/frame (p95 {:.3})",
+        report.frame_timings.production_frame.mean_ms, report.frame_timings.production_frame.p95_ms,
+    );
+    if report.metadata.timestamps_supported {
+        println!(
+            "instrumented GPU passes sum: {:.3} ms/frame  (+ {:.3} unattributed = {:.3} gpu_wait)\n",
+            report.frame_timings.gpu_passes_sum.mean_ms,
+            report.frame_timings.gpu_unattributed.mean_ms,
+            report.frame_timings.gpu_wait.mean_ms,
+        );
+        println!(
+            "{:<20} {:>10} {:>8} {:>9}",
+            "pass", "ms/frame", "%gpu", "passes/f"
+        );
+        for pass in &report.gpu_passes {
+            println!(
+                "{:<20} {:>10.3} {:>7.1}% {:>9.0}",
+                pass.label, pass.mean_ms, pass.share_of_gpu_pct, pass.passes_per_frame
+            );
+        }
+    } else {
+        println!(
+            "GPU timestamps unavailable on this adapter - no per-pass breakdown. \
+             GPU time (submit -> done): {:.3} ms/frame\n",
+            report.frame_timings.gpu_wait.mean_ms,
+        );
+    }
+    println!("\nJSON written to: {}", path.display());
+}
+
+fn profile_mpm_solver(
+    ctx: &ProfilerDeviceContext<'_>,
+    run: &ProfilerRunConfig<'_>,
+    solver: SolverSpec,
+    pressure: PressureSolverKind,
+) {
+    let mut settings = scene_settings(run.scene);
+    settings.pressure_solver = pressure;
+    settings.pressure_cg_iterations = std::env::var("COFFEE_SIM_PROFILE_CG_ITERATIONS")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(settings.pressure_rbgs_pairs);
+    let grid_dims = settings.grid_dims;
+    let total_cells = grid_dims[0] * grid_dims[1] * grid_dims[2];
+    let max_particles = settings.max_particles;
+    let substeps = settings.substeps.max(1);
+
+    let mut sim = MpmSim3D::new(ctx.device, ctx.queue, settings);
+
+    for _ in 0..run.warmup {
+        sim.step_frame(ctx.device, ctx.queue, FRAME_DT);
+    }
+    let _ = ctx.device.poll(wgpu::PollType::wait_indefinitely());
+    let bed_particles = sim.num_bed;
+    let pressure_rbgs_pairs = sim
+        .last_pressure_rbgs_pairs
+        .max(sim.settings.pressure_rbgs_pairs);
+
+    let mut production_ms = Vec::with_capacity(run.calibration as usize);
+    for _ in 0..run.calibration {
+        let t = Instant::now();
+        sim.step_frame(ctx.device, ctx.queue, FRAME_DT);
+        let _ = ctx.device.poll(wgpu::PollType::wait_indefinitely());
+        production_ms.push(ms(t));
+    }
+
+    let query_capacity = sim.profiler_timestamp_query_capacity();
+    let timer = ctx
+        .timestamps_supported
+        .then(|| GpuTimer::new(ctx.device, ctx.period_ns, query_capacity));
+    let mut wall_ms = Vec::with_capacity(run.measured as usize);
+    let mut gpu_passes_sum = Vec::with_capacity(run.measured as usize);
+    let mut gpu_wait = Vec::with_capacity(run.measured as usize);
+    let mut gpu_unattributed = Vec::with_capacity(run.measured as usize);
+    let mut cpu_emit = Vec::with_capacity(run.measured as usize);
+    let mut cpu_uniforms = Vec::with_capacity(run.measured as usize);
+    let mut cpu_encode = Vec::with_capacity(run.measured as usize);
+    let mut cpu_submit = Vec::with_capacity(run.measured as usize);
+    let mut per_label: BTreeMap<MpmPassLabel, Vec<f64>> = BTreeMap::new();
+    let mut label_dispatch_count: BTreeMap<MpmPassLabel, u64> = BTreeMap::new();
+
+    let water_particles_start = sim.num_water;
+    for _ in 0..run.measured {
+        let t = Instant::now();
+        let sums =
+            step_frame_instrumented(&mut sim, ctx.device, ctx.queue, FRAME_DT, timer.as_ref());
+        wall_ms.push(ms(t));
+        gpu_passes_sum.push(sums.gpu_passes_ms);
+        gpu_wait.push(sums.gpu_wait_ms);
+        gpu_unattributed.push((sums.gpu_wait_ms - sums.gpu_passes_ms).max(0.0));
+        cpu_emit.push(sums.cpu_emit_ms);
+        cpu_uniforms.push(sums.cpu_uniforms_ms);
+        cpu_encode.push(sums.cpu_encode_ms);
+        cpu_submit.push(sums.cpu_submit_ms);
+        for (label, value) in sums.per_label_ms {
+            per_label.entry(label).or_default().push(value);
+        }
+        for (label, count) in sums.per_label_count {
+            *label_dispatch_count.entry(label).or_insert(0) += count as u64;
+        }
+    }
+    let water_particles_end = sim.num_water;
+
+    let total_pass_mean: f64 = per_label
+        .values()
+        .map(|v| v.iter().sum::<f64>() / v.len().max(1) as f64)
+        .sum();
+    let mut gpu_passes: Vec<PassStat> = per_label
+        .into_iter()
+        .map(|(label, samples)| {
+            let stat = Stat::from_samples(samples);
+            let passes =
+                *label_dispatch_count.get(&label).unwrap_or(&0) as f64 / run.measured.max(1) as f64;
+            PassStat {
+                label: label.id().to_string(),
+                display_label: label.display().to_string(),
+                category: label.category().to_string(),
+                passes_per_frame: passes,
+                share_of_gpu_pct: if total_pass_mean > 0.0 {
+                    stat.mean_ms / total_pass_mean * 100.0
+                } else {
+                    0.0
+                },
+                mean_ms: stat.mean_ms,
+                min_ms: stat.min_ms,
+                max_ms: stat.max_ms,
+                p50_ms: stat.p50_ms,
+                p95_ms: stat.p95_ms,
+                total_ms: stat.total_ms,
+            }
+        })
+        .collect();
+    gpu_passes.sort_by(|a, b| b.mean_ms.total_cmp(&a.mean_ms));
+
+    let frame_timings = FrameTimings {
+        production_frame: Stat::from_samples(production_ms),
+        instrumented_wall: Stat::from_samples(wall_ms),
+        gpu_passes_sum: Stat::from_samples(gpu_passes_sum),
+        gpu_wait: Stat::from_samples(gpu_wait),
+        gpu_unattributed: Stat::from_samples(gpu_unattributed),
+        cpu_emit: Stat::from_samples(cpu_emit),
+        cpu_uniforms: Stat::from_samples(cpu_uniforms),
+        cpu_encode: Stat::from_samples(cpu_encode),
+        cpu_submit: Stat::from_samples(cpu_submit),
+    };
+
+    let mut bottlenecks = Vec::new();
+    for pass in gpu_passes.iter().take(5) {
+        bottlenecks.push(format!(
+            "{}: {:.3} ms/frame ({:.1}% of GPU pass time, {:.0} passes/frame)",
+            pass.label, pass.mean_ms, pass.share_of_gpu_pct, pass.passes_per_frame
+        ));
+    }
+    let cpu_total = frame_timings.cpu_emit.mean_ms
+        + frame_timings.cpu_uniforms.mean_ms
+        + frame_timings.cpu_encode.mean_ms
+        + frame_timings.cpu_submit.mean_ms;
+    let cpu_gpu_verdict = if !ctx.timestamps_supported {
+        "n/a - no GPU timestamps on this adapter; compare CPU against gpu_wait instead"
+    } else if cpu_total > frame_timings.gpu_passes_sum.mean_ms * 0.25 {
+        "CPU-side is non-trivial"
+    } else {
+        "GPU-bound (CPU orchestration negligible)"
+    };
+    bottlenecks.push(format!(
+        "CPU orchestration: {:.3} ms/frame vs GPU passes {:.3} ms/frame -> {}",
+        cpu_total, frame_timings.gpu_passes_sum.mean_ms, cpu_gpu_verdict
+    ));
+
+    let report = ProfileReport {
+        schema_version: 2,
+        metadata: Metadata {
+            scene: run.scene.to_string(),
+            adapter: ctx.info.name.clone(),
+            backend: format!("{:?}", ctx.info.backend),
+            device_type: format!("{:?}", ctx.info.device_type),
+            timestamps_supported: ctx.timestamps_supported,
+            timestamp_period_ns: ctx.period_ns,
+            warmup_frames: run.warmup,
+            measured_frames: run.measured,
+            calibration_frames: run.calibration,
+            substeps_per_frame: substeps,
+            frame_dt_s: FRAME_DT,
+            grid_dims,
+            total_cells,
+            max_particles,
+            solver: SolverMetadata {
+                backend: solver.backend().to_string(),
+                pressure: PressureSolverMetadata {
+                    kind: sim.pressure_solver_kind().to_string(),
+                    iterations_per_substep: sim.pressure_solver_iterations_per_substep(),
+                },
+            },
+            pressure_rbgs_pairs,
+            water_particles_start,
+            water_particles_end,
+            bed_particles,
+            total_particles_end: water_particles_end + bed_particles,
+        },
+        frame_timings,
+        gpu_passes,
+        bottlenecks,
+    };
+
+    let path = output_path_for_solver(run.base_output_path, solver, run.multiple_outputs);
+    write_report(&path, &report);
+    print_report_summary(&path, &report);
+}
+
 #[test]
 #[ignore = "profiling harness; run explicitly with --ignored --release"]
 fn profile_mpm_pipeline() {
@@ -719,241 +968,32 @@ fn profile_mpm_pipeline() {
         );
     }
 
+    let device_ctx = ProfilerDeviceContext {
+        device: &device,
+        queue: &queue,
+        info: &info,
+        timestamps_supported,
+        period_ns,
+    };
+    let run = ProfilerRunConfig {
+        scene: &scene,
+        warmup,
+        measured,
+        calibration,
+        base_output_path: &base_output_path,
+        multiple_outputs,
+    };
+
     for &solver in &solvers {
-        let mut settings = scene_settings(&scene);
         match solver {
             SolverSpec::Mpm { pressure } => {
-                settings.pressure_solver = pressure;
+                profile_mpm_solver(&device_ctx, &run, solver, pressure);
             }
-            SolverSpec::Dfsph => {
-                panic!(
-                    "DFSPH profiler backend is registered but not yet ported into \
-                     codex/modular-solver-profiler; integrate codex/dfsph-water state, \
-                     pipelines, and schedule before profiling it"
-                );
-            }
+            SolverSpec::Dfsph => panic!(
+                "DFSPH profiler backend is registered but not yet ported into \
+                 codex/modular-solver-profiler; integrate codex/dfsph-water state, \
+                 pipelines, and schedule before profiling it"
+            ),
         }
-        settings.pressure_cg_iterations = std::env::var("COFFEE_SIM_PROFILE_CG_ITERATIONS")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .filter(|v| *v > 0)
-            .unwrap_or(settings.pressure_rbgs_pairs);
-        let grid_dims = settings.grid_dims;
-        let total_cells = grid_dims[0] * grid_dims[1] * grid_dims[2];
-        let max_particles = settings.max_particles;
-        let substeps = settings.substeps.max(1);
-
-        let mut sim = MpmSim3D::new(&device, &queue, settings);
-
-        // Warm up: fill the pour, settle the bed, warm the driver.
-        for _ in 0..warmup {
-            sim.step_frame(&device, &queue, FRAME_DT);
-        }
-        let _ = device.poll(wgpu::PollType::wait_indefinitely());
-        let bed_particles = sim.num_bed;
-        let pressure_rbgs_pairs = sim
-            .last_pressure_rbgs_pairs
-            .max(sim.settings.pressure_rbgs_pairs);
-
-        // Calibration: honest production-path frame cost (single batched pass).
-        let mut production_ms = Vec::with_capacity(calibration as usize);
-        for _ in 0..calibration {
-            let t = Instant::now();
-            sim.step_frame(&device, &queue, FRAME_DT);
-            let _ = device.poll(wgpu::PollType::wait_indefinitely());
-            production_ms.push(ms(t));
-        }
-
-        // Instrumented measurement.
-        let query_capacity = sim.profiler_timestamp_query_capacity();
-        let timer = timestamps_supported.then(|| GpuTimer::new(&device, period_ns, query_capacity));
-        let mut wall_ms = Vec::with_capacity(measured as usize);
-        let mut gpu_passes_sum = Vec::with_capacity(measured as usize);
-        let mut gpu_wait = Vec::with_capacity(measured as usize);
-        let mut gpu_unattributed = Vec::with_capacity(measured as usize);
-        let mut cpu_emit = Vec::with_capacity(measured as usize);
-        let mut cpu_uniforms = Vec::with_capacity(measured as usize);
-        let mut cpu_encode = Vec::with_capacity(measured as usize);
-        let mut cpu_submit = Vec::with_capacity(measured as usize);
-        let mut per_label: BTreeMap<MpmPassLabel, Vec<f64>> = BTreeMap::new();
-        let mut label_dispatch_count: BTreeMap<MpmPassLabel, u64> = BTreeMap::new();
-
-        // Capture the particle count at the true start of the measured window —
-        // after warmup AND calibration, both of which keep emitting inflow.
-        let water_particles_start = sim.num_water;
-        for _ in 0..measured {
-            let t = Instant::now();
-            let sums = step_frame_instrumented(&mut sim, &device, &queue, FRAME_DT, timer.as_ref());
-            wall_ms.push(ms(t));
-            gpu_passes_sum.push(sums.gpu_passes_ms);
-            gpu_wait.push(sums.gpu_wait_ms);
-            gpu_unattributed.push((sums.gpu_wait_ms - sums.gpu_passes_ms).max(0.0));
-            cpu_emit.push(sums.cpu_emit_ms);
-            cpu_uniforms.push(sums.cpu_uniforms_ms);
-            cpu_encode.push(sums.cpu_encode_ms);
-            cpu_submit.push(sums.cpu_submit_ms);
-            for (label, value) in sums.per_label_ms {
-                per_label.entry(label).or_default().push(value);
-            }
-            for (label, count) in sums.per_label_count {
-                *label_dispatch_count.entry(label).or_insert(0) += count as u64;
-            }
-        }
-        let water_particles_end = sim.num_water;
-
-        // Build per-pass stats, sorted by mean descending.
-        let total_pass_mean: f64 = per_label
-            .values()
-            .map(|v| v.iter().sum::<f64>() / v.len().max(1) as f64)
-            .sum();
-        let mut gpu_passes: Vec<PassStat> = per_label
-            .into_iter()
-            .map(|(label, samples)| {
-                let stat = Stat::from_samples(samples);
-                let passes =
-                    *label_dispatch_count.get(&label).unwrap_or(&0) as f64 / measured.max(1) as f64;
-                PassStat {
-                    label: label.id().to_string(),
-                    display_label: label.display().to_string(),
-                    category: label.category().to_string(),
-                    passes_per_frame: passes,
-                    share_of_gpu_pct: if total_pass_mean > 0.0 {
-                        stat.mean_ms / total_pass_mean * 100.0
-                    } else {
-                        0.0
-                    },
-                    mean_ms: stat.mean_ms,
-                    min_ms: stat.min_ms,
-                    max_ms: stat.max_ms,
-                    p50_ms: stat.p50_ms,
-                    p95_ms: stat.p95_ms,
-                    total_ms: stat.total_ms,
-                }
-            })
-            .collect();
-        gpu_passes.sort_by(|a, b| b.mean_ms.total_cmp(&a.mean_ms));
-
-        let frame_timings = FrameTimings {
-            production_frame: Stat::from_samples(production_ms),
-            instrumented_wall: Stat::from_samples(wall_ms),
-            gpu_passes_sum: Stat::from_samples(gpu_passes_sum),
-            gpu_wait: Stat::from_samples(gpu_wait),
-            gpu_unattributed: Stat::from_samples(gpu_unattributed),
-            cpu_emit: Stat::from_samples(cpu_emit),
-            cpu_uniforms: Stat::from_samples(cpu_uniforms),
-            cpu_encode: Stat::from_samples(cpu_encode),
-            cpu_submit: Stat::from_samples(cpu_submit),
-        };
-
-        let mut bottlenecks = Vec::new();
-        for pass in gpu_passes.iter().take(5) {
-            bottlenecks.push(format!(
-                "{}: {:.3} ms/frame ({:.1}% of GPU pass time, {:.0} passes/frame)",
-                pass.label, pass.mean_ms, pass.share_of_gpu_pct, pass.passes_per_frame
-            ));
-        }
-        let cpu_total = frame_timings.cpu_emit.mean_ms
-            + frame_timings.cpu_uniforms.mean_ms
-            + frame_timings.cpu_encode.mean_ms
-            + frame_timings.cpu_submit.mean_ms;
-        let cpu_gpu_verdict = if !timestamps_supported {
-            "n/a - no GPU timestamps on this adapter; compare CPU against gpu_wait instead"
-        } else if cpu_total > frame_timings.gpu_passes_sum.mean_ms * 0.25 {
-            "CPU-side is non-trivial"
-        } else {
-            "GPU-bound (CPU orchestration negligible)"
-        };
-        bottlenecks.push(format!(
-            "CPU orchestration: {:.3} ms/frame vs GPU passes {:.3} ms/frame -> {}",
-            cpu_total, frame_timings.gpu_passes_sum.mean_ms, cpu_gpu_verdict
-        ));
-
-        let report = ProfileReport {
-            schema_version: 2,
-            metadata: Metadata {
-                scene: scene.clone(),
-                adapter: info.name.clone(),
-                backend: format!("{:?}", info.backend),
-                device_type: format!("{:?}", info.device_type),
-                timestamps_supported,
-                timestamp_period_ns: period_ns,
-                warmup_frames: warmup,
-                measured_frames: measured,
-                calibration_frames: calibration,
-                substeps_per_frame: substeps,
-                frame_dt_s: FRAME_DT,
-                grid_dims,
-                total_cells,
-                max_particles,
-                solver: SolverMetadata {
-                    backend: solver.backend().to_string(),
-                    pressure: PressureSolverMetadata {
-                        kind: sim.pressure_solver_kind().to_string(),
-                        iterations_per_substep: sim.pressure_solver_iterations_per_substep(),
-                    },
-                },
-                pressure_rbgs_pairs,
-                water_particles_start,
-                water_particles_end,
-                bed_particles,
-                total_particles_end: water_particles_end + bed_particles,
-            },
-            frame_timings,
-            gpu_passes,
-            bottlenecks,
-        };
-
-        let json = serde_json::to_string_pretty(&report).expect("serialize report");
-        let path = output_path_for_solver(&base_output_path, solver, multiple_outputs);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).expect("create output dir");
-        }
-        std::fs::write(&path, &json).expect("write profile json");
-
-        // Console summary (visible with --nocapture).
-        println!(
-            "\n=== {} profile ({}, pressure solver: {}) ===",
-            report.metadata.solver.backend,
-            report.metadata.scene,
-            report.metadata.solver.pressure.kind
-        );
-        println!(
-            "adapter: {} [{}] | cells: {} | particles: {} water + {} bed",
-            report.metadata.adapter,
-            report.metadata.backend,
-            report.metadata.total_cells,
-            report.metadata.water_particles_end,
-            report.metadata.bed_particles,
-        );
-        println!(
-            "production step_frame: {:.3} ms/frame (p95 {:.3})",
-            report.frame_timings.production_frame.mean_ms,
-            report.frame_timings.production_frame.p95_ms,
-        );
-        if report.metadata.timestamps_supported {
-            println!(
-            "instrumented GPU passes sum: {:.3} ms/frame  (+ {:.3} unattributed = {:.3} gpu_wait)\n",
-            report.frame_timings.gpu_passes_sum.mean_ms,
-            report.frame_timings.gpu_unattributed.mean_ms,
-            report.frame_timings.gpu_wait.mean_ms,
-        );
-            println!(
-                "{:<20} {:>10} {:>8} {:>9}",
-                "pass", "ms/frame", "%gpu", "passes/f"
-            );
-            for pass in &report.gpu_passes {
-                println!(
-                    "{:<20} {:>10.3} {:>7.1}% {:>9.0}",
-                    pass.label, pass.mean_ms, pass.share_of_gpu_pct, pass.passes_per_frame
-                );
-            }
-        } else {
-            println!(
-                "GPU timestamps unavailable on this adapter - no per-pass breakdown. \
-             GPU time (submit -> done): {:.3} ms/frame\n",
-                report.frame_timings.gpu_wait.mean_ms,
-            );
-        }
-        println!("\nJSON written to: {}", path.display());
     }
 }
