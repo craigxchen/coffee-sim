@@ -86,6 +86,14 @@ pub(crate) struct MpmUniforms {
 pub(crate) struct MpmBuffers {
     pub particles: wgpu::Buffer,
     pub affine: wgpu::Buffer,
+    /// DFSPH backend scratch: grid hash heads followed by per-water-particle
+    /// next links. Kept outside the current MPM pressure bind group until the
+    /// backend runner owns its shader/bind-group layout.
+    #[allow(dead_code)]
+    pub water_hash: wgpu::Buffer,
+    /// DFSPH tiled-pressure indirect dispatch args.
+    #[allow(dead_code)]
+    pub pressure_indirect: wgpu::Buffer,
     pub grid: wgpu::Buffer,
     pub cg: wgpu::Buffer,
     pub grid_vel: wgpu::Buffer,
@@ -137,6 +145,23 @@ impl MpmBuffers {
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_DST
                 | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        let water_hash_slots = total_cells + max_p;
+        let water_hash = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("dfsph water hash"),
+            size: (water_hash_slots * size_of::<i32>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let pressure_indirect = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("dfsph pressure tile indirect args"),
+            size: (3 * size_of::<i32>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::INDIRECT
+                | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
 
@@ -238,6 +263,8 @@ impl MpmBuffers {
         Self {
             particles,
             affine,
+            water_hash,
+            pressure_indirect,
             grid,
             cg,
             grid_vel,
