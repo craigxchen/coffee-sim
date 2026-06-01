@@ -1,0 +1,2 @@
+# Data files (dripper SDF textures, calibration tables, presets) land here.
+# The solver-description catalog is NOT here — it lives in src/engine/solvers.json.

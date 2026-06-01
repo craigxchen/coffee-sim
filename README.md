@@ -1,83 +1,52 @@
 # Coffee Sim
 
-`coffee-sim` is a browser-based pour-over coffee simulation powered by Rust,
-WebAssembly, and WebGPU.
+`coffee-sim` is an interactive, real-time **pour-over coffee simulator** built in Rust with
+`wgpu` + WGSL — water poured through a deformable coffee bed in a dripper, with believable
+flow, bed deformation, and an extraction model whose causal levers (grind, temperature,
+ratio, pour technique, freshness, evenness) drive the right outcomes.
 
-![Coffee Sim center pour](docs/assets/coffee-sim-center-pour.gif)
+It is organized as a **modular library of complete fluid-simulation solvers** behind one
+seam (`Solver`), sharing one physics layer (`models`) so methods can be implemented and
+compared fairly. One WGSL codebase targets native desktop now and WASM + WebGPU later.
 
-## Features
-
-- 3D V60-style pour-over scene
-- WebGPU MPM particle simulation
-- interactive pour controls
-- orbit, zoom, and pan camera controls
-- built-in benchmark and debug scenes
-- browser-based diagnostics overlay
+> **Status: rewrite in progress.** Phase 0 (the scaffold/harness) is in place: the solver
+> seam, the registry + runtime solver-switch, the headless `GpuContext`, and the local
+> profiler. Solver physics (XPBD water core first) comes next. The previous MPM
+> implementation it supersedes lives on `origin/*` branches.
 
 ## Quick Start
 
-Prerequisites:
-
-- Rust: <https://rustup.rs/>
-- the `wasm32-unknown-unknown` Rust target
-- `wasm-pack`
-- a local static file server
-- a browser with WebGPU support
-
-Clone the repo and install the WebAssembly tooling:
+Prerequisites: [Rust](https://rustup.rs/) and a GPU with a Metal/Vulkan/DX12 backend.
 
 ```bash
 git clone https://github.com/craigxchen/coffee-sim.git
 cd coffee-sim
-rustup target add wasm32-unknown-unknown
-cargo install wasm-pack --locked
+cargo run --example phase0_noop   # headless Phase 0 demo (skips if no GPU adapter)
 ```
-
-Build the browser bundle:
-
-```bash
-wasm-pack build crates/sim-wasm --target web --release --out-dir www-3d/pkg
-```
-
-Serve the app with any static file server. For example, with Python 3:
-
-```bash
-cd crates/sim-wasm/www-3d
-python3 -m http.server 8080
-```
-
-Open <http://localhost:8080>.
-
-## Controls
-
-- Drag to orbit the camera.
-- Scroll to zoom.
-- Use `W/A/S/D` to pan.
-- Use pause and reset from the sidebar.
-- Switch between Center Pour, Water Only, and the Debug Scenes tab.
-- Adjust water velocity in meters per second.
-- Move the spout in X/Z with the plane control and adjust spout height with the
-  height slider.
-- Show Debug Stats to inspect simulation diagnostics.
-
-## Project Layout
-
-- `crates/sim-core`: shared math/types
-- `crates/sim-wasm`: WASM API, WebGPU renderer, browser UI, and simulation
-- `crates/sim-wasm/www-3d`: browser app
-- `docs/ARCHITECTURE.md`: implementation notes
 
 ## Development
 
-Useful checks:
-
 ```bash
 cargo fmt --check
-cargo clippy -p coffee-sim-wasm -- -D warnings
-cargo test -p coffee-sim-wasm --lib
-wasm-pack build crates/sim-wasm --target web --release --out-dir www-3d/pkg
+cargo clippy --all-targets -- -D warnings
+cargo test
+cargo run --example phase0_noop
 ```
+
+## Project Layout
+
+Single crate; the repo root is the workspace + package. Modular blocks under `src/`:
+
+- `engine/` — orchestration: `Scene`, `Simulator`, `State`, the solver registry + catalog.
+- `solvers/` — the `Solver` seam and each complete method (XPBD, MPM, SPH+MPM).
+- `models/` — shared physics + materials, imported by every solver.
+- `emission/` — particle emission (coffee + water).
+- `ui/` — rendering, controls, overlays (consumes canonical state only).
+- `profiling/` — local timestamp + dispatch profiler.
+- `utils/` — `GpuContext`, spatial hash, SDF, kernels, RNG, geometry, config.
 
 ## More Info
 
-- [Architecture](docs/ARCHITECTURE.md)
+- [Architecture](docs/ARCHITECTURE.md) — authoritative top-level design.
+- [Sub-module plans](docs/plans/) — per-block detail.
+- [KEEP.md](KEEP.md) — salvaged reference values (calibration, units, geometry) from v1.
