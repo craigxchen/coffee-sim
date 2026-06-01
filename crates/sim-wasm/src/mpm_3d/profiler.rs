@@ -15,6 +15,8 @@
 //!
 //! Tunable via environment variables:
 //! - `COFFEE_SIM_PROFILE_SCENE`   scene preset: `center_pour` (default) | `free_stream` | `water_block`
+//! - `COFFEE_SIM_PROFILE_SOLVER`  pressure solver: `rbgs` (default)
+//! - `COFFEE_SIM_PROFILE_SOLVERS` comma-separated pressure solvers, or `all`
 //! - `COFFEE_SIM_PROFILE_WARMUP`  frames to run before measuring (default 60)
 //! - `COFFEE_SIM_PROFILE_FRAMES`  instrumented frames to measure (default 120)
 //! - `COFFEE_SIM_PROFILE_CAL`     production `step_frame` calibration frames (default 30)
@@ -44,7 +46,7 @@ use bytemuck::cast_slice;
 use serde::Serialize;
 
 use super::inflow::{EmissionResult, MASS_UNITS_PER_ML, PARTICLES_PER_ML};
-use super::pressure::PressureContext;
+use super::pressure::{PressureContext, PressureSolverKind};
 use super::state::{METRICS_SLOT_COUNT, NUM_THREADS};
 use super::{
     dispatch_size, encode_mpm_substep_schedule, required_limits, MpmDispatchSizes, MpmPassLabel,
@@ -490,6 +492,27 @@ fn scene_settings(name: &str) -> MpmSettings {
     }
 }
 
+fn profile_solvers() -> Vec<PressureSolverKind> {
+    if let Ok(value) = std::env::var("COFFEE_SIM_PROFILE_SOLVERS") {
+        let trimmed = value.trim();
+        if trimmed.eq_ignore_ascii_case("all") {
+            return PressureSolverKind::ALL.to_vec();
+        }
+        return trimmed
+            .split(',')
+            .filter(|part| !part.trim().is_empty())
+            .map(|part| {
+                part.parse::<PressureSolverKind>()
+                    .unwrap_or_else(|err| panic!("{err}"))
+            })
+            .collect();
+    }
+    let solver = std::env::var("COFFEE_SIM_PROFILE_SOLVER").unwrap_or_else(|_| "rbgs".into());
+    vec![solver
+        .parse::<PressureSolverKind>()
+        .unwrap_or_else(|err| panic!("{err}"))]
+}
+
 fn output_path() -> PathBuf {
     if let Ok(p) = std::env::var("COFFEE_SIM_PROFILE_OUT") {
         return PathBuf::from(p);
@@ -498,6 +521,22 @@ fn output_path() -> PathBuf {
         env!("CARGO_MANIFEST_DIR"),
         "/../../target/coffee-sim-profile.json"
     ))
+}
+
+fn output_path_for_solver(base: &PathBuf, solver: PressureSolverKind, multiple: bool) -> PathBuf {
+    if !multiple {
+        return base.clone();
+    }
+    let stem = base
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("coffee-sim-profile");
+    let extension = base.extension().and_then(|value| value.to_str());
+    let file_name = match extension {
+        Some(ext) => format!("{stem}-{}.{}", solver.id(), ext),
+        None => format!("{stem}-{}", solver.id()),
+    };
+    base.with_file_name(file_name)
 }
 
 #[test]
@@ -528,11 +567,18 @@ fn profile_mpm_pipeline() {
 
     let info = adapter.get_info();
     let scene = std::env::var("COFFEE_SIM_PROFILE_SCENE").unwrap_or_else(|_| "center_pour".into());
+    let solvers = profile_solvers();
+    assert!(
+        solvers.len() == 1,
+        "multi-solver profiling is wired for selection but not yet fanned out; use COFFEE_SIM_PROFILE_SOLVER for now"
+    );
+    let solver = solvers[0];
     let warmup = env_u32_or("COFFEE_SIM_PROFILE_WARMUP", DEFAULT_WARMUP_FRAMES);
     let measured = env_u32_or("COFFEE_SIM_PROFILE_FRAMES", DEFAULT_MEASURED_FRAMES);
     let calibration = env_u32_or("COFFEE_SIM_PROFILE_CAL", DEFAULT_CALIBRATION_FRAMES);
 
-    let settings = scene_settings(&scene);
+    let mut settings = scene_settings(&scene);
+    settings.pressure_solver = solver;
     let grid_dims = settings.grid_dims;
     let total_cells = grid_dims[0] * grid_dims[1] * grid_dims[2];
     let max_particles = settings.max_particles;
@@ -706,14 +752,17 @@ fn profile_mpm_pipeline() {
     };
 
     let json = serde_json::to_string_pretty(&report).expect("serialize report");
-    let path = output_path();
+    let path = output_path_for_solver(&output_path(), solver, false);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).expect("create output dir");
     }
     std::fs::write(&path, &json).expect("write profile json");
 
     // Console summary (visible with --nocapture).
-    println!("\n=== MPM profile ({}) ===", report.metadata.scene);
+    println!(
+        "\n=== MPM profile ({}, pressure solver: {}) ===",
+        report.metadata.scene, report.metadata.solver.pressure.kind
+    );
     println!(
         "adapter: {} [{}] | cells: {} | particles: {} water + {} bed",
         report.metadata.adapter,
