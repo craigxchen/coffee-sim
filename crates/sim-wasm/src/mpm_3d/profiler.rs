@@ -15,8 +15,8 @@
 //!
 //! Tunable via environment variables:
 //! - `COFFEE_SIM_PROFILE_SCENE`   scene preset: `center_pour` (default) | `free_stream` | `water_block`
-//! - `COFFEE_SIM_PROFILE_SOLVER`  pressure solver: `rbgs` (default) | `jacobi-cg` | `sparse-cg`
-//! - `COFFEE_SIM_PROFILE_SOLVERS` comma-separated pressure solvers, or `all`
+//! - `COFFEE_SIM_PROFILE_SOLVER`  solver spec: `rbgs` (default) | `mpm:jacobi-cg` | `mpm:sparse-cg`
+//! - `COFFEE_SIM_PROFILE_SOLVERS` comma-separated solver specs, or `all`
 //! - `COFFEE_SIM_PROFILE_CG_ITERATIONS` CG iterations per substep (defaults to scene RBGS pairs)
 //! - `COFFEE_SIM_PROFILE_WARMUP`  frames to run before measuring (default 60)
 //! - `COFFEE_SIM_PROFILE_FRAMES`  instrumented frames to measure (default 120)
@@ -39,7 +39,9 @@
 //! production frame cost.
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::mpsc;
 use std::time::Instant;
 
@@ -58,6 +60,78 @@ const DEFAULT_WARMUP_FRAMES: u32 = 60;
 const DEFAULT_MEASURED_FRAMES: u32 = 120;
 const DEFAULT_CALIBRATION_FRAMES: u32 = 30;
 const FRAME_DT: f32 = 1.0 / 60.0;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SimulationBackendKind {
+    Mpm,
+}
+
+impl SimulationBackendKind {
+    fn id(self) -> &'static str {
+        match self {
+            Self::Mpm => "mpm",
+        }
+    }
+}
+
+impl fmt::Display for SimulationBackendKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.id())
+    }
+}
+
+impl FromStr for SimulationBackendKind {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "mpm" | "mpm-3d" => Ok(Self::Mpm),
+            other => Err(format!(
+                "unknown simulation backend '{other}'; available backends: mpm"
+            )),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SolverSpec {
+    backend: SimulationBackendKind,
+    pressure: PressureSolverKind,
+}
+
+impl SolverSpec {
+    fn mpm(pressure: PressureSolverKind) -> Self {
+        Self {
+            backend: SimulationBackendKind::Mpm,
+            pressure,
+        }
+    }
+
+    fn id(self) -> String {
+        format!("{}-{}", self.backend.id(), self.pressure.id())
+    }
+}
+
+impl fmt::Display for SolverSpec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:{}", self.backend, self.pressure)
+    }
+}
+
+impl FromStr for SolverSpec {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let trimmed = value.trim();
+        if let Some((backend, solver)) = trimmed.split_once(':') {
+            let backend = backend.parse::<SimulationBackendKind>()?;
+            return match backend {
+                SimulationBackendKind::Mpm => Ok(Self::mpm(solver.parse::<PressureSolverKind>()?)),
+            };
+        }
+        Ok(Self::mpm(trimmed.parse::<PressureSolverKind>()?))
+    }
+}
 
 fn env_u32_or(name: &str, default: u32) -> u32 {
     std::env::var(name)
@@ -424,6 +498,7 @@ struct PassStat {
 
 #[derive(Serialize)]
 struct SolverMetadata {
+    backend: String,
     pressure: PressureSolverMetadata,
 }
 
@@ -511,24 +586,28 @@ fn scene_settings(name: &str) -> MpmSettings {
     }
 }
 
-fn profile_solvers() -> Vec<PressureSolverKind> {
+fn profile_solver_specs() -> Vec<SolverSpec> {
     if let Ok(value) = std::env::var("COFFEE_SIM_PROFILE_SOLVERS") {
         let trimmed = value.trim();
         if trimmed.eq_ignore_ascii_case("all") {
-            return PressureSolverKind::ALL.to_vec();
+            return PressureSolverKind::ALL
+                .iter()
+                .copied()
+                .map(SolverSpec::mpm)
+                .collect();
         }
         return trimmed
             .split(',')
             .filter(|part| !part.trim().is_empty())
             .map(|part| {
-                part.parse::<PressureSolverKind>()
+                part.parse::<SolverSpec>()
                     .unwrap_or_else(|err| panic!("{err}"))
             })
             .collect();
     }
     let solver = std::env::var("COFFEE_SIM_PROFILE_SOLVER").unwrap_or_else(|_| "rbgs".into());
     vec![solver
-        .parse::<PressureSolverKind>()
+        .parse::<SolverSpec>()
         .unwrap_or_else(|err| panic!("{err}"))]
 }
 
@@ -542,7 +621,7 @@ fn output_path() -> PathBuf {
     ))
 }
 
-fn output_path_for_solver(base: &PathBuf, solver: PressureSolverKind, multiple: bool) -> PathBuf {
+fn output_path_for_solver(base: &PathBuf, solver: SolverSpec, multiple: bool) -> PathBuf {
     if !multiple {
         return base.clone();
     }
@@ -551,11 +630,25 @@ fn output_path_for_solver(base: &PathBuf, solver: PressureSolverKind, multiple: 
         .and_then(|value| value.to_str())
         .unwrap_or("coffee-sim-profile");
     let extension = base.extension().and_then(|value| value.to_str());
+    let solver_id = solver.id();
     let file_name = match extension {
-        Some(ext) => format!("{stem}-{}.{}", solver.id(), ext),
-        None => format!("{stem}-{}", solver.id()),
+        Some(ext) => format!("{stem}-{solver_id}.{ext}"),
+        None => format!("{stem}-{solver_id}"),
     };
     base.with_file_name(file_name)
+}
+
+#[test]
+fn profiler_solver_specs_parse_backend_qualified_values() {
+    assert_eq!(
+        "rbgs".parse::<SolverSpec>(),
+        Ok(SolverSpec::mpm(PressureSolverKind::Rbgs))
+    );
+    assert_eq!(
+        "mpm:sparse-cg".parse::<SolverSpec>(),
+        Ok(SolverSpec::mpm(PressureSolverKind::SparseCg))
+    );
+    assert!("dfsph".parse::<SolverSpec>().is_err());
 }
 
 #[test]
@@ -586,7 +679,7 @@ fn profile_mpm_pipeline() {
 
     let info = adapter.get_info();
     let scene = std::env::var("COFFEE_SIM_PROFILE_SCENE").unwrap_or_else(|_| "center_pour".into());
-    let solvers = profile_solvers();
+    let solvers = profile_solver_specs();
     let warmup = env_u32_or("COFFEE_SIM_PROFILE_WARMUP", DEFAULT_WARMUP_FRAMES);
     let measured = env_u32_or("COFFEE_SIM_PROFILE_FRAMES", DEFAULT_MEASURED_FRAMES);
     let calibration = env_u32_or("COFFEE_SIM_PROFILE_CAL", DEFAULT_CALIBRATION_FRAMES);
@@ -603,7 +696,11 @@ fn profile_mpm_pipeline() {
 
     for &solver in &solvers {
         let mut settings = scene_settings(&scene);
-        settings.pressure_solver = solver;
+        match solver.backend {
+            SimulationBackendKind::Mpm => {
+                settings.pressure_solver = solver.pressure;
+            }
+        }
         settings.pressure_cg_iterations = std::env::var("COFFEE_SIM_PROFILE_CG_ITERATIONS")
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
@@ -757,6 +854,7 @@ fn profile_mpm_pipeline() {
                 total_cells,
                 max_particles,
                 solver: SolverMetadata {
+                    backend: solver.backend.to_string(),
                     pressure: PressureSolverMetadata {
                         kind: sim.pressure_solver_kind().to_string(),
                         iterations_per_substep: sim.pressure_solver_iterations_per_substep(),
@@ -782,8 +880,10 @@ fn profile_mpm_pipeline() {
 
         // Console summary (visible with --nocapture).
         println!(
-            "\n=== MPM profile ({}, pressure solver: {}) ===",
-            report.metadata.scene, report.metadata.solver.pressure.kind
+            "\n=== {} profile ({}, pressure solver: {}) ===",
+            report.metadata.solver.backend,
+            report.metadata.scene,
+            report.metadata.solver.pressure.kind
         );
         println!(
             "adapter: {} [{}] | cells: {} | particles: {} water + {} bed",
