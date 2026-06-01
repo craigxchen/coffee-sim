@@ -671,6 +671,15 @@ fn pressure_face_weight_fillcached(
     neighbor_cell: u32,
     neighbor_kind: i32,
 ) -> f32 {
+    // Identical to `pressure_face_weight` for active pressure neighbours, but
+    // reads the neighbour liquid-fill fraction from the CG scratch cache instead
+    // of recomputing the six-neighbour fill scan in every matvec.
+    //
+    // Invariant: `pressure_cg_init` caches `liquid_fill_fraction(cell,
+    // cell_kind_load(cell))`, while the matvec supplies `neighbor_kind` from the
+    // same classified kind lane. Keep `classify_cells` immediately before CG
+    // init in the schedule so the cached active set and live classifications
+    // describe the same operator.
     if is_solid_kind(neighbor_kind) {
         return 0.0;
     }
