@@ -52,6 +52,7 @@ impl FromStr for PressureSolverKind {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PressureOperatorKind {
     Collocated,
+    Staggered,
 }
 
 impl PressureOperatorKind {
@@ -60,6 +61,7 @@ impl PressureOperatorKind {
     pub(crate) fn id(self) -> &'static str {
         match self {
             Self::Collocated => "collocated",
+            Self::Staggered => "staggered",
         }
     }
 }
@@ -105,6 +107,7 @@ pub(crate) struct PressureContext {
 pub(crate) struct PressurePipelines {
     pub(crate) rbgs: RbgsPressureSolver,
     pub(crate) jacobi_cg: JacobiCgPressureSolver,
+    pub(crate) staged_staggered: StagedStaggeredPressurePipelines,
 }
 
 impl PressurePipelines {
@@ -125,6 +128,7 @@ impl PressurePipelines {
                 PressureOperatorKind::Collocated,
                 PressureSolverKind::JacobiCg | PressureSolverKind::SparseCg,
             ) => &self.jacobi_cg.classify_cells,
+            (PressureOperatorKind::Staggered, _) => &self.staged_staggered.classify_cells,
         }
     }
 
@@ -137,6 +141,7 @@ impl PressurePipelines {
                 PressureOperatorKind::Collocated,
                 PressureSolverKind::JacobiCg | PressureSolverKind::SparseCg,
             ) => &self.jacobi_cg.project_pressure,
+            (PressureOperatorKind::Staggered, _) => &self.staged_staggered.project_pressure,
         }
     }
 
@@ -149,6 +154,7 @@ impl PressurePipelines {
                 PressureOperatorKind::Collocated,
                 PressureSolverKind::JacobiCg | PressureSolverKind::SparseCg,
             ) => &self.jacobi_cg.pressure_residual,
+            (PressureOperatorKind::Staggered, _) => &self.staged_staggered.pressure_residual,
         }
     }
 
@@ -206,6 +212,12 @@ pub(crate) struct RbgsPressureSolver {
     pub(crate) classify_cells: wgpu::ComputePipeline,
     pub(crate) pressure_rbgs_red: wgpu::ComputePipeline,
     pub(crate) pressure_rbgs_black: wgpu::ComputePipeline,
+    pub(crate) project_pressure: wgpu::ComputePipeline,
+    pub(crate) pressure_residual: wgpu::ComputePipeline,
+}
+
+pub(crate) struct StagedStaggeredPressurePipelines {
+    pub(crate) classify_cells: wgpu::ComputePipeline,
     pub(crate) project_pressure: wgpu::ComputePipeline,
     pub(crate) pressure_residual: wgpu::ComputePipeline,
 }
@@ -375,6 +387,7 @@ mod tests {
             PressureOperatorKind::ALL,
             &[PressureOperatorKind::Collocated]
         );
+        assert_eq!(PressureOperatorKind::Staggered.id(), "staggered");
         let err = "staggered"
             .parse::<PressureOperatorKind>()
             .expect_err("staggered operator is intentionally not runnable yet");
