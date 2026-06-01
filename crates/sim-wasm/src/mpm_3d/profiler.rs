@@ -693,11 +693,49 @@ fn request_adapter() -> Option<wgpu::Adapter> {
     .ok()
 }
 
-fn scene_settings(name: &str) -> MpmSettings {
-    match name {
-        "free_stream" => MpmSettings::benchmark_free_stream(),
-        "water_block" => MpmSettings::benchmark_filter_water_block(),
-        _ => MpmSettings::benchmark_center_pour(),
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProfileScene {
+    CenterPour,
+    FreeStream,
+    WaterBlock,
+}
+
+impl ProfileScene {
+    fn id(self) -> &'static str {
+        match self {
+            Self::CenterPour => "center_pour",
+            Self::FreeStream => "free_stream",
+            Self::WaterBlock => "water_block",
+        }
+    }
+
+    fn mpm_settings(self) -> MpmSettings {
+        match self {
+            Self::CenterPour => MpmSettings::benchmark_center_pour(),
+            Self::FreeStream => MpmSettings::benchmark_free_stream(),
+            Self::WaterBlock => MpmSettings::benchmark_filter_water_block(),
+        }
+    }
+}
+
+impl fmt::Display for ProfileScene {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.id())
+    }
+}
+
+impl FromStr for ProfileScene {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "" | "center_pour" | "center-pour" => Ok(Self::CenterPour),
+            "free_stream" | "free-stream" => Ok(Self::FreeStream),
+            "water_block" | "water-block" => Ok(Self::WaterBlock),
+            other => Err(format!(
+                "unknown profile scene '{other}'; available scenes: center_pour, free_stream, water_block"
+            )),
+        }
     }
 }
 
@@ -779,8 +817,25 @@ fn profiler_solver_specs_parse_backend_qualified_values() {
     );
 }
 
+#[test]
+fn profiler_scenes_parse_shared_profile_scene_ids() {
+    assert_eq!(
+        "center_pour".parse::<ProfileScene>(),
+        Ok(ProfileScene::CenterPour)
+    );
+    assert_eq!(
+        "free-stream".parse::<ProfileScene>(),
+        Ok(ProfileScene::FreeStream)
+    );
+    assert_eq!(
+        "water_block".parse::<ProfileScene>(),
+        Ok(ProfileScene::WaterBlock)
+    );
+    assert!("low_complexity_shortcut".parse::<ProfileScene>().is_err());
+}
+
 struct ProfilerRunConfig<'a> {
-    scene: &'a str,
+    scene: ProfileScene,
     warmup: u32,
     measured: u32,
     calibration: u32,
@@ -869,7 +924,7 @@ fn profile_mpm_solver(
     solver: SolverSpec,
     pressure: PressureSolverKind,
 ) {
-    let mut settings = scene_settings(run.scene);
+    let mut settings = run.scene.mpm_settings();
     settings.pressure_solver = pressure;
     settings.pressure_cg_iterations = std::env::var("COFFEE_SIM_PROFILE_CG_ITERATIONS")
         .ok()
@@ -1078,7 +1133,10 @@ fn profile_mpm_pipeline() {
     .expect("request profiler device");
 
     let info = adapter.get_info();
-    let scene = std::env::var("COFFEE_SIM_PROFILE_SCENE").unwrap_or_else(|_| "center_pour".into());
+    let scene = std::env::var("COFFEE_SIM_PROFILE_SCENE")
+        .unwrap_or_else(|_| "center_pour".into())
+        .parse::<ProfileScene>()
+        .unwrap_or_else(|err| panic!("{err}"));
     let solvers = profile_solver_specs();
     let warmup = env_u32_or("COFFEE_SIM_PROFILE_WARMUP", DEFAULT_WARMUP_FRAMES);
     let measured = env_u32_or("COFFEE_SIM_PROFILE_FRAMES", DEFAULT_MEASURED_FRAMES);
@@ -1102,7 +1160,7 @@ fn profile_mpm_pipeline() {
         period_ns,
     };
     let run = ProfilerRunConfig {
-        scene: &scene,
+        scene,
         warmup,
         measured,
         calibration,
