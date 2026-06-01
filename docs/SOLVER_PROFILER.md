@@ -91,9 +91,9 @@ Solver development was spread across several local branches. Current status:
 ## Verification Status
 
 Focused non-GPU checks prove parser/registry behavior and same-scene settings
-selection. The native `--dry-run` and `--dry-run-json` modes resolve solver
-fan-out, output paths, scene dimensions, and pressure budgets without requesting
-a GPU adapter. The
+selection. The native `--dry-run` and versioned `--dry-run-json` modes resolve
+solver fan-out, output paths, scene dimensions, and pressure budgets without
+requesting a GPU adapter. The
 ignored profiler smoke with `solvers=all scene=center_pour` currently compiles
 in this environment but skips measurement because no native GPU adapter is
 available. Real completion still requires running that profiler on a host with

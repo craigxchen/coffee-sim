@@ -1530,6 +1530,8 @@ struct SolverRunMetadata {
 
 #[derive(Serialize)]
 struct DryRunPlan {
+    schema_version: u32,
+    mode: &'static str,
     scene: String,
     pressure_operator: String,
     warmup_frames: u32,
@@ -2201,6 +2203,8 @@ fn profiler_dry_run_json_is_machine_readable_same_scene_plan() {
     let selection = ProfileSelection::from_cli_with_env(&args, |_| None);
     let value: serde_json::Value =
         serde_json::from_str(&selection.dry_run_json()).expect("dry run json parses");
+    assert_eq!(value["schema_version"], 1);
+    assert_eq!(value["mode"], "dry_run");
     assert_eq!(value["scene"], "center_pour");
     assert_eq!(value["solvers"].as_array().expect("solver array").len(), 5);
     assert_eq!(value["solvers"][0]["solver"], "mpm:rbgs");
@@ -2649,6 +2653,8 @@ impl ProfileSelection {
             .collect();
 
         DryRunPlan {
+            schema_version: 1,
+            mode: "dry_run",
             scene: self.scene.to_string(),
             pressure_operator: self.pressure_operator.to_string(),
             warmup_frames: self.warmup,
