@@ -15,8 +15,8 @@
 //!
 //! Tunable via environment variables:
 //! - `COFFEE_SIM_PROFILE_SCENE`   scene preset: `center_pour` (default) | `free_stream` | `water_block`
-//! - `COFFEE_SIM_PROFILE_SOLVER`  solver spec: `rbgs` (default) | `mpm:jacobi-cg` | `mpm:sparse-cg`
-//! - `COFFEE_SIM_PROFILE_SOLVERS` comma-separated solver specs, or `all`
+//! - `COFFEE_SIM_PROFILE_SOLVER`  solver spec: `rbgs` (default) | `mpm:jacobi-cg` | `mpm:sparse-cg` | `xpbd:cpu`
+//! - `COFFEE_SIM_PROFILE_SOLVERS` comma-separated runnable solver specs, or `all`
 //! - `COFFEE_SIM_PROFILE_CG_ITERATIONS` CG iterations per substep (defaults to scene RBGS pairs)
 //! - `COFFEE_SIM_PROFILE_WARMUP`  frames to run before measuring (default 60)
 //! - `COFFEE_SIM_PROFILE_FRAMES`  instrumented frames to measure (default 120)
@@ -65,6 +65,7 @@ const FRAME_DT: f32 = 1.0 / 60.0;
 enum SimulationBackendKind {
     Mpm,
     Dfsph,
+    Xpbd,
 }
 
 impl SimulationBackendKind {
@@ -72,6 +73,7 @@ impl SimulationBackendKind {
         match self {
             Self::Mpm => "mpm",
             Self::Dfsph => "dfsph",
+            Self::Xpbd => "xpbd",
         }
     }
 }
@@ -89,8 +91,41 @@ impl FromStr for SimulationBackendKind {
         match value.trim().to_ascii_lowercase().as_str() {
             "mpm" | "mpm-3d" => Ok(Self::Mpm),
             "dfsph" | "dfsph-water" => Ok(Self::Dfsph),
+            "xpbd" => Ok(Self::Xpbd),
             other => Err(format!(
-                "unknown simulation backend '{other}'; available backends: mpm, dfsph"
+                "unknown simulation backend '{other}'; available backends: mpm, dfsph, xpbd"
+            )),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum XpbdSolverKind {
+    Cpu,
+}
+
+impl XpbdSolverKind {
+    fn id(self) -> &'static str {
+        match self {
+            Self::Cpu => "cpu",
+        }
+    }
+}
+
+impl fmt::Display for XpbdSolverKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.id())
+    }
+}
+
+impl FromStr for XpbdSolverKind {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "" | "cpu" => Ok(Self::Cpu),
+            other => Err(format!(
+                "unknown xpbd solver '{other}'; available solvers: cpu"
             )),
         }
     }
@@ -100,6 +135,7 @@ impl FromStr for SimulationBackendKind {
 enum SolverSpec {
     Mpm { pressure: PressureSolverKind },
     Dfsph,
+    Xpbd { solver: XpbdSolverKind },
 }
 
 impl SolverSpec {
@@ -111,6 +147,7 @@ impl SolverSpec {
         match self {
             Self::Mpm { .. } => SimulationBackendKind::Mpm,
             Self::Dfsph => SimulationBackendKind::Dfsph,
+            Self::Xpbd { .. } => SimulationBackendKind::Xpbd,
         }
     }
 
@@ -120,6 +157,9 @@ impl SolverSpec {
                 format!("{}-{}", SimulationBackendKind::Mpm.id(), pressure.id())
             }
             Self::Dfsph => SimulationBackendKind::Dfsph.id().to_string(),
+            Self::Xpbd { solver } => {
+                format!("{}-{}", SimulationBackendKind::Xpbd.id(), solver.id())
+            }
         }
     }
 }
@@ -129,6 +169,7 @@ impl fmt::Display for SolverSpec {
         match *self {
             Self::Mpm { pressure } => write!(f, "{}:{pressure}", SimulationBackendKind::Mpm),
             Self::Dfsph => f.write_str(SimulationBackendKind::Dfsph.id()),
+            Self::Xpbd { solver } => write!(f, "{}:{solver}", SimulationBackendKind::Xpbd),
         }
     }
 }
@@ -148,10 +189,18 @@ impl FromStr for SolverSpec {
                         "unknown dfsph solver '{other}'; available solvers: water"
                     )),
                 },
+                SimulationBackendKind::Xpbd => Ok(Self::Xpbd {
+                    solver: solver.parse::<XpbdSolverKind>()?,
+                }),
             };
         }
         if trimmed.eq_ignore_ascii_case("dfsph") || trimmed.eq_ignore_ascii_case("dfsph-water") {
             return Ok(Self::Dfsph);
+        }
+        if trimmed.eq_ignore_ascii_case("xpbd") {
+            return Ok(Self::Xpbd {
+                solver: XpbdSolverKind::Cpu,
+            });
         }
         Ok(Self::mpm(trimmed.parse::<PressureSolverKind>()?))
     }
@@ -229,12 +278,35 @@ impl GpuTimer {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct ProfilePassLabel {
+    id: String,
+    display: String,
+    category: String,
+}
+
+impl ProfilePassLabel {
+    fn mpm(label: MpmPassLabel) -> Self {
+        Self {
+            id: label.id().to_string(),
+            display: label.display().to_string(),
+            category: label.category().to_string(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ProfilePassMeta {
+    display: String,
+    category: String,
+}
+
 /// Records pass labels and the query-set slot indices used within one substep.
 struct FrameRecorder<'a> {
     qs: Option<&'a wgpu::QuerySet>,
     capacity: u32,
     next: u32,
-    scopes: Vec<(MpmPassLabel, u32, u32)>,
+    scopes: Vec<(ProfilePassLabel, u32, u32)>,
 }
 
 impl<'a> FrameRecorder<'a> {
@@ -249,7 +321,11 @@ impl<'a> FrameRecorder<'a> {
     }
 
     /// Reserve a begin/end timestamp pair for a compute pass labeled `label`.
-    fn writes(&mut self, label: MpmPassLabel) -> Option<wgpu::ComputePassTimestampWrites<'a>> {
+    fn writes_mpm(&mut self, label: MpmPassLabel) -> Option<wgpu::ComputePassTimestampWrites<'a>> {
+        self.writes(ProfilePassLabel::mpm(label))
+    }
+
+    fn writes(&mut self, label: ProfilePassLabel) -> Option<wgpu::ComputePassTimestampWrites<'a>> {
         let qs = self.qs?;
         let (begin, end) = self.reserve(label);
         Some(wgpu::ComputePassTimestampWrites {
@@ -259,7 +335,7 @@ impl<'a> FrameRecorder<'a> {
         })
     }
 
-    fn reserve(&mut self, label: MpmPassLabel) -> (u32, u32) {
+    fn reserve(&mut self, label: ProfilePassLabel) -> (u32, u32) {
         let begin = self.next;
         let end = self.next + 1;
         self.next += 2;
@@ -286,7 +362,7 @@ fn timed_pass(
     pipeline: &wgpu::ComputePipeline,
     dispatch: MpmDispatch<'_>,
 ) {
-    let timestamp_writes = rec.writes(label);
+    let timestamp_writes = rec.writes_mpm(label);
     let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
         label: Some(label.display()),
         timestamp_writes,
@@ -311,10 +387,11 @@ struct FrameSums {
     cpu_submit_ms: f64,
     gpu_wait_ms: f64,
     gpu_passes_ms: f64,
-    per_label_ms: BTreeMap<MpmPassLabel, f64>,
+    per_label_ms: BTreeMap<String, f64>,
     /// How many timed compute passes of each label ran this frame (e.g.
     /// `boundary_project` runs once per occurrence × substeps).
-    per_label_count: BTreeMap<MpmPassLabel, u32>,
+    per_label_count: BTreeMap<String, u32>,
+    per_label_meta: BTreeMap<String, ProfilePassMeta>,
 }
 
 /// Run one instrumented frame, advancing `sim` and folding per-pass GPU times
@@ -405,7 +482,7 @@ fn step_frame_instrumented(
                     pressure,
                     ctx,
                 } => {
-                    let timestamp_writes = rec.writes(label);
+                    let timestamp_writes = rec.writes_mpm(label);
                     let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                         label: Some(label.display()),
                         timestamp_writes,
@@ -449,11 +526,17 @@ fn step_frame_instrumented(
         //    counted in gpu_wait — it only shows up in the whole-frame wall time.
         if let Some(t) = timer {
             let ticks = t.read_ticks(device, used);
-            for &(label, b, e) in &rec.scopes {
-                let delta = ticks[e as usize].saturating_sub(ticks[b as usize]);
+            for (label, b, e) in &rec.scopes {
+                let delta = ticks[*e as usize].saturating_sub(ticks[*b as usize]);
                 let pass_ms = delta as f64 * t.period_ns as f64 / 1.0e6;
-                *sums.per_label_ms.entry(label).or_insert(0.0) += pass_ms;
-                *sums.per_label_count.entry(label).or_insert(0) += 1;
+                sums.per_label_meta
+                    .entry(label.id.clone())
+                    .or_insert_with(|| ProfilePassMeta {
+                        display: label.display.clone(),
+                        category: label.category.clone(),
+                    });
+                *sums.per_label_ms.entry(label.id.clone()).or_insert(0.0) += pass_ms;
+                *sums.per_label_count.entry(label.id.clone()).or_insert(0) += 1;
                 sums.gpu_passes_ms += pass_ms;
             }
         }
@@ -523,13 +606,21 @@ struct PassStat {
 #[derive(Serialize)]
 struct SolverMetadata {
     backend: String,
-    pressure: PressureSolverMetadata,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pressure: Option<PressureSolverMetadata>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    xpbd: Option<XpbdSolverMetadata>,
 }
 
 #[derive(Serialize)]
 struct PressureSolverMetadata {
     kind: String,
     iterations_per_substep: u32,
+}
+
+#[derive(Serialize)]
+struct XpbdSolverMetadata {
+    kind: String,
 }
 
 #[derive(Serialize)]
@@ -674,6 +765,18 @@ fn profiler_solver_specs_parse_backend_qualified_values() {
     );
     assert_eq!("dfsph".parse::<SolverSpec>(), Ok(SolverSpec::Dfsph));
     assert_eq!("dfsph:water".parse::<SolverSpec>(), Ok(SolverSpec::Dfsph));
+    assert_eq!(
+        "xpbd".parse::<SolverSpec>(),
+        Ok(SolverSpec::Xpbd {
+            solver: XpbdSolverKind::Cpu
+        })
+    );
+    assert_eq!(
+        "xpbd:cpu".parse::<SolverSpec>(),
+        Ok(SolverSpec::Xpbd {
+            solver: XpbdSolverKind::Cpu
+        })
+    );
 }
 
 struct ProfilerRunConfig<'a> {
@@ -702,9 +805,24 @@ fn write_report(path: &PathBuf, report: &ProfileReport) {
 }
 
 fn print_report_summary(path: &PathBuf, report: &ProfileReport) {
+    let solver_kind = report
+        .metadata
+        .solver
+        .pressure
+        .as_ref()
+        .map(|pressure| pressure.kind.as_str())
+        .or_else(|| {
+            report
+                .metadata
+                .solver
+                .xpbd
+                .as_ref()
+                .map(|xpbd| xpbd.kind.as_str())
+        })
+        .unwrap_or("n/a");
     println!(
-        "\n=== {} profile ({}, pressure solver: {}) ===",
-        report.metadata.solver.backend, report.metadata.scene, report.metadata.solver.pressure.kind
+        "\n=== {} profile ({}, solver: {}) ===",
+        report.metadata.solver.backend, report.metadata.scene, solver_kind
     );
     println!(
         "adapter: {} [{}] | cells: {} | particles: {} water + {} bed",
@@ -794,8 +912,9 @@ fn profile_mpm_solver(
     let mut cpu_uniforms = Vec::with_capacity(run.measured as usize);
     let mut cpu_encode = Vec::with_capacity(run.measured as usize);
     let mut cpu_submit = Vec::with_capacity(run.measured as usize);
-    let mut per_label: BTreeMap<MpmPassLabel, Vec<f64>> = BTreeMap::new();
-    let mut label_dispatch_count: BTreeMap<MpmPassLabel, u64> = BTreeMap::new();
+    let mut per_label: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+    let mut label_dispatch_count: BTreeMap<String, u64> = BTreeMap::new();
+    let mut label_meta: BTreeMap<String, ProfilePassMeta> = BTreeMap::new();
 
     let water_particles_start = sim.num_water;
     for _ in 0..run.measured {
@@ -816,6 +935,9 @@ fn profile_mpm_solver(
         for (label, count) in sums.per_label_count {
             *label_dispatch_count.entry(label).or_insert(0) += count as u64;
         }
+        for (label, meta) in sums.per_label_meta {
+            label_meta.entry(label).or_insert(meta);
+        }
     }
     let water_particles_end = sim.num_water;
 
@@ -829,10 +951,13 @@ fn profile_mpm_solver(
             let stat = Stat::from_samples(samples);
             let passes =
                 *label_dispatch_count.get(&label).unwrap_or(&0) as f64 / run.measured.max(1) as f64;
+            let meta = label_meta
+                .get(&label)
+                .expect("profile label metadata recorded with samples");
             PassStat {
-                label: label.id().to_string(),
-                display_label: label.display().to_string(),
-                category: label.category().to_string(),
+                label,
+                display_label: meta.display.clone(),
+                category: meta.category.clone(),
                 passes_per_frame: passes,
                 share_of_gpu_pct: if total_pass_mean > 0.0 {
                     stat.mean_ms / total_pass_mean * 100.0
@@ -904,10 +1029,11 @@ fn profile_mpm_solver(
             max_particles,
             solver: SolverMetadata {
                 backend: solver.backend().to_string(),
-                pressure: PressureSolverMetadata {
+                pressure: Some(PressureSolverMetadata {
                     kind: sim.pressure_solver_kind().to_string(),
                     iterations_per_substep: sim.pressure_solver_iterations_per_substep(),
-                },
+                }),
+                xpbd: None,
             },
             pressure_rbgs_pairs,
             water_particles_start,
@@ -993,6 +1119,11 @@ fn profile_mpm_pipeline() {
                 "DFSPH profiler backend is registered but not yet ported into \
                  codex/modular-solver-profiler; integrate codex/dfsph-water state, \
                  pipelines, and schedule before profiling it"
+            ),
+            SolverSpec::Xpbd { .. } => panic!(
+                "XPBD profiler backend is registered but not yet ported into \
+                 codex/modular-solver-profiler; integrate xpbd-solver-rewrite \
+                 scene/state/engine code before profiling it"
             ),
         }
     }
