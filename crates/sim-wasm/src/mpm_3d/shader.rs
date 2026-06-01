@@ -596,6 +596,56 @@ fn staggered_pressure_laplacian_apply_search_direction(c: vec3<i32>, d_self: f32
     return q;
 }
 
+fn staggered_pressure_projection_target_divergence(
+    idx: u32,
+    kind: i32,
+    cell: vec3<i32>,
+) -> f32 {
+    return projection_target_divergence_for_cell(idx, kind, cell, cell_center_from_cell(cell));
+}
+
+fn staggered_pressure_linear_system_cell(idx: u32) -> vec2<f32> {
+    let iz_val = idx / (gx() * gy());
+    let rem = idx % (gx() * gy());
+    let iy_val = rem / gx();
+    let ix_val = rem % gx();
+
+    let kind = cell_kind_load(idx);
+    if !pressure_active_cell(idx, kind) {
+        return vec2<f32>(0.0);
+    }
+
+    let cell = vec3<i32>(i32(ix_val), i32(iy_val), i32(iz_val));
+    if !staggered_pressure_cell_in_bounds(cell) {
+        return vec2<f32>(0.0);
+    }
+
+    let self_fill = liquid_fill_fraction(idx, kind);
+    pressure_cg_fill_store(idx, self_fill);
+
+    let diag = staggered_pressure_laplacian_diag(cell);
+    let target_divergence = staggered_pressure_projection_target_divergence(idx, kind, cell);
+    let rhs = -dx() * dx() * (divergence_load(idx) - target_divergence) * self_fill
+        / max(dt(), 1.0e-6);
+    return vec2<f32>(diag, rhs);
+}
+
+fn staggered_pressure_apply_search_direction(idx: u32) -> vec2<f32> {
+    let iz_val = idx / (gx() * gy());
+    let rem = idx % (gx() * gy());
+    let iy_val = rem / gx();
+    let ix_val = rem % gx();
+
+    if !pressure_cg_is_active(idx) {
+        return vec2<f32>(0.0);
+    }
+
+    let cell = vec3<i32>(i32(ix_val), i32(iy_val), i32(iz_val));
+    let d_here = pressure_cg_state_load(idx).z;
+    let q = staggered_pressure_laplacian_apply_search_direction(cell, d_here);
+    return vec2<f32>(q, d_here * q);
+}
+
 fn pressure_face_weight(
     self_kind: i32,
     self_fill: f32,
@@ -3611,5 +3661,7 @@ mod tests {
         assert!(
             MPM_COMPUTE_SHADER.contains("fn staggered_pressure_laplacian_apply_search_direction(")
         );
+        assert!(MPM_COMPUTE_SHADER.contains("fn staggered_pressure_linear_system_cell("));
+        assert!(MPM_COMPUTE_SHADER.contains("fn staggered_pressure_apply_search_direction("));
     }
 }
