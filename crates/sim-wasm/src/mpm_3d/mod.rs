@@ -52,16 +52,33 @@ pub(crate) struct MpmDispatchSizes {
     pub metrics_wg: u32,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum MpmDispatch<'a> {
+    Direct(u32),
+    Indirect {
+        buffer: &'a wgpu::Buffer,
+        offset: u64,
+    },
+}
+
+#[derive(Clone, Copy)]
 pub(crate) enum MpmScheduleOp<'a> {
     Pipeline {
         label: MpmPassLabel,
         pipeline: &'a wgpu::ComputePipeline,
-        workgroups: u32,
+        dispatch: MpmDispatch<'a>,
     },
     PressureSolve {
         label: MpmPassLabel,
         pressure: &'a pressure::PressurePipelines,
         ctx: PressureContext,
+    },
+    CopyBufferToBuffer {
+        src: &'a wgpu::Buffer,
+        src_offset: u64,
+        dst: &'a wgpu::Buffer,
+        dst_offset: u64,
+        size: u64,
     },
 }
 
@@ -838,13 +855,13 @@ pub(crate) struct MpmSim3D {
     latest_metrics: MetricsSnapshot,
 }
 
-fn encode_mpm_substep_schedule<RunOp>(
-    pipelines: &MpmPipelines,
+fn encode_mpm_substep_schedule<'a, RunOp>(
+    pipelines: &'a MpmPipelines,
     dispatch: MpmDispatchSizes,
     pressure_ctx: PressureContext,
     mut run_op: RunOp,
 ) where
-    RunOp: FnMut(MpmScheduleOp<'_>),
+    RunOp: FnMut(MpmScheduleOp<'a>),
 {
     let common = &pipelines.common;
     macro_rules! run_pipeline {
@@ -852,7 +869,7 @@ fn encode_mpm_substep_schedule<RunOp>(
             run_op(MpmScheduleOp::Pipeline {
                 label: $label,
                 pipeline: $pipeline,
-                workgroups: $workgroups,
+                dispatch: MpmDispatch::Direct($workgroups),
             });
         };
     }
@@ -974,6 +991,76 @@ fn encode_mpm_substep_schedule<RunOp>(
             &common.prepare_render,
             dispatch.particle_wg,
         );
+    }
+}
+
+fn encode_mpm_compute_ops(pass: &mut wgpu::ComputePass<'_>, ops: &[MpmScheduleOp<'_>]) {
+    for op in ops {
+        match *op {
+            MpmScheduleOp::Pipeline {
+                label,
+                pipeline,
+                dispatch,
+            } => {
+                let _ = label;
+                pass.set_pipeline(pipeline);
+                match dispatch {
+                    MpmDispatch::Direct(workgroups) => {
+                        pass.dispatch_workgroups(workgroups, 1, 1);
+                    }
+                    MpmDispatch::Indirect { buffer, offset } => {
+                        pass.dispatch_workgroups_indirect(buffer, offset);
+                    }
+                }
+            }
+            MpmScheduleOp::PressureSolve {
+                label,
+                pressure,
+                ctx,
+            } => {
+                let _ = label;
+                pressure.encode_solve(pass, ctx);
+            }
+            MpmScheduleOp::CopyBufferToBuffer { .. } => {}
+        }
+    }
+}
+
+fn encode_mpm_schedule_production(
+    encoder: &mut wgpu::CommandEncoder,
+    bind_group: &wgpu::BindGroup,
+    ops: &[MpmScheduleOp<'_>],
+) {
+    let mut batch_start = 0usize;
+    for (i, op) in ops.iter().enumerate() {
+        if let MpmScheduleOp::CopyBufferToBuffer {
+            src,
+            src_offset,
+            dst,
+            dst_offset,
+            size,
+        } = *op
+        {
+            if batch_start < i {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("mpm compute"),
+                    timestamp_writes: None,
+                });
+                pass.set_bind_group(0, bind_group, &[]);
+                encode_mpm_compute_ops(&mut pass, &ops[batch_start..i]);
+            }
+            encoder.copy_buffer_to_buffer(src, src_offset, dst, dst_offset, size);
+            batch_start = i + 1;
+        }
+    }
+
+    if batch_start < ops.len() {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("mpm compute"),
+            timestamp_writes: None,
+        });
+        pass.set_bind_group(0, bind_group, &[]);
+        encode_mpm_compute_ops(&mut pass, &ops[batch_start..]);
     }
 }
 
@@ -1889,38 +1976,11 @@ impl MpmSim3D {
             });
             encoder.clear_buffer(&self.buffers.grid, 0, None);
             encoder.clear_buffer(&self.buffers.grid_vel, 0, None);
-            {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("mpm compute"),
-                    timestamp_writes: None,
-                });
-                pass.set_bind_group(0, &self.pipelines.bind_group, &[]);
-
-                encode_mpm_substep_schedule(
-                    &self.pipelines,
-                    dispatch,
-                    pressure_ctx,
-                    |op| match op {
-                        MpmScheduleOp::Pipeline {
-                            label,
-                            pipeline,
-                            workgroups,
-                        } => {
-                            let _ = label;
-                            pass.set_pipeline(pipeline);
-                            pass.dispatch_workgroups(workgroups, 1, 1);
-                        }
-                        MpmScheduleOp::PressureSolve {
-                            label,
-                            pressure,
-                            ctx,
-                        } => {
-                            let _ = label;
-                            pressure.encode_solve(&mut pass, ctx);
-                        }
-                    },
-                );
-            }
+            let mut ops = Vec::new();
+            encode_mpm_substep_schedule(&self.pipelines, dispatch, pressure_ctx, |op| {
+                ops.push(op);
+            });
+            encode_mpm_schedule_production(&mut encoder, &self.pipelines.bind_group, &ops);
             queue.submit(Some(encoder.finish()));
 
             self.total_time += sub_dt;
