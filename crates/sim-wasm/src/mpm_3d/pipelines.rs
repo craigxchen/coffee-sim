@@ -1,10 +1,16 @@
 use std::borrow::Cow;
 
+use super::pressure::{PressurePipelines, RbgsPressureSolver};
 use super::shader::MPM_COMPUTE_SHADER;
 use super::state::MpmBuffers;
 
 pub(crate) struct MpmPipelines {
     pub bind_group: wgpu::BindGroup,
+    pub common: CommonPipelines,
+    pub pressure: PressurePipelines,
+}
+
+pub(crate) struct CommonPipelines {
     pub metrics_clear: wgpu::ComputePipeline,
     pub bed_lookup_clear: wgpu::ComputePipeline,
     pub bed_lookup_scatter: wgpu::ComputePipeline,
@@ -12,11 +18,6 @@ pub(crate) struct MpmPipelines {
     pub grid_update: wgpu::ComputePipeline,
     pub viscosity_prepare: wgpu::ComputePipeline,
     pub viscosity_apply: wgpu::ComputePipeline,
-    pub classify_cells: wgpu::ComputePipeline,
-    pub pressure_rbgs_red: wgpu::ComputePipeline,
-    pub pressure_rbgs_black: wgpu::ComputePipeline,
-    pub project_pressure: wgpu::ComputePipeline,
-    pub pressure_residual: wgpu::ComputePipeline,
     pub boundary_project: wgpu::ComputePipeline,
     pub packing_prepare: wgpu::ComputePipeline,
     pub packing_apply: wgpu::ComputePipeline,
@@ -165,26 +166,30 @@ impl MpmPipelines {
 
         Self {
             bind_group,
-            metrics_clear: make("metrics_clear"),
-            bed_lookup_clear: make("bed_lookup_clear"),
-            bed_lookup_scatter: make("bed_lookup_scatter"),
-            p2g: make("p2g"),
-            grid_update: make("grid_update"),
-            viscosity_prepare: make("viscosity_prepare"),
-            viscosity_apply: make("viscosity_apply"),
-            classify_cells: make("classify_cells"),
-            pressure_rbgs_red: make("pressure_rbgs_red"),
-            pressure_rbgs_black: make("pressure_rbgs_black"),
-            project_pressure: make("project_pressure"),
-            pressure_residual: make("pressure_residual"),
-            boundary_project: make("boundary_project"),
-            packing_prepare: make("packing_prepare"),
-            packing_apply: make("packing_apply"),
-            g2p: make("g2p"),
-            bed_coupling: make("bed_coupling"),
-            extraction_advect: make("extraction_advect"),
-            bed_dynamics: make("bed_dynamics"),
-            prepare_render: make("prepare_render"),
+            common: CommonPipelines {
+                metrics_clear: make("metrics_clear"),
+                bed_lookup_clear: make("bed_lookup_clear"),
+                bed_lookup_scatter: make("bed_lookup_scatter"),
+                p2g: make("p2g"),
+                grid_update: make("grid_update"),
+                viscosity_prepare: make("viscosity_prepare"),
+                viscosity_apply: make("viscosity_apply"),
+                boundary_project: make("boundary_project"),
+                packing_prepare: make("packing_prepare"),
+                packing_apply: make("packing_apply"),
+                g2p: make("g2p"),
+                bed_coupling: make("bed_coupling"),
+                extraction_advect: make("extraction_advect"),
+                bed_dynamics: make("bed_dynamics"),
+                prepare_render: make("prepare_render"),
+            },
+            pressure: PressurePipelines::Rbgs(RbgsPressureSolver {
+                classify_cells: make("classify_cells"),
+                pressure_rbgs_red: make("pressure_rbgs_red"),
+                pressure_rbgs_black: make("pressure_rbgs_black"),
+                project_pressure: make("project_pressure"),
+                pressure_residual: make("pressure_residual"),
+            }),
         }
     }
 }

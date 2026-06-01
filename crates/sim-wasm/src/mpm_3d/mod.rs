@@ -13,6 +13,7 @@ pub(crate) mod inflow;
 #[cfg(test)]
 mod physics_tests;
 mod pipelines;
+mod pressure;
 #[cfg(test)]
 mod profiler;
 mod shader;
@@ -28,6 +29,7 @@ use brew_config::{kozeny_carman_permeability_m2, DEFAULT_BREW};
 use filter_mesh::FilterMesh;
 use inflow::{EmissionResult, InflowState, SpoutSettings, MASS_UNITS_PER_ML};
 use pipelines::MpmPipelines;
+use pressure::PressureContext;
 use state::{
     MpmBuffers, MpmUniforms, FP_SCALE, FP_VALUE_LIMIT, MAX_VELOCITY, METRICS_DIV_FP_SCALE,
     METRICS_SLOT_COUNT, NUM_THREADS, SDF_RES,
@@ -36,6 +38,126 @@ use state::{
 const TARGET_BED_RETENTION_ML: f32 = DEFAULT_BREW.target_bed_retention_ml;
 pub(crate) const CONTACT_OFFSET: f32 = 0.05;
 pub(crate) const OBSTACLE_WALL_THICKNESS: f32 = 0.4;
+
+#[cfg(test)]
+const COMMON_TIMED_SCOPES_PER_SUBSTEP: u32 = 17;
+#[cfg(test)]
+const MIN_TIMESTAMP_QUERY_CAPACITY: u32 = 64;
+
+#[derive(Clone, Copy)]
+pub(crate) struct MpmDispatchSizes {
+    pub cell_wg: u32,
+    pub particle_wg: u32,
+    pub bed_wg: u32,
+    pub metrics_wg: u32,
+}
+
+pub(crate) enum MpmScheduleOp<'a> {
+    Pipeline {
+        label: MpmPassLabel,
+        pipeline: &'a wgpu::ComputePipeline,
+        workgroups: u32,
+    },
+    PressureSolve {
+        label: MpmPassLabel,
+        pressure: &'a pressure::PressurePipelines,
+        ctx: PressureContext,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub(crate) enum MpmPassLabel {
+    MetricsClear,
+    BedLookupClear,
+    BedLookupScatter,
+    P2G,
+    GridUpdate,
+    BoundaryProject,
+    PressureClassify,
+    PressureSolve,
+    PressureProject,
+    PressureResidual,
+    PackingPrepare,
+    PackingApply,
+    ViscosityPrepare,
+    ViscosityApply,
+    G2P,
+    BedCoupling,
+    ExtractionAdvect,
+    BedDynamics,
+    PrepareRender,
+}
+
+#[cfg(test)]
+impl MpmPassLabel {
+    pub(crate) fn id(self) -> &'static str {
+        match self {
+            Self::MetricsClear => "metrics.clear",
+            Self::BedLookupClear => "bed.lookup_clear",
+            Self::BedLookupScatter => "bed.lookup_scatter",
+            Self::P2G => "transfer.p2g",
+            Self::GridUpdate => "grid.update",
+            Self::BoundaryProject => "boundary.project",
+            Self::PressureClassify => "pressure.classify",
+            Self::PressureSolve => "pressure.solve",
+            Self::PressureProject => "pressure.project",
+            Self::PressureResidual => "pressure.residual",
+            Self::PackingPrepare => "packing.prepare",
+            Self::PackingApply => "packing.apply",
+            Self::ViscosityPrepare => "viscosity.prepare",
+            Self::ViscosityApply => "viscosity.apply",
+            Self::G2P => "transfer.g2p",
+            Self::BedCoupling => "bed.coupling",
+            Self::ExtractionAdvect => "bed.extraction_advect",
+            Self::BedDynamics => "bed.dynamics",
+            Self::PrepareRender => "render.prepare",
+        }
+    }
+
+    pub(crate) fn display(self) -> &'static str {
+        match self {
+            Self::MetricsClear => "metrics_clear",
+            Self::BedLookupClear => "bed_lookup_clear",
+            Self::BedLookupScatter => "bed_lookup_scatter",
+            Self::P2G => "p2g",
+            Self::GridUpdate => "grid_update",
+            Self::BoundaryProject => "boundary_project",
+            Self::PressureClassify => "classify_cells",
+            Self::PressureSolve => "pressure_solve",
+            Self::PressureProject => "project_pressure",
+            Self::PressureResidual => "pressure_residual",
+            Self::PackingPrepare => "packing_prepare",
+            Self::PackingApply => "packing_apply",
+            Self::ViscosityPrepare => "viscosity_prepare",
+            Self::ViscosityApply => "viscosity_apply",
+            Self::G2P => "g2p",
+            Self::BedCoupling => "bed_coupling",
+            Self::ExtractionAdvect => "extraction_advect",
+            Self::BedDynamics => "bed_dynamics",
+            Self::PrepareRender => "prepare_render",
+        }
+    }
+
+    pub(crate) fn category(self) -> &'static str {
+        match self {
+            Self::MetricsClear => "metrics",
+            Self::BedLookupClear
+            | Self::BedLookupScatter
+            | Self::BedCoupling
+            | Self::ExtractionAdvect
+            | Self::BedDynamics => "bed",
+            Self::P2G | Self::G2P => "transfer",
+            Self::GridUpdate | Self::BoundaryProject => "grid",
+            Self::PressureClassify
+            | Self::PressureSolve
+            | Self::PressureProject
+            | Self::PressureResidual => "pressure",
+            Self::PackingPrepare | Self::PackingApply => "packing",
+            Self::ViscosityPrepare | Self::ViscosityApply => "viscosity",
+            Self::PrepareRender => "render",
+        }
+    }
+}
 
 /// Device limits required by the MPM compute pipeline.
 ///
@@ -690,6 +812,145 @@ pub(crate) struct MpmSim3D {
     total_dropped_particles: u32,
     last_pressure_rbgs_pairs: u32,
     latest_metrics: MetricsSnapshot,
+}
+
+fn encode_mpm_substep_schedule<RunOp>(
+    pipelines: &MpmPipelines,
+    dispatch: MpmDispatchSizes,
+    pressure_ctx: PressureContext,
+    mut run_op: RunOp,
+) where
+    RunOp: FnMut(MpmScheduleOp<'_>),
+{
+    let common = &pipelines.common;
+    macro_rules! run_pipeline {
+        ($label:expr, $pipeline:expr, $workgroups:expr $(,)?) => {
+            run_op(MpmScheduleOp::Pipeline {
+                label: $label,
+                pipeline: $pipeline,
+                workgroups: $workgroups,
+            });
+        };
+    }
+
+    if dispatch.metrics_wg > 0 {
+        run_pipeline!(
+            MpmPassLabel::MetricsClear,
+            &common.metrics_clear,
+            dispatch.metrics_wg,
+        );
+    }
+    run_pipeline!(
+        MpmPassLabel::BedLookupClear,
+        &common.bed_lookup_clear,
+        dispatch.cell_wg,
+    );
+    if dispatch.bed_wg > 0 {
+        run_pipeline!(
+            MpmPassLabel::BedLookupScatter,
+            &common.bed_lookup_scatter,
+            dispatch.bed_wg,
+        );
+    }
+    if dispatch.particle_wg > 0 {
+        run_pipeline!(MpmPassLabel::P2G, &common.p2g, dispatch.particle_wg);
+    }
+    run_pipeline!(
+        MpmPassLabel::GridUpdate,
+        &common.grid_update,
+        dispatch.cell_wg
+    );
+    run_pipeline!(
+        MpmPassLabel::BoundaryProject,
+        &common.boundary_project,
+        dispatch.cell_wg,
+    );
+
+    run_pipeline!(
+        MpmPassLabel::PressureClassify,
+        pipelines.pressure.classify_pipeline(),
+        dispatch.cell_wg,
+    );
+    run_op(MpmScheduleOp::PressureSolve {
+        label: MpmPassLabel::PressureSolve,
+        pressure: &pipelines.pressure,
+        ctx: pressure_ctx,
+    });
+    run_pipeline!(
+        MpmPassLabel::PressureProject,
+        pipelines.pressure.project_pipeline(),
+        dispatch.cell_wg,
+    );
+    run_pipeline!(
+        MpmPassLabel::BoundaryProject,
+        &common.boundary_project,
+        dispatch.cell_wg,
+    );
+    run_pipeline!(
+        MpmPassLabel::PressureResidual,
+        pipelines.pressure.residual_pipeline(),
+        dispatch.cell_wg,
+    );
+
+    run_pipeline!(
+        MpmPassLabel::PackingPrepare,
+        &common.packing_prepare,
+        dispatch.cell_wg,
+    );
+    run_pipeline!(
+        MpmPassLabel::PackingApply,
+        &common.packing_apply,
+        dispatch.cell_wg,
+    );
+    run_pipeline!(
+        MpmPassLabel::BoundaryProject,
+        &common.boundary_project,
+        dispatch.cell_wg,
+    );
+
+    run_pipeline!(
+        MpmPassLabel::ViscosityPrepare,
+        &common.viscosity_prepare,
+        dispatch.cell_wg,
+    );
+    run_pipeline!(
+        MpmPassLabel::ViscosityApply,
+        &common.viscosity_apply,
+        dispatch.cell_wg,
+    );
+    run_pipeline!(
+        MpmPassLabel::BoundaryProject,
+        &common.boundary_project,
+        dispatch.cell_wg,
+    );
+
+    if dispatch.particle_wg > 0 {
+        run_pipeline!(MpmPassLabel::G2P, &common.g2p, dispatch.particle_wg);
+        run_pipeline!(
+            MpmPassLabel::BedCoupling,
+            &common.bed_coupling,
+            dispatch.particle_wg,
+        );
+    }
+    if dispatch.bed_wg > 0 {
+        run_pipeline!(
+            MpmPassLabel::ExtractionAdvect,
+            &common.extraction_advect,
+            dispatch.bed_wg,
+        );
+        run_pipeline!(
+            MpmPassLabel::BedDynamics,
+            &common.bed_dynamics,
+            dispatch.bed_wg,
+        );
+    }
+    if dispatch.particle_wg > 0 {
+        run_pipeline!(
+            MpmPassLabel::PrepareRender,
+            &common.prepare_render,
+            dispatch.particle_wg,
+        );
+    }
 }
 
 impl MpmSim3D {
@@ -1586,11 +1847,16 @@ impl MpmSim3D {
                 * self.settings.grid_dims[1]
                 * self.settings.grid_dims[2];
             let num_particles = self.num_water + self.num_bed;
-            let cell_wg = dispatch_size(total_cells, NUM_THREADS);
-            let particle_wg = dispatch_size(num_particles, NUM_THREADS);
-            let bed_wg = dispatch_size(self.num_bed, NUM_THREADS);
-
-            let metrics_wg = dispatch_size(METRICS_SLOT_COUNT as u32, 8);
+            let dispatch = MpmDispatchSizes {
+                cell_wg: dispatch_size(total_cells, NUM_THREADS),
+                particle_wg: dispatch_size(num_particles, NUM_THREADS),
+                bed_wg: dispatch_size(self.num_bed, NUM_THREADS),
+                metrics_wg: dispatch_size(METRICS_SLOT_COUNT as u32, 8),
+            };
+            let pressure_ctx = PressureContext {
+                cell_wg: dispatch.cell_wg,
+                rbgs_pairs: pressure_pairs,
+            };
 
             let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("mpm step"),
@@ -1604,108 +1870,30 @@ impl MpmSim3D {
                 });
                 pass.set_bind_group(0, &self.pipelines.bind_group, &[]);
 
-                // 1a. metrics_clear (fresh per-substep observability counters)
-                if metrics_wg > 0 {
-                    pass.set_pipeline(&self.pipelines.metrics_clear);
-                    pass.dispatch_workgroups(metrics_wg, 1, 1);
-                }
-
-                // 1b. bed_lookup_clear + scatter: rebuild the spatial index
-                // so classify_cells / bed_coupling / g2p see current
-                // bed-particle positions.
-                pass.set_pipeline(&self.pipelines.bed_lookup_clear);
-                pass.dispatch_workgroups(cell_wg, 1, 1);
-                if bed_wg > 0 {
-                    pass.set_pipeline(&self.pipelines.bed_lookup_scatter);
-                    pass.dispatch_workgroups(bed_wg, 1, 1);
-                }
-
-                // 2. p2g
-                if particle_wg > 0 {
-                    pass.set_pipeline(&self.pipelines.p2g);
-                    pass.dispatch_workgroups(particle_wg, 1, 1);
-                }
-
-                // 3. grid_update
-                pass.set_pipeline(&self.pipelines.grid_update);
-                pass.dispatch_workgroups(cell_wg, 1, 1);
-
-                // 4. boundary_project
-                pass.set_pipeline(&self.pipelines.boundary_project);
-                pass.dispatch_workgroups(cell_wg, 1, 1);
-
-                // Pressure projection: classify cells, RBGS pressure
-                // solve, velocity correction, then re-project boundaries.
-                pass.set_pipeline(&self.pipelines.classify_cells);
-                pass.dispatch_workgroups(cell_wg, 1, 1);
-
-                for _ in 0..pressure_pairs {
-                    pass.set_pipeline(&self.pipelines.pressure_rbgs_red);
-                    pass.dispatch_workgroups(cell_wg, 1, 1);
-                    pass.set_pipeline(&self.pipelines.pressure_rbgs_black);
-                    pass.dispatch_workgroups(cell_wg, 1, 1);
-                }
-
-                pass.set_pipeline(&self.pipelines.project_pressure);
-                pass.dispatch_workgroups(cell_wg, 1, 1);
-                pass.set_pipeline(&self.pipelines.boundary_project);
-                pass.dispatch_workgroups(cell_wg, 1, 1);
-                pass.set_pipeline(&self.pipelines.pressure_residual);
-                pass.dispatch_workgroups(cell_wg, 1, 1);
-
-                // Packing pressure reuses the projection scratch lanes before
-                // viscosity overwrites the grid momentum lanes with temporary
-                // FP-encoded velocity scratch. The shader limits this corrective
-                // pressure to interior liquid so sparse free-surface drip cells
-                // keep atmospheric pressure instead of kicking the pool/head.
-                pass.set_pipeline(&self.pipelines.packing_prepare);
-                pass.dispatch_workgroups(cell_wg, 1, 1);
-                pass.set_pipeline(&self.pipelines.packing_apply);
-                pass.dispatch_workgroups(cell_wg, 1, 1);
-                pass.set_pipeline(&self.pipelines.boundary_project);
-                pass.dispatch_workgroups(cell_wg, 1, 1);
-
-                // Viscosity is split after the pressure and packing
-                // projections so neither correction can immediately
-                // reintroduce the high-frequency pool velocities that
-                // diffusion just removed.
-                pass.set_pipeline(&self.pipelines.viscosity_prepare);
-                pass.dispatch_workgroups(cell_wg, 1, 1);
-                pass.set_pipeline(&self.pipelines.viscosity_apply);
-                pass.dispatch_workgroups(cell_wg, 1, 1);
-                pass.set_pipeline(&self.pipelines.boundary_project);
-                pass.dispatch_workgroups(cell_wg, 1, 1);
-
-                // 6. g2p
-                if particle_wg > 0 {
-                    pass.set_pipeline(&self.pipelines.g2p);
-                    pass.dispatch_workgroups(particle_wg, 1, 1);
-                }
-
-                // 7. bed_coupling (after g2p so absorption uses projected
-                //    velocities and remains the sole bed storage transfer)
-                if particle_wg > 0 {
-                    pass.set_pipeline(&self.pipelines.bed_coupling);
-                    pass.dispatch_workgroups(particle_wg, 1, 1);
-                }
-
-                // 8. extraction_advect (consumes bed water delta from bed_coupling)
-                if bed_wg > 0 {
-                    pass.set_pipeline(&self.pipelines.extraction_advect);
-                    pass.dispatch_workgroups(bed_wg, 1, 1);
-                }
-
-                // 9. bed_dynamics
-                if bed_wg > 0 {
-                    pass.set_pipeline(&self.pipelines.bed_dynamics);
-                    pass.dispatch_workgroups(bed_wg, 1, 1);
-                }
-
-                // 10. prepare_render
-                if particle_wg > 0 {
-                    pass.set_pipeline(&self.pipelines.prepare_render);
-                    pass.dispatch_workgroups(particle_wg, 1, 1);
-                }
+                encode_mpm_substep_schedule(
+                    &self.pipelines,
+                    dispatch,
+                    pressure_ctx,
+                    |op| match op {
+                        MpmScheduleOp::Pipeline {
+                            label,
+                            pipeline,
+                            workgroups,
+                        } => {
+                            let _ = label;
+                            pass.set_pipeline(pipeline);
+                            pass.dispatch_workgroups(workgroups, 1, 1);
+                        }
+                        MpmScheduleOp::PressureSolve {
+                            label,
+                            pressure,
+                            ctx,
+                        } => {
+                            let _ = label;
+                            pressure.encode_solve(&mut pass, ctx);
+                        }
+                    },
+                );
             }
             queue.submit(Some(encoder.finish()));
 
@@ -1835,6 +2023,30 @@ impl MpmSim3D {
 
     pub fn last_pressure_rbgs_pairs(&self) -> u32 {
         self.last_pressure_rbgs_pairs
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pressure_solver_kind(&self) -> &'static str {
+        self.pipelines.pressure.kind()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pressure_solver_iterations_per_substep(&self) -> u32 {
+        self.pipelines
+            .pressure
+            .iterations_per_substep(PressureContext {
+                cell_wg: 0,
+                rbgs_pairs: self
+                    .last_pressure_rbgs_pairs
+                    .max(self.settings.pressure_rbgs_pairs),
+            })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn profiler_timestamp_query_capacity(&self) -> u32 {
+        let scopes =
+            COMMON_TIMED_SCOPES_PER_SUBSTEP + self.pipelines.pressure.estimated_timestamp_scopes();
+        ((scopes * 2) + 8).max(MIN_TIMESTAMP_QUERY_CAPACITY)
     }
 
     pub fn frame_emitted_mass(&self) -> f32 {
