@@ -7,6 +7,7 @@ use wasm_bindgen::{closure::Closure, JsCast};
 
 pub(crate) mod bed;
 mod brew_config;
+mod dfsph;
 mod filter;
 mod filter_mesh;
 pub(crate) mod inflow;

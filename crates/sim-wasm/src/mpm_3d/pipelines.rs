@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 
+use super::dfsph::DfsphPipelines;
 use super::pressure::{JacobiCgPressureSolver, PressurePipelines, RbgsPressureSolver};
 use super::shader::MPM_COMPUTE_SHADER;
 use super::state::MpmBuffers;
@@ -28,11 +29,6 @@ pub(crate) struct CommonPipelines {
     pub extraction_advect: wgpu::ComputePipeline,
     pub bed_dynamics: wgpu::ComputePipeline,
     pub prepare_render: wgpu::ComputePipeline,
-}
-
-#[allow(dead_code)]
-pub(crate) struct DfsphPipelines {
-    pub active_tile_bind_group: wgpu::BindGroup,
 }
 
 impl MpmPipelines {
@@ -155,44 +151,6 @@ impl MpmPipelines {
             ],
         });
 
-        let active_tile_bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("dfsph active pressure tile bind group layout"),
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                    storage_entry(3),
-                    storage_entry(13),
-                ],
-            });
-
-        let active_tile_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("dfsph active pressure tile bind group"),
-            layout: &active_tile_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: buffers.uniform_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: buffers.water_hash.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 13,
-                    resource: buffers.pressure_indirect.as_entire_binding(),
-                },
-            ],
-        });
-
         let shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("mpm compute shader"),
             source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(MPM_COMPUTE_SHADER)),
@@ -257,9 +215,7 @@ impl MpmPipelines {
                     pressure_residual: make("pressure_residual"),
                 },
             },
-            dfsph: DfsphPipelines {
-                active_tile_bind_group,
-            },
+            dfsph: DfsphPipelines::new(device, buffers),
         }
     }
 }
