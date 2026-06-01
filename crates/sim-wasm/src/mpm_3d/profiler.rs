@@ -15,7 +15,7 @@
 //!
 //! Tunable via environment variables:
 //! - `COFFEE_SIM_PROFILE_SCENE`   scene preset: `center_pour` (default) | `free_stream` | `water_block`
-//! - `COFFEE_SIM_PROFILE_SOLVER`  solver spec: `rbgs` (default) | `mpm:jacobi-cg` | `mpm:sparse-cg` | `xpbd:cpu`
+//! - `COFFEE_SIM_PROFILE_SOLVER`  solver spec: `rbgs` (default) | `mpm:jacobi-cg` | `mpm:sparse-cg` | `dfsph`
 //! - `COFFEE_SIM_PROFILE_SOLVERS` comma-separated runnable solver specs, or `all`
 //! - `COFFEE_SIM_PROFILE_CG_ITERATIONS` CG iterations per substep (defaults to scene RBGS pairs)
 //! - `COFFEE_SIM_PROFILE_WARMUP`  frames to run before measuring (default 60)
@@ -101,13 +101,13 @@ impl FromStr for SimulationBackendKind {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum XpbdSolverKind {
-    Cpu,
+    Gpu,
 }
 
 impl XpbdSolverKind {
     fn id(self) -> &'static str {
         match self {
-            Self::Cpu => "cpu",
+            Self::Gpu => "gpu",
         }
     }
 }
@@ -123,9 +123,9 @@ impl FromStr for XpbdSolverKind {
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value.trim().to_ascii_lowercase().as_str() {
-            "" | "cpu" => Ok(Self::Cpu),
+            "" | "gpu" => Ok(Self::Gpu),
             other => Err(format!(
-                "unknown xpbd solver '{other}'; available solvers: cpu"
+                "unknown xpbd solver '{other}'; available solvers: gpu"
             )),
         }
     }
@@ -199,7 +199,7 @@ impl FromStr for SolverSpec {
         }
         if trimmed.eq_ignore_ascii_case("xpbd") {
             return Ok(Self::Xpbd {
-                solver: XpbdSolverKind::Cpu,
+                solver: XpbdSolverKind::Gpu,
             });
         }
         Ok(Self::mpm(trimmed.parse::<PressureSolverKind>()?))
@@ -1163,13 +1163,7 @@ fn profile_solver_specs() -> Vec<SolverSpec> {
     if let Ok(value) = std::env::var("COFFEE_SIM_PROFILE_SOLVERS") {
         let trimmed = value.trim();
         if trimmed.eq_ignore_ascii_case("all") {
-            let mut specs: Vec<_> = PressureSolverKind::ALL
-                .iter()
-                .copied()
-                .map(SolverSpec::mpm)
-                .collect();
-            specs.push(SolverSpec::Dfsph);
-            return specs;
+            return runnable_solver_specs();
         }
         return trimmed
             .split(',')
@@ -1184,6 +1178,16 @@ fn profile_solver_specs() -> Vec<SolverSpec> {
     vec![solver
         .parse::<SolverSpec>()
         .unwrap_or_else(|err| panic!("{err}"))]
+}
+
+fn runnable_solver_specs() -> Vec<SolverSpec> {
+    let mut specs: Vec<_> = PressureSolverKind::ALL
+        .iter()
+        .copied()
+        .map(SolverSpec::mpm)
+        .collect();
+    specs.push(SolverSpec::Dfsph);
+    specs
 }
 
 fn output_path() -> PathBuf {
@@ -1228,14 +1232,34 @@ fn profiler_solver_specs_parse_backend_qualified_values() {
     assert_eq!(
         "xpbd".parse::<SolverSpec>(),
         Ok(SolverSpec::Xpbd {
-            solver: XpbdSolverKind::Cpu
+            solver: XpbdSolverKind::Gpu
         })
     );
     assert_eq!(
-        "xpbd:cpu".parse::<SolverSpec>(),
+        "xpbd:gpu".parse::<SolverSpec>(),
         Ok(SolverSpec::Xpbd {
-            solver: XpbdSolverKind::Cpu
+            solver: XpbdSolverKind::Gpu
         })
+    );
+    assert!("xpbd:cpu".parse::<SolverSpec>().is_err());
+}
+
+#[test]
+fn profiler_all_expands_to_runnable_gpu_solver_specs() {
+    assert_eq!(
+        runnable_solver_specs(),
+        vec![
+            SolverSpec::mpm(PressureSolverKind::Rbgs),
+            SolverSpec::mpm(PressureSolverKind::JacobiCg),
+            SolverSpec::mpm(PressureSolverKind::SparseCg),
+            SolverSpec::Dfsph,
+        ]
+    );
+    assert!(
+        !runnable_solver_specs()
+            .iter()
+            .any(|solver| matches!(solver, SolverSpec::Xpbd { .. })),
+        "XPBD branch currently has stub GPU kernels and must not be in `all`"
     );
 }
 
@@ -1787,8 +1811,8 @@ fn profile_mpm_pipeline() {
             }
             SolverSpec::Xpbd { .. } => panic!(
                 "XPBD profiler backend is registered but not yet ported into \
-                 codex/modular-solver-profiler; integrate xpbd-solver-rewrite \
-                 scene/state/engine code before profiling it"
+                 codex/modular-solver-profiler; xpbd-solver-rewrite currently \
+                 contains stub GPU kernels, so implement real GPU passes before profiling it"
             ),
         }
     }
