@@ -201,17 +201,7 @@ impl SolverSpec {
             "solver '{self}' does not support pressure_operator='{}'; use mpm:jacobi-cg for the staggered operator",
             run.pressure_operator
         );
-        match self {
-            Self::Mpm { pressure } => {
-                profile_mpm_solver(ctx, run, self, pressure);
-            }
-            Self::Dfsph => {
-                profile_dfsph_solver(ctx, run, self);
-            }
-            Self::Xpbd { solver } => {
-                profile_xpbd_solver(ctx, run, self, solver);
-            }
-        }
+        profile_solver_backend(ctx, run, self);
     }
 }
 
@@ -1997,6 +1987,55 @@ fn profiler_solver_run_metadata_records_requested_same_scene_set() {
 }
 
 #[test]
+fn profiler_solver_settings_keep_scene_and_selected_solver_separate() {
+    let base = PathBuf::from("target/profile.json");
+    let run = ProfilerRunConfig {
+        scene: ProfileScene::WaterBlock,
+        warmup: 1,
+        measured: 1,
+        calibration: 1,
+        cg_iterations: Some(17),
+        pressure_operator: PressureOperatorKind::Collocated,
+        solver_ids: vec!["mpm-sparse-cg".to_string()],
+        base_output_path: &base,
+        multiple_outputs: false,
+    };
+
+    let mpm = settings_for_solver(SolverSpec::mpm(PressureSolverKind::SparseCg), &run);
+    assert_eq!(mpm.pressure_solver, PressureSolverKind::SparseCg);
+    assert_eq!(mpm.pressure_operator, PressureOperatorKind::Collocated);
+    assert_eq!(mpm.pressure_cg_iterations, 17);
+    assert_eq!(
+        mpm.grid_dims,
+        ProfileScene::WaterBlock.mpm_settings().grid_dims
+    );
+
+    let dfsph = settings_for_solver(SolverSpec::Dfsph, &run);
+    assert_eq!(
+        dfsph.grid_dims, mpm.grid_dims,
+        "backend comparisons should keep the selected scene geometry"
+    );
+    assert_eq!(
+        dfsph.pressure_cg_iterations,
+        ProfileScene::WaterBlock
+            .mpm_settings()
+            .pressure_cg_iterations,
+        "non-MPM backend grid tail should inherit the scene pressure budget"
+    );
+
+    let xpbd = settings_for_solver(
+        SolverSpec::Xpbd {
+            solver: XpbdSolverKind::Gpu,
+        },
+        &run,
+    );
+    assert_eq!(
+        xpbd.grid_dims, mpm.grid_dims,
+        "XPBD backend should run on the same selected scene"
+    );
+}
+
+#[test]
 fn profiler_scenes_parse_shared_profile_scene_ids() {
     assert_eq!(
         "center_pour".parse::<ProfileScene>(),
@@ -2125,135 +2164,225 @@ fn solver_run_metadata(run: &ProfilerRunConfig<'_>, solver: SolverSpec) -> Solve
     }
 }
 
-fn profile_mpm_solver(
-    ctx: &ProfilerDeviceContext<'_>,
-    run: &ProfilerRunConfig<'_>,
-    solver: SolverSpec,
-    pressure: PressureSolverKind,
-) {
-    let mut settings = run.scene.mpm_settings();
-    settings.pressure_solver = pressure;
-    settings.pressure_operator = run.pressure_operator;
-    settings.pressure_cg_iterations = run
-        .cg_iterations
-        .or_else(|| env_u32("COFFEE_SIM_PROFILE_CG_ITERATIONS"))
-        .unwrap_or(settings.pressure_rbgs_pairs);
-    let grid_dims = settings.grid_dims;
-    let total_cells = grid_dims[0] * grid_dims[1] * grid_dims[2];
-    let max_particles = settings.max_particles;
-    let substeps = settings.substeps.max(1);
+trait ProfileBackend {
+    fn calibration_step(&mut self, sim: &mut MpmSim3D, device: &wgpu::Device, queue: &wgpu::Queue);
 
-    let mut sim = MpmSim3D::new(ctx.device, ctx.queue, settings);
+    fn measured_step(
+        &mut self,
+        sim: &mut MpmSim3D,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        timer: Option<&GpuTimer>,
+    ) -> FrameSums;
 
-    for _ in 0..run.warmup {
-        sim.step_frame(ctx.device, ctx.queue, FRAME_DT);
-    }
-    let _ = ctx.device.poll(wgpu::PollType::wait_indefinitely());
-    let bed_particles = sim.num_bed;
-    let pressure_rbgs_pairs = sim
-        .last_pressure_rbgs_pairs
-        .max(sim.settings.pressure_rbgs_pairs);
+    fn timestamp_query_capacity(&self, sim: &MpmSim3D) -> u32;
 
-    let mut production_ms = Vec::with_capacity(run.calibration as usize);
-    for _ in 0..run.calibration {
-        let t = Instant::now();
-        sim.step_frame(ctx.device, ctx.queue, FRAME_DT);
-        let _ = ctx.device.poll(wgpu::PollType::wait_indefinitely());
-        production_ms.push(ms(t));
+    fn solver_metadata(&self, solver: SolverSpec, sim: &MpmSim3D) -> SolverMetadata;
+
+    fn pressure_rbgs_pairs(&self, sim: &MpmSim3D) -> u32 {
+        sim.last_pressure_rbgs_pairs
+            .max(sim.settings.pressure_rbgs_pairs)
     }
 
-    let query_capacity = sim.profiler_timestamp_query_capacity();
-    let timer = ctx
-        .timestamps_supported
-        .then(|| GpuTimer::new(ctx.device, ctx.period_ns, query_capacity));
-    let mut measurements = ProfileMeasurements::with_capacity(run.measured);
-
-    let water_particles_start = sim.num_water;
-    for _ in 0..run.measured {
-        let t = Instant::now();
-        let sums =
-            step_frame_instrumented(&mut sim, ctx.device, ctx.queue, FRAME_DT, timer.as_ref());
-        measurements.record(ms(t), sums);
-    }
-    let water_particles_end = sim.num_water;
-    let (frame_timings, gpu_passes) = measurements.finish(production_ms, run.measured);
-
-    let mut bottlenecks = top_pass_bottlenecks(&gpu_passes);
-    let cpu_total = frame_timings.cpu_emit.mean_ms
-        + frame_timings.cpu_uniforms.mean_ms
-        + frame_timings.cpu_encode.mean_ms
-        + frame_timings.cpu_submit.mean_ms;
-    let cpu_gpu_verdict = if !ctx.timestamps_supported {
-        "n/a - no GPU timestamps on this adapter; compare CPU against gpu_wait instead"
-    } else if cpu_total > frame_timings.gpu_passes_sum.mean_ms * 0.25 {
-        "CPU-side is non-trivial"
-    } else {
-        "GPU-bound (CPU orchestration negligible)"
-    };
-    bottlenecks.push(format!(
-        "CPU orchestration: {:.3} ms/frame vs GPU passes {:.3} ms/frame -> {}",
-        cpu_total, frame_timings.gpu_passes_sum.mean_ms, cpu_gpu_verdict
-    ));
-
-    let report = ProfileReport {
-        schema_version: 2,
-        metadata: Metadata {
-            scene: run.scene.to_string(),
-            adapter: ctx.info.name.clone(),
-            backend: format!("{:?}", ctx.info.backend),
-            device_type: format!("{:?}", ctx.info.device_type),
-            timestamps_supported: ctx.timestamps_supported,
-            timestamp_period_ns: ctx.period_ns,
-            warmup_frames: run.warmup,
-            measured_frames: run.measured,
-            calibration_frames: run.calibration,
-            substeps_per_frame: substeps,
-            frame_dt_s: FRAME_DT,
-            grid_dims,
-            total_cells,
-            max_particles,
-            solver: SolverMetadata {
-                backend: solver.backend().to_string(),
-                pressure: Some(PressureSolverMetadata {
-                    kind: sim.pressure_solver_kind().to_string(),
-                    operator: sim.pressure_operator_kind().to_string(),
-                    iterations_per_substep: sim.pressure_solver_iterations_per_substep(),
-                }),
-                dfsph: None,
-                xpbd: None,
-            },
-            solver_run: solver_run_metadata(run, solver),
-            pressure_rbgs_pairs,
-            water_particles_start,
-            water_particles_end,
-            bed_particles,
-            total_particles_end: water_particles_end + bed_particles,
-        },
-        frame_timings,
-        gpu_passes,
-        bottlenecks,
-    };
-
-    let path = output_path_for_solver(run.base_output_path, solver, run.multiple_outputs);
-    write_report(&path, &report);
-    print_report_summary(&path, &report);
+    fn append_bottlenecks(&self, bottlenecks: &mut Vec<String>, frame_timings: &FrameTimings);
 }
 
-fn profile_dfsph_solver(
+struct MpmProfileBackend;
+
+impl ProfileBackend for MpmProfileBackend {
+    fn calibration_step(&mut self, sim: &mut MpmSim3D, device: &wgpu::Device, queue: &wgpu::Queue) {
+        sim.step_frame(device, queue, FRAME_DT);
+    }
+
+    fn measured_step(
+        &mut self,
+        sim: &mut MpmSim3D,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        timer: Option<&GpuTimer>,
+    ) -> FrameSums {
+        step_frame_instrumented(sim, device, queue, FRAME_DT, timer)
+    }
+
+    fn timestamp_query_capacity(&self, sim: &MpmSim3D) -> u32 {
+        sim.profiler_timestamp_query_capacity()
+    }
+
+    fn solver_metadata(&self, solver: SolverSpec, sim: &MpmSim3D) -> SolverMetadata {
+        SolverMetadata {
+            backend: solver.backend().to_string(),
+            pressure: Some(PressureSolverMetadata {
+                kind: sim.pressure_solver_kind().to_string(),
+                operator: sim.pressure_operator_kind().to_string(),
+                iterations_per_substep: sim.pressure_solver_iterations_per_substep(),
+            }),
+            dfsph: None,
+            xpbd: None,
+        }
+    }
+
+    fn append_bottlenecks(&self, bottlenecks: &mut Vec<String>, frame_timings: &FrameTimings) {
+        let cpu_total = frame_timings.cpu_emit.mean_ms
+            + frame_timings.cpu_uniforms.mean_ms
+            + frame_timings.cpu_encode.mean_ms
+            + frame_timings.cpu_submit.mean_ms;
+        let cpu_gpu_verdict = if frame_timings.gpu_passes_sum.mean_ms <= 0.0 {
+            "n/a - no GPU timestamps on this adapter; compare CPU against gpu_wait instead"
+        } else if cpu_total > frame_timings.gpu_passes_sum.mean_ms * 0.25 {
+            "CPU-side is non-trivial"
+        } else {
+            "GPU-bound (CPU orchestration negligible)"
+        };
+        bottlenecks.push(format!(
+            "CPU orchestration: {:.3} ms/frame vs GPU passes {:.3} ms/frame -> {}",
+            cpu_total, frame_timings.gpu_passes_sum.mean_ms, cpu_gpu_verdict
+        ));
+    }
+}
+
+struct DfsphProfileBackend;
+
+impl ProfileBackend for DfsphProfileBackend {
+    fn calibration_step(&mut self, sim: &mut MpmSim3D, device: &wgpu::Device, queue: &wgpu::Queue) {
+        step_frame_dfsph_instrumented(sim, device, queue, FRAME_DT, None);
+    }
+
+    fn measured_step(
+        &mut self,
+        sim: &mut MpmSim3D,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        timer: Option<&GpuTimer>,
+    ) -> FrameSums {
+        step_frame_dfsph_instrumented(sim, device, queue, FRAME_DT, timer)
+    }
+
+    fn timestamp_query_capacity(&self, sim: &MpmSim3D) -> u32 {
+        dfsph_profiler_timestamp_query_capacity(sim.settings.substeps)
+    }
+
+    fn solver_metadata(&self, solver: SolverSpec, sim: &MpmSim3D) -> SolverMetadata {
+        SolverMetadata {
+            backend: solver.backend().to_string(),
+            pressure: None,
+            dfsph: Some(DfsphSolverMetadata {
+                kind: "water".to_string(),
+                divergence_iterations_per_substep: 1,
+                density_iterations_per_substep: 2,
+                grid_pressure_kind: sim.pressure_solver_kind().to_string(),
+                grid_pressure_operator: sim.pressure_operator_kind().to_string(),
+                grid_pressure_iterations_per_substep: sim.pressure_solver_iterations_per_substep(),
+            }),
+            xpbd: None,
+        }
+    }
+
+    fn append_bottlenecks(&self, bottlenecks: &mut Vec<String>, _frame_timings: &FrameTimings) {
+        bottlenecks.push(
+            "DFSPH backend profiles GPU water pressure correction plus the shared MPM grid/bed/render tail; \
+             DFSPH active pressure-tile compaction is staged separately and is not wired into the shared MPM shader."
+                .to_string(),
+        );
+    }
+}
+
+struct XpbdProfileBackend {
+    kind: XpbdSolverKind,
+    pipelines: XpbdPipelines,
+}
+
+impl ProfileBackend for XpbdProfileBackend {
+    fn calibration_step(&mut self, sim: &mut MpmSim3D, device: &wgpu::Device, queue: &wgpu::Queue) {
+        step_frame_xpbd_instrumented(sim, &self.pipelines, device, queue, FRAME_DT, None);
+    }
+
+    fn measured_step(
+        &mut self,
+        sim: &mut MpmSim3D,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        timer: Option<&GpuTimer>,
+    ) -> FrameSums {
+        step_frame_xpbd_instrumented(sim, &self.pipelines, device, queue, FRAME_DT, timer)
+    }
+
+    fn timestamp_query_capacity(&self, sim: &MpmSim3D) -> u32 {
+        xpbd_profiler_timestamp_query_capacity(sim.settings.substeps)
+    }
+
+    fn solver_metadata(&self, solver: SolverSpec, _sim: &MpmSim3D) -> SolverMetadata {
+        SolverMetadata {
+            backend: solver.backend().to_string(),
+            pressure: None,
+            dfsph: None,
+            xpbd: Some(XpbdSolverMetadata {
+                kind: self.kind.to_string(),
+                constraint_iterations_per_substep: XPBD_CONSTRAINT_ITERATIONS,
+            }),
+        }
+    }
+
+    fn pressure_rbgs_pairs(&self, _sim: &MpmSim3D) -> u32 {
+        0
+    }
+
+    fn append_bottlenecks(&self, bottlenecks: &mut Vec<String>, _frame_timings: &FrameTimings) {
+        bottlenecks.push(
+            "XPBD backend uses GPU prediction, spatial hash, density constraints, bounds constraints, \
+             and velocity update over the shared particle buffers; browser parity and physical validation \
+             remain the next gates before treating it as production-equivalent."
+                .to_string(),
+        );
+    }
+}
+
+fn settings_for_solver(solver: SolverSpec, run: &ProfilerRunConfig<'_>) -> MpmSettings {
+    let mut settings = run.scene.mpm_settings();
+    match solver {
+        SolverSpec::Mpm { pressure } => {
+            settings.pressure_solver = pressure;
+            settings.pressure_operator = run.pressure_operator;
+            settings.pressure_cg_iterations =
+                run.cg_iterations.unwrap_or(settings.pressure_rbgs_pairs);
+        }
+        SolverSpec::Dfsph => {
+            settings.pressure_operator = run.pressure_operator;
+        }
+        SolverSpec::Xpbd { .. } => {}
+    }
+    settings
+}
+
+fn backend_for_solver(
+    solver: SolverSpec,
+    device: &wgpu::Device,
+    sim: &MpmSim3D,
+) -> Box<dyn ProfileBackend> {
+    match solver {
+        SolverSpec::Mpm { .. } => Box::new(MpmProfileBackend),
+        SolverSpec::Dfsph => Box::new(DfsphProfileBackend),
+        SolverSpec::Xpbd { solver: kind } => Box::new(XpbdProfileBackend {
+            kind,
+            pipelines: XpbdPipelines::new(device, &sim.buffers),
+        }),
+    }
+}
+
+fn profile_solver_backend(
     ctx: &ProfilerDeviceContext<'_>,
     run: &ProfilerRunConfig<'_>,
     solver: SolverSpec,
 ) {
-    let mut settings = run.scene.mpm_settings();
-    settings.pressure_operator = run.pressure_operator;
+    let settings = settings_for_solver(solver, run);
     let grid_dims = settings.grid_dims;
     let total_cells = grid_dims[0] * grid_dims[1] * grid_dims[2];
     let max_particles = settings.max_particles;
     let substeps = settings.substeps.max(1);
     let mut sim = MpmSim3D::new(ctx.device, ctx.queue, settings);
+    let mut backend = backend_for_solver(solver, ctx.device, &sim);
 
     for _ in 0..run.warmup {
-        step_frame_dfsph_instrumented(&mut sim, ctx.device, ctx.queue, FRAME_DT, None);
+        backend.calibration_step(&mut sim, ctx.device, ctx.queue);
     }
     let _ = ctx.device.poll(wgpu::PollType::wait_indefinitely());
 
@@ -2261,7 +2390,7 @@ fn profile_dfsph_solver(
     let mut production_ms = Vec::with_capacity(run.calibration as usize);
     for _ in 0..run.calibration {
         let t = Instant::now();
-        step_frame_dfsph_instrumented(&mut sim, ctx.device, ctx.queue, FRAME_DT, None);
+        backend.calibration_step(&mut sim, ctx.device, ctx.queue);
         let _ = ctx.device.poll(wgpu::PollType::wait_indefinitely());
         production_ms.push(ms(t));
     }
@@ -2270,7 +2399,7 @@ fn profile_dfsph_solver(
         GpuTimer::new(
             ctx.device,
             ctx.period_ns,
-            dfsph_profiler_timestamp_query_capacity(substeps),
+            backend.timestamp_query_capacity(&sim),
         )
     });
     let mut measurements = ProfileMeasurements::with_capacity(run.measured);
@@ -2278,24 +2407,14 @@ fn profile_dfsph_solver(
     let water_particles_start = sim.num_water;
     for _ in 0..run.measured {
         let t = Instant::now();
-        let sums = step_frame_dfsph_instrumented(
-            &mut sim,
-            ctx.device,
-            ctx.queue,
-            FRAME_DT,
-            timer.as_ref(),
-        );
+        let sums = backend.measured_step(&mut sim, ctx.device, ctx.queue, timer.as_ref());
         measurements.record(ms(t), sums);
     }
     let water_particles_end = sim.num_water;
     let (frame_timings, gpu_passes) = measurements.finish(production_ms, run.measured);
 
     let mut bottlenecks = top_pass_bottlenecks(&gpu_passes);
-    bottlenecks.push(
-        "DFSPH backend profiles GPU water pressure correction plus the shared MPM grid/bed/render tail; \
-         DFSPH active pressure-tile compaction is staged separately and is not wired into the shared MPM shader."
-            .to_string(),
-    );
+    backend.append_bottlenecks(&mut bottlenecks, &frame_timings);
 
     let report = ProfileReport {
         schema_version: 2,
@@ -2314,125 +2433,9 @@ fn profile_dfsph_solver(
             grid_dims,
             total_cells,
             max_particles,
-            solver: SolverMetadata {
-                backend: solver.backend().to_string(),
-                pressure: None,
-                dfsph: Some(DfsphSolverMetadata {
-                    kind: "water".to_string(),
-                    divergence_iterations_per_substep: 1,
-                    density_iterations_per_substep: 2,
-                    grid_pressure_kind: sim.pressure_solver_kind().to_string(),
-                    grid_pressure_operator: sim.pressure_operator_kind().to_string(),
-                    grid_pressure_iterations_per_substep: sim
-                        .pressure_solver_iterations_per_substep(),
-                }),
-                xpbd: None,
-            },
+            solver: backend.solver_metadata(solver, &sim),
             solver_run: solver_run_metadata(run, solver),
-            pressure_rbgs_pairs: sim
-                .last_pressure_rbgs_pairs
-                .max(sim.settings.pressure_rbgs_pairs),
-            water_particles_start,
-            water_particles_end,
-            bed_particles,
-            total_particles_end: water_particles_end + bed_particles,
-        },
-        frame_timings,
-        gpu_passes,
-        bottlenecks,
-    };
-
-    let path = output_path_for_solver(run.base_output_path, solver, run.multiple_outputs);
-    write_report(&path, &report);
-    print_report_summary(&path, &report);
-}
-
-fn profile_xpbd_solver(
-    ctx: &ProfilerDeviceContext<'_>,
-    run: &ProfilerRunConfig<'_>,
-    solver: SolverSpec,
-    kind: XpbdSolverKind,
-) {
-    let settings = run.scene.mpm_settings();
-    let grid_dims = settings.grid_dims;
-    let total_cells = grid_dims[0] * grid_dims[1] * grid_dims[2];
-    let max_particles = settings.max_particles;
-    let substeps = settings.substeps.max(1);
-    let mut sim = MpmSim3D::new(ctx.device, ctx.queue, settings);
-    let xpbd = XpbdPipelines::new(ctx.device, &sim.buffers);
-
-    for _ in 0..run.warmup {
-        step_frame_xpbd_instrumented(&mut sim, &xpbd, ctx.device, ctx.queue, FRAME_DT, None);
-    }
-    let _ = ctx.device.poll(wgpu::PollType::wait_indefinitely());
-
-    let bed_particles = sim.num_bed;
-    let mut production_ms = Vec::with_capacity(run.calibration as usize);
-    for _ in 0..run.calibration {
-        let t = Instant::now();
-        step_frame_xpbd_instrumented(&mut sim, &xpbd, ctx.device, ctx.queue, FRAME_DT, None);
-        let _ = ctx.device.poll(wgpu::PollType::wait_indefinitely());
-        production_ms.push(ms(t));
-    }
-
-    let query_capacity = xpbd_profiler_timestamp_query_capacity(substeps);
-    let timer = ctx
-        .timestamps_supported
-        .then(|| GpuTimer::new(ctx.device, ctx.period_ns, query_capacity));
-    let mut measurements = ProfileMeasurements::with_capacity(run.measured);
-
-    let water_particles_start = sim.num_water;
-    for _ in 0..run.measured {
-        let t = Instant::now();
-        let sums = step_frame_xpbd_instrumented(
-            &mut sim,
-            &xpbd,
-            ctx.device,
-            ctx.queue,
-            FRAME_DT,
-            timer.as_ref(),
-        );
-        measurements.record(ms(t), sums);
-    }
-    let water_particles_end = sim.num_water;
-    let (frame_timings, gpu_passes) = measurements.finish(production_ms, run.measured);
-
-    let mut bottlenecks = top_pass_bottlenecks(&gpu_passes);
-    bottlenecks.push(
-        "XPBD backend uses GPU prediction, spatial hash, density constraints, bounds constraints, \
-         and velocity update over the shared particle buffers; browser parity and physical validation \
-         remain the next gates before treating it as production-equivalent."
-            .to_string(),
-    );
-
-    let report = ProfileReport {
-        schema_version: 2,
-        metadata: Metadata {
-            scene: run.scene.to_string(),
-            adapter: ctx.info.name.clone(),
-            backend: format!("{:?}", ctx.info.backend),
-            device_type: format!("{:?}", ctx.info.device_type),
-            timestamps_supported: ctx.timestamps_supported,
-            timestamp_period_ns: ctx.period_ns,
-            warmup_frames: run.warmup,
-            measured_frames: run.measured,
-            calibration_frames: run.calibration,
-            substeps_per_frame: substeps,
-            frame_dt_s: FRAME_DT,
-            grid_dims,
-            total_cells,
-            max_particles,
-            solver: SolverMetadata {
-                backend: solver.backend().to_string(),
-                pressure: None,
-                dfsph: None,
-                xpbd: Some(XpbdSolverMetadata {
-                    kind: kind.to_string(),
-                    constraint_iterations_per_substep: XPBD_CONSTRAINT_ITERATIONS,
-                }),
-            },
-            solver_run: solver_run_metadata(run, solver),
-            pressure_rbgs_pairs: 0,
+            pressure_rbgs_pairs: backend.pressure_rbgs_pairs(&sim),
             water_particles_start,
             water_particles_end,
             bed_particles,
