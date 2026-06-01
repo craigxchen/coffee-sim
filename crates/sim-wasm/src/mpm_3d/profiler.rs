@@ -1545,6 +1545,7 @@ struct DryRunPlan {
 #[derive(Serialize)]
 struct DryRunSolverPlan {
     solver: String,
+    solver_run: SolverRunMetadata,
     metadata: SolverMetadata,
     output_path: String,
     grid_dims: [u32; 3],
@@ -2210,6 +2211,11 @@ fn profiler_dry_run_json_is_machine_readable_same_scene_plan() {
     assert_eq!(value["solvers"].as_array().expect("solver array").len(), 5);
     assert_eq!(value["solvers"][0]["solver"], "mpm:rbgs");
     assert_eq!(value["solvers"][4]["solver"], "xpbd:gpu");
+    assert_eq!(value["solvers"][0]["solver_run"]["current"], "mpm-rbgs");
+    assert_eq!(value["solvers"][0]["solver_run"]["ordinal"], 1);
+    assert_eq!(value["solvers"][0]["solver_run"]["count"], 5);
+    assert_eq!(value["solvers"][4]["solver_run"]["current"], "xpbd-gpu");
+    assert_eq!(value["solvers"][4]["solver_run"]["ordinal"], 5);
     assert_eq!(value["solvers"][0]["metadata"]["backend"], "mpm");
     assert_eq!(value["solvers"][0]["metadata"]["pressure"]["kind"], "rbgs");
     assert_eq!(
@@ -2702,6 +2708,7 @@ impl ProfileSelection {
                 let settings = settings_for_solver(solver, &run);
                 DryRunSolverPlan {
                     solver: solver.to_string(),
+                    solver_run: solver_run_metadata(&run, solver),
                     metadata: dry_run_solver_metadata(solver, &settings),
                     output_path: output_path_for_solver(
                         &self.base_output_path,
