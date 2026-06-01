@@ -418,6 +418,111 @@ fn liquid_fill_fraction(cell: u32, kind: i32) -> f32 {
     return clamp(fill_sum / max(fill_weight, 1e-6), 0.0, 1.0);
 }
 
+// ── Staggered pressure operator staging ──
+//
+// These helpers are the geometry/incidence half of the staggered pressure work
+// from `codex/perf-60hz-tier1`: velocities live on grid nodes, pressure rows
+// live at cell centers, and divergence/gradient are assembled from the same
+// node-cell incidence. They are intentionally not wired into the current
+// collocated operator yet; keeping them parsed but unused lets the modular
+// pressure boundary grow a selectable `staggered` operator without silently
+// changing today's RBGS/CG/sparse-CG behavior.
+fn pressure_node_in_bounds(n: vec3<i32>) -> bool {
+    return n.x >= 0 && n.y >= 0 && n.z >= 0
+        && u32(n.x) < gx() && u32(n.y) < gy() && u32(n.z) < gz();
+}
+
+fn staggered_pressure_cell_in_bounds(c: vec3<i32>) -> bool {
+    return c.x >= 0 && c.y >= 0 && c.z >= 0
+        && u32(c.x) + 1u < gx()
+        && u32(c.y) + 1u < gy()
+        && u32(c.z) + 1u < gz();
+}
+
+fn staggered_pressure_node_fill_weight(n: vec3<i32>) -> f32 {
+    var sum = 0.0;
+    for (var a = 0; a <= 1; a++) {
+        for (var b = 0; b <= 1; b++) {
+            for (var d = 0; d <= 1; d++) {
+                let c = n - vec3<i32>(a, b, d);
+                if !staggered_pressure_cell_in_bounds(c) {
+                    continue;
+                }
+                let kind = current_cell_kind(c);
+                if !is_fluid_kind(kind) {
+                    continue;
+                }
+                let ci = cell_index(u32(c.x), u32(c.y), u32(c.z));
+                sum += raw_liquid_fill_fraction(ci, kind);
+            }
+        }
+    }
+    let mean_fill = clamp(sum / 8.0, 0.0, 1.0);
+    return mean_fill * mean_fill * mean_fill;
+}
+
+fn staggered_pressure_cell_pressure(c: vec3<i32>) -> f32 {
+    if !staggered_pressure_cell_in_bounds(c) || sdf_class_is_solid(c) {
+        return 0.0;
+    }
+    let ci = cell_index(u32(c.x), u32(c.y), u32(c.z));
+    if pressure_cg_is_active(ci) {
+        return pressure_load(ci);
+    }
+    return 0.0;
+}
+
+fn staggered_pressure_corner_velocity_component(n: vec3<i32>, axis: i32) -> f32 {
+    if !pressure_node_in_bounds(n) || sdf_class_is_solid(n) {
+        return 0.0;
+    }
+    let ni = cell_index(u32(n.x), u32(n.y), u32(n.z));
+    let nv = grid_vel[ni];
+    let w = staggered_pressure_node_fill_weight(n);
+    if axis == 0 {
+        return w * nv.x;
+    }
+    if axis == 1 {
+        return w * nv.y;
+    }
+    return w * nv.z;
+}
+
+fn staggered_pressure_cell_divergence(c: vec3<i32>) -> f32 {
+    var dvx = 0.0;
+    var dvy = 0.0;
+    var dvz = 0.0;
+    for (var b = 0; b <= 1; b++) {
+        for (var d = 0; d <= 1; d++) {
+            dvx += staggered_pressure_corner_velocity_component(c + vec3<i32>(1, b, d), 0)
+                - staggered_pressure_corner_velocity_component(c + vec3<i32>(0, b, d), 0);
+            dvy += staggered_pressure_corner_velocity_component(c + vec3<i32>(b, 1, d), 1)
+                - staggered_pressure_corner_velocity_component(c + vec3<i32>(b, 0, d), 1);
+            dvz += staggered_pressure_corner_velocity_component(c + vec3<i32>(b, d, 1), 2)
+                - staggered_pressure_corner_velocity_component(c + vec3<i32>(b, d, 0), 2);
+        }
+    }
+    return inv_dx() * 0.25 * (dvx + dvy + dvz);
+}
+
+fn staggered_pressure_node_gradient(n: vec3<i32>) -> vec3<f32> {
+    var gx_acc = 0.0;
+    var gy_acc = 0.0;
+    var gz_acc = 0.0;
+    for (var b = 0; b <= 1; b++) {
+        for (var d = 0; d <= 1; d++) {
+            gx_acc += staggered_pressure_cell_pressure(n - vec3<i32>(0, b, d))
+                - staggered_pressure_cell_pressure(n - vec3<i32>(1, b, d));
+            gy_acc += staggered_pressure_cell_pressure(n - vec3<i32>(b, 0, d))
+                - staggered_pressure_cell_pressure(n - vec3<i32>(b, 1, d));
+            gz_acc += staggered_pressure_cell_pressure(n - vec3<i32>(b, d, 0))
+                - staggered_pressure_cell_pressure(n - vec3<i32>(b, d, 1));
+        }
+    }
+    let w = staggered_pressure_node_fill_weight(n);
+    return w * inv_dx() * 0.25 * vec3<f32>(gx_acc, gy_acc, gz_acc);
+}
+
 fn pressure_face_weight(
     self_kind: i32,
     self_fill: f32,
@@ -3422,5 +3527,12 @@ mod tests {
     fn apic_columns_are_applied_without_transpose() {
         assert!(MPM_COMPUTE_SHADER.contains("C0 * dpos.x + C1 * dpos.y + C2 * dpos.z"));
         assert!(!MPM_COMPUTE_SHADER.contains("dot(aff_col0, dpos)"));
+    }
+
+    #[test]
+    fn staged_staggered_pressure_helpers_are_present() {
+        assert!(MPM_COMPUTE_SHADER.contains("fn staggered_pressure_cell_divergence("));
+        assert!(MPM_COMPUTE_SHADER.contains("fn staggered_pressure_node_gradient("));
+        assert!(MPM_COMPUTE_SHADER.contains("fn staggered_pressure_node_fill_weight("));
     }
 }
