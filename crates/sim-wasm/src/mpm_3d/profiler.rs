@@ -51,6 +51,7 @@ use std::time::Instant;
 
 use bytemuck::cast_slice;
 use serde::Serialize;
+use serde_json::Value;
 
 use super::inflow::{EmissionResult, MASS_UNITS_PER_ML, PARTICLES_PER_ML};
 use super::pressure::{PressureContext, PressureOperatorKind, PressureSolverKind};
@@ -261,6 +262,7 @@ struct ProfilerCliArgs {
     dry_run: Option<bool>,
     dry_run_json: Option<bool>,
     require_gpu: Option<bool>,
+    verify_reports: Option<bool>,
     list_solvers: Option<bool>,
     help: Option<bool>,
 }
@@ -335,6 +337,7 @@ impl ProfilerCliArgs {
                 "dry_run" | "dry-run" => "--dry-run".to_string(),
                 "dry_run_json" | "dry-run-json" => "--dry-run-json".to_string(),
                 "require_gpu" | "require-gpu" => "--require-gpu".to_string(),
+                "verify_reports" | "verify-reports" => "--verify-reports".to_string(),
                 "list_solvers" | "list-solvers" => "--list-solvers".to_string(),
                 "help" => "--help".to_string(),
                 _ => flag,
@@ -385,6 +388,9 @@ impl ProfilerCliArgs {
                 "--require-gpu" => {
                     parsed.require_gpu = Some(parse_optional_bool(inline_value.as_deref())?);
                 }
+                "--verify-reports" => {
+                    parsed.verify_reports = Some(parse_optional_bool(inline_value.as_deref())?);
+                }
                 "--list-solvers" => {
                     parsed.list_solvers = Some(parse_optional_bool(inline_value.as_deref())?);
                 }
@@ -394,8 +400,8 @@ impl ProfilerCliArgs {
                 other => {
                     return Err(format!(
                         "unknown profiler option '{other}'; supported options: \
-                         --scene, --solver, --solvers, --pressure-operator, --warmup, --frames, --cal, --out, --cg-iterations, --dry-run, --dry-run-json, --require-gpu, --list-solvers, --help, \
-                         or kwargs scene=, solver=, solvers=, pressure_operator=, warmup=, frames=, cal=, out=, cg_iterations=, dry_run=, dry_run_json=, require_gpu=, list_solvers=, help="
+                         --scene, --solver, --solvers, --pressure-operator, --warmup, --frames, --cal, --out, --cg-iterations, --dry-run, --dry-run-json, --require-gpu, --verify-reports, --list-solvers, --help, \
+                         or kwargs scene=, solver=, solvers=, pressure_operator=, warmup=, frames=, cal=, out=, cg_iterations=, dry_run=, dry_run_json=, require_gpu=, verify_reports=, list_solvers=, help="
                     ));
                 }
             }
@@ -416,6 +422,7 @@ impl ProfilerCliArgs {
         self.dry_run = other.dry_run.or(self.dry_run);
         self.dry_run_json = other.dry_run_json.or(self.dry_run_json);
         self.require_gpu = other.require_gpu.or(self.require_gpu);
+        self.verify_reports = other.verify_reports.or(self.verify_reports);
         self.list_solvers = other.list_solvers.or(self.list_solvers);
         self.help = other.help.or(self.help);
     }
@@ -1872,6 +1879,7 @@ Options:\n\
   --dry-run[=true|false]     Print the resolved run plan without GPU work\n\
   --dry-run-json             Print the resolved run plan as JSON without GPU work\n\
   --require-gpu[=true|false] Fail instead of skipping when no GPU adapter is available\n\
+  --verify-reports           Verify emitted JSON reports for the selected solver set\n\
   --list-solvers             Print available solver specs\n\
   -h, --help                 Print this help\n\
 \n\
@@ -2082,6 +2090,7 @@ fn profiler_cli_args_parse_kwargs_forms() {
         "dry_run=true",
         "dry_run_json=true",
         "require_gpu=true",
+        "verify_reports=true",
     ])
     .expect("profiler kwargs parse");
 
@@ -2096,6 +2105,7 @@ fn profiler_cli_args_parse_kwargs_forms() {
     assert_eq!(args.dry_run, Some(true));
     assert_eq!(args.dry_run_json, Some(true));
     assert_eq!(args.require_gpu, Some(true));
+    assert_eq!(args.verify_reports, Some(true));
 }
 
 #[test]
@@ -2257,6 +2267,146 @@ fn profiler_dry_run_json_is_machine_readable_same_scene_plan() {
     );
     assert_eq!(value["solvers"][0]["pressure_rbgs_pairs"], 40);
     assert_eq!(value["solvers"][0]["pressure_cg_iterations"], 40);
+}
+
+#[test]
+fn profiler_report_verifier_accepts_same_scene_solver_set() {
+    let base = PathBuf::from("target/profile.json");
+    let args = ProfilerCliArgs::from_env_and_args(
+        None,
+        [
+            "--scene",
+            "water_block",
+            "--solvers",
+            "mpm:rbgs,xpbd:gpu",
+            "--frames",
+            "3",
+            "--warmup",
+            "2",
+            "--cal",
+            "1",
+            "--out",
+            "target/profile.json",
+        ],
+        true,
+    );
+    let selection = ProfileSelection::from_cli_with_env(&args, |_| None);
+    let reports = selection
+        .solvers
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(index, solver)| {
+            (
+                solver,
+                minimal_profile_report_json(&selection, solver, index + 1),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let verification =
+        validate_report_values(&selection, &reports).expect("same-scene reports verify");
+    assert_eq!(
+        verification,
+        ReportVerification {
+            scene: "water_block".to_string(),
+            solvers: vec!["mpm-rbgs".to_string(), "xpbd-gpu".to_string()],
+            reports: 2,
+        }
+    );
+    assert!(verification
+        .summary()
+        .contains("verified 2 profile reports"));
+    assert_eq!(
+        output_path_for_solver(&base, SolverSpec::mpm(PressureSolverKind::Rbgs), true),
+        PathBuf::from("target/profile-mpm-rbgs.json")
+    );
+}
+
+#[test]
+fn profiler_report_verifier_rejects_mixed_scene_reports() {
+    let base = PathBuf::from("target/profile.json");
+    let args = ProfilerCliArgs::from_env_and_args(
+        None,
+        [
+            "--scene",
+            "center_pour",
+            "--solvers",
+            "mpm:rbgs,xpbd:gpu",
+            "--frames",
+            "3",
+            "--warmup",
+            "2",
+            "--cal",
+            "1",
+            "--out",
+            "target/profile.json",
+        ],
+        true,
+    );
+    let selection = ProfileSelection::from_cli_with_env(&args, |_| None);
+    let mut reports = selection
+        .solvers
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(index, solver)| {
+            (
+                solver,
+                minimal_profile_report_json(&selection, solver, index + 1),
+            )
+        })
+        .collect::<Vec<_>>();
+    reports[1].1["metadata"]["scene"] = serde_json::json!("water_block");
+
+    let err = validate_report_values(&selection, &reports).expect_err("mixed scenes fail");
+    assert!(err.contains("metadata.scene mismatch"), "{err}");
+    assert_eq!(
+        output_path_for_solver(&base, SolverSpec::mpm(PressureSolverKind::Rbgs), false),
+        base
+    );
+}
+
+fn minimal_profile_report_json(
+    selection: &ProfileSelection,
+    solver: SolverSpec,
+    ordinal: usize,
+) -> Value {
+    let run = ProfilerRunConfig {
+        scene: selection.scene,
+        warmup: selection.warmup,
+        measured: selection.measured,
+        calibration: selection.calibration,
+        cg_iterations: selection.cg_iterations,
+        pressure_operator: selection.pressure_operator,
+        solver_ids: selection.solver_ids.clone(),
+        base_output_path: &selection.base_output_path,
+        multiple_outputs: selection.multiple_outputs,
+    };
+    let settings = settings_for_solver(solver, &run);
+    serde_json::json!({
+        "schema_version": 2,
+        "metadata": {
+            "scene": selection.scene.to_string(),
+            "warmup_frames": selection.warmup,
+            "measured_frames": selection.measured,
+            "calibration_frames": selection.calibration,
+            "grid_dims": settings.grid_dims,
+            "max_particles": settings.max_particles,
+            "substeps_per_frame": settings.substeps.max(1),
+            "solver": dry_run_solver_metadata(solver, &settings),
+            "solver_run": {
+                "requested": selection.solver_ids,
+                "current": solver.id(),
+                "ordinal": ordinal,
+                "count": selection.solvers.len(),
+                "multiple_outputs": selection.multiple_outputs
+            }
+        },
+        "frame_timings": {},
+        "gpu_passes": [],
+        "bottlenecks": []
+    })
 }
 
 #[test]
@@ -2782,6 +2932,170 @@ impl ProfileSelection {
     fn dry_run_json(&self) -> String {
         serde_json::to_string_pretty(&self.dry_run_plan()).expect("serialize dry run plan")
     }
+
+    fn verify_reports(&self) -> Result<ReportVerification, String> {
+        let reports = self
+            .solvers
+            .iter()
+            .copied()
+            .map(|solver| {
+                let path =
+                    output_path_for_solver(&self.base_output_path, solver, self.multiple_outputs);
+                let json = std::fs::read_to_string(&path)
+                    .map_err(|err| format!("read {}: {err}", path.display()))?;
+                let value = serde_json::from_str::<Value>(&json)
+                    .map_err(|err| format!("parse {}: {err}", path.display()))?;
+                Ok((solver, value))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        validate_report_values(self, &reports)
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct ReportVerification {
+    scene: String,
+    solvers: Vec<String>,
+    reports: usize,
+}
+
+impl ReportVerification {
+    fn summary(&self) -> String {
+        format!(
+            "verified {} profile reports for scene {}: {}\n",
+            self.reports,
+            self.scene,
+            self.solvers.join(", ")
+        )
+    }
+}
+
+fn validate_report_values(
+    selection: &ProfileSelection,
+    reports: &[(SolverSpec, Value)],
+) -> Result<ReportVerification, String> {
+    if reports.len() != selection.solvers.len() {
+        return Err(format!(
+            "expected {} reports, got {}",
+            selection.solvers.len(),
+            reports.len()
+        ));
+    }
+
+    for (index, (solver, value)) in reports.iter().enumerate() {
+        let expected_solver = selection.solvers[index];
+        if *solver != expected_solver {
+            return Err(format!(
+                "report order mismatch at {}: expected {}, got {}",
+                index + 1,
+                expected_solver,
+                solver
+            ));
+        }
+
+        assert_json_eq(value, "schema_version", serde_json::json!(2))?;
+        assert_json_eq(
+            value,
+            "metadata.scene",
+            serde_json::json!(selection.scene.to_string()),
+        )?;
+        assert_json_eq(
+            value,
+            "metadata.warmup_frames",
+            serde_json::json!(selection.warmup),
+        )?;
+        assert_json_eq(
+            value,
+            "metadata.measured_frames",
+            serde_json::json!(selection.measured),
+        )?;
+        assert_json_eq(
+            value,
+            "metadata.calibration_frames",
+            serde_json::json!(selection.calibration),
+        )?;
+        assert_json_eq(
+            value,
+            "metadata.solver.backend",
+            serde_json::json!(solver.backend().to_string()),
+        )?;
+        assert_json_eq(
+            value,
+            "metadata.solver_run.requested",
+            serde_json::json!(selection.solver_ids),
+        )?;
+        assert_json_eq(
+            value,
+            "metadata.solver_run.current",
+            serde_json::json!(solver.id()),
+        )?;
+        assert_json_eq(
+            value,
+            "metadata.solver_run.ordinal",
+            serde_json::json!(index + 1),
+        )?;
+        assert_json_eq(
+            value,
+            "metadata.solver_run.count",
+            serde_json::json!(selection.solvers.len()),
+        )?;
+        assert_json_eq(
+            value,
+            "metadata.solver_run.multiple_outputs",
+            serde_json::json!(selection.multiple_outputs),
+        )?;
+
+        let expected_settings = settings_for_solver(
+            *solver,
+            &ProfilerRunConfig {
+                scene: selection.scene,
+                warmup: selection.warmup,
+                measured: selection.measured,
+                calibration: selection.calibration,
+                cg_iterations: selection.cg_iterations,
+                pressure_operator: selection.pressure_operator,
+                solver_ids: selection.solver_ids.clone(),
+                base_output_path: &selection.base_output_path,
+                multiple_outputs: selection.multiple_outputs,
+            },
+        );
+        assert_json_eq(
+            value,
+            "metadata.grid_dims",
+            serde_json::json!(expected_settings.grid_dims),
+        )?;
+        assert_json_eq(
+            value,
+            "metadata.max_particles",
+            serde_json::json!(expected_settings.max_particles),
+        )?;
+        assert_json_eq(
+            value,
+            "metadata.substeps_per_frame",
+            serde_json::json!(expected_settings.substeps.max(1)),
+        )?;
+    }
+
+    Ok(ReportVerification {
+        scene: selection.scene.to_string(),
+        solvers: selection.solver_ids.clone(),
+        reports: reports.len(),
+    })
+}
+
+fn assert_json_eq(value: &Value, path: &str, expected: Value) -> Result<(), String> {
+    let actual = json_path(value, path).ok_or_else(|| format!("missing JSON path {path}"))?;
+    if actual == &expected {
+        return Ok(());
+    }
+    Err(format!(
+        "JSON path {path} mismatch: expected {expected}, got {actual}"
+    ))
+}
+
+fn json_path<'a>(value: &'a Value, path: &str) -> Option<&'a Value> {
+    path.split('.')
+        .try_fold(value, |current, key| current.get(key))
 }
 
 struct ProfilerDeviceContext<'a> {
@@ -3244,6 +3558,13 @@ pub fn run_profile_from_env_args() {
     }
     if cli.dry_run.unwrap_or(false) {
         print!("{}", selection.dry_run_summary());
+        return;
+    }
+    if cli.verify_reports.unwrap_or(false) {
+        match selection.verify_reports() {
+            Ok(verification) => print!("{}", verification.summary()),
+            Err(err) => panic!("profile_solvers report verification failed: {err}"),
+        }
         return;
     }
     let require_gpu = require_gpu_with_env(&cli, |name| std::env::var(name).ok());

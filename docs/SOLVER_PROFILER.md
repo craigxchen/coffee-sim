@@ -20,6 +20,8 @@ cargo run -p coffee-sim-wasm --features native-profiler --bin profile_solvers --
 cargo run -p coffee-sim-wasm --features native-profiler --bin profile_solvers -- \
   --scene center_pour --solvers all --frames 120 --warmup 60 --cal 30 --require-gpu
 cargo run -p coffee-sim-wasm --features native-profiler --bin profile_solvers -- \
+  --scene center_pour --solvers all --frames 120 --warmup 60 --cal 30 --verify-reports
+cargo run -p coffee-sim-wasm --features native-profiler --bin profile_solvers -- \
   --scene center_pour --solvers all --frames 120 --warmup 60 --cal 30 --dry-run
 cargo run -p coffee-sim-wasm --features native-profiler --bin profile_solvers -- \
   --scene center_pour --solvers all --frames 120 --warmup 60 --cal 30 --dry-run-json
@@ -33,7 +35,9 @@ COFFEE_SIM_PROFILE_ARGS="--scene water_block --solver mpm:sparse-cg --pressure-o
 Use `--require-gpu`, `require_gpu=true`, or
 `COFFEE_SIM_PROFILE_REQUIRE_GPU=true` for measurement gates. Without it, a host
 with no native adapter prints a skip message so regular non-GPU development
-does not fail.
+does not fail. After a measured run, use `--verify-reports` with the same scene,
+solver, frame, and output arguments to verify that every emitted JSON report
+belongs to the requested same-scene solver set.
 
 Runnable solver specs are:
 
@@ -124,4 +128,5 @@ set can be checked before any GPU work starts. The
 ignored profiler smoke with `solvers=all scene=center_pour` currently compiles
 in this environment but skips measurement because no native GPU adapter is
 available. Real completion still requires running that profiler on a host with
-GPU adapter access and comparing all emitted JSON reports for the same scene.
+GPU adapter access and verifying all emitted JSON reports for the same scene
+with `--verify-reports`.
