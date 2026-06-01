@@ -63,6 +63,7 @@ struct ContactResult {
 @group(0) @binding(10) var<storage, read_write> metrics: array<atomic<u32>>;
 @group(0) @binding(11) var sdf_class_tex: texture_3d<u32>;
 @group(0) @binding(12) var<storage, read_write> cg: array<vec4<f32>>;
+@group(0) @binding(13) var<storage, read_write> water_hash: array<atomic<i32>>;
 
 // Metrics slot layout — keep in sync with `METRICS_SLOT_COUNT` in state.rs.
 const OBSTACLE_WALL_THICKNESS: f32 = 0.4;
@@ -114,6 +115,33 @@ fn total_cells() -> u32 { return u.grid_dims.w; }
 fn num_bed() -> u32 { return u.counts.y; }
 fn max_particles() -> u32 { return u.counts.z; }
 fn num_particles() -> u32 { return u.counts.x + u.counts.y; }
+fn pressure_tile_size() -> u32 { return 4u; }
+fn pressure_tile_dims() -> vec3<u32> {
+    let tile = pressure_tile_size();
+    return vec3<u32>(
+        (gx() + tile - 1u) / tile,
+        (gy() + tile - 1u) / tile,
+        (gz() + tile - 1u) / tile,
+    );
+}
+fn pressure_tile_count() -> u32 {
+    let dims = pressure_tile_dims();
+    return dims.x * dims.y * dims.z;
+}
+fn pressure_tile_counter_idx() -> u32 { return pressure_tile_count(); }
+fn pressure_tile_list_idx(slot: u32) -> u32 { return pressure_tile_count() + 1u + slot; }
+fn pressure_tile_id_from_cell(ix_val: u32, iy_val: u32, iz_val: u32) -> u32 {
+    let tile = pressure_tile_size();
+    let dims = pressure_tile_dims();
+    let tx = ix_val / tile;
+    let ty = iy_val / tile;
+    let tz = iz_val / tile;
+    return tz * dims.x * dims.y + ty * dims.x + tx;
+}
+fn mark_pressure_tile(ix_val: u32, iy_val: u32, iz_val: u32) {
+    let tile_id = pressure_tile_id_from_cell(ix_val, iy_val, iz_val);
+    atomicStore(&water_hash[tile_id], 1);
+}
 fn use_sdf_cache() -> bool { return u.counts.w > 0u; }
 fn dt() -> f32 { return u.sim_params.x; }
 fn gravity() -> f32 { return u.sim_params.y; }
@@ -2065,6 +2093,7 @@ fn classify_cells(@builtin(global_invocation_id) gid: vec3<u32>) {
         divergence_store(idx, 0.0);
         return;
     }
+    mark_pressure_tile(ix_val, iy_val, iz_val);
 
     // Central-difference divergence using cell-centered velocities. No-flow
     // boundaries (off-grid faces and CELL_SOLID neighbors) use a ghost-mirror
@@ -2340,6 +2369,45 @@ fn pressure_rbgs_red(@builtin(global_invocation_id) gid: vec3<u32>) {
 @compute @workgroup_size(64)
 fn pressure_rbgs_black(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
+    if idx >= total_cells() { return; }
+    pressure_update(idx, 1u);
+}
+
+fn pressure_tile_cell_idx(tile_slot: u32, local_id: u32) -> u32 {
+    let tile_id = u32(atomicLoad(&water_hash[pressure_tile_list_idx(tile_slot)]));
+    let tile = pressure_tile_size();
+    let dims = pressure_tile_dims();
+    let tx = tile_id % dims.x;
+    let ty = (tile_id / dims.x) % dims.y;
+    let tz = tile_id / (dims.x * dims.y);
+    let lx = local_id % tile;
+    let ly = (local_id / tile) % tile;
+    let lz = local_id / (tile * tile);
+    let ix_val = tx * tile + lx;
+    let iy_val = ty * tile + ly;
+    let iz_val = tz * tile + lz;
+    if ix_val >= gx() || iy_val >= gy() || iz_val >= gz() {
+        return total_cells();
+    }
+    return cell_index(ix_val, iy_val, iz_val);
+}
+
+@compute @workgroup_size(64)
+fn pressure_rbgs_red_tiles(
+    @builtin(workgroup_id) workgroup_id: vec3<u32>,
+    @builtin(local_invocation_id) local_id: vec3<u32>,
+) {
+    let idx = pressure_tile_cell_idx(workgroup_id.x, local_id.x);
+    if idx >= total_cells() { return; }
+    pressure_update(idx, 0u);
+}
+
+@compute @workgroup_size(64)
+fn pressure_rbgs_black_tiles(
+    @builtin(workgroup_id) workgroup_id: vec3<u32>,
+    @builtin(local_invocation_id) local_id: vec3<u32>,
+) {
+    let idx = pressure_tile_cell_idx(workgroup_id.x, local_id.x);
     if idx >= total_cells() { return; }
     pressure_update(idx, 1u);
 }
@@ -2824,9 +2892,7 @@ fn project_pressure_staggered(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 // ── pressure_residual ──
 
-@compute @workgroup_size(64)
-fn pressure_residual(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
+fn pressure_residual_idx(idx: u32) {
     if idx >= total_cells() { return; }
 
     let kind = cell_kind_load(idx);
@@ -2855,6 +2921,19 @@ fn pressure_residual(@builtin(global_invocation_id) gid: vec3<u32>) {
     atomicAdd(&metrics[METRIC_PROJECTION_RESIDUAL_SUM_IDX], fp_sum);
     atomicAdd(&metrics[METRIC_PROJECTION_RESIDUAL_CELLS_IDX], 1u);
     pressure_cg_persistent_pressure_store(idx, pressure_load(idx));
+}
+
+@compute @workgroup_size(64)
+fn pressure_residual(@builtin(global_invocation_id) gid: vec3<u32>) {
+    pressure_residual_idx(gid.x);
+}
+
+@compute @workgroup_size(64)
+fn pressure_residual_tiles(
+    @builtin(workgroup_id) workgroup_id: vec3<u32>,
+    @builtin(local_invocation_id) local_id: vec3<u32>,
+) {
+    pressure_residual_idx(pressure_tile_cell_idx(workgroup_id.x, local_id.x));
 }
 
 @compute @workgroup_size(64)
@@ -2956,9 +3035,7 @@ fn is_packing_pressure_cell(idx: u32, kind: i32) -> bool {
     return fluid_neighbor_count >= 3u;
 }
 
-@compute @workgroup_size(64)
-fn packing_prepare(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
+fn packing_prepare_idx(idx: u32) {
     if idx >= total_cells() { return; }
 
     let kind = cell_kind_load(idx);
@@ -2976,8 +3053,19 @@ fn packing_prepare(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 
 @compute @workgroup_size(64)
-fn packing_apply(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
+fn packing_prepare(@builtin(global_invocation_id) gid: vec3<u32>) {
+    packing_prepare_idx(gid.x);
+}
+
+@compute @workgroup_size(64)
+fn packing_prepare_tiles(
+    @builtin(workgroup_id) workgroup_id: vec3<u32>,
+    @builtin(local_invocation_id) local_id: vec3<u32>,
+) {
+    packing_prepare_idx(pressure_tile_cell_idx(workgroup_id.x, local_id.x));
+}
+
+fn packing_apply_idx(idx: u32) {
     if idx >= total_cells() { return; }
 
     let gv = grid_vel[idx];
@@ -3016,6 +3104,19 @@ fn packing_apply(@builtin(global_invocation_id) gid: vec3<u32>) {
         v = v * (vel_cap() / speed);
     }
     grid_vel[idx] = vec4<f32>(v, gv.w);
+}
+
+@compute @workgroup_size(64)
+fn packing_apply(@builtin(global_invocation_id) gid: vec3<u32>) {
+    packing_apply_idx(gid.x);
+}
+
+@compute @workgroup_size(64)
+fn packing_apply_tiles(
+    @builtin(workgroup_id) workgroup_id: vec3<u32>,
+    @builtin(local_invocation_id) local_id: vec3<u32>,
+) {
+    packing_apply_idx(pressure_tile_cell_idx(workgroup_id.x, local_id.x));
 }
 
 // ── boundary_project ──
@@ -3856,6 +3957,11 @@ mod tests {
         assert!(MPM_COMPUTE_SHADER.contains("fn pressure_cg_matvec_staggered("));
         assert!(MPM_COMPUTE_SHADER.contains("fn project_pressure_staggered("));
         assert!(MPM_COMPUTE_SHADER.contains("fn pressure_residual_staggered("));
+        assert!(MPM_COMPUTE_SHADER.contains("fn pressure_rbgs_red_tiles("));
+        assert!(MPM_COMPUTE_SHADER.contains("fn pressure_rbgs_black_tiles("));
+        assert!(MPM_COMPUTE_SHADER.contains("fn pressure_residual_tiles("));
+        assert!(MPM_COMPUTE_SHADER.contains("fn packing_prepare_tiles("));
+        assert!(MPM_COMPUTE_SHADER.contains("fn packing_apply_tiles("));
         assert!(MPM_COMPUTE_SHADER.contains("fn staggered_pressure_cell_divergence("));
         assert!(MPM_COMPUTE_SHADER.contains("fn staggered_pressure_node_gradient("));
         assert!(MPM_COMPUTE_SHADER.contains("fn staggered_pressure_node_fill_weight("));

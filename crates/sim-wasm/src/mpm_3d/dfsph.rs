@@ -25,6 +25,8 @@ pub(crate) struct DfsphPipelines {
     pub density_star: wgpu::ComputePipeline,
     pub density_solve: wgpu::ComputePipeline,
     pub active_tile_bind_group: wgpu::BindGroup,
+    pub active_tile_clear: wgpu::ComputePipeline,
+    pub active_tile_compact: wgpu::ComputePipeline,
 }
 
 impl DfsphPipelines {
@@ -117,10 +119,26 @@ impl DfsphPipelines {
             bind_group_layouts: &[Some(&bind_group_layout)],
             immediate_size: 0,
         });
+        let active_tile_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("dfsph active pressure tile pipeline layout"),
+                bind_group_layouts: &[Some(&active_tile_bind_group_layout)],
+                immediate_size: 0,
+            });
         let make = |entry: &str| -> wgpu::ComputePipeline {
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some(entry),
                 layout: Some(&pipeline_layout),
+                module: &shader_module,
+                entry_point: Some(entry),
+                compilation_options: Default::default(),
+                cache: None,
+            })
+        };
+        let make_active = |entry: &str| -> wgpu::ComputePipeline {
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(entry),
+                layout: Some(&active_tile_pipeline_layout),
                 module: &shader_module,
                 entry_point: Some(entry),
                 compilation_options: Default::default(),
@@ -139,6 +157,8 @@ impl DfsphPipelines {
             density_star: make("dfsph_density_star"),
             density_solve: make("dfsph_density_solve"),
             active_tile_bind_group,
+            active_tile_clear: make_active("active_tile_clear"),
+            active_tile_compact: make_active("active_tile_compact"),
         }
     }
 }
@@ -192,6 +212,7 @@ struct AffineC {
 @group(0) @binding(1) var<storage, read_write> particles: array<Particle>;
 @group(0) @binding(2) var<storage, read_write> affine: array<AffineC>;
 @group(0) @binding(3) var<storage, read_write> water_hash: array<atomic<i32>>;
+@group(0) @binding(13) var<storage, read_write> pressure_indirect: array<atomic<i32>>;
 
 const DFSPH_MAX_NEIGHBORS_PER_CELL: u32 = 4096u;
 const DFSPH_EPS: f32 = 1.0e-6;
@@ -225,6 +246,22 @@ fn water_hash_head_idx(cell: u32) -> u32 {
 fn water_hash_next_idx(pid: u32) -> u32 {
     return total_cells() + pid;
 }
+
+fn pressure_tile_size() -> u32 { return 4u; }
+fn pressure_tile_dims() -> vec3<u32> {
+    let tile = pressure_tile_size();
+    return vec3<u32>(
+        (gx() + tile - 1u) / tile,
+        (gy() + tile - 1u) / tile,
+        (gz() + tile - 1u) / tile,
+    );
+}
+fn pressure_tile_count() -> u32 {
+    let dims = pressure_tile_dims();
+    return dims.x * dims.y * dims.z;
+}
+fn pressure_tile_counter_idx() -> u32 { return pressure_tile_count(); }
+fn pressure_tile_list_idx(slot: u32) -> u32 { return pressure_tile_count() + 1u + slot; }
 
 fn water_particle_id(local_water_id: u32) -> u32 {
     return num_bed() + local_water_id;
@@ -318,6 +355,37 @@ fn water_hash_scatter(@builtin(global_invocation_id) gid: vec3<u32>) {
     let head_idx = water_hash_head_idx(cell_index(u32(cell.x), u32(cell.y), u32(cell.z)));
     let old_head = atomicExchange(&water_hash[head_idx], i32(pid));
     atomicStore(&water_hash[water_hash_next_idx(pid)], old_head);
+}
+
+@compute @workgroup_size(64)
+fn active_tile_clear(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    let tile_count = pressure_tile_count();
+    let counter_idx = pressure_tile_counter_idx();
+    if idx < tile_count {
+        atomicStore(&water_hash[idx], 0);
+    }
+    if idx == counter_idx {
+        atomicStore(&water_hash[idx], 0);
+    }
+    if idx == 0u {
+        atomicStore(&pressure_indirect[0], 0);
+    } else if idx == 1u || idx == 2u {
+        atomicStore(&pressure_indirect[idx], 1);
+    }
+}
+
+@compute @workgroup_size(64)
+fn active_tile_compact(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let tile_id = gid.x;
+    if tile_id >= pressure_tile_count() { return; }
+    if atomicLoad(&water_hash[tile_id]) == 0 {
+        return;
+    }
+
+    let slot = u32(atomicAdd(&water_hash[pressure_tile_counter_idx()], 1));
+    atomicStore(&water_hash[pressure_tile_list_idx(slot)], i32(tile_id));
+    atomicMax(&pressure_indirect[0], i32(slot + 1u));
 }
 
 @compute @workgroup_size(64)
@@ -666,6 +734,8 @@ mod tests {
             .collect();
         assert!(entry_names.contains(&"water_hash_clear"));
         assert!(entry_names.contains(&"water_hash_scatter"));
+        assert!(entry_names.contains(&"active_tile_clear"));
+        assert!(entry_names.contains(&"active_tile_compact"));
         assert!(entry_names.contains(&"dfsph_density_factor"));
         assert!(entry_names.contains(&"dfsph_divergence_estimate"));
         assert!(entry_names.contains(&"dfsph_divergence_solve"));
