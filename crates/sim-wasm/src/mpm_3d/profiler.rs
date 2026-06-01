@@ -259,6 +259,7 @@ struct ProfilerCliArgs {
     output: Option<PathBuf>,
     cg_iterations: Option<u32>,
     dry_run: Option<bool>,
+    dry_run_json: bool,
     list_solvers: bool,
     help: bool,
 }
@@ -331,6 +332,7 @@ impl ProfilerCliArgs {
                 "out" | "output" => "--out".to_string(),
                 "cg_iterations" | "cg-iterations" => "--cg-iterations".to_string(),
                 "dry_run" | "dry-run" => "--dry-run".to_string(),
+                "dry_run_json" | "dry-run-json" => "--dry-run-json".to_string(),
                 "list_solvers" | "list-solvers" => "--list-solvers".to_string(),
                 "help" => "--help".to_string(),
                 _ => flag,
@@ -375,13 +377,14 @@ impl ProfilerCliArgs {
                             .unwrap_or(true),
                     );
                 }
+                "--dry-run-json" => parsed.dry_run_json = true,
                 "--list-solvers" => parsed.list_solvers = true,
                 "--help" | "-h" => parsed.help = true,
                 other => {
                     return Err(format!(
                         "unknown profiler option '{other}'; supported options: \
-                         --scene, --solver, --solvers, --pressure-operator, --warmup, --frames, --cal, --out, --cg-iterations, --dry-run, --list-solvers, --help, \
-                         or kwargs scene=, solver=, solvers=, pressure_operator=, warmup=, frames=, cal=, out=, cg_iterations=, dry_run=, list_solvers=, help="
+                         --scene, --solver, --solvers, --pressure-operator, --warmup, --frames, --cal, --out, --cg-iterations, --dry-run, --dry-run-json, --list-solvers, --help, \
+                         or kwargs scene=, solver=, solvers=, pressure_operator=, warmup=, frames=, cal=, out=, cg_iterations=, dry_run=, dry_run_json=, list_solvers=, help="
                     ));
                 }
             }
@@ -400,6 +403,7 @@ impl ProfilerCliArgs {
         self.output = other.output.or(self.output.take());
         self.cg_iterations = other.cg_iterations.or(self.cg_iterations);
         self.dry_run = other.dry_run.or(self.dry_run);
+        self.dry_run_json = other.dry_run_json || self.dry_run_json;
         self.list_solvers = other.list_solvers || self.list_solvers;
         self.help = other.help || self.help;
     }
@@ -1512,6 +1516,29 @@ struct SolverRunMetadata {
 }
 
 #[derive(Serialize)]
+struct DryRunPlan {
+    scene: String,
+    pressure_operator: String,
+    warmup_frames: u32,
+    measured_frames: u32,
+    calibration_frames: u32,
+    base_output_path: String,
+    multiple_outputs: bool,
+    solvers: Vec<DryRunSolverPlan>,
+}
+
+#[derive(Serialize)]
+struct DryRunSolverPlan {
+    solver: String,
+    output_path: String,
+    grid_dims: [u32; 3],
+    substeps: u32,
+    max_particles: u32,
+    pressure_rbgs_pairs: u32,
+    pressure_cg_iterations: u32,
+}
+
+#[derive(Serialize)]
 struct Metadata {
     scene: String,
     adapter: String,
@@ -1805,6 +1832,7 @@ Options:\n\
   --out <PATH>\n\
   --cg-iterations <N>\n\
   --dry-run[=true|false]     Print the resolved run plan without GPU work\n\
+  --dry-run-json             Print the resolved run plan as JSON without GPU work\n\
   --list-solvers             Print available solver specs\n\
   -h, --help                 Print this help\n\
 \n\
@@ -2013,6 +2041,7 @@ fn profiler_cli_args_parse_kwargs_forms() {
         "output=target/profile.json",
         "cg_iterations=9",
         "dry_run=true",
+        "dry_run_json=true",
     ])
     .expect("profiler kwargs parse");
 
@@ -2025,6 +2054,7 @@ fn profiler_cli_args_parse_kwargs_forms() {
     assert_eq!(args.output, Some(PathBuf::from("target/profile.json")));
     assert_eq!(args.cg_iterations, Some(9));
     assert_eq!(args.dry_run, Some(true));
+    assert!(args.dry_run_json);
 }
 
 #[test]
@@ -2130,6 +2160,44 @@ fn profiler_dry_run_summary_lists_all_solver_outputs_and_scene_settings() {
     assert!(summary.contains("grid=80x115x80"));
     assert!(summary.contains("rbgs_pairs=40"));
     assert!(summary.contains("cg_iterations=40"));
+}
+
+#[test]
+fn profiler_dry_run_json_is_machine_readable_same_scene_plan() {
+    let args = ProfilerCliArgs::from_env_and_args(
+        None,
+        [
+            "--scene",
+            "center_pour",
+            "--solvers",
+            "all",
+            "--frames",
+            "1",
+            "--warmup",
+            "1",
+            "--cal",
+            "1",
+            "--out",
+            "target/dry-profile.json",
+            "--dry-run-json",
+        ],
+        true,
+    );
+    assert!(args.dry_run_json);
+
+    let selection = ProfileSelection::from_cli_with_env(&args, |_| None);
+    let value: serde_json::Value =
+        serde_json::from_str(&selection.dry_run_json()).expect("dry run json parses");
+    assert_eq!(value["scene"], "center_pour");
+    assert_eq!(value["solvers"].as_array().expect("solver array").len(), 5);
+    assert_eq!(value["solvers"][0]["solver"], "mpm:rbgs");
+    assert_eq!(value["solvers"][4]["solver"], "xpbd:gpu");
+    assert_eq!(
+        value["solvers"][0]["grid_dims"],
+        serde_json::json!([80, 115, 80])
+    );
+    assert_eq!(value["solvers"][0]["pressure_rbgs_pairs"], 40);
+    assert_eq!(value["solvers"][0]["pressure_cg_iterations"], 40);
 }
 
 #[test]
@@ -2506,6 +2574,64 @@ impl ProfileSelection {
             );
         }
         summary
+    }
+
+    fn dry_run_plan(&self) -> DryRunPlan {
+        let solver_ids = self
+            .solvers
+            .iter()
+            .copied()
+            .map(SolverSpec::id)
+            .collect::<Vec<_>>();
+        let run = ProfilerRunConfig {
+            scene: self.scene,
+            warmup: self.warmup,
+            measured: self.measured,
+            calibration: self.calibration,
+            cg_iterations: self.cg_iterations,
+            pressure_operator: self.pressure_operator,
+            solver_ids,
+            base_output_path: &self.base_output_path,
+            multiple_outputs: self.multiple_outputs,
+        };
+        let solvers = self
+            .solvers
+            .iter()
+            .copied()
+            .map(|solver| {
+                let settings = settings_for_solver(solver, &run);
+                DryRunSolverPlan {
+                    solver: solver.to_string(),
+                    output_path: output_path_for_solver(
+                        &self.base_output_path,
+                        solver,
+                        self.multiple_outputs,
+                    )
+                    .display()
+                    .to_string(),
+                    grid_dims: settings.grid_dims,
+                    substeps: settings.substeps,
+                    max_particles: settings.max_particles,
+                    pressure_rbgs_pairs: settings.pressure_rbgs_pairs,
+                    pressure_cg_iterations: settings.pressure_cg_iterations,
+                }
+            })
+            .collect();
+
+        DryRunPlan {
+            scene: self.scene.to_string(),
+            pressure_operator: self.pressure_operator.to_string(),
+            warmup_frames: self.warmup,
+            measured_frames: self.measured,
+            calibration_frames: self.calibration,
+            base_output_path: self.base_output_path.display().to_string(),
+            multiple_outputs: self.multiple_outputs,
+            solvers,
+        }
+    }
+
+    fn dry_run_json(&self) -> String {
+        serde_json::to_string_pretty(&self.dry_run_plan()).expect("serialize dry run plan")
     }
 }
 
@@ -2907,6 +3033,10 @@ pub fn run_profile_from_env_args() {
         return;
     }
     let selection = ProfileSelection::from_cli(&cli);
+    if cli.dry_run_json {
+        println!("{}", selection.dry_run_json());
+        return;
+    }
     if cli.dry_run.unwrap_or(false) {
         print!("{}", selection.dry_run_summary());
         return;
