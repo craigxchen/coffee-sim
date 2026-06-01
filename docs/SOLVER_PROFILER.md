@@ -19,6 +19,8 @@ cargo run -p coffee-sim-wasm --features native-profiler --bin profile_solvers --
   --scene center_pour --solvers all --frames 120 --warmup 60 --cal 30
 cargo run -p coffee-sim-wasm --features native-profiler --bin profile_solvers -- \
   --scene center_pour --solvers all --frames 120 --warmup 60 --cal 30 --dry-run
+cargo run -p coffee-sim-wasm --features native-profiler --bin profile_solvers -- \
+  --scene center_pour --solvers all --frames 120 --warmup 60 --cal 30 --dry-run-json
 cargo run -p coffee-sim-wasm --features native-profiler --bin profile_solvers -- --list-solvers
 COFFEE_SIM_PROFILE_ARGS="scene=center_pour solvers=all frames=120 warmup=60 cal=30" \
   cargo test -p coffee-sim-wasm --lib --release profile_solvers -- --ignored --nocapture
@@ -89,8 +91,9 @@ Solver development was spread across several local branches. Current status:
 ## Verification Status
 
 Focused non-GPU checks prove parser/registry behavior and same-scene settings
-selection. The native `--dry-run` mode resolves solver fan-out, output paths,
-scene dimensions, and pressure budgets without requesting a GPU adapter. The
+selection. The native `--dry-run` and `--dry-run-json` modes resolve solver
+fan-out, output paths, scene dimensions, and pressure budgets without requesting
+a GPU adapter. The
 ignored profiler smoke with `solvers=all scene=center_pour` currently compiles
 in this environment but skips measurement because no native GPU adapter is
 available. Real completion still requires running that profiler on a host with
