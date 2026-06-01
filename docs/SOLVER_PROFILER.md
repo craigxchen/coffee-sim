@@ -35,9 +35,10 @@ COFFEE_SIM_PROFILE_ARGS="--scene water_block --solver mpm:sparse-cg --pressure-o
 Use `--require-gpu`, `require_gpu=true`, or
 `COFFEE_SIM_PROFILE_REQUIRE_GPU=true` for measurement gates. Without it, a host
 with no native adapter prints a skip message so regular non-GPU development
-does not fail. After a measured run, use `--verify-reports` with the same scene,
-solver, frame, and output arguments to verify that every emitted JSON report
-belongs to the requested same-scene solver set.
+does not fail. After a measured run, use `--verify-reports`,
+`verify_reports=true`, or `COFFEE_SIM_PROFILE_VERIFY_REPORTS=true` with the
+same scene, solver, frame, and output arguments to verify that every emitted
+JSON report belongs to the requested same-scene solver set.
 
 Runnable solver specs are:
 
