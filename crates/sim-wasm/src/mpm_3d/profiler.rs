@@ -610,7 +610,7 @@ fn step_frame_dfsph_instrumented(
     let mass_per_particle = MASS_UNITS_PER_ML / PARTICLES_PER_ML;
     let mut sums = FrameSums::default();
 
-    for _ in 0..substeps {
+    for substep_idx in 0..substeps {
         let t = Instant::now();
         let EmissionResult { emitted, .. } = sim.inflow.emit_particles(
             queue,
@@ -631,6 +631,12 @@ fn step_frame_dfsph_instrumented(
 
         let total_cells =
             sim.settings.grid_dims[0] * sim.settings.grid_dims[1] * sim.settings.grid_dims[2];
+        let dispatch = MpmDispatchSizes {
+            cell_wg: dispatch_size(total_cells, NUM_THREADS),
+            particle_wg: dispatch_size(sim.num_water + sim.num_bed, NUM_THREADS),
+            bed_wg: dispatch_size(sim.num_bed, NUM_THREADS),
+            metrics_wg: dispatch_size(METRICS_SLOT_COUNT as u32, 8),
+        };
         let water_hash_wg = dispatch_size(total_cells + sim.settings.max_particles, NUM_THREADS);
         let water_wg = dispatch_size(sim.num_water, NUM_THREADS);
 
@@ -639,6 +645,39 @@ fn step_frame_dfsph_instrumented(
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("dfsph profiled step"),
         });
+        encoder.clear_buffer(&sim.buffers.grid, 0, None);
+        encoder.clear_buffer(&sim.buffers.grid_vel, 0, None);
+        let common = &sim.pipelines.common;
+        let mpm_bg = &sim.pipelines.bind_group;
+        if dispatch.metrics_wg > 0 {
+            timed_pass(
+                &mut encoder,
+                &mut rec,
+                mpm_bg,
+                MpmPassLabel::MetricsClear,
+                &common.metrics_clear,
+                MpmDispatch::Direct(dispatch.metrics_wg),
+            );
+        }
+        timed_pass(
+            &mut encoder,
+            &mut rec,
+            mpm_bg,
+            MpmPassLabel::BedLookupClear,
+            &common.bed_lookup_clear,
+            MpmDispatch::Direct(dispatch.cell_wg),
+        );
+        if dispatch.bed_wg > 0 {
+            timed_pass(
+                &mut encoder,
+                &mut rec,
+                mpm_bg,
+                MpmPassLabel::BedLookupScatter,
+                &common.bed_lookup_scatter,
+                MpmDispatch::Direct(dispatch.bed_wg),
+            );
+        }
+
         let dfsph = &sim.pipelines.dfsph;
         timed_profile_pass(
             &mut encoder,
@@ -715,6 +754,103 @@ fn step_frame_dfsph_instrumented(
                     water_wg,
                 );
             }
+        }
+
+        if dispatch.particle_wg > 0 {
+            timed_pass(
+                &mut encoder,
+                &mut rec,
+                mpm_bg,
+                MpmPassLabel::P2G,
+                &common.p2g,
+                MpmDispatch::Direct(dispatch.particle_wg),
+            );
+        }
+        timed_pass(
+            &mut encoder,
+            &mut rec,
+            mpm_bg,
+            MpmPassLabel::GridUpdate,
+            &common.grid_update,
+            MpmDispatch::Direct(dispatch.cell_wg),
+        );
+        timed_pass(
+            &mut encoder,
+            &mut rec,
+            mpm_bg,
+            MpmPassLabel::BoundaryProject,
+            &common.boundary_project,
+            MpmDispatch::Direct(dispatch.cell_wg),
+        );
+        timed_pass(
+            &mut encoder,
+            &mut rec,
+            mpm_bg,
+            MpmPassLabel::ViscosityPrepare,
+            &common.viscosity_prepare,
+            MpmDispatch::Direct(dispatch.cell_wg),
+        );
+        timed_pass(
+            &mut encoder,
+            &mut rec,
+            mpm_bg,
+            MpmPassLabel::ViscosityApply,
+            &common.viscosity_apply,
+            MpmDispatch::Direct(dispatch.cell_wg),
+        );
+        timed_pass(
+            &mut encoder,
+            &mut rec,
+            mpm_bg,
+            MpmPassLabel::BoundaryProject,
+            &common.boundary_project,
+            MpmDispatch::Direct(dispatch.cell_wg),
+        );
+        if dispatch.particle_wg > 0 {
+            timed_pass(
+                &mut encoder,
+                &mut rec,
+                mpm_bg,
+                MpmPassLabel::G2P,
+                &common.g2p,
+                MpmDispatch::Direct(dispatch.particle_wg),
+            );
+            timed_pass(
+                &mut encoder,
+                &mut rec,
+                mpm_bg,
+                MpmPassLabel::BedCoupling,
+                &common.bed_coupling,
+                MpmDispatch::Direct(dispatch.particle_wg),
+            );
+        }
+        if dispatch.bed_wg > 0 {
+            timed_pass(
+                &mut encoder,
+                &mut rec,
+                mpm_bg,
+                MpmPassLabel::ExtractionAdvect,
+                &common.extraction_advect,
+                MpmDispatch::Direct(dispatch.bed_wg),
+            );
+            timed_pass(
+                &mut encoder,
+                &mut rec,
+                mpm_bg,
+                MpmPassLabel::BedDynamics,
+                &common.bed_dynamics,
+                MpmDispatch::Direct(dispatch.bed_wg),
+            );
+        }
+        if substep_idx + 1 == substeps && dispatch.particle_wg > 0 {
+            timed_pass(
+                &mut encoder,
+                &mut rec,
+                mpm_bg,
+                MpmPassLabel::PrepareRender,
+                &common.prepare_render,
+                MpmDispatch::Direct(dispatch.particle_wg),
+            );
         }
         let used = rec.next;
         if let Some(t) = timer {
@@ -1443,8 +1579,8 @@ fn profile_dfsph_solver(
         ));
     }
     bottlenecks.push(
-        "DFSPH backend currently profiles the GPU water pressure-correction sequence; \
-         hybrid grid tail integration remains a follow-up before adding it to `all`."
+        "DFSPH backend profiles GPU water pressure correction plus the shared MPM grid/bed/render tail; \
+         tiled pressure projection from codex/dfsph-water remains a follow-up before adding it to `all`."
             .to_string(),
     );
 
