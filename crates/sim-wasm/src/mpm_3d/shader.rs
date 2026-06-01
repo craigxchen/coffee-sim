@@ -99,6 +99,7 @@ const BED_REACTION_IMPULSE_CAP: f32 = 0.012;
 // place. The principled fix for the fragility is float reductions instead of
 // fixed-point atomics, after which most of these could be relaxed or removed.
 const PRESSURE_MIN_DIAGONAL: f32 = 1e-6;   // drop isolated cells (no fluid faces) from the solve
+const PRESSURE_STORABLE_FRACTION: f32 = 0.5; // drop a cell from the solve if its Jacobi pressure estimate exceeds this fraction of the storable ceiling (vanishing-support sparse cell; legitimate hydrostatic pressure sits well below the clamp)
 const CG_CONVERGENCE_REL_TOL: f32 = 1e-4;  // converged when weighted residual drops 4 orders vs initial
 const CG_RZ_ABS_FLOOR: f32 = 1e-8;         // absolute residual floor for near-zero baselines
 const CG_ALPHA_GATE_REL: f32 = 1e-5;       // skip the step when pᵀAp is tiny vs old_rz (near-singular direction)
@@ -2146,6 +2147,24 @@ fn pressure_cg_init(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     let inv_diag = 1.0 / diag;
     let z = r * inv_diag;
+    // Storable-pressure gate. The weighted operator A = D·Dᵀ folds the per-node
+    // liquid weight w_n into both D factors, so a cell's pressure scales like
+    // 1/w_n: a sparse free-surface cell (tiny w_n) has a near-zero diagonal and a
+    // Jacobi pressure estimate `z = r/diag` that runs past the fixed-point
+    // pressure storage ceiling (±pressure_clamp_limit). Storing such a cell would
+    // saturate the clamp and feed a CORRUPTED (clamped) pressure back into the
+    // staggered gradient — breaking G = -Dᵀ and ejecting the sparse stream. By
+    // 1/w_n, an unstorable z means the cell has vanishing continuum support, so
+    // drop it from the pressure domain and leave it particle-resolved (ballistic
+    // v*), exactly as the active-set design intends for sparse streams. The gate
+    // reads only the cell's own (diag, r), so the matvec/gradient — which test
+    // membership via the cached inv_diag — stay consistent with classification.
+    if abs(z) > pressure_clamp_limit() * PRESSURE_STORABLE_FRACTION {
+        pressure_store(idx, 0.0);
+        pressure_inv_diag_store(idx, 0.0);
+        cg[idx] = vec4<f32>(0.0);
+        return;
+    }
     pressure_store(idx, 0.0);
     pressure_inv_diag_store(idx, inv_diag);
     cg[idx] = vec4<f32>(r, z, z, 0.0);

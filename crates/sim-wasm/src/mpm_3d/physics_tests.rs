@@ -3436,4 +3436,3 @@ fn coffee_bed_retains_water_above_bed_surface() {
     );
 }
 
-// ── Extended diagnostics ──
