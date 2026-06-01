@@ -164,6 +164,33 @@ impl SolverSpec {
             }
         }
     }
+
+    fn runnable_specs() -> Vec<Self> {
+        let mut specs: Vec<_> = PressureSolverKind::ALL
+            .iter()
+            .copied()
+            .map(Self::mpm)
+            .collect();
+        specs.push(Self::Dfsph);
+        specs.push(Self::Xpbd {
+            solver: XpbdSolverKind::Gpu,
+        });
+        specs
+    }
+
+    fn profile(self, ctx: &ProfilerDeviceContext<'_>, run: &ProfilerRunConfig<'_>) {
+        match self {
+            Self::Mpm { pressure } => {
+                profile_mpm_solver(ctx, run, self, pressure);
+            }
+            Self::Dfsph => {
+                profile_dfsph_solver(ctx, run, self);
+            }
+            Self::Xpbd { solver } => {
+                profile_xpbd_solver(ctx, run, self, solver);
+            }
+        }
+    }
 }
 
 impl fmt::Display for SolverSpec {
@@ -1505,16 +1532,7 @@ fn profile_solver_specs() -> Vec<SolverSpec> {
 }
 
 fn runnable_solver_specs() -> Vec<SolverSpec> {
-    let mut specs: Vec<_> = PressureSolverKind::ALL
-        .iter()
-        .copied()
-        .map(SolverSpec::mpm)
-        .collect();
-    specs.push(SolverSpec::Dfsph);
-    specs.push(SolverSpec::Xpbd {
-        solver: XpbdSolverKind::Gpu,
-    });
-    specs
+    SolverSpec::runnable_specs()
 }
 
 fn xpbd_profiler_timestamp_query_capacity(substeps: u32) -> u32 {
@@ -1580,8 +1598,9 @@ fn profiler_solver_specs_parse_backend_qualified_values() {
 
 #[test]
 fn profiler_all_expands_to_runnable_gpu_solver_specs() {
+    let specs = runnable_solver_specs();
     assert_eq!(
-        runnable_solver_specs(),
+        specs,
         vec![
             SolverSpec::mpm(PressureSolverKind::Rbgs),
             SolverSpec::mpm(PressureSolverKind::JacobiCg),
@@ -1593,11 +1612,21 @@ fn profiler_all_expands_to_runnable_gpu_solver_specs() {
         ]
     );
     assert!(
-        runnable_solver_specs()
-            .iter()
+        specs.iter()
             .any(|solver| matches!(solver, SolverSpec::Xpbd { .. })),
         "XPBD GPU path should be included in `all` so same-scene solver comparisons do not require code changes"
     );
+}
+
+#[test]
+fn profiler_runnable_solver_ids_are_unique() {
+    let mut ids = runnable_solver_specs()
+        .into_iter()
+        .map(SolverSpec::id)
+        .collect::<Vec<_>>();
+    ids.sort();
+    ids.dedup();
+    assert_eq!(ids.len(), SolverSpec::runnable_specs().len());
 }
 
 #[test]
@@ -2085,16 +2114,6 @@ fn profile_mpm_pipeline() {
     };
 
     for &solver in &solvers {
-        match solver {
-            SolverSpec::Mpm { pressure } => {
-                profile_mpm_solver(&device_ctx, &run, solver, pressure);
-            }
-            SolverSpec::Dfsph => {
-                profile_dfsph_solver(&device_ctx, &run, solver);
-            }
-            SolverSpec::Xpbd { solver: kind } => {
-                profile_xpbd_solver(&device_ctx, &run, solver, kind);
-            }
-        }
+        solver.profile(&device_ctx, &run);
     }
 }
