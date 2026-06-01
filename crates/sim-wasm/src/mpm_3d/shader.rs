@@ -2279,7 +2279,7 @@ fn pressure_update(idx: u32, target_parity: u32) {
     }
 
     let kind = cell_kind_load(idx);
-    if !pressure_cg_is_active(idx) {
+    if !is_fluid_kind(kind) {
         pressure_store(idx, 0.0);
         return;
     }
@@ -2740,16 +2740,18 @@ fn pressure_cg_sparse_update_dir(@builtin(global_invocation_id) gid: vec3<u32>) 
 
 // ── project_pressure ──
 
-@compute @workgroup_size(64)
-fn project_pressure(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
+fn project_pressure_idx(idx: u32, require_active: bool) {
     if idx >= total_cells() { return; }
 
     let gv = grid_vel[idx];
     if gv.w < 1e-6 { return; }
 
     let kind = cell_kind_load(idx);
-    if !pressure_cg_is_active(idx) {
+    if require_active {
+        if !pressure_cg_is_active(idx) {
+            return;
+        }
+    } else if !is_fluid_kind(kind) {
         return;
     }
 
@@ -2832,6 +2834,16 @@ fn project_pressure(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 
 @compute @workgroup_size(64)
+fn project_pressure(@builtin(global_invocation_id) gid: vec3<u32>) {
+    project_pressure_idx(gid.x, false);
+}
+
+@compute @workgroup_size(64)
+fn project_pressure_active(@builtin(global_invocation_id) gid: vec3<u32>) {
+    project_pressure_idx(gid.x, true);
+}
+
+@compute @workgroup_size(64)
 fn project_pressure_staggered(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
     if idx >= total_cells() { return; }
@@ -2861,11 +2873,15 @@ fn project_pressure_staggered(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 // ── pressure_residual ──
 
-fn pressure_residual_idx(idx: u32) {
+fn pressure_residual_idx(idx: u32, require_active: bool) {
     if idx >= total_cells() { return; }
 
     let kind = cell_kind_load(idx);
-    if !pressure_cg_is_active(idx) {
+    if require_active {
+        if !pressure_cg_is_active(idx) {
+            return;
+        }
+    } else if !is_fluid_kind(kind) {
         return;
     }
 
@@ -2894,7 +2910,12 @@ fn pressure_residual_idx(idx: u32) {
 
 @compute @workgroup_size(64)
 fn pressure_residual(@builtin(global_invocation_id) gid: vec3<u32>) {
-    pressure_residual_idx(gid.x);
+    pressure_residual_idx(gid.x, false);
+}
+
+@compute @workgroup_size(64)
+fn pressure_residual_active(@builtin(global_invocation_id) gid: vec3<u32>) {
+    pressure_residual_idx(gid.x, true);
 }
 
 @compute @workgroup_size(64)
@@ -3912,5 +3933,16 @@ mod tests {
         );
         assert!(MPM_COMPUTE_SHADER.contains("fn staggered_pressure_linear_system_cell("));
         assert!(MPM_COMPUTE_SHADER.contains("fn staggered_pressure_apply_search_direction("));
+    }
+
+    #[test]
+    fn rbgs_pressure_entrypoints_keep_legacy_fluid_domain() {
+        assert!(MPM_COMPUTE_SHADER.contains(
+            "let kind = cell_kind_load(idx);\n    if !is_fluid_kind(kind) {\n        pressure_store(idx, 0.0);"
+        ));
+        assert!(MPM_COMPUTE_SHADER.contains("project_pressure_idx(gid.x, false);"));
+        assert!(MPM_COMPUTE_SHADER.contains("pressure_residual_idx(gid.x, false);"));
+        assert!(MPM_COMPUTE_SHADER.contains("project_pressure_idx(gid.x, true);"));
+        assert!(MPM_COMPUTE_SHADER.contains("pressure_residual_idx(gid.x, true);"));
     }
 }
