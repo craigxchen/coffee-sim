@@ -15,12 +15,12 @@ pub(crate) mod inflow;
 mod physics_tests;
 mod pipelines;
 mod pressure;
-#[cfg(test)]
-mod profiler;
+#[cfg(any(test, feature = "native-profiler"))]
+pub mod profiler;
 mod shader;
 mod state;
 pub(crate) mod units;
-#[cfg(test)]
+#[cfg(any(test, feature = "native-profiler"))]
 mod xpbd;
 
 pub(crate) use filter::FilterConfig;
@@ -42,9 +42,9 @@ const TARGET_BED_RETENTION_ML: f32 = DEFAULT_BREW.target_bed_retention_ml;
 pub(crate) const CONTACT_OFFSET: f32 = 0.05;
 pub(crate) const OBSTACLE_WALL_THICKNESS: f32 = 0.4;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "native-profiler"))]
 const COMMON_TIMED_SCOPES_PER_SUBSTEP: u32 = 17;
-#[cfg(test)]
+#[cfg(any(test, feature = "native-profiler"))]
 const MIN_TIMESTAMP_QUERY_CAPACITY: u32 = 64;
 
 #[derive(Clone, Copy)]
@@ -108,7 +108,7 @@ pub(crate) enum MpmPassLabel {
     PrepareRender,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "native-profiler"))]
 impl MpmPassLabel {
     pub(crate) fn id(self) -> &'static str {
         match self {
@@ -2133,17 +2133,17 @@ impl MpmSim3D {
         self.last_pressure_rbgs_pairs
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "native-profiler"))]
     pub(crate) fn pressure_solver_kind(&self) -> PressureSolverKind {
         self.settings.pressure_solver
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "native-profiler"))]
     pub(crate) fn pressure_operator_kind(&self) -> PressureOperatorKind {
         self.settings.pressure_operator
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "native-profiler"))]
     pub(crate) fn pressure_solver_iterations_per_substep(&self) -> u32 {
         self.pipelines
             .pressure
@@ -2158,7 +2158,7 @@ impl MpmSim3D {
             })
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "native-profiler"))]
     pub(crate) fn profiler_timestamp_query_capacity(&self) -> u32 {
         let pressure_ctx = PressureContext {
             kind: self.settings.pressure_solver,

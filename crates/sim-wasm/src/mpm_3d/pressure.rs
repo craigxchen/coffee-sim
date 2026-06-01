@@ -107,7 +107,7 @@ pub(crate) struct PressurePipelines {
 }
 
 impl PressurePipelines {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "native-profiler"))]
     pub(crate) fn iterations_per_substep(&self, ctx: PressureContext) -> u32 {
         match ctx.kind {
             PressureSolverKind::Rbgs => ctx.rbgs_pairs,
@@ -208,7 +208,7 @@ impl PressurePipelines {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "native-profiler"))]
     pub(crate) fn estimated_timestamp_scopes(&self, ctx: PressureContext) -> u32 {
         match ctx.kind {
             PressureSolverKind::Rbgs => {
