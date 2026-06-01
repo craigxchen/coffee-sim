@@ -203,6 +203,7 @@ impl MpmPipelines {
                 jacobi_cg: JacobiCgPressureSolver {
                     classify_cells: make("classify_cells"),
                     pressure_cg_init: make("pressure_cg_init"),
+                    pressure_cg_warmstart: make("pressure_cg_warmstart"),
                     pressure_cg_matvec: make("pressure_cg_matvec"),
                     pressure_cg_apply_alpha: make("pressure_cg_apply_alpha"),
                     pressure_cg_update_dir: make("pressure_cg_update_dir"),
