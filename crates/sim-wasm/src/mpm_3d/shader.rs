@@ -2746,6 +2746,34 @@ fn project_pressure(@builtin(global_invocation_id) gid: vec3<u32>) {
     grid_vel[idx] = vec4<f32>(v, gv.w);
 }
 
+@compute @workgroup_size(64)
+fn project_pressure_staggered(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if idx >= total_cells() { return; }
+
+    let gv = grid_vel[idx];
+    if gv.w < 1.0e-6 {
+        return;
+    }
+
+    let iz_val = idx / (gx() * gy());
+    let rem = idx % (gx() * gy());
+    let iy_val = rem / gx();
+    let ix_val = rem % gx();
+    let node = vec3<i32>(i32(ix_val), i32(iy_val), i32(iz_val));
+    if sdf_class_is_solid(node) {
+        return;
+    }
+
+    let grad_p = staggered_pressure_node_gradient(node);
+    var v = gv.xyz - dt() * grad_p;
+    let speed = length(v);
+    if speed > vel_cap() {
+        v = v * (vel_cap() / speed);
+    }
+    grid_vel[idx] = vec4<f32>(v, gv.w);
+}
+
 // ── pressure_residual ──
 
 @compute @workgroup_size(64)
@@ -3742,6 +3770,7 @@ mod tests {
     #[test]
     fn staged_staggered_pressure_helpers_are_present() {
         assert!(MPM_COMPUTE_SHADER.contains("fn classify_cells_staggered("));
+        assert!(MPM_COMPUTE_SHADER.contains("fn project_pressure_staggered("));
         assert!(MPM_COMPUTE_SHADER.contains("fn staggered_pressure_cell_divergence("));
         assert!(MPM_COMPUTE_SHADER.contains("fn staggered_pressure_node_gradient("));
         assert!(MPM_COMPUTE_SHADER.contains("fn staggered_pressure_node_fill_weight("));
