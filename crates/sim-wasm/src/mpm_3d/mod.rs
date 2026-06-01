@@ -2022,6 +2022,11 @@ impl MpmSim3D {
         // Rebuild the CPU filter mesh so reset/scene changes keep render
         // geometry aligned with the active filter config.
         self.filter_mesh = self.settings.filter.as_ref().map(FilterMesh::new);
+        queue.write_buffer(
+            &self.buffers.cg,
+            0,
+            &vec![0u8; self.buffers.cg.size() as usize],
+        );
         self.init_bed(queue);
     }
 
@@ -2594,6 +2599,7 @@ mod tests {
         assert!(shader::MPM_COMPUTE_SHADER.contains("|| kind == CELL_SURFACE_FLUID"));
         assert!(shader::MPM_COMPUTE_SHADER.contains("@group(0) @binding(12)"));
         assert!(shader::MPM_COMPUTE_SHADER.contains("fn pressure_cg_init("));
+        assert!(shader::MPM_COMPUTE_SHADER.contains("fn pressure_cg_warmstart("));
         assert!(shader::MPM_COMPUTE_SHADER.contains("fn pressure_cg_matvec("));
         assert!(shader::MPM_COMPUTE_SHADER.contains("fn pressure_cg_apply_alpha("));
         assert!(shader::MPM_COMPUTE_SHADER.contains("fn pressure_cg_update_dir("));

@@ -140,9 +140,9 @@ impl PressurePipelines {
                 4
             }
             PressureSolverKind::SparseCg => {
-                // classify, init, finalize, four kernels per CG iteration,
+                // classify, init, finalize, warmstart, four kernels per CG iteration,
                 // project, residual. Buffer copies are not timestamped.
-                5 + (4 * ctx.cg_iterations)
+                6 + (4 * ctx.cg_iterations)
             }
         }
     }
@@ -174,6 +174,7 @@ impl RbgsPressureSolver {
 pub(crate) struct JacobiCgPressureSolver {
     pub(crate) classify_cells: wgpu::ComputePipeline,
     pub(crate) pressure_cg_init: wgpu::ComputePipeline,
+    pub(crate) pressure_cg_warmstart: wgpu::ComputePipeline,
     pub(crate) pressure_cg_matvec: wgpu::ComputePipeline,
     pub(crate) pressure_cg_apply_alpha: wgpu::ComputePipeline,
     pub(crate) pressure_cg_update_dir: wgpu::ComputePipeline,
@@ -189,6 +190,8 @@ pub(crate) struct JacobiCgPressureSolver {
 impl JacobiCgPressureSolver {
     pub(crate) fn encode_solve(&self, pass: &mut wgpu::ComputePass<'_>, ctx: PressureContext) {
         pass.set_pipeline(&self.pressure_cg_init);
+        pass.dispatch_workgroups(ctx.cell_wg, 1, 1);
+        pass.set_pipeline(&self.pressure_cg_warmstart);
         pass.dispatch_workgroups(ctx.cell_wg, 1, 1);
 
         for _ in 0..ctx.cg_iterations {
@@ -212,6 +215,8 @@ impl JacobiCgPressureSolver {
         pass.dispatch_workgroups(ctx.cell_wg, 1, 1);
         pass.set_pipeline(&self.pressure_active_finalize_dispatch);
         pass.dispatch_workgroups(1, 1, 1);
+        pass.set_pipeline(&self.pressure_cg_warmstart);
+        pass.dispatch_workgroups(ctx.cell_wg, 1, 1);
 
         for _ in 0..ctx.cg_iterations {
             pass.set_pipeline(&self.pressure_cg_sparse_matvec);
@@ -242,6 +247,11 @@ impl JacobiCgPressureSolver {
             label: MpmPassLabel::PressureSolve,
             pipeline: &self.pressure_active_finalize_dispatch,
             dispatch: MpmDispatch::Direct(1),
+        });
+        run_op(MpmScheduleOp::Pipeline {
+            label: MpmPassLabel::PressureSolve,
+            pipeline: &self.pressure_cg_warmstart,
+            dispatch: MpmDispatch::Direct(ctx.cell_wg),
         });
         run_op(MpmScheduleOp::CopyBufferToBuffer {
             src: &buffers.metrics,

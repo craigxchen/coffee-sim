@@ -208,6 +208,20 @@ fn pressure_cg_active_cell_store(cell: u32, is_active: bool) {
 fn pressure_cg_is_active(cell: u32) -> bool {
     return cg[2u * total_cells() + cell].x > 0.5;
 }
+fn pressure_cg_fill_idx(cell: u32) -> u32 { return 3u * total_cells() + cell; }
+fn pressure_cg_fill_store(cell: u32, value: f32) {
+    cg[pressure_cg_fill_idx(cell)] = vec4<f32>(value, 0.0, 0.0, 0.0);
+}
+fn pressure_cg_fill_load(cell: u32) -> f32 {
+    return cg[pressure_cg_fill_idx(cell)].x;
+}
+fn pressure_cg_persistent_pressure_idx(cell: u32) -> u32 { return 4u * total_cells() + cell; }
+fn pressure_cg_persistent_pressure_store(cell: u32, value: f32) {
+    cg[pressure_cg_persistent_pressure_idx(cell)] = vec4<f32>(value, 0.0, 0.0, 0.0);
+}
+fn pressure_cg_persistent_pressure_load(cell: u32) -> f32 {
+    return cg[pressure_cg_persistent_pressure_idx(cell)].x;
+}
 fn pressure_cg_dot_add(metric_idx: u32, value: f32) {
     let fixed = u32(clamp(max(value, 0.0) * cg_dot_fp_scale(), 0.0, f32(0xffffffffu)));
     atomicAdd(&metrics[metric_idx], fixed);
@@ -412,6 +426,25 @@ fn pressure_face_weight(
     }
 
     return min(self_fill, liquid_fill_fraction(neighbor_cell, neighbor_kind));
+}
+
+fn pressure_face_weight_fillcached(
+    self_kind: i32,
+    self_fill: f32,
+    neighbor_cell: u32,
+    neighbor_kind: i32,
+) -> f32 {
+    if is_solid_kind(neighbor_kind) {
+        return 0.0;
+    }
+    if self_kind == CELL_BED_COUPLED || neighbor_kind == CELL_BED_COUPLED {
+        return 1.0;
+    }
+    if !pressure_cg_is_active(neighbor_cell) {
+        return self_fill;
+    }
+
+    return min(self_fill, pressure_cg_fill_load(neighbor_cell));
 }
 
 fn pressure_weighted_or_mirror(
@@ -1845,6 +1878,50 @@ fn pressure_rbgs_black(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 // ── pressure_cg ──
 
+fn pressure_cg_uncached_diag(idx: u32, self_fill: f32) -> f32 {
+    let kind = cell_kind_load(idx);
+    if !is_fluid_kind(kind) {
+        return 0.0;
+    }
+
+    let iz_val = idx / (gx() * gy());
+    let rem = idx % (gx() * gy());
+    let iy_val = rem / gx();
+    let ix_val = rem % gx();
+    let offsets = array<vec3<i32>, 6>(
+        vec3<i32>(-1, 0, 0),
+        vec3<i32>(1, 0, 0),
+        vec3<i32>(0, -1, 0),
+        vec3<i32>(0, 1, 0),
+        vec3<i32>(0, 0, -1),
+        vec3<i32>(0, 0, 1),
+    );
+
+    var diag = 0.0;
+    for (var n = 0u; n < 6u; n++) {
+        let neighbor = vec3<i32>(i32(ix_val), i32(iy_val), i32(iz_val)) + offsets[n];
+        if neighbor.x < 0 || neighbor.y < 0 || neighbor.z < 0
+            || u32(neighbor.x) >= gx() || u32(neighbor.y) >= gy() || u32(neighbor.z) >= gz() {
+            continue;
+        }
+
+        let neighbor_idx = cell_index(u32(neighbor.x), u32(neighbor.y), u32(neighbor.z));
+        let neighbor_kind = cell_kind_load(neighbor_idx);
+        if is_solid_kind(neighbor_kind) {
+            continue;
+        }
+
+        let face_weight = pressure_face_weight(kind, self_fill, neighbor_idx, neighbor_kind);
+        if face_weight <= 0.0 {
+            continue;
+        }
+
+        diag += face_weight;
+    }
+
+    return diag;
+}
+
 fn pressure_cg_diag_and_lhs(idx: u32, candidate: f32) -> vec2<f32> {
     let kind = cell_kind_load(idx);
     if !is_fluid_kind(kind) {
@@ -1855,7 +1932,7 @@ fn pressure_cg_diag_and_lhs(idx: u32, candidate: f32) -> vec2<f32> {
     let rem = idx % (gx() * gy());
     let iy_val = rem / gx();
     let ix_val = rem % gx();
-    let self_fill = liquid_fill_fraction(idx, kind);
+    let self_fill = pressure_cg_fill_load(idx);
     let offsets = array<vec3<i32>, 6>(
         vec3<i32>(-1, 0, 0),
         vec3<i32>(1, 0, 0),
@@ -1876,11 +1953,7 @@ fn pressure_cg_diag_and_lhs(idx: u32, candidate: f32) -> vec2<f32> {
 
         let neighbor_idx = cell_index(u32(neighbor.x), u32(neighbor.y), u32(neighbor.z));
         let neighbor_kind = cell_kind_load(neighbor_idx);
-        if is_solid_kind(neighbor_kind) {
-            continue;
-        }
-
-        let face_weight = pressure_face_weight(kind, self_fill, neighbor_idx, neighbor_kind);
+        let face_weight = pressure_face_weight_fillcached(kind, self_fill, neighbor_idx, neighbor_kind);
         if face_weight <= 0.0 {
             continue;
         }
@@ -1894,6 +1967,51 @@ fn pressure_cg_diag_and_lhs(idx: u32, candidate: f32) -> vec2<f32> {
     return vec2<f32>(diag, diag * candidate - weighted_neighbor_sum);
 }
 
+fn pressure_cg_warmstart_lhs(idx: u32, p_here: f32) -> f32 {
+    let kind = cell_kind_load(idx);
+    if !is_fluid_kind(kind) {
+        return 0.0;
+    }
+
+    let iz_val = idx / (gx() * gy());
+    let rem = idx % (gx() * gy());
+    let iy_val = rem / gx();
+    let ix_val = rem % gx();
+    let self_fill = pressure_cg_fill_load(idx);
+    let offsets = array<vec3<i32>, 6>(
+        vec3<i32>(-1, 0, 0),
+        vec3<i32>(1, 0, 0),
+        vec3<i32>(0, -1, 0),
+        vec3<i32>(0, 1, 0),
+        vec3<i32>(0, 0, -1),
+        vec3<i32>(0, 0, 1),
+    );
+
+    var ap = 0.0;
+    for (var n = 0u; n < 6u; n++) {
+        let neighbor = vec3<i32>(i32(ix_val), i32(iy_val), i32(iz_val)) + offsets[n];
+        if neighbor.x < 0 || neighbor.y < 0 || neighbor.z < 0
+            || u32(neighbor.x) >= gx() || u32(neighbor.y) >= gy() || u32(neighbor.z) >= gz() {
+            continue;
+        }
+
+        let neighbor_idx = cell_index(u32(neighbor.x), u32(neighbor.y), u32(neighbor.z));
+        let neighbor_kind = cell_kind_load(neighbor_idx);
+        let face_weight = pressure_face_weight_fillcached(kind, self_fill, neighbor_idx, neighbor_kind);
+        if face_weight <= 0.0 {
+            continue;
+        }
+
+        if pressure_cg_is_active(neighbor_idx) {
+            ap += face_weight * (p_here - pressure_cg_persistent_pressure_load(neighbor_idx));
+        } else {
+            ap += face_weight * p_here;
+        }
+    }
+
+    return ap;
+}
+
 @compute @workgroup_size(64)
 fn pressure_cg_init(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
@@ -1902,25 +2020,48 @@ fn pressure_cg_init(@builtin(global_invocation_id) gid: vec3<u32>) {
     if !pressure_cg_is_active(idx) {
         pressure_store(idx, 0.0);
         pressure_cg_state_store(idx, vec4<f32>(0.0));
+        pressure_cg_fill_store(idx, 0.0);
+        pressure_cg_persistent_pressure_store(idx, 0.0);
         return;
     }
 
     let kind = cell_kind_load(idx);
     let self_fill = liquid_fill_fraction(idx, kind);
+    pressure_cg_fill_store(idx, self_fill);
     let rhs = -dx() * dx() * divergence_load(idx) * self_fill / max(dt(), 1e-6);
-    let diag_lhs = pressure_cg_diag_and_lhs(idx, 0.0);
-    if diag_lhs.x <= 0.0 {
+    let diag = pressure_cg_uncached_diag(idx, self_fill);
+    if diag <= 0.0 {
         pressure_store(idx, 0.0);
         pressure_cg_state_store(idx, vec4<f32>(0.0));
+        pressure_cg_fill_store(idx, 0.0);
+        pressure_cg_persistent_pressure_store(idx, 0.0);
         pressure_cg_active_cell_store(idx, false);
         return;
     }
 
-    let r = rhs - diag_lhs.y;
-    let z = r / diag_lhs.x;
-    pressure_cg_state_store(idx, vec4<f32>(r, z, z, 0.0));
+    let p0 = clamp(
+        pressure_cg_persistent_pressure_load(idx),
+        -pressure_clamp_limit(),
+        pressure_clamp_limit(),
+    );
+    pressure_store(idx, p0);
+    pressure_cg_state_store(idx, vec4<f32>(rhs, 0.0, 0.0, 0.0));
     let active_slot = atomicAdd(&metrics[METRIC_PRESSURE_ACTIVE_COUNT_IDX], 1u);
     pressure_cg_active_cell_list_store(active_slot, idx);
+}
+
+@compute @workgroup_size(64)
+fn pressure_cg_warmstart(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if idx >= total_cells() || !pressure_cg_is_active(idx) { return; }
+
+    let b = pressure_cg_state_load(idx).x;
+    let p0 = pressure_load(idx);
+    let ap0 = pressure_cg_warmstart_lhs(idx, p0);
+    let r = b - ap0;
+    let diag = max(pressure_cg_diag_and_lhs(idx, 0.0).x, 1e-6);
+    let z = r / diag;
+    pressure_cg_state_store(idx, vec4<f32>(r, z, z, 0.0));
     pressure_cg_dot_add(METRIC_CG_RZ_IDX, r * z);
     pressure_cg_dot_add(METRIC_PRESSURE_INITIAL_RZ_IDX, r * z);
 }
@@ -2162,6 +2303,7 @@ fn pressure_residual(@builtin(global_invocation_id) gid: vec3<u32>) {
     atomicMax(&metrics[METRIC_PROJECTION_RESIDUAL_MAX_IDX], fp_max);
     atomicAdd(&metrics[METRIC_PROJECTION_RESIDUAL_SUM_IDX], fp_sum);
     atomicAdd(&metrics[METRIC_PROJECTION_RESIDUAL_CELLS_IDX], 1u);
+    pressure_cg_persistent_pressure_store(idx, pressure_load(idx));
 }
 
 // ── packing pressure ──
