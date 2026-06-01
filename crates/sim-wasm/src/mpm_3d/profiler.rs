@@ -44,12 +44,12 @@ use bytemuck::cast_slice;
 use serde::Serialize;
 
 use super::inflow::{EmissionResult, MASS_UNITS_PER_ML, PARTICLES_PER_ML};
+use super::pressure::PressureContext;
 use super::state::{METRICS_SLOT_COUNT, NUM_THREADS};
-use super::{dispatch_size, required_limits, MpmSettings, MpmSim3D};
-
-/// Query-set slots to allocate per substep. One substep records ~23 passes ×
-/// 2 timestamps; 64 leaves comfortable headroom.
-const QUERY_CAPACITY: u32 = 64;
+use super::{
+    dispatch_size, encode_mpm_substep_schedule, required_limits, MpmDispatchSizes, MpmPassLabel,
+    MpmScheduleOp, MpmSettings, MpmSim3D,
+};
 
 const DEFAULT_WARMUP_FRAMES: u32 = 60;
 const DEFAULT_MEASURED_FRAMES: u32 = 120;
@@ -73,16 +73,17 @@ struct GpuTimer {
     resolve_buf: wgpu::Buffer,
     read_buf: wgpu::Buffer,
     period_ns: f32,
+    capacity: u32,
 }
 
 impl GpuTimer {
-    fn new(device: &wgpu::Device, period_ns: f32) -> Self {
+    fn new(device: &wgpu::Device, period_ns: f32, capacity: u32) -> Self {
         let query_set = device.create_query_set(&wgpu::QuerySetDescriptor {
             label: Some("mpm profiler timestamps"),
             ty: wgpu::QueryType::Timestamp,
-            count: QUERY_CAPACITY,
+            count: capacity,
         });
-        let bytes = (QUERY_CAPACITY as u64) * 8;
+        let bytes = (capacity as u64) * 8;
         let resolve_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("mpm profiler resolve"),
             size: bytes,
@@ -100,6 +101,7 @@ impl GpuTimer {
             resolve_buf,
             read_buf,
             period_ns,
+            capacity,
         }
     }
 
@@ -129,21 +131,24 @@ impl GpuTimer {
 /// Records pass labels and the query-set slot indices used within one substep.
 struct FrameRecorder<'a> {
     qs: Option<&'a wgpu::QuerySet>,
+    capacity: u32,
     next: u32,
-    scopes: Vec<(&'static str, u32, u32)>,
+    scopes: Vec<(MpmPassLabel, u32, u32)>,
 }
 
 impl<'a> FrameRecorder<'a> {
-    fn new(qs: Option<&'a wgpu::QuerySet>) -> Self {
+    fn new(timer: Option<&'a GpuTimer>) -> Self {
+        let capacity = timer.map_or(0, |t| t.capacity);
         Self {
-            qs,
+            qs: timer.map(|t| &t.query_set),
+            capacity,
             next: 0,
-            scopes: Vec::with_capacity(QUERY_CAPACITY as usize / 2),
+            scopes: Vec::with_capacity(capacity as usize / 2),
         }
     }
 
     /// Reserve a begin/end timestamp pair for a compute pass labeled `label`.
-    fn writes(&mut self, label: &'static str) -> Option<wgpu::ComputePassTimestampWrites<'a>> {
+    fn writes(&mut self, label: MpmPassLabel) -> Option<wgpu::ComputePassTimestampWrites<'a>> {
         let qs = self.qs?;
         let (begin, end) = self.reserve(label);
         Some(wgpu::ComputePassTimestampWrites {
@@ -153,7 +158,7 @@ impl<'a> FrameRecorder<'a> {
         })
     }
 
-    fn reserve(&mut self, label: &'static str) -> (u32, u32) {
+    fn reserve(&mut self, label: MpmPassLabel) -> (u32, u32) {
         let begin = self.next;
         let end = self.next + 1;
         self.next += 2;
@@ -161,9 +166,9 @@ impl<'a> FrameRecorder<'a> {
         // overrunning the query set would otherwise surface as an opaque wgpu
         // validation panic instead of this actionable message.
         assert!(
-            self.next <= QUERY_CAPACITY,
-            "query set capacity {} exceeded ({} slots needed); raise QUERY_CAPACITY",
-            QUERY_CAPACITY,
+            self.next <= self.capacity,
+            "query set capacity {} exceeded ({} slots needed); increase the profiler timestamp capacity estimate",
+            self.capacity,
             self.next
         );
         self.scopes.push((label, begin, end));
@@ -176,13 +181,13 @@ fn timed_pass(
     encoder: &mut wgpu::CommandEncoder,
     rec: &mut FrameRecorder<'_>,
     bind_group: &wgpu::BindGroup,
-    label: &'static str,
+    label: MpmPassLabel,
     pipeline: &wgpu::ComputePipeline,
     workgroups: u32,
 ) {
     let timestamp_writes = rec.writes(label);
     let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-        label: Some(label),
+        label: Some(label.display()),
         timestamp_writes,
     });
     pass.set_bind_group(0, bind_group, &[]);
@@ -200,10 +205,10 @@ struct FrameSums {
     cpu_submit_ms: f64,
     gpu_wait_ms: f64,
     gpu_passes_ms: f64,
-    per_label_ms: BTreeMap<&'static str, f64>,
+    per_label_ms: BTreeMap<MpmPassLabel, f64>,
     /// How many timed compute passes of each label ran this frame (e.g.
     /// `boundary_project` runs once per occurrence × substeps).
-    per_label_count: BTreeMap<&'static str, u32>,
+    per_label_count: BTreeMap<MpmPassLabel, u32>,
 }
 
 /// Run one instrumented frame, advancing `sim` and folding per-pass GPU times
@@ -252,14 +257,20 @@ fn step_frame_instrumented(
         let total_cells =
             sim.settings.grid_dims[0] * sim.settings.grid_dims[1] * sim.settings.grid_dims[2];
         let num_particles = sim.num_water + sim.num_bed;
-        let cell_wg = dispatch_size(total_cells, NUM_THREADS);
-        let particle_wg = dispatch_size(num_particles, NUM_THREADS);
-        let bed_wg = dispatch_size(sim.num_bed, NUM_THREADS);
-        let metrics_wg = dispatch_size(METRICS_SLOT_COUNT as u32, 8);
+        let dispatch = MpmDispatchSizes {
+            cell_wg: dispatch_size(total_cells, NUM_THREADS),
+            particle_wg: dispatch_size(num_particles, NUM_THREADS),
+            bed_wg: dispatch_size(sim.num_bed, NUM_THREADS),
+            metrics_wg: dispatch_size(METRICS_SLOT_COUNT as u32, 8),
+        };
+        let pressure_ctx = PressureContext {
+            cell_wg: dispatch.cell_wg,
+            rbgs_pairs: pressure_pairs,
+        };
 
         // 3. Encode all passes, each in its own timestamped compute pass.
         let t_encode = Instant::now();
-        let mut rec = FrameRecorder::new(timer.map(|t| &t.query_set));
+        let mut rec = FrameRecorder::new(timer);
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("mpm profiled step"),
         });
@@ -272,191 +283,28 @@ fn step_frame_instrumented(
         encoder.clear_buffer(&sim.buffers.grid_vel, 0, None);
 
         let bg = &sim.pipelines.bind_group;
-        let p = &sim.pipelines;
-
-        if metrics_wg > 0 {
-            timed_pass(
-                &mut encoder,
-                &mut rec,
-                bg,
-                "metrics_clear",
-                &p.metrics_clear,
-                metrics_wg,
-            );
-        }
-        timed_pass(
-            &mut encoder,
-            &mut rec,
-            bg,
-            "bed_lookup_clear",
-            &p.bed_lookup_clear,
-            cell_wg,
-        );
-        if bed_wg > 0 {
-            timed_pass(
-                &mut encoder,
-                &mut rec,
-                bg,
-                "bed_lookup_scatter",
-                &p.bed_lookup_scatter,
-                bed_wg,
-            );
-        }
-        if particle_wg > 0 {
-            timed_pass(&mut encoder, &mut rec, bg, "p2g", &p.p2g, particle_wg);
-        }
-        timed_pass(
-            &mut encoder,
-            &mut rec,
-            bg,
-            "grid_update",
-            &p.grid_update,
-            cell_wg,
-        );
-        timed_pass(
-            &mut encoder,
-            &mut rec,
-            bg,
-            "boundary_project",
-            &p.boundary_project,
-            cell_wg,
-        );
-        timed_pass(
-            &mut encoder,
-            &mut rec,
-            bg,
-            "classify_cells",
-            &p.classify_cells,
-            cell_wg,
-        );
-
-        // Pressure: interleaved red/black GS in a single pass (matches production).
-        {
-            let timestamp_writes = rec.writes("pressure_solve");
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("pressure_solve"),
-                timestamp_writes,
-            });
-            pass.set_bind_group(0, bg, &[]);
-            for _ in 0..pressure_pairs {
-                pass.set_pipeline(&p.pressure_rbgs_red);
-                pass.dispatch_workgroups(cell_wg, 1, 1);
-                pass.set_pipeline(&p.pressure_rbgs_black);
-                pass.dispatch_workgroups(cell_wg, 1, 1);
+        encode_mpm_substep_schedule(&sim.pipelines, dispatch, pressure_ctx, |op| match op {
+            MpmScheduleOp::Pipeline {
+                label,
+                pipeline,
+                workgroups,
+            } => {
+                timed_pass(&mut encoder, &mut rec, bg, label, pipeline, workgroups);
             }
-        }
-
-        timed_pass(
-            &mut encoder,
-            &mut rec,
-            bg,
-            "project_pressure",
-            &p.project_pressure,
-            cell_wg,
-        );
-        timed_pass(
-            &mut encoder,
-            &mut rec,
-            bg,
-            "boundary_project",
-            &p.boundary_project,
-            cell_wg,
-        );
-        timed_pass(
-            &mut encoder,
-            &mut rec,
-            bg,
-            "pressure_residual",
-            &p.pressure_residual,
-            cell_wg,
-        );
-        timed_pass(
-            &mut encoder,
-            &mut rec,
-            bg,
-            "packing_prepare",
-            &p.packing_prepare,
-            cell_wg,
-        );
-        timed_pass(
-            &mut encoder,
-            &mut rec,
-            bg,
-            "packing_apply",
-            &p.packing_apply,
-            cell_wg,
-        );
-        timed_pass(
-            &mut encoder,
-            &mut rec,
-            bg,
-            "boundary_project",
-            &p.boundary_project,
-            cell_wg,
-        );
-        timed_pass(
-            &mut encoder,
-            &mut rec,
-            bg,
-            "viscosity_prepare",
-            &p.viscosity_prepare,
-            cell_wg,
-        );
-        timed_pass(
-            &mut encoder,
-            &mut rec,
-            bg,
-            "viscosity_apply",
-            &p.viscosity_apply,
-            cell_wg,
-        );
-        timed_pass(
-            &mut encoder,
-            &mut rec,
-            bg,
-            "boundary_project",
-            &p.boundary_project,
-            cell_wg,
-        );
-        if particle_wg > 0 {
-            timed_pass(&mut encoder, &mut rec, bg, "g2p", &p.g2p, particle_wg);
-            timed_pass(
-                &mut encoder,
-                &mut rec,
-                bg,
-                "bed_coupling",
-                &p.bed_coupling,
-                particle_wg,
-            );
-        }
-        if bed_wg > 0 {
-            timed_pass(
-                &mut encoder,
-                &mut rec,
-                bg,
-                "extraction_advect",
-                &p.extraction_advect,
-                bed_wg,
-            );
-            timed_pass(
-                &mut encoder,
-                &mut rec,
-                bg,
-                "bed_dynamics",
-                &p.bed_dynamics,
-                bed_wg,
-            );
-        }
-        if particle_wg > 0 {
-            timed_pass(
-                &mut encoder,
-                &mut rec,
-                bg,
-                "prepare_render",
-                &p.prepare_render,
-                particle_wg,
-            );
-        }
+            MpmScheduleOp::PressureSolve {
+                label,
+                pressure,
+                ctx,
+            } => {
+                let timestamp_writes = rec.writes(label);
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some(label.display()),
+                    timestamp_writes,
+                });
+                pass.set_bind_group(0, bg, &[]);
+                pressure.encode_solve(&mut pass, ctx);
+            }
+        });
 
         let used = rec.next;
         if let Some(t) = timer {
@@ -541,6 +389,8 @@ impl Stat {
 #[derive(Serialize)]
 struct PassStat {
     label: String,
+    display_label: String,
+    category: String,
     passes_per_frame: f64,
     share_of_gpu_pct: f64,
     mean_ms: f64,
@@ -549,6 +399,17 @@ struct PassStat {
     p50_ms: f64,
     p95_ms: f64,
     total_ms: f64,
+}
+
+#[derive(Serialize)]
+struct SolverMetadata {
+    pressure: PressureSolverMetadata,
+}
+
+#[derive(Serialize)]
+struct PressureSolverMetadata {
+    kind: String,
+    iterations_per_substep: u32,
 }
 
 #[derive(Serialize)]
@@ -567,6 +428,7 @@ struct Metadata {
     grid_dims: [u32; 3],
     total_cells: u32,
     max_particles: u32,
+    solver: SolverMetadata,
     pressure_rbgs_pairs: u32,
     water_particles_start: u32,
     water_particles_end: u32,
@@ -596,6 +458,7 @@ struct FrameTimings {
 
 #[derive(Serialize)]
 struct ProfileReport {
+    schema_version: u32,
     metadata: Metadata,
     frame_timings: FrameTimings,
     gpu_passes: Vec<PassStat>,
@@ -705,7 +568,8 @@ fn profile_mpm_pipeline() {
     }
 
     // Instrumented measurement.
-    let timer = timestamps_supported.then(|| GpuTimer::new(&device, period_ns));
+    let query_capacity = sim.profiler_timestamp_query_capacity();
+    let timer = timestamps_supported.then(|| GpuTimer::new(&device, period_ns, query_capacity));
     let mut wall_ms = Vec::with_capacity(measured as usize);
     let mut gpu_passes_sum = Vec::with_capacity(measured as usize);
     let mut gpu_wait = Vec::with_capacity(measured as usize);
@@ -714,8 +578,8 @@ fn profile_mpm_pipeline() {
     let mut cpu_uniforms = Vec::with_capacity(measured as usize);
     let mut cpu_encode = Vec::with_capacity(measured as usize);
     let mut cpu_submit = Vec::with_capacity(measured as usize);
-    let mut per_label: BTreeMap<&'static str, Vec<f64>> = BTreeMap::new();
-    let mut label_dispatch_count: BTreeMap<&'static str, u64> = BTreeMap::new();
+    let mut per_label: BTreeMap<MpmPassLabel, Vec<f64>> = BTreeMap::new();
+    let mut label_dispatch_count: BTreeMap<MpmPassLabel, u64> = BTreeMap::new();
 
     // Capture the particle count at the true start of the measured window —
     // after warmup AND calibration, both of which keep emitting inflow.
@@ -750,9 +614,11 @@ fn profile_mpm_pipeline() {
         .map(|(label, samples)| {
             let stat = Stat::from_samples(samples);
             let passes =
-                *label_dispatch_count.get(label).unwrap_or(&0) as f64 / measured.max(1) as f64;
+                *label_dispatch_count.get(&label).unwrap_or(&0) as f64 / measured.max(1) as f64;
             PassStat {
-                label: label.to_string(),
+                label: label.id().to_string(),
+                display_label: label.display().to_string(),
+                category: label.category().to_string(),
                 passes_per_frame: passes,
                 share_of_gpu_pct: if total_pass_mean > 0.0 {
                     stat.mean_ms / total_pass_mean * 100.0
@@ -806,6 +672,7 @@ fn profile_mpm_pipeline() {
     ));
 
     let report = ProfileReport {
+        schema_version: 2,
         metadata: Metadata {
             scene: scene.clone(),
             adapter: info.name.clone(),
@@ -821,6 +688,12 @@ fn profile_mpm_pipeline() {
             grid_dims,
             total_cells,
             max_particles,
+            solver: SolverMetadata {
+                pressure: PressureSolverMetadata {
+                    kind: sim.pressure_solver_kind().to_string(),
+                    iterations_per_substep: sim.pressure_solver_iterations_per_substep(),
+                },
+            },
             pressure_rbgs_pairs,
             water_particles_start,
             water_particles_end,
