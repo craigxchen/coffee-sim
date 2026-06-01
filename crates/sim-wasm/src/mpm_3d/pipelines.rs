@@ -1,7 +1,9 @@
 use std::borrow::Cow;
 
 use super::dfsph::DfsphPipelines;
-use super::pressure::{JacobiCgPressureSolver, PressurePipelines, RbgsPressureSolver};
+use super::pressure::{
+    JacobiCgPressureSolver, PressurePipelines, RbgsPressureSolver, StagedStaggeredPressurePipelines,
+};
 use super::shader::MPM_COMPUTE_SHADER;
 use super::state::MpmBuffers;
 
@@ -214,6 +216,11 @@ impl MpmPipelines {
                     pressure_cg_sparse_update_dir: make("pressure_cg_sparse_update_dir"),
                     project_pressure: make("project_pressure"),
                     pressure_residual: make("pressure_residual"),
+                },
+                staged_staggered: StagedStaggeredPressurePipelines {
+                    classify_cells: make("classify_cells_staggered"),
+                    project_pressure: make("project_pressure_staggered"),
+                    pressure_residual: make("pressure_residual_staggered"),
                 },
             },
             dfsph: DfsphPipelines::new(device, buffers),
