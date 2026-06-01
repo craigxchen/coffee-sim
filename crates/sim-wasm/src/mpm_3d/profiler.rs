@@ -15,7 +15,7 @@
 //!
 //! Tunable via environment variables:
 //! - `COFFEE_SIM_PROFILE_SCENE`   scene preset: `center_pour` (default) | `free_stream` | `water_block`
-//! - `COFFEE_SIM_PROFILE_SOLVER`  pressure solver: `rbgs` (default) | `jacobi-cg`
+//! - `COFFEE_SIM_PROFILE_SOLVER`  pressure solver: `rbgs` (default) | `jacobi-cg` | `sparse-cg`
 //! - `COFFEE_SIM_PROFILE_SOLVERS` comma-separated pressure solvers, or `all`
 //! - `COFFEE_SIM_PROFILE_CG_ITERATIONS` CG iterations per substep (defaults to scene RBGS pairs)
 //! - `COFFEE_SIM_PROFILE_WARMUP`  frames to run before measuring (default 60)
@@ -293,35 +293,37 @@ fn step_frame_instrumented(
         encoder.clear_buffer(&sim.buffers.grid_vel, 0, None);
 
         let bg = &sim.pipelines.bind_group;
-        encode_mpm_substep_schedule(&sim.pipelines, dispatch, pressure_ctx, |op| match op {
-            MpmScheduleOp::Pipeline {
-                label,
-                pipeline,
-                dispatch,
-            } => {
-                timed_pass(&mut encoder, &mut rec, bg, label, pipeline, dispatch);
-            }
-            MpmScheduleOp::PressureSolve {
-                label,
-                pressure,
-                ctx,
-            } => {
-                let timestamp_writes = rec.writes(label);
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some(label.display()),
-                    timestamp_writes,
-                });
-                pass.set_bind_group(0, bg, &[]);
-                pressure.encode_solve(&mut pass, ctx);
-            }
-            MpmScheduleOp::CopyBufferToBuffer {
-                src,
-                src_offset,
-                dst,
-                dst_offset,
-                size,
-            } => {
-                encoder.copy_buffer_to_buffer(src, src_offset, dst, dst_offset, size);
+        encode_mpm_substep_schedule(&sim.pipelines, &sim.buffers, dispatch, pressure_ctx, |op| {
+            match op {
+                MpmScheduleOp::Pipeline {
+                    label,
+                    pipeline,
+                    dispatch,
+                } => {
+                    timed_pass(&mut encoder, &mut rec, bg, label, pipeline, dispatch);
+                }
+                MpmScheduleOp::PressureSolve {
+                    label,
+                    pressure,
+                    ctx,
+                } => {
+                    let timestamp_writes = rec.writes(label);
+                    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some(label.display()),
+                        timestamp_writes,
+                    });
+                    pass.set_bind_group(0, bg, &[]);
+                    pressure.encode_solve(&mut pass, ctx);
+                }
+                MpmScheduleOp::CopyBufferToBuffer {
+                    src,
+                    src_offset,
+                    dst,
+                    dst_offset,
+                    size,
+                } => {
+                    encoder.copy_buffer_to_buffer(src, src_offset, dst, dst_offset, size);
+                }
             }
         });
 
