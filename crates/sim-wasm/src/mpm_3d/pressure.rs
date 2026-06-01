@@ -49,6 +49,50 @@ impl FromStr for PressureSolverKind {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PressureOperatorKind {
+    Collocated,
+}
+
+impl PressureOperatorKind {
+    pub(crate) const ALL: &'static [Self] = &[Self::Collocated];
+
+    pub(crate) fn id(self) -> &'static str {
+        match self {
+            Self::Collocated => "collocated",
+        }
+    }
+}
+
+impl fmt::Display for PressureOperatorKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.id())
+    }
+}
+
+impl FromStr for PressureOperatorKind {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "" | "collocated" | "cell-centered" | "cell_centered" => Ok(Self::Collocated),
+            "staggered" => Err(
+                "pressure operator 'staggered' is known from codex/perf-60hz-tier1 \
+                 but is not ported to the modular pressure boundary yet"
+                    .to_string(),
+            ),
+            other => Err(format!(
+                "unknown pressure operator '{other}'; available operators: {}",
+                Self::ALL
+                    .iter()
+                    .map(|kind| kind.id())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct PressureContext {
     pub kind: PressureSolverKind,
@@ -292,7 +336,7 @@ impl JacobiCgPressureSolver {
 
 #[cfg(test)]
 mod tests {
-    use super::PressureSolverKind;
+    use super::{PressureOperatorKind, PressureSolverKind};
 
     #[test]
     fn pressure_solver_kind_parses_registered_solvers() {
@@ -308,5 +352,22 @@ mod tests {
                 PressureSolverKind::SparseCg
             ]
         );
+    }
+
+    #[test]
+    fn pressure_operator_kind_parses_current_operator_and_rejects_unported_staggered() {
+        assert_eq!("collocated".parse(), Ok(PressureOperatorKind::Collocated));
+        assert_eq!(
+            "cell-centered".parse(),
+            Ok(PressureOperatorKind::Collocated)
+        );
+        assert_eq!(
+            PressureOperatorKind::ALL,
+            &[PressureOperatorKind::Collocated]
+        );
+        let err = "staggered"
+            .parse::<PressureOperatorKind>()
+            .expect_err("staggered operator is intentionally not runnable yet");
+        assert!(err.contains("not ported"));
     }
 }

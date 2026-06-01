@@ -32,7 +32,7 @@ use brew_config::{kozeny_carman_permeability_m2, DEFAULT_BREW};
 use filter_mesh::FilterMesh;
 use inflow::{EmissionResult, InflowState, SpoutSettings, MASS_UNITS_PER_ML};
 use pipelines::MpmPipelines;
-use pressure::{PressureContext, PressureSolverKind};
+use pressure::{PressureContext, PressureOperatorKind, PressureSolverKind};
 use state::{
     MpmBuffers, MpmUniforms, FP_SCALE, FP_VALUE_LIMIT, MAX_VELOCITY, METRICS_DIV_FP_SCALE,
     METRICS_SLOT_COUNT, NUM_THREADS, SDF_RES,
@@ -453,6 +453,7 @@ pub(crate) struct MpmSettings {
     pub viscosity: f32,
     pub render_radius: f32,
     pub pressure_solver: PressureSolverKind,
+    pub pressure_operator: PressureOperatorKind,
     pub pressure_rbgs_pairs: u32,
     pub pressure_cg_iterations: u32,
     /// Optional residual target for browser-driven adaptive pressure solves.
@@ -489,6 +490,7 @@ impl MpmSettings {
             viscosity: DEFAULT_BREW.water_viscosity,
             render_radius: dx * 0.7,
             pressure_solver: PressureSolverKind::Rbgs,
+            pressure_operator: PressureOperatorKind::Collocated,
             pressure_rbgs_pairs: 40,
             pressure_cg_iterations: 40,
             pressure_residual_target: 0.0,
@@ -2127,6 +2129,11 @@ impl MpmSim3D {
     #[cfg(test)]
     pub(crate) fn pressure_solver_kind(&self) -> PressureSolverKind {
         self.settings.pressure_solver
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pressure_operator_kind(&self) -> PressureOperatorKind {
+        self.settings.pressure_operator
     }
 
     #[cfg(test)]
