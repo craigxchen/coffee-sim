@@ -2171,6 +2171,93 @@ fn classify_cells(@builtin(global_invocation_id) gid: vec3<u32>) {
     atomicAdd(&metrics[METRIC_FLUID_CELLS_IDX], 1u);
 }
 
+@compute @workgroup_size(64)
+fn classify_cells_staggered(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if idx >= total_cells() { return; }
+
+    let mass = grid_vel[idx].w;
+    pressure_store(idx, 0.0);
+    pressure_cg_state_store(idx, vec4<f32>(0.0));
+    pressure_cg_active_cell_store(idx, false);
+
+    let iz_val = idx / (gx() * gy());
+    let rem = idx % (gx() * gy());
+    let iy_val = rem / gx();
+    let ix_val = rem % gx();
+    let cell = vec3<i32>(i32(ix_val), i32(iy_val), i32(iz_val));
+    let cell_center = cell_center_from_cell(cell);
+    let self_is_solid = select(
+        sample_sdf(cell_center) < 0.0,
+        sdf_class_is_solid(cell),
+        use_sdf_cache(),
+    );
+    if self_is_solid {
+        atomicStore(&grid[scratch_kind_idx(idx)], CELL_SOLID);
+        divergence_store(idx, 0.0);
+        return;
+    }
+
+    if mass <= occupancy_mass_threshold() {
+        atomicStore(&grid[scratch_kind_idx(idx)], CELL_AIR);
+        divergence_store(idx, 0.0);
+        return;
+    }
+
+    let bed_idx_here = bed_lookup_load(idx);
+    if bed_idx_here >= 0 {
+        atomicStore(&grid[scratch_kind_idx(idx)], CELL_BED_COUPLED);
+    } else {
+        let offsets = array<vec3<i32>, 6>(
+            vec3<i32>(-1, 0, 0),
+            vec3<i32>(1, 0, 0),
+            vec3<i32>(0, -1, 0),
+            vec3<i32>(0, 1, 0),
+            vec3<i32>(0, 0, -1),
+            vec3<i32>(0, 0, 1),
+        );
+
+        var has_air_neighbor = false;
+        for (var n = 0u; n < 6u; n++) {
+            let neighbor = cell + offsets[n];
+            if neighbor.x < 0 || neighbor.y < 0 || neighbor.z < 0
+                || u32(neighbor.x) >= gx()
+                || u32(neighbor.y) >= gy()
+                || u32(neighbor.z) >= gz() {
+                has_air_neighbor = true;
+                break;
+            }
+
+            let neighbor_idx = cell_index(u32(neighbor.x), u32(neighbor.y), u32(neighbor.z));
+            if grid_vel[neighbor_idx].w <= occupancy_mass_threshold() {
+                has_air_neighbor = true;
+                break;
+            }
+        }
+
+        atomicStore(
+            &grid[scratch_kind_idx(idx)],
+            select(CELL_INTERIOR_FLUID, CELL_SURFACE_FLUID, has_air_neighbor),
+        );
+    }
+
+    let kind = cell_kind_load(idx);
+    pressure_cg_active_cell_store(idx, pressure_active_cell(idx, kind));
+    if !is_fluid_kind(kind) || !staggered_pressure_cell_in_bounds(cell) {
+        divergence_store(idx, 0.0);
+        return;
+    }
+
+    let div = staggered_pressure_cell_divergence(cell);
+    let target_divergence = staggered_pressure_projection_target_divergence(idx, kind, cell);
+    divergence_store(idx, div - target_divergence);
+
+    let abs_div = abs(div);
+    let fp_div = u32(clamp(abs_div * metrics_div_fp_scale(), 0.0, f32(0x7fffffffu)));
+    atomicMax(&metrics[METRIC_MAX_ABS_DIV_IDX], fp_div);
+    atomicAdd(&metrics[METRIC_FLUID_CELLS_IDX], 1u);
+}
+
 // ── pressure_rbgs ──
 
 fn pressure_update(idx: u32, target_parity: u32) {
@@ -3654,6 +3741,7 @@ mod tests {
 
     #[test]
     fn staged_staggered_pressure_helpers_are_present() {
+        assert!(MPM_COMPUTE_SHADER.contains("fn classify_cells_staggered("));
         assert!(MPM_COMPUTE_SHADER.contains("fn staggered_pressure_cell_divergence("));
         assert!(MPM_COMPUTE_SHADER.contains("fn staggered_pressure_node_gradient("));
         assert!(MPM_COMPUTE_SHADER.contains("fn staggered_pressure_node_fill_weight("));
