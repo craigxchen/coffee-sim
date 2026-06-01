@@ -1545,6 +1545,7 @@ struct DryRunPlan {
 #[derive(Serialize)]
 struct DryRunSolverPlan {
     solver: String,
+    metadata: SolverMetadata,
     output_path: String,
     grid_dims: [u32; 3],
     substeps: u32,
@@ -2209,6 +2210,17 @@ fn profiler_dry_run_json_is_machine_readable_same_scene_plan() {
     assert_eq!(value["solvers"].as_array().expect("solver array").len(), 5);
     assert_eq!(value["solvers"][0]["solver"], "mpm:rbgs");
     assert_eq!(value["solvers"][4]["solver"], "xpbd:gpu");
+    assert_eq!(value["solvers"][0]["metadata"]["backend"], "mpm");
+    assert_eq!(value["solvers"][0]["metadata"]["pressure"]["kind"], "rbgs");
+    assert_eq!(
+        value["solvers"][0]["metadata"]["pressure"]["iterations_per_substep"],
+        40
+    );
+    assert_eq!(value["solvers"][3]["metadata"]["dfsph"]["kind"], "water");
+    assert_eq!(
+        value["solvers"][4]["metadata"]["xpbd"]["constraint_iterations_per_substep"],
+        XPBD_CONSTRAINT_ITERATIONS
+    );
     assert_eq!(
         value["solvers"][0]["grid_dims"],
         serde_json::json!([80, 115, 80])
@@ -2663,6 +2675,7 @@ impl ProfileSelection {
                 let settings = settings_for_solver(solver, &run);
                 DryRunSolverPlan {
                     solver: solver.to_string(),
+                    metadata: dry_run_solver_metadata(solver, &settings),
                     output_path: output_path_for_solver(
                         &self.base_output_path,
                         solver,
@@ -2992,6 +3005,43 @@ fn settings_for_solver_with_base(
         SolverSpec::Xpbd { .. } => {}
     }
     settings
+}
+
+fn dry_run_solver_metadata(solver: SolverSpec, settings: &MpmSettings) -> SolverMetadata {
+    match solver {
+        SolverSpec::Mpm { pressure } => SolverMetadata {
+            backend: solver.backend().to_string(),
+            pressure: Some(PressureSolverMetadata {
+                kind: pressure.to_string(),
+                operator: settings.pressure_operator.to_string(),
+                iterations_per_substep: settings.pressure_cg_iterations,
+            }),
+            dfsph: None,
+            xpbd: None,
+        },
+        SolverSpec::Dfsph => SolverMetadata {
+            backend: solver.backend().to_string(),
+            pressure: None,
+            dfsph: Some(DfsphSolverMetadata {
+                kind: "water".to_string(),
+                divergence_iterations_per_substep: 1,
+                density_iterations_per_substep: 2,
+                grid_pressure_kind: settings.pressure_solver.to_string(),
+                grid_pressure_operator: settings.pressure_operator.to_string(),
+                grid_pressure_iterations_per_substep: settings.pressure_cg_iterations,
+            }),
+            xpbd: None,
+        },
+        SolverSpec::Xpbd { solver: kind } => SolverMetadata {
+            backend: solver.backend().to_string(),
+            pressure: None,
+            dfsph: None,
+            xpbd: Some(XpbdSolverMetadata {
+                kind: kind.to_string(),
+                constraint_iterations_per_substep: XPBD_CONSTRAINT_ITERATIONS,
+            }),
+        },
+    }
 }
 
 fn backend_for_solver(
