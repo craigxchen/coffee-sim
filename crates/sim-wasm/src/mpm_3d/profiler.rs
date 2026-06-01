@@ -10,7 +10,7 @@
 //! Run it (release is important — debug numbers are not representative):
 //!
 //! ```text
-//! cargo test -p coffee-sim-wasm --lib --release profile_mpm_pipeline -- --ignored --nocapture
+//! cargo test -p coffee-sim-wasm --lib --release profile_solvers -- --ignored --nocapture
 //! ```
 //!
 //! Tunable via environment variables:
@@ -2197,7 +2197,7 @@ fn profiler_harness_args_require_profile_sentinel() {
 
     let forwarded_args = ProfilerCliArgs::from_env_and_args(
         None,
-        ["profile_mpm_pipeline", "--profile", "--solver", "xpbd:gpu"],
+        ["profile_solvers", "--profile", "--solver", "xpbd:gpu"],
         false,
     );
     assert_eq!(forwarded_args.solver.as_deref(), Some("xpbd:gpu"));
@@ -2912,7 +2912,7 @@ pub fn run_profile_from_env_args() {
         return;
     }
     let Some(adapter) = request_adapter() else {
-        eprintln!("profile_mpm_pipeline: no GPU adapter available; skipping.");
+        eprintln!("profile_solvers: no GPU adapter available; skipping.");
         return;
     };
 
@@ -2939,7 +2939,7 @@ pub fn run_profile_from_env_args() {
 
     if !timestamps_supported {
         eprintln!(
-            "profile_mpm_pipeline: adapter lacks TIMESTAMP_QUERY; \
+            "profile_solvers: adapter lacks TIMESTAMP_QUERY; \
              reporting frame-level timings only (no per-pass breakdown)."
         );
     }
@@ -2970,6 +2970,12 @@ pub fn run_profile_from_env_args() {
 
 #[test]
 #[ignore = "profiling harness; run explicitly with --ignored --release"]
+fn profile_solvers() {
+    run_profile_from_env_args();
+}
+
+#[test]
+#[ignore = "compatibility wrapper; prefer profile_solvers"]
 fn profile_mpm_pipeline() {
     run_profile_from_env_args();
 }
