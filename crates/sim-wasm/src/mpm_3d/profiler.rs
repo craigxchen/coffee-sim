@@ -64,12 +64,14 @@ const FRAME_DT: f32 = 1.0 / 60.0;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SimulationBackendKind {
     Mpm,
+    Dfsph,
 }
 
 impl SimulationBackendKind {
     fn id(self) -> &'static str {
         match self {
             Self::Mpm => "mpm",
+            Self::Dfsph => "dfsph",
         }
     }
 }
@@ -86,35 +88,48 @@ impl FromStr for SimulationBackendKind {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value.trim().to_ascii_lowercase().as_str() {
             "mpm" | "mpm-3d" => Ok(Self::Mpm),
+            "dfsph" | "dfsph-water" => Ok(Self::Dfsph),
             other => Err(format!(
-                "unknown simulation backend '{other}'; available backends: mpm"
+                "unknown simulation backend '{other}'; available backends: mpm, dfsph"
             )),
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct SolverSpec {
-    backend: SimulationBackendKind,
-    pressure: PressureSolverKind,
+enum SolverSpec {
+    Mpm { pressure: PressureSolverKind },
+    Dfsph,
 }
 
 impl SolverSpec {
     fn mpm(pressure: PressureSolverKind) -> Self {
-        Self {
-            backend: SimulationBackendKind::Mpm,
-            pressure,
+        Self::Mpm { pressure }
+    }
+
+    fn backend(self) -> SimulationBackendKind {
+        match self {
+            Self::Mpm { .. } => SimulationBackendKind::Mpm,
+            Self::Dfsph => SimulationBackendKind::Dfsph,
         }
     }
 
     fn id(self) -> String {
-        format!("{}-{}", self.backend.id(), self.pressure.id())
+        match self {
+            Self::Mpm { pressure } => {
+                format!("{}-{}", SimulationBackendKind::Mpm.id(), pressure.id())
+            }
+            Self::Dfsph => SimulationBackendKind::Dfsph.id().to_string(),
+        }
     }
 }
 
 impl fmt::Display for SolverSpec {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}:{}", self.backend, self.pressure)
+        match *self {
+            Self::Mpm { pressure } => write!(f, "{}:{pressure}", SimulationBackendKind::Mpm),
+            Self::Dfsph => f.write_str(SimulationBackendKind::Dfsph.id()),
+        }
     }
 }
 
@@ -127,7 +142,16 @@ impl FromStr for SolverSpec {
             let backend = backend.parse::<SimulationBackendKind>()?;
             return match backend {
                 SimulationBackendKind::Mpm => Ok(Self::mpm(solver.parse::<PressureSolverKind>()?)),
+                SimulationBackendKind::Dfsph => match solver.trim().to_ascii_lowercase().as_str() {
+                    "" | "water" => Ok(Self::Dfsph),
+                    other => Err(format!(
+                        "unknown dfsph solver '{other}'; available solvers: water"
+                    )),
+                },
             };
+        }
+        if trimmed.eq_ignore_ascii_case("dfsph") || trimmed.eq_ignore_ascii_case("dfsph-water") {
+            return Ok(Self::Dfsph);
         }
         Ok(Self::mpm(trimmed.parse::<PressureSolverKind>()?))
     }
@@ -648,7 +672,8 @@ fn profiler_solver_specs_parse_backend_qualified_values() {
         "mpm:sparse-cg".parse::<SolverSpec>(),
         Ok(SolverSpec::mpm(PressureSolverKind::SparseCg))
     );
-    assert!("dfsph".parse::<SolverSpec>().is_err());
+    assert_eq!("dfsph".parse::<SolverSpec>(), Ok(SolverSpec::Dfsph));
+    assert_eq!("dfsph:water".parse::<SolverSpec>(), Ok(SolverSpec::Dfsph));
 }
 
 #[test]
@@ -696,9 +721,16 @@ fn profile_mpm_pipeline() {
 
     for &solver in &solvers {
         let mut settings = scene_settings(&scene);
-        match solver.backend {
-            SimulationBackendKind::Mpm => {
-                settings.pressure_solver = solver.pressure;
+        match solver {
+            SolverSpec::Mpm { pressure } => {
+                settings.pressure_solver = pressure;
+            }
+            SolverSpec::Dfsph => {
+                panic!(
+                    "DFSPH profiler backend is registered but not yet ported into \
+                     codex/modular-solver-profiler; integrate codex/dfsph-water state, \
+                     pipelines, and schedule before profiling it"
+                );
             }
         }
         settings.pressure_cg_iterations = std::env::var("COFFEE_SIM_PROFILE_CG_ITERATIONS")
@@ -854,7 +886,7 @@ fn profile_mpm_pipeline() {
                 total_cells,
                 max_particles,
                 solver: SolverMetadata {
-                    backend: solver.backend.to_string(),
+                    backend: solver.backend().to_string(),
                     pressure: PressureSolverMetadata {
                         kind: sim.pressure_solver_kind().to_string(),
                         iterations_per_substep: sim.pressure_solver_iterations_per_substep(),
