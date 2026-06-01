@@ -22,6 +22,8 @@
 //! - `COFFEE_SIM_PROFILE_FRAMES`  instrumented frames to measure (default 120)
 //! - `COFFEE_SIM_PROFILE_CAL`     production `step_frame` calibration frames (default 30)
 //! - `COFFEE_SIM_PROFILE_OUT`     output JSON path (default `<repo>/target/coffee-sim-profile.json`)
+//! - `COFFEE_SIM_PROFILE_ARGS`    optional CLI-style overrides, e.g.
+//!   `--solvers all --scene center_pour --warmup 10 --frames 30 --cal 5 --out target/profile.json`
 //!
 //! ## Method and caveat
 //!
@@ -235,12 +237,130 @@ impl FromStr for SolverSpec {
     }
 }
 
-fn env_u32_or(name: &str, default: u32) -> u32 {
+#[derive(Default)]
+struct ProfilerCliArgs {
+    scene: Option<String>,
+    solver: Option<String>,
+    solvers: Option<String>,
+    warmup: Option<u32>,
+    measured: Option<u32>,
+    calibration: Option<u32>,
+    output: Option<PathBuf>,
+    cg_iterations: Option<u32>,
+}
+
+impl ProfilerCliArgs {
+    fn from_env_args() -> Self {
+        let mut cli = Self::default();
+        if let Ok(value) = std::env::var("COFFEE_SIM_PROFILE_ARGS") {
+            cli.merge(Self::parse(value.split_whitespace()).unwrap_or_else(|err| panic!("{err}")));
+        }
+
+        let mut args = std::env::args().skip(1).peekable();
+        while let Some(arg) = args.next() {
+            if arg == "--profile" || arg == "--profile-args" {
+                cli.merge(Self::parse(args).unwrap_or_else(|err| panic!("{err}")));
+                break;
+            }
+        }
+
+        cli
+    }
+
+    fn parse<I, S>(args: I) -> Result<Self, String>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut parsed = Self::default();
+        let mut args = args
+            .into_iter()
+            .map(|arg| arg.as_ref().to_string())
+            .peekable();
+        while let Some(arg) = args.next() {
+            let (flag, inline_value) = match arg.split_once('=') {
+                Some((flag, value)) => (flag.to_string(), Some(value.to_string())),
+                None => (arg, None),
+            };
+            let mut take_value = |name: &str| -> Result<String, String> {
+                if let Some(value) = inline_value.clone() {
+                    return Ok(value);
+                }
+                args.next()
+                    .ok_or_else(|| format!("missing value for profiler option {name}"))
+            };
+            match flag.as_str() {
+                "--scene" => parsed.scene = Some(take_value("--scene")?),
+                "--solver" => parsed.solver = Some(take_value("--solver")?),
+                "--solvers" => parsed.solvers = Some(take_value("--solvers")?),
+                "--warmup" => {
+                    parsed.warmup = Some(parse_positive_u32("--warmup", &take_value("--warmup")?)?)
+                }
+                "--frames" | "--measured" => {
+                    parsed.measured =
+                        Some(parse_positive_u32("--frames", &take_value("--frames")?)?);
+                }
+                "--cal" | "--calibration" => {
+                    parsed.calibration = Some(parse_positive_u32("--cal", &take_value("--cal")?)?);
+                }
+                "--out" | "--output" => parsed.output = Some(PathBuf::from(take_value("--out")?)),
+                "--cg-iterations" => {
+                    parsed.cg_iterations = Some(parse_positive_u32(
+                        "--cg-iterations",
+                        &take_value("--cg-iterations")?,
+                    )?);
+                }
+                other => {
+                    return Err(format!(
+                        "unknown profiler option '{other}'; supported options: \
+                         --scene, --solver, --solvers, --warmup, --frames, --cal, --out, --cg-iterations"
+                    ));
+                }
+            }
+        }
+        Ok(parsed)
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.scene = other.scene.or(self.scene.take());
+        self.solver = other.solver.or(self.solver.take());
+        self.solvers = other.solvers.or(self.solvers.take());
+        self.warmup = other.warmup.or(self.warmup);
+        self.measured = other.measured.or(self.measured);
+        self.calibration = other.calibration.or(self.calibration);
+        self.output = other.output.or(self.output.take());
+        self.cg_iterations = other.cg_iterations.or(self.cg_iterations);
+    }
+}
+
+fn parse_positive_u32(name: &str, value: &str) -> Result<u32, String> {
+    value
+        .parse::<u32>()
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| format!("{name} must be a positive integer, got '{value}'"))
+}
+
+fn env_u32(name: &str) -> Option<u32> {
     std::env::var(name)
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
         .filter(|v| *v > 0)
-        .unwrap_or(default)
+}
+
+fn parse_solver_specs(value: &str) -> Vec<SolverSpec> {
+    let trimmed = value.trim();
+    if trimmed.eq_ignore_ascii_case("all") {
+        return runnable_solver_specs();
+    }
+    trimmed
+        .split(',')
+        .filter(|part| !part.trim().is_empty())
+        .map(|part| {
+            part.parse::<SolverSpec>()
+                .unwrap_or_else(|err| panic!("{err}"))
+        })
+        .collect()
 }
 
 // ── GPU timestamp ring ──
@@ -1510,20 +1630,17 @@ impl FromStr for ProfileScene {
     }
 }
 
-fn profile_solver_specs() -> Vec<SolverSpec> {
+fn profile_solver_specs(cli: &ProfilerCliArgs) -> Vec<SolverSpec> {
+    if let Some(value) = cli.solvers.as_deref() {
+        return parse_solver_specs(value);
+    }
+    if let Some(value) = cli.solver.as_deref() {
+        return vec![value
+            .parse::<SolverSpec>()
+            .unwrap_or_else(|err| panic!("{err}"))];
+    }
     if let Ok(value) = std::env::var("COFFEE_SIM_PROFILE_SOLVERS") {
-        let trimmed = value.trim();
-        if trimmed.eq_ignore_ascii_case("all") {
-            return runnable_solver_specs();
-        }
-        return trimmed
-            .split(',')
-            .filter(|part| !part.trim().is_empty())
-            .map(|part| {
-                part.parse::<SolverSpec>()
-                    .unwrap_or_else(|err| panic!("{err}"))
-            })
-            .collect();
+        return parse_solver_specs(&value);
     }
     let solver = std::env::var("COFFEE_SIM_PROFILE_SOLVER").unwrap_or_else(|_| "rbgs".into());
     vec![solver
@@ -1542,7 +1659,10 @@ fn xpbd_profiler_timestamp_query_capacity(substeps: u32) -> u32 {
     (substeps.max(1) * passes_per_substep * 2).max(MIN_TIMESTAMP_QUERY_CAPACITY)
 }
 
-fn output_path() -> PathBuf {
+fn output_path(cli: &ProfilerCliArgs) -> PathBuf {
+    if let Some(path) = cli.output.as_ref() {
+        return path.clone();
+    }
     if let Ok(p) = std::env::var("COFFEE_SIM_PROFILE_OUT") {
         return PathBuf::from(p);
     }
@@ -1630,6 +1750,49 @@ fn profiler_runnable_solver_ids_are_unique() {
 }
 
 #[test]
+fn profiler_cli_args_parse_key_value_and_separate_forms() {
+    let args = ProfilerCliArgs::parse([
+        "--solvers=all",
+        "--scene",
+        "water_block",
+        "--warmup=2",
+        "--frames",
+        "3",
+        "--cal",
+        "4",
+        "--out",
+        "target/profile.json",
+        "--cg-iterations",
+        "5",
+    ])
+    .expect("profiler args parse");
+
+    assert_eq!(args.solvers.as_deref(), Some("all"));
+    assert_eq!(args.scene.as_deref(), Some("water_block"));
+    assert_eq!(args.warmup, Some(2));
+    assert_eq!(args.measured, Some(3));
+    assert_eq!(args.calibration, Some(4));
+    assert_eq!(args.output, Some(PathBuf::from("target/profile.json")));
+    assert_eq!(args.cg_iterations, Some(5));
+}
+
+#[test]
+fn profiler_cli_solver_overrides_expand_to_specs() {
+    let args = ProfilerCliArgs::parse(["--solvers", "mpm:jacobi-cg,dfsph,xpbd"])
+        .expect("profiler args parse");
+    assert_eq!(
+        profile_solver_specs(&args),
+        vec![
+            SolverSpec::mpm(PressureSolverKind::JacobiCg),
+            SolverSpec::Dfsph,
+            SolverSpec::Xpbd {
+                solver: XpbdSolverKind::Gpu
+            },
+        ]
+    );
+}
+
+#[test]
 fn profiler_scenes_parse_shared_profile_scene_ids() {
     assert_eq!(
         "center_pour".parse::<ProfileScene>(),
@@ -1651,6 +1814,7 @@ struct ProfilerRunConfig<'a> {
     warmup: u32,
     measured: u32,
     calibration: u32,
+    cg_iterations: Option<u32>,
     base_output_path: &'a PathBuf,
     multiple_outputs: bool,
 }
@@ -1746,10 +1910,9 @@ fn profile_mpm_solver(
 ) {
     let mut settings = run.scene.mpm_settings();
     settings.pressure_solver = pressure;
-    settings.pressure_cg_iterations = std::env::var("COFFEE_SIM_PROFILE_CG_ITERATIONS")
-        .ok()
-        .and_then(|v| v.parse::<u32>().ok())
-        .filter(|v| *v > 0)
+    settings.pressure_cg_iterations = run
+        .cg_iterations
+        .or_else(|| env_u32("COFFEE_SIM_PROFILE_CG_ITERATIONS"))
         .unwrap_or(settings.pressure_rbgs_pairs);
     let grid_dims = settings.grid_dims;
     let total_cells = grid_dims[0] * grid_dims[1] * grid_dims[2];
@@ -2078,15 +2241,28 @@ fn profile_mpm_pipeline() {
     .expect("request profiler device");
 
     let info = adapter.get_info();
-    let scene = std::env::var("COFFEE_SIM_PROFILE_SCENE")
-        .unwrap_or_else(|_| "center_pour".into())
+    let cli = ProfilerCliArgs::from_env_args();
+    let scene = cli
+        .scene
+        .clone()
+        .or_else(|| std::env::var("COFFEE_SIM_PROFILE_SCENE").ok())
+        .unwrap_or_else(|| "center_pour".into())
         .parse::<ProfileScene>()
         .unwrap_or_else(|err| panic!("{err}"));
-    let solvers = profile_solver_specs();
-    let warmup = env_u32_or("COFFEE_SIM_PROFILE_WARMUP", DEFAULT_WARMUP_FRAMES);
-    let measured = env_u32_or("COFFEE_SIM_PROFILE_FRAMES", DEFAULT_MEASURED_FRAMES);
-    let calibration = env_u32_or("COFFEE_SIM_PROFILE_CAL", DEFAULT_CALIBRATION_FRAMES);
-    let base_output_path = output_path();
+    let solvers = profile_solver_specs(&cli);
+    let warmup = cli
+        .warmup
+        .or_else(|| env_u32("COFFEE_SIM_PROFILE_WARMUP"))
+        .unwrap_or(DEFAULT_WARMUP_FRAMES);
+    let measured = cli
+        .measured
+        .or_else(|| env_u32("COFFEE_SIM_PROFILE_FRAMES"))
+        .unwrap_or(DEFAULT_MEASURED_FRAMES);
+    let calibration = cli
+        .calibration
+        .or_else(|| env_u32("COFFEE_SIM_PROFILE_CAL"))
+        .unwrap_or(DEFAULT_CALIBRATION_FRAMES);
+    let base_output_path = output_path(&cli);
     let multiple_outputs = solvers.len() > 1;
     let period_ns = queue.get_timestamp_period();
 
@@ -2109,6 +2285,9 @@ fn profile_mpm_pipeline() {
         warmup,
         measured,
         calibration,
+        cg_iterations: cli
+            .cg_iterations
+            .or_else(|| env_u32("COFFEE_SIM_PROFILE_CG_ITERATIONS")),
         base_output_path: &base_output_path,
         multiple_outputs,
     };
