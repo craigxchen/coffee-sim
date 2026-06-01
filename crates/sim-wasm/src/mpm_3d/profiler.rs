@@ -17,6 +17,7 @@
 //! - `COFFEE_SIM_PROFILE_SCENE`   scene preset: `center_pour` (default) | `free_stream` | `water_block`
 //! - `COFFEE_SIM_PROFILE_SOLVER`  solver spec: `rbgs` (default) | `mpm:jacobi-cg` | `mpm:sparse-cg` | `dfsph` | `xpbd`
 //! - `COFFEE_SIM_PROFILE_SOLVERS` comma-separated runnable solver specs, or `all`
+//! - `COFFEE_SIM_PROFILE_PRESSURE_OPERATOR` pressure operator: `collocated` (default)
 //! - `COFFEE_SIM_PROFILE_CG_ITERATIONS` CG iterations per substep (defaults to scene RBGS pairs)
 //! - `COFFEE_SIM_PROFILE_WARMUP`  frames to run before measuring (default 60)
 //! - `COFFEE_SIM_PROFILE_FRAMES`  instrumented frames to measure (default 120)
@@ -52,7 +53,7 @@ use bytemuck::cast_slice;
 use serde::Serialize;
 
 use super::inflow::{EmissionResult, MASS_UNITS_PER_ML, PARTICLES_PER_ML};
-use super::pressure::{PressureContext, PressureSolverKind};
+use super::pressure::{PressureContext, PressureOperatorKind, PressureSolverKind};
 use super::state::{METRICS_SLOT_COUNT, NUM_THREADS};
 use super::xpbd::XpbdPipelines;
 use super::{
@@ -243,6 +244,7 @@ struct ProfilerCliArgs {
     scene: Option<String>,
     solver: Option<String>,
     solvers: Option<String>,
+    pressure_operator: Option<String>,
     warmup: Option<u32>,
     measured: Option<u32>,
     calibration: Option<u32>,
@@ -287,6 +289,9 @@ impl ProfilerCliArgs {
                 "scene" => "--scene".to_string(),
                 "solver" => "--solver".to_string(),
                 "solvers" => "--solvers".to_string(),
+                "pressure_operator" | "pressure-operator" | "operator" => {
+                    "--pressure-operator".to_string()
+                }
                 "warmup" => "--warmup".to_string(),
                 "frames" | "measured" => "--frames".to_string(),
                 "cal" | "calibration" => "--cal".to_string(),
@@ -305,6 +310,9 @@ impl ProfilerCliArgs {
                 "--scene" => parsed.scene = Some(take_value("--scene")?),
                 "--solver" => parsed.solver = Some(take_value("--solver")?),
                 "--solvers" => parsed.solvers = Some(take_value("--solvers")?),
+                "--pressure-operator" | "--operator" => {
+                    parsed.pressure_operator = Some(take_value("--pressure-operator")?);
+                }
                 "--warmup" => {
                     parsed.warmup = Some(parse_positive_u32("--warmup", &take_value("--warmup")?)?)
                 }
@@ -325,8 +333,8 @@ impl ProfilerCliArgs {
                 other => {
                     return Err(format!(
                         "unknown profiler option '{other}'; supported options: \
-                         --scene, --solver, --solvers, --warmup, --frames, --cal, --out, --cg-iterations, \
-                         or kwargs scene=, solver=, solvers=, warmup=, frames=, cal=, out=, cg_iterations="
+                         --scene, --solver, --solvers, --pressure-operator, --warmup, --frames, --cal, --out, --cg-iterations, \
+                         or kwargs scene=, solver=, solvers=, pressure_operator=, warmup=, frames=, cal=, out=, cg_iterations="
                     ));
                 }
             }
@@ -338,6 +346,7 @@ impl ProfilerCliArgs {
         self.scene = other.scene.or(self.scene.take());
         self.solver = other.solver.or(self.solver.take());
         self.solvers = other.solvers.or(self.solvers.take());
+        self.pressure_operator = other.pressure_operator.or(self.pressure_operator.take());
         self.warmup = other.warmup.or(self.warmup);
         self.measured = other.measured.or(self.measured);
         self.calibration = other.calibration.or(self.calibration);
@@ -1390,6 +1399,7 @@ struct SolverMetadata {
 #[derive(Serialize)]
 struct PressureSolverMetadata {
     kind: String,
+    operator: String,
     iterations_per_substep: u32,
 }
 
@@ -1399,6 +1409,7 @@ struct DfsphSolverMetadata {
     divergence_iterations_per_substep: u32,
     density_iterations_per_substep: u32,
     grid_pressure_kind: String,
+    grid_pressure_operator: String,
     grid_pressure_iterations_per_substep: u32,
 }
 
@@ -1779,6 +1790,7 @@ fn profiler_cli_args_parse_key_value_and_separate_forms() {
         "--solvers=all",
         "--scene",
         "water_block",
+        "--pressure-operator=collocated",
         "--warmup=2",
         "--frames",
         "3",
@@ -1793,6 +1805,7 @@ fn profiler_cli_args_parse_key_value_and_separate_forms() {
 
     assert_eq!(args.solvers.as_deref(), Some("all"));
     assert_eq!(args.scene.as_deref(), Some("water_block"));
+    assert_eq!(args.pressure_operator.as_deref(), Some("collocated"));
     assert_eq!(args.warmup, Some(2));
     assert_eq!(args.measured, Some(3));
     assert_eq!(args.calibration, Some(4));
@@ -1805,6 +1818,7 @@ fn profiler_cli_args_parse_kwargs_forms() {
     let args = ProfilerCliArgs::parse([
         "solver=xpbd",
         "scene=center_pour",
+        "pressure_operator=collocated",
         "warmup=6",
         "measured=7",
         "calibration=8",
@@ -1815,6 +1829,7 @@ fn profiler_cli_args_parse_kwargs_forms() {
 
     assert_eq!(args.solver.as_deref(), Some("xpbd"));
     assert_eq!(args.scene.as_deref(), Some("center_pour"));
+    assert_eq!(args.pressure_operator.as_deref(), Some("collocated"));
     assert_eq!(args.warmup, Some(6));
     assert_eq!(args.measured, Some(7));
     assert_eq!(args.calibration, Some(8));
@@ -1883,6 +1898,7 @@ fn profiler_solver_run_metadata_records_requested_same_scene_set() {
         measured: 1,
         calibration: 1,
         cg_iterations: None,
+        pressure_operator: PressureOperatorKind::Collocated,
         solver_ids: solvers.iter().copied().map(SolverSpec::id).collect(),
         base_output_path: &base,
         multiple_outputs: true,
@@ -1919,6 +1935,7 @@ struct ProfilerRunConfig<'a> {
     measured: u32,
     calibration: u32,
     cg_iterations: Option<u32>,
+    pressure_operator: PressureOperatorKind,
     solver_ids: Vec<String>,
     base_output_path: &'a PathBuf,
     multiple_outputs: bool,
@@ -2032,6 +2049,7 @@ fn profile_mpm_solver(
 ) {
     let mut settings = run.scene.mpm_settings();
     settings.pressure_solver = pressure;
+    settings.pressure_operator = run.pressure_operator;
     settings.pressure_cg_iterations = run
         .cg_iterations
         .or_else(|| env_u32("COFFEE_SIM_PROFILE_CG_ITERATIONS"))
@@ -2114,6 +2132,7 @@ fn profile_mpm_solver(
                 backend: solver.backend().to_string(),
                 pressure: Some(PressureSolverMetadata {
                     kind: sim.pressure_solver_kind().to_string(),
+                    operator: sim.pressure_operator_kind().to_string(),
                     iterations_per_substep: sim.pressure_solver_iterations_per_substep(),
                 }),
                 dfsph: None,
@@ -2141,7 +2160,8 @@ fn profile_dfsph_solver(
     run: &ProfilerRunConfig<'_>,
     solver: SolverSpec,
 ) {
-    let settings = run.scene.mpm_settings();
+    let mut settings = run.scene.mpm_settings();
+    settings.pressure_operator = run.pressure_operator;
     let grid_dims = settings.grid_dims;
     let total_cells = grid_dims[0] * grid_dims[1] * grid_dims[2];
     let max_particles = settings.max_particles;
@@ -2214,6 +2234,7 @@ fn profile_dfsph_solver(
                     divergence_iterations_per_substep: 1,
                     density_iterations_per_substep: 2,
                     grid_pressure_kind: sim.pressure_solver_kind().to_string(),
+                    grid_pressure_operator: sim.pressure_operator_kind().to_string(),
                     grid_pressure_iterations_per_substep: sim
                         .pressure_solver_iterations_per_substep(),
                 }),
@@ -2380,6 +2401,13 @@ fn profile_mpm_pipeline() {
         .copied()
         .map(SolverSpec::id)
         .collect::<Vec<_>>();
+    let pressure_operator = cli
+        .pressure_operator
+        .clone()
+        .or_else(|| std::env::var("COFFEE_SIM_PROFILE_PRESSURE_OPERATOR").ok())
+        .unwrap_or_else(|| PressureOperatorKind::Collocated.to_string())
+        .parse::<PressureOperatorKind>()
+        .unwrap_or_else(|err| panic!("{err}"));
     let warmup = cli
         .warmup
         .or_else(|| env_u32("COFFEE_SIM_PROFILE_WARMUP"))
@@ -2418,6 +2446,7 @@ fn profile_mpm_pipeline() {
         cg_iterations: cli
             .cg_iterations
             .or_else(|| env_u32("COFFEE_SIM_PROFILE_CG_ITERATIONS")),
+        pressure_operator,
         solver_ids,
         base_output_path: &base_output_path,
         multiple_outputs,
