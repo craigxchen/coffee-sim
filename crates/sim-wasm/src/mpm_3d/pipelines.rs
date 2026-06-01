@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 
-use super::pressure::{PressurePipelines, RbgsPressureSolver};
+use super::pressure::{JacobiCgPressureSolver, PressurePipelines, RbgsPressureSolver};
 use super::shader::MPM_COMPUTE_SHADER;
 use super::state::MpmBuffers;
 
@@ -84,6 +84,8 @@ impl MpmPipelines {
                     },
                     count: None,
                 },
+                // 12: pressure CG scratch/state
+                storage_entry(12),
             ],
         });
 
@@ -139,6 +141,10 @@ impl MpmPipelines {
                     binding: 11,
                     resource: wgpu::BindingResource::TextureView(&buffers.sdf_class_view),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 12,
+                    resource: buffers.cg.as_entire_binding(),
+                },
             ],
         });
 
@@ -183,13 +189,25 @@ impl MpmPipelines {
                 bed_dynamics: make("bed_dynamics"),
                 prepare_render: make("prepare_render"),
             },
-            pressure: PressurePipelines::Rbgs(RbgsPressureSolver {
-                classify_cells: make("classify_cells"),
-                pressure_rbgs_red: make("pressure_rbgs_red"),
-                pressure_rbgs_black: make("pressure_rbgs_black"),
-                project_pressure: make("project_pressure"),
-                pressure_residual: make("pressure_residual"),
-            }),
+            pressure: PressurePipelines {
+                rbgs: RbgsPressureSolver {
+                    classify_cells: make("classify_cells"),
+                    pressure_rbgs_red: make("pressure_rbgs_red"),
+                    pressure_rbgs_black: make("pressure_rbgs_black"),
+                    project_pressure: make("project_pressure"),
+                    pressure_residual: make("pressure_residual"),
+                },
+                jacobi_cg: JacobiCgPressureSolver {
+                    classify_cells: make("classify_cells"),
+                    pressure_cg_init: make("pressure_cg_init"),
+                    pressure_cg_matvec: make("pressure_cg_matvec"),
+                    pressure_cg_apply_alpha: make("pressure_cg_apply_alpha"),
+                    pressure_cg_update_dir: make("pressure_cg_update_dir"),
+                    pressure_cg_finish_iteration: make("pressure_cg_finish_iteration"),
+                    project_pressure: make("project_pressure"),
+                    pressure_residual: make("pressure_residual"),
+                },
+            },
         }
     }
 }

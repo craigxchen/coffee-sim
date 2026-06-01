@@ -21,7 +21,7 @@ pub(crate) const SDF_RES: u32 = 128;
 
 /// Number of `u32` slots in the metrics buffer. Keep in sync with the indices
 /// in `shader.rs` (`METRIC_*_IDX`).
-pub(crate) const METRICS_SLOT_COUNT: usize = 12;
+pub(crate) const METRICS_SLOT_COUNT: usize = 18;
 pub(crate) const METRIC_MAX_ABS_DIV_IDX: usize = 0;
 pub(crate) const METRIC_FLUID_CELLS_IDX: usize = 1;
 pub(crate) const METRIC_DIV_CLAMP_FIRES_IDX: usize = 2;
@@ -34,6 +34,12 @@ pub(crate) const METRIC_CUP_SOLUTE_MASS_IDX: usize = 8;
 pub(crate) const METRIC_PROJECTION_RESIDUAL_MAX_IDX: usize = 9;
 pub(crate) const METRIC_PROJECTION_RESIDUAL_SUM_IDX: usize = 10;
 pub(crate) const METRIC_PROJECTION_RESIDUAL_CELLS_IDX: usize = 11;
+pub(crate) const METRIC_CG_RZ_IDX: usize = 12;
+pub(crate) const METRIC_CG_PAP_IDX: usize = 13;
+pub(crate) const METRIC_CG_NEW_RZ_IDX: usize = 14;
+pub(crate) const METRIC_PRESSURE_INITIAL_RZ_IDX: usize = 15;
+pub(crate) const METRIC_PRESSURE_FINAL_RZ_IDX: usize = 16;
+pub(crate) const METRIC_PRESSURE_ACTIVE_COUNT_IDX: usize = 17;
 /// Fixed-point scale used by the `MAX_ABS_DIV` slot — divergence is already a
 /// moderate-magnitude quantity, so a smaller scale keeps the atomic headroom
 /// comfortable while still giving useful resolution on the HUD.
@@ -41,6 +47,7 @@ pub(crate) const METRICS_DIV_FP_SCALE: f32 = 1024.0;
 /// Coarser scale for an accumulated residual sum. Max residual still uses the
 /// finer divergence scale; the sum favors atomic headroom across many cells.
 pub(crate) const METRICS_RESIDUAL_SUM_FP_SCALE: f32 = 16.0;
+pub(crate) const METRICS_CG_DOT_FP_SCALE: f32 = 1024.0;
 pub(crate) const METRICS_MASS_FP_SCALE: f32 = 1024.0;
 pub(crate) const METRICS_SOLUTE_FP_SCALE: f32 = 65536.0;
 
@@ -77,6 +84,7 @@ pub(crate) struct MpmBuffers {
     pub particles: wgpu::Buffer,
     pub affine: wgpu::Buffer,
     pub grid: wgpu::Buffer,
+    pub cg: wgpu::Buffer,
     pub grid_vel: wgpu::Buffer,
     pub bed_lookup: wgpu::Buffer,
     pub bed_delta: wgpu::Buffer,
@@ -104,6 +112,10 @@ impl MpmBuffers {
         let max_p = settings.max_particles as usize;
         let [gx, gy, gz] = settings.grid_dims;
         let total_cells = (gx * gy * gz) as usize;
+        debug_assert!(
+            total_cells <= 16_777_216,
+            "CG active cell ids are stored as exactly representable f32 values"
+        );
 
         let particles = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("mpm particles"),
@@ -126,6 +138,15 @@ impl MpmBuffers {
         let grid = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("mpm grid atomics"),
             size: (6 * total_cells * size_of::<i32>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let cg = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("mpm pressure cg scratch"),
+            // Three vec4 regions: per-cell CG state, active pressure cell ids,
+            // and a reserved active-grid list for future sparse scheduling.
+            size: (3 * total_cells * 16) as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -206,6 +227,7 @@ impl MpmBuffers {
             particles,
             affine,
             grid,
+            cg,
             grid_vel,
             bed_lookup,
             bed_delta,

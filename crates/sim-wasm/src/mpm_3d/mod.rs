@@ -161,8 +161,8 @@ impl MpmPassLabel {
 
 /// Device limits required by the MPM compute pipeline.
 ///
-/// The MPM bind group holds 9 storage buffers (particles, affine, grid,
-/// grid_vel, render_data, bed_extract, bed_lookup, bed_delta, metrics) plus
+/// The MPM bind group holds 10 storage buffers (particles, affine, grid,
+/// pressure CG scratch, grid_vel, render_data, bed_extract, bed_lookup, bed_delta, metrics) plus
 /// one SDF texture. This stays within the 10-buffer cap that some WebGPU
 /// adapters enforce. Any
 /// `request_device` site that uses this pipeline must use these limits, and
@@ -199,6 +199,12 @@ pub(crate) struct MetricsSnapshot {
     /// `pressure_residual`.
     pub projection_residual_mean_abs_div: f32,
     pub projection_residual_cells: u32,
+    pub pressure_active_cells: u32,
+    pub pressure_cg_rz: f32,
+    pub pressure_cg_pap: f32,
+    pub pressure_cg_new_rz: f32,
+    pub pressure_cg_initial_rz: f32,
+    pub pressure_cg_final_rz: f32,
     pub mean_tds: f32,
     pub cup_tds: f32,
     pub extraction_yield: f32,
@@ -343,6 +349,14 @@ fn metrics_snapshot_from_raw(raw: &[u32], has_bed: bool) -> Option<MetricsSnapsh
     let projection_residual_cells = raw[state::METRIC_PROJECTION_RESIDUAL_CELLS_IDX];
     let projection_residual_sum = raw[state::METRIC_PROJECTION_RESIDUAL_SUM_IDX] as f32
         / state::METRICS_RESIDUAL_SUM_FP_SCALE;
+    let pressure_cg_initial_rz =
+        raw[state::METRIC_PRESSURE_INITIAL_RZ_IDX] as f32 / state::METRICS_CG_DOT_FP_SCALE;
+    let pressure_cg_final_rz =
+        raw[state::METRIC_PRESSURE_FINAL_RZ_IDX] as f32 / state::METRICS_CG_DOT_FP_SCALE;
+    let pressure_cg_rz = raw[state::METRIC_CG_RZ_IDX] as f32 / state::METRICS_CG_DOT_FP_SCALE;
+    let pressure_cg_pap = raw[state::METRIC_CG_PAP_IDX] as f32 / state::METRICS_CG_DOT_FP_SCALE;
+    let pressure_cg_new_rz =
+        raw[state::METRIC_CG_NEW_RZ_IDX] as f32 / state::METRICS_CG_DOT_FP_SCALE;
 
     Some(MetricsSnapshot {
         max_abs_div: raw[state::METRIC_MAX_ABS_DIV_IDX] as f32 / METRICS_DIV_FP_SCALE,
@@ -355,6 +369,12 @@ fn metrics_snapshot_from_raw(raw: &[u32], has_bed: bool) -> Option<MetricsSnapsh
         projection_residual_mean_abs_div: projection_residual_sum
             / (projection_residual_cells as f32).max(1.0),
         projection_residual_cells,
+        pressure_active_cells: raw[state::METRIC_PRESSURE_ACTIVE_COUNT_IDX],
+        pressure_cg_rz,
+        pressure_cg_pap,
+        pressure_cg_new_rz,
+        pressure_cg_initial_rz,
+        pressure_cg_final_rz,
         mean_tds: active_solute_mass / active_water_mass.max(1e-6),
         cup_tds: cup_solute_mass / cup_water_mass.max(1e-6),
         extraction_yield: if has_bed {
@@ -414,6 +434,7 @@ pub(crate) struct MpmSettings {
     pub render_radius: f32,
     pub pressure_solver: PressureSolverKind,
     pub pressure_rbgs_pairs: u32,
+    pub pressure_cg_iterations: u32,
     /// Optional residual target for browser-driven adaptive pressure solves.
     /// `<= 0` keeps the fixed `pressure_rbgs_pairs` behavior.
     pub pressure_residual_target: f32,
@@ -449,6 +470,7 @@ impl MpmSettings {
             render_radius: dx * 0.7,
             pressure_solver: PressureSolverKind::Rbgs,
             pressure_rbgs_pairs: 40,
+            pressure_cg_iterations: 40,
             pressure_residual_target: 0.0,
             pressure_rbgs_max_pairs: 40,
             use_sdf_cache: true,
@@ -870,7 +892,7 @@ fn encode_mpm_substep_schedule<RunOp>(
 
     run_pipeline!(
         MpmPassLabel::PressureClassify,
-        pipelines.pressure.classify_pipeline(),
+        pipelines.pressure.classify_pipeline_for(pressure_ctx.kind),
         dispatch.cell_wg,
     );
     run_op(MpmScheduleOp::PressureSolve {
@@ -880,7 +902,7 @@ fn encode_mpm_substep_schedule<RunOp>(
     });
     run_pipeline!(
         MpmPassLabel::PressureProject,
-        pipelines.pressure.project_pipeline(),
+        pipelines.pressure.project_pipeline_for(pressure_ctx.kind),
         dispatch.cell_wg,
     );
     run_pipeline!(
@@ -890,7 +912,7 @@ fn encode_mpm_substep_schedule<RunOp>(
     );
     run_pipeline!(
         MpmPassLabel::PressureResidual,
-        pipelines.pressure.residual_pipeline(),
+        pipelines.pressure.residual_pipeline_for(pressure_ctx.kind),
         dispatch.cell_wg,
     );
 
@@ -1856,8 +1878,10 @@ impl MpmSim3D {
                 metrics_wg: dispatch_size(METRICS_SLOT_COUNT as u32, 8),
             };
             let pressure_ctx = PressureContext {
+                kind: self.settings.pressure_solver,
                 cell_wg: dispatch.cell_wg,
                 rbgs_pairs: pressure_pairs,
+                cg_iterations: self.settings.pressure_cg_iterations,
             };
 
             let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -2037,17 +2061,22 @@ impl MpmSim3D {
         self.pipelines
             .pressure
             .iterations_per_substep(PressureContext {
+                kind: self.settings.pressure_solver,
                 cell_wg: 0,
                 rbgs_pairs: self
                     .last_pressure_rbgs_pairs
                     .max(self.settings.pressure_rbgs_pairs),
+                cg_iterations: self.settings.pressure_cg_iterations,
             })
     }
 
     #[cfg(test)]
     pub(crate) fn profiler_timestamp_query_capacity(&self) -> u32 {
-        let scopes =
-            COMMON_TIMED_SCOPES_PER_SUBSTEP + self.pipelines.pressure.estimated_timestamp_scopes();
+        let scopes = COMMON_TIMED_SCOPES_PER_SUBSTEP
+            + self
+                .pipelines
+                .pressure
+                .estimated_timestamp_scopes_for(self.settings.pressure_solver);
         ((scopes * 2) + 8).max(MIN_TIMESTAMP_QUERY_CAPACITY)
     }
 
@@ -2487,6 +2516,24 @@ mod tests {
         assert!(shader::MPM_COMPUTE_SHADER.contains("fn viscosity_prepare("));
         assert!(shader::MPM_COMPUTE_SHADER.contains("fn viscosity_apply("));
         assert!(shader::MPM_COMPUTE_SHADER.contains("|| kind == CELL_SURFACE_FLUID"));
+        assert!(shader::MPM_COMPUTE_SHADER.contains("@group(0) @binding(12)"));
+        assert!(shader::MPM_COMPUTE_SHADER.contains("fn pressure_cg_init("));
+        assert!(shader::MPM_COMPUTE_SHADER.contains("fn pressure_cg_matvec("));
+        assert!(shader::MPM_COMPUTE_SHADER.contains("fn pressure_cg_apply_alpha("));
+        assert!(shader::MPM_COMPUTE_SHADER.contains("fn pressure_cg_update_dir("));
+        assert!(shader::MPM_COMPUTE_SHADER.contains("fn pressure_cg_finish_iteration("));
+    }
+
+    #[test]
+    fn mpm_compute_shader_parses() {
+        let module = naga::front::wgsl::parse_str(shader::MPM_COMPUTE_SHADER)
+            .expect("MPM WGSL should parse");
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::empty(),
+        )
+        .validate(&module)
+        .expect("MPM WGSL should validate");
     }
 
     #[test]
