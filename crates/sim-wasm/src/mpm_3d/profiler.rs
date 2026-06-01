@@ -258,7 +258,7 @@ struct ProfilerCliArgs {
     calibration: Option<u32>,
     output: Option<PathBuf>,
     cg_iterations: Option<u32>,
-    dry_run: bool,
+    dry_run: Option<bool>,
 }
 
 impl ProfilerCliArgs {
@@ -363,11 +363,13 @@ impl ProfilerCliArgs {
                     )?);
                 }
                 "--dry-run" => {
-                    parsed.dry_run = inline_value
-                        .as_deref()
-                        .map(parse_bool)
-                        .transpose()?
-                        .unwrap_or(true);
+                    parsed.dry_run = Some(
+                        inline_value
+                            .as_deref()
+                            .map(parse_bool)
+                            .transpose()?
+                            .unwrap_or(true),
+                    );
                 }
                 other => {
                     return Err(format!(
@@ -391,7 +393,7 @@ impl ProfilerCliArgs {
         self.calibration = other.calibration.or(self.calibration);
         self.output = other.output.or(self.output.take());
         self.cg_iterations = other.cg_iterations.or(self.cg_iterations);
-        self.dry_run = other.dry_run || self.dry_run;
+        self.dry_run = other.dry_run.or(self.dry_run);
     }
 }
 
@@ -1969,7 +1971,7 @@ fn profiler_cli_args_parse_kwargs_forms() {
     assert_eq!(args.calibration, Some(8));
     assert_eq!(args.output, Some(PathBuf::from("target/profile.json")));
     assert_eq!(args.cg_iterations, Some(9));
-    assert!(args.dry_run);
+    assert_eq!(args.dry_run, Some(true));
 }
 
 #[test]
@@ -2059,7 +2061,7 @@ fn profiler_dry_run_summary_lists_all_solver_outputs_and_scene_settings() {
         ],
         true,
     );
-    assert!(args.dry_run);
+    assert_eq!(args.dry_run, Some(true));
 
     let selection = ProfileSelection::from_cli_with_env(&args, |_| None);
     let summary = selection.dry_run_summary();
@@ -2146,6 +2148,18 @@ fn profiler_harness_args_require_profile_sentinel() {
         false,
     );
     assert_eq!(forwarded_args.solver.as_deref(), Some("xpbd:gpu"));
+}
+
+#[test]
+fn profiler_later_args_can_disable_dry_run() {
+    let args = ProfilerCliArgs::from_env_and_args(
+        Some("dry_run=true solver=dfsph"),
+        ["--solver", "xpbd:gpu", "--dry-run=false"],
+        true,
+    );
+
+    assert_eq!(args.solver.as_deref(), Some("xpbd:gpu"));
+    assert_eq!(args.dry_run, Some(false));
 }
 
 #[test]
@@ -2832,7 +2846,7 @@ fn profile_solver_backend(
 pub fn run_profile_from_env_args() {
     let cli = ProfilerCliArgs::from_env_args();
     let selection = ProfileSelection::from_cli(&cli);
-    if cli.dry_run {
+    if cli.dry_run.unwrap_or(false) {
         print!("{}", selection.dry_run_summary());
         return;
     }
