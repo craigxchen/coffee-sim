@@ -50,8 +50,8 @@ use super::inflow::{EmissionResult, MASS_UNITS_PER_ML, PARTICLES_PER_ML};
 use super::pressure::{PressureContext, PressureSolverKind};
 use super::state::{METRICS_SLOT_COUNT, NUM_THREADS};
 use super::{
-    dispatch_size, encode_mpm_substep_schedule, required_limits, MpmDispatchSizes, MpmPassLabel,
-    MpmScheduleOp, MpmSettings, MpmSim3D,
+    dispatch_size, encode_mpm_substep_schedule, required_limits, MpmDispatch, MpmDispatchSizes,
+    MpmPassLabel, MpmScheduleOp, MpmSettings, MpmSim3D,
 };
 
 const DEFAULT_WARMUP_FRAMES: u32 = 60;
@@ -186,7 +186,7 @@ fn timed_pass(
     bind_group: &wgpu::BindGroup,
     label: MpmPassLabel,
     pipeline: &wgpu::ComputePipeline,
-    workgroups: u32,
+    dispatch: MpmDispatch<'_>,
 ) {
     let timestamp_writes = rec.writes(label);
     let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -195,7 +195,12 @@ fn timed_pass(
     });
     pass.set_bind_group(0, bind_group, &[]);
     pass.set_pipeline(pipeline);
-    pass.dispatch_workgroups(workgroups, 1, 1);
+    match dispatch {
+        MpmDispatch::Direct(workgroups) => pass.dispatch_workgroups(workgroups, 1, 1),
+        MpmDispatch::Indirect { buffer, offset } => {
+            pass.dispatch_workgroups_indirect(buffer, offset);
+        }
+    }
 }
 
 // ── Per-frame accumulators ──
@@ -292,9 +297,9 @@ fn step_frame_instrumented(
             MpmScheduleOp::Pipeline {
                 label,
                 pipeline,
-                workgroups,
+                dispatch,
             } => {
-                timed_pass(&mut encoder, &mut rec, bg, label, pipeline, workgroups);
+                timed_pass(&mut encoder, &mut rec, bg, label, pipeline, dispatch);
             }
             MpmScheduleOp::PressureSolve {
                 label,
@@ -308,6 +313,15 @@ fn step_frame_instrumented(
                 });
                 pass.set_bind_group(0, bg, &[]);
                 pressure.encode_solve(&mut pass, ctx);
+            }
+            MpmScheduleOp::CopyBufferToBuffer {
+                src,
+                src_offset,
+                dst,
+                dst_offset,
+                size,
+            } => {
+                encoder.copy_buffer_to_buffer(src, src_offset, dst, dst_offset, size);
             }
         });
 
