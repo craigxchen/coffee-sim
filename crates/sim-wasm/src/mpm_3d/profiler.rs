@@ -353,14 +353,19 @@ fn parse_solver_specs(value: &str) -> Vec<SolverSpec> {
     if trimmed.eq_ignore_ascii_case("all") {
         return runnable_solver_specs();
     }
-    trimmed
+    let specs = trimmed
         .split(',')
         .filter(|part| !part.trim().is_empty())
         .map(|part| {
             part.parse::<SolverSpec>()
                 .unwrap_or_else(|err| panic!("{err}"))
         })
-        .collect()
+        .collect::<Vec<_>>();
+    assert!(
+        !specs.is_empty(),
+        "no profiler solvers selected; use a solver spec like mpm:rbgs, dfsph, xpbd:gpu, or all"
+    );
+    specs
 }
 
 // ── GPU timestamp ring ──
@@ -1645,17 +1650,13 @@ fn profile_solver_specs(cli: &ProfilerCliArgs) -> Vec<SolverSpec> {
         return parse_solver_specs(value);
     }
     if let Some(value) = cli.solver.as_deref() {
-        return vec![value
-            .parse::<SolverSpec>()
-            .unwrap_or_else(|err| panic!("{err}"))];
+        return parse_solver_specs(value);
     }
     if let Ok(value) = std::env::var("COFFEE_SIM_PROFILE_SOLVERS") {
         return parse_solver_specs(&value);
     }
     let solver = std::env::var("COFFEE_SIM_PROFILE_SOLVER").unwrap_or_else(|_| "rbgs".into());
-    vec![solver
-        .parse::<SolverSpec>()
-        .unwrap_or_else(|err| panic!("{err}"))]
+    parse_solver_specs(&solver)
 }
 
 fn runnable_solver_specs() -> Vec<SolverSpec> {
@@ -1800,6 +1801,12 @@ fn profiler_cli_solver_overrides_expand_to_specs() {
             },
         ]
     );
+}
+
+#[test]
+fn profiler_cli_singular_solver_all_expands_to_runnable_specs() {
+    let args = ProfilerCliArgs::parse(["--solver", "all"]).expect("profiler args parse");
+    assert_eq!(profile_solver_specs(&args), runnable_solver_specs());
 }
 
 #[test]
