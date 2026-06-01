@@ -259,9 +259,9 @@ struct ProfilerCliArgs {
     output: Option<PathBuf>,
     cg_iterations: Option<u32>,
     dry_run: Option<bool>,
-    dry_run_json: bool,
-    list_solvers: bool,
-    help: bool,
+    dry_run_json: Option<bool>,
+    list_solvers: Option<bool>,
+    help: Option<bool>,
 }
 
 impl ProfilerCliArgs {
@@ -377,9 +377,15 @@ impl ProfilerCliArgs {
                             .unwrap_or(true),
                     );
                 }
-                "--dry-run-json" => parsed.dry_run_json = true,
-                "--list-solvers" => parsed.list_solvers = true,
-                "--help" | "-h" => parsed.help = true,
+                "--dry-run-json" => {
+                    parsed.dry_run_json = Some(parse_optional_bool(inline_value.as_deref())?);
+                }
+                "--list-solvers" => {
+                    parsed.list_solvers = Some(parse_optional_bool(inline_value.as_deref())?);
+                }
+                "--help" | "-h" => {
+                    parsed.help = Some(parse_optional_bool(inline_value.as_deref())?);
+                }
                 other => {
                     return Err(format!(
                         "unknown profiler option '{other}'; supported options: \
@@ -403,9 +409,9 @@ impl ProfilerCliArgs {
         self.output = other.output.or(self.output.take());
         self.cg_iterations = other.cg_iterations.or(self.cg_iterations);
         self.dry_run = other.dry_run.or(self.dry_run);
-        self.dry_run_json = other.dry_run_json || self.dry_run_json;
-        self.list_solvers = other.list_solvers || self.list_solvers;
-        self.help = other.help || self.help;
+        self.dry_run_json = other.dry_run_json.or(self.dry_run_json);
+        self.list_solvers = other.list_solvers.or(self.list_solvers);
+        self.help = other.help.or(self.help);
     }
 }
 
@@ -425,6 +431,13 @@ fn parse_bool(value: &str) -> Result<bool, String> {
             "--dry-run must be a boolean when a value is provided, got '{other}'"
         )),
     }
+}
+
+fn parse_optional_bool(value: Option<&str>) -> Result<bool, String> {
+    value
+        .map(parse_bool)
+        .transpose()
+        .map(|value| value.unwrap_or(true))
 }
 
 fn env_u32(name: &str) -> Option<u32> {
@@ -2016,8 +2029,8 @@ fn profiler_cli_args_parse_key_value_and_separate_forms() {
 #[test]
 fn profiler_cli_discovery_flags_do_not_need_gpu() {
     let args = ProfilerCliArgs::parse(["--list-solvers", "--help"]).expect("profiler args parse");
-    assert!(args.list_solvers);
-    assert!(args.help);
+    assert_eq!(args.list_solvers, Some(true));
+    assert_eq!(args.help, Some(true));
 
     let solvers = solver_list_summary();
     assert!(solvers.contains("mpm:rbgs"));
@@ -2054,7 +2067,7 @@ fn profiler_cli_args_parse_kwargs_forms() {
     assert_eq!(args.output, Some(PathBuf::from("target/profile.json")));
     assert_eq!(args.cg_iterations, Some(9));
     assert_eq!(args.dry_run, Some(true));
-    assert!(args.dry_run_json);
+    assert_eq!(args.dry_run_json, Some(true));
 }
 
 #[test]
@@ -2183,7 +2196,7 @@ fn profiler_dry_run_json_is_machine_readable_same_scene_plan() {
         ],
         true,
     );
-    assert!(args.dry_run_json);
+    assert_eq!(args.dry_run_json, Some(true));
 
     let selection = ProfileSelection::from_cli_with_env(&args, |_| None);
     let value: serde_json::Value =
@@ -2281,6 +2294,23 @@ fn profiler_later_args_can_disable_dry_run() {
 
     assert_eq!(args.solver.as_deref(), Some("xpbd:gpu"));
     assert_eq!(args.dry_run, Some(false));
+}
+
+#[test]
+fn profiler_later_args_can_disable_discovery_flags() {
+    let args = ProfilerCliArgs::from_env_and_args(
+        Some("dry_run_json=true list_solvers=true help=true"),
+        [
+            "--dry-run-json=false",
+            "--list-solvers=false",
+            "--help=false",
+        ],
+        true,
+    );
+
+    assert_eq!(args.dry_run_json, Some(false));
+    assert_eq!(args.list_solvers, Some(false));
+    assert_eq!(args.help, Some(false));
 }
 
 #[test]
@@ -3024,16 +3054,16 @@ fn profile_solver_backend(
 
 pub fn run_profile_from_env_args() {
     let cli = ProfilerCliArgs::from_env_args();
-    if cli.help {
+    if cli.help.unwrap_or(false) {
         print!("{}", profiler_usage());
         return;
     }
-    if cli.list_solvers {
+    if cli.list_solvers.unwrap_or(false) {
         print!("{}", solver_list_summary());
         return;
     }
     let selection = ProfileSelection::from_cli(&cli);
-    if cli.dry_run_json {
+    if cli.dry_run_json.unwrap_or(false) {
         println!("{}", selection.dry_run_json());
         return;
     }
