@@ -181,15 +181,15 @@ impl MpmPassLabel {
 
 /// Device limits required by the MPM compute pipeline.
 ///
-/// The MPM bind group holds 11 storage buffers (particles, affine, grid,
+/// The MPM bind group holds 10 storage buffers (particles, affine, grid,
 /// pressure CG scratch, grid_vel, render_data, bed_extract, bed_lookup,
-/// bed_delta, metrics, and the DFSPH active-tile scratch) plus one SDF texture.
-/// Any
+/// bed_delta, metrics) plus one SDF texture. This stays within the 10-buffer
+/// cap that some WebGPU adapters enforce. Any
 /// `request_device` site that uses this pipeline must use these limits, and
 /// `mpm_pipelines_fit_within_required_limits` pins the invariant.
 pub(crate) fn required_limits() -> wgpu::Limits {
     wgpu::Limits {
-        max_storage_buffers_per_shader_stage: 11,
+        max_storage_buffers_per_shader_stage: 10,
         ..wgpu::Limits::default()
     }
 }

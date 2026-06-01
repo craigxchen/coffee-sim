@@ -232,14 +232,8 @@ pub(crate) struct RbgsPressureSolver {
     pub(crate) classify_cells: wgpu::ComputePipeline,
     pub(crate) pressure_rbgs_red: wgpu::ComputePipeline,
     pub(crate) pressure_rbgs_black: wgpu::ComputePipeline,
-    #[allow(dead_code)]
-    pub(crate) pressure_rbgs_red_tiles: wgpu::ComputePipeline,
-    #[allow(dead_code)]
-    pub(crate) pressure_rbgs_black_tiles: wgpu::ComputePipeline,
     pub(crate) project_pressure: wgpu::ComputePipeline,
     pub(crate) pressure_residual: wgpu::ComputePipeline,
-    #[allow(dead_code)]
-    pub(crate) pressure_residual_tiles: wgpu::ComputePipeline,
 }
 
 pub(crate) struct StagedStaggeredPressurePipelines {

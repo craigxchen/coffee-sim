@@ -836,16 +836,6 @@ fn step_frame_dfsph_instrumented(
         };
         let water_hash_wg = dispatch_size(total_cells + sim.settings.max_particles, NUM_THREADS);
         let water_wg = dispatch_size(sim.num_water, NUM_THREADS);
-        let pressure_tile_size = 4_u32;
-        let pressure_tile_dims = [
-            sim.settings.grid_dims[0].div_ceil(pressure_tile_size),
-            sim.settings.grid_dims[1].div_ceil(pressure_tile_size),
-            sim.settings.grid_dims[2].div_ceil(pressure_tile_size),
-        ];
-        let pressure_tile_count =
-            pressure_tile_dims[0] * pressure_tile_dims[1] * pressure_tile_dims[2];
-        let active_tile_clear_wg = dispatch_size(pressure_tile_count + 1, NUM_THREADS);
-        let active_tile_compact_wg = dispatch_size(pressure_tile_count, NUM_THREADS);
         let pressure_ctx = PressureContext {
             kind: sim.settings.pressure_solver,
             operator: sim.settings.pressure_operator,
@@ -999,26 +989,10 @@ fn step_frame_dfsph_instrumented(
         timed_pass(
             &mut encoder,
             &mut rec,
-            &dfsph.active_tile_bind_group,
-            MpmPassLabel::PressureClassify,
-            &dfsph.active_tile_clear,
-            MpmDispatch::Direct(active_tile_clear_wg),
-        );
-        timed_pass(
-            &mut encoder,
-            &mut rec,
             mpm_bg,
             MpmPassLabel::PressureClassify,
             sim.pipelines.pressure.classify_pipeline_for(pressure_ctx),
             MpmDispatch::Direct(dispatch.cell_wg),
-        );
-        timed_pass(
-            &mut encoder,
-            &mut rec,
-            &dfsph.active_tile_bind_group,
-            MpmPassLabel::PressureClassify,
-            &dfsph.active_tile_compact,
-            MpmDispatch::Direct(active_tile_compact_wg),
         );
         {
             let timestamp_writes = rec.writes_mpm(MpmPassLabel::PressureSolve);
@@ -1027,13 +1001,7 @@ fn step_frame_dfsph_instrumented(
                 timestamp_writes,
             });
             pass.set_bind_group(0, mpm_bg, &[]);
-            let pressure = &sim.pipelines.pressure.rbgs;
-            for _ in 0..pressure_pairs {
-                pass.set_pipeline(&pressure.pressure_rbgs_red_tiles);
-                pass.dispatch_workgroups_indirect(&sim.buffers.pressure_indirect, 0);
-                pass.set_pipeline(&pressure.pressure_rbgs_black_tiles);
-                pass.dispatch_workgroups_indirect(&sim.buffers.pressure_indirect, 0);
-            }
+            sim.pipelines.pressure.encode_solve(&mut pass, pressure_ctx);
         }
         timed_pass(
             &mut encoder,
@@ -1056,33 +1024,24 @@ fn step_frame_dfsph_instrumented(
             &mut rec,
             mpm_bg,
             MpmPassLabel::PressureResidual,
-            &sim.pipelines.pressure.rbgs.pressure_residual_tiles,
-            MpmDispatch::Indirect {
-                buffer: &sim.buffers.pressure_indirect,
-                offset: 0,
-            },
+            sim.pipelines.pressure.residual_pipeline_for(pressure_ctx),
+            MpmDispatch::Direct(dispatch.cell_wg),
         );
         timed_pass(
             &mut encoder,
             &mut rec,
             mpm_bg,
             MpmPassLabel::PackingPrepare,
-            &common.packing_prepare_tiles,
-            MpmDispatch::Indirect {
-                buffer: &sim.buffers.pressure_indirect,
-                offset: 0,
-            },
+            &common.packing_prepare,
+            MpmDispatch::Direct(dispatch.cell_wg),
         );
         timed_pass(
             &mut encoder,
             &mut rec,
             mpm_bg,
             MpmPassLabel::PackingApply,
-            &common.packing_apply_tiles,
-            MpmDispatch::Indirect {
-                buffer: &sim.buffers.pressure_indirect,
-                offset: 0,
-            },
+            &common.packing_apply,
+            MpmDispatch::Direct(dispatch.cell_wg),
         );
         timed_pass(
             &mut encoder,
@@ -1781,7 +1740,7 @@ fn xpbd_profiled_gpu_passes_per_substep() -> u32 {
 
 fn dfsph_profiler_timestamp_query_capacity(substeps: u32) -> u32 {
     // Worst-case instrumented DFSPH substep: DFSPH neighbor/constraint passes
-    // plus shared MPM grid/bed/render tail and tiled pressure/packing passes.
+    // plus the shared dense MPM grid/pressure/bed/render tail.
     let passes_per_substep = 40;
     (substeps.max(1) * passes_per_substep * 2).max(MIN_TIMESTAMP_QUERY_CAPACITY)
 }
@@ -1893,7 +1852,7 @@ fn profiler_xpbd_schedule_refreshes_hash_and_splits_density_apply() {
 }
 
 #[test]
-fn profiler_dfsph_timestamp_capacity_covers_tiled_pressure_schedule() {
+fn profiler_dfsph_timestamp_capacity_covers_shared_pressure_schedule() {
     assert!(dfsph_profiler_timestamp_query_capacity(1) >= 80);
     assert!(dfsph_profiler_timestamp_query_capacity(2) >= 160);
 }
@@ -2334,7 +2293,7 @@ fn profile_dfsph_solver(
     let mut bottlenecks = top_pass_bottlenecks(&gpu_passes);
     bottlenecks.push(
         "DFSPH backend profiles GPU water pressure correction plus the shared MPM grid/bed/render tail; \
-         the grid pressure/residual/packing tail uses the tiled sparse pressure path ported from codex/dfsph-water."
+         DFSPH active pressure-tile compaction is staged separately and is not wired into the shared MPM shader."
             .to_string(),
     );
 
@@ -2525,11 +2484,6 @@ fn profile_mpm_pipeline() {
         .parse::<ProfileScene>()
         .unwrap_or_else(|err| panic!("{err}"));
     let solvers = profile_solver_specs(&cli);
-    let solver_ids = solvers
-        .iter()
-        .copied()
-        .map(SolverSpec::id)
-        .collect::<Vec<_>>();
     let pressure_operator = cli
         .pressure_operator
         .clone()
@@ -2537,6 +2491,17 @@ fn profile_mpm_pipeline() {
         .unwrap_or_else(|| PressureOperatorKind::Collocated.to_string())
         .parse::<PressureOperatorKind>()
         .unwrap_or_else(|err| panic!("{err}"));
+    for solver in &solvers {
+        assert!(
+            solver.supports_pressure_operator(pressure_operator),
+            "solver '{solver}' does not support pressure_operator='{pressure_operator}'; use mpm:jacobi-cg for the staggered operator"
+        );
+    }
+    let solver_ids = solvers
+        .iter()
+        .copied()
+        .map(SolverSpec::id)
+        .collect::<Vec<_>>();
     let warmup = cli
         .warmup
         .or_else(|| env_u32("COFFEE_SIM_PROFILE_WARMUP"))
