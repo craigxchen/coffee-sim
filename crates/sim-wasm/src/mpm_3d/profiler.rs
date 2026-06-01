@@ -1976,6 +1976,45 @@ fn profiler_native_raw_cli_args_select_all_solvers_on_one_scene() {
 }
 
 #[test]
+fn profiler_all_solvers_share_selected_scene_settings() {
+    let base = PathBuf::from("target/profile.json");
+    let scene = ProfileScene::FreeStream;
+    let scene_settings = scene.mpm_settings();
+    let run = ProfilerRunConfig {
+        scene,
+        warmup: 1,
+        measured: 1,
+        calibration: 1,
+        cg_iterations: None,
+        pressure_operator: PressureOperatorKind::Collocated,
+        solver_ids: runnable_solver_specs()
+            .into_iter()
+            .map(SolverSpec::id)
+            .collect(),
+        base_output_path: &base,
+        multiple_outputs: true,
+    };
+
+    for solver in runnable_solver_specs() {
+        let settings = settings_for_solver(solver, &run);
+        assert_eq!(settings.grid_dims, scene_settings.grid_dims, "{solver}");
+        assert_eq!(settings.substeps, scene_settings.substeps, "{solver}");
+        assert_eq!(
+            settings.max_particles, scene_settings.max_particles,
+            "{solver}"
+        );
+        assert_eq!(
+            settings.pressure_rbgs_pairs, scene_settings.pressure_rbgs_pairs,
+            "{solver}"
+        );
+        assert_eq!(
+            settings.pressure_cg_iterations, scene_settings.pressure_cg_iterations,
+            "{solver}"
+        );
+    }
+}
+
+#[test]
 fn profiler_harness_args_require_profile_sentinel() {
     let ignored_harness_args =
         ProfilerCliArgs::from_env_and_args(None, ["--solver", "xpbd:gpu"], false);
