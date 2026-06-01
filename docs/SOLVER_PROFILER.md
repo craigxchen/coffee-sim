@@ -38,7 +38,8 @@ with no native adapter prints a skip message so regular non-GPU development
 does not fail. After a measured run, use `--verify-reports`,
 `verify_reports=true`, or `COFFEE_SIM_PROFILE_VERIFY_REPORTS=true` with the
 same scene, solver, frame, and output arguments to verify that every emitted
-JSON report belongs to the requested same-scene solver set.
+JSON report belongs to the requested same-scene solver set and print a compact
+production/GPU-time comparison table.
 
 Runnable solver specs are:
 
