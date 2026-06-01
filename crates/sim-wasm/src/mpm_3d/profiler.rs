@@ -1723,16 +1723,28 @@ impl FromStr for ProfileScene {
 }
 
 fn profile_solver_specs(cli: &ProfilerCliArgs) -> Vec<SolverSpec> {
+    profile_solver_specs_with_env(
+        cli,
+        std::env::var("COFFEE_SIM_PROFILE_SOLVERS").ok(),
+        std::env::var("COFFEE_SIM_PROFILE_SOLVER").ok(),
+    )
+}
+
+fn profile_solver_specs_with_env(
+    cli: &ProfilerCliArgs,
+    solvers_env: Option<String>,
+    solver_env: Option<String>,
+) -> Vec<SolverSpec> {
     if let Some(value) = cli.solvers.as_deref() {
         return parse_solver_specs(value);
     }
     if let Some(value) = cli.solver.as_deref() {
         return parse_solver_specs(value);
     }
-    if let Ok(value) = std::env::var("COFFEE_SIM_PROFILE_SOLVERS") {
+    if let Some(value) = solvers_env {
         return parse_solver_specs(&value);
     }
-    let solver = std::env::var("COFFEE_SIM_PROFILE_SOLVER").unwrap_or_else(|_| "rbgs".into());
+    let solver = solver_env.unwrap_or_else(|| "rbgs".into());
     parse_solver_specs(&solver)
 }
 
@@ -1759,10 +1771,14 @@ fn dfsph_profiler_timestamp_query_capacity(substeps: u32) -> u32 {
 }
 
 fn output_path(cli: &ProfilerCliArgs) -> PathBuf {
+    output_path_with_env(cli, std::env::var("COFFEE_SIM_PROFILE_OUT").ok())
+}
+
+fn output_path_with_env(cli: &ProfilerCliArgs, output_env: Option<String>) -> PathBuf {
     if let Some(path) = cli.output.as_ref() {
         return path.clone();
     }
-    if let Ok(p) = std::env::var("COFFEE_SIM_PROFILE_OUT") {
+    if let Some(p) = output_env {
         return PathBuf::from(p);
     }
     PathBuf::from(concat!(
@@ -1973,6 +1989,49 @@ fn profiler_native_raw_cli_args_select_all_solvers_on_one_scene() {
         PathBuf::from("target/native-profile.json")
     );
     assert!(selection.multiple_outputs);
+}
+
+#[test]
+fn profiler_env_solver_selection_uses_same_scene_path() {
+    let args = ProfilerCliArgs::from_env_and_args(
+        Some("scene=water_block frames=5 warmup=4 cal=3"),
+        std::iter::empty::<&str>(),
+        false,
+    );
+    let selection = ProfileSelection::from_cli_with_env(&args, |name| match name {
+        "COFFEE_SIM_PROFILE_SOLVERS" => Some("all".to_string()),
+        "COFFEE_SIM_PROFILE_OUT" => Some("target/env-profile.json".to_string()),
+        _ => None,
+    });
+
+    assert_eq!(selection.scene, ProfileScene::WaterBlock);
+    assert_eq!(selection.solvers, runnable_solver_specs());
+    assert_eq!(selection.warmup, 4);
+    assert_eq!(selection.measured, 5);
+    assert_eq!(selection.calibration, 3);
+    assert_eq!(
+        selection.base_output_path,
+        PathBuf::from("target/env-profile.json")
+    );
+    assert!(selection.multiple_outputs);
+}
+
+#[test]
+fn profiler_cli_solver_overrides_solver_env() {
+    let args = ProfilerCliArgs::parse(["--solver", "xpbd:gpu"]).expect("profiler args parse");
+    let selection = ProfileSelection::from_cli_with_env(&args, |name| match name {
+        "COFFEE_SIM_PROFILE_SOLVERS" => Some("all".to_string()),
+        "COFFEE_SIM_PROFILE_SOLVER" => Some("dfsph".to_string()),
+        _ => None,
+    });
+
+    assert_eq!(
+        selection.solvers,
+        vec![SolverSpec::Xpbd {
+            solver: XpbdSolverKind::Gpu
+        }]
+    );
+    assert!(!selection.multiple_outputs);
 }
 
 #[test]
@@ -2205,10 +2264,13 @@ impl ProfileSelection {
     {
         let scene_env = get_env("COFFEE_SIM_PROFILE_SCENE");
         let pressure_operator_env = get_env("COFFEE_SIM_PROFILE_PRESSURE_OPERATOR");
+        let solvers_env = get_env("COFFEE_SIM_PROFILE_SOLVERS");
+        let solver_env = get_env("COFFEE_SIM_PROFILE_SOLVER");
         let warmup_env = get_env("COFFEE_SIM_PROFILE_WARMUP");
         let frames_env = get_env("COFFEE_SIM_PROFILE_FRAMES");
         let calibration_env = get_env("COFFEE_SIM_PROFILE_CAL");
         let cg_iterations_env = get_env("COFFEE_SIM_PROFILE_CG_ITERATIONS");
+        let output_env = get_env("COFFEE_SIM_PROFILE_OUT");
 
         let scene = cli
             .scene
@@ -2217,7 +2279,7 @@ impl ProfileSelection {
             .unwrap_or_else(|| "center_pour".into())
             .parse::<ProfileScene>()
             .unwrap_or_else(|err| panic!("{err}"));
-        let solvers = profile_solver_specs(cli);
+        let solvers = profile_solver_specs_with_env(cli, solvers_env, solver_env);
         let pressure_operator = cli
             .pressure_operator
             .clone()
@@ -2248,7 +2310,7 @@ impl ProfileSelection {
             .calibration
             .or_else(|| env_u32_value(calibration_env))
             .unwrap_or(DEFAULT_CALIBRATION_FRAMES);
-        let base_output_path = output_path(cli);
+        let base_output_path = output_path_with_env(cli, output_env);
         let multiple_outputs = solvers.len() > 1;
         Self {
             scene,
