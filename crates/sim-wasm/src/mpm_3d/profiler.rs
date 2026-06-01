@@ -1296,6 +1296,130 @@ struct ProfileReport {
     bottlenecks: Vec<String>,
 }
 
+struct ProfileMeasurements {
+    wall_ms: Vec<f64>,
+    gpu_passes_sum: Vec<f64>,
+    gpu_wait: Vec<f64>,
+    gpu_unattributed: Vec<f64>,
+    cpu_emit: Vec<f64>,
+    cpu_uniforms: Vec<f64>,
+    cpu_encode: Vec<f64>,
+    cpu_submit: Vec<f64>,
+    per_label: BTreeMap<String, Vec<f64>>,
+    label_dispatch_count: BTreeMap<String, u64>,
+    label_meta: BTreeMap<String, ProfilePassMeta>,
+}
+
+impl ProfileMeasurements {
+    fn with_capacity(frames: u32) -> Self {
+        let capacity = frames as usize;
+        Self {
+            wall_ms: Vec::with_capacity(capacity),
+            gpu_passes_sum: Vec::with_capacity(capacity),
+            gpu_wait: Vec::with_capacity(capacity),
+            gpu_unattributed: Vec::with_capacity(capacity),
+            cpu_emit: Vec::with_capacity(capacity),
+            cpu_uniforms: Vec::with_capacity(capacity),
+            cpu_encode: Vec::with_capacity(capacity),
+            cpu_submit: Vec::with_capacity(capacity),
+            per_label: BTreeMap::new(),
+            label_dispatch_count: BTreeMap::new(),
+            label_meta: BTreeMap::new(),
+        }
+    }
+
+    fn record(&mut self, wall_ms: f64, sums: FrameSums) {
+        self.wall_ms.push(wall_ms);
+        self.gpu_passes_sum.push(sums.gpu_passes_ms);
+        self.gpu_wait.push(sums.gpu_wait_ms);
+        self.gpu_unattributed
+            .push((sums.gpu_wait_ms - sums.gpu_passes_ms).max(0.0));
+        self.cpu_emit.push(sums.cpu_emit_ms);
+        self.cpu_uniforms.push(sums.cpu_uniforms_ms);
+        self.cpu_encode.push(sums.cpu_encode_ms);
+        self.cpu_submit.push(sums.cpu_submit_ms);
+        for (label, value) in sums.per_label_ms {
+            self.per_label.entry(label).or_default().push(value);
+        }
+        for (label, count) in sums.per_label_count {
+            *self.label_dispatch_count.entry(label).or_insert(0) += count as u64;
+        }
+        for (label, meta) in sums.per_label_meta {
+            self.label_meta.entry(label).or_insert(meta);
+        }
+    }
+
+    fn finish(
+        self,
+        production_ms: Vec<f64>,
+        measured_frames: u32,
+    ) -> (FrameTimings, Vec<PassStat>) {
+        let total_pass_mean: f64 = self
+            .per_label
+            .values()
+            .map(|v| v.iter().sum::<f64>() / v.len().max(1) as f64)
+            .sum();
+        let mut gpu_passes: Vec<PassStat> = self
+            .per_label
+            .into_iter()
+            .map(|(label, samples)| {
+                let stat = Stat::from_samples(samples);
+                let passes = *self.label_dispatch_count.get(&label).unwrap_or(&0) as f64
+                    / measured_frames.max(1) as f64;
+                let meta = self
+                    .label_meta
+                    .get(&label)
+                    .expect("profile label metadata recorded with samples");
+                PassStat {
+                    label,
+                    display_label: meta.display.clone(),
+                    category: meta.category.clone(),
+                    passes_per_frame: passes,
+                    share_of_gpu_pct: if total_pass_mean > 0.0 {
+                        stat.mean_ms / total_pass_mean * 100.0
+                    } else {
+                        0.0
+                    },
+                    mean_ms: stat.mean_ms,
+                    min_ms: stat.min_ms,
+                    max_ms: stat.max_ms,
+                    p50_ms: stat.p50_ms,
+                    p95_ms: stat.p95_ms,
+                    total_ms: stat.total_ms,
+                }
+            })
+            .collect();
+        gpu_passes.sort_by(|a, b| b.mean_ms.total_cmp(&a.mean_ms));
+
+        let frame_timings = FrameTimings {
+            production_frame: Stat::from_samples(production_ms),
+            instrumented_wall: Stat::from_samples(self.wall_ms),
+            gpu_passes_sum: Stat::from_samples(self.gpu_passes_sum),
+            gpu_wait: Stat::from_samples(self.gpu_wait),
+            gpu_unattributed: Stat::from_samples(self.gpu_unattributed),
+            cpu_emit: Stat::from_samples(self.cpu_emit),
+            cpu_uniforms: Stat::from_samples(self.cpu_uniforms),
+            cpu_encode: Stat::from_samples(self.cpu_encode),
+            cpu_submit: Stat::from_samples(self.cpu_submit),
+        };
+
+        (frame_timings, gpu_passes)
+    }
+}
+
+fn top_pass_bottlenecks(gpu_passes: &[PassStat]) -> Vec<String> {
+    gpu_passes
+        .iter()
+        .take(5)
+        .map(|pass| {
+            format!(
+                "{}: {:.3} ms/frame ({:.1}% of GPU pass time, {:.0} passes/frame)",
+                pass.label, pass.mean_ms, pass.share_of_gpu_pct, pass.passes_per_frame
+            )
+        })
+        .collect()
+}
+
 // ── Device setup ──
 
 fn request_adapter() -> Option<wgpu::Adapter> {
@@ -1387,6 +1511,9 @@ fn runnable_solver_specs() -> Vec<SolverSpec> {
         .map(SolverSpec::mpm)
         .collect();
     specs.push(SolverSpec::Dfsph);
+    specs.push(SolverSpec::Xpbd {
+        solver: XpbdSolverKind::Gpu,
+    });
     specs
 }
 
@@ -1460,13 +1587,16 @@ fn profiler_all_expands_to_runnable_gpu_solver_specs() {
             SolverSpec::mpm(PressureSolverKind::JacobiCg),
             SolverSpec::mpm(PressureSolverKind::SparseCg),
             SolverSpec::Dfsph,
+            SolverSpec::Xpbd {
+                solver: XpbdSolverKind::Gpu
+            },
         ]
     );
     assert!(
-        !runnable_solver_specs()
+        runnable_solver_specs()
             .iter()
             .any(|solver| matches!(solver, SolverSpec::Xpbd { .. })),
-        "XPBD GPU path must stay out of `all` until its physics and browser parity are validated"
+        "XPBD GPU path should be included in `all` so same-scene solver comparisons do not require code changes"
     );
 }
 
@@ -1620,96 +1750,19 @@ fn profile_mpm_solver(
     let timer = ctx
         .timestamps_supported
         .then(|| GpuTimer::new(ctx.device, ctx.period_ns, query_capacity));
-    let mut wall_ms = Vec::with_capacity(run.measured as usize);
-    let mut gpu_passes_sum = Vec::with_capacity(run.measured as usize);
-    let mut gpu_wait = Vec::with_capacity(run.measured as usize);
-    let mut gpu_unattributed = Vec::with_capacity(run.measured as usize);
-    let mut cpu_emit = Vec::with_capacity(run.measured as usize);
-    let mut cpu_uniforms = Vec::with_capacity(run.measured as usize);
-    let mut cpu_encode = Vec::with_capacity(run.measured as usize);
-    let mut cpu_submit = Vec::with_capacity(run.measured as usize);
-    let mut per_label: BTreeMap<String, Vec<f64>> = BTreeMap::new();
-    let mut label_dispatch_count: BTreeMap<String, u64> = BTreeMap::new();
-    let mut label_meta: BTreeMap<String, ProfilePassMeta> = BTreeMap::new();
+    let mut measurements = ProfileMeasurements::with_capacity(run.measured);
 
     let water_particles_start = sim.num_water;
     for _ in 0..run.measured {
         let t = Instant::now();
         let sums =
             step_frame_instrumented(&mut sim, ctx.device, ctx.queue, FRAME_DT, timer.as_ref());
-        wall_ms.push(ms(t));
-        gpu_passes_sum.push(sums.gpu_passes_ms);
-        gpu_wait.push(sums.gpu_wait_ms);
-        gpu_unattributed.push((sums.gpu_wait_ms - sums.gpu_passes_ms).max(0.0));
-        cpu_emit.push(sums.cpu_emit_ms);
-        cpu_uniforms.push(sums.cpu_uniforms_ms);
-        cpu_encode.push(sums.cpu_encode_ms);
-        cpu_submit.push(sums.cpu_submit_ms);
-        for (label, value) in sums.per_label_ms {
-            per_label.entry(label).or_default().push(value);
-        }
-        for (label, count) in sums.per_label_count {
-            *label_dispatch_count.entry(label).or_insert(0) += count as u64;
-        }
-        for (label, meta) in sums.per_label_meta {
-            label_meta.entry(label).or_insert(meta);
-        }
+        measurements.record(ms(t), sums);
     }
     let water_particles_end = sim.num_water;
+    let (frame_timings, gpu_passes) = measurements.finish(production_ms, run.measured);
 
-    let total_pass_mean: f64 = per_label
-        .values()
-        .map(|v| v.iter().sum::<f64>() / v.len().max(1) as f64)
-        .sum();
-    let mut gpu_passes: Vec<PassStat> = per_label
-        .into_iter()
-        .map(|(label, samples)| {
-            let stat = Stat::from_samples(samples);
-            let passes =
-                *label_dispatch_count.get(&label).unwrap_or(&0) as f64 / run.measured.max(1) as f64;
-            let meta = label_meta
-                .get(&label)
-                .expect("profile label metadata recorded with samples");
-            PassStat {
-                label,
-                display_label: meta.display.clone(),
-                category: meta.category.clone(),
-                passes_per_frame: passes,
-                share_of_gpu_pct: if total_pass_mean > 0.0 {
-                    stat.mean_ms / total_pass_mean * 100.0
-                } else {
-                    0.0
-                },
-                mean_ms: stat.mean_ms,
-                min_ms: stat.min_ms,
-                max_ms: stat.max_ms,
-                p50_ms: stat.p50_ms,
-                p95_ms: stat.p95_ms,
-                total_ms: stat.total_ms,
-            }
-        })
-        .collect();
-    gpu_passes.sort_by(|a, b| b.mean_ms.total_cmp(&a.mean_ms));
-
-    let frame_timings = FrameTimings {
-        production_frame: Stat::from_samples(production_ms),
-        instrumented_wall: Stat::from_samples(wall_ms),
-        gpu_passes_sum: Stat::from_samples(gpu_passes_sum),
-        gpu_wait: Stat::from_samples(gpu_wait),
-        gpu_unattributed: Stat::from_samples(gpu_unattributed),
-        cpu_emit: Stat::from_samples(cpu_emit),
-        cpu_uniforms: Stat::from_samples(cpu_uniforms),
-        cpu_encode: Stat::from_samples(cpu_encode),
-        cpu_submit: Stat::from_samples(cpu_submit),
-    };
-
-    let mut bottlenecks = Vec::new();
-    for pass in gpu_passes.iter().take(5) {
-        bottlenecks.push(format!(
-            "{}: {:.3} ms/frame ({:.1}% of GPU pass time, {:.0} passes/frame)",
-            pass.label, pass.mean_ms, pass.share_of_gpu_pct, pass.passes_per_frame
-        ));
-    }
+    let mut bottlenecks = top_pass_bottlenecks(&gpu_passes);
     let cpu_total = frame_timings.cpu_emit.mean_ms
         + frame_timings.cpu_uniforms.mean_ms
         + frame_timings.cpu_encode.mean_ms
@@ -1797,17 +1850,7 @@ fn profile_dfsph_solver(
     let timer = ctx
         .timestamps_supported
         .then(|| GpuTimer::new(ctx.device, ctx.period_ns, MIN_TIMESTAMP_QUERY_CAPACITY));
-    let mut wall_ms = Vec::with_capacity(run.measured as usize);
-    let mut gpu_passes_sum = Vec::with_capacity(run.measured as usize);
-    let mut gpu_wait = Vec::with_capacity(run.measured as usize);
-    let mut gpu_unattributed = Vec::with_capacity(run.measured as usize);
-    let mut cpu_emit = Vec::with_capacity(run.measured as usize);
-    let mut cpu_uniforms = Vec::with_capacity(run.measured as usize);
-    let mut cpu_encode = Vec::with_capacity(run.measured as usize);
-    let mut cpu_submit = Vec::with_capacity(run.measured as usize);
-    let mut per_label: BTreeMap<String, Vec<f64>> = BTreeMap::new();
-    let mut label_dispatch_count: BTreeMap<String, u64> = BTreeMap::new();
-    let mut label_meta: BTreeMap<String, ProfilePassMeta> = BTreeMap::new();
+    let mut measurements = ProfileMeasurements::with_capacity(run.measured);
 
     let water_particles_start = sim.num_water;
     for _ in 0..run.measured {
@@ -1819,79 +1862,12 @@ fn profile_dfsph_solver(
             FRAME_DT,
             timer.as_ref(),
         );
-        wall_ms.push(ms(t));
-        gpu_passes_sum.push(sums.gpu_passes_ms);
-        gpu_wait.push(sums.gpu_wait_ms);
-        gpu_unattributed.push((sums.gpu_wait_ms - sums.gpu_passes_ms).max(0.0));
-        cpu_emit.push(sums.cpu_emit_ms);
-        cpu_uniforms.push(sums.cpu_uniforms_ms);
-        cpu_encode.push(sums.cpu_encode_ms);
-        cpu_submit.push(sums.cpu_submit_ms);
-        for (label, value) in sums.per_label_ms {
-            per_label.entry(label).or_default().push(value);
-        }
-        for (label, count) in sums.per_label_count {
-            *label_dispatch_count.entry(label).or_insert(0) += count as u64;
-        }
-        for (label, meta) in sums.per_label_meta {
-            label_meta.entry(label).or_insert(meta);
-        }
+        measurements.record(ms(t), sums);
     }
     let water_particles_end = sim.num_water;
+    let (frame_timings, gpu_passes) = measurements.finish(production_ms, run.measured);
 
-    let total_pass_mean: f64 = per_label
-        .values()
-        .map(|v| v.iter().sum::<f64>() / v.len().max(1) as f64)
-        .sum();
-    let mut gpu_passes: Vec<PassStat> = per_label
-        .into_iter()
-        .map(|(label, samples)| {
-            let stat = Stat::from_samples(samples);
-            let passes =
-                *label_dispatch_count.get(&label).unwrap_or(&0) as f64 / run.measured.max(1) as f64;
-            let meta = label_meta
-                .get(&label)
-                .expect("profile label metadata recorded with samples");
-            PassStat {
-                label,
-                display_label: meta.display.clone(),
-                category: meta.category.clone(),
-                passes_per_frame: passes,
-                share_of_gpu_pct: if total_pass_mean > 0.0 {
-                    stat.mean_ms / total_pass_mean * 100.0
-                } else {
-                    0.0
-                },
-                mean_ms: stat.mean_ms,
-                min_ms: stat.min_ms,
-                max_ms: stat.max_ms,
-                p50_ms: stat.p50_ms,
-                p95_ms: stat.p95_ms,
-                total_ms: stat.total_ms,
-            }
-        })
-        .collect();
-    gpu_passes.sort_by(|a, b| b.mean_ms.total_cmp(&a.mean_ms));
-
-    let frame_timings = FrameTimings {
-        production_frame: Stat::from_samples(production_ms),
-        instrumented_wall: Stat::from_samples(wall_ms),
-        gpu_passes_sum: Stat::from_samples(gpu_passes_sum),
-        gpu_wait: Stat::from_samples(gpu_wait),
-        gpu_unattributed: Stat::from_samples(gpu_unattributed),
-        cpu_emit: Stat::from_samples(cpu_emit),
-        cpu_uniforms: Stat::from_samples(cpu_uniforms),
-        cpu_encode: Stat::from_samples(cpu_encode),
-        cpu_submit: Stat::from_samples(cpu_submit),
-    };
-
-    let mut bottlenecks = Vec::new();
-    for pass in gpu_passes.iter().take(5) {
-        bottlenecks.push(format!(
-            "{}: {:.3} ms/frame ({:.1}% of GPU pass time, {:.0} passes/frame)",
-            pass.label, pass.mean_ms, pass.share_of_gpu_pct, pass.passes_per_frame
-        ));
-    }
+    let mut bottlenecks = top_pass_bottlenecks(&gpu_passes);
     bottlenecks.push(
         "DFSPH backend profiles GPU water pressure correction plus the shared MPM grid/bed/render tail; \
          tiled pressure projection from codex/dfsph-water remains a future sparse optimization."
@@ -1978,17 +1954,7 @@ fn profile_xpbd_solver(
     let timer = ctx
         .timestamps_supported
         .then(|| GpuTimer::new(ctx.device, ctx.period_ns, query_capacity));
-    let mut wall_ms = Vec::with_capacity(run.measured as usize);
-    let mut gpu_passes_sum = Vec::with_capacity(run.measured as usize);
-    let mut gpu_wait = Vec::with_capacity(run.measured as usize);
-    let mut gpu_unattributed = Vec::with_capacity(run.measured as usize);
-    let mut cpu_emit = Vec::with_capacity(run.measured as usize);
-    let mut cpu_uniforms = Vec::with_capacity(run.measured as usize);
-    let mut cpu_encode = Vec::with_capacity(run.measured as usize);
-    let mut cpu_submit = Vec::with_capacity(run.measured as usize);
-    let mut per_label: BTreeMap<String, Vec<f64>> = BTreeMap::new();
-    let mut label_dispatch_count: BTreeMap<String, u64> = BTreeMap::new();
-    let mut label_meta: BTreeMap<String, ProfilePassMeta> = BTreeMap::new();
+    let mut measurements = ProfileMeasurements::with_capacity(run.measured);
 
     let water_particles_start = sim.num_water;
     for _ in 0..run.measured {
@@ -2001,83 +1967,16 @@ fn profile_xpbd_solver(
             FRAME_DT,
             timer.as_ref(),
         );
-        wall_ms.push(ms(t));
-        gpu_passes_sum.push(sums.gpu_passes_ms);
-        gpu_wait.push(sums.gpu_wait_ms);
-        gpu_unattributed.push((sums.gpu_wait_ms - sums.gpu_passes_ms).max(0.0));
-        cpu_emit.push(sums.cpu_emit_ms);
-        cpu_uniforms.push(sums.cpu_uniforms_ms);
-        cpu_encode.push(sums.cpu_encode_ms);
-        cpu_submit.push(sums.cpu_submit_ms);
-        for (label, value) in sums.per_label_ms {
-            per_label.entry(label).or_default().push(value);
-        }
-        for (label, count) in sums.per_label_count {
-            *label_dispatch_count.entry(label).or_insert(0) += count as u64;
-        }
-        for (label, meta) in sums.per_label_meta {
-            label_meta.entry(label).or_insert(meta);
-        }
+        measurements.record(ms(t), sums);
     }
     let water_particles_end = sim.num_water;
+    let (frame_timings, gpu_passes) = measurements.finish(production_ms, run.measured);
 
-    let total_pass_mean: f64 = per_label
-        .values()
-        .map(|v| v.iter().sum::<f64>() / v.len().max(1) as f64)
-        .sum();
-    let mut gpu_passes: Vec<PassStat> = per_label
-        .into_iter()
-        .map(|(label, samples)| {
-            let stat = Stat::from_samples(samples);
-            let passes =
-                *label_dispatch_count.get(&label).unwrap_or(&0) as f64 / run.measured.max(1) as f64;
-            let meta = label_meta
-                .get(&label)
-                .expect("profile label metadata recorded with samples");
-            PassStat {
-                label,
-                display_label: meta.display.clone(),
-                category: meta.category.clone(),
-                passes_per_frame: passes,
-                share_of_gpu_pct: if total_pass_mean > 0.0 {
-                    stat.mean_ms / total_pass_mean * 100.0
-                } else {
-                    0.0
-                },
-                mean_ms: stat.mean_ms,
-                min_ms: stat.min_ms,
-                max_ms: stat.max_ms,
-                p50_ms: stat.p50_ms,
-                p95_ms: stat.p95_ms,
-                total_ms: stat.total_ms,
-            }
-        })
-        .collect();
-    gpu_passes.sort_by(|a, b| b.mean_ms.total_cmp(&a.mean_ms));
-
-    let frame_timings = FrameTimings {
-        production_frame: Stat::from_samples(production_ms),
-        instrumented_wall: Stat::from_samples(wall_ms),
-        gpu_passes_sum: Stat::from_samples(gpu_passes_sum),
-        gpu_wait: Stat::from_samples(gpu_wait),
-        gpu_unattributed: Stat::from_samples(gpu_unattributed),
-        cpu_emit: Stat::from_samples(cpu_emit),
-        cpu_uniforms: Stat::from_samples(cpu_uniforms),
-        cpu_encode: Stat::from_samples(cpu_encode),
-        cpu_submit: Stat::from_samples(cpu_submit),
-    };
-
-    let mut bottlenecks = Vec::new();
-    for pass in gpu_passes.iter().take(5) {
-        bottlenecks.push(format!(
-            "{}: {:.3} ms/frame ({:.1}% of GPU pass time, {:.0} passes/frame)",
-            pass.label, pass.mean_ms, pass.share_of_gpu_pct, pass.passes_per_frame
-        ));
-    }
+    let mut bottlenecks = top_pass_bottlenecks(&gpu_passes);
     bottlenecks.push(
         "XPBD backend uses GPU prediction, spatial hash, density constraints, bounds constraints, \
-         and velocity update over the shared particle buffers; it remains excluded from `all` until \
-         its physics and parity against the app path are validated."
+         and velocity update over the shared particle buffers; browser parity and physical validation \
+         remain the next gates before treating it as production-equivalent."
             .to_string(),
     );
 
