@@ -260,6 +260,7 @@ struct ProfilerCliArgs {
     cg_iterations: Option<u32>,
     dry_run: Option<bool>,
     dry_run_json: Option<bool>,
+    require_gpu: Option<bool>,
     list_solvers: Option<bool>,
     help: Option<bool>,
 }
@@ -333,6 +334,7 @@ impl ProfilerCliArgs {
                 "cg_iterations" | "cg-iterations" => "--cg-iterations".to_string(),
                 "dry_run" | "dry-run" => "--dry-run".to_string(),
                 "dry_run_json" | "dry-run-json" => "--dry-run-json".to_string(),
+                "require_gpu" | "require-gpu" => "--require-gpu".to_string(),
                 "list_solvers" | "list-solvers" => "--list-solvers".to_string(),
                 "help" => "--help".to_string(),
                 _ => flag,
@@ -380,6 +382,9 @@ impl ProfilerCliArgs {
                 "--dry-run-json" => {
                     parsed.dry_run_json = Some(parse_optional_bool(inline_value.as_deref())?);
                 }
+                "--require-gpu" => {
+                    parsed.require_gpu = Some(parse_optional_bool(inline_value.as_deref())?);
+                }
                 "--list-solvers" => {
                     parsed.list_solvers = Some(parse_optional_bool(inline_value.as_deref())?);
                 }
@@ -389,8 +394,8 @@ impl ProfilerCliArgs {
                 other => {
                     return Err(format!(
                         "unknown profiler option '{other}'; supported options: \
-                         --scene, --solver, --solvers, --pressure-operator, --warmup, --frames, --cal, --out, --cg-iterations, --dry-run, --dry-run-json, --list-solvers, --help, \
-                         or kwargs scene=, solver=, solvers=, pressure_operator=, warmup=, frames=, cal=, out=, cg_iterations=, dry_run=, dry_run_json=, list_solvers=, help="
+                         --scene, --solver, --solvers, --pressure-operator, --warmup, --frames, --cal, --out, --cg-iterations, --dry-run, --dry-run-json, --require-gpu, --list-solvers, --help, \
+                         or kwargs scene=, solver=, solvers=, pressure_operator=, warmup=, frames=, cal=, out=, cg_iterations=, dry_run=, dry_run_json=, require_gpu=, list_solvers=, help="
                     ));
                 }
             }
@@ -410,6 +415,7 @@ impl ProfilerCliArgs {
         self.cg_iterations = other.cg_iterations.or(self.cg_iterations);
         self.dry_run = other.dry_run.or(self.dry_run);
         self.dry_run_json = other.dry_run_json.or(self.dry_run_json);
+        self.require_gpu = other.require_gpu.or(self.require_gpu);
         self.list_solvers = other.list_solvers.or(self.list_solvers);
         self.help = other.help.or(self.help);
     }
@@ -446,6 +452,21 @@ fn env_u32(name: &str) -> Option<u32> {
 
 fn env_u32_value(value: Option<String>) -> Option<u32> {
     value.and_then(|v| v.parse::<u32>().ok()).filter(|v| *v > 0)
+}
+
+fn require_gpu_with_env<F>(cli: &ProfilerCliArgs, mut get_env: F) -> bool
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    cli.require_gpu
+        .or_else(|| {
+            get_env("COFFEE_SIM_PROFILE_REQUIRE_GPU").map(|value| {
+                parse_bool(&value).unwrap_or_else(|err| {
+                    panic!("COFFEE_SIM_PROFILE_REQUIRE_GPU is invalid: {err}")
+                })
+            })
+        })
+        .unwrap_or(false)
 }
 
 fn parse_solver_specs(value: &str) -> Vec<SolverSpec> {
@@ -1850,6 +1871,7 @@ Options:\n\
   --cg-iterations <N>\n\
   --dry-run[=true|false]     Print the resolved run plan without GPU work\n\
   --dry-run-json             Print the resolved run plan as JSON without GPU work\n\
+  --require-gpu[=true|false] Fail instead of skipping when no GPU adapter is available\n\
   --list-solvers             Print available solver specs\n\
   -h, --help                 Print this help\n\
 \n\
@@ -2059,6 +2081,7 @@ fn profiler_cli_args_parse_kwargs_forms() {
         "cg_iterations=9",
         "dry_run=true",
         "dry_run_json=true",
+        "require_gpu=true",
     ])
     .expect("profiler kwargs parse");
 
@@ -2072,6 +2095,7 @@ fn profiler_cli_args_parse_kwargs_forms() {
     assert_eq!(args.cg_iterations, Some(9));
     assert_eq!(args.dry_run, Some(true));
     assert_eq!(args.dry_run_json, Some(true));
+    assert_eq!(args.require_gpu, Some(true));
 }
 
 #[test]
@@ -2387,6 +2411,21 @@ fn profiler_later_args_can_disable_discovery_flags() {
     assert_eq!(args.dry_run_json, Some(false));
     assert_eq!(args.list_solvers, Some(false));
     assert_eq!(args.help, Some(false));
+}
+
+#[test]
+fn profiler_require_gpu_can_be_set_by_cli_or_env() {
+    let args = ProfilerCliArgs::parse(["--require-gpu"]).expect("profiler args parse");
+    assert!(require_gpu_with_env(&args, |_| None));
+
+    let args = ProfilerCliArgs::parse(["--require-gpu=false"]).expect("profiler args parse");
+    assert!(!require_gpu_with_env(&args, |_| Some("true".to_string())));
+
+    let args = ProfilerCliArgs::default();
+    assert!(require_gpu_with_env(&args, |name| match name {
+        "COFFEE_SIM_PROFILE_REQUIRE_GPU" => Some("true".to_string()),
+        _ => None,
+    }));
 }
 
 #[test]
@@ -3207,7 +3246,12 @@ pub fn run_profile_from_env_args() {
         print!("{}", selection.dry_run_summary());
         return;
     }
+    let require_gpu = require_gpu_with_env(&cli, |name| std::env::var(name).ok());
     let Some(adapter) = request_adapter() else {
+        assert!(
+            !require_gpu,
+            "profile_solvers: no GPU adapter available and require_gpu=true"
+        );
         eprintln!("profile_solvers: no GPU adapter available; skipping.");
         return;
     };
