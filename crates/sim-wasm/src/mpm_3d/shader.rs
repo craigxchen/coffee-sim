@@ -523,6 +523,79 @@ fn staggered_pressure_node_gradient(n: vec3<i32>) -> vec3<f32> {
     return w * inv_dx() * 0.25 * vec3<f32>(gx_acc, gy_acc, gz_acc);
 }
 
+fn staggered_pressure_div_node_valid(n: vec3<i32>) -> bool {
+    return pressure_node_in_bounds(n) && !sdf_class_is_solid(n);
+}
+
+fn staggered_pressure_div_sign(c: vec3<i32>, n: vec3<i32>) -> vec3<f32> {
+    let r = vec3<f32>(n - c);
+    return 2.0 * r - vec3<f32>(1.0);
+}
+
+fn staggered_pressure_laplacian_diag(c: vec3<i32>) -> f32 {
+    var diag = 0.0;
+    for (var a = 0; a <= 1; a++) {
+        for (var b = 0; b <= 1; b++) {
+            for (var d = 0; d <= 1; d++) {
+                let n = c + vec3<i32>(a, b, d);
+                if !staggered_pressure_div_node_valid(n) {
+                    continue;
+                }
+                let sign = staggered_pressure_div_sign(c, n);
+                let w = staggered_pressure_node_fill_weight(n);
+                diag += 0.0625 * w * w * dot(sign, sign);
+            }
+        }
+    }
+    return diag;
+}
+
+fn staggered_pressure_laplacian_apply_search_direction(c: vec3<i32>, d_self: f32) -> f32 {
+    var q = 0.0;
+    for (var a = 0; a <= 1; a++) {
+        for (var b = 0; b <= 1; b++) {
+            for (var d = 0; d <= 1; d++) {
+                let n = c + vec3<i32>(a, b, d);
+                if !staggered_pressure_div_node_valid(n) {
+                    continue;
+                }
+
+                let w = staggered_pressure_node_fill_weight(n);
+                let self_incidence = 0.25 * w * staggered_pressure_div_sign(c, n);
+                for (var a2 = 0; a2 <= 1; a2++) {
+                    for (var b2 = 0; b2 <= 1; b2++) {
+                        for (var d2 = 0; d2 <= 1; d2++) {
+                            let neighbor_cell = n - vec3<i32>(a2, b2, d2);
+                            var d_neighbor = 0.0;
+                            if all(neighbor_cell == c) {
+                                d_neighbor = d_self;
+                            } else if staggered_pressure_cell_in_bounds(neighbor_cell)
+                                && !sdf_class_is_solid(neighbor_cell) {
+                                let neighbor_idx = cell_index(
+                                    u32(neighbor_cell.x),
+                                    u32(neighbor_cell.y),
+                                    u32(neighbor_cell.z),
+                                );
+                                if pressure_cg_is_active(neighbor_idx) {
+                                    d_neighbor = pressure_cg_state_load(neighbor_idx).z;
+                                }
+                            }
+                            if d_neighbor == 0.0 {
+                                continue;
+                            }
+
+                            let neighbor_incidence =
+                                0.25 * w * staggered_pressure_div_sign(neighbor_cell, n);
+                            q += dot(self_incidence, neighbor_incidence) * d_neighbor;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return q;
+}
+
 fn pressure_face_weight(
     self_kind: i32,
     self_fill: f32,
@@ -3534,5 +3607,9 @@ mod tests {
         assert!(MPM_COMPUTE_SHADER.contains("fn staggered_pressure_cell_divergence("));
         assert!(MPM_COMPUTE_SHADER.contains("fn staggered_pressure_node_gradient("));
         assert!(MPM_COMPUTE_SHADER.contains("fn staggered_pressure_node_fill_weight("));
+        assert!(MPM_COMPUTE_SHADER.contains("fn staggered_pressure_laplacian_diag("));
+        assert!(
+            MPM_COMPUTE_SHADER.contains("fn staggered_pressure_laplacian_apply_search_direction(")
+        );
     }
 }
