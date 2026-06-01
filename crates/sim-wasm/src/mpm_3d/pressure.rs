@@ -1,3 +1,45 @@
+use std::fmt;
+use std::str::FromStr;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PressureSolverKind {
+    Rbgs,
+}
+
+impl PressureSolverKind {
+    pub(crate) const ALL: &'static [Self] = &[Self::Rbgs];
+
+    pub(crate) fn id(self) -> &'static str {
+        match self {
+            Self::Rbgs => "rbgs",
+        }
+    }
+}
+
+impl fmt::Display for PressureSolverKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.id())
+    }
+}
+
+impl FromStr for PressureSolverKind {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "rbgs" | "mpm-rbgs" | "pressure-rbgs" => Ok(Self::Rbgs),
+            other => Err(format!(
+                "unknown pressure solver '{other}'; available solvers: {}",
+                Self::ALL
+                    .iter()
+                    .map(|kind| kind.id())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct PressureContext {
     pub cell_wg: u32,
@@ -9,13 +51,6 @@ pub(crate) enum PressurePipelines {
 }
 
 impl PressurePipelines {
-    #[cfg(test)]
-    pub(crate) fn kind(&self) -> &'static str {
-        match self {
-            Self::Rbgs(_) => "rbgs",
-        }
-    }
-
     #[cfg(test)]
     pub(crate) fn iterations_per_substep(&self, ctx: PressureContext) -> u32 {
         match self {
