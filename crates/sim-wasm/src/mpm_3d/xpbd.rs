@@ -13,6 +13,7 @@ pub(crate) struct XpbdPipelines {
     pub hash_scatter: wgpu::ComputePipeline,
     pub predict: wgpu::ComputePipeline,
     pub solve_density: wgpu::ComputePipeline,
+    pub apply_density: wgpu::ComputePipeline,
     pub solve_bounds: wgpu::ComputePipeline,
     pub velocity_update: wgpu::ComputePipeline,
 }
@@ -86,6 +87,7 @@ impl XpbdPipelines {
             hash_scatter: make("xpbd_hash_scatter"),
             predict: make("xpbd_predict"),
             solve_density: make("xpbd_solve_density"),
+            apply_density: make("xpbd_apply_density"),
             solve_bounds: make("xpbd_solve_bounds"),
             velocity_update: make("xpbd_velocity_update"),
         }
@@ -270,9 +272,20 @@ fn xpbd_solve_density(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     if count > 0.0 {
-        let limited = correction / count;
-        particles[pid].pos = vec4<f32>(pos + limited, particles[pid].pos.w);
+        affine[pid].col1 = vec4<f32>(correction / count, affine[pid].col1.w);
+    } else {
+        affine[pid].col1 = vec4<f32>(0.0, 0.0, 0.0, affine[pid].col1.w);
     }
+}
+
+@compute @workgroup_size(64)
+fn xpbd_apply_density(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if gid.x >= num_water() { return; }
+    let pid = water_particle_id(gid.x);
+    if !active_water(pid) { return; }
+    let correction = affine[pid].col1.xyz;
+    particles[pid].pos = vec4<f32>(particles[pid].pos.xyz + correction, particles[pid].pos.w);
+    affine[pid].col1 = vec4<f32>(0.0, 0.0, 0.0, affine[pid].col1.w);
 }
 
 @compute @workgroup_size(64)
@@ -319,6 +332,7 @@ mod tests {
         assert!(entry_names.contains(&"xpbd_hash_scatter"));
         assert!(entry_names.contains(&"xpbd_predict"));
         assert!(entry_names.contains(&"xpbd_solve_density"));
+        assert!(entry_names.contains(&"xpbd_apply_density"));
         assert!(entry_names.contains(&"xpbd_solve_bounds"));
         assert!(entry_names.contains(&"xpbd_velocity_update"));
     }
