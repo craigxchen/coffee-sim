@@ -24,6 +24,7 @@
 //! - `COFFEE_SIM_PROFILE_OUT`     output JSON path (default `<repo>/target/coffee-sim-profile.json`)
 //! - `COFFEE_SIM_PROFILE_ARGS`    optional CLI-style overrides, e.g.
 //!   `--solvers all --scene center_pour --warmup 10 --frames 30 --cal 5 --out target/profile.json`
+//!   or kwargs-style `solvers=all scene=center_pour frames=30 out=target/profile.json`
 //!
 //! ## Method and caveat
 //!
@@ -282,6 +283,17 @@ impl ProfilerCliArgs {
                 Some((flag, value)) => (flag.to_string(), Some(value.to_string())),
                 None => (arg, None),
             };
+            let flag = match flag.as_str() {
+                "scene" => "--scene".to_string(),
+                "solver" => "--solver".to_string(),
+                "solvers" => "--solvers".to_string(),
+                "warmup" => "--warmup".to_string(),
+                "frames" | "measured" => "--frames".to_string(),
+                "cal" | "calibration" => "--cal".to_string(),
+                "out" | "output" => "--out".to_string(),
+                "cg_iterations" | "cg-iterations" => "--cg-iterations".to_string(),
+                _ => flag,
+            };
             let mut take_value = |name: &str| -> Result<String, String> {
                 if let Some(value) = inline_value.clone() {
                     return Ok(value);
@@ -313,7 +325,8 @@ impl ProfilerCliArgs {
                 other => {
                     return Err(format!(
                         "unknown profiler option '{other}'; supported options: \
-                         --scene, --solver, --solvers, --warmup, --frames, --cal, --out, --cg-iterations"
+                         --scene, --solver, --solvers, --warmup, --frames, --cal, --out, --cg-iterations, \
+                         or kwargs scene=, solver=, solvers=, warmup=, frames=, cal=, out=, cg_iterations="
                     ));
                 }
             }
@@ -1785,6 +1798,28 @@ fn profiler_cli_args_parse_key_value_and_separate_forms() {
     assert_eq!(args.calibration, Some(4));
     assert_eq!(args.output, Some(PathBuf::from("target/profile.json")));
     assert_eq!(args.cg_iterations, Some(5));
+}
+
+#[test]
+fn profiler_cli_args_parse_kwargs_forms() {
+    let args = ProfilerCliArgs::parse([
+        "solver=xpbd",
+        "scene=center_pour",
+        "warmup=6",
+        "measured=7",
+        "calibration=8",
+        "output=target/profile.json",
+        "cg_iterations=9",
+    ])
+    .expect("profiler kwargs parse");
+
+    assert_eq!(args.solver.as_deref(), Some("xpbd"));
+    assert_eq!(args.scene.as_deref(), Some("center_pour"));
+    assert_eq!(args.warmup, Some(6));
+    assert_eq!(args.measured, Some(7));
+    assert_eq!(args.calibration, Some(8));
+    assert_eq!(args.output, Some(PathBuf::from("target/profile.json")));
+    assert_eq!(args.cg_iterations, Some(9));
 }
 
 #[test]
