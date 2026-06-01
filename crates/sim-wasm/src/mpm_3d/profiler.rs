@@ -1233,7 +1233,7 @@ fn step_frame_xpbd_instrumented(
                 &xpbd.hash_scatter,
                 water_wg,
             );
-            for _ in 0..XPBD_CONSTRAINT_ITERATIONS {
+            for iteration in 0..XPBD_CONSTRAINT_ITERATIONS {
                 timed_profile_pass(
                     &mut encoder,
                     &mut rec,
@@ -1246,10 +1246,36 @@ fn step_frame_xpbd_instrumented(
                     &mut encoder,
                     &mut rec,
                     &xpbd.bind_group,
+                    ProfilePassLabel::new("xpbd.apply_density", "xpbd_apply_density", "xpbd"),
+                    &xpbd.apply_density,
+                    water_wg,
+                );
+                timed_profile_pass(
+                    &mut encoder,
+                    &mut rec,
+                    &xpbd.bind_group,
                     ProfilePassLabel::new("xpbd.solve_bounds", "xpbd_solve_bounds", "xpbd"),
                     &xpbd.solve_bounds,
                     water_wg,
                 );
+                if iteration + 1 < XPBD_CONSTRAINT_ITERATIONS {
+                    timed_profile_pass(
+                        &mut encoder,
+                        &mut rec,
+                        &xpbd.bind_group,
+                        ProfilePassLabel::new("xpbd.hash_clear", "xpbd_hash_clear", "xpbd"),
+                        &xpbd.hash_clear,
+                        hash_wg,
+                    );
+                    timed_profile_pass(
+                        &mut encoder,
+                        &mut rec,
+                        &xpbd.bind_group,
+                        ProfilePassLabel::new("xpbd.hash_scatter", "xpbd_hash_scatter", "xpbd"),
+                        &xpbd.hash_scatter,
+                        water_wg,
+                    );
+                }
             }
             timed_profile_pass(
                 &mut encoder,
@@ -1684,10 +1710,14 @@ fn runnable_solver_specs() -> Vec<SolverSpec> {
 }
 
 fn xpbd_profiler_timestamp_query_capacity(substeps: u32) -> u32 {
-    let xpbd_passes = 4 + XPBD_CONSTRAINT_ITERATIONS * 2;
+    let xpbd_passes = xpbd_profiled_gpu_passes_per_substep();
     let shared_tail_passes = 7;
     let passes_per_substep = xpbd_passes + shared_tail_passes;
     (substeps.max(1) * passes_per_substep * 2).max(MIN_TIMESTAMP_QUERY_CAPACITY)
+}
+
+fn xpbd_profiled_gpu_passes_per_substep() -> u32 {
+    4 + XPBD_CONSTRAINT_ITERATIONS * 3 + (XPBD_CONSTRAINT_ITERATIONS - 1) * 2
 }
 
 fn output_path(cli: &ProfilerCliArgs) -> PathBuf {
@@ -1766,6 +1796,18 @@ fn profiler_all_expands_to_runnable_gpu_solver_specs() {
         specs.iter()
             .any(|solver| matches!(solver, SolverSpec::Xpbd { .. })),
         "XPBD GPU path should be included in `all` so same-scene solver comparisons do not require code changes"
+    );
+}
+
+#[test]
+fn profiler_xpbd_schedule_refreshes_hash_and_splits_density_apply() {
+    assert_eq!(
+        xpbd_profiled_gpu_passes_per_substep(),
+        4 + XPBD_CONSTRAINT_ITERATIONS * 3 + (XPBD_CONSTRAINT_ITERATIONS - 1) * 2
+    );
+    assert!(
+        xpbd_profiler_timestamp_query_capacity(1)
+            >= (xpbd_profiled_gpu_passes_per_substep() + 7) * 2
     );
 }
 
