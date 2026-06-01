@@ -56,7 +56,7 @@ pub(crate) enum PressureOperatorKind {
 }
 
 impl PressureOperatorKind {
-    pub(crate) const ALL: &'static [Self] = &[Self::Collocated];
+    pub(crate) const ALL: &'static [Self] = &[Self::Collocated, Self::Staggered];
 
     pub(crate) fn id(self) -> &'static str {
         match self {
@@ -78,11 +78,7 @@ impl FromStr for PressureOperatorKind {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value.trim().to_ascii_lowercase().as_str() {
             "" | "collocated" | "cell-centered" | "cell_centered" => Ok(Self::Collocated),
-            "staggered" => Err(
-                "pressure operator 'staggered' is known from codex/perf-60hz-tier1 \
-                 but is not ported to the modular pressure boundary yet"
-                    .to_string(),
-            ),
+            "staggered" | "mac" => Ok(Self::Staggered),
             other => Err(format!(
                 "unknown pressure operator '{other}'; available operators: {}",
                 Self::ALL
@@ -159,10 +155,23 @@ impl PressurePipelines {
     }
 
     pub(crate) fn encode_solve(&self, pass: &mut wgpu::ComputePass<'_>, ctx: PressureContext) {
-        match ctx.kind {
-            PressureSolverKind::Rbgs => self.rbgs.encode_solve(pass, ctx),
-            PressureSolverKind::JacobiCg => self.jacobi_cg.encode_solve(pass, ctx),
-            PressureSolverKind::SparseCg => self.jacobi_cg.encode_sparse_solve(pass, ctx),
+        match (ctx.operator, ctx.kind) {
+            (PressureOperatorKind::Collocated, PressureSolverKind::Rbgs) => {
+                self.rbgs.encode_solve(pass, ctx)
+            }
+            (PressureOperatorKind::Collocated, PressureSolverKind::JacobiCg) => {
+                self.jacobi_cg.encode_solve(pass, ctx)
+            }
+            (PressureOperatorKind::Collocated, PressureSolverKind::SparseCg) => {
+                self.jacobi_cg.encode_sparse_solve(pass, ctx)
+            }
+            (PressureOperatorKind::Staggered, PressureSolverKind::JacobiCg) => {
+                self.staged_staggered.encode_solve(pass, ctx)
+            }
+            (
+                PressureOperatorKind::Staggered,
+                PressureSolverKind::Rbgs | PressureSolverKind::SparseCg,
+            ) => panic!("staggered pressure operator currently requires jacobi-cg"),
         }
     }
 
@@ -174,11 +183,22 @@ impl PressurePipelines {
     ) where
         RunOp: FnMut(MpmScheduleOp<'a>),
     {
-        match ctx.kind {
-            PressureSolverKind::SparseCg => {
+        match (ctx.operator, ctx.kind) {
+            (PressureOperatorKind::Collocated, PressureSolverKind::SparseCg) => {
                 self.jacobi_cg.encode_sparse_solve_ops(buffers, ctx, run_op)
             }
-            PressureSolverKind::Rbgs | PressureSolverKind::JacobiCg => {
+            (PressureOperatorKind::Staggered, PressureSolverKind::SparseCg) => {
+                panic!("staggered pressure operator currently requires jacobi-cg")
+            }
+            (PressureOperatorKind::Staggered, PressureSolverKind::JacobiCg) => {
+                run_op(MpmScheduleOp::PressureSolve {
+                    label: MpmPassLabel::PressureSolve,
+                    pressure: self,
+                    ctx,
+                })
+            }
+            (_, PressureSolverKind::Rbgs)
+            | (PressureOperatorKind::Collocated, PressureSolverKind::JacobiCg) => {
                 run_op(MpmScheduleOp::PressureSolve {
                     label: MpmPassLabel::PressureSolve,
                     pressure: self,
@@ -224,12 +244,31 @@ pub(crate) struct RbgsPressureSolver {
 
 pub(crate) struct StagedStaggeredPressurePipelines {
     pub(crate) classify_cells: wgpu::ComputePipeline,
-    // Staged only: full staggered CG also needs operator-matched warmstart and
-    // residual-update kernels before this can be exposed as runnable.
     pub(crate) pressure_cg_init: wgpu::ComputePipeline,
     pub(crate) pressure_cg_matvec: wgpu::ComputePipeline,
+    pub(crate) pressure_cg_apply_alpha: wgpu::ComputePipeline,
+    pub(crate) pressure_cg_update_dir: wgpu::ComputePipeline,
+    pub(crate) pressure_cg_finish_iteration: wgpu::ComputePipeline,
     pub(crate) project_pressure: wgpu::ComputePipeline,
     pub(crate) pressure_residual: wgpu::ComputePipeline,
+}
+
+impl StagedStaggeredPressurePipelines {
+    pub(crate) fn encode_solve(&self, pass: &mut wgpu::ComputePass<'_>, ctx: PressureContext) {
+        pass.set_pipeline(&self.pressure_cg_init);
+        pass.dispatch_workgroups(ctx.cell_wg, 1, 1);
+
+        for _ in 0..ctx.cg_iterations {
+            pass.set_pipeline(&self.pressure_cg_matvec);
+            pass.dispatch_workgroups(ctx.cell_wg, 1, 1);
+            pass.set_pipeline(&self.pressure_cg_apply_alpha);
+            pass.dispatch_workgroups(ctx.cell_wg, 1, 1);
+            pass.set_pipeline(&self.pressure_cg_update_dir);
+            pass.dispatch_workgroups(ctx.cell_wg, 1, 1);
+            pass.set_pipeline(&self.pressure_cg_finish_iteration);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+    }
 }
 
 impl RbgsPressureSolver {
@@ -387,20 +426,20 @@ mod tests {
     }
 
     #[test]
-    fn pressure_operator_kind_parses_current_operator_and_rejects_unported_staggered() {
+    fn pressure_operator_kind_parses_registered_operators() {
         assert_eq!("collocated".parse(), Ok(PressureOperatorKind::Collocated));
         assert_eq!(
             "cell-centered".parse(),
             Ok(PressureOperatorKind::Collocated)
         );
+        assert_eq!("staggered".parse(), Ok(PressureOperatorKind::Staggered));
+        assert_eq!("mac".parse(), Ok(PressureOperatorKind::Staggered));
         assert_eq!(
             PressureOperatorKind::ALL,
-            &[PressureOperatorKind::Collocated]
+            &[
+                PressureOperatorKind::Collocated,
+                PressureOperatorKind::Staggered
+            ]
         );
-        assert_eq!(PressureOperatorKind::Staggered.id(), "staggered");
-        let err = "staggered"
-            .parse::<PressureOperatorKind>()
-            .expect_err("staggered operator is intentionally not runnable yet");
-        assert!(err.contains("not ported"));
     }
 }

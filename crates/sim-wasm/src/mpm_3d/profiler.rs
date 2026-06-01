@@ -182,7 +182,25 @@ impl SolverSpec {
         specs
     }
 
+    fn supports_pressure_operator(self, operator: PressureOperatorKind) -> bool {
+        match self {
+            Self::Mpm {
+                pressure: PressureSolverKind::Rbgs | PressureSolverKind::SparseCg,
+            } => operator == PressureOperatorKind::Collocated,
+            Self::Mpm {
+                pressure: PressureSolverKind::JacobiCg,
+            } => true,
+            Self::Dfsph => operator == PressureOperatorKind::Collocated,
+            Self::Xpbd { .. } => true,
+        }
+    }
+
     fn profile(self, ctx: &ProfilerDeviceContext<'_>, run: &ProfilerRunConfig<'_>) {
+        assert!(
+            self.supports_pressure_operator(run.pressure_operator),
+            "solver '{self}' does not support pressure_operator='{}'; use mpm:jacobi-cg for the staggered operator",
+            run.pressure_operator
+        );
         match self {
             Self::Mpm { pressure } => {
                 profile_mpm_solver(ctx, run, self, pressure);
@@ -1845,6 +1863,21 @@ fn profiler_all_expands_to_runnable_gpu_solver_specs() {
             .any(|solver| matches!(solver, SolverSpec::Xpbd { .. })),
         "XPBD GPU path should be included in `all` so same-scene solver comparisons do not require code changes"
     );
+}
+
+#[test]
+fn profiler_pressure_operator_support_is_explicit() {
+    assert!(SolverSpec::mpm(PressureSolverKind::JacobiCg)
+        .supports_pressure_operator(PressureOperatorKind::Staggered));
+    assert!(!SolverSpec::mpm(PressureSolverKind::Rbgs)
+        .supports_pressure_operator(PressureOperatorKind::Staggered));
+    assert!(!SolverSpec::mpm(PressureSolverKind::SparseCg)
+        .supports_pressure_operator(PressureOperatorKind::Staggered));
+    assert!(!SolverSpec::Dfsph.supports_pressure_operator(PressureOperatorKind::Staggered));
+    assert!(SolverSpec::Xpbd {
+        solver: XpbdSolverKind::Gpu
+    }
+    .supports_pressure_operator(PressureOperatorKind::Staggered));
 }
 
 #[test]
