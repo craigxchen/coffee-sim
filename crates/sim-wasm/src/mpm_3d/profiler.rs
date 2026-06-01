@@ -23,6 +23,8 @@
 //! - `COFFEE_SIM_PROFILE_FRAMES`  instrumented frames to measure (default 120)
 //! - `COFFEE_SIM_PROFILE_CAL`     production `step_frame` calibration frames (default 30)
 //! - `COFFEE_SIM_PROFILE_OUT`     output JSON path (default `<repo>/target/coffee-sim-profile.json`)
+//! - `COFFEE_SIM_PROFILE_VERIFY_REPORTS` verify existing solver JSON reports and exit
+//! - `COFFEE_SIM_PROFILE_REQUIRE_GPU` fail instead of skipping when no adapter is available
 //! - `COFFEE_SIM_PROFILE_ARGS`    optional CLI-style overrides, e.g.
 //!   `--solvers all --scene center_pour --warmup 10 --frames 30 --cal 5 --out target/profile.json`
 //!   or kwargs-style `solvers=all scene=center_pour frames=30 out=target/profile.json`
@@ -470,6 +472,21 @@ where
             get_env("COFFEE_SIM_PROFILE_REQUIRE_GPU").map(|value| {
                 parse_bool(&value).unwrap_or_else(|err| {
                     panic!("COFFEE_SIM_PROFILE_REQUIRE_GPU is invalid: {err}")
+                })
+            })
+        })
+        .unwrap_or(false)
+}
+
+fn verify_reports_with_env<F>(cli: &ProfilerCliArgs, mut get_env: F) -> bool
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    cli.verify_reports
+        .or_else(|| {
+            get_env("COFFEE_SIM_PROFILE_VERIFY_REPORTS").map(|value| {
+                parse_bool(&value).unwrap_or_else(|err| {
+                    panic!("COFFEE_SIM_PROFILE_VERIFY_REPORTS is invalid: {err}")
                 })
             })
         })
@@ -2633,6 +2650,22 @@ fn profiler_require_gpu_can_be_set_by_cli_or_env() {
 }
 
 #[test]
+fn profiler_verify_reports_can_be_set_by_cli_or_env() {
+    let args = ProfilerCliArgs::parse(["--verify-reports"]).expect("profiler args parse");
+    assert!(verify_reports_with_env(&args, |_| None));
+
+    let args = ProfilerCliArgs::parse(["--verify-reports=false"]).expect("profiler args parse");
+    let env_true = |_: &str| Some("true".to_string());
+    assert!(!verify_reports_with_env(&args, env_true));
+
+    let args = ProfilerCliArgs::default();
+    assert!(verify_reports_with_env(&args, |name| match name {
+        "COFFEE_SIM_PROFILE_VERIFY_REPORTS" => Some("true".to_string()),
+        _ => None,
+    }));
+}
+
+#[test]
 fn profiler_cli_solver_overrides_expand_to_specs() {
     let args = ProfilerCliArgs::parse(["--solvers", "mpm:jacobi-cg,dfsph,xpbd"])
         .expect("profiler args parse");
@@ -3614,7 +3647,7 @@ pub fn run_profile_from_env_args() {
         print!("{}", selection.dry_run_summary());
         return;
     }
-    if cli.verify_reports.unwrap_or(false) {
+    if verify_reports_with_env(&cli, |name| std::env::var(name).ok()) {
         match selection.verify_reports() {
             Ok(verification) => print!("{}", verification.summary()),
             Err(err) => panic!("profile_solvers report verification failed: {err}"),
