@@ -88,6 +88,9 @@ Important invariant:
   - static filter support mesh and upload-ready vertex state
 - `physics_tests.rs`
   - headless GPU regression tests against the MPM stack
+- `profiler.rs`
+  - ignored headless GPU profiler with runtime solver selection
+  - supports `mpm:rbgs`, `mpm:jacobi-cg`, `mpm:sparse-cg`, `dfsph`, and `xpbd:gpu`
 
 ## Buffer Ownership
 
