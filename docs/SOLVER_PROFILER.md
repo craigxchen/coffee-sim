@@ -88,12 +88,32 @@ Solver development was spread across several local branches. Current status:
 - `codex/perf-60hz`: not merged wholesale. It contains tuning/test-deletion
   commits that are not appropriate for an honest solver comparison branch.
 
+Additional local experiments were checked but are not registered as solver
+backends:
+
+- `codex/genesis-pressure-residual`: not a separate solver. The useful
+  pressure-residual concept is represented in the shared MPM schedule as
+  `pressure.residual` and in the report metrics.
+- `codex/pressure-debug-mode`: browser/debug stepping support, not a solver or
+  profiler backend.
+- `codex/perf-improvements`: web render-loop overhead work, not a solver
+  implementation.
+- `codex/incompressible-rewrite`, `dry-bed-dual-grid`,
+  `integration/dry-bed-mechanics`, and `integration/physics-mainline`: bed,
+  filter, and grid-coupling experiments rather than selectable solver methods.
+- `codex/genesis-bed-constraints`, `codex/genesis-inflow-slug`,
+  `codex/genesis-pourover-plan`, and `codex/pour-stability-follow-up`: scene,
+  inflow, and stability experiments; they should only be pulled after their
+  physics changes are promoted independently of solver comparison.
+
 ## Verification Status
 
 Focused non-GPU checks prove parser/registry behavior and same-scene settings
 selection. The native `--dry-run` and versioned `--dry-run-json` modes resolve
 solver fan-out, output paths, scene dimensions, and pressure budgets without
-requesting a GPU adapter. The
+requesting a GPU adapter. Dry-run JSON also includes per-solver `solver_run`
+metadata matching real profile reports, so the selected same-scene comparison
+set can be checked before any GPU work starts. The
 ignored profiler smoke with `solvers=all scene=center_pour` currently compiles
 in this environment but skips measurement because no native GPU adapter is
 available. Real completion still requires running that profiler on a host with
