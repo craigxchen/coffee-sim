@@ -239,6 +239,16 @@ fn metrics_snapshot_object(snapshot: mpm_3d::MetricsSnapshot) -> Result<js_sys::
         "projectionResidualCellCount",
         snapshot.projection_residual_cells,
     )?;
+    set_u32(
+        &obj,
+        "pressureActiveCellCount",
+        snapshot.pressure_active_cells,
+    )?;
+    set_number(&obj, "pressureCgRz", snapshot.pressure_cg_rz)?;
+    set_number(&obj, "pressureCgPap", snapshot.pressure_cg_pap)?;
+    set_number(&obj, "pressureCgNewRz", snapshot.pressure_cg_new_rz)?;
+    set_number(&obj, "pressureCgInitialRz", snapshot.pressure_cg_initial_rz)?;
+    set_number(&obj, "pressureCgFinalRz", snapshot.pressure_cg_final_rz)?;
     set_number(&obj, "meanTds", snapshot.mean_tds)?;
     set_number(&obj, "cupTds", snapshot.cup_tds)?;
     set_number(&obj, "extractionYield", snapshot.extraction_yield)?;

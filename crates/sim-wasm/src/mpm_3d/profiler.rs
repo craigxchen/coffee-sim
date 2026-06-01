@@ -15,8 +15,9 @@
 //!
 //! Tunable via environment variables:
 //! - `COFFEE_SIM_PROFILE_SCENE`   scene preset: `center_pour` (default) | `free_stream` | `water_block`
-//! - `COFFEE_SIM_PROFILE_SOLVER`  pressure solver: `rbgs` (default)
+//! - `COFFEE_SIM_PROFILE_SOLVER`  pressure solver: `rbgs` (default) | `jacobi-cg`
 //! - `COFFEE_SIM_PROFILE_SOLVERS` comma-separated pressure solvers, or `all`
+//! - `COFFEE_SIM_PROFILE_CG_ITERATIONS` CG iterations per substep (defaults to scene RBGS pairs)
 //! - `COFFEE_SIM_PROFILE_WARMUP`  frames to run before measuring (default 60)
 //! - `COFFEE_SIM_PROFILE_FRAMES`  instrumented frames to measure (default 120)
 //! - `COFFEE_SIM_PROFILE_CAL`     production `step_frame` calibration frames (default 30)
@@ -266,8 +267,10 @@ fn step_frame_instrumented(
             metrics_wg: dispatch_size(METRICS_SLOT_COUNT as u32, 8),
         };
         let pressure_ctx = PressureContext {
+            kind: sim.settings.pressure_solver,
             cell_wg: dispatch.cell_wg,
             rbgs_pairs: pressure_pairs,
+            cg_iterations: sim.settings.pressure_cg_iterations,
         };
 
         // 3. Encode all passes, each in its own timestamped compute pass.
@@ -585,6 +588,11 @@ fn profile_mpm_pipeline() {
     for &solver in &solvers {
         let mut settings = scene_settings(&scene);
         settings.pressure_solver = solver;
+        settings.pressure_cg_iterations = std::env::var("COFFEE_SIM_PROFILE_CG_ITERATIONS")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(settings.pressure_rbgs_pairs);
         let grid_dims = settings.grid_dims;
         let total_cells = grid_dims[0] * grid_dims[1] * grid_dims[2];
         let max_particles = settings.max_particles;
