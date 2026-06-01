@@ -145,6 +145,14 @@ mod tests {
     }
 
     #[test]
+    fn default_water_sampling_preserves_represented_mass() {
+        let represented_mass_per_ml =
+            DEFAULT_BREW.water_particle_mass_units() * DEFAULT_BREW.water_particles_per_ml;
+
+        assert!((represented_mass_per_ml - DEFAULT_BREW.water_mass_units_per_ml).abs() <= 1e-6);
+    }
+
+    #[test]
     fn kozeny_carman_permeability_tracks_grind_size_squared() {
         let fine = kozeny_carman_permeability_m2(400.0, DEFAULT_BREW.bed_porosity);
         let coarse = kozeny_carman_permeability_m2(800.0, DEFAULT_BREW.bed_porosity);

@@ -469,6 +469,12 @@ pub(crate) struct MpmSettings {
 }
 
 impl MpmSettings {
+    fn set_pressure_iteration_budget(&mut self, iterations: u32) {
+        self.pressure_rbgs_pairs = iterations;
+        self.pressure_cg_iterations = iterations;
+        self.pressure_rbgs_max_pairs = self.pressure_rbgs_max_pairs.max(iterations);
+    }
+
     pub fn default_v60() -> Self {
         let bounds_size = Vec3::new(14.0, 20.0, 14.0);
         // Ensure uniform cell spacing: derive gy from dx = bounds_x / gx
@@ -520,7 +526,7 @@ impl MpmSettings {
         // residuals, so the water-only scene needs tighter projection
         // convergence to keep the cup surface from settling into a lopsided
         // heap.
-        settings.pressure_rbgs_pairs = 80;
+        settings.set_pressure_iteration_budget(80);
         settings.initial_water_speed_m_s = DEFAULT_BREW.initial_water_speed_m_s;
         settings
     }
@@ -536,7 +542,7 @@ impl MpmSettings {
         let mut settings = Self::default_v60();
         settings.spout.origin = Vec3::new(0.0, 7.1, 0.0);
         settings.initial_water_speed_m_s = 0.0;
-        settings.pressure_rbgs_pairs = 80;
+        settings.set_pressure_iteration_budget(80);
         settings
     }
 
@@ -551,14 +557,14 @@ impl MpmSettings {
         settings.spout.nozzle_radius = 0.15;
         settings.spout.max_flow_rate_ml_s = 10.0;
         settings.spout.max_exit_speed = units::sim_speed_from_meters_per_second(0.6);
-        settings.pressure_rbgs_pairs = 80;
+        settings.set_pressure_iteration_budget(80);
         settings
     }
 
     pub fn debug_seeded_paper_wall_sheet() -> Self {
         let mut settings = Self::default_v60();
         settings.initial_water_speed_m_s = 0.0;
-        settings.pressure_rbgs_pairs = 80;
+        settings.set_pressure_iteration_budget(80);
         settings
     }
 
@@ -566,35 +572,35 @@ impl MpmSettings {
         let mut settings = Self::default_v60();
         settings.bed = None;
         settings.initial_water_speed_m_s = 0.0;
-        settings.pressure_rbgs_pairs = 80;
+        settings.set_pressure_iteration_budget(80);
         settings
     }
 
     pub fn debug_cup_wall_floor_corner_contact() -> Self {
         let mut settings = Self::cup_only_water_scene();
         settings.initial_water_speed_m_s = 0.0;
-        settings.pressure_rbgs_pairs = 90;
+        settings.set_pressure_iteration_budget(90);
         settings
     }
 
     pub fn debug_asymmetric_cup_mound() -> Self {
         let mut settings = Self::cup_only_water_scene();
         settings.initial_water_speed_m_s = 0.0;
-        settings.pressure_rbgs_pairs = 90;
+        settings.set_pressure_iteration_budget(90);
         settings
     }
 
     pub fn debug_hydrostatic_column() -> Self {
         let mut settings = Self::cup_only_water_scene();
         settings.initial_water_speed_m_s = 0.0;
-        settings.pressure_rbgs_pairs = 100;
+        settings.set_pressure_iteration_budget(100);
         settings
     }
 
     pub fn debug_dam_break_slosh() -> Self {
         let mut settings = Self::cup_only_water_scene();
         settings.initial_water_speed_m_s = 0.0;
-        settings.pressure_rbgs_pairs = 90;
+        settings.set_pressure_iteration_budget(90);
         settings
     }
 
@@ -614,14 +620,14 @@ impl MpmSettings {
         settings.spout.max_flow_rate_ml_s = 14.0;
         settings.spout.max_exit_speed = units::sim_speed_from_meters_per_second(0.65);
         settings.initial_water_speed_m_s = 0.48;
-        settings.pressure_rbgs_pairs = 100;
+        settings.set_pressure_iteration_budget(100);
         settings
     }
 
     pub fn debug_uniform_bed_saturation() -> Self {
         let mut settings = Self::default_v60();
         settings.initial_water_speed_m_s = 0.0;
-        settings.pressure_rbgs_pairs = 80;
+        settings.set_pressure_iteration_budget(80);
         settings
     }
 
@@ -632,7 +638,7 @@ impl MpmSettings {
         }
         settings.spout.origin = Vec3::new(0.0, 7.1, 0.0);
         settings.initial_water_speed_m_s = 0.18;
-        settings.pressure_rbgs_pairs = 80;
+        settings.set_pressure_iteration_budget(80);
         settings
     }
 
@@ -644,7 +650,7 @@ impl MpmSettings {
         settings.spout.max_flow_rate_ml_s = 18.0;
         settings.spout.max_exit_speed = units::sim_speed_from_meters_per_second(0.65);
         settings.initial_water_speed_m_s = 0.42;
-        settings.pressure_rbgs_pairs = 80;
+        settings.set_pressure_iteration_budget(80);
         settings
     }
 
@@ -2653,6 +2659,57 @@ mod tests {
         inflow.update(&s.spout);
         assert!(inflow.exit_speed() * units::METERS_PER_SIM_UNIT <= 0.13);
         assert!(s.spout.max_exit_speed * units::METERS_PER_SIM_UNIT <= 0.50);
+    }
+
+    #[test]
+    fn pressure_iteration_budget_is_solver_neutral_for_profile_scenes() {
+        let scenes = [
+            MpmSettings::benchmark_center_pour(),
+            MpmSettings::benchmark_free_stream(),
+            MpmSettings::benchmark_filter_water_block(),
+            MpmSettings::debug_off_center_filter_wall_pour(),
+            MpmSettings::debug_seeded_paper_wall_sheet(),
+            MpmSettings::debug_filter_apex_drain(),
+            MpmSettings::debug_cup_wall_floor_corner_contact(),
+            MpmSettings::debug_asymmetric_cup_mound(),
+            MpmSettings::debug_hydrostatic_column(),
+            MpmSettings::debug_dam_break_slosh(),
+            MpmSettings::debug_sparse_free_jet(),
+            MpmSettings::debug_high_velocity_jet_impact(),
+            MpmSettings::debug_uniform_bed_saturation(),
+            MpmSettings::debug_permeability_comparison(),
+            MpmSettings::debug_particle_capacity_stress(),
+        ];
+
+        for scene in scenes {
+            assert_eq!(
+                scene.pressure_cg_iterations, scene.pressure_rbgs_pairs,
+                "CG and RBGS solver variants should inherit the same scene pressure budget"
+            );
+            assert!(
+                scene.pressure_rbgs_max_pairs >= scene.pressure_rbgs_pairs,
+                "adaptive RBGS cap should not be lower than the fixed scene budget"
+            );
+        }
+    }
+
+    #[test]
+    fn default_v60_substeps_and_pressure_budget_survive_perf_cuts() {
+        let s = MpmSettings::default_v60();
+        let water_only = MpmSettings::benchmark_free_stream();
+        let dx = s.bounds_size.x / s.grid_dims[0] as f32;
+        let sub_dt = (1.0 / 60.0) / s.substeps.max(1) as f32;
+        let exit_displacement_per_substep = s.spout.max_exit_speed * sub_dt;
+
+        assert_eq!(s.substeps, 10);
+        assert!(
+            exit_displacement_per_substep <= dx,
+            "default spout motion should stay within one grid cell per substep: \
+             displacement={exit_displacement_per_substep} dx={dx}"
+        );
+        assert!(s.pressure_rbgs_pairs >= 40);
+        assert!(s.pressure_cg_iterations >= s.pressure_rbgs_pairs);
+        assert!(water_only.pressure_cg_iterations > s.pressure_cg_iterations);
     }
 
     #[test]
