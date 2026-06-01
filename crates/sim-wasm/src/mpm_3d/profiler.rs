@@ -2275,6 +2275,33 @@ fn profiler_all_solvers_share_selected_scene_settings() {
 }
 
 #[test]
+fn profiler_mpm_cg_defaults_to_scene_cg_budget() {
+    let base = PathBuf::from("target/profile.json");
+    let mut scene_settings = ProfileScene::CenterPour.mpm_settings();
+    scene_settings.pressure_rbgs_pairs = 12;
+    scene_settings.pressure_cg_iterations = 34;
+    let run = ProfilerRunConfig {
+        scene: ProfileScene::CenterPour,
+        warmup: 1,
+        measured: 1,
+        calibration: 1,
+        cg_iterations: None,
+        pressure_operator: PressureOperatorKind::Collocated,
+        solver_ids: vec!["mpm-sparse-cg".to_string()],
+        base_output_path: &base,
+        multiple_outputs: false,
+    };
+
+    let settings = settings_for_solver_with_base(
+        SolverSpec::mpm(PressureSolverKind::SparseCg),
+        &run,
+        scene_settings,
+    );
+    assert_eq!(settings.pressure_rbgs_pairs, 12);
+    assert_eq!(settings.pressure_cg_iterations, 34);
+}
+
+#[test]
 fn profiler_harness_args_require_profile_sentinel() {
     let ignored_harness_args =
         ProfilerCliArgs::from_env_and_args(None, ["--solver", "xpbd:gpu"], false);
@@ -2944,13 +2971,20 @@ impl ProfileBackend for XpbdProfileBackend {
 }
 
 fn settings_for_solver(solver: SolverSpec, run: &ProfilerRunConfig<'_>) -> MpmSettings {
-    let mut settings = run.scene.mpm_settings();
+    settings_for_solver_with_base(solver, run, run.scene.mpm_settings())
+}
+
+fn settings_for_solver_with_base(
+    solver: SolverSpec,
+    run: &ProfilerRunConfig<'_>,
+    mut settings: MpmSettings,
+) -> MpmSettings {
     match solver {
         SolverSpec::Mpm { pressure } => {
             settings.pressure_solver = pressure;
             settings.pressure_operator = run.pressure_operator;
             settings.pressure_cg_iterations =
-                run.cg_iterations.unwrap_or(settings.pressure_rbgs_pairs);
+                run.cg_iterations.unwrap_or(settings.pressure_cg_iterations);
         }
         SolverSpec::Dfsph => {
             settings.pressure_operator = run.pressure_operator;
