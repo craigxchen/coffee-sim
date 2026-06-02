@@ -97,10 +97,15 @@ impl ApplicationHandler for App {
 
         // SPACING env scales particle size/count (default 1.0 ≈ 5k; 0.48 ≈ 40k). h and the
         // render radius scale with it so the physics + look stay resolution-consistent.
-        let spacing: f32 = std::env::var("SPACING")
+        let requested: f32 = std::env::var("SPACING")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(1.0);
+        // Floor: below ~0.25 the neighbor-grid buffer would exceed the GPU 128 MB limit.
+        let spacing = requested.max(0.25);
+        if spacing != requested {
+            eprintln!("SPACING {requested} too small (grid buffer would exceed the GPU limit); using {spacing}");
+        }
         let mats = Materials {
             particle_spacing: spacing,
             support_radius: 2.0 * spacing,
