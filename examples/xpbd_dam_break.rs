@@ -1,11 +1,5 @@
-//! PBF water-core dam-break (headless).
-//!
-//! Builds the XPBD water solver on a dam-break scene, runs it, and every K frames prints
-//! the stability signals: bounding-box extents, max speed, max bucket occupancy, effective
-//! iterations, dispatches/frame, and per-pass GPU µs. The interim "watch it settle"
-//! artifact until the renderer lands. Skips when no GPU adapter is available.
-//!
-//! Run with: `cargo run --example xpbd_dam_break`
+//! PBF water-core dam-break (headless): long-run stability check of the default config.
+//! Reports the post-settle peak speed (eruption detector), settled speed, and max occupancy.
 
 use coffee_sim::engine::Scene;
 use coffee_sim::models::Materials;
@@ -15,21 +9,9 @@ use coffee_sim::utils::config::Config;
 use coffee_sim::utils::gpu::GpuContext;
 use coffee_sim::EmissionInput;
 
-fn extents(pts: &[[f32; 4]]) -> ([f32; 3], [f32; 3]) {
-    let mut lo = [f32::INFINITY; 3];
-    let mut hi = [f32::NEG_INFINITY; 3];
-    for p in pts {
-        for a in 0..3 {
-            lo[a] = lo[a].min(p[a]);
-            hi[a] = hi[a].max(p[a]);
-        }
-    }
-    (lo, hi)
-}
-
-fn max_speed(vels: &[[f32; 4]]) -> f32 {
-    vels.iter()
-        .map(|v| (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt())
+fn max_speed(v: &[[f32; 4]]) -> f32 {
+    v.iter()
+        .map(|x| (x[0] * x[0] + x[1] * x[1] + x[2] * x[2]).sqrt())
         .fold(0.0, f32::max)
 }
 
@@ -38,43 +20,37 @@ fn main() {
         eprintln!("xpbd_dam_break: no GPU adapter available; skipping.");
         return;
     };
-    println!(
-        "adapter: {} | timestamp-query: {}",
-        gpu.adapter.get_info().name,
-        gpu.timestamps_supported
-    );
-
     let scene = Scene::dam_break();
     let mut solver = XpbdSolver::build(&scene, &Materials::default(), &Config::default(), &gpu);
     let input = EmissionInput::default();
-    println!("particles: {}", solver.particles().particle_count);
 
-    let total_frames = 600u32;
-    let report_every = 60u32;
-
-    for f in 0..total_frames {
+    let frames = 1800u32;
+    let n = solver.particles().particle_count as usize;
+    let mut post_peak = 0.0f32;
+    let mut max_fast = 0usize; // most particles > 15 in one post-settle frame (global-jump detector)
+    let mut max_occ = 0u32;
+    let mut overflow = false;
+    let mut final_v = 0.0f32;
+    for f in 0..frames {
         solver.step(1.0 / 60.0, &input);
-
-        if f % report_every == 0 || f == total_frames - 1 {
+        if f % 10 == 0 || f == frames - 1 {
             solver.sample_diagnostics();
-            let pos = solver.read_positions();
             let vel = solver.read_velocities();
-            let (lo, hi) = extents(&pos);
-            let diag = solver.diagnostics();
-            let prof = solver.profile();
-            let ts_total: f32 = prof.passes.iter().map(|(_, us)| *us).sum();
-            println!(
-                "f{:>4} | extent x[{:.1},{:.1}] y[{:.1},{:.1}] z[{:.1},{:.1}] | vmax {:>6.2} | occ {:>3} | iters {} | overflow {} | dispatch {} | gpu {:.1}µs ({} passes)",
-                f,
-                lo[0], hi[0], lo[1], hi[1], lo[2], hi[2],
-                max_speed(&vel),
-                diag.max_occupancy,
-                diag.effective_iters,
-                diag.overflow,
-                prof.dispatches_per_frame,
-                ts_total,
-                prof.passes.len(),
-            );
+            final_v = max_speed(&vel);
+            let d = solver.diagnostics();
+            max_occ = max_occ.max(d.max_occupancy);
+            overflow |= d.overflow;
+            if f > 250 {
+                post_peak = post_peak.max(final_v);
+                max_fast = max_fast.max(
+                    vel.iter()
+                        .filter(|x| (x[0] * x[0] + x[1] * x[1] + x[2] * x[2]).sqrt() > 15.0)
+                        .count(),
+                );
+            }
         }
     }
+    println!(
+        "particles {n} | post-settle peak {post_peak:.2} | max global-fast {max_fast} | settled {final_v:.2} | occ {max_occ} | overflow {overflow}"
+    );
 }

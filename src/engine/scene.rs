@@ -27,11 +27,14 @@ impl Default for Scene {
         Self {
             dose_g: 0.0,
             water_ml: 0.0,
-            gravity: [0.0, -20.0, 0.0],
+            gravity: [0.0, -12.0, 0.0],
             box_min: [0.0, 0.0, 0.0],
             box_max: [32.0, 40.0, 32.0],
-            water_block_min: [1.0, 1.0, 10.0],
-            water_block_max: [13.0, 29.0, 22.0],
+            // A 16³ block against one wall — a dam-break that's lively but not a torture
+            // column (a too-tall column over-compresses the pool and triggers squeeze-out
+            // eruptions). Settles to a shallow pool over the floor.
+            water_block_min: [1.0, 1.0, 8.0],
+            water_block_max: [17.0, 17.0, 24.0],
         }
     }
 }

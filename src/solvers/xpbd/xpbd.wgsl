@@ -27,7 +27,11 @@ struct Params {
     max_iters: u32,
     residual_tolerance: f32,
     lambda_noncohesive: u32,
-    _pad0: u32,
+    max_correction: f32,
+    velocity_damping: f32,
+    _pad1: u32,
+    _pad2: u32,
+    _pad3: u32,
 };
 
 struct Status {
@@ -268,8 +272,13 @@ fn apply_dp(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
     if (i >= params.particle_count) { return; }
     if (status.converged != 0u) { return; }
-    let np = pred[i].xyz + params.position_relaxation * dp[i].xyz;
-    let clamped = clamp(np, params.box_min.xyz, params.box_max.xyz);
+    // Cap the per-iteration correction so no single overcorrection can launch a particle.
+    var d = params.position_relaxation * dp[i].xyz;
+    let dl = length(d);
+    if (dl > params.max_correction) {
+        d = d * (params.max_correction / dl);
+    }
+    let clamped = clamp(pred[i].xyz + d, params.box_min.xyz, params.box_max.xyz);
     pred[i] = vec4<f32>(clamped, 0.0);
 }
 
@@ -278,7 +287,7 @@ fn finalize(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
     if (i >= params.particle_count) { return; }
     let xi = pred[i].xyz;
-    var v = (xi - pos[i].xyz) / params.dt;
+    var v = ((xi - pos[i].xyz) / params.dt) * params.velocity_damping;
     let sp = length(v);
     if (sp > params.max_speed) {
         v = v * (params.max_speed / sp);

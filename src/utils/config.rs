@@ -41,7 +41,12 @@ pub struct Config {
     // --- artifact damping / stability ---
     /// XSPH velocity-smoothing coefficient (damps s_corr surface jitter).
     pub xsph_viscosity_c: f32,
-    /// Velocity clamp `‖v‖ ≤ max_speed` (CFL + anti-blow-up).
+    /// Per-iteration position-correction cap as a fraction of `h` — no single overcorrection
+    /// can launch a particle (anti-eruption, the main blow-up guard).
+    pub max_correction_ratio: f32,
+    /// Global per-step velocity damping (energy bleed so the pool settles; `1.0` = none).
+    pub velocity_damping: f32,
+    /// Velocity clamp `‖v‖ ≤ max_speed` (CFL + anti-blow-up backstop).
     pub max_speed: f32,
 
     // --- neighbor grid ---
@@ -63,19 +68,30 @@ impl Default for Config {
             // propagate pressure up the pool (early-exit keeps calm frames cheap).
             max_iters: 20,
             residual_tolerance: 0.01,
-            relaxation_eps: 1.0e-4,
+            relaxation_eps: 1.0e-3,
             // Under-relax the Jacobi position solve (ω<1) — stabilizes it and keeps
             // per-iteration moves within a grid cell (the grid is rebuilt once/frame).
             position_relaxation: 0.5,
-            s_corr_k: 0.1,
+            // Artificial pressure: kept modest. It prevents clumping but is non-conservative
+            // (injects energy); too large and the pool jitters/erupts and never rests.
+            s_corr_k: 0.04,
             s_corr_n: 4.0,
             s_corr_dq_ratio: 0.2,
             spiky_r_min_ratio: 0.01,
+            // Two-sided density correction (full incompressibility). Compression-only was
+            // tried and REJECTED — it slowly over-compacts and collapses into overflow.
             lambda_clamp_noncohesive: false,
-            // XSPH must be strong enough to dissipate the energy s_corr injects (else the
-            // surface jitters / never settles).
-            xsph_viscosity_c: 0.1,
-            max_speed: 50.0,
+            xsph_viscosity_c: 0.2,
+            // THE stability lever: cap any single position correction to 0.12·h. This bounds
+            // the velocity that corrections inject, which kills the deficient-neighborhood /
+            // squeeze-out eruptions ("the fluid jumped"). Tighter is calmer (0.25 still left
+            // occasional global jumps); too tight under-resolves the deep pool.
+            max_correction_ratio: 0.12,
+            // Mild global damping so the pool settles to rest and stray splashes decay fast.
+            velocity_damping: 0.99,
+            // Cap velocity near the physical free-fall max for the box (≈√(2·g·H)); keeps any
+            // residual eruption from launching past believable water speeds.
+            max_speed: 30.0,
             bucket_capacity: 64,
             seed_jitter: 0.1,
         }

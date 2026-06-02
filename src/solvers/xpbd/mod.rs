@@ -21,6 +21,8 @@ use crate::utils::gpu::GpuContext;
 use crate::utils::kernels;
 
 const WG: u32 = 256;
+/// Rebuild the neighbor grid every this-many solver iterations (anti-stale-grid).
+const REGRID_INTERVAL: u32 = 4;
 
 fn groups(n: u32) -> u32 {
     n.div_ceil(WG)
@@ -53,7 +55,11 @@ struct Params {
     max_iters: u32,
     residual_tolerance: f32,
     lambda_noncohesive: u32,
-    _pad0: u32,
+    max_correction: f32,
+    velocity_damping: f32,
+    _pad1: u32,
+    _pad2: u32,
+    _pad3: u32,
 }
 
 /// CPU mirror of the WGSL `Status` struct (8 × u32).
@@ -349,7 +355,11 @@ impl Solver for XpbdSolver {
             max_iters: cfg.max_iters,
             residual_tolerance: cfg.residual_tolerance,
             lambda_noncohesive: cfg.lambda_clamp_noncohesive as u32,
-            _pad0: 0,
+            max_correction: cfg.max_correction_ratio * h,
+            velocity_damping: cfg.velocity_damping,
+            _pad1: 0,
+            _pad2: 0,
+            _pad3: 0,
         };
 
         let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -533,7 +543,7 @@ impl Solver for XpbdSolver {
         };
 
         let ts = if gpu.timestamps_supported {
-            let passes_per_step = 5 + 4 * cfg.max_iters;
+            let passes_per_step = 5 + 6 * cfg.max_iters;
             let capacity = (2 * passes_per_step * cfg.substeps).clamp(2, 512);
             let qset = device.create_query_set(&wgpu::QuerySetDescriptor {
                 label: Some("xpbd-timestamps"),
@@ -623,29 +633,34 @@ impl Solver for XpbdSolver {
                 np,
                 &mut dispatches,
             );
-            dispatch_pass(
-                &mut enc,
-                &self.pipelines.grid_clear,
-                &self.bind_groups.grid_clear,
-                self.ts.as_ref(),
-                &mut cursor,
-                &mut labels,
-                "grid_clear",
-                nc,
-                &mut dispatches,
-            );
-            dispatch_pass(
-                &mut enc,
-                &self.pipelines.grid_fill,
-                &self.bind_groups.grid_fill,
-                self.ts.as_ref(),
-                &mut cursor,
-                &mut labels,
-                "grid_fill",
-                np,
-                &mut dispatches,
-            );
-            for _ in 0..self.max_iters {
+            for it in 0..self.max_iters {
+                // Rebuild the neighbor grid every few iterations so corrections never act on
+                // a stale grid — particles can drift > 1 cell over the solve, and stale
+                // neighbors are the source of the stochastic squeeze-out eruptions.
+                if it % REGRID_INTERVAL == 0 {
+                    dispatch_pass(
+                        &mut enc,
+                        &self.pipelines.grid_clear,
+                        &self.bind_groups.grid_clear,
+                        self.ts.as_ref(),
+                        &mut cursor,
+                        &mut labels,
+                        "grid_clear",
+                        nc,
+                        &mut dispatches,
+                    );
+                    dispatch_pass(
+                        &mut enc,
+                        &self.pipelines.grid_fill,
+                        &self.bind_groups.grid_fill,
+                        self.ts.as_ref(),
+                        &mut cursor,
+                        &mut labels,
+                        "grid_fill",
+                        np,
+                        &mut dispatches,
+                    );
+                }
                 dispatch_pass(
                     &mut enc,
                     &self.pipelines.compute_lambda,
@@ -655,17 +670,6 @@ impl Solver for XpbdSolver {
                     &mut labels,
                     "compute_lambda",
                     np,
-                    &mut dispatches,
-                );
-                dispatch_pass(
-                    &mut enc,
-                    &self.pipelines.residual_reduce,
-                    &self.bind_groups.residual_reduce,
-                    self.ts.as_ref(),
-                    &mut cursor,
-                    &mut labels,
-                    "residual_reduce",
-                    1,
                     &mut dispatches,
                 );
                 dispatch_pass(
@@ -688,6 +692,21 @@ impl Solver for XpbdSolver {
                     &mut labels,
                     "apply_dp",
                     np,
+                    &mut dispatches,
+                );
+                // Check convergence AFTER applying the correction, so every frame relieves
+                // gravity's compression at least once. (Checking before — the old order —
+                // let "converged" frames skip the correction, so sub-tolerance compression
+                // accumulated silently until it detonated into a global eruption.)
+                dispatch_pass(
+                    &mut enc,
+                    &self.pipelines.residual_reduce,
+                    &self.bind_groups.residual_reduce,
+                    self.ts.as_ref(),
+                    &mut cursor,
+                    &mut labels,
+                    "residual_reduce",
+                    1,
                     &mut dispatches,
                 );
             }
