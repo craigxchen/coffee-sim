@@ -72,26 +72,29 @@ impl Default for Config {
             // Under-relax the Jacobi position solve (ω<1) — stabilizes it and keeps
             // per-iteration moves within a grid cell (the grid is rebuilt once/frame).
             position_relaxation: 0.5,
-            // Artificial pressure: kept modest. It prevents clumping but is non-conservative
-            // (injects energy); too large and the pool jitters/erupts and never rests.
-            s_corr_k: 0.04,
+            // Artificial pressure (Monaghan anti-clustering): standard strength. With
+            // compression-only λ it's the only short-range repulsion keeping spacing.
+            s_corr_k: 0.1,
             s_corr_n: 4.0,
             s_corr_dq_ratio: 0.2,
             spiky_r_min_ratio: 0.01,
-            // Two-sided density correction (full incompressibility). Compression-only was
-            // tried and REJECTED — it slowly over-compacts and collapses into overflow.
-            lambda_clamp_noncohesive: false,
-            xsph_viscosity_c: 0.2,
+            // Compression-only correction (λ ≤ 0): resist over-density but apply NO cohesive
+            // pull on under-dense surface particles — that pull is PBF's implicit surface
+            // tension and makes the water bead into droplets. Safe now that the convergence
+            // order is fixed (the earlier collapse was that accumulation bug, not this).
+            lambda_clamp_noncohesive: true,
+            // Light viscosity — just enough to damp jitter; not the over-damped 0.2.
+            xsph_viscosity_c: 0.05,
             // THE stability lever: cap any single position correction to 0.12·h. This bounds
             // the velocity that corrections inject, which kills the deficient-neighborhood /
             // squeeze-out eruptions ("the fluid jumped"). Tighter is calmer (0.25 still left
             // occasional global jumps); too tight under-resolves the deep pool.
-            max_correction_ratio: 0.12,
-            // Mild global damping so the pool settles to rest and stray splashes decay fast.
-            velocity_damping: 0.99,
-            // Cap velocity near the physical free-fall max for the box (≈√(2·g·H)); keeps any
-            // residual eruption from launching past believable water speeds.
-            max_speed: 30.0,
+            max_correction_ratio: 0.15,
+            // No global damping — the convergence fix removed the energy accumulation, so the
+            // water can stay lively instead of looking syrupy. (1.0 = off; available as a knob.)
+            velocity_damping: 1.0,
+            // Velocity cap as a pure safety backstop, above believable water speeds.
+            max_speed: 50.0,
             bucket_capacity: 64,
             seed_jitter: 0.1,
         }

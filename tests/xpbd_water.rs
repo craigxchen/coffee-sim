@@ -96,9 +96,9 @@ fn dam_break_stable_incompressible_clumpfree_and_settles() {
     assert!(n > 1000, "expected a few thousand particles, got {n}");
 
     let input = EmissionInput::default();
-    let frames = 360u32;
-    let sample_every = 40u32;
-    let mut vmax_early = 0.0f32;
+    let frames = 700u32;
+    let sample_every = 20u32;
+    let mut collapse_peak = 0.0f32;
     let mut vmax_late = 0.0f32;
 
     for f in 0..frames {
@@ -130,21 +130,18 @@ fn dam_break_stable_incompressible_clumpfree_and_settles() {
             }
 
             let vmax = max_speed(&vel);
-            if f == 0 {
-                vmax_early = vmax;
+            // Peak speed during the collapse (first ~2 s), before it settles.
+            if f < 120 {
+                collapse_peak = collapse_peak.max(vmax);
             }
             vmax_late = vmax;
-            eprintln!(
-                "f{f}: vmax {vmax:.2} occ {} iters {}",
-                diag.max_occupancy, diag.effective_iters
-            );
         }
     }
 
-    // Settling: late kinetic energy is a small fraction of the violent early phase.
+    // Settling: late kinetic energy is a small fraction of the collapse peak.
     assert!(
-        vmax_late < 0.3 * vmax_early,
-        "did not settle: vmax_early {vmax_early:.2} vmax_late {vmax_late:.2}"
+        vmax_late < 0.25 * collapse_peak,
+        "did not settle: collapse_peak {collapse_peak:.2} vmax_late {vmax_late:.2}"
     );
 
     // Final-frame structure checks.
