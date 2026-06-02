@@ -1,11 +1,13 @@
 //! Rendering + controls + debug overlays. Solver-agnostic: consumes ONLY the canonical
-//! state (`ParticleBuffers` / `Metrics` / `Profile`) and **never writes simulation state**
-//! — a strict one-way data flow (solver → `State` → `ui`/`profiling`).
+//! state (`ParticleBuffers`/`Metrics`/`Profile`) and never writes simulation state (one-way
+//! data flow). The `wgpu`/WGSL renderer is portable; windowing/event-loop is native (lives
+//! in the app/example).
 //!
-//! Phase 0: stub. The renderer + window/surface arrive in the vis phase (Phase 0 runs
-//! headless).
+//! v1: a windowed sphere-impostor particle renderer with a CAD orbit camera and an
+//! orientation cube. Screen-space fluid / scorecard / debug overlays come later.
 
-/// Render the current brew state.
-pub fn render() {
-    todo!("rendering + window surface land with the vis phase")
-}
+pub mod camera;
+pub mod render;
+
+pub use camera::OrbitCamera;
+pub use render::Renderer;
