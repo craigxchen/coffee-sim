@@ -46,11 +46,7 @@ struct Params {
     dry_cohesion: f32,        // weak short-range attraction strength (0 = none)
     cohesion_range: f32,      // cohesion/contact search reach (absolute; d ≤ r < this)
     rolling_damping: f32,     // grain velocity retained per frame (rolling-resistance proxy)
-    freeze_speed: f32,        // a grain may freeze only below this speed
-    freeze_pen: f32,          // …and below this normalized penetration
-    thaw_pen: f32,            // a frozen grain thaws above this normalized penetration
-    freeze_frames: u32,       // sustained calm frames required before freezing
-    _pad0: u32,
+    grain_sleep_speed: f32,   // static-yield dead-band: below this a grain is treated as at rest
 };
 
 struct Status {
@@ -60,7 +56,7 @@ struct Status {
     iters_done: u32,
     effective_iters: u32,
     residual_bits: u32,
-    frozen_count: atomic<u32>,
+    _pad0: u32,
     _pad1: u32,
 };
 
@@ -76,7 +72,9 @@ struct Status {
 @group(0) @binding(9) var<storage, read_write> cell_bucket: array<u32>;
 @group(0) @binding(10) var<storage, read_write> status: Status;
 @group(0) @binding(11) var<storage, read_write> phase: array<u32>;
-@group(0) @binding(12) var<storage, read_write> frozen: array<u32>;
+// Per-grain accumulated normal-correction magnitude this frame (reset in predict). The Coulomb
+// friction budget is μ·normal_impulse — load-scaled and non-zero at static rest, unlike μ·overlap.
+@group(0) @binding(12) var<storage, read_write> normal_impulse: array<f32>;
 
 const PI: f32 = 3.14159265358979;
 
@@ -121,32 +119,20 @@ fn cell_id(c: vec3<i32>) -> u32 {
     return u32(c.x) + dims.x * (u32(c.y) + dims.y * u32(c.z));
 }
 
-// A grain is frozen (zero inverse mass: it neither integrates gravity nor moves) once it has
-// stayed calm and un-penetrated for `freeze_frames` consecutive frames. `frozen[i]` is that
-// per-grain settle counter, saturating at `freeze_frames`.
-fn is_frozen(i: u32) -> bool {
-    return phase[i] == PHASE_GRAIN && frozen[i] >= params.freeze_frames;
-}
-
 @compute @workgroup_size(256)
 fn predict(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
     if (i == 0u) {
         atomicStore(&status.overflow, 0u);
         atomicStore(&status.max_occupancy, 0u);
-        atomicStore(&status.frozen_count, 0u);
         status.converged = 0u;
         status.iters_done = 0u;
         status.effective_iters = params.max_iters;
         status.residual_bits = 0u;
     }
     if (i >= params.particle_count) { return; }
+    normal_impulse[i] = 0.0; // reset the per-frame friction-budget accumulator (grains)
     let p = pos[i].xyz;
-    // Frozen grains hold their rest position exactly (no gravity, no drift).
-    if (is_frozen(i)) {
-        pred[i] = vec4<f32>(p, 0.0);
-        return;
-    }
     let v = vel[i].xyz;
     let g = params.gravity.xyz;
     let np = p + params.dt * v + (params.dt * params.dt) * g;
@@ -228,25 +214,13 @@ fn finalize(@builtin(global_invocation_id) gid: vec3<u32>) {
         if (pen > 1e-4) {
             v = v * params.rolling_damping;
         }
-        let sp = length(v);
-        var s = frozen[i];
-        if (pen > params.thaw_pen) {
-            s = 0u; // a neighbor pushed in → thaw and let it flow
-        } else if (sp < params.freeze_speed && pen < params.freeze_pen) {
-            s = min(s + 1u, params.freeze_frames); // sustained calm → settle toward frozen
-        } else {
-            s = 0u;
+        // Static-yield regularization (NOT freezing): below a small speed a grain is treated as
+        // at rest. Gravity and the contact solve still run for it every frame, so an unsupported
+        // grain immediately re-accelerates and penetration is never masked — this only removes
+        // the sub-threshold numerical jitter a Jacobi contact pile never fully shakes off.
+        if (length(v) < params.grain_sleep_speed) {
+            v = vec3<f32>(0.0);
         }
-        frozen[i] = s;
-        if (s >= params.freeze_frames) {
-            v = vec3<f32>(0.0); // frozen: exact static rest (predict holds the position)
-            atomicAdd(&status.frozen_count, 1u);
-        }
-        let spc = length(v);
-        if (spc > params.max_speed) { v = v * (params.max_speed / spc); }
-        vel[i] = vec4<f32>(v, 0.0);
-        pos[i] = vec4<f32>(xi, 0.0);
-        return;
     }
 
     let sp = length(v);
