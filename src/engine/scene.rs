@@ -1,16 +1,39 @@
 //! `Scene` — the user-facing brew description, immutable input to `Solver::build`/`reset`.
 //!
-//! Phase 0: a minimal placeholder. Real fields (dripper geometry SDF, dose/ratio,
-//! water temperature, the pour schedule) arrive with `geometry` and `models`; reference
-//! recipe values are in `KEEP.md` §1.
+//! Phase 1.1 carries what the PBF water core needs: the simulation box, an initial water
+//! block (the dam), and gravity. Real V60 dripper geometry / pour schedule arrive with
+//! `geometry`; reference recipe values are in `KEEP.md` §1.
 
-/// Immutable brew description handed to a solver at build/reset.
-#[derive(Clone, Debug, Default)]
+/// Immutable brew/scene description handed to a solver at build/reset.
+#[derive(Clone, Debug)]
 pub struct Scene {
-    /// Coffee dose (grams).
+    /// Coffee dose (grams) — placeholder for the recipe-driven scenes.
     pub dose_g: f32,
-    /// Brew water (milliliters).
+    /// Brew water (milliliters) — placeholder for the recipe-driven scenes.
     pub water_ml: f32,
+
+    /// Gravity vector (scene units / s²).
+    pub gravity: [f32; 3],
+    /// Axis-aligned simulation domain (inclusive bounds).
+    pub box_min: [f32; 3],
+    pub box_max: [f32; 3],
+    /// Axis-aligned region seeded with water particles at build/reset (the "dam").
+    pub water_block_min: [f32; 3],
+    pub water_block_max: [f32; 3],
+}
+
+impl Default for Scene {
+    fn default() -> Self {
+        Self {
+            dose_g: 0.0,
+            water_ml: 0.0,
+            gravity: [0.0, -20.0, 0.0],
+            box_min: [0.0, 0.0, 0.0],
+            box_max: [32.0, 40.0, 32.0],
+            water_block_min: [1.0, 1.0, 10.0],
+            water_block_max: [13.0, 29.0, 22.0],
+        }
+    }
 }
 
 impl Scene {
@@ -19,6 +42,12 @@ impl Scene {
         Self {
             dose_g: 15.0,
             water_ml: 250.0,
+            ..Self::default()
         }
+    }
+
+    /// A dam-break: a tall water column released in a box. The water-core gate scene.
+    pub fn dam_break() -> Self {
+        Self::default()
     }
 }

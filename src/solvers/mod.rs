@@ -4,3 +4,4 @@
 
 pub mod base;
 pub mod noop;
+pub mod xpbd;

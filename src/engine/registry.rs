@@ -10,6 +10,7 @@ use crate::engine::scene::Scene;
 use crate::models::Materials;
 use crate::solvers::base::{Solver, SolverInfo};
 use crate::solvers::noop::{NoopSolverA, NoopSolverB};
+use crate::solvers::xpbd::XpbdSolver;
 use crate::utils::config::Config;
 use crate::utils::gpu::GpuContext;
 
@@ -21,6 +22,7 @@ const SOLVERS_JSON: &str = include_str!("solvers.json");
 pub enum SolverId {
     NoopA,
     NoopB,
+    Xpbd,
 }
 
 impl SolverId {
@@ -28,12 +30,13 @@ impl SolverId {
         match self {
             SolverId::NoopA => "noop_a",
             SolverId::NoopB => "noop_b",
+            SolverId::Xpbd => "xpbd",
         }
     }
 
     /// Every registered solver, for UI dropdowns and comparison sweeps.
     pub fn all() -> &'static [SolverId] {
-        &[SolverId::NoopA, SolverId::NoopB]
+        &[SolverId::NoopA, SolverId::NoopB, SolverId::Xpbd]
     }
 }
 
@@ -76,6 +79,7 @@ pub fn build_solver(
     match id {
         SolverId::NoopA => Box::new(NoopSolverA::build(scene, mats, cfg, gpu)),
         SolverId::NoopB => Box::new(NoopSolverB::build(scene, mats, cfg, gpu)),
+        SolverId::Xpbd => Box::new(XpbdSolver::build(scene, mats, cfg, gpu)),
     }
 }
 
