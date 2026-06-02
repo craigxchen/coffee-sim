@@ -27,7 +27,7 @@ impl Default for Scene {
         Self {
             dose_g: 0.0,
             water_ml: 0.0,
-            gravity: [0.0, -12.0, 0.0],
+            gravity: [0.0, -20.0, 0.0],
             box_min: [0.0, 0.0, 0.0],
             box_max: [32.0, 40.0, 32.0],
             // A 16³ block against one wall — a dam-break that's lively but not a torture
