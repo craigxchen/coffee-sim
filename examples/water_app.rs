@@ -95,9 +95,20 @@ impl ApplicationHandler for App {
         };
         surface.configure(&gpu.device, &config);
 
+        // SPACING env scales particle size/count (default 1.0 ≈ 5k; 0.48 ≈ 40k). h and the
+        // render radius scale with it so the physics + look stay resolution-consistent.
+        let spacing: f32 = std::env::var("SPACING")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1.0);
+        let mats = Materials {
+            particle_spacing: spacing,
+            support_radius: 2.0 * spacing,
+            particle_mass: 1.0,
+        };
         let scene = Scene::dam_break();
-        let solver = XpbdSolver::build(&scene, &Materials::default(), &Config::default(), &gpu);
-        let renderer = Renderer::new(&gpu, format, (config.width, config.height), 0.5);
+        let solver = XpbdSolver::build(&scene, &mats, &Config::default(), &gpu);
+        let renderer = Renderer::new(&gpu, format, (config.width, config.height), 0.5 * spacing);
         let camera = OrbitCamera::framing(Vec3::from(scene.box_min), Vec3::from(scene.box_max));
 
         window.request_redraw();
