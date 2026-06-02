@@ -4,9 +4,10 @@
 //! camera and a corner orientation cube. The `winit` event loop is the only native-specific
 //! part; `ui::Renderer` is portable wgpu/WGSL.
 //!
-//! Run: `cargo run --example water_app`
+//! Run: `cargo run --example water_app` (water dam) · `SCENE=bed cargo run --example water_app`
+//! (dry coffee bed). `SPACING` scales particle size/count.
 //! Controls: drag = orbit · scroll / pinch = zoom · two-finger drag = pan ·
-//!           space = pause · R = re-drop the dam · Esc = quit.
+//!           space = pause · R = reset the scene · Esc = quit.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -40,6 +41,7 @@ struct State {
     scene: Scene,
     camera: OrbitCamera,
     input: EmissionInput,
+    scene_label: &'static str,
     paused: bool,
     dragging: bool,
     last_cursor: Option<PhysicalPosition<f64>>,
@@ -58,7 +60,7 @@ impl ApplicationHandler for App {
             return;
         }
         let attrs = Window::default_attributes()
-            .with_title("coffee-sim — water")
+            .with_title("coffee-sim")
             .with_inner_size(LogicalSize::new(1100.0, 760.0));
         let window = match event_loop.create_window(attrs) {
             Ok(w) => Arc::new(w),
@@ -106,12 +108,20 @@ impl ApplicationHandler for App {
         if spacing != requested {
             eprintln!("SPACING {requested} too small (grid buffer would exceed the GPU limit); using {spacing}");
         }
+        // `SCENE=bed` views the dry coffee bed; anything else (default) views the water dam.
+        let bed = std::env::var("SCENE").map(|s| s == "bed").unwrap_or(false);
+        let (scene, scene_label) = if bed {
+            (Scene::bed_drop(), "bed")
+        } else {
+            (Scene::dam_break(), "water")
+        };
         let mats = Materials {
             particle_spacing: spacing,
             support_radius: 2.0 * spacing,
             particle_mass: 1.0,
+            grain_diameter: spacing,
+            ..Materials::default()
         };
-        let scene = Scene::dam_break();
         let solver = XpbdSolver::build(&scene, &mats, &Config::default(), &gpu);
         let renderer = Renderer::new(&gpu, format, (config.width, config.height), 0.5 * spacing);
         let camera = OrbitCamera::framing(Vec3::from(scene.box_min), Vec3::from(scene.box_max));
@@ -127,6 +137,7 @@ impl ApplicationHandler for App {
             scene,
             camera,
             input: EmissionInput::default(),
+            scene_label,
             paused: false,
             dragging: false,
             last_cursor: None,
@@ -227,8 +238,9 @@ impl ApplicationHandler for App {
                     st.last_fps = Instant::now();
                     let n = st.solver.particles().particle_count;
                     let paused = if st.paused { " [paused]" } else { "" };
+                    let label = st.scene_label;
                     st.window.set_title(&format!(
-                        "coffee-sim — water | {n} particles | {fps} fps{paused}"
+                        "coffee-sim — {label} | {n} particles | {fps} fps{paused}"
                     ));
                 }
                 st.window.request_redraw();

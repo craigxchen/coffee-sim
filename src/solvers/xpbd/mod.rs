@@ -11,6 +11,7 @@ use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
 use crate::emission::EmissionInput;
+use crate::engine::scene::Species;
 use crate::engine::{Metrics, Scene};
 use crate::models::Materials;
 use crate::profiling::Profile;
@@ -57,9 +58,18 @@ struct Params {
     lambda_noncohesive: u32,
     max_correction: f32,
     velocity_damping: f32,
-    _pad1: u32,
-    _pad2: u32,
-    _pad3: u32,
+    // --- granular bed (grain phase) ---
+    grain_diameter: f32,
+    friction_mu: f32,
+    floor_mu: f32,
+    dry_cohesion: f32,
+    cohesion_range: f32,
+    rolling_damping: f32,
+    freeze_speed: f32,
+    freeze_pen: f32,
+    thaw_pen: f32,
+    freeze_frames: u32,
+    _pad0: u32,
 }
 
 /// CPU mirror of the WGSL `Status` struct (8 × u32).
@@ -72,7 +82,7 @@ struct StatusRaw {
     iters_done: u32,
     effective_iters: u32,
     residual_bits: u32,
-    _pad0: u32,
+    frozen_count: u32,
     _pad1: u32,
 }
 
@@ -83,6 +93,7 @@ struct Pipelines {
     compute_lambda: wgpu::ComputePipeline,
     residual_reduce: wgpu::ComputePipeline,
     compute_dp: wgpu::ComputePipeline,
+    bed_project: wgpu::ComputePipeline,
     apply_dp: wgpu::ComputePipeline,
     finalize: wgpu::ComputePipeline,
     xsph: wgpu::ComputePipeline,
@@ -95,6 +106,7 @@ struct BindGroups {
     compute_lambda: wgpu::BindGroup,
     residual_reduce: wgpu::BindGroup,
     compute_dp: wgpu::BindGroup,
+    bed_project: wgpu::BindGroup,
     apply_dp: wgpu::BindGroup,
     finalize: wgpu::BindGroup,
     xsph: wgpu::BindGroup,
@@ -116,7 +128,10 @@ pub struct XpbdDiagnostics {
     pub overflow: bool,
     pub max_occupancy: u32,
     pub effective_iters: u32,
+    /// Final max constraint residual: over-density (water) or normalized penetration (grain).
     pub residual: f32,
+    /// Number of frozen (settled, static) grains last frame.
+    pub frozen_count: u32,
 }
 
 pub struct XpbdSolver {
@@ -126,15 +141,22 @@ pub struct XpbdSolver {
     particle_count: u32,
     num_cells: u32,
     substeps: u32,
+    /// Constraint-iteration cap for this scene's species (water or bed).
     max_iters: u32,
+    /// Neighbor-grid rebuild interval for this scene's species.
+    regrid_interval: u32,
+    /// Which species this scene seeds; selects the per-frame pass sequence.
+    species: Species,
 
     // Buffers referenced every frame only through the bind groups (which retain them) are
     // not held here. We keep the ones we touch directly: params (write), pos/vel (expose +
-    // readback/copy), vel_smoothed (copy src), status (+ readbacks).
+    // readback/copy), vel_smoothed (copy src), status (+ readbacks), phase/frozen (expose/reset).
     params_buf: wgpu::Buffer,
     pos: Arc<wgpu::Buffer>,
     vel: Arc<wgpu::Buffer>,
     vel_smoothed: wgpu::Buffer,
+    phase: Arc<wgpu::Buffer>,
+    frozen: wgpu::Buffer,
     status: wgpu::Buffer,
     status_readback: wgpu::Buffer,
     pos_readback: wgpu::Buffer,
@@ -147,17 +169,25 @@ pub struct XpbdSolver {
     cached_diag: XpbdDiagnostics,
     cached_passes: Vec<(String, f32)>,
 
-    // retained for reset (exact re-seed of the initial dam-break block)
+    // retained for reset (exact re-seed of the initial block + phase tags)
     initial_positions: Vec<[f32; 4]>,
+    initial_phases: Vec<u32>,
 }
 
-fn seed_dam_break(scene: &Scene, mats: &Materials, cfg: &Config) -> Vec<[f32; 4]> {
+/// Seed the scene's initial particle block on a jittered lattice. Returns positions and the
+/// matching per-particle phase tags (all water or all grain — scenes are single-species for now).
+fn seed_block(scene: &Scene, mats: &Materials, cfg: &Config) -> (Vec<[f32; 4]>, Vec<u32>) {
     let s = mats.particle_spacing;
     let jitter = cfg.seed_jitter * s;
     let mut rng = crate::utils::rng::Rng::new(cfg.seed);
     let lo = scene.water_block_min;
     let hi = scene.water_block_max;
-    let mut out = Vec::new();
+    let tag = match scene.species {
+        Species::Water => 0u32,
+        Species::Grain => 1u32,
+    };
+    let mut pos = Vec::new();
+    let mut phase = Vec::new();
     let nx = (((hi[0] - lo[0]) / s).floor() as i32).max(0);
     let ny = (((hi[1] - lo[1]) / s).floor() as i32).max(0);
     let nz = (((hi[2] - lo[2]) / s).floor() as i32).max(0);
@@ -167,16 +197,17 @@ fn seed_dam_break(scene: &Scene, mats: &Materials, cfg: &Config) -> Vec<[f32; 4]
                 let jx = (rng.next_f32() * 2.0 - 1.0) * jitter;
                 let jy = (rng.next_f32() * 2.0 - 1.0) * jitter;
                 let jz = (rng.next_f32() * 2.0 - 1.0) * jitter;
-                out.push([
+                pos.push([
                     lo[0] + i as f32 * s + jx,
                     lo[1] + j as f32 * s + jy,
                     lo[2] + k as f32 * s + jz,
                     0.0,
                 ]);
+                phase.push(tag);
             }
         }
     }
-    out
+    (pos, phase)
 }
 
 impl XpbdSolver {
@@ -194,13 +225,19 @@ impl XpbdSolver {
         })
     }
 
-    /// Re-seed the particles to the original dam-break block (exact, deterministic).
+    /// Re-seed the particles to the original block (exact, deterministic): positions, phase
+    /// tags, zeroed velocities, and thawed (zeroed) freeze counters.
     fn seed(&mut self) {
         self.queue
             .write_buffer(&self.pos, 0, bytemuck::cast_slice(&self.initial_positions));
+        self.queue
+            .write_buffer(&self.phase, 0, bytemuck::cast_slice(&self.initial_phases));
         let zeros = vec![[0.0f32; 4]; self.particle_count as usize];
         self.queue
             .write_buffer(&self.vel, 0, bytemuck::cast_slice(&zeros));
+        let frozen_zeros = vec![0u32; self.particle_count as usize];
+        self.queue
+            .write_buffer(&self.frozen, 0, bytemuck::cast_slice(&frozen_zeros));
     }
 
     /// Blocking GPU→CPU read-back of a `vec4` particle buffer (dev/test only — stalls).
@@ -274,6 +311,7 @@ impl XpbdSolver {
             max_occupancy: raw.max_occupancy,
             effective_iters: raw.effective_iters,
             residual: f32::from_bits(raw.residual_bits),
+            frozen_count: raw.frozen_count,
         };
 
         // --- timestamps ---
@@ -317,8 +355,27 @@ impl Solver for XpbdSolver {
         let h = mats.support_radius;
         let m = mats.particle_mass;
 
-        let positions = seed_dam_break(scene, mats, cfg);
+        let (positions, phases) = seed_block(scene, mats, cfg);
         let particle_count = positions.len() as u32;
+
+        // The grain bed solves contacts (harder to converge than water): its own iteration cap,
+        // contact tolerance, and a more frequent grid rebuild. Single-species scenes pick one set.
+        let grain = scene.species == Species::Grain;
+        let solve_iters = if grain {
+            cfg.bed_max_iters
+        } else {
+            cfg.max_iters
+        };
+        let regrid_interval = if grain {
+            cfg.bed_regrid_interval.max(1)
+        } else {
+            REGRID_INTERVAL
+        };
+        let residual_tolerance = if grain {
+            cfg.bed_residual_tolerance
+        } else {
+            cfg.residual_tolerance
+        };
 
         let cell_size = h;
         let nx = (((scene.box_max[0] - scene.box_min[0]) / cell_size).ceil() as u32).max(1);
@@ -352,14 +409,22 @@ impl Solver for XpbdSolver {
             particle_count,
             bucket_capacity: cfg.bucket_capacity,
             min_iters: cfg.min_iters,
-            max_iters: cfg.max_iters,
-            residual_tolerance: cfg.residual_tolerance,
+            max_iters: solve_iters,
+            residual_tolerance,
             lambda_noncohesive: cfg.lambda_clamp_noncohesive as u32,
             max_correction: cfg.max_correction_ratio * h,
             velocity_damping: cfg.velocity_damping,
-            _pad1: 0,
-            _pad2: 0,
-            _pad3: 0,
+            grain_diameter: mats.grain_diameter,
+            friction_mu: mats.friction_mu,
+            floor_mu: mats.floor_mu,
+            dry_cohesion: mats.dry_cohesion,
+            cohesion_range: crate::models::cohesion::COHESION_RANGE_RATIO * mats.grain_diameter,
+            rolling_damping: mats.rolling_damping,
+            freeze_speed: cfg.freeze_speed,
+            freeze_pen: cfg.freeze_pen,
+            thaw_pen: cfg.thaw_pen,
+            freeze_frames: cfg.freeze_frames,
+            _pad0: 0,
         };
 
         let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -397,6 +462,16 @@ impl Solver for XpbdSolver {
         let dp = Self::storage(&device, "xpbd-dp", vec4, wgpu::BufferUsages::empty());
         let c_residual =
             Self::storage(&device, "xpbd-cresidual", f32s, wgpu::BufferUsages::empty());
+        // Per-particle species tag (exposed to the renderer for color-by-phase) and the
+        // per-grain freeze/settle counter (zero-initialized by wgpu = all thawed).
+        let phase = Arc::new(
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("xpbd-phase"),
+                contents: bytemuck::cast_slice(&phases),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            }),
+        );
+        let frozen = Self::storage(&device, "xpbd-frozen", f32s, wgpu::BufferUsages::empty());
         let cell_count = Self::storage(
             &device,
             "xpbd-cellcount",
@@ -429,9 +504,18 @@ impl Solver for XpbdSolver {
             mapped_at_creation: false,
         });
 
+        // WGSL has no imports: assemble the one module from the three concern files. `common`
+        // declares Params/Status/bindings + shared kernels; `water` and `bed` add the
+        // per-species solves. Module-scope declarations are order-independent.
+        let shader_src = format!(
+            "{}\n{}\n{}",
+            include_str!("common.wgsl"),
+            include_str!("water.wgsl"),
+            include_str!("bed.wgsl"),
+        );
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("xpbd"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("xpbd.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(shader_src.into()),
         });
         let make = |entry: &str| {
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -450,6 +534,7 @@ impl Solver for XpbdSolver {
             compute_lambda: make("compute_lambda"),
             residual_reduce: make("residual_reduce"),
             compute_dp: make("compute_dp"),
+            bed_project: make("bed_project"),
             apply_dp: make("apply_dp"),
             finalize: make("finalize"),
             xsph: make("xsph"),
@@ -480,6 +565,8 @@ impl Solver for XpbdSolver {
                     (2, &pred),
                     (3, &vel),
                     (10, &status),
+                    (11, &phase),
+                    (12, &frozen),
                 ],
             ),
             grid_clear: bg(&pipelines.grid_clear, &[(0, &params_buf), (8, &cell_count)]),
@@ -503,6 +590,7 @@ impl Solver for XpbdSolver {
                     (8, &cell_count),
                     (9, &cell_bucket),
                     (10, &status),
+                    (11, &phase),
                 ],
             ),
             residual_reduce: bg(
@@ -519,15 +607,46 @@ impl Solver for XpbdSolver {
                     (8, &cell_count),
                     (9, &cell_bucket),
                     (10, &status),
+                    (11, &phase),
+                ],
+            ),
+            bed_project: bg(
+                &pipelines.bed_project,
+                &[
+                    (0, &params_buf),
+                    (1, &pos),
+                    (2, &pred),
+                    (6, &dp),
+                    (7, &c_residual),
+                    (8, &cell_count),
+                    (9, &cell_bucket),
+                    (11, &phase),
+                    (12, &frozen),
                 ],
             ),
             apply_dp: bg(
                 &pipelines.apply_dp,
-                &[(0, &params_buf), (2, &pred), (6, &dp), (10, &status)],
+                &[
+                    (0, &params_buf),
+                    (1, &pos),
+                    (2, &pred),
+                    (6, &dp),
+                    (10, &status),
+                    (11, &phase),
+                ],
             ),
             finalize: bg(
                 &pipelines.finalize,
-                &[(0, &params_buf), (1, &pos), (2, &pred), (3, &vel)],
+                &[
+                    (0, &params_buf),
+                    (1, &pos),
+                    (2, &pred),
+                    (3, &vel),
+                    (7, &c_residual),
+                    (10, &status),
+                    (11, &phase),
+                    (12, &frozen),
+                ],
             ),
             xsph: bg(
                 &pipelines.xsph,
@@ -543,7 +662,7 @@ impl Solver for XpbdSolver {
         };
 
         let ts = if gpu.timestamps_supported {
-            let passes_per_step = 5 + 6 * cfg.max_iters;
+            let passes_per_step = 5 + 6 * solve_iters;
             let capacity = (2 * passes_per_step * cfg.substeps).clamp(2, 512);
             let qset = device.create_query_set(&wgpu::QuerySetDescriptor {
                 label: Some("xpbd-timestamps"),
@@ -582,11 +701,15 @@ impl Solver for XpbdSolver {
             particle_count,
             num_cells,
             substeps: cfg.substeps.max(1),
-            max_iters: cfg.max_iters,
+            max_iters: solve_iters,
+            regrid_interval,
+            species: scene.species,
             params_buf,
             pos,
             vel,
             vel_smoothed,
+            phase,
+            frozen,
             status,
             status_readback,
             pos_readback,
@@ -597,6 +720,7 @@ impl Solver for XpbdSolver {
             cached_diag: XpbdDiagnostics::default(),
             cached_passes: Vec::new(),
             initial_positions: positions,
+            initial_phases: phases,
         }
     }
 
@@ -621,6 +745,9 @@ impl Solver for XpbdSolver {
                 label: Some("xpbd-frame"),
             });
 
+        // A scene is single-species: run the water density solve OR the granular contact solve.
+        // Both share predict / grid build / apply_dp / finalize; the constraint passes differ.
+        let grain = self.species == Species::Grain;
         for _ in 0..self.substeps {
             dispatch_pass(
                 &mut enc,
@@ -636,8 +763,9 @@ impl Solver for XpbdSolver {
             for it in 0..self.max_iters {
                 // Rebuild the neighbor grid every few iterations so corrections never act on
                 // a stale grid — particles can drift > 1 cell over the solve, and stale
-                // neighbors are the source of the stochastic squeeze-out eruptions.
-                if it % REGRID_INTERVAL == 0 {
+                // neighbors are the source of the stochastic squeeze-out eruptions. The bed is
+                // contact-heavy and rebuilds more often (smaller interval).
+                if it % self.regrid_interval == 0 {
                     dispatch_pass(
                         &mut enc,
                         &self.pipelines.grid_clear,
@@ -661,28 +789,43 @@ impl Solver for XpbdSolver {
                         &mut dispatches,
                     );
                 }
-                dispatch_pass(
-                    &mut enc,
-                    &self.pipelines.compute_lambda,
-                    &self.bind_groups.compute_lambda,
-                    self.ts.as_ref(),
-                    &mut cursor,
-                    &mut labels,
-                    "compute_lambda",
-                    np,
-                    &mut dispatches,
-                );
-                dispatch_pass(
-                    &mut enc,
-                    &self.pipelines.compute_dp,
-                    &self.bind_groups.compute_dp,
-                    self.ts.as_ref(),
-                    &mut cursor,
-                    &mut labels,
-                    "compute_dp",
-                    np,
-                    &mut dispatches,
-                );
+                if grain {
+                    // Granular projection: non-penetration + Coulomb friction + light cohesion.
+                    dispatch_pass(
+                        &mut enc,
+                        &self.pipelines.bed_project,
+                        &self.bind_groups.bed_project,
+                        self.ts.as_ref(),
+                        &mut cursor,
+                        &mut labels,
+                        "bed_project",
+                        np,
+                        &mut dispatches,
+                    );
+                } else {
+                    dispatch_pass(
+                        &mut enc,
+                        &self.pipelines.compute_lambda,
+                        &self.bind_groups.compute_lambda,
+                        self.ts.as_ref(),
+                        &mut cursor,
+                        &mut labels,
+                        "compute_lambda",
+                        np,
+                        &mut dispatches,
+                    );
+                    dispatch_pass(
+                        &mut enc,
+                        &self.pipelines.compute_dp,
+                        &self.bind_groups.compute_dp,
+                        self.ts.as_ref(),
+                        &mut cursor,
+                        &mut labels,
+                        "compute_dp",
+                        np,
+                        &mut dispatches,
+                    );
+                }
                 dispatch_pass(
                     &mut enc,
                     &self.pipelines.apply_dp,
@@ -721,24 +864,28 @@ impl Solver for XpbdSolver {
                 np,
                 &mut dispatches,
             );
-            dispatch_pass(
-                &mut enc,
-                &self.pipelines.xsph,
-                &self.bind_groups.xsph,
-                self.ts.as_ref(),
-                &mut cursor,
-                &mut labels,
-                "xsph",
-                np,
-                &mut dispatches,
-            );
-            enc.copy_buffer_to_buffer(
-                &self.vel_smoothed,
-                0,
-                &self.vel,
-                0,
-                (self.particle_count as u64) * 16,
-            );
+            // XSPH viscosity is a fluid term; the dry bed has none. Skipping it for grains also
+            // avoids the vel_smoothed copy clobbering grain velocities (xsph doesn't write them).
+            if !grain {
+                dispatch_pass(
+                    &mut enc,
+                    &self.pipelines.xsph,
+                    &self.bind_groups.xsph,
+                    self.ts.as_ref(),
+                    &mut cursor,
+                    &mut labels,
+                    "xsph",
+                    np,
+                    &mut dispatches,
+                );
+                enc.copy_buffer_to_buffer(
+                    &self.vel_smoothed,
+                    0,
+                    &self.vel,
+                    0,
+                    (self.particle_count as u64) * 16,
+                );
+            }
         }
 
         if let Some(ts) = &self.ts {
@@ -762,6 +909,7 @@ impl Solver for XpbdSolver {
             particle_count: self.particle_count,
             position: Some(Arc::clone(&self.pos)),
             velocity: Some(Arc::clone(&self.vel)),
+            phase_tag: Some(Arc::clone(&self.phase)),
             ..Default::default()
         }
     }
