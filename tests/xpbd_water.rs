@@ -212,3 +212,46 @@ fn same_seed_is_reproducible_short_run() {
         "not reproducible: mean diff {mean_diff:.5}"
     );
 }
+
+/// Regression for the global-eruption bug: a "converged" frame must still apply a
+/// correction, or gravity's sub-tolerance compression accumulates and detonates the whole
+/// pool (~20 s in). Run long and assert no frame has many fast particles, and it settles.
+#[test]
+fn long_run_no_global_eruption() {
+    let Some(gpu) = GpuContext::new_headless() else {
+        eprintln!("xpbd_water: no GPU adapter; skipping.");
+        return;
+    };
+    let scene = Scene::dam_break();
+    let mut solver = XpbdSolver::build(&scene, &Materials::default(), &Config::default(), &gpu);
+    let n = solver.particles().particle_count as usize;
+    let input = EmissionInput::default();
+    let frames = 1600u32;
+    let mut worst_fast = 0usize;
+    let mut final_v = 0.0f32;
+
+    for f in 0..frames {
+        solver.step(1.0 / 60.0, &input);
+        if f % 10 == 0 || f == frames - 1 {
+            solver.sample_diagnostics();
+            assert!(!solver.diagnostics().overflow, "grid overflow at frame {f}");
+            // Once the dam should have settled, no large fraction of the fluid may be fast.
+            if f > 300 {
+                let vel = solver.read_velocities();
+                final_v = max_speed(&vel);
+                let fast = vel
+                    .iter()
+                    .filter(|x| (x[0] * x[0] + x[1] * x[1] + x[2] * x[2]).sqrt() > 15.0)
+                    .count();
+                worst_fast = worst_fast.max(fast);
+            }
+        }
+    }
+    eprintln!("long run: worst fast-count {worst_fast}/{n}, settled vmax {final_v:.2}");
+    // A global eruption lights up a large fraction at once; a few splash particles are fine.
+    assert!(
+        worst_fast < n / 20,
+        "global eruption: {worst_fast}/{n} particles fast at once"
+    );
+    assert!(final_v < 6.0, "did not settle: final vmax {final_v:.2}");
+}
