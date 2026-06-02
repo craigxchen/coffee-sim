@@ -72,7 +72,8 @@ fn main() {
     };
     let scene = Scene::bed_drop();
     let floor_y = scene.box_min[1];
-    let mut solver = XpbdSolver::build(&scene, &mats, &Config::default(), &gpu);
+    let cfg = Config::default();
+    let mut solver = XpbdSolver::build(&scene, &mats, &cfg, &gpu);
     let n = solver.particles().particle_count as usize;
     println!("spacing {spacing} -> {n} grains");
     let input = EmissionInput::default();
@@ -84,6 +85,9 @@ fn main() {
     let mut overflow = false;
     let mut max_pen = 0.0f32;
     let mut mid_height = 0.0f32; // peak height once settled — for the creep check vs the end
+    let mut max_eff = 0u32; // worst-frame effective iterations (adaptive early-exit diagnostic)
+    let mut last_eff = 0u32;
+    let mut last_pen = 0.0f32; // settled (final-frame) penetration
     let mut gpu_us_samples: Vec<f32> = Vec::new();
 
     for f in 0..frames {
@@ -96,6 +100,9 @@ fn main() {
             max_occ = max_occ.max(d.max_occupancy);
             overflow |= d.overflow;
             max_pen = max_pen.max(d.residual);
+            max_eff = max_eff.max(d.effective_iters);
+            last_eff = d.effective_iters;
+            last_pen = d.residual;
             let us: f32 = solver.profile().passes.iter().map(|(_, t)| *t).sum();
             if us > 0.0 {
                 gpu_us_samples.push(us);
@@ -135,9 +142,11 @@ fn main() {
     println!(
         "collapse {collapse_peak:.1} | settled {settled:.3} | static {still}/{n} ({still_pct:.0}%) | \
          max-penetration {max_pen:.3}·d | occ {max_occ} ovf {overflow}\n\
+         iters: worst {max_eff}, final {last_eff} (cap {}) | settled-pen {last_pen:.3}·d | \
          heap: height {height:.1}, base radius {radius:.1}, repose ≈ {deg:.0}° (diagnostic) | \
          creep (Δheight 2nd half) {creep:.2}\n\
          GPU/frame: median {:.2} ms, p95 {:.2} ms, worst {:.2} ms (16.7 ms = 60 fps budget)",
+        cfg.bed_max_iters,
         pct(0.5),
         pct(0.95),
         pct(1.0)
