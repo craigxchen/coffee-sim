@@ -51,6 +51,7 @@ fn main() {
         particle_spacing: spacing,
         support_radius: 2.0 * spacing,
         particle_mass: 1.0,
+        ..Materials::default()
     };
     let scene = Scene::dam_break();
     let mut solver = XpbdSolver::build(&scene, &mats, &Config::default(), &gpu);

@@ -75,6 +75,7 @@ impl Renderer {
                 uniform_entry(0, wgpu::ShaderStages::VERTEX_FRAGMENT),
                 storage_read_entry(1, wgpu::ShaderStages::VERTEX),
                 storage_read_entry(2, wgpu::ShaderStages::VERTEX),
+                storage_read_entry(3, wgpu::ShaderStages::VERTEX),
             ],
         });
         let particle_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -239,7 +240,8 @@ impl Renderer {
             .position
             .as_ref()
             .zip(particles.velocity.as_ref())
-            .map(|(pos, vel)| {
+            .zip(particles.phase_tag.as_ref())
+            .map(|((pos, vel), phase)| {
                 self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("particle-bg"),
                     layout: &self.particle_bgl,
@@ -255,6 +257,10 @@ impl Renderer {
                         wgpu::BindGroupEntry {
                             binding: 2,
                             resource: vel.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: phase.as_entire_binding(),
                         },
                     ],
                 })

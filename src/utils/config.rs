@@ -56,6 +56,22 @@ pub struct Config {
     // --- initial seeding ---
     /// Initial position jitter as a fraction of particle spacing (breaks lattice symmetry).
     pub seed_jitter: f32,
+
+    // --- granular bed (grain phase) ---
+    /// Iteration cap for the contact solve (contacts converge slower than the density solve).
+    pub bed_max_iters: u32,
+    /// Early-exit threshold on the max normalized penetration `overlap/d` (e.g. 0.02 = 2%).
+    pub bed_residual_tolerance: f32,
+    /// Rebuild the neighbor grid every this-many bed iterations (more frequent than water).
+    pub bed_regrid_interval: u32,
+    /// A grain may freeze only when its speed is below this (scene units/s).
+    pub freeze_speed: f32,
+    /// …and its normalized penetration is below this (anti-freeze-while-penetrating).
+    pub freeze_pen: f32,
+    /// A frozen grain thaws when its normalized penetration exceeds this (a neighbor pushed in).
+    pub thaw_pen: f32,
+    /// Consecutive calm frames a grain must accumulate before it freezes (settle counter).
+    pub freeze_frames: u32,
 }
 
 impl Default for Config {
@@ -97,6 +113,16 @@ impl Default for Config {
             max_speed: 50.0,
             bucket_capacity: 64,
             seed_jitter: 0.1,
+            // Granular bed: contacts need more iterations + a tighter penetration tolerance than
+            // the density solve, and a more frequent grid rebuild (contact-heavy). Freeze a grain
+            // after ~8 calm, un-penetrated frames; thaw it the moment a neighbor pushes in.
+            bed_max_iters: 24,
+            bed_residual_tolerance: 0.02,
+            bed_regrid_interval: 2,
+            freeze_speed: 0.3,
+            freeze_pen: 0.05,
+            thaw_pen: 0.15,
+            freeze_frames: 8,
         }
     }
 }

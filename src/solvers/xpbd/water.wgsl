@@ -1,150 +1,18 @@
-// PBF water core (water incompressibility only) — Macklin & Müller 2013.
-// One @group(0); each entry point uses a subset of the bindings (auto bind-group layouts
-// keep every kernel within the WebGPU 8-storage-buffer limit).
-
-struct Params {
-    box_min: vec4<f32>,
-    box_max: vec4<f32>,
-    gravity: vec4<f32>,
-    grid_origin: vec4<f32>,   // = box_min
-    grid_dims: vec4<u32>,     // nx, ny, nz, num_cells
-    dt: f32,
-    h: f32,
-    rest_density: f32,
-    particle_mass: f32,
-    s_corr_k: f32,
-    s_corr_n: f32,
-    s_corr_wq: f32,           // W_poly6(Δq, h)
-    relaxation_eps: f32,
-    position_relaxation: f32, // ω
-    xsph_c: f32,
-    max_speed: f32,
-    spiky_r_min: f32,         // ε_r · h
-    cell_size: f32,           // = h
-    particle_count: u32,
-    bucket_capacity: u32,     // K
-    min_iters: u32,
-    max_iters: u32,
-    residual_tolerance: f32,
-    lambda_noncohesive: u32,
-    max_correction: f32,
-    velocity_damping: f32,
-    _pad1: u32,
-    _pad2: u32,
-    _pad3: u32,
-};
-
-struct Status {
-    overflow: atomic<u32>,
-    max_occupancy: atomic<u32>,
-    converged: u32,
-    iters_done: u32,
-    effective_iters: u32,
-    residual_bits: u32,
-    _pad0: u32,
-    _pad1: u32,
-};
-
-@group(0) @binding(0) var<uniform> params: Params;
-@group(0) @binding(1) var<storage, read_write> pos: array<vec4<f32>>;
-@group(0) @binding(2) var<storage, read_write> pred: array<vec4<f32>>;
-@group(0) @binding(3) var<storage, read_write> vel: array<vec4<f32>>;
-@group(0) @binding(4) var<storage, read_write> vel_smoothed: array<vec4<f32>>;
-@group(0) @binding(5) var<storage, read_write> lambda: array<f32>;
-@group(0) @binding(6) var<storage, read_write> dp: array<vec4<f32>>;
-@group(0) @binding(7) var<storage, read_write> c_residual: array<f32>;
-@group(0) @binding(8) var<storage, read_write> cell_count: array<atomic<u32>>;
-@group(0) @binding(9) var<storage, read_write> cell_bucket: array<u32>;
-@group(0) @binding(10) var<storage, read_write> status: Status;
-
-const PI: f32 = 3.14159265358979;
-
-fn w_poly6(r: f32, h: f32) -> f32 {
-    if (r >= h) { return 0.0; }
-    let t = h * h - r * r;
-    let coeff = 315.0 / (64.0 * PI * pow(h, 9.0));
-    return coeff * t * t * t;
-}
-
-// True spiky gradient ∇W(d) for d = x_i − x_j (decreases with r ⇒ negative along d), with an
-// r→0 safeguard so near-coincident particles still get a finite separation force.
-fn spiky_grad(d: vec3<f32>, h: f32, r_min: f32) -> vec3<f32> {
-    let len = length(d);
-    if (len >= h) { return vec3<f32>(0.0); }
-    var r = len;
-    var dir: vec3<f32>;
-    if (len < r_min) {
-        r = r_min;
-        if (len < 1e-8) {
-            dir = vec3<f32>(1.0, 0.0, 0.0); // deterministic fallback direction
-        } else {
-            dir = d / len;
-        }
-    } else {
-        dir = d / len;
-    }
-    let coeff = 45.0 / (PI * pow(h, 6.0));
-    let t = h - r;
-    return -coeff * t * t * dir;
-}
-
-fn cell_coord(p: vec3<f32>) -> vec3<i32> {
-    let rel = (p - params.grid_origin.xyz) / params.cell_size;
-    let dims = vec3<i32>(params.grid_dims.xyz);
-    let c = vec3<i32>(floor(rel));
-    return clamp(c, vec3<i32>(0, 0, 0), dims - vec3<i32>(1, 1, 1));
-}
-
-fn cell_id(c: vec3<i32>) -> u32 {
-    let dims = params.grid_dims;
-    return u32(c.x) + dims.x * (u32(c.y) + dims.y * u32(c.z));
-}
-
-@compute @workgroup_size(256)
-fn predict(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
-    if (i == 0u) {
-        atomicStore(&status.overflow, 0u);
-        atomicStore(&status.max_occupancy, 0u);
-        status.converged = 0u;
-        status.iters_done = 0u;
-        status.effective_iters = params.max_iters;
-        status.residual_bits = 0u;
-    }
-    if (i >= params.particle_count) { return; }
-    let p = pos[i].xyz;
-    let v = vel[i].xyz;
-    let g = params.gravity.xyz;
-    let np = p + params.dt * v + (params.dt * params.dt) * g;
-    pred[i] = vec4<f32>(np, 0.0);
-}
-
-@compute @workgroup_size(256)
-fn grid_clear(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let c = gid.x;
-    if (c >= params.grid_dims.w) { return; }
-    atomicStore(&cell_count[c], 0u);
-}
-
-@compute @workgroup_size(256)
-fn grid_fill(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
-    if (i >= params.particle_count) { return; }
-    let cell = cell_id(cell_coord(pred[i].xyz));
-    let slot = atomicAdd(&cell_count[cell], 1u);
-    if (slot < params.bucket_capacity) {
-        cell_bucket[cell * params.bucket_capacity + slot] = i;
-        atomicMax(&status.max_occupancy, slot + 1u);
-    } else {
-        atomicStore(&status.overflow, 1u);
-    }
-}
+// Water incompressibility (Position Based Fluids — Macklin & Müller 2013): the constant-density
+// constraint + λ, the s_corr artificial-pressure Δp, the convergence reduction, and XSPH
+// viscosity. Concatenated after `common.wgsl`, which declares Params/Status/bindings + the SPH
+// and grid helpers these kernels use.
+//
+// Every density sum is phase-guarded: a grain neighbor has no fluid density and must not enter
+// the water constraint (and grain particles skip the water solve entirely). For a single-species
+// water scene the guards are pass-throughs, so water behaviour is unchanged.
 
 @compute @workgroup_size(256)
 fn compute_lambda(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
     if (i >= params.particle_count) { return; }
     if (status.converged != 0u) { return; }
+    if (phase[i] != PHASE_WATER) { return; } // grains have no density constraint
     let h = params.h;
     let m = params.particle_mass;
     let xi = pred[i].xyz;
@@ -166,6 +34,7 @@ fn compute_lambda(@builtin(global_invocation_id) gid: vec3<u32>) {
                 for (var s = 0u; s < cnt; s = s + 1u) {
                     let j = cell_bucket[cid * params.bucket_capacity + s];
                     if (j == i) { continue; }
+                    if (phase[j] != PHASE_WATER) { continue; } // skip grain neighbors
                     let d = xi - pred[j].xyz;
                     let r = length(d);
                     if (r >= h) { continue; }
@@ -232,6 +101,7 @@ fn compute_dp(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
     if (i >= params.particle_count) { return; }
     if (status.converged != 0u) { return; }
+    if (phase[i] != PHASE_WATER) { return; } // grains are projected by bed_project
     let h = params.h;
     let m = params.particle_mass;
     let xi = pred[i].xyz;
@@ -251,6 +121,7 @@ fn compute_dp(@builtin(global_invocation_id) gid: vec3<u32>) {
                 for (var s = 0u; s < cnt; s = s + 1u) {
                     let j = cell_bucket[cid * params.bucket_capacity + s];
                     if (j == i) { continue; }
+                    if (phase[j] != PHASE_WATER) { continue; } // skip grain neighbors
                     let d = xi - pred[j].xyz;
                     let r = length(d);
                     if (r >= h) { continue; }
@@ -265,35 +136,6 @@ fn compute_dp(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     let inv_rho0 = 1.0 / params.rest_density;
     dp[i] = vec4<f32>(sum * inv_rho0, 0.0);
-}
-
-@compute @workgroup_size(256)
-fn apply_dp(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
-    if (i >= params.particle_count) { return; }
-    if (status.converged != 0u) { return; }
-    // Cap the per-iteration correction so no single overcorrection can launch a particle.
-    var d = params.position_relaxation * dp[i].xyz;
-    let dl = length(d);
-    if (dl > params.max_correction) {
-        d = d * (params.max_correction / dl);
-    }
-    let clamped = clamp(pred[i].xyz + d, params.box_min.xyz, params.box_max.xyz);
-    pred[i] = vec4<f32>(clamped, 0.0);
-}
-
-@compute @workgroup_size(256)
-fn finalize(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
-    if (i >= params.particle_count) { return; }
-    let xi = pred[i].xyz;
-    var v = ((xi - pos[i].xyz) / params.dt) * params.velocity_damping;
-    let sp = length(v);
-    if (sp > params.max_speed) {
-        v = v * (params.max_speed / sp);
-    }
-    vel[i] = vec4<f32>(v, 0.0);
-    pos[i] = vec4<f32>(xi, 0.0);
 }
 
 @compute @workgroup_size(256)
