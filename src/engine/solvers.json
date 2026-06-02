@@ -10,5 +10,11 @@
     "paradigm": "ForceBased",
     "owns_grid": true,
     "stability": { "CflLimited": { "c": 0.5 } }
+  },
+  "xpbd": {
+    "name": "XPBD (PBF water)",
+    "paradigm": "PositionBased",
+    "owns_grid": false,
+    "stability": "Unconditional"
   }
 }
