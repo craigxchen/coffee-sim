@@ -11,6 +11,23 @@ use coffee_sim::utils::config::Config;
 use coffee_sim::utils::gpu::GpuContext;
 use coffee_sim::EmissionInput;
 
+/// Read the `SPACING` env var (particle pitch). Clamped to a floor below which the
+/// fixed-bucket neighbor grid would exceed the WebGPU 128 MB buffer-binding limit.
+fn parse_spacing() -> f32 {
+    const MIN_SPACING: f32 = 0.25;
+    let requested: f32 = std::env::var("SPACING")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1.0);
+    let spacing = requested.max(MIN_SPACING);
+    if spacing != requested {
+        eprintln!(
+            "SPACING {requested} is too small (grid buffer would exceed the GPU limit); using {spacing}"
+        );
+    }
+    spacing
+}
+
 fn max_speed(v: &[[f32; 4]]) -> f32 {
     v.iter()
         .map(|x| (x[0] * x[0] + x[1] * x[1] + x[2] * x[2]).sqrt())
@@ -29,10 +46,7 @@ fn main() {
         eprintln!("no GPU adapter; skipping.");
         return;
     };
-    let spacing: f32 = std::env::var("SPACING")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1.0);
+    let spacing = parse_spacing();
     let mats = Materials {
         particle_spacing: spacing,
         support_radius: 2.0 * spacing,
