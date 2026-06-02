@@ -47,12 +47,14 @@ impl OrbitCamera {
         proj * view
     }
 
-    /// Orientation-only view (for the corner gizmo): same rotation, fixed distance, origin target.
+    /// Orientation-only view (for the corner gizmo): the camera's rotation at a fixed
+    /// distance, framed to fit the cube `[-1,1]³` plus the axis rods (which reach ~1.55).
     pub fn rotation_only_view(&self) -> Mat4 {
         let (sy, cy) = self.yaw.sin_cos();
         let (sp, cp) = self.pitch.sin_cos();
         let dir = Vec3::new(cp * sy, sp, cp * cy);
-        Mat4::look_at_rh(dir * 2.5, Vec3::ZERO, Vec3::Y)
+        let center = Vec3::splat(0.25);
+        Mat4::look_at_rh(center + dir * 6.0, center, Vec3::Y)
     }
 
     /// Drag → orbit (radians). Pitch is clamped just shy of the poles.

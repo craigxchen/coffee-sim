@@ -11,7 +11,6 @@ use crate::utils::buffers::ParticleBuffers;
 use crate::utils::gpu::GpuContext;
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
-const GIZMO_PX: u32 = 120;
 /// Speed mapped to the top of the color ramp.
 const COLOR_MAX_SPEED: f32 = 25.0;
 
@@ -47,6 +46,8 @@ pub struct Renderer {
     gizmo_pipeline: wgpu::RenderPipeline,
     cube_vbuf: wgpu::Buffer,
     cube_vcount: u32,
+    axis_vbuf: wgpu::Buffer,
+    axis_vcount: u32,
 }
 
 impl Renderer {
@@ -136,6 +137,12 @@ impl Renderer {
             contents: bytemuck::cast_slice(&cube),
             usage: wgpu::BufferUsages::VERTEX,
         });
+        let axes = axis_rods();
+        let axis_vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("gizmo-axes"),
+            contents: bytemuck::cast_slice(&axes),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
         let gizmo_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("gizmo"),
             source: wgpu::ShaderSource::Wgsl(include_str!("gizmo.wgsl").into()),
@@ -187,6 +194,8 @@ impl Renderer {
             gizmo_pipeline,
             cube_vbuf,
             cube_vcount: cube.len() as u32,
+            axis_vbuf,
+            axis_vcount: axes.len() as u32,
         }
     }
 
@@ -307,8 +316,11 @@ impl Renderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            let pad = 8.0;
-            let s = GIZMO_PX.min(self.size.0).min(self.size.1) as f32;
+            let pad = 12.0;
+            let s = ((self.size.0.min(self.size.1)) as f32 * 0.30)
+                .clamp(220.0, 380.0)
+                .min(self.size.0 as f32)
+                .min(self.size.1 as f32);
             let x = (self.size.0 as f32 - s - pad).max(0.0);
             let y = (self.size.1 as f32 - s - pad).max(0.0);
             pass.set_viewport(x, y, s, s, 0.0, 1.0);
@@ -316,6 +328,8 @@ impl Renderer {
             pass.set_bind_group(0, &self.gizmo_bg, &[]);
             pass.set_vertex_buffer(0, self.cube_vbuf.slice(..));
             pass.draw(0..self.cube_vcount, 0..1);
+            pass.set_vertex_buffer(0, self.axis_vbuf.slice(..));
+            pass.draw(0..self.axis_vcount, 0..1);
         }
 
         self.queue.submit(Some(enc.finish()));
@@ -388,87 +402,74 @@ fn storage_read_entry(binding: u32, vis: wgpu::ShaderStages) -> wgpu::BindGroupL
     }
 }
 
-/// (axis normal, face color, the four CCW corners) for one cube face.
-type CubeFace = ([f32; 3], [f32; 3], [[f32; 3]; 4]);
+/// (outward normal, the four CCW corners in ±1) for one cube face.
+type FaceGeom = ([f32; 3], [[f32; 3]; 4]);
 
-/// 36 vertices (6 faces × 2 tris), each `[pos.xyz, color.rgb, normal.xyz]`.
-fn cube_vertices() -> Vec<[f32; 9]> {
-    let faces: [CubeFace; 6] = [
-        // +X red
-        (
-            [1.0, 0.0, 0.0],
-            [0.90, 0.20, 0.20],
-            [
-                [1.0, -1.0, 1.0],
-                [1.0, -1.0, -1.0],
-                [1.0, 1.0, -1.0],
-                [1.0, 1.0, 1.0],
-            ],
-        ),
-        // -X cyan
-        (
-            [-1.0, 0.0, 0.0],
-            [0.20, 0.80, 0.85],
-            [
-                [-1.0, -1.0, -1.0],
-                [-1.0, -1.0, 1.0],
-                [-1.0, 1.0, 1.0],
-                [-1.0, 1.0, -1.0],
-            ],
-        ),
-        // +Y green
-        (
-            [0.0, 1.0, 0.0],
-            [0.25, 0.80, 0.30],
-            [
-                [-1.0, 1.0, 1.0],
-                [1.0, 1.0, 1.0],
-                [1.0, 1.0, -1.0],
-                [-1.0, 1.0, -1.0],
-            ],
-        ),
-        // -Y magenta
-        (
-            [0.0, -1.0, 0.0],
-            [0.85, 0.25, 0.80],
-            [
-                [-1.0, -1.0, -1.0],
-                [1.0, -1.0, -1.0],
-                [1.0, -1.0, 1.0],
-                [-1.0, -1.0, 1.0],
-            ],
-        ),
-        // +Z blue
-        (
-            [0.0, 0.0, 1.0],
-            [0.25, 0.40, 0.95],
-            [
-                [-1.0, -1.0, 1.0],
-                [1.0, -1.0, 1.0],
-                [1.0, 1.0, 1.0],
-                [-1.0, 1.0, 1.0],
-            ],
-        ),
-        // -Z yellow
-        (
-            [0.0, 0.0, -1.0],
-            [0.90, 0.85, 0.25],
-            [
-                [1.0, -1.0, -1.0],
-                [-1.0, -1.0, -1.0],
-                [-1.0, 1.0, -1.0],
-                [1.0, 1.0, -1.0],
-            ],
-        ),
-    ];
-    let mut v = Vec::with_capacity(36);
-    let mut push = |p: [f32; 3], c: [f32; 3], n: [f32; 3]| {
-        v.push([p[0], p[1], p[2], c[0], c[1], c[2], n[0], n[1], n[2]]);
-    };
-    for (n, c, q) in faces {
-        for &i in &[0usize, 1, 2, 0, 2, 3] {
-            push(q[i], c, n);
-        }
+#[rustfmt::skip]
+const FACES: [FaceGeom; 6] = [
+    ([ 1.0, 0.0, 0.0], [[ 1.0,-1.0, 1.0], [ 1.0,-1.0,-1.0], [ 1.0, 1.0,-1.0], [ 1.0, 1.0, 1.0]]), // +X
+    ([-1.0, 0.0, 0.0], [[-1.0,-1.0,-1.0], [-1.0,-1.0, 1.0], [-1.0, 1.0, 1.0], [-1.0, 1.0,-1.0]]), // -X
+    ([ 0.0, 1.0, 0.0], [[-1.0, 1.0, 1.0], [ 1.0, 1.0, 1.0], [ 1.0, 1.0,-1.0], [-1.0, 1.0,-1.0]]), // +Y
+    ([ 0.0,-1.0, 0.0], [[-1.0,-1.0,-1.0], [ 1.0,-1.0,-1.0], [ 1.0,-1.0, 1.0], [-1.0,-1.0, 1.0]]), // -Y
+    ([ 0.0, 0.0, 1.0], [[-1.0,-1.0, 1.0], [ 1.0,-1.0, 1.0], [ 1.0, 1.0, 1.0], [-1.0, 1.0, 1.0]]), // +Z
+    ([ 0.0, 0.0,-1.0], [[ 1.0,-1.0,-1.0], [-1.0,-1.0,-1.0], [-1.0, 1.0,-1.0], [ 1.0, 1.0,-1.0]]), // -Z
+];
+
+const TRI: [usize; 6] = [0, 1, 2, 0, 2, 3];
+
+fn emit_face(out: &mut Vec<[f32; 9]>, corners: &[[f32; 3]; 4], color: [f32; 3], n: [f32; 3]) {
+    for &i in &TRI {
+        let p = corners[i];
+        out.push([
+            p[0], p[1], p[2], color[0], color[1], color[2], n[0], n[1], n[2],
+        ]);
     }
+}
+
+/// The grey orientation cube (36 verts `[pos, color, normal]`). Faces are neutral grey;
+/// lighting differentiates them and the XYZ axis rods convey orientation.
+fn cube_vertices() -> Vec<[f32; 9]> {
+    let grey = [0.58, 0.60, 0.64];
+    let mut v = Vec::with_capacity(36);
+    for (n, corners) in FACES {
+        emit_face(&mut v, &corners, grey, n);
+    }
+    v
+}
+
+/// An axis-aligned box `[min, max]` as 36 vertices with a single color.
+fn box_verts(min: [f32; 3], max: [f32; 3], color: [f32; 3]) -> Vec<[f32; 9]> {
+    let remap = |c: [f32; 3]| {
+        [
+            min[0] + (c[0] + 1.0) * 0.5 * (max[0] - min[0]),
+            min[1] + (c[1] + 1.0) * 0.5 * (max[1] - min[1]),
+            min[2] + (c[2] + 1.0) * 0.5 * (max[2] - min[2]),
+        ]
+    };
+    let mut v = Vec::with_capacity(36);
+    for (n, corners) in FACES {
+        let mapped = [
+            remap(corners[0]),
+            remap(corners[1]),
+            remap(corners[2]),
+            remap(corners[3]),
+        ];
+        emit_face(&mut v, &mapped, color, n);
+    }
+    v
+}
+
+/// Three colored axis rods (thin boxes) from the cube's −corner along +X/+Y/+Z (CAD-style).
+fn axis_rods() -> Vec<[f32; 9]> {
+    let c = -1.0; // corner
+    let r = 0.10; // rod half-thickness
+    let len = 1.55; // rod tip, past the cube face
+    let red = [0.92, 0.26, 0.24];
+    let green = [0.36, 0.82, 0.36];
+    let blue = [0.30, 0.52, 0.95];
+    let mut v = Vec::with_capacity(108);
+    v.extend(box_verts([c, c - r, c - r], [len, c + r, c + r], red)); // +X
+    v.extend(box_verts([c - r, c, c - r], [c + r, len, c + r], green)); // +Y
+    v.extend(box_verts([c - r, c - r, c], [c + r, c + r, len], blue)); // +Z
     v
 }
