@@ -1,7 +1,7 @@
-//! Dry granular-bed drop (headless): a grain column collapses onto the flat floor and settles
-//! into a static heap. Reports the diagnostic angle of repose, settled speed, frozen %, max
-//! penetration, and GPU cost. Set `SPACING` (default 1.0) to change grain size/count; the grain
-//! contact diameter and support radius scale with it so the physics stays resolution-consistent.
+//! Dry granular-bed drop (headless): a grain block is dropped onto the flat floor and flows into
+//! a heap. Reports the diagnostic angle of repose, settled speed, static %, max penetration, the
+//! second-half height creep, and GPU cost. Set `SPACING` (default 1.0) to change grain size/count;
+//! the grain contact diameter and support radius scale with it so the physics stays consistent.
 //!
 //! Run: `cargo run --example bed_drop`
 
@@ -82,8 +82,8 @@ fn main() {
     let mut settled = 0.0f32;
     let mut max_occ = 0u32;
     let mut overflow = false;
-    let mut frozen = 0u32;
     let mut max_pen = 0.0f32;
+    let mut mid_height = 0.0f32; // peak height once settled — for the creep check vs the end
     let mut gpu_us_samples: Vec<f32> = Vec::new();
 
     for f in 0..frames {
@@ -95,7 +95,6 @@ fn main() {
             let d = solver.diagnostics();
             max_occ = max_occ.max(d.max_occupancy);
             overflow |= d.overflow;
-            frozen = d.frozen_count;
             max_pen = max_pen.max(d.residual);
             let us: f32 = solver.profile().passes.iter().map(|(_, t)| *t).sum();
             if us > 0.0 {
@@ -103,6 +102,10 @@ fn main() {
             }
             if f < 180 {
                 collapse_peak = collapse_peak.max(v);
+            }
+            if f == frames / 2 {
+                let (_, h, _) = repose_deg(&solver.read_positions(), floor_y);
+                mid_height = h;
             }
             settled = v;
         }
@@ -120,12 +123,20 @@ fn main() {
             / 1000.0
     };
     let pos = solver.read_positions();
+    let vel = solver.read_velocities();
     let (deg, height, radius) = repose_deg(&pos, floor_y);
-    let frozen_pct = 100.0 * frozen as f32 / n.max(1) as f32;
+    // Static fraction from actual velocities (no freeze flag any more): grains below 0.1 units/s.
+    let still = vel
+        .iter()
+        .filter(|v| max_speed(std::slice::from_ref(v)) < 0.1)
+        .count();
+    let still_pct = 100.0 * still as f32 / n.max(1) as f32;
+    let creep = (mid_height - height).abs();
     println!(
-        "collapse {collapse_peak:.1} | settled {settled:.3} | frozen {frozen}/{n} ({frozen_pct:.0}%) | \
+        "collapse {collapse_peak:.1} | settled {settled:.3} | static {still}/{n} ({still_pct:.0}%) | \
          max-penetration {max_pen:.3}·d | occ {max_occ} ovf {overflow}\n\
-         heap: height {height:.1}, base radius {radius:.1}, repose ≈ {deg:.0}° (diagnostic)\n\
+         heap: height {height:.1}, base radius {radius:.1}, repose ≈ {deg:.0}° (diagnostic) | \
+         creep (Δheight 2nd half) {creep:.2}\n\
          GPU/frame: median {:.2} ms, p95 {:.2} ms, worst {:.2} ms (16.7 ms = 60 fps budget)",
         pct(0.5),
         pct(0.95),

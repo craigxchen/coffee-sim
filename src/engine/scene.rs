@@ -72,11 +72,13 @@ impl Scene {
     pub fn bed_drop() -> Self {
         Self {
             // A wider floor than the water box so the heap settles without ever touching a wall
-            // (wall contact would confine the pile and corrupt the repose). A ~12-wide block,
-            // centered, dropped from ~14 units up: it free-falls, hits the floor, and spreads.
+            // (wall contact would confine the pile and corrupt the repose). Grounds are *poured*,
+            // not dropped from height: a low, wide block deposited just above the floor slumps
+            // gently into a bed — far less impact energy to dissipate than a tall dropped column,
+            // so it reaches static rest cleanly.
             box_max: [48.0, 40.0, 48.0],
-            water_block_min: [18.0, 14.0, 18.0],
-            water_block_max: [30.0, 28.0, 30.0],
+            water_block_min: [15.0, 2.0, 15.0],
+            water_block_max: [33.0, 12.0, 33.0],
             species: Species::Grain,
             ..Self::default()
         }

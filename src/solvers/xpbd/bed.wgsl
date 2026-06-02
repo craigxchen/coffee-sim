@@ -1,7 +1,14 @@
-// Dry granular bed (position-based; Macklin "Unified Particle Physics" 2014). Grains solve
-// direct position corrections — non-penetration + Coulomb friction + light cohesion — over their
-// grain neighbors, written into `dp[i]` (Jacobi) and applied by the shared `apply_dp` (which also
-// adds grain–boundary friction). Concatenated after `common.wgsl` + `water.wgsl`.
+// Dry granular bed (position-based; Macklin "Unified Particle Physics" 2014, with XPBD friction
+// from Macklin et al. 2020). Grains solve direct position corrections — non-penetration + Coulomb
+// friction + light cohesion — over their grain neighbors, written into `dp[i]` (Jacobi) and
+// applied by the shared `apply_dp` (which also adds grain–boundary friction). Concatenated after
+// `common.wgsl` + `water.wgsl`.
+//
+// Friction budget is μ · (accumulated normal impulse this frame), NOT μ · overlap. The
+// non-penetration solve drives overlap → 0 at rest, so an overlap-based budget would vanish
+// exactly when the pile needs to hold its slope (→ continuous creep). The accumulated normal
+// correction is load-scaled (a deep grain is pushed harder, every iteration) and stays non-zero
+// at static rest, so the pile holds a true repose without any freeze hack.
 //
 // To stay within the WebGPU 8-storage-buffer limit this kernel does NOT bind `status`: the
 // convergence early-exit is enforced by `apply_dp`/`residual_reduce`, so a wasted projection
@@ -15,9 +22,10 @@ fn bed_project(@builtin(global_invocation_id) gid: vec3<u32>) {
     let d = params.grain_diameter;
     let xi = pred[i].xyz;
     let prev_i = pos[i].xyz;
-    let frozen_i = is_frozen(i);
 
-    var sum = vec3<f32>(0.0);
+    var separation = vec3<f32>(0.0); // non-penetration (+ cohesion) push
+    var tangential = vec3<f32>(0.0); // unclamped tangential-relative-motion removal
+    var normal_mag = 0.0;            // total normal-correction magnitude this iteration
     var max_pen = 0.0;
 
     let base = cell_coord(xi);
@@ -45,40 +53,36 @@ fn bed_project(@builtin(global_invocation_id) gid: vec3<u32>) {
                         n = dvec / r;
                     }
                     if (r < d) {
-                        // --- non-penetration ---
+                        // --- non-penetration (½/½ split between the two mobile grains) ---
                         let overlap = d - r;
                         max_pen = max(max_pen, overlap);
-                        if (!frozen_i) {
-                            // Split the separation ½/½ with a mobile neighbor; take it all off a
-                            // frozen neighbor (zero inverse mass — it doesn't move).
-                            let w = select(0.5, 1.0, is_frozen(j));
-                            sum = sum + n * (overlap * w);
-                            // --- grain–grain Coulomb friction ---
-                            // Remove the tangential relative displacement this frame, clamped to
-                            // μ·overlap (static if within the cone, else slip to the limit).
-                            let rel = (xi - prev_i) - (pred[j].xyz - pos[j].xyz);
-                            let tang = rel - dot(rel, n) * n;
-                            let tlen = length(tang);
-                            if (tlen > 1e-8) {
-                                let corr = min(tlen, params.friction_mu * overlap);
-                                sum = sum - (tang / tlen) * (corr * w);
-                            }
-                        }
-                    } else if (!frozen_i && params.dry_cohesion > 0.0) {
+                        let push = overlap * 0.5;
+                        separation = separation + n * push;
+                        normal_mag = normal_mag + push;
+                        // --- tangential relative displacement this frame (this grain's ½ share) ---
+                        let rel = (xi - prev_i) - (pred[j].xyz - pos[j].xyz);
+                        tangential = tangential - (rel - dot(rel, n) * n) * 0.5;
+                    } else if (params.dry_cohesion > 0.0) {
                         // --- light dry cohesion just past contact (linear falloff) ---
                         let f = params.dry_cohesion * (1.0 - (r - d) / (params.cohesion_range - d));
-                        sum = sum - n * f; // pull i toward j (direction −n)
+                        separation = separation - n * f; // pull i toward j (direction −n)
                     }
                 }
             }
         }
     }
 
-    // Frozen grains report their penetration (so finalize can thaw them) but do not move.
-    if (frozen_i) {
-        dp[i] = vec4<f32>(0.0);
-    } else {
-        dp[i] = vec4<f32>(sum, 0.0);
+    // Accumulate the normal impulse over the frame's iterations; the Coulomb budget is μ times it.
+    // (Static if the desired tangential removal is within the cone, else slip to the limit.)
+    let impulse = normal_impulse[i] + normal_mag;
+    normal_impulse[i] = impulse;
+    let limit = params.friction_mu * impulse;
+    let tlen = length(tangential);
+    var friction = tangential;
+    if (tlen > limit) {
+        friction = tangential * (limit / tlen);
     }
+
+    dp[i] = vec4<f32>(separation + friction, 0.0);
     c_residual[i] = max_pen / d;
 }

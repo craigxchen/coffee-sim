@@ -65,11 +65,7 @@ struct Params {
     dry_cohesion: f32,
     cohesion_range: f32,
     rolling_damping: f32,
-    freeze_speed: f32,
-    freeze_pen: f32,
-    thaw_pen: f32,
-    freeze_frames: u32,
-    _pad0: u32,
+    grain_sleep_speed: f32,
 }
 
 /// CPU mirror of the WGSL `Status` struct (8 × u32).
@@ -82,7 +78,7 @@ struct StatusRaw {
     iters_done: u32,
     effective_iters: u32,
     residual_bits: u32,
-    frozen_count: u32,
+    _pad0: u32,
     _pad1: u32,
 }
 
@@ -130,8 +126,6 @@ pub struct XpbdDiagnostics {
     pub effective_iters: u32,
     /// Final max constraint residual: over-density (water) or normalized penetration (grain).
     pub residual: f32,
-    /// Number of frozen (settled, static) grains last frame.
-    pub frozen_count: u32,
 }
 
 pub struct XpbdSolver {
@@ -150,13 +144,12 @@ pub struct XpbdSolver {
 
     // Buffers referenced every frame only through the bind groups (which retain them) are
     // not held here. We keep the ones we touch directly: params (write), pos/vel (expose +
-    // readback/copy), vel_smoothed (copy src), status (+ readbacks), phase/frozen (expose/reset).
+    // readback/copy), vel_smoothed (copy src), status (+ readbacks), phase (expose + re-seed).
     params_buf: wgpu::Buffer,
     pos: Arc<wgpu::Buffer>,
     vel: Arc<wgpu::Buffer>,
     vel_smoothed: wgpu::Buffer,
     phase: Arc<wgpu::Buffer>,
-    frozen: wgpu::Buffer,
     status: wgpu::Buffer,
     status_readback: wgpu::Buffer,
     pos_readback: wgpu::Buffer,
@@ -226,7 +219,7 @@ impl XpbdSolver {
     }
 
     /// Re-seed the particles to the original block (exact, deterministic): positions, phase
-    /// tags, zeroed velocities, and thawed (zeroed) freeze counters.
+    /// tags, and zeroed velocities. (`normal_impulse` is reset every frame in `predict`.)
     fn seed(&mut self) {
         self.queue
             .write_buffer(&self.pos, 0, bytemuck::cast_slice(&self.initial_positions));
@@ -235,9 +228,6 @@ impl XpbdSolver {
         let zeros = vec![[0.0f32; 4]; self.particle_count as usize];
         self.queue
             .write_buffer(&self.vel, 0, bytemuck::cast_slice(&zeros));
-        let frozen_zeros = vec![0u32; self.particle_count as usize];
-        self.queue
-            .write_buffer(&self.frozen, 0, bytemuck::cast_slice(&frozen_zeros));
     }
 
     /// Blocking GPU→CPU read-back of a `vec4` particle buffer (dev/test only — stalls).
@@ -311,7 +301,6 @@ impl XpbdSolver {
             max_occupancy: raw.max_occupancy,
             effective_iters: raw.effective_iters,
             residual: f32::from_bits(raw.residual_bits),
-            frozen_count: raw.frozen_count,
         };
 
         // --- timestamps ---
@@ -420,11 +409,7 @@ impl Solver for XpbdSolver {
             dry_cohesion: mats.dry_cohesion,
             cohesion_range: crate::models::cohesion::COHESION_RANGE_RATIO * mats.grain_diameter,
             rolling_damping: mats.rolling_damping,
-            freeze_speed: cfg.freeze_speed,
-            freeze_pen: cfg.freeze_pen,
-            thaw_pen: cfg.thaw_pen,
-            freeze_frames: cfg.freeze_frames,
-            _pad0: 0,
+            grain_sleep_speed: cfg.grain_sleep_speed,
         };
 
         let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -462,8 +447,8 @@ impl Solver for XpbdSolver {
         let dp = Self::storage(&device, "xpbd-dp", vec4, wgpu::BufferUsages::empty());
         let c_residual =
             Self::storage(&device, "xpbd-cresidual", f32s, wgpu::BufferUsages::empty());
-        // Per-particle species tag (exposed to the renderer for color-by-phase) and the
-        // per-grain freeze/settle counter (zero-initialized by wgpu = all thawed).
+        // Per-particle species tag (exposed to the renderer for color-by-phase) and the per-grain
+        // accumulated-normal-impulse buffer (the friction budget; reset each frame in predict).
         let phase = Arc::new(
             device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("xpbd-phase"),
@@ -471,7 +456,12 @@ impl Solver for XpbdSolver {
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             }),
         );
-        let frozen = Self::storage(&device, "xpbd-frozen", f32s, wgpu::BufferUsages::empty());
+        let normal_impulse = Self::storage(
+            &device,
+            "xpbd-normal-impulse",
+            f32s,
+            wgpu::BufferUsages::empty(),
+        );
         let cell_count = Self::storage(
             &device,
             "xpbd-cellcount",
@@ -565,8 +555,7 @@ impl Solver for XpbdSolver {
                     (2, &pred),
                     (3, &vel),
                     (10, &status),
-                    (11, &phase),
-                    (12, &frozen),
+                    (12, &normal_impulse),
                 ],
             ),
             grid_clear: bg(&pipelines.grid_clear, &[(0, &params_buf), (8, &cell_count)]),
@@ -621,7 +610,7 @@ impl Solver for XpbdSolver {
                     (8, &cell_count),
                     (9, &cell_bucket),
                     (11, &phase),
-                    (12, &frozen),
+                    (12, &normal_impulse),
                 ],
             ),
             apply_dp: bg(
@@ -643,9 +632,7 @@ impl Solver for XpbdSolver {
                     (2, &pred),
                     (3, &vel),
                     (7, &c_residual),
-                    (10, &status),
                     (11, &phase),
-                    (12, &frozen),
                 ],
             ),
             xsph: bg(
@@ -709,7 +696,6 @@ impl Solver for XpbdSolver {
             vel,
             vel_smoothed,
             phase,
-            frozen,
             status,
             status_readback,
             pos_readback,

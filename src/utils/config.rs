@@ -64,14 +64,10 @@ pub struct Config {
     pub bed_residual_tolerance: f32,
     /// Rebuild the neighbor grid every this-many bed iterations (more frequent than water).
     pub bed_regrid_interval: u32,
-    /// A grain may freeze only when its speed is below this (scene units/s).
-    pub freeze_speed: f32,
-    /// …and its normalized penetration is below this (anti-freeze-while-penetrating).
-    pub freeze_pen: f32,
-    /// A frozen grain thaws when its normalized penetration exceeds this (a neighbor pushed in).
-    pub thaw_pen: f32,
-    /// Consecutive calm frames a grain must accumulate before it freezes (settle counter).
-    pub freeze_frames: u32,
+    /// Grain static-yield dead-band (scene units/s): below this a grain is snapped to rest.
+    /// Honest quasi-static regularization (gravity + contacts still evaluated) — removes the
+    /// sub-threshold jitter a Jacobi contact pile never fully settles, without freezing.
+    pub grain_sleep_speed: f32,
 }
 
 impl Default for Config {
@@ -114,15 +110,11 @@ impl Default for Config {
             bucket_capacity: 64,
             seed_jitter: 0.1,
             // Granular bed: contacts need more iterations + a tighter penetration tolerance than
-            // the density solve, and a more frequent grid rebuild (contact-heavy). Freeze a grain
-            // after ~8 calm, un-penetrated frames; thaw it the moment a neighbor pushes in.
+            // the density solve, and a more frequent grid rebuild (contact-heavy).
             bed_max_iters: 24,
             bed_residual_tolerance: 0.02,
             bed_regrid_interval: 2,
-            freeze_speed: 0.3,
-            freeze_pen: 0.05,
-            thaw_pen: 0.15,
-            freeze_frames: 8,
+            grain_sleep_speed: 0.2,
         }
     }
 }
