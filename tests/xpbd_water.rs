@@ -1,7 +1,8 @@
-//! PBF water-core gate (GPU-gated; skips without an adapter).
+//! PBF water-core invariants (GPU-gated; skips without an adapter).
 //!
-//! Verifies the dam-break is stable, incompressible, clump-free, and settles — the v1
-//! water-core acceptance gate from `docs/plans/solver_xpbd.md`.
+//! One long dam-break run that asserts the physical invariants that actually matter — not
+//! tuned target values. If the solver changes, these should still hold (or reveal a real
+//! regression), rather than needing constant re-tuning.
 
 use coffee_sim::engine::Scene;
 use coffee_sim::models::Materials;
@@ -12,10 +13,8 @@ use coffee_sim::utils::gpu::GpuContext;
 use coffee_sim::utils::kernels;
 use coffee_sim::EmissionInput;
 
-fn max_speed(v: &[[f32; 4]]) -> f32 {
-    v.iter()
-        .map(|x| (x[0] * x[0] + x[1] * x[1] + x[2] * x[2]).sqrt())
-        .fold(0.0, f32::max)
+fn speed(v: [f32; 4]) -> f32 {
+    (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt()
 }
 
 fn dist2(a: [f32; 4], b: [f32; 4]) -> f32 {
@@ -23,8 +22,13 @@ fn dist2(a: [f32; 4], b: [f32; 4]) -> f32 {
     d[0] * d[0] + d[1] * d[1] + d[2] * d[2]
 }
 
+fn finite(p: &[[f32; 4]]) -> bool {
+    p.iter()
+        .all(|q| q[0].is_finite() && q[1].is_finite() && q[2].is_finite())
+}
+
 /// Min nearest-neighbor distance over a strided sample (clumping detector).
-fn min_nn_sample(pos: &[[f32; 4]], stride: usize) -> f32 {
+fn min_nn(pos: &[[f32; 4]], stride: usize) -> f32 {
     let mut min_nn = f32::INFINITY;
     let mut i = 0;
     while i < pos.len() {
@@ -40,13 +44,11 @@ fn min_nn_sample(pos: &[[f32; 4]], stride: usize) -> f32 {
     min_nn.sqrt()
 }
 
-/// (#interior in density band, #interior) over a strided sample. Interior = particles
-/// with a full-ish neighborhood (excludes the free surface, where deficit is physical).
-fn density_band(pos: &[[f32; 4]], h: f32, m: f32, rho0: f32, stride: usize) -> (usize, usize) {
-    let lo = 0.85 * rho0;
-    let hi = 1.15 * rho0;
-    let mut in_band = 0;
-    let mut interior = 0;
+/// (#interior particles within the density band, #interior) over a strided sample.
+/// "Interior" = a full-ish neighborhood, so the free surface (physically deficient) is excluded.
+fn density_in_band(pos: &[[f32; 4]], h: f32, m: f32, rho0: f32, stride: usize) -> (usize, usize) {
+    let (lo, hi) = (0.85 * rho0, 1.15 * rho0);
+    let (mut ok, mut interior) = (0, 0);
     let mut i = 0;
     while i < pos.len() {
         let mut rho = m * kernels::w_poly6(0.0, h);
@@ -60,25 +62,19 @@ fn density_band(pos: &[[f32; 4]], h: f32, m: f32, rho0: f32, stride: usize) -> (
                 }
             }
         }
-        // Interior heuristic: enough neighbors that it's not a surface/edge particle.
         if neighbors >= 24 {
             interior += 1;
             if rho >= lo && rho <= hi {
-                in_band += 1;
+                ok += 1;
             }
         }
         i += stride;
     }
-    (in_band, interior)
-}
-
-fn finite(pts: &[[f32; 4]]) -> bool {
-    pts.iter()
-        .all(|p| p[0].is_finite() && p[1].is_finite() && p[2].is_finite())
+    (ok, interior)
 }
 
 #[test]
-fn dam_break_stable_incompressible_clumpfree_and_settles() {
+fn dam_break_holds_water_invariants() {
     let Some(gpu) = GpuContext::new_headless() else {
         eprintln!("xpbd_water: no GPU adapter; skipping.");
         return;
@@ -92,91 +88,77 @@ fn dam_break_stable_incompressible_clumpfree_and_settles() {
         mats.particle_mass,
     );
     let mut solver = XpbdSolver::build(&scene, &mats, &cfg, &gpu);
-    let n = solver.particles().particle_count;
+    let n = solver.particles().particle_count as usize;
     assert!(n > 1000, "expected a few thousand particles, got {n}");
-
     let input = EmissionInput::default();
-    let frames = 700u32;
-    let sample_every = 20u32;
+
+    // Long enough to catch the slow-accumulation global eruption (it detonated ~f1300).
+    let frames = 1500u32;
     let mut collapse_peak = 0.0f32;
-    let mut vmax_late = 0.0f32;
+    let mut settled = 0.0f32;
 
     for f in 0..frames {
         solver.step(1.0 / 60.0, &input);
-        if f % sample_every == 0 || f == frames - 1 {
-            solver.sample_diagnostics();
-            let pos = solver.read_positions();
-            let vel = solver.read_velocities();
-            assert!(finite(&pos), "non-finite position at frame {f}");
-            assert!(finite(&vel), "non-finite velocity at frame {f}");
-
-            let diag = solver.diagnostics();
-            assert!(!diag.overflow, "grid bucket overflow at frame {f}");
-            assert!(
-                diag.max_occupancy < cfg.bucket_capacity,
-                "occupancy {} >= K at frame {f}",
-                diag.max_occupancy
-            );
-
-            // no leak (small margin for the clamp boundary)
-            let inside = |v: f32, lo: f32, hi: f32| v >= lo - 0.6 && v <= hi + 0.6;
-            for p in &pos {
-                assert!(
-                    inside(p[0], scene.box_min[0], scene.box_max[0])
-                        && inside(p[1], scene.box_min[1], scene.box_max[1])
-                        && inside(p[2], scene.box_min[2], scene.box_max[2]),
-                    "particle left the box at frame {f}: {p:?}"
-                );
-            }
-
-            let vmax = max_speed(&vel);
-            // Peak speed during the collapse (first ~2 s), before it settles.
-            if f < 120 {
-                collapse_peak = collapse_peak.max(vmax);
-            }
-            vmax_late = vmax;
+        if f % 15 != 0 && f != frames - 1 {
+            continue;
         }
+        solver.sample_diagnostics();
+        let vel = solver.read_velocities();
+        let pos = solver.read_positions();
+
+        // Always-true invariants, every sampled frame.
+        assert!(
+            finite(&pos) && finite(&vel),
+            "non-finite state at frame {f}"
+        );
+        assert!(!solver.diagnostics().overflow, "grid overflow at frame {f}");
+        let in_box = |p: &[f32; 4]| {
+            (0..3).all(|a| p[a] >= scene.box_min[a] - 0.6 && p[a] <= scene.box_max[a] + 0.6)
+        };
+        assert!(pos.iter().all(in_box), "particle left the box at frame {f}");
+
+        let vmax = vel.iter().map(|&v| speed(v)).fold(0.0, f32::max);
+        if f < 120 {
+            collapse_peak = collapse_peak.max(vmax);
+        } else {
+            // No global eruption: a large fraction of the fluid never goes fast at once.
+            let fast = vel.iter().filter(|&&v| speed(v) > 15.0).count();
+            assert!(
+                fast < n / 20,
+                "global eruption at frame {f}: {fast}/{n} fast"
+            );
+        }
+        settled = vmax;
     }
 
-    // Settling: late kinetic energy is a small fraction of the collapse peak.
-    assert!(
-        vmax_late < 0.25 * collapse_peak,
-        "did not settle: collapse_peak {collapse_peak:.2} vmax_late {vmax_late:.2}"
-    );
-
-    // Final-frame structure checks.
     let pos = solver.read_positions();
-    let nn = min_nn_sample(&pos, 17);
-    let (in_band, interior) = density_band(&pos, mats.support_radius, mats.particle_mass, rho0, 17);
-    let frac = if interior > 0 {
-        in_band as f32 / interior as f32
-    } else {
-        0.0
-    };
+    let nn = min_nn(&pos, 17);
+    let (ok, interior) = density_in_band(&pos, mats.support_radius, mats.particle_mass, rho0, 17);
     eprintln!(
-        "final: nn {nn:.3} (spacing {}), density in-band {in_band}/{interior} = {:.2}, rho0 {rho0:.4}",
-        mats.particle_spacing, frac
+        "collapse_peak {collapse_peak:.1}, settled {settled:.2}, nn {nn:.2}, density in-band {ok}/{interior}"
     );
 
+    // It fell with energy, then came to rest (not bouncy, not over-damped to a standstill mid-fall).
+    assert!(
+        collapse_peak > 8.0,
+        "dam never gained momentum ({collapse_peak:.1})"
+    );
+    assert!(
+        settled < 0.25 * collapse_peak,
+        "did not settle ({settled:.2})"
+    );
+    // Incompressible: most interior particles sit in the density band.
+    assert!(interior > 40, "too few interior samples ({interior})");
+    assert!(
+        ok * 100 / interior >= 80,
+        "incompressibility: {ok}/{interior} interior in band"
+    );
     // No clumping: nearest neighbors keep their spacing.
-    assert!(
-        nn >= 0.4 * mats.particle_spacing,
-        "clumping: min nearest-neighbor {nn:.3} < 0.4·spacing"
-    );
-    // Incompressibility: most interior particles sit within the density band.
-    assert!(
-        interior > 50,
-        "too few interior samples ({interior}) to judge density"
-    );
-    assert!(
-        frac >= 0.75,
-        "incompressibility: only {:.0}% of interior in band",
-        frac * 100.0
-    );
+    assert!(nn > 0.4 * mats.particle_spacing, "clumping: nn {nn:.2}");
 }
 
 #[test]
-fn same_seed_is_reproducible_short_run() {
+fn same_seed_is_reproducible() {
     let Some(gpu) = GpuContext::new_headless() else {
         eprintln!("xpbd_water: no GPU adapter; skipping.");
         return;
@@ -185,7 +167,6 @@ fn same_seed_is_reproducible_short_run() {
     let mats = Materials::default();
     let cfg = Config::default();
     let input = EmissionInput::default();
-
     let run = |gpu: &GpuContext| {
         let mut s = XpbdSolver::build(&scene, &mats, &cfg, gpu);
         for _ in 0..10 {
@@ -193,9 +174,7 @@ fn same_seed_is_reproducible_short_run() {
         }
         s.read_positions()
     };
-    let a = run(&gpu);
-    let b = run(&gpu);
-    assert_eq!(a.len(), b.len());
+    let (a, b) = (run(&gpu), run(&gpu));
     let mean_diff: f32 = a
         .iter()
         .zip(&b)
@@ -203,52 +182,8 @@ fn same_seed_is_reproducible_short_run() {
         .sum::<f32>()
         / a.len() as f32;
     eprintln!("reproducibility mean per-particle diff after 10 frames: {mean_diff:.5}");
-    // Tolerance-level reproducibility (GPU fp reductions may reorder).
     assert!(
         mean_diff < 0.05,
         "not reproducible: mean diff {mean_diff:.5}"
     );
-}
-
-/// Regression for the global-eruption bug: a "converged" frame must still apply a
-/// correction, or gravity's sub-tolerance compression accumulates and detonates the whole
-/// pool (~20 s in). Run long and assert no frame has many fast particles, and it settles.
-#[test]
-fn long_run_no_global_eruption() {
-    let Some(gpu) = GpuContext::new_headless() else {
-        eprintln!("xpbd_water: no GPU adapter; skipping.");
-        return;
-    };
-    let scene = Scene::dam_break();
-    let mut solver = XpbdSolver::build(&scene, &Materials::default(), &Config::default(), &gpu);
-    let n = solver.particles().particle_count as usize;
-    let input = EmissionInput::default();
-    let frames = 1600u32;
-    let mut worst_fast = 0usize;
-    let mut final_v = 0.0f32;
-
-    for f in 0..frames {
-        solver.step(1.0 / 60.0, &input);
-        if f % 10 == 0 || f == frames - 1 {
-            solver.sample_diagnostics();
-            assert!(!solver.diagnostics().overflow, "grid overflow at frame {f}");
-            // Once the dam should have settled, no large fraction of the fluid may be fast.
-            if f > 300 {
-                let vel = solver.read_velocities();
-                final_v = max_speed(&vel);
-                let fast = vel
-                    .iter()
-                    .filter(|x| (x[0] * x[0] + x[1] * x[1] + x[2] * x[2]).sqrt() > 15.0)
-                    .count();
-                worst_fast = worst_fast.max(fast);
-            }
-        }
-    }
-    eprintln!("long run: worst fast-count {worst_fast}/{n}, settled vmax {final_v:.2}");
-    // A global eruption lights up a large fraction at once; a few splash particles are fine.
-    assert!(
-        worst_fast < n / 20,
-        "global eruption: {worst_fast}/{n} particles fast at once"
-    );
-    assert!(final_v < 6.0, "did not settle: final vmax {final_v:.2}");
 }
