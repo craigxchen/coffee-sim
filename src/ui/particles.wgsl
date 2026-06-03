@@ -30,7 +30,9 @@ fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VsOut
     );
     let c = corners[vi];
     let p = positions[ii].xyz;
-    let radius = cam.params.x;
+    // params.z = grain radius scale (grains can be coarser than water); water = 1×.
+    let scale = select(1.0, cam.params.z, phases[ii] == PHASE_GRAIN);
+    let radius = cam.params.x * scale;
     let world = p + cam.right.xyz * c.x * radius + cam.up.xyz * c.y * radius;
 
     var out: VsOut;

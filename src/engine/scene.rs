@@ -96,20 +96,19 @@ impl Scene {
     pub fn dam_through_sand() -> Self {
         Self {
             box_min: [0.0, 0.0, 0.0],
-            box_max: [40.0, 30.0, 12.0],
+            box_max: [28.0, 22.0, 10.0],
             regions: vec![
-                // Vertical sand wall across the box (3 thick in x, full depth), sitting on the
-                // floor. Heavy grains (set via Materials.grain_mass) so the surge can't bulldoze
-                // it — water must overtop / seep through instead of shoving the whole wall.
+                // Vertical sand wall across the box. With coarse grains (grain_diameter > the water
+                // spacing) this is a few big grains thick, with pores the fine water threads.
                 SeedRegion {
-                    min: [23.0, 1.0, 1.0],
-                    max: [26.0, 18.0, 11.0],
+                    min: [14.0, 0.0, 0.0],
+                    max: [20.0, 14.0, 10.0],
                     species: Species::Grain,
                 },
-                // Tall water dam on the left, released toward the wall (builds head to drive flow).
+                // Water dam on the left, released toward the wall (builds head to drive flow).
                 SeedRegion {
                     min: [1.0, 1.0, 1.0],
-                    max: [18.0, 24.0, 11.0],
+                    max: [11.0, 14.0, 9.0],
                     species: Species::Water,
                 },
             ],

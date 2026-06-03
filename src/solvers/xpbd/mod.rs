@@ -210,17 +210,19 @@ pub struct XpbdSolver {
 /// Seed the scene's initial particles on a jittered lattice, one block per region. Returns
 /// positions and the matching per-particle phase tags (0=water, 1=grain).
 fn seed_block(scene: &Scene, mats: &Materials, cfg: &Config) -> (Vec<[f32; 4]>, Vec<u32>) {
-    let s = mats.particle_spacing;
-    let jitter = cfg.seed_jitter * s;
     let mut rng = crate::utils::rng::Rng::new(cfg.seed);
     let mut pos = Vec::new();
     let mut phase = Vec::new();
     for region in &scene.regions {
         let (lo, hi) = (region.min, region.max);
-        let tag = match region.species {
-            Species::Water => 0u32,
-            Species::Grain => 1u32,
+        // Water seeds at the (fine) particle spacing; grains seed at their (possibly coarser)
+        // contact diameter, so a sand wall can have pores larger than the water that flows through
+        // it. When grain_diameter == particle_spacing (the default), both seed identically.
+        let (s, tag) = match region.species {
+            Species::Water => (mats.particle_spacing, 0u32),
+            Species::Grain => (mats.grain_diameter, 1u32),
         };
+        let jitter = cfg.seed_jitter * s;
         let nx = (((hi[0] - lo[0]) / s).floor() as i32).max(0);
         let ny = (((hi[1] - lo[1]) / s).floor() as i32).max(0);
         let nz = (((hi[2] - lo[2]) / s).floor() as i32).max(0);
@@ -455,7 +457,10 @@ impl Solver for XpbdSolver {
         };
         let grain_volume = std::f32::consts::FRAC_PI_6 * mats.grain_diameter.powi(3);
 
-        let cell_size = h;
+        // Grid cell must cover the largest neighbor query: the water support radius h, OR the
+        // grain contact diameter when grains are coarser than the water (so grain neighbors aren't
+        // missed). For single-resolution scenes (grain_diameter ≤ h) this is just h.
+        let cell_size = h.max(mats.grain_diameter);
         let nx = (((scene.box_max[0] - scene.box_min[0]) / cell_size).ceil() as u32).max(1);
         let ny = (((scene.box_max[1] - scene.box_min[1]) / cell_size).ceil() as u32).max(1);
         let nz = (((scene.box_max[2] - scene.box_min[2]) / cell_size).ceil() as u32).max(1);

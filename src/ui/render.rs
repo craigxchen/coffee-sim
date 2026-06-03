@@ -34,6 +34,8 @@ pub struct Renderer {
     queue: wgpu::Queue,
     size: (u32, u32),
     radius: f32,
+    /// Render-radius multiplier for grain particles (water = 1×); coarse grains draw bigger.
+    grain_radius_scale: f32,
 
     depth: wgpu::TextureView,
 
@@ -186,6 +188,7 @@ impl Renderer {
             queue,
             size,
             radius,
+            grain_radius_scale: 1.0,
             depth,
             camera_buf,
             particle_pipeline,
@@ -198,6 +201,12 @@ impl Renderer {
             axis_vbuf,
             axis_vcount: axes.len() as u32,
         }
+    }
+
+    /// Set the render-radius multiplier for grain particles (1.0 = same as water). Use when grains
+    /// are coarser than the water (e.g. a porous sand wall) so they draw at their true size.
+    pub fn set_grain_radius_scale(&mut self, scale: f32) {
+        self.grain_radius_scale = scale;
     }
 
     pub fn resize(&mut self, size: (u32, u32)) {
@@ -223,7 +232,12 @@ impl Renderer {
             view_proj: camera.view_proj(aspect).to_cols_array_2d(),
             right: [right.x, right.y, right.z, 0.0],
             up: [up.x, up.y, up.z, 0.0],
-            params: [self.radius, 1.0 / COLOR_MAX_SPEED, 0.0, 0.0],
+            params: [
+                self.radius,
+                1.0 / COLOR_MAX_SPEED,
+                self.grain_radius_scale,
+                0.0,
+            ],
         };
         self.queue
             .write_buffer(&self.camera_buf, 0, bytemuck::bytes_of(&cam_u));
