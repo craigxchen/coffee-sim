@@ -127,13 +127,23 @@ impl ApplicationHandler for App {
             ..Materials::default()
         };
         if scene_kind == "dam" {
-            // Heavier grains so the surge can't trivially bulldoze the wall, and a water↔grain
-            // contact below the grain spacing so water threads the wall's pores (porous flow).
-            mats.grain_mass = 6.0;
-            mats.water_grain_distance = 0.4 * spacing;
+            // Fine water through a COARSE sand wall: water at a fine spacing, grains at a larger
+            // contact diameter so the wall has pores the water threads. Heavy grains hold the wall;
+            // the small water↔grain contact lets fine water flow through the gaps. (Ignores SPACING.)
+            mats.particle_spacing = 0.5;
+            mats.support_radius = 1.0;
+            mats.grain_diameter = 1.5;
+            mats.water_grain_distance = 0.4;
+            mats.grain_mass = 12.0;
         }
         let solver = XpbdSolver::build(&scene, &mats, &Config::default(), &gpu);
-        let renderer = Renderer::new(&gpu, format, (config.width, config.height), 0.5 * spacing);
+        let mut renderer = Renderer::new(
+            &gpu,
+            format,
+            (config.width, config.height),
+            0.5 * mats.particle_spacing,
+        );
+        renderer.set_grain_radius_scale(mats.grain_diameter / mats.particle_spacing);
         let camera = OrbitCamera::framing(Vec3::from(scene.box_min), Vec3::from(scene.box_max));
 
         window.request_redraw();

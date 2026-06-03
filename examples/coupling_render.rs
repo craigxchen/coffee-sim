@@ -30,6 +30,15 @@ fn main() {
         Scene::pour_over()
     };
     let mut mats = Materials::default();
+    if dam {
+        // Fine water through a COARSE sand wall: water seeds at particle_spacing, grains at the
+        // (larger) grain_diameter, so the wall has pores bigger than the water that flows through.
+        mats.particle_spacing = 0.5;
+        mats.support_radius = 1.0;
+        mats.grain_diameter = 1.5; // 3× the water spacing → coarse grains, real pores
+        mats.water_grain_distance = 0.4; // fine water threads the gaps
+        mats.grain_mass = 12.0; // a coarse grain is much heavier than a water particle
+    }
     if let Some(gm) = std::env::var("GRAIN_MASS")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -47,7 +56,8 @@ fn main() {
     let phase = solver.read_phases();
     let input = EmissionInput::default();
 
-    let renderer = Renderer::new(&gpu, FORMAT, (W, H), 0.5 * mats.particle_spacing);
+    let mut renderer = Renderer::new(&gpu, FORMAT, (W, H), 0.5 * mats.particle_spacing);
+    renderer.set_grain_radius_scale(mats.grain_diameter / mats.particle_spacing);
     let mut camera = OrbitCamera::framing(Vec3::from(scene.box_min), Vec3::from(scene.box_max));
     // Near-front view for the dam (see the surge → wall → far-side cross-section); 3/4 for the bed.
     camera.orbit(if dam { 0.25 } else { 0.6 }, -0.18);
@@ -82,8 +92,8 @@ fn main() {
         &[90, 240, 450, 750]
     };
     let mut next = 0usize;
-    // For the dam scene, the wall spans x[22,27]; count water that crossed to the far side (x>28).
-    let far_x = 28.0f32;
+    // For the dam scene, the wall spans x[14,20]; count water that crossed to the far side (x>21).
+    let far_x = 21.0f32;
 
     for f in 0..=*shots.last().unwrap() {
         solver.step(1.0 / 60.0, &input);
