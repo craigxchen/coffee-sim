@@ -108,12 +108,12 @@ impl ApplicationHandler for App {
         if spacing != requested {
             eprintln!("SPACING {requested} too small (grid buffer would exceed the GPU limit); using {spacing}");
         }
-        // `SCENE=bed` views the dry coffee bed; anything else (default) views the water dam.
-        let bed = std::env::var("SCENE").map(|s| s == "bed").unwrap_or(false);
-        let (scene, scene_label) = if bed {
-            (Scene::bed_drop(), "bed")
-        } else {
-            (Scene::dam_break(), "water")
+        // SCENE selects the scene: `bed` = dry coffee bed, `pour` = water poured onto the bed
+        // (coupling), anything else (default) = the water dam.
+        let (scene, scene_label) = match std::env::var("SCENE").as_deref() {
+            Ok("bed") => (Scene::bed_drop(), "bed"),
+            Ok("pour") => (Scene::pour_over(), "pour-over"),
+            _ => (Scene::dam_break(), "water"),
         };
         let mats = Materials {
             particle_spacing: spacing,
