@@ -88,6 +88,11 @@ struct Status {
 // Per-grain accumulated normal-correction magnitude this frame (reset in predict). The Coulomb
 // friction budget is μ·normal_impulse — load-scaled and non-zero at static rest, unlike μ·overlap.
 @group(0) @binding(12) var<storage, read_write> normal_impulse: array<f32>;
+// Per-particle solid fraction α_s = Σ grain V_g W (clamped to the packing limit). Computed each
+// iteration by compute_fractions in mixed scenes; zero in single-species scenes (so the water
+// density solve is unmodulated there). The water target becomes ρ₀·(1−α_s) → pore water packs to
+// the pore fraction (drainage-ready), and the geometric exclusion keeps water out of grain bodies.
+@group(0) @binding(13) var<storage, read_write> alpha_s: array<f32>;
 
 const PI: f32 = 3.14159265358979;
 

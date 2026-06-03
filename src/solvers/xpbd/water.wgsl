@@ -47,7 +47,11 @@ fn compute_lambda(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
 
-    let inv_rho0 = 1.0 / params.rest_density;
+    // Pore-modulated rest density: where grains are present the water target is ρ₀·(1−α_s), so
+    // pore water packs to fill only the pore fraction (α_s+α_f=1) instead of full ρ₀ — which would
+    // over-fill and get expelled. α_s=0 (single-species water) → unmodulated ρ₀ (identical).
+    let pore = max(1.0 - alpha_s[i], 0.05);
+    let inv_rho0 = 1.0 / (params.rest_density * pore);
     let c = rho * inv_rho0 - 1.0;
     let denom = (dot(sum_g, sum_g) + sum_g2) * inv_rho0 * inv_rho0 + params.relaxation_eps;
     var lam = -c / denom;
@@ -134,7 +138,8 @@ fn compute_dp(@builtin(global_invocation_id) gid: vec3<u32>) {
             }
         }
     }
-    let inv_rho0 = 1.0 / params.rest_density;
+    let pore = max(1.0 - alpha_s[i], 0.05);
+    let inv_rho0 = 1.0 / (params.rest_density * pore);
     dp[i] = vec4<f32>(sum * inv_rho0, 0.0);
 }
 
