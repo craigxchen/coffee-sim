@@ -13,6 +13,7 @@ use wgpu::util::DeviceExt;
 use crate::emission::EmissionInput;
 use crate::engine::scene::Species;
 use crate::engine::{Metrics, Scene};
+use crate::models::permeability::{drag_rate, kozeny_carman};
 use crate::models::Materials;
 use crate::profiling::Profile;
 use crate::solvers::base::Solver;
@@ -106,6 +107,10 @@ struct Pipelines {
     compute_fractions: wgpu::ComputePipeline,
     exclude_water: wgpu::ComputePipeline,
     exclude_grain: wgpu::ComputePipeline,
+    compute_coupling_scale: wgpu::ComputePipeline,
+    drag_water: wgpu::ComputePipeline,
+    drag_grain: wgpu::ComputePipeline,
+    apply_drag_pred: wgpu::ComputePipeline,
     apply_dp: wgpu::ComputePipeline,
     finalize: wgpu::ComputePipeline,
     xsph: wgpu::ComputePipeline,
@@ -122,6 +127,10 @@ struct BindGroups {
     compute_fractions: wgpu::BindGroup,
     exclude_water: wgpu::BindGroup,
     exclude_grain: wgpu::BindGroup,
+    compute_coupling_scale: wgpu::BindGroup,
+    drag_water: wgpu::BindGroup,
+    drag_grain: wgpu::BindGroup,
+    apply_drag_pred: wgpu::BindGroup,
     apply_dp: wgpu::BindGroup,
     finalize: wgpu::BindGroup,
     xsph: wgpu::BindGroup,
@@ -163,6 +172,8 @@ pub struct XpbdSolver {
     /// Bed contact-solve iteration cap + grid-rebuild interval.
     bed_iters: u32,
     bed_regrid: u32,
+    /// Jacobi sub-iterations for implicit water↔grain velocity drag (mixed scenes only).
+    drag_subiters: u32,
 
     // Buffers referenced every frame only through the bind groups (which retain them) are
     // not held here. We keep the ones we touch directly: params (write), pos/vel (expose +
@@ -171,6 +182,7 @@ pub struct XpbdSolver {
     pos: Arc<wgpu::Buffer>,
     vel: Arc<wgpu::Buffer>,
     vel_smoothed: wgpu::Buffer,
+    vel_frozen: wgpu::Buffer,
     phase: Arc<wgpu::Buffer>,
     status: wgpu::Buffer,
     status_readback: wgpu::Buffer,
@@ -290,6 +302,17 @@ impl XpbdSolver {
         self.read_vec4(self.vel.as_ref())
     }
 
+    /// Overwrite current particle velocities (dev/test only).
+    pub fn write_velocities_for_test(&self, velocities: &[[f32; 4]]) {
+        assert_eq!(
+            velocities.len(),
+            self.particle_count as usize,
+            "velocity seed length must match particle count"
+        );
+        self.queue
+            .write_buffer(&self.vel, 0, bytemuck::cast_slice(velocities));
+    }
+
     /// Read back per-particle phase tags (0=water, 1=grain) (dev/test only — stalls the GPU).
     pub fn read_phases(&self) -> Vec<u32> {
         let size = (self.particle_count as u64) * 4;
@@ -405,6 +428,7 @@ impl Solver for XpbdSolver {
         let water_regrid = REGRID_INTERVAL;
         let bed_iters = cfg.bed_max_iters;
         let bed_regrid = cfg.bed_regrid_interval.max(1);
+        let drag_subiters = cfg.drag_subiters;
         // The shared `status` residual machinery (single-species early-exit) tracks the sole
         // species; a mixed scene runs fixed iteration counts (no early-exit), so it doesn't use it.
         let (param_iters, residual_tolerance) = if has_grain && !has_water {
@@ -423,6 +447,10 @@ impl Solver for XpbdSolver {
         let rest_density = kernels::rest_density(s, h, m);
         let dq = cfg.s_corr_dq_ratio * h;
         let s_corr_wq = kernels::w_poly6(dq, h);
+        // Resolve the user-facing drag scale through Kozeny-Carman once at build time. WGSL keeps
+        // the existing 240-byte Params layout by storing this resolved rate in `drag_gamma`.
+        let permeability = kozeny_carman(mats.grain_diameter, mats.porosity);
+        let resolved_drag_gamma = drag_rate(permeability, cfg.drag_gamma);
 
         let params = Params {
             box_min: [scene.box_min[0], scene.box_min[1], scene.box_min[2], 0.0],
@@ -462,7 +490,7 @@ impl Solver for XpbdSolver {
             grain_volume,
             packing_limit: cfg.packing_limit,
             exclusion_relax: cfg.exclusion_relax,
-            drag_gamma: cfg.drag_gamma,
+            drag_gamma: resolved_drag_gamma,
             drag_beta_max: cfg.drag_beta_max,
             buoyancy_scale: cfg.buoyancy_scale,
             wake_threshold: cfg.wake_threshold,
@@ -503,6 +531,12 @@ impl Solver for XpbdSolver {
             vec4,
             wgpu::BufferUsages::COPY_SRC,
         );
+        let vel_frozen = Self::storage(
+            &device,
+            "xpbd-vel-frozen",
+            vec4,
+            wgpu::BufferUsages::empty(),
+        );
         let lambda = Self::storage(&device, "xpbd-lambda", f32s, wgpu::BufferUsages::empty());
         let dp = Self::storage(&device, "xpbd-dp", vec4, wgpu::BufferUsages::empty());
         let c_residual =
@@ -527,6 +561,18 @@ impl Solver for XpbdSolver {
         // Per-particle solid fraction α_s (coupling). Zero-initialized by wgpu, so single-species
         // scenes (which never run compute_fractions) read α_s=0 → the water solve is unmodulated.
         let alpha_s = Self::storage(&device, "xpbd-alpha-s", f32s, wgpu::BufferUsages::empty());
+        let fluid_impulse = Self::storage(
+            &device,
+            "xpbd-fluid-impulse",
+            f32s,
+            wgpu::BufferUsages::empty(),
+        );
+        let coupling_scale = Self::storage(
+            &device,
+            "xpbd-coupling-scale",
+            f32s,
+            wgpu::BufferUsages::empty(),
+        );
         let cell_count = Self::storage(
             &device,
             "xpbd-cellcount",
@@ -594,6 +640,10 @@ impl Solver for XpbdSolver {
             compute_fractions: make("compute_fractions"),
             exclude_water: make("exclude_water"),
             exclude_grain: make("exclude_grain"),
+            compute_coupling_scale: make("compute_coupling_scale"),
+            drag_water: make("drag_water"),
+            drag_grain: make("drag_grain"),
+            apply_drag_pred: make("apply_drag_pred"),
             apply_dp: make("apply_dp"),
             finalize: make("finalize"),
             xsph: make("xsph"),
@@ -625,6 +675,7 @@ impl Solver for XpbdSolver {
                     (3, &vel),
                     (10, &status),
                     (12, &normal_impulse),
+                    (14, &fluid_impulse),
                 ],
             ),
             grid_clear: bg(&pipelines.grid_clear, &[(0, &params_buf), (8, &cell_count)]),
@@ -719,6 +770,49 @@ impl Solver for XpbdSolver {
                     (11, &phase),
                 ],
             ),
+            compute_coupling_scale: bg(
+                &pipelines.compute_coupling_scale,
+                &[
+                    (0, &params_buf),
+                    (2, &pred),
+                    (8, &cell_count),
+                    (9, &cell_bucket),
+                    (11, &phase),
+                    (16, &coupling_scale),
+                ],
+            ),
+            drag_water: bg(
+                &pipelines.drag_water,
+                &[
+                    (0, &params_buf),
+                    (2, &pred),
+                    (3, &vel),
+                    (8, &cell_count),
+                    (9, &cell_bucket),
+                    (11, &phase),
+                    (14, &fluid_impulse),
+                    (15, &vel_frozen),
+                    (16, &coupling_scale),
+                ],
+            ),
+            drag_grain: bg(
+                &pipelines.drag_grain,
+                &[
+                    (0, &params_buf),
+                    (2, &pred),
+                    (3, &vel),
+                    (8, &cell_count),
+                    (9, &cell_bucket),
+                    (11, &phase),
+                    (14, &fluid_impulse),
+                    (15, &vel_frozen),
+                    (16, &coupling_scale),
+                ],
+            ),
+            apply_drag_pred: bg(
+                &pipelines.apply_drag_pred,
+                &[(0, &params_buf), (2, &pred), (3, &vel), (15, &vel_frozen)],
+            ),
             apply_dp: bg(
                 &pipelines.apply_dp,
                 &[
@@ -739,6 +833,7 @@ impl Solver for XpbdSolver {
                     (3, &vel),
                     (7, &c_residual),
                     (11, &phase),
+                    (14, &fluid_impulse),
                 ],
             ),
             xsph: bg(
@@ -803,10 +898,12 @@ impl Solver for XpbdSolver {
             water_regrid,
             bed_iters,
             bed_regrid,
+            drag_subiters,
             params_buf,
             pos,
             vel,
             vel_smoothed,
+            vel_frozen,
             phase,
             status,
             status_readback,
@@ -924,6 +1021,36 @@ impl Solver for XpbdSolver {
                                 1,
                             );
                         }
+                    }
+                }
+
+                if mixed && self.drag_subiters > 0 {
+                    pass(&mut enc, &p.grid_clear, &b.grid_clear, "grid_clear", nc);
+                    pass(&mut enc, &p.grid_fill, &b.grid_fill, "grid_fill", np);
+                    pass(
+                        &mut enc,
+                        &p.compute_coupling_scale,
+                        &b.compute_coupling_scale,
+                        "compute_coupling_scale",
+                        np,
+                    );
+                    for _ in 0..self.drag_subiters {
+                        enc.copy_buffer_to_buffer(
+                            self.vel.as_ref(),
+                            0,
+                            &self.vel_frozen,
+                            0,
+                            (self.particle_count as u64) * 16,
+                        );
+                        pass(&mut enc, &p.drag_water, &b.drag_water, "drag_water", np);
+                        pass(&mut enc, &p.drag_grain, &b.drag_grain, "drag_grain", np);
+                        pass(
+                            &mut enc,
+                            &p.apply_drag_pred,
+                            &b.apply_drag_pred,
+                            "apply_drag_pred",
+                            np,
+                        );
                     }
                 }
 

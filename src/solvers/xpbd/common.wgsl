@@ -93,6 +93,14 @@ struct Status {
 // density solve is unmodulated there). The water target becomes ρ₀·(1−α_s) → pore water packs to
 // the pore fraction (drainage-ready), and the geometric exclusion keeps water out of grain bodies.
 @group(0) @binding(13) var<storage, read_write> alpha_s: array<f32>;
+// Per-grain accumulated |water↔grain drag impulse| this frame; it wakes the static dead-band
+// under fluid load. Reset in predict, written by drag_grain, read in finalize.
+@group(0) @binding(14) var<storage, read_write> fluid_impulse: array<f32>;
+// Frozen velocity snapshot for symmetric water↔grain drag gathers. Both drag passes read the
+// same snapshot so every pair computes equal-and-opposite impulses without atomics.
+@group(0) @binding(15) var<storage, read_write> vel_frozen: array<vec4<f32>>;
+// Per-particle drag blend cap computed from the opposite-phase neighbor count.
+@group(0) @binding(16) var<storage, read_write> coupling_scale: array<f32>;
 
 const PI: f32 = 3.14159265358979;
 
@@ -150,6 +158,7 @@ fn predict(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     if (i >= params.particle_count) { return; }
     normal_impulse[i] = 0.0; // reset the per-frame friction-budget accumulator (grains)
+    fluid_impulse[i] = 0.0; // reset the per-frame water↔grain wake signal
     let p = pos[i].xyz;
     let v = vel[i].xyz;
     let g = params.gravity.xyz;
@@ -236,7 +245,7 @@ fn finalize(@builtin(global_invocation_id) gid: vec3<u32>) {
         // at rest. Gravity and the contact solve still run for it every frame, so an unsupported
         // grain immediately re-accelerates and penetration is never masked — this only removes
         // the sub-threshold numerical jitter a Jacobi contact pile never fully shakes off.
-        if (length(v) < params.grain_sleep_speed) {
+        if (fluid_impulse[i] <= params.wake_threshold && length(v) < params.grain_sleep_speed) {
             v = vec3<f32>(0.0);
         }
     }

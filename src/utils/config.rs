@@ -131,13 +131,12 @@ impl Default for Config {
             bed_residual_tolerance: 0.02,
             bed_regrid_interval: 2,
             grain_sleep_speed: 0.2,
-            // Coupling: step-1 exclusion is active; drag (subiters) + buoyancy start disabled and
-            // are switched on in their own steps after exclusion is verified.
+            // Coupling: drag_gamma is a scale resolved through Kozeny-Carman at solver build.
             packing_limit: 0.64,
             exclusion_relax: 0.5,
-            drag_gamma: 1.0,
+            drag_gamma: 0.02,
             drag_beta_max: 0.8,
-            drag_subiters: 0,
+            drag_subiters: 4,
             buoyancy_scale: 0.0,
             wake_threshold: 0.05,
         }
