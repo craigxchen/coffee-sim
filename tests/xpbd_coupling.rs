@@ -6,6 +6,7 @@
 //! Water percolating to the floor is expected — drag (step 2) is what resists it into a realistic
 //! drawdown; here there's no resistance, so water simply drains through the pore network.
 
+use coffee_sim::engine::scene::{SeedRegion, Species};
 use coffee_sim::engine::Scene;
 use coffee_sim::models::Materials;
 use coffee_sim::solvers::base::Solver;
@@ -25,6 +26,75 @@ fn finite(p: &[[f32; 4]]) -> bool {
 
 fn dist(a: [f32; 4], b: [f32; 4]) -> f32 {
     ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt()
+}
+
+fn momentum(vel: &[[f32; 4]], phase: &[u32], mats: &Materials) -> [f32; 3] {
+    vel.iter().zip(phase).fold([0.0; 3], |mut acc, (v, &ph)| {
+        let m = if ph == 1 {
+            mats.grain_mass
+        } else {
+            mats.particle_mass
+        };
+        acc[0] += m * v[0];
+        acc[1] += m * v[1];
+        acc[2] += m * v[2];
+        acc
+    })
+}
+
+fn kinetic_energy(vel: &[[f32; 4]], phase: &[u32], mats: &Materials) -> f32 {
+    vel.iter()
+        .zip(phase)
+        .map(|(v, &ph)| {
+            let m = if ph == 1 {
+                mats.grain_mass
+            } else {
+                mats.particle_mass
+            };
+            0.5 * m * (v[0] * v[0] + v[1] * v[1] + v[2] * v[2])
+        })
+        .sum()
+}
+
+fn pnorm(p: [f32; 3]) -> f32 {
+    (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt()
+}
+
+fn drag_only_config() -> Config {
+    Config {
+        max_iters: 0,
+        bed_max_iters: 0,
+        xsph_viscosity_c: 0.0,
+        drag_gamma: 0.02,
+        drag_beta_max: 0.8,
+        drag_subiters: 4,
+        grain_sleep_speed: 0.0,
+        ..Config::default()
+    }
+}
+
+fn low_water_mean(pos: &[[f32; 4]], phase: &[u32]) -> f32 {
+    let mut ys: Vec<f32> = pos
+        .iter()
+        .zip(phase)
+        .filter(|(_, &ph)| ph == 0)
+        .map(|(p, _)| p[1])
+        .collect();
+    ys.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let n = (ys.len() / 20).max(1);
+    ys.iter().take(n).sum::<f32>() / n as f32
+}
+
+fn water_mean_y(pos: &[[f32; 4]], phase: &[u32]) -> f32 {
+    let mut sum = 0.0;
+    let mut n = 0usize;
+    for (p, &ph) in pos.iter().zip(phase) {
+        if ph == 0 {
+            sum += p[1];
+            n += 1;
+        }
+    }
+    sum / n.max(1) as f32
 }
 
 /// Closest approach between any sampled water particle and any sampled grain (strided for speed).
@@ -50,6 +120,162 @@ fn min_water_grain(pos: &[[f32; 4]], phase: &[u32]) -> f32 {
         }
     }
     m
+}
+
+#[test]
+fn drag_conserves_momentum_and_damps_relative_velocity() {
+    let Some(gpu) = GpuContext::new_headless() else {
+        eprintln!("xpbd_coupling: no GPU adapter; skipping.");
+        return;
+    };
+    let scene = Scene {
+        gravity: [0.0, 0.0, 0.0],
+        box_min: [0.0, 0.0, 0.0],
+        box_max: [8.0, 8.0, 8.0],
+        regions: vec![
+            SeedRegion {
+                min: [3.0, 4.0, 4.0],
+                max: [3.0, 4.0, 4.0],
+                species: Species::Water,
+            },
+            SeedRegion {
+                min: [4.0, 4.0, 4.0],
+                max: [4.0, 4.0, 4.0],
+                species: Species::Grain,
+            },
+        ],
+        ..Scene::default()
+    };
+    let mats = Materials {
+        grain_mass: 2.0,
+        grain_diameter: 0.5,
+        ..Materials::default()
+    };
+    let mut solver = XpbdSolver::build(&scene, &mats, &drag_only_config(), &gpu);
+    let phase = solver.read_phases();
+    assert_eq!(phase, vec![0, 1]);
+    solver.write_velocities_for_test(&[[1.0, 0.0, 0.0, 0.0], [-0.25, 0.0, 0.0, 0.0]]);
+    let input = EmissionInput::default();
+    let p0 = momentum(&solver.read_velocities(), &phase, &mats);
+    let mut prev_rel = 1.25f32;
+
+    for step in 0..8 {
+        solver.step(1.0 / 60.0, &input);
+        let vel = solver.read_velocities();
+        let p = momentum(&vel, &phase, &mats);
+        let drift = pnorm([p[0] - p0[0], p[1] - p0[1], p[2] - p0[2]]);
+        assert!(drift < 2.0e-4, "momentum drift at step {step}: {drift}");
+
+        let rel = vel[0][0] - vel[1][0];
+        assert!(rel >= -1.0e-5, "relative velocity flipped sign: {rel}");
+        assert!(
+            rel <= prev_rel + 1.0e-5,
+            "relative velocity did not decay: {rel} > {prev_rel}"
+        );
+        prev_rel = rel;
+    }
+    assert!(
+        prev_rel < 0.2,
+        "relative velocity did not damp enough: {prev_rel}"
+    );
+}
+
+#[test]
+fn drag_dense_blob_is_dissipative_at_fine_grind() {
+    let Some(gpu) = GpuContext::new_headless() else {
+        eprintln!("xpbd_coupling: no GPU adapter; skipping.");
+        return;
+    };
+    let scene = Scene {
+        gravity: [0.0, 0.0, 0.0],
+        box_min: [0.0, 0.0, 0.0],
+        box_max: [12.0, 12.0, 12.0],
+        regions: vec![
+            SeedRegion {
+                min: [5.5, 6.0, 5.5],
+                max: [6.5, 6.0, 6.5],
+                species: Species::Water,
+            },
+            SeedRegion {
+                min: [4.5, 5.0, 4.5],
+                max: [7.5, 7.0, 7.5],
+                species: Species::Grain,
+            },
+        ],
+        ..Scene::default()
+    };
+    let mats = Materials {
+        grain_diameter: 0.5,
+        grain_mass: 2.0,
+        ..Materials::default()
+    };
+    let mut solver = XpbdSolver::build(&scene, &mats, &drag_only_config(), &gpu);
+    let phase = solver.read_phases();
+    let seeded: Vec<[f32; 4]> = phase
+        .iter()
+        .enumerate()
+        .map(|(i, &ph)| {
+            if ph == 0 {
+                [1.5, 0.0, 0.0, 0.0]
+            } else {
+                let s = if i % 2 == 0 { -1.0 } else { 1.0 };
+                [0.0, 0.25 * s, 0.0, 0.0]
+            }
+        })
+        .collect();
+    solver.write_velocities_for_test(&seeded);
+    let input = EmissionInput::default();
+    let ke0 = kinetic_energy(&solver.read_velocities(), &phase, &mats);
+
+    for _ in 0..6 {
+        solver.step(1.0 / 60.0, &input);
+    }
+
+    let pos = solver.read_positions();
+    let vel = solver.read_velocities();
+    let ke1 = kinetic_energy(&vel, &phase, &mats);
+    assert!(
+        finite(&pos) && finite(&vel),
+        "drag produced non-finite state"
+    );
+    assert!(ke1 <= ke0 + 1.0e-4, "drag increased KE: {ke0} -> {ke1}");
+}
+
+#[test]
+fn coarse_grind_draws_down_faster_than_fine() {
+    let Some(gpu) = GpuContext::new_headless() else {
+        eprintln!("xpbd_coupling: no GPU adapter; skipping.");
+        return;
+    };
+    let input = EmissionInput::default();
+    let run = |grain_diameter: f32| {
+        let scene = Scene::pour_over();
+        let mats = Materials {
+            grain_diameter,
+            ..Materials::default()
+        };
+        let cfg = Config {
+            xsph_viscosity_c: 0.0,
+            ..Config::default()
+        };
+        let mut solver = XpbdSolver::build(&scene, &mats, &cfg, &gpu);
+        let phase = solver.read_phases();
+        for _ in 0..120 {
+            solver.step(1.0 / 60.0, &input);
+        }
+        let pos = solver.read_positions();
+        (low_water_mean(&pos, &phase), water_mean_y(&pos, &phase))
+    };
+
+    let (fine_low, fine_mean) = run(1.0);
+    let (coarse_low, coarse_mean) = run(1.6);
+    eprintln!(
+        "drawdown water y: fine low {fine_low:.3} mean {fine_mean:.3}, coarse low {coarse_low:.3} mean {coarse_mean:.3}"
+    );
+    assert!(
+        coarse_mean + 0.2 < fine_mean,
+        "coarse grind should draw down farther: coarse mean {coarse_mean:.3}, fine mean {fine_mean:.3}"
+    );
 }
 
 #[test]

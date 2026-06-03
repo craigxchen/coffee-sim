@@ -8,6 +8,9 @@
 //     particles: water can't pass through grain bodies, so it rests on / sits in the bed. Run as a
 //     symmetric pair of gathers (exclude_water + exclude_grain) reading the same predicted
 //     positions, with opposite-mass weights → momentum-conserving without float atomics.
+//  3. implicit drag — symmetric frozen-velocity gathers using the Kozeny-Carman-resolved drag
+//     rate in params.drag_gamma. The same pair scale is used by both phases, so each pair impulse
+//     is equal-and-opposite to float tolerance.
 
 @compute @workgroup_size(256)
 fn compute_fractions(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -125,4 +128,132 @@ fn exclude_grain(@builtin(global_invocation_id) gid: vec3<u32>) {
     // subcycle that follows will overwrite it again). Always write, so a grain with no water
     // neighbors gets dp=0 rather than a stale value.
     dp[i] = vec4<f32>(push, 0.0);
+}
+
+fn drag_pair_beta() -> f32 {
+    let x = max(params.drag_gamma * params.dt, 0.0);
+    return x / (1.0 + x);
+}
+
+fn particle_mass_for_phase(ph: u32) -> f32 {
+    if (ph == PHASE_GRAIN) {
+        return params.grain_mass;
+    }
+    return params.particle_mass;
+}
+
+@compute @workgroup_size(256)
+fn compute_coupling_scale(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= params.particle_count) { return; }
+    let ph_i = phase[i];
+    let xi = pred[i].xyz;
+    let beta = drag_pair_beta();
+    var total = 0.0;
+
+    let base = cell_coord(xi);
+    for (var dz = -1; dz <= 1; dz = dz + 1) {
+        for (var dy = -1; dy <= 1; dy = dy + 1) {
+            for (var dx = -1; dx <= 1; dx = dx + 1) {
+                let nc = base + vec3<i32>(dx, dy, dz);
+                if (nc.x < 0 || nc.y < 0 || nc.z < 0) { continue; }
+                let dims = vec3<i32>(params.grid_dims.xyz);
+                if (nc.x >= dims.x || nc.y >= dims.y || nc.z >= dims.z) { continue; }
+                let cid = cell_id(nc);
+                let cnt = min(atomicLoad(&cell_count[cid]), params.bucket_capacity);
+                for (var s = 0u; s < cnt; s = s + 1u) {
+                    let j = cell_bucket[cid * params.bucket_capacity + s];
+                    if (j == i) { continue; }
+                    if (phase[j] == ph_i) { continue; }
+                    let r = length(xi - pred[j].xyz);
+                    if (r >= params.h) { continue; }
+                    total = total + beta;
+                }
+            }
+        }
+    }
+
+    coupling_scale[i] = min(1.0, params.drag_beta_max / max(total, 1.0e-6));
+}
+
+fn drag_delta_for_pair(i: u32, j: u32, self_phase: u32) -> vec3<f32> {
+    let beta = drag_pair_beta();
+    let s = beta * min(coupling_scale[i], coupling_scale[j]);
+    let m_i = particle_mass_for_phase(self_phase);
+    let m_j = particle_mass_for_phase(phase[j]);
+    return s * (m_j / (m_i + m_j)) * (vel_frozen[j].xyz - vel_frozen[i].xyz);
+}
+
+@compute @workgroup_size(256)
+fn drag_water(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= params.particle_count) { return; }
+    if (phase[i] != PHASE_WATER) { return; }
+    let xi = pred[i].xyz;
+    var dv = vec3<f32>(0.0);
+
+    let base = cell_coord(xi);
+    for (var dz = -1; dz <= 1; dz = dz + 1) {
+        for (var dy = -1; dy <= 1; dy = dy + 1) {
+            for (var dx = -1; dx <= 1; dx = dx + 1) {
+                let nc = base + vec3<i32>(dx, dy, dz);
+                if (nc.x < 0 || nc.y < 0 || nc.z < 0) { continue; }
+                let dims = vec3<i32>(params.grid_dims.xyz);
+                if (nc.x >= dims.x || nc.y >= dims.y || nc.z >= dims.z) { continue; }
+                let cid = cell_id(nc);
+                let cnt = min(atomicLoad(&cell_count[cid]), params.bucket_capacity);
+                for (var s = 0u; s < cnt; s = s + 1u) {
+                    let j = cell_bucket[cid * params.bucket_capacity + s];
+                    if (phase[j] != PHASE_GRAIN) { continue; }
+                    let r = length(xi - pred[j].xyz);
+                    if (r >= params.h) { continue; }
+                    dv = dv + drag_delta_for_pair(i, j, PHASE_WATER);
+                }
+            }
+        }
+    }
+
+    vel[i] = vec4<f32>(vel_frozen[i].xyz + dv, 0.0);
+    fluid_impulse[i] = fluid_impulse[i]; // keep drag_water's auto-layout at the shared 8 buffers
+}
+
+@compute @workgroup_size(256)
+fn drag_grain(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= params.particle_count) { return; }
+    if (phase[i] != PHASE_GRAIN) { return; }
+    let xi = pred[i].xyz;
+    var dv = vec3<f32>(0.0);
+
+    let base = cell_coord(xi);
+    for (var dz = -1; dz <= 1; dz = dz + 1) {
+        for (var dy = -1; dy <= 1; dy = dy + 1) {
+            for (var dx = -1; dx <= 1; dx = dx + 1) {
+                let nc = base + vec3<i32>(dx, dy, dz);
+                if (nc.x < 0 || nc.y < 0 || nc.z < 0) { continue; }
+                let dims = vec3<i32>(params.grid_dims.xyz);
+                if (nc.x >= dims.x || nc.y >= dims.y || nc.z >= dims.z) { continue; }
+                let cid = cell_id(nc);
+                let cnt = min(atomicLoad(&cell_count[cid]), params.bucket_capacity);
+                for (var s = 0u; s < cnt; s = s + 1u) {
+                    let j = cell_bucket[cid * params.bucket_capacity + s];
+                    if (phase[j] != PHASE_WATER) { continue; }
+                    let r = length(xi - pred[j].xyz);
+                    if (r >= params.h) { continue; }
+                    dv = dv + drag_delta_for_pair(i, j, PHASE_GRAIN);
+                }
+            }
+        }
+    }
+
+    vel[i] = vec4<f32>(vel_frozen[i].xyz + dv, 0.0);
+    fluid_impulse[i] = fluid_impulse[i] + params.grain_mass * length(dv);
+}
+
+@compute @workgroup_size(256)
+fn apply_drag_pred(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= params.particle_count) { return; }
+    let dv = vel[i].xyz - vel_frozen[i].xyz;
+    pred[i] = vec4<f32>(clamp(pred[i].xyz + params.dt * dv, params.box_min.xyz, params.box_max.xyz), 0.0);
 }
