@@ -73,6 +73,19 @@ fn drag_only_config() -> Config {
     }
 }
 
+fn buoyancy_only_config(scale: f32) -> Config {
+    Config {
+        max_iters: 0,
+        bed_max_iters: 0,
+        xsph_viscosity_c: 0.0,
+        drag_subiters: 0,
+        buoyancy_scale: scale,
+        grain_sleep_speed: 0.0,
+        wake_threshold: 0.0,
+        ..Config::default()
+    }
+}
+
 fn low_water_mean(pos: &[[f32; 4]], phase: &[u32]) -> f32 {
     let mut ys: Vec<f32> = pos
         .iter()
@@ -90,6 +103,18 @@ fn water_mean_y(pos: &[[f32; 4]], phase: &[u32]) -> f32 {
     let mut n = 0usize;
     for (p, &ph) in pos.iter().zip(phase) {
         if ph == 0 {
+            sum += p[1];
+            n += 1;
+        }
+    }
+    sum / n.max(1) as f32
+}
+
+fn grain_mean_y(pos: &[[f32; 4]], phase: &[u32]) -> f32 {
+    let mut sum = 0.0;
+    let mut n = 0usize;
+    for (p, &ph) in pos.iter().zip(phase) {
+        if ph == 1 {
             sum += p[1];
             n += 1;
         }
@@ -120,6 +145,118 @@ fn min_water_grain(pos: &[[f32; 4]], phase: &[u32]) -> f32 {
         }
     }
     m
+}
+
+#[test]
+fn buoyancy_conserves_momentum_and_lifts_grain() {
+    let Some(gpu) = GpuContext::new_headless() else {
+        eprintln!("xpbd_coupling: no GPU adapter; skipping.");
+        return;
+    };
+    let scene = Scene {
+        gravity: [0.0, 0.0, 0.0],
+        box_min: [0.0, 0.0, 0.0],
+        box_max: [8.0, 8.0, 8.0],
+        regions: vec![
+            SeedRegion {
+                min: [4.0, 5.0, 4.0],
+                max: [4.0, 5.0, 4.0],
+                species: Species::Water,
+            },
+            SeedRegion {
+                min: [4.0, 4.0, 4.0],
+                max: [4.0, 4.0, 4.0],
+                species: Species::Grain,
+            },
+        ],
+        ..Scene::default()
+    };
+    let mats = Materials {
+        grain_mass: 2.0,
+        grain_diameter: 0.5,
+        ..Materials::default()
+    };
+    let mut solver = XpbdSolver::build(&scene, &mats, &buoyancy_only_config(1.0), &gpu);
+    let phase = solver.read_phases();
+    assert_eq!(phase, vec![0, 1]);
+    solver.write_velocities_for_test(&[[0.0; 4], [0.0; 4]]);
+    // PBF λ is negative under compression; pressure is -λ in the buoyancy kernels.
+    solver.write_lambdas_for_test(&[-10.0, 0.0]);
+
+    let p0 = momentum(&solver.read_velocities(), &phase, &mats);
+    solver.step(1.0 / 60.0, &EmissionInput::default());
+    let vel = solver.read_velocities();
+    let p1 = momentum(&vel, &phase, &mats);
+    let drift = pnorm([p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]]);
+    assert!(drift < 1.0e-4, "buoyancy momentum drift: {drift}");
+    assert!(vel[1][1] > 0.0, "grain was not lifted: vy={}", vel[1][1]);
+    assert!(
+        vel[0][1] < 0.0,
+        "water did not receive the downward reaction: vy={}",
+        vel[0][1]
+    );
+}
+
+#[test]
+fn buoyancy_pressure_proxy_lifts_fine_bed_without_blowup() {
+    let Some(gpu) = GpuContext::new_headless() else {
+        eprintln!("xpbd_coupling: no GPU adapter; skipping.");
+        return;
+    };
+    let scene = Scene {
+        gravity: [0.0, 0.0, 0.0],
+        box_min: [0.0, 0.0, 0.0],
+        box_max: [12.0, 12.0, 12.0],
+        regions: vec![
+            SeedRegion {
+                min: [4.0, 5.0, 4.0],
+                max: [8.0, 7.0, 8.0],
+                species: Species::Water,
+            },
+            SeedRegion {
+                min: [4.0, 3.0, 4.0],
+                max: [8.0, 4.0, 8.0],
+                species: Species::Grain,
+            },
+        ],
+        ..Scene::default()
+    };
+    let mats = Materials {
+        grain_diameter: 0.5,
+        grain_mass: 2.0,
+        ..Materials::default()
+    };
+    let run = |scale: f32| {
+        let mut solver = XpbdSolver::build(&scene, &mats, &buoyancy_only_config(scale), &gpu);
+        let phase = solver.read_phases();
+        let lambdas: Vec<f32> = phase
+            .iter()
+            .map(|&ph| if ph == 0 { -0.5 } else { 0.0 })
+            .collect();
+        solver.write_lambdas_for_test(&lambdas);
+        let y0 = grain_mean_y(&solver.read_positions(), &phase);
+        for _ in 0..4 {
+            solver.step(1.0 / 60.0, &EmissionInput::default());
+            solver.write_lambdas_for_test(&lambdas);
+        }
+        let pos = solver.read_positions();
+        let vel = solver.read_velocities();
+        (
+            grain_mean_y(&pos, &phase) - y0,
+            finite(&pos) && finite(&vel),
+        )
+    };
+
+    let (off_rise, off_finite) = run(0.0);
+    let (on_rise, on_finite) = run(1.0);
+    assert!(
+        off_finite && on_finite,
+        "buoyancy pressure-proxy test blew up"
+    );
+    assert!(
+        on_rise > off_rise + 1.0e-3,
+        "fine bed did not lift under seeded pressure proxy: on {on_rise:.6}, off {off_rise:.6}"
+    );
 }
 
 #[test]

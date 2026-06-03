@@ -110,6 +110,8 @@ struct Pipelines {
     compute_coupling_scale: wgpu::ComputePipeline,
     drag_water: wgpu::ComputePipeline,
     drag_grain: wgpu::ComputePipeline,
+    buoyancy_grain: wgpu::ComputePipeline,
+    buoyancy_water: wgpu::ComputePipeline,
     apply_drag_pred: wgpu::ComputePipeline,
     apply_dp: wgpu::ComputePipeline,
     finalize: wgpu::ComputePipeline,
@@ -130,6 +132,8 @@ struct BindGroups {
     compute_coupling_scale: wgpu::BindGroup,
     drag_water: wgpu::BindGroup,
     drag_grain: wgpu::BindGroup,
+    buoyancy_grain: wgpu::BindGroup,
+    buoyancy_water: wgpu::BindGroup,
     apply_drag_pred: wgpu::BindGroup,
     apply_dp: wgpu::BindGroup,
     finalize: wgpu::BindGroup,
@@ -177,12 +181,14 @@ pub struct XpbdSolver {
 
     // Buffers referenced every frame only through the bind groups (which retain them) are
     // not held here. We keep the ones we touch directly: params (write), pos/vel (expose +
-    // readback/copy), vel_smoothed (copy src), status (+ readbacks), phase (expose + re-seed).
+    // readback/copy), vel_smoothed (copy src), lambda (test seeding), status (+ readbacks),
+    // phase (expose + re-seed).
     params_buf: wgpu::Buffer,
     pos: Arc<wgpu::Buffer>,
     vel: Arc<wgpu::Buffer>,
     vel_smoothed: wgpu::Buffer,
     vel_frozen: wgpu::Buffer,
+    lambda: wgpu::Buffer,
     phase: Arc<wgpu::Buffer>,
     status: wgpu::Buffer,
     status_readback: wgpu::Buffer,
@@ -311,6 +317,17 @@ impl XpbdSolver {
         );
         self.queue
             .write_buffer(&self.vel, 0, bytemuck::cast_slice(velocities));
+    }
+
+    /// Overwrite current water Lagrange multipliers (dev/test only).
+    pub fn write_lambdas_for_test(&self, lambdas: &[f32]) {
+        assert_eq!(
+            lambdas.len(),
+            self.particle_count as usize,
+            "lambda seed length must match particle count"
+        );
+        self.queue
+            .write_buffer(&self.lambda, 0, bytemuck::cast_slice(lambdas));
     }
 
     /// Read back per-particle phase tags (0=water, 1=grain) (dev/test only — stalls the GPU).
@@ -643,6 +660,8 @@ impl Solver for XpbdSolver {
             compute_coupling_scale: make("compute_coupling_scale"),
             drag_water: make("drag_water"),
             drag_grain: make("drag_grain"),
+            buoyancy_grain: make("buoyancy_grain"),
+            buoyancy_water: make("buoyancy_water"),
             apply_drag_pred: make("apply_drag_pred"),
             apply_dp: make("apply_dp"),
             finalize: make("finalize"),
@@ -809,6 +828,33 @@ impl Solver for XpbdSolver {
                     (16, &coupling_scale),
                 ],
             ),
+            buoyancy_grain: bg(
+                &pipelines.buoyancy_grain,
+                &[
+                    (0, &params_buf),
+                    (2, &pred),
+                    (3, &vel),
+                    (5, &lambda),
+                    (8, &cell_count),
+                    (9, &cell_bucket),
+                    (11, &phase),
+                    (14, &fluid_impulse),
+                    (15, &vel_frozen),
+                ],
+            ),
+            buoyancy_water: bg(
+                &pipelines.buoyancy_water,
+                &[
+                    (0, &params_buf),
+                    (2, &pred),
+                    (3, &vel),
+                    (5, &lambda),
+                    (8, &cell_count),
+                    (9, &cell_bucket),
+                    (11, &phase),
+                    (15, &vel_frozen),
+                ],
+            ),
             apply_drag_pred: bg(
                 &pipelines.apply_drag_pred,
                 &[(0, &params_buf), (2, &pred), (3, &vel), (15, &vel_frozen)],
@@ -853,7 +899,7 @@ impl Solver for XpbdSolver {
         let ts = if gpu.timestamps_supported {
             // Generous upper bound: water density loop (≈6 passes/iter) + bed contact loop
             // (≈4 passes/iter) + coupling/finalize overhead; clamped to the query-set cap.
-            let passes_per_step = 8 + 6 * water_iters + 5 * bed_iters;
+            let passes_per_step = 12 + 6 * water_iters + 5 * bed_iters;
             let capacity = (2 * passes_per_step * cfg.substeps).clamp(2, 512);
             let qset = device.create_query_set(&wgpu::QuerySetDescriptor {
                 label: Some("xpbd-timestamps"),
@@ -904,6 +950,7 @@ impl Solver for XpbdSolver {
             vel,
             vel_smoothed,
             vel_frozen,
+            lambda,
             phase,
             status,
             status_readback,
@@ -1052,6 +1099,39 @@ impl Solver for XpbdSolver {
                             np,
                         );
                     }
+                }
+
+                if mixed && self.params.buoyancy_scale > 0.0 {
+                    pass(&mut enc, &p.grid_clear, &b.grid_clear, "grid_clear", nc);
+                    pass(&mut enc, &p.grid_fill, &b.grid_fill, "grid_fill", np);
+                    enc.copy_buffer_to_buffer(
+                        self.vel.as_ref(),
+                        0,
+                        &self.vel_frozen,
+                        0,
+                        (self.particle_count as u64) * 16,
+                    );
+                    pass(
+                        &mut enc,
+                        &p.buoyancy_grain,
+                        &b.buoyancy_grain,
+                        "buoyancy_grain",
+                        np,
+                    );
+                    pass(
+                        &mut enc,
+                        &p.buoyancy_water,
+                        &b.buoyancy_water,
+                        "buoyancy_water",
+                        np,
+                    );
+                    pass(
+                        &mut enc,
+                        &p.apply_drag_pred,
+                        &b.apply_drag_pred,
+                        "apply_drag_pred",
+                        np,
+                    );
                 }
 
                 if self.has_grain {
