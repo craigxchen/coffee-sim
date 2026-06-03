@@ -66,6 +66,19 @@ struct Params {
     cohesion_range: f32,
     rolling_damping: f32,
     grain_sleep_speed: f32,
+    // --- water/bed coupling (mixed scenes) ---
+    grain_mass: f32,
+    grain_volume: f32, // (π/6)·grain_diameter³ — effective volume for the α_s sum
+    packing_limit: f32,
+    exclusion_relax: f32,
+    drag_gamma: f32,
+    drag_beta_max: f32,
+    buoyancy_scale: f32,
+    wake_threshold: f32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+    _pad3: u32,
 }
 
 /// CPU mirror of the WGSL `Status` struct (8 × u32).
@@ -135,12 +148,15 @@ pub struct XpbdSolver {
     particle_count: u32,
     num_cells: u32,
     substeps: u32,
-    /// Constraint-iteration cap for this scene's species (water or bed).
-    max_iters: u32,
-    /// Neighbor-grid rebuild interval for this scene's species.
-    regrid_interval: u32,
-    /// Which species this scene seeds; selects the per-frame pass sequence.
-    species: Species,
+    /// Which species are present (from the scene's seed regions) — selects the per-frame passes.
+    has_water: bool,
+    has_grain: bool,
+    /// Water density-solve iteration cap + grid-rebuild interval.
+    water_iters: u32,
+    water_regrid: u32,
+    /// Bed contact-solve iteration cap + grid-rebuild interval.
+    bed_iters: u32,
+    bed_regrid: u32,
 
     // Buffers referenced every frame only through the bind groups (which retain them) are
     // not held here. We keep the ones we touch directly: params (write), pos/vel (expose +
@@ -167,36 +183,37 @@ pub struct XpbdSolver {
     initial_phases: Vec<u32>,
 }
 
-/// Seed the scene's initial particle block on a jittered lattice. Returns positions and the
-/// matching per-particle phase tags (all water or all grain — scenes are single-species for now).
+/// Seed the scene's initial particles on a jittered lattice, one block per region. Returns
+/// positions and the matching per-particle phase tags (0=water, 1=grain).
 fn seed_block(scene: &Scene, mats: &Materials, cfg: &Config) -> (Vec<[f32; 4]>, Vec<u32>) {
     let s = mats.particle_spacing;
     let jitter = cfg.seed_jitter * s;
     let mut rng = crate::utils::rng::Rng::new(cfg.seed);
-    let lo = scene.water_block_min;
-    let hi = scene.water_block_max;
-    let tag = match scene.species {
-        Species::Water => 0u32,
-        Species::Grain => 1u32,
-    };
     let mut pos = Vec::new();
     let mut phase = Vec::new();
-    let nx = (((hi[0] - lo[0]) / s).floor() as i32).max(0);
-    let ny = (((hi[1] - lo[1]) / s).floor() as i32).max(0);
-    let nz = (((hi[2] - lo[2]) / s).floor() as i32).max(0);
-    for k in 0..=nz {
-        for j in 0..=ny {
-            for i in 0..=nx {
-                let jx = (rng.next_f32() * 2.0 - 1.0) * jitter;
-                let jy = (rng.next_f32() * 2.0 - 1.0) * jitter;
-                let jz = (rng.next_f32() * 2.0 - 1.0) * jitter;
-                pos.push([
-                    lo[0] + i as f32 * s + jx,
-                    lo[1] + j as f32 * s + jy,
-                    lo[2] + k as f32 * s + jz,
-                    0.0,
-                ]);
-                phase.push(tag);
+    for region in &scene.regions {
+        let (lo, hi) = (region.min, region.max);
+        let tag = match region.species {
+            Species::Water => 0u32,
+            Species::Grain => 1u32,
+        };
+        let nx = (((hi[0] - lo[0]) / s).floor() as i32).max(0);
+        let ny = (((hi[1] - lo[1]) / s).floor() as i32).max(0);
+        let nz = (((hi[2] - lo[2]) / s).floor() as i32).max(0);
+        for k in 0..=nz {
+            for j in 0..=ny {
+                for i in 0..=nx {
+                    let jx = (rng.next_f32() * 2.0 - 1.0) * jitter;
+                    let jy = (rng.next_f32() * 2.0 - 1.0) * jitter;
+                    let jz = (rng.next_f32() * 2.0 - 1.0) * jitter;
+                    pos.push([
+                        lo[0] + i as f32 * s + jx,
+                        lo[1] + j as f32 * s + jy,
+                        lo[2] + k as f32 * s + jz,
+                        0.0,
+                    ]);
+                    phase.push(tag);
+                }
             }
         }
     }
@@ -347,24 +364,22 @@ impl Solver for XpbdSolver {
         let (positions, phases) = seed_block(scene, mats, cfg);
         let particle_count = positions.len() as u32;
 
-        // The grain bed solves contacts (harder to converge than water): its own iteration cap,
-        // contact tolerance, and a more frequent grid rebuild. Single-species scenes pick one set.
-        let grain = scene.species == Species::Grain;
-        let solve_iters = if grain {
-            cfg.bed_max_iters
+        // Which species are present drives the per-frame passes. The grain bed solves contacts
+        // (harder to converge than water): its own iteration cap + more frequent grid rebuild.
+        let has_water = scene.regions.iter().any(|r| r.species == Species::Water);
+        let has_grain = scene.regions.iter().any(|r| r.species == Species::Grain);
+        let water_iters = cfg.max_iters;
+        let water_regrid = REGRID_INTERVAL;
+        let bed_iters = cfg.bed_max_iters;
+        let bed_regrid = cfg.bed_regrid_interval.max(1);
+        // The shared `status` residual machinery (single-species early-exit) tracks the sole
+        // species; a mixed scene runs fixed iteration counts (no early-exit), so it doesn't use it.
+        let (param_iters, residual_tolerance) = if has_grain && !has_water {
+            (bed_iters, cfg.bed_residual_tolerance)
         } else {
-            cfg.max_iters
+            (water_iters, cfg.residual_tolerance)
         };
-        let regrid_interval = if grain {
-            cfg.bed_regrid_interval.max(1)
-        } else {
-            REGRID_INTERVAL
-        };
-        let residual_tolerance = if grain {
-            cfg.bed_residual_tolerance
-        } else {
-            cfg.residual_tolerance
-        };
+        let grain_volume = std::f32::consts::FRAC_PI_6 * mats.grain_diameter.powi(3);
 
         let cell_size = h;
         let nx = (((scene.box_max[0] - scene.box_min[0]) / cell_size).ceil() as u32).max(1);
@@ -398,7 +413,7 @@ impl Solver for XpbdSolver {
             particle_count,
             bucket_capacity: cfg.bucket_capacity,
             min_iters: cfg.min_iters,
-            max_iters: solve_iters,
+            max_iters: param_iters,
             residual_tolerance,
             lambda_noncohesive: cfg.lambda_clamp_noncohesive as u32,
             max_correction: cfg.max_correction_ratio * h,
@@ -410,6 +425,18 @@ impl Solver for XpbdSolver {
             cohesion_range: crate::models::cohesion::COHESION_RANGE_RATIO * mats.grain_diameter,
             rolling_damping: mats.rolling_damping,
             grain_sleep_speed: cfg.grain_sleep_speed,
+            grain_mass: mats.grain_mass,
+            grain_volume,
+            packing_limit: cfg.packing_limit,
+            exclusion_relax: cfg.exclusion_relax,
+            drag_gamma: cfg.drag_gamma,
+            drag_beta_max: cfg.drag_beta_max,
+            buoyancy_scale: cfg.buoyancy_scale,
+            wake_threshold: cfg.wake_threshold,
+            _pad0: 0,
+            _pad1: 0,
+            _pad2: 0,
+            _pad3: 0,
         };
 
         let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -644,12 +671,15 @@ impl Solver for XpbdSolver {
                     (4, &vel_smoothed),
                     (8, &cell_count),
                     (9, &cell_bucket),
+                    (11, &phase),
                 ],
             ),
         };
 
         let ts = if gpu.timestamps_supported {
-            let passes_per_step = 5 + 6 * solve_iters;
+            // Generous upper bound: water density loop (≈6 passes/iter) + bed contact loop
+            // (≈4 passes/iter) + coupling/finalize overhead; clamped to the query-set cap.
+            let passes_per_step = 8 + 6 * water_iters + 5 * bed_iters;
             let capacity = (2 * passes_per_step * cfg.substeps).clamp(2, 512);
             let qset = device.create_query_set(&wgpu::QuerySetDescriptor {
                 label: Some("xpbd-timestamps"),
@@ -688,9 +718,12 @@ impl Solver for XpbdSolver {
             particle_count,
             num_cells,
             substeps: cfg.substeps.max(1),
-            max_iters: solve_iters,
-            regrid_interval,
-            species: scene.species,
+            has_water,
+            has_grain,
+            water_iters,
+            water_regrid,
+            bed_iters,
+            bed_regrid,
             params_buf,
             pos,
             vel,
@@ -731,146 +764,96 @@ impl Solver for XpbdSolver {
                 label: Some("xpbd-frame"),
             });
 
-        // A scene is single-species: run the water density solve OR the granular contact solve.
-        // Both share predict / grid build / apply_dp / finalize; the constraint passes differ.
-        let grain = self.species == Species::Grain;
-        for _ in 0..self.substeps {
-            dispatch_pass(
-                &mut enc,
-                &self.pipelines.predict,
-                &self.bind_groups.predict,
-                self.ts.as_ref(),
-                &mut cursor,
-                &mut labels,
-                "predict",
-                np,
-                &mut dispatches,
-            );
-            for it in 0..self.max_iters {
-                // Rebuild the neighbor grid every few iterations so corrections never act on
-                // a stale grid — particles can drift > 1 cell over the solve, and stale
-                // neighbors are the source of the stochastic squeeze-out eruptions. The bed is
-                // contact-heavy and rebuilds more often (smaller interval).
-                if it % self.regrid_interval == 0 {
-                    dispatch_pass(
-                        &mut enc,
-                        &self.pipelines.grid_clear,
-                        &self.bind_groups.grid_clear,
-                        self.ts.as_ref(),
-                        &mut cursor,
-                        &mut labels,
-                        "grid_clear",
-                        nc,
-                        &mut dispatches,
-                    );
-                    dispatch_pass(
-                        &mut enc,
-                        &self.pipelines.grid_fill,
-                        &self.bind_groups.grid_fill,
-                        self.ts.as_ref(),
-                        &mut cursor,
-                        &mut labels,
-                        "grid_fill",
-                        np,
-                        &mut dispatches,
+        // Pass sequence is chosen from which species are present. Water runs the density solve
+        // (+ grain exclusion when mixed); grain runs the contact subcycle; mixed runs both, with
+        // the bed contact AFTER the water/fluid passes so grains respond. Single-species scenes
+        // keep their adaptive early-exit (residual_reduce); mixed runs fixed iteration counts.
+        let mixed = self.has_water && self.has_grain;
+        let p = &self.pipelines;
+        let b = &self.bind_groups;
+        let ts_ref = self.ts.as_ref();
+        {
+            let mut pass = |enc: &mut wgpu::CommandEncoder,
+                            pipe: &wgpu::ComputePipeline,
+                            bg: &wgpu::BindGroup,
+                            label: &str,
+                            groups: u32| {
+                dispatch_pass(
+                    enc,
+                    pipe,
+                    bg,
+                    ts_ref,
+                    &mut cursor,
+                    &mut labels,
+                    label,
+                    groups,
+                    &mut dispatches,
+                );
+            };
+            for _ in 0..self.substeps {
+                pass(&mut enc, &p.predict, &b.predict, "predict", np);
+
+                if self.has_water {
+                    for it in 0..self.water_iters {
+                        if it % self.water_regrid == 0 {
+                            pass(&mut enc, &p.grid_clear, &b.grid_clear, "grid_clear", nc);
+                            pass(&mut enc, &p.grid_fill, &b.grid_fill, "grid_fill", np);
+                        }
+                        pass(
+                            &mut enc,
+                            &p.compute_lambda,
+                            &b.compute_lambda,
+                            "compute_lambda",
+                            np,
+                        );
+                        pass(&mut enc, &p.compute_dp, &b.compute_dp, "compute_dp", np);
+                        pass(&mut enc, &p.apply_dp, &b.apply_dp, "apply_dp", np);
+                        // Adaptive early-exit only for single-species water (mixed runs fixed iters).
+                        if !mixed {
+                            pass(
+                                &mut enc,
+                                &p.residual_reduce,
+                                &b.residual_reduce,
+                                "residual_reduce",
+                                1,
+                            );
+                        }
+                    }
+                }
+
+                if self.has_grain {
+                    for it in 0..self.bed_iters {
+                        if it % self.bed_regrid == 0 {
+                            pass(&mut enc, &p.grid_clear, &b.grid_clear, "grid_clear", nc);
+                            pass(&mut enc, &p.grid_fill, &b.grid_fill, "grid_fill", np);
+                        }
+                        pass(&mut enc, &p.bed_project, &b.bed_project, "bed_project", np);
+                        pass(&mut enc, &p.apply_dp, &b.apply_dp, "apply_dp", np);
+                        if !mixed {
+                            pass(
+                                &mut enc,
+                                &p.residual_reduce,
+                                &b.residual_reduce,
+                                "residual_reduce",
+                                1,
+                            );
+                        }
+                    }
+                }
+
+                pass(&mut enc, &p.finalize, &b.finalize, "finalize", np);
+
+                // XSPH viscosity is a fluid term; runs only when water is present.
+                if self.has_water {
+                    pass(&mut enc, &p.xsph, &b.xsph, "xsph", np);
+                    enc.copy_buffer_to_buffer(
+                        &self.vel_smoothed,
+                        0,
+                        &self.vel,
+                        0,
+                        (self.particle_count as u64) * 16,
                     );
                 }
-                if grain {
-                    // Granular projection: non-penetration + Coulomb friction + light cohesion.
-                    dispatch_pass(
-                        &mut enc,
-                        &self.pipelines.bed_project,
-                        &self.bind_groups.bed_project,
-                        self.ts.as_ref(),
-                        &mut cursor,
-                        &mut labels,
-                        "bed_project",
-                        np,
-                        &mut dispatches,
-                    );
-                } else {
-                    dispatch_pass(
-                        &mut enc,
-                        &self.pipelines.compute_lambda,
-                        &self.bind_groups.compute_lambda,
-                        self.ts.as_ref(),
-                        &mut cursor,
-                        &mut labels,
-                        "compute_lambda",
-                        np,
-                        &mut dispatches,
-                    );
-                    dispatch_pass(
-                        &mut enc,
-                        &self.pipelines.compute_dp,
-                        &self.bind_groups.compute_dp,
-                        self.ts.as_ref(),
-                        &mut cursor,
-                        &mut labels,
-                        "compute_dp",
-                        np,
-                        &mut dispatches,
-                    );
-                }
-                dispatch_pass(
-                    &mut enc,
-                    &self.pipelines.apply_dp,
-                    &self.bind_groups.apply_dp,
-                    self.ts.as_ref(),
-                    &mut cursor,
-                    &mut labels,
-                    "apply_dp",
-                    np,
-                    &mut dispatches,
-                );
-                // Check convergence AFTER applying the correction, so every frame relieves
-                // gravity's compression at least once. (Checking before — the old order —
-                // let "converged" frames skip the correction, so sub-tolerance compression
-                // accumulated silently until it detonated into a global eruption.)
-                dispatch_pass(
-                    &mut enc,
-                    &self.pipelines.residual_reduce,
-                    &self.bind_groups.residual_reduce,
-                    self.ts.as_ref(),
-                    &mut cursor,
-                    &mut labels,
-                    "residual_reduce",
-                    1,
-                    &mut dispatches,
-                );
-            }
-            dispatch_pass(
-                &mut enc,
-                &self.pipelines.finalize,
-                &self.bind_groups.finalize,
-                self.ts.as_ref(),
-                &mut cursor,
-                &mut labels,
-                "finalize",
-                np,
-                &mut dispatches,
-            );
-            // XSPH viscosity is a fluid term; the dry bed has none. Skipping it for grains also
-            // avoids the vel_smoothed copy clobbering grain velocities (xsph doesn't write them).
-            if !grain {
-                dispatch_pass(
-                    &mut enc,
-                    &self.pipelines.xsph,
-                    &self.bind_groups.xsph,
-                    self.ts.as_ref(),
-                    &mut cursor,
-                    &mut labels,
-                    "xsph",
-                    np,
-                    &mut dispatches,
-                );
-                enc.copy_buffer_to_buffer(
-                    &self.vel_smoothed,
-                    0,
-                    &self.vel,
-                    0,
-                    (self.particle_count as u64) * 16,
-                );
             }
         }
 

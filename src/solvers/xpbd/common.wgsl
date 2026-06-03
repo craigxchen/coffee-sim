@@ -47,6 +47,19 @@ struct Params {
     cohesion_range: f32,      // cohesion/contact search reach (absolute; d ≤ r < this)
     rolling_damping: f32,     // grain velocity retained per frame (rolling-resistance proxy)
     grain_sleep_speed: f32,   // static-yield dead-band: below this a grain is treated as at rest
+    // --- water/bed coupling (mixed scenes) ---
+    grain_mass: f32,
+    grain_volume: f32,        // (π/6)·grain_diameter³ — effective volume for the α_s sum
+    packing_limit: f32,       // α_s clamp (~0.64)
+    exclusion_relax: f32,     // under-relaxation on the A.2 correction
+    drag_gamma: f32,
+    drag_beta_max: f32,
+    buoyancy_scale: f32,
+    wake_threshold: f32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+    _pad3: u32,
 };
 
 struct Status {

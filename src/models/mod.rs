@@ -36,6 +36,12 @@ pub struct Materials {
     pub dry_cohesion: f32,
     /// Per-frame grain velocity retention (rolling-resistance proxy; <1 bleeds energy).
     pub rolling_damping: f32,
+
+    // --- coupling (water ↔ bed) ---
+    /// Per-grain particle mass (grains are denser than water; sets the interphase mass weighting).
+    pub grain_mass: f32,
+    /// Bed porosity φ (pore/fluid volume fraction of a packed bed) — the Kozeny–Carman input.
+    pub porosity: f32,
 }
 
 impl Default for Materials {
@@ -52,6 +58,10 @@ impl Default for Materials {
             floor_mu: 0.8,
             dry_cohesion: cohesion::dry(),
             rolling_damping: 0.9,
+            // Coupling: grains a bit denser than water (a settled bed resists being lifted); 40%
+            // bed porosity (KEEP.md §1).
+            grain_mass: 1.5,
+            porosity: 0.40,
         }
     }
 }

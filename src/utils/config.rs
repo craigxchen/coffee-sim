@@ -68,6 +68,22 @@ pub struct Config {
     /// Honest quasi-static regularization (gravity + contacts still evaluated) — removes the
     /// sub-threshold jitter a Jacobi contact pile never fully settles, without freezing.
     pub grain_sleep_speed: f32,
+
+    // --- water/bed coupling (mixed scenes) ---
+    /// Solid-fraction packing clamp on `α_s` (~0.64 random close packing).
+    pub packing_limit: f32,
+    /// Under-relaxation on the grain-exclusion position correction (A.2).
+    pub exclusion_relax: f32,
+    /// Drag rate scale: `γ = drag_gamma / k` (Kozeny–Carman k); higher = stiffer drag. (step 2)
+    pub drag_gamma: f32,
+    /// Per-particle accumulated-drag-blend cap `β_max < 1` (anti-overshoot). (step 2)
+    pub drag_beta_max: f32,
+    /// Drag Jacobi sub-iterations per frame. 0 disables drag. (step 2)
+    pub drag_subiters: u32,
+    /// Buoyancy impulse scale on the PBF `λ` pressure proxy. 0 disables buoyancy. (step 3)
+    pub buoyancy_scale: f32,
+    /// A grain skips its static dead-band when its frame fluid-impulse exceeds this (wake). (step 2)
+    pub wake_threshold: f32,
 }
 
 impl Default for Config {
@@ -115,6 +131,15 @@ impl Default for Config {
             bed_residual_tolerance: 0.02,
             bed_regrid_interval: 2,
             grain_sleep_speed: 0.2,
+            // Coupling: step-1 exclusion is active; drag (subiters) + buoyancy start disabled and
+            // are switched on in their own steps after exclusion is verified.
+            packing_limit: 0.64,
+            exclusion_relax: 0.5,
+            drag_gamma: 1.0,
+            drag_beta_max: 0.8,
+            drag_subiters: 0,
+            buoyancy_scale: 0.0,
+            wake_threshold: 0.05,
         }
     }
 }
