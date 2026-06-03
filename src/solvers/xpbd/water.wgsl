@@ -142,6 +142,12 @@ fn compute_dp(@builtin(global_invocation_id) gid: vec3<u32>) {
 fn xsph(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
     if (i >= params.particle_count) { return; }
+    // Viscosity is a fluid term; grains pass through unchanged (so the vel_smoothed→vel copy in a
+    // mixed scene doesn't clobber grain velocities).
+    if (phase[i] != PHASE_WATER) {
+        vel_smoothed[i] = vel[i];
+        return;
+    }
     let h = params.h;
     let xi = pos[i].xyz;
     let vi = vel[i].xyz;
