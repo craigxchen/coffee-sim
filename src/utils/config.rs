@@ -137,7 +137,7 @@ impl Default for Config {
             drag_gamma: 0.02,
             drag_beta_max: 0.8,
             drag_subiters: 4,
-            buoyancy_scale: 0.0,
+            buoyancy_scale: 1.0,
             wake_threshold: 0.05,
         }
     }
