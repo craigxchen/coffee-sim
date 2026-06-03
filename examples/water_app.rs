@@ -4,8 +4,9 @@
 //! camera and a corner orientation cube. The `winit` event loop is the only native-specific
 //! part; `ui::Renderer` is portable wgpu/WGSL.
 //!
-//! Run: `cargo run --example water_app` (water dam) · `SCENE=bed cargo run --example water_app`
-//! (dry coffee bed). `SPACING` scales particle size/count.
+//! Run: `cargo run --example water_app` (water dam) · `SCENE=bed` (dry coffee bed) ·
+//! `SCENE=pour` (water poured onto a bed) · `SCENE=dam` (dam-break through a porous sand wall).
+//! `SPACING` scales particle size/count.
 //! Controls: drag = orbit · scroll / pinch = zoom · two-finger drag = pan ·
 //!           space = pause · R = reset the scene · Esc = quit.
 
@@ -108,20 +109,29 @@ impl ApplicationHandler for App {
         if spacing != requested {
             eprintln!("SPACING {requested} too small (grid buffer would exceed the GPU limit); using {spacing}");
         }
-        // SCENE selects the scene: `bed` = dry coffee bed, `pour` = water poured onto the bed
-        // (coupling), anything else (default) = the water dam.
-        let (scene, scene_label) = match std::env::var("SCENE").as_deref() {
-            Ok("bed") => (Scene::bed_drop(), "bed"),
-            Ok("pour") => (Scene::pour_over(), "pour-over"),
+        // SCENE selects the scene: `bed` = dry coffee bed, `pour` = water poured onto the bed,
+        // `dam` = dam-break through a porous sand wall (water threads + erodes it), anything else
+        // (default) = the water dam.
+        let scene_kind = std::env::var("SCENE").unwrap_or_default();
+        let (scene, scene_label) = match scene_kind.as_str() {
+            "bed" => (Scene::bed_drop(), "bed"),
+            "pour" => (Scene::pour_over(), "pour-over"),
+            "dam" => (Scene::dam_through_sand(), "dam→sand"),
             _ => (Scene::dam_break(), "water"),
         };
-        let mats = Materials {
+        let mut mats = Materials {
             particle_spacing: spacing,
             support_radius: 2.0 * spacing,
             particle_mass: 1.0,
             grain_diameter: spacing,
             ..Materials::default()
         };
+        if scene_kind == "dam" {
+            // Heavier grains so the surge can't trivially bulldoze the wall, and a water↔grain
+            // contact below the grain spacing so water threads the wall's pores (porous flow).
+            mats.grain_mass = 6.0;
+            mats.water_grain_distance = 0.4 * spacing;
+        }
         let solver = XpbdSolver::build(&scene, &mats, &Config::default(), &gpu);
         let renderer = Renderer::new(&gpu, format, (config.width, config.height), 0.5 * spacing);
         let camera = OrbitCamera::framing(Vec3::from(scene.box_min), Vec3::from(scene.box_max));

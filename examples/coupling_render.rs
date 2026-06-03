@@ -22,14 +22,35 @@ fn main() {
         eprintln!("no GPU adapter; skipping.");
         return;
     };
-    let scene = Scene::pour_over();
-    let mats = Materials::default();
-    let mut solver = XpbdSolver::build(&scene, &mats, &Config::default(), &gpu);
+    // SCENE=dam renders the dam-break-through-a-sand-wall; default is the pour-over bed.
+    let dam = std::env::var("SCENE").as_deref() == Ok("dam");
+    let scene = if dam {
+        Scene::dam_through_sand()
+    } else {
+        Scene::pour_over()
+    };
+    let mut mats = Materials::default();
+    if let Some(gm) = std::env::var("GRAIN_MASS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+    {
+        mats.grain_mass = gm; // heavy grains hold the wall against the surge
+    }
+    if let Some(wg) = std::env::var("WGDIST").ok().and_then(|s| s.parse().ok()) {
+        mats.water_grain_distance = wg; // < grain spacing ⇒ water threads the packed wall's pores
+    }
+    let mut cfg = Config::default();
+    if let Some(ds) = std::env::var("DRAGSUB").ok().and_then(|s| s.parse().ok()) {
+        cfg.drag_subiters = ds; // DRAGSUB=0 → drag off (water threads pores without dragging the wall)
+    }
+    let mut solver = XpbdSolver::build(&scene, &mats, &cfg, &gpu);
+    let phase = solver.read_phases();
     let input = EmissionInput::default();
 
     let renderer = Renderer::new(&gpu, FORMAT, (W, H), 0.5 * mats.particle_spacing);
     let mut camera = OrbitCamera::framing(Vec3::from(scene.box_min), Vec3::from(scene.box_max));
-    camera.orbit(0.6, -0.2); // 3/4 view
+    // Near-front view for the dam (see the surge → wall → far-side cross-section); 3/4 for the bed.
+    camera.orbit(if dam { 0.25 } else { 0.6 }, -0.18);
 
     let target = gpu.device.create_texture(&wgpu::TextureDescriptor {
         label: Some("offscreen"),
@@ -55,13 +76,29 @@ fn main() {
     });
 
     std::fs::create_dir_all("/tmp/coffee-coupling").unwrap();
-    let shots = [90u32, 240, 450, 750];
+    let shots: &[u32] = if dam {
+        &[30, 90, 180, 300, 480]
+    } else {
+        &[90, 240, 450, 750]
+    };
     let mut next = 0usize;
+    // For the dam scene, the wall spans x[22,27]; count water that crossed to the far side (x>28).
+    let far_x = 28.0f32;
 
     for f in 0..=*shots.last().unwrap() {
         solver.step(1.0 / 60.0, &input);
         if next < shots.len() && f == shots[next] {
             next += 1;
+            if dam {
+                let pos = solver.read_positions();
+                let through = pos
+                    .iter()
+                    .zip(&phase)
+                    .filter(|(p, &ph)| ph == 0 && p[0] > far_x)
+                    .count();
+                let total_water = phase.iter().filter(|&&p| p == 0).count();
+                eprintln!("  f{f}: water through wall (x>{far_x:.0}): {through}/{total_water}");
+            }
             renderer.render(&view, &solver.particles(), &camera);
             // Copy texture → buffer.
             let mut enc = gpu
