@@ -29,6 +29,10 @@ pub struct Materials {
     // --- grain (dry bed) ---
     /// Contact diameter `d`: grains within this distance push apart (≈ particle spacing).
     pub grain_diameter: f32,
+    /// Water↔grain exclusion contact distance. Defaults to `grain_diameter` (water rests on the
+    /// bed). Set **below** the grain spacing to let water thread the pores of a packed grain wall
+    /// (porous through-flow) while grain–grain contact still holds the wall together.
+    pub water_grain_distance: f32,
     /// Grain–grain Coulomb friction coefficient (the slope-holding yield stress).
     pub friction_mu: f32,
     /// Grain–boundary (floor/wall) Coulomb friction — stops the pile sliding flat.
@@ -55,6 +59,7 @@ impl Default for Materials {
             // friction, light cohesion + rolling damping so the sphere pile isn't too shallow.
             // Calibrated against the standing-heap invariant, not an exact repose angle.
             grain_diameter: 1.0,
+            water_grain_distance: 1.0, // = grain_diameter: water rests on the bed (override for porous flow)
             friction_mu: 0.8,
             floor_mu: 0.8,
             dry_cohesion: cohesion::dry(),

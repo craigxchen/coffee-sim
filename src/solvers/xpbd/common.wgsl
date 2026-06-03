@@ -56,7 +56,7 @@ struct Params {
     drag_beta_max: f32,
     buoyancy_scale: f32,
     wake_threshold: f32,
-    _pad0: u32,
+    water_grain_distance: f32, // water↔grain exclusion contact (≤ grain spacing lets water thread pores)
     _pad1: u32,
     _pad2: u32,
     _pad3: u32,

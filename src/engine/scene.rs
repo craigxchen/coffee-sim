@@ -88,6 +88,35 @@ impl Scene {
         }
     }
 
+    /// A dam-break against a porous **sand wall**: a tall water column on the left collapses and
+    /// surges into a vertical slab of grains spanning the box. Because there is open space on the
+    /// *far* side, water actually flows **through** the wall (the far side is the outlet — no drain
+    /// hole needed), driven by the surge + the head that builds behind the wall. Showcases the
+    /// coupling: percolation through a porous barrier, with the wall eroding/holding under the load.
+    pub fn dam_through_sand() -> Self {
+        Self {
+            box_min: [0.0, 0.0, 0.0],
+            box_max: [40.0, 30.0, 12.0],
+            regions: vec![
+                // Vertical sand wall across the box (3 thick in x, full depth), sitting on the
+                // floor. Heavy grains (set via Materials.grain_mass) so the surge can't bulldoze
+                // it — water must overtop / seep through instead of shoving the whole wall.
+                SeedRegion {
+                    min: [23.0, 1.0, 1.0],
+                    max: [26.0, 18.0, 11.0],
+                    species: Species::Grain,
+                },
+                // Tall water dam on the left, released toward the wall (builds head to drive flow).
+                SeedRegion {
+                    min: [1.0, 1.0, 1.0],
+                    max: [18.0, 24.0, 11.0],
+                    species: Species::Water,
+                },
+            ],
+            ..Self::default()
+        }
+    }
+
     /// A pour-over: a grain bed on the floor with a water column above it — the first **mixed**
     /// water+grain scene, the water/bed-coupling gate. The bed settles, then water pools on /
     /// drains through it (drainage needs the drag step; exclusion alone keeps water off the floor).

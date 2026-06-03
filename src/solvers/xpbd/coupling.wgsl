@@ -49,7 +49,7 @@ fn compute_fractions(@builtin(global_invocation_id) gid: vec3<u32>) {
 // Water↔grain contact separation for one pair, opposite-mass weighted. Both passes call this with
 // the same (xi, xj) so the pair impulse is identical and conservation holds (to float tolerance).
 fn exclusion_push(xi: vec3<f32>, xj: vec3<f32>, w_self: f32) -> vec3<f32> {
-    let d_wg = params.grain_diameter; // water–grain contact distance
+    let d_wg = params.water_grain_distance; // water–grain contact distance (< grain spacing ⇒ pores)
     let dvec = xi - xj;
     var r = length(dvec);
     if (r >= d_wg) { return vec3<f32>(0.0); }
