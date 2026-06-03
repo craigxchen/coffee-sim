@@ -103,6 +103,9 @@ struct Pipelines {
     residual_reduce: wgpu::ComputePipeline,
     compute_dp: wgpu::ComputePipeline,
     bed_project: wgpu::ComputePipeline,
+    compute_fractions: wgpu::ComputePipeline,
+    exclude_water: wgpu::ComputePipeline,
+    exclude_grain: wgpu::ComputePipeline,
     apply_dp: wgpu::ComputePipeline,
     finalize: wgpu::ComputePipeline,
     xsph: wgpu::ComputePipeline,
@@ -116,6 +119,9 @@ struct BindGroups {
     residual_reduce: wgpu::BindGroup,
     compute_dp: wgpu::BindGroup,
     bed_project: wgpu::BindGroup,
+    compute_fractions: wgpu::BindGroup,
+    exclude_water: wgpu::BindGroup,
+    exclude_grain: wgpu::BindGroup,
     apply_dp: wgpu::BindGroup,
     finalize: wgpu::BindGroup,
     xsph: wgpu::BindGroup,
@@ -282,6 +288,33 @@ impl XpbdSolver {
     /// Read back current particle velocities (dev/test only — stalls the GPU).
     pub fn read_velocities(&self) -> Vec<[f32; 4]> {
         self.read_vec4(self.vel.as_ref())
+    }
+
+    /// Read back per-particle phase tags (0=water, 1=grain) (dev/test only — stalls the GPU).
+    pub fn read_phases(&self) -> Vec<u32> {
+        let size = (self.particle_count as u64) * 4;
+        let mut enc = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("phase-readback"),
+            });
+        enc.copy_buffer_to_buffer(self.phase.as_ref(), 0, &self.pos_readback, 0, size);
+        self.queue.submit(Some(enc.finish()));
+        let slice = self.pos_readback.slice(0..size);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        let _ = self.device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        });
+        rx.recv().unwrap().unwrap();
+        let data = slice.get_mapped_range();
+        let out: Vec<u32> = bytemuck::cast_slice(&data).to_vec();
+        drop(data);
+        self.pos_readback.unmap();
+        out
     }
 
     /// Sample GPU diagnostics (status + per-pass timestamps) into the caches that
@@ -480,7 +513,9 @@ impl Solver for XpbdSolver {
             device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("xpbd-phase"),
                 contents: bytemuck::cast_slice(&phases),
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_DST
+                    | wgpu::BufferUsages::COPY_SRC,
             }),
         );
         let normal_impulse = Self::storage(
@@ -489,6 +524,9 @@ impl Solver for XpbdSolver {
             f32s,
             wgpu::BufferUsages::empty(),
         );
+        // Per-particle solid fraction α_s (coupling). Zero-initialized by wgpu, so single-species
+        // scenes (which never run compute_fractions) read α_s=0 → the water solve is unmodulated.
+        let alpha_s = Self::storage(&device, "xpbd-alpha-s", f32s, wgpu::BufferUsages::empty());
         let cell_count = Self::storage(
             &device,
             "xpbd-cellcount",
@@ -525,10 +563,11 @@ impl Solver for XpbdSolver {
         // declares Params/Status/bindings + shared kernels; `water` and `bed` add the
         // per-species solves. Module-scope declarations are order-independent.
         let shader_src = format!(
-            "{}\n{}\n{}",
+            "{}\n{}\n{}\n{}",
             include_str!("common.wgsl"),
             include_str!("water.wgsl"),
             include_str!("bed.wgsl"),
+            include_str!("coupling.wgsl"),
         );
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("xpbd"),
@@ -552,6 +591,9 @@ impl Solver for XpbdSolver {
             residual_reduce: make("residual_reduce"),
             compute_dp: make("compute_dp"),
             bed_project: make("bed_project"),
+            compute_fractions: make("compute_fractions"),
+            exclude_water: make("exclude_water"),
+            exclude_grain: make("exclude_grain"),
             apply_dp: make("apply_dp"),
             finalize: make("finalize"),
             xsph: make("xsph"),
@@ -607,6 +649,7 @@ impl Solver for XpbdSolver {
                     (9, &cell_bucket),
                     (10, &status),
                     (11, &phase),
+                    (13, &alpha_s),
                 ],
             ),
             residual_reduce: bg(
@@ -624,6 +667,7 @@ impl Solver for XpbdSolver {
                     (9, &cell_bucket),
                     (10, &status),
                     (11, &phase),
+                    (13, &alpha_s),
                 ],
             ),
             bed_project: bg(
@@ -638,6 +682,41 @@ impl Solver for XpbdSolver {
                     (9, &cell_bucket),
                     (11, &phase),
                     (12, &normal_impulse),
+                ],
+            ),
+            compute_fractions: bg(
+                &pipelines.compute_fractions,
+                &[
+                    (0, &params_buf),
+                    (2, &pred),
+                    (8, &cell_count),
+                    (9, &cell_bucket),
+                    (11, &phase),
+                    (13, &alpha_s),
+                ],
+            ),
+            exclude_water: bg(
+                &pipelines.exclude_water,
+                &[
+                    (0, &params_buf),
+                    (2, &pred),
+                    (6, &dp),
+                    (8, &cell_count),
+                    (9, &cell_bucket),
+                    (10, &status),
+                    (11, &phase),
+                ],
+            ),
+            exclude_grain: bg(
+                &pipelines.exclude_grain,
+                &[
+                    (0, &params_buf),
+                    (2, &pred),
+                    (6, &dp),
+                    (8, &cell_count),
+                    (9, &cell_bucket),
+                    (10, &status),
+                    (11, &phase),
                 ],
             ),
             apply_dp: bg(
@@ -799,6 +878,16 @@ impl Solver for XpbdSolver {
                             pass(&mut enc, &p.grid_clear, &b.grid_clear, "grid_clear", nc);
                             pass(&mut enc, &p.grid_fill, &b.grid_fill, "grid_fill", np);
                         }
+                        if mixed {
+                            // Solid fraction (live from current pred) → pore-modulated water target.
+                            pass(
+                                &mut enc,
+                                &p.compute_fractions,
+                                &b.compute_fractions,
+                                "compute_fractions",
+                                np,
+                            );
+                        }
                         pass(
                             &mut enc,
                             &p.compute_lambda,
@@ -807,6 +896,23 @@ impl Solver for XpbdSolver {
                             np,
                         );
                         pass(&mut enc, &p.compute_dp, &b.compute_dp, "compute_dp", np);
+                        if mixed {
+                            // Grain exclusion (A.2), two-way: water out of grain bodies + reaction.
+                            pass(
+                                &mut enc,
+                                &p.exclude_water,
+                                &b.exclude_water,
+                                "exclude_water",
+                                np,
+                            );
+                            pass(
+                                &mut enc,
+                                &p.exclude_grain,
+                                &b.exclude_grain,
+                                "exclude_grain",
+                                np,
+                            );
+                        }
                         pass(&mut enc, &p.apply_dp, &b.apply_dp, "apply_dp", np);
                         // Adaptive early-exit only for single-species water (mixed runs fixed iters).
                         if !mixed {
