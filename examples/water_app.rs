@@ -6,7 +6,8 @@
 //!
 //! Run: `cargo run --example water_app` (water dam) · `SCENE=bed` (dry coffee bed) ·
 //! `SCENE=pour` (water poured onto a bed) · `SCENE=dam` (dam-break through a porous sand wall).
-//! `SPACING` scales particle size/count.
+//! `SPACING` scales particle size/count. `WET=1` (mixed scenes) turns on wetting: grains absorb
+//! water, swell, darken, and clump (Phase 1.4) — e.g. `WET=1 SCENE=pour`.
 //! Controls: drag = orbit · scroll / pinch = zoom · two-finger drag = pan ·
 //!           space = pause · R = reset the scene · Esc = quit.
 
@@ -136,7 +137,15 @@ impl ApplicationHandler for App {
             mats.water_grain_distance = 0.4;
             mats.grain_mass = 12.0;
         }
-        let solver = XpbdSolver::build(&scene, &mats, &Config::default(), &gpu);
+        // WET=1 turns on Phase 1.4 wetting (mixed scenes): grains absorb water, swell, darken, gain
+        // capillary cohesion, and drag rises with local packing. Off by default (mechanical coupling
+        // only). Wire the grain saturation tint so wetting is visible.
+        let mut cfg = Config::default();
+        if std::env::var("WET").is_ok() {
+            cfg.absorb_rate = 0.5;
+            mats.c_max = 2.0;
+        }
+        let solver = XpbdSolver::build(&scene, &mats, &cfg, &gpu);
         let mut renderer = Renderer::new(
             &gpu,
             format,
@@ -144,6 +153,9 @@ impl ApplicationHandler for App {
             0.5 * mats.particle_spacing,
         );
         renderer.set_grain_radius_scale(mats.grain_diameter / mats.particle_spacing);
+        let v_cap =
+            mats.r_max * mats.rho_ratio * std::f32::consts::FRAC_PI_6 * mats.grain_diameter.powi(3);
+        renderer.set_moisture_scale(1.0 / v_cap);
         let camera = OrbitCamera::framing(Vec3::from(scene.box_min), Vec3::from(scene.box_max));
 
         window.request_redraw();
