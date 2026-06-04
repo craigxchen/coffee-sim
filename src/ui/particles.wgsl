@@ -5,7 +5,7 @@ struct Camera {
     view_proj: mat4x4<f32>,
     right: vec4<f32>,   // camera right in world space (xyz)
     up: vec4<f32>,      // camera up in world space (xyz)
-    params: vec4<f32>,  // x = particle radius, y = inv color-max-speed
+    params: vec4<f32>,  // x = radius, y = inv color-max-speed, z = grain radius scale, w = 1/V_cap (moisture tint)
 };
 
 @group(0) @binding(0) var<uniform> cam: Camera;
@@ -20,6 +20,7 @@ struct VsOut {
     @location(0) uv: vec2<f32>,
     @location(1) speed: f32,
     @location(2) @interpolate(flat) phase: u32,
+    @location(3) @interpolate(flat) saturation: f32,
 };
 
 @vertex
@@ -40,6 +41,8 @@ fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VsOut
     out.uv = c;
     out.speed = length(velocities[ii].xyz);
     out.phase = phases[ii];
+    // Grain saturation = V_abs / V_cap (pos.w · 1/V_cap); 0 when the tint is disabled (params.w=0).
+    out.saturation = clamp(positions[ii].w * cam.params.w, 0.0, 1.0);
     return out;
 }
 
@@ -58,8 +61,10 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
     var calm: vec3<f32>;
     var fast: vec3<f32>;
     if (in.phase == PHASE_GRAIN) {
-        // Coffee grounds: brown, lightening slightly when disturbed.
-        calm = vec3<f32>(0.30, 0.18, 0.10);
+        // Coffee grounds: brown, lightening slightly when disturbed; darkening as they wet.
+        let dry = vec3<f32>(0.30, 0.18, 0.10);
+        let wet = vec3<f32>(0.13, 0.07, 0.03);
+        calm = mix(dry, wet, in.saturation);
         fast = vec3<f32>(0.60, 0.42, 0.26);
     } else {
         calm = vec3<f32>(0.10, 0.32, 0.85);

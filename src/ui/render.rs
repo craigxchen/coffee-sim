@@ -36,6 +36,8 @@ pub struct Renderer {
     radius: f32,
     /// Render-radius multiplier for grain particles (water = 1×); coarse grains draw bigger.
     grain_radius_scale: f32,
+    /// `1/V_cap` for the grain saturation tint (0 = no tint).
+    moisture_inv_cap: f32,
 
     depth: wgpu::TextureView,
 
@@ -189,6 +191,7 @@ impl Renderer {
             size,
             radius,
             grain_radius_scale: 1.0,
+            moisture_inv_cap: 0.0,
             depth,
             camera_buf,
             particle_pipeline,
@@ -207,6 +210,12 @@ impl Renderer {
     /// are coarser than the water (e.g. a porous sand wall) so they draw at their true size.
     pub fn set_grain_radius_scale(&mut self, scale: f32) {
         self.grain_radius_scale = scale;
+    }
+
+    /// Set `1/V_cap` so grains can be tinted by saturation (`pos.w·inv_cap`): dry grounds darken as
+    /// they wet. 0 (default) disables the tint. `V_cap = r_max·rho_ratio·grain_volume`.
+    pub fn set_moisture_scale(&mut self, inv_cap: f32) {
+        self.moisture_inv_cap = inv_cap;
     }
 
     pub fn resize(&mut self, size: (u32, u32)) {
@@ -236,7 +245,7 @@ impl Renderer {
                 self.radius,
                 1.0 / COLOR_MAX_SPEED,
                 self.grain_radius_scale,
-                0.0,
+                self.moisture_inv_cap,
             ],
         };
         self.queue
