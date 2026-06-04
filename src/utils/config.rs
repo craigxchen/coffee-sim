@@ -150,9 +150,10 @@ impl Default for Config {
             drag_subiters: 4,
             buoyancy_scale: 1.0,
             wake_threshold: 0.05,
-            // Wetting: ~2 s saturation time constant; deactivate water only at a tiny remaining
-            // fraction (exact conservation), skip it from PBF well above that.
-            absorb_rate: 0.5,
+            // Wetting OFF by default (like drag_subiters=0): scenes opt in with absorb_rate>0 until
+            // the feature is calibrated. ~2 s saturation time constant when enabled; deactivate
+            // water only at a tiny remaining fraction (exact conservation), skip from PBF above that.
+            absorb_rate: 0.0,
             absorb_roundoff: 1.0e-3,
             pbf_eps: 0.05,
         }

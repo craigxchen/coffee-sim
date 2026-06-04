@@ -106,6 +106,10 @@ struct Status {
 @group(0) @binding(15) var<storage, read_write> vel_frozen: array<vec4<f32>>;
 // Per-particle drag blend cap computed from the opposite-phase neighbor count.
 @group(0) @binding(16) var<storage, read_write> coupling_scale: array<f32>;
+// Per-particle count of ELIGIBLE opposite-species neighbors for absorption (wetting): water → N_w
+// (# unsaturated grains), grain → N_g (# non-empty waters). Written by wet_count, read by both
+// transfer passes so the two-sided allocation take_wg is identical (and conservation-safe).
+@group(0) @binding(17) var<storage, read_write> wet_neighbors: array<u32>;
 
 const PI: f32 = 3.14159265358979;
 
