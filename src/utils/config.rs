@@ -49,10 +49,6 @@ pub struct Config {
     /// Velocity clamp `‖v‖ ≤ max_speed` (CFL + anti-blow-up backstop).
     pub max_speed: f32,
 
-    // --- neighbor grid ---
-    /// Fixed per-cell bucket capacity `K` (overflow is a hard correctness failure).
-    pub bucket_capacity: u32,
-
     // --- initial seeding ---
     /// Initial position jitter as a fraction of particle spacing (breaks lattice symmetry).
     pub seed_jitter: f32,
@@ -134,7 +130,6 @@ impl Default for Config {
             velocity_damping: 1.0,
             // Velocity cap as a pure safety backstop, above believable water speeds.
             max_speed: 50.0,
-            bucket_capacity: 64,
             seed_jitter: 0.1,
             // Granular bed: contacts need more iterations + a tighter penetration tolerance than
             // the density solve, and a more frequent grid rebuild (contact-heavy).

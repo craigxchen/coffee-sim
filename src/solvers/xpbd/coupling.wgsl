@@ -31,9 +31,10 @@ fn compute_fractions(@builtin(global_invocation_id) gid: vec3<u32>) {
                 let dims = vec3<i32>(params.grid_dims.xyz);
                 if (nc.x >= dims.x || nc.y >= dims.y || nc.z >= dims.z) { continue; }
                 let cid = cell_id(nc);
-                let cnt = min(atomicLoad(&cell_count[cid]), params.bucket_capacity);
-                for (var s = 0u; s < cnt; s = s + 1u) {
-                    let j = cell_bucket[cid * params.bucket_capacity + s];
+                let lo = cell_start[cid];
+                let hi = cell_start[cid + 1u];
+                for (var s = lo; s < hi; s = s + 1u) {
+                    let j = sorted_indices[s];
                     if (j == i) { continue; }
                     if (phase[j] != PHASE_GRAIN) { continue; } // solid fraction from grains only
                     let r = length(xi - pred[j].xyz);
@@ -85,9 +86,10 @@ fn exclude_water(@builtin(global_invocation_id) gid: vec3<u32>) {
                 let dims = vec3<i32>(params.grid_dims.xyz);
                 if (nc.x >= dims.x || nc.y >= dims.y || nc.z >= dims.z) { continue; }
                 let cid = cell_id(nc);
-                let cnt = min(atomicLoad(&cell_count[cid]), params.bucket_capacity);
-                for (var s = 0u; s < cnt; s = s + 1u) {
-                    let j = cell_bucket[cid * params.bucket_capacity + s];
+                let lo = cell_start[cid];
+                let hi = cell_start[cid + 1u];
+                for (var s = lo; s < hi; s = s + 1u) {
+                    let j = sorted_indices[s];
                     if (phase[j] != PHASE_GRAIN) { continue; }
                     let m_g = grain_eff_mass(pred[j].w);
                     push = push + exclusion_push(xi, pred[j].xyz, m_g / (m_w + m_g));
@@ -119,9 +121,10 @@ fn exclude_grain(@builtin(global_invocation_id) gid: vec3<u32>) {
                 let dims = vec3<i32>(params.grid_dims.xyz);
                 if (nc.x >= dims.x || nc.y >= dims.y || nc.z >= dims.z) { continue; }
                 let cid = cell_id(nc);
-                let cnt = min(atomicLoad(&cell_count[cid]), params.bucket_capacity);
-                for (var s = 0u; s < cnt; s = s + 1u) {
-                    let j = cell_bucket[cid * params.bucket_capacity + s];
+                let lo = cell_start[cid];
+                let hi = cell_start[cid + 1u];
+                for (var s = lo; s < hi; s = s + 1u) {
+                    let j = sorted_indices[s];
                     if (phase[j] != PHASE_WATER) { continue; }
                     // Mirror of the water-side push for this pair (swapped args give −n); grain's
                     // opposite-mass weight m_w/(m_w+m_g) → exact pair antisymmetry.
@@ -184,9 +187,10 @@ fn compute_coupling_scale(@builtin(global_invocation_id) gid: vec3<u32>) {
                 let dims = vec3<i32>(params.grid_dims.xyz);
                 if (nc.x >= dims.x || nc.y >= dims.y || nc.z >= dims.z) { continue; }
                 let cid = cell_id(nc);
-                let cnt = min(atomicLoad(&cell_count[cid]), params.bucket_capacity);
-                for (var s = 0u; s < cnt; s = s + 1u) {
-                    let j = cell_bucket[cid * params.bucket_capacity + s];
+                let lo = cell_start[cid];
+                let hi = cell_start[cid + 1u];
+                for (var s = lo; s < hi; s = s + 1u) {
+                    let j = sorted_indices[s];
                     if (j == i) { continue; }
                     if (phase[j] == ph_i) { continue; }
                     let r = length(xi - pred[j].xyz);
@@ -228,9 +232,10 @@ fn drag_water(@builtin(global_invocation_id) gid: vec3<u32>) {
                 let dims = vec3<i32>(params.grid_dims.xyz);
                 if (nc.x >= dims.x || nc.y >= dims.y || nc.z >= dims.z) { continue; }
                 let cid = cell_id(nc);
-                let cnt = min(atomicLoad(&cell_count[cid]), params.bucket_capacity);
-                for (var s = 0u; s < cnt; s = s + 1u) {
-                    let j = cell_bucket[cid * params.bucket_capacity + s];
+                let lo = cell_start[cid];
+                let hi = cell_start[cid + 1u];
+                for (var s = lo; s < hi; s = s + 1u) {
+                    let j = sorted_indices[s];
                     if (phase[j] != PHASE_GRAIN) { continue; }
                     let r = length(xi - pred[j].xyz);
                     if (r >= params.h) { continue; }
@@ -261,9 +266,10 @@ fn drag_grain(@builtin(global_invocation_id) gid: vec3<u32>) {
                 let dims = vec3<i32>(params.grid_dims.xyz);
                 if (nc.x >= dims.x || nc.y >= dims.y || nc.z >= dims.z) { continue; }
                 let cid = cell_id(nc);
-                let cnt = min(atomicLoad(&cell_count[cid]), params.bucket_capacity);
-                for (var s = 0u; s < cnt; s = s + 1u) {
-                    let j = cell_bucket[cid * params.bucket_capacity + s];
+                let lo = cell_start[cid];
+                let hi = cell_start[cid + 1u];
+                for (var s = lo; s < hi; s = s + 1u) {
+                    let j = sorted_indices[s];
                     if (phase[j] != PHASE_WATER) { continue; }
                     let r = length(xi - pred[j].xyz);
                     if (r >= params.h) { continue; }
@@ -298,9 +304,10 @@ fn buoyancy_grain(@builtin(global_invocation_id) gid: vec3<u32>) {
                 let dims = vec3<i32>(params.grid_dims.xyz);
                 if (nc.x >= dims.x || nc.y >= dims.y || nc.z >= dims.z) { continue; }
                 let cid = cell_id(nc);
-                let cnt = min(atomicLoad(&cell_count[cid]), params.bucket_capacity);
-                for (var s = 0u; s < cnt; s = s + 1u) {
-                    let j = cell_bucket[cid * params.bucket_capacity + s];
+                let lo = cell_start[cid];
+                let hi = cell_start[cid + 1u];
+                for (var s = lo; s < hi; s = s + 1u) {
+                    let j = sorted_indices[s];
                     if (phase[j] != PHASE_WATER) { continue; }
                     let d = xi - pred[j].xyz;
                     let r = length(d);
@@ -336,9 +343,10 @@ fn buoyancy_water(@builtin(global_invocation_id) gid: vec3<u32>) {
                 let dims = vec3<i32>(params.grid_dims.xyz);
                 if (nc.x >= dims.x || nc.y >= dims.y || nc.z >= dims.z) { continue; }
                 let cid = cell_id(nc);
-                let cnt = min(atomicLoad(&cell_count[cid]), params.bucket_capacity);
-                for (var s = 0u; s < cnt; s = s + 1u) {
-                    let j = cell_bucket[cid * params.bucket_capacity + s];
+                let lo = cell_start[cid];
+                let hi = cell_start[cid + 1u];
+                for (var s = lo; s < hi; s = s + 1u) {
+                    let j = sorted_indices[s];
                     if (phase[j] != PHASE_GRAIN) { continue; }
                     let d = xi - pred[j].xyz;
                     let r = length(d);

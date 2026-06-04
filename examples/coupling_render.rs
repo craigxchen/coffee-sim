@@ -52,12 +52,24 @@ fn main() {
     if let Some(ds) = std::env::var("DRAGSUB").ok().and_then(|s| s.parse().ok()) {
         cfg.drag_subiters = ds; // DRAGSUB=0 → drag off (water threads pores without dragging the wall)
     }
+    // WET=1 turns on absorption: grains wet, swell, darken, drag rises with packing (live porosity),
+    // and the bed gains capillary cohesion. Prints a per-shot volume-conservation + saturation readout.
+    let wet = std::env::var("WET").is_ok();
+    if wet {
+        cfg.absorb_rate = 0.5;
+        mats.c_max = 2.0;
+    }
     let mut solver = XpbdSolver::build(&scene, &mats, &cfg, &gpu);
     let phase = solver.read_phases();
     let input = EmissionInput::default();
 
     let mut renderer = Renderer::new(&gpu, FORMAT, (W, H), 0.5 * mats.particle_spacing);
     renderer.set_grain_radius_scale(mats.grain_diameter / mats.particle_spacing);
+    // Grain saturation tint: V_cap = r_max·rho_ratio·(π/6·d³); pass 1/V_cap so wet grains darken.
+    let v_cap =
+        mats.r_max * mats.rho_ratio * std::f32::consts::FRAC_PI_6 * mats.grain_diameter.powi(3);
+    let v_w = solver.water_particle_volume();
+    renderer.set_moisture_scale(1.0 / v_cap);
     let mut camera = OrbitCamera::framing(Vec3::from(scene.box_min), Vec3::from(scene.box_max));
     // Near-front view for the dam (see the surge → wall → far-side cross-section); 3/4 for the bed.
     camera.orbit(if dam { 0.25 } else { 0.6 }, -0.18);
@@ -94,6 +106,15 @@ fn main() {
     let mut next = 0usize;
     // For the dam scene, the wall spans x[14,20]; count water that crossed to the far side (x>21).
     let far_x = 21.0f32;
+    if wet {
+        let m0 = solver.read_moisture();
+        let vol0: f32 = m0
+            .iter()
+            .zip(&phase)
+            .map(|(&w, &ph)| if ph == 0 { w * v_w } else { w })
+            .sum();
+        eprintln!("  f0: total volume {vol0:.2} (conservation baseline)");
+    }
 
     for f in 0..=*shots.last().unwrap() {
         solver.step(1.0 / 60.0, &input);
@@ -108,6 +129,26 @@ fn main() {
                     .count();
                 let total_water = phase.iter().filter(|&&p| p == 0).count();
                 eprintln!("  f{f}: water through wall (x>{far_x:.0}): {through}/{total_water}");
+            }
+            if wet {
+                // Volume conservation (Σ f_w·V_w + Σ V_abs) + mean grain saturation.
+                let m = solver.read_moisture();
+                let vol: f32 = m
+                    .iter()
+                    .zip(&phase)
+                    .map(|(&w, &ph)| if ph == 0 { w * v_w } else { w })
+                    .sum();
+                let (sat_sum, ng) = m.iter().zip(&phase).fold((0.0f32, 0u32), |acc, (&w, &ph)| {
+                    if ph == 1 {
+                        (acc.0 + (w / v_cap).min(1.0), acc.1 + 1)
+                    } else {
+                        acc
+                    }
+                });
+                eprintln!(
+                    "  f{f}: total volume {vol:.2} | mean grain saturation {:.3}",
+                    sat_sum / ng.max(1) as f32
+                );
             }
             renderer.render(&view, &solver.particles(), &camera);
             // Copy texture → buffer.

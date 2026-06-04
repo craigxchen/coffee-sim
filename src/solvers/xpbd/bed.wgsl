@@ -41,9 +41,10 @@ fn bed_project(@builtin(global_invocation_id) gid: vec3<u32>) {
                 let dims = vec3<i32>(params.grid_dims.xyz);
                 if (nc.x >= dims.x || nc.y >= dims.y || nc.z >= dims.z) { continue; }
                 let cid = cell_id(nc);
-                let cnt = min(atomicLoad(&cell_count[cid]), params.bucket_capacity);
-                for (var s = 0u; s < cnt; s = s + 1u) {
-                    let j = cell_bucket[cid * params.bucket_capacity + s];
+                let lo = cell_start[cid];
+                let hi = cell_start[cid + 1u];
+                for (var s = lo; s < hi; s = s + 1u) {
+                    let j = sorted_indices[s];
                     if (j == i) { continue; }
                     if (phase[j] != PHASE_GRAIN) { continue; } // grain contacts only
                     // Per-pair swollen contact distance (sum of effective radii) + cohesion reach,
