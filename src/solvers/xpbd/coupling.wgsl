@@ -378,7 +378,8 @@ fn apply_drag_pred(@builtin(global_invocation_id) gid: vec3<u32>) {
     // the drag micro-step needs neither pos nor the floor_mu machinery). No-op when num_solids == 0.
     if (params.num_solids > 0u) {
         let hit = solid_union(p, phase[i]);
-        let contact = 0.5 * params.grain_diameter;
+        // Water projects to the surface (offset 0, dissipative); grains keep a radius standoff.
+        let contact = select(0.0, 0.5 * params.grain_diameter, phase[i] == PHASE_GRAIN);
         if (hit.dist < contact) {
             p = p + (contact - hit.dist) * hit.grad;
         }
