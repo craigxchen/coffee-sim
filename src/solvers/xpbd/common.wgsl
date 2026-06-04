@@ -163,6 +163,16 @@ fn eff_mass(ph: u32, w: f32) -> f32 {
     return water_eff_mass(w);
 }
 
+// Density-aware buoyancy scaling: the buoyant acceleration is ∝ ρ_water/ρ_grain, so a grain DENSER
+// than water (dry coffee, ρ≈several×) is barely buoyed and still sinks, while a saturated grain
+// (ρ→ρ_water) is neutrally buoyant. Clamped ≤ 1. Both buoyancy passes apply the grain's factor per
+// pair, so the impulse stays equal-and-opposite (momentum conserved). Fixes the dam over-lift where
+// the uncalibrated λ proxy launched denser-than-water grains out of the column.
+fn grain_buoyancy_factor(v_abs: f32) -> f32 {
+    let rho_g = grain_eff_mass(v_abs) / max(grain_eff_volume(v_abs), 1.0e-6);
+    return clamp(params.rest_density / max(rho_g, 1.0e-6), 0.0, 1.0);
+}
+
 // Saturation→cohesion curve (mirrors models::cohesion::for_saturation): a piecewise-linear bump,
 // 0 at dry (s=0) and full saturation (s=1), peak c_max at s_peak, with s = V_abs / V_cap.
 fn wet_cohesion(v_abs: f32) -> f32 {

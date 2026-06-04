@@ -319,8 +319,10 @@ fn buoyancy_grain(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
 
-    let m_g = grain_eff_mass(pred[i].w); // swelling: heavier wet grain accelerates less (momentum J=m·dv conserved either way)
-    let dv = impulse / m_g;
+    let m_g = grain_eff_mass(pred[i].w); // swelling: heavier wet grain accelerates less
+    // Density-aware: a denser-than-water grain is buoyed less (sinks); same factor on the water side
+    // (per pair) keeps momentum conserved. Uniform over this grain's pairs, so scale the total.
+    let dv = grain_buoyancy_factor(pred[i].w) * impulse / m_g;
     vel[i] = vec4<f32>(vel_frozen[i].xyz + dv, 0.0);
     fluid_impulse[i] = fluid_impulse[i] + m_g * length(dv);
 }
@@ -352,9 +354,10 @@ fn buoyancy_water(@builtin(global_invocation_id) gid: vec3<u32>) {
                     let r = length(d);
                     if (r >= params.h) { continue; }
                     // Grain pass pair: J_gw = s*p_w*∇W(x_g − x_w). Here d = x_w − x_g, so
-                    // ∇W(d) = −∇W(x_g − x_w), making this exactly −J_gw for the same pair.
-                    impulse = impulse + params.buoyancy_scale * pressure *
-                        spiky_grad(d, params.h, params.spiky_r_min);
+                    // ∇W(d) = −∇W(x_g − x_w), making this exactly −J_gw for the same pair. The grain's
+                    // density factor matches the grain-pass scaling → equal-and-opposite per pair.
+                    impulse = impulse + grain_buoyancy_factor(pred[j].w) * params.buoyancy_scale *
+                        pressure * spiky_grad(d, params.h, params.spiky_r_min);
                 }
             }
         }

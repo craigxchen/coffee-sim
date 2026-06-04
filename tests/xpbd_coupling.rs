@@ -253,8 +253,10 @@ fn buoyancy_pressure_proxy_lifts_fine_bed_without_blowup() {
         off_finite && on_finite,
         "buoyancy pressure-proxy test blew up"
     );
+    // Density-aware buoyancy (added in Phase 1.4) scales the lift by ρ_water/ρ_grain, so this very
+    // dense grain (ρ≈30× water) lifts only a little — but it must still rise vs no buoyancy, finitely.
     assert!(
-        on_rise > off_rise + 1.0e-3,
+        on_rise > off_rise + 1.0e-4,
         "fine bed did not lift under seeded pressure proxy: on {on_rise:.6}, off {off_rise:.6}"
     );
 }
