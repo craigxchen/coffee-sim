@@ -851,6 +851,7 @@ impl Solver for XpbdSolver {
                     (8, &cell_count),
                     (9, &cell_bucket),
                     (11, &phase),
+                    (13, &alpha_s),
                     (16, &coupling_scale),
                 ],
             ),

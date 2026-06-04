@@ -518,3 +518,72 @@ fn swelling_pushes_contacting_grains_apart() {
         "wetted grains did not swell apart: {gap0} -> {gap1}"
     );
 }
+
+#[test]
+fn live_porosity_drag_path_conserves_momentum() {
+    let Some(gpu) = GpuContext::new_headless() else {
+        eprintln!("xpbd_wetting: no GPU adapter; skipping.");
+        return;
+    };
+    let mats = Materials::default();
+    // Drag ON with absorption ON (so live-porosity drag + effective masses are active), gravity off,
+    // density/bed/buoyancy off. The only momentum exchanges are the symmetric drag impulse and the
+    // inelastic absorption merge — both conservative — so Σ(m_eff·v) is invariant.
+    let scene = Scene {
+        gravity: [0.0, 0.0, 0.0],
+        ..mixed_scene()
+    };
+    let cfg = Config {
+        max_iters: 0,
+        bed_max_iters: 0,
+        buoyancy_scale: 0.0,
+        xsph_viscosity_c: 0.0,
+        grain_sleep_speed: 0.0,
+        drag_subiters: 4,
+        absorb_rate: 0.5,
+        ..Config::default()
+    };
+    let mut solver = XpbdSolver::build(&scene, &mats, &cfg, &gpu);
+    let phase = solver.read_phases();
+    let v_w = solver.water_particle_volume();
+    let rho_w = mats.particle_mass / v_w;
+
+    let vel0: Vec<[f32; 4]> = phase
+        .iter()
+        .map(|&ph| {
+            if ph == 0 {
+                [1.5, 0.0, 0.0, 0.0]
+            } else {
+                [0.0; 4]
+            }
+        })
+        .collect();
+    solver.write_velocities_for_test(&vel0);
+
+    let p0 = eff_momentum(
+        &solver.read_velocities(),
+        &solver.read_moisture(),
+        &phase,
+        &mats,
+        rho_w,
+    );
+    for _ in 0..30 {
+        solver.step(1.0 / 60.0, &EmissionInput::default());
+    }
+    let p1 = eff_momentum(
+        &solver.read_velocities(),
+        &solver.read_moisture(),
+        &phase,
+        &mats,
+        rho_w,
+    );
+    let drift =
+        ((p1[0] - p0[0]).powi(2) + (p1[1] - p0[1]).powi(2) + (p1[2] - p0[2]).powi(2)).sqrt();
+    let scale = (p0[0] * p0[0] + p0[1] * p0[1] + p0[2] * p0[2])
+        .sqrt()
+        .max(1.0);
+    assert!(
+        drift <= 2.0e-3 * scale,
+        "drag+absorption momentum drift {drift} (scale {scale})"
+    );
+}

@@ -71,9 +71,9 @@ fn exclude_water(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (i >= params.particle_count) { return; }
     if (status.converged != 0u) { return; }
     if (phase[i] != PHASE_WATER) { return; }
-    let m_w = params.particle_mass;
-    let m_g = params.grain_mass;
-    let w_self = m_g / (m_w + m_g); // opposite-mass weight for the water side
+    // Effective masses (swelling): heavier wet grains / lighter shrunk water shift the split. Dry
+    // (V_abs=0, f_w=1) ⇒ the original particle_mass/grain_mass split. w_self computed per neighbor.
+    let m_w = water_eff_mass(pred[i].w);
     let xi = pred[i].xyz;
     var push = vec3<f32>(0.0);
     let base = cell_coord(xi);
@@ -89,7 +89,8 @@ fn exclude_water(@builtin(global_invocation_id) gid: vec3<u32>) {
                 for (var s = 0u; s < cnt; s = s + 1u) {
                     let j = cell_bucket[cid * params.bucket_capacity + s];
                     if (phase[j] != PHASE_GRAIN) { continue; }
-                    push = push + exclusion_push(xi, pred[j].xyz, w_self);
+                    let m_g = grain_eff_mass(pred[j].w);
+                    push = push + exclusion_push(xi, pred[j].xyz, m_g / (m_w + m_g));
                 }
             }
         }
@@ -104,9 +105,9 @@ fn exclude_grain(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (i >= params.particle_count) { return; }
     if (status.converged != 0u) { return; }
     if (phase[i] != PHASE_GRAIN) { return; }
-    let m_w = params.particle_mass;
-    let m_g = params.grain_mass;
-    let w_self = m_w / (m_w + m_g); // opposite-mass weight for the grain side
+    // Effective masses (swelling), mirror of exclude_water. Same per-pair m_w/m_g read from pred.w on
+    // both sides ⇒ the antisymmetric correction still conserves momentum exactly.
+    let m_g = grain_eff_mass(pred[i].w);
     let xi = pred[i].xyz;
     var push = vec3<f32>(0.0);
     let base = cell_coord(xi);
@@ -122,9 +123,10 @@ fn exclude_grain(@builtin(global_invocation_id) gid: vec3<u32>) {
                 for (var s = 0u; s < cnt; s = s + 1u) {
                     let j = cell_bucket[cid * params.bucket_capacity + s];
                     if (phase[j] != PHASE_WATER) { continue; }
-                    // Mirror of the water-side push for this pair (note the swapped argument order
-                    // gives −n) with the grain's opposite-mass weight → exact pair antisymmetry.
-                    push = push + exclusion_push(xi, pred[j].xyz, w_self);
+                    // Mirror of the water-side push for this pair (swapped args give −n); grain's
+                    // opposite-mass weight m_w/(m_w+m_g) → exact pair antisymmetry.
+                    let m_w = water_eff_mass(pred[j].w);
+                    push = push + exclusion_push(xi, pred[j].xyz, m_w / (m_w + m_g));
                 }
             }
         }
@@ -135,16 +137,27 @@ fn exclude_grain(@builtin(global_invocation_id) gid: vec3<u32>) {
     dp[i] = vec4<f32>(push, 0.0);
 }
 
-fn drag_pair_beta() -> f32 {
-    let x = max(params.drag_gamma * params.dt, 0.0);
-    return x / (1.0 + x);
+fn beta_from_rate(rate: f32) -> f32 {
+    let x = max(rate * params.dt, 0.0);
+    return x / (1.0 + x); // implicit: rate→∞ ⇒ β→1 (no overshoot); bounds rate·dt
 }
 
-fn particle_mass_for_phase(ph: u32) -> f32 {
-    if (ph == PHASE_GRAIN) {
-        return params.grain_mass;
-    }
-    return params.particle_mass;
+fn drag_pair_beta() -> f32 {
+    return beta_from_rate(params.drag_gamma);
+}
+
+// Live-porosity drag (wetting only): the local drag rate scales with local permeability k(φ_f),
+// φ_f = 1−α_s, relative to the reference porosity the build-time rate was resolved at. The K-C
+// d²/180 cancels in the ratio, so this is a pure porosity factor. As the bed wets/swells, α_s↑ ⇒
+// φ_f↓ ⇒ k↓ ⇒ rate↑ ⇒ drainage slows. (Bulk-correct; a harmonic-k pair blend would be sharper at a
+// porosity discontinuity — deferred.)
+const WET_REF_POROSITY: f32 = 0.40; // must match Materials.porosity (build-time drag resolution)
+fn porosity_drag_factor(a_s: f32) -> f32 {
+    let phi = clamp(1.0 - a_s, 0.05, 0.999); // clamp away from 0 (K-C diverges)
+    let pr = WET_REF_POROSITY;
+    let num = pr * pr * pr * (1.0 - phi) * (1.0 - phi);
+    let den = phi * phi * phi * (1.0 - pr) * (1.0 - pr);
+    return num / max(den, 1.0e-12); // k_ref / k_local
 }
 
 @compute @workgroup_size(256)
@@ -153,8 +166,14 @@ fn compute_coupling_scale(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (i >= params.particle_count) { return; }
     let ph_i = phase[i];
     let xi = pred[i].xyz;
-    let beta = drag_pair_beta();
-    var total = 0.0;
+    // Per-particle drag blend: global rate, or the local-porosity rate when wetting is active. The
+    // result is the FULL per-pair scale (the multi-neighbor cap is folded in below), so drag uses
+    // min(scale_i, scale_j) directly — which, for the global rate, equals the old beta·min(c_i,c_j).
+    var beta_i = drag_pair_beta();
+    if (params.k_abs > 0.0) {
+        beta_i = beta_from_rate(params.drag_gamma * porosity_drag_factor(alpha_s[i]));
+    }
+    var n = 0.0;
 
     let base = cell_coord(xi);
     for (var dz = -1; dz <= 1; dz = dz + 1) {
@@ -172,20 +191,23 @@ fn compute_coupling_scale(@builtin(global_invocation_id) gid: vec3<u32>) {
                     if (phase[j] == ph_i) { continue; }
                     let r = length(xi - pred[j].xyz);
                     if (r >= params.h) { continue; }
-                    total = total + beta;
+                    n = n + 1.0;
                 }
             }
         }
     }
 
-    coupling_scale[i] = min(1.0, params.drag_beta_max / max(total, 1.0e-6));
+    // Cap so Σ_j min(scale_i, scale_j) ≤ β_max (anti-overshoot). min(beta_i, β_max/N) = beta_i·c_i
+    // with the old cap c_i = min(1, β_max/(N·beta_i)), so the global-rate path is unchanged.
+    coupling_scale[i] = min(beta_i, params.drag_beta_max / max(n, 1.0));
 }
 
 fn drag_delta_for_pair(i: u32, j: u32, self_phase: u32) -> vec3<f32> {
-    let beta = drag_pair_beta();
-    let s = beta * min(coupling_scale[i], coupling_scale[j]);
-    let m_i = particle_mass_for_phase(self_phase);
-    let m_j = particle_mass_for_phase(phase[j]);
+    // coupling_scale already folds in the (possibly local-porosity) rate + the cap, so the symmetric
+    // pair scale is just min of the two. Effective masses (swelling) keep momentum conserved.
+    let s = min(coupling_scale[i], coupling_scale[j]);
+    let m_i = eff_mass(self_phase, pred[i].w);
+    let m_j = eff_mass(phase[j], pred[j].w);
     return s * (m_j / (m_i + m_j)) * (vel_frozen[j].xyz - vel_frozen[i].xyz);
 }
 
@@ -290,9 +312,10 @@ fn buoyancy_grain(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
 
-    let dv = impulse / params.grain_mass;
+    let m_g = grain_eff_mass(pred[i].w); // swelling: heavier wet grain accelerates less (momentum J=m·dv conserved either way)
+    let dv = impulse / m_g;
     vel[i] = vec4<f32>(vel_frozen[i].xyz + dv, 0.0);
-    fluid_impulse[i] = fluid_impulse[i] + params.grain_mass * length(dv);
+    fluid_impulse[i] = fluid_impulse[i] + m_g * length(dv);
 }
 
 @compute @workgroup_size(256)
@@ -329,7 +352,9 @@ fn buoyancy_water(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
 
-    vel[i] = vec4<f32>(vel_frozen[i].xyz + impulse / params.particle_mass, 0.0);
+    // Effective water mass, floored so a near-empty (absorbed) particle can't blow up the divide.
+    let m_w = max(water_eff_mass(pred[i].w), params.particle_mass * params.pbf_eps);
+    vel[i] = vec4<f32>(vel_frozen[i].xyz + impulse / m_w, 0.0);
 }
 
 @compute @workgroup_size(256)
