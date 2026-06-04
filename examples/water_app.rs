@@ -111,13 +111,15 @@ impl ApplicationHandler for App {
             eprintln!("SPACING {requested} too small (grid buffer would exceed the GPU limit); using {spacing}");
         }
         // SCENE selects the scene: `bed` = dry coffee bed, `pour` = water poured onto the bed,
-        // `dam` = dam-break through a porous sand wall (water threads + erodes it), anything else
+        // `dam` = dam-break through a porous sand wall (water threads + erodes it), `v60` = the V60
+        // dripper (cone + grains-only filter + cup, with a bed seeded in the cone), anything else
         // (default) = the water dam.
         let scene_kind = std::env::var("SCENE").unwrap_or_default();
         let (scene, scene_label) = match scene_kind.as_str() {
             "bed" => (Scene::bed_drop(), "bed"),
             "pour" => (Scene::pour_over(), "pour-over"),
             "dam" => (Scene::dam_through_sand(), "dam→sand"),
+            "v60" => (Scene::v60(), "v60"),
             _ => (Scene::dam_break(), "water"),
         };
         let mut mats = Materials {
