@@ -229,6 +229,10 @@ pub struct XpbdSolver {
 /// Seed the scene's initial particles on a jittered lattice, one block per region. Returns
 /// positions and the matching per-particle phase tags (0=water, 1=grain).
 fn seed_block(scene: &Scene, mats: &Materials, cfg: &Config) -> (Vec<[f32; 4]>, Vec<u32>) {
+    // Cone-aware rejection clearance: when the scene has solids, a seeded particle must sit at least
+    // this far inside a solid's cavity for its species (KEEP.md §4 uses 0.4–0.6 units) so a bed
+    // starts inside the dripper, not through its wall.
+    const SEED_CLEARANCE: f32 = 0.4;
     let mut rng = crate::utils::rng::Rng::new(cfg.seed);
     let mut pos = Vec::new();
     let mut phase = Vec::new();
@@ -253,18 +257,76 @@ fn seed_block(scene: &Scene, mats: &Materials, cfg: &Config) -> (Vec<[f32; 4]>, 
                     let jx = (rng.next_f32() * 2.0 - 1.0) * jitter;
                     let jy = (rng.next_f32() * 2.0 - 1.0) * jitter;
                     let jz = (rng.next_f32() * 2.0 - 1.0) * jitter;
-                    pos.push([
-                        lo[0] + i as f32 * s + jx,
-                        lo[1] + j as f32 * s + jy,
-                        lo[2] + k as f32 * s + jz,
-                        w0,
-                    ]);
+                    let px = lo[0] + i as f32 * s + jx;
+                    let py = lo[1] + j as f32 * s + jy;
+                    let pz = lo[2] + k as f32 * s + jz;
+                    // Cone-aware rejection: drop lattice points that fall outside (or too near) a
+                    // solid's cavity for this species. RNG draws happen above regardless, so the
+                    // lattice stays deterministic whether or not a point is kept.
+                    if !scene.solids.is_empty() {
+                        let c = crate::utils::sdf::nearest(
+                            &scene.solids,
+                            glam::Vec3::new(px, py, pz),
+                            tag,
+                        );
+                        if c.signed < SEED_CLEARANCE {
+                            continue;
+                        }
+                    }
+                    pos.push([px, py, pz, w0]);
                     phase.push(tag);
                 }
             }
         }
     }
     (pos, phase)
+}
+
+#[cfg(test)]
+mod seed_tests {
+    use super::*;
+
+    /// The V60 scene's cone-aware rejection seeds both species strictly inside their cavities.
+    #[test]
+    fn v60_seeds_inside_the_cavity() {
+        let scene = Scene::v60();
+        let (pos, phase) = seed_block(&scene, &Materials::default(), &Config::default());
+        assert!(!pos.is_empty(), "v60 seeds particles");
+        let (mut nw, mut ng) = (0u32, 0u32);
+        for (p, &ph) in pos.iter().zip(&phase) {
+            let c =
+                crate::utils::sdf::nearest(&scene.solids, glam::Vec3::new(p[0], p[1], p[2]), ph);
+            assert!(
+                c.signed >= 0.0,
+                "seed (phase {ph}) at {:?} is outside its cavity: signed {}",
+                [p[0], p[1], p[2]],
+                c.signed
+            );
+            if ph == 0 {
+                nw += 1
+            } else {
+                ng += 1
+            }
+        }
+        assert!(
+            nw > 0 && ng > 0,
+            "both species seeded (water {nw}, grain {ng})"
+        );
+    }
+
+    /// Existing AABB scenes carry no solids, so rejection is a no-op for them.
+    #[test]
+    fn aabb_scenes_have_no_solids() {
+        for s in [
+            Scene::default(),
+            Scene::dam_break(),
+            Scene::bed_drop(),
+            Scene::dam_through_sand(),
+            Scene::pour_over(),
+        ] {
+            assert!(s.solids.is_empty());
+        }
+    }
 }
 
 impl XpbdSolver {
