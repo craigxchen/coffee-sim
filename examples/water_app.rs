@@ -144,7 +144,9 @@ impl ApplicationHandler for App {
         let mut cfg = Config::default();
         if std::env::var("WET").is_ok() {
             cfg.absorb_rate = 0.5;
-            mats.c_max = 2.0;
+            // Small cohesion (position-correction units): ~0.3 clumps wet grounds into a coherent
+            // bed; larger values overpower non-penetration and ball the grains up.
+            mats.c_max = 0.3;
         }
         let solver = XpbdSolver::build(&scene, &mats, &cfg, &gpu);
         let mut renderer = Renderer::new(

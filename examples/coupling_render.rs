@@ -58,7 +58,10 @@ fn main() {
     let wet = std::env::var("WET").is_ok();
     if wet {
         cfg.absorb_rate = 0.5;
-        mats.c_max = 2.0;
+        // Cohesion is in position-correction units (≈ grain diameters), so keep it small: ~0.3
+        // clumps the wet grounds into a coherent bed/wall; large values (≳1) overpower
+        // non-penetration and ball the grains up (position-pull cohesion instability).
+        mats.c_max = 0.3;
     }
     // Diagnostic overrides to isolate which force launches grains: BUOY=buoyancy_scale, CMAX=c_max.
     if let Some(b) = std::env::var("BUOY").ok().and_then(|s| s.parse().ok()) {
