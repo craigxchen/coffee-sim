@@ -1,9 +1,12 @@
 //! `Scene` — the user-facing brew description, immutable input to `Solver::build`/`reset`.
 //!
-//! Carries the simulation box, gravity, and a list of **seed regions** (each a block of one
-//! species). Single-species scenes have one region; the coupling scenes seed both a grain bed and
-//! a water column. Real V60 dripper geometry / pour schedule arrive with `geometry`; reference
-//! recipe values are in `KEEP.md` §1.
+//! Carries the simulation box, gravity, a list of **seed regions** (each a block of one species),
+//! and any static **solids** (analytic SDF geometry — a V60 dripper, a cup) the particles collide
+//! with. Single-species scenes have one region and no solids; the coupling scenes seed both a grain
+//! bed and a water column; the V60 scene adds dripper geometry. Reference recipe values are in
+//! `KEEP.md` §1.
+
+pub use crate::utils::sdf::{SdfPrimitive, SolidKind};
 
 /// Which material a seed region is. The solver shares one particle system + grid across both,
 /// tagged per particle by `phase`; the per-frame pass sequence is chosen from which species are present.
@@ -36,6 +39,10 @@ pub struct Scene {
     pub box_max: [f32; 3],
     /// Regions seeded with particles at build/reset (one per species block).
     pub regions: Vec<SeedRegion>,
+    /// Static solid geometry (analytic SDF) the particles collide with — empty for the AABB-only
+    /// scenes. When non-empty, seeding rejects lattice points that fall outside a solid's cavity for
+    /// their species (so a bed starts inside the dripper, not through its wall).
+    pub solids: Vec<SdfPrimitive>,
 }
 
 impl Default for Scene {
@@ -54,17 +61,39 @@ impl Default for Scene {
                 max: [17.0, 17.0, 24.0],
                 species: Species::Water,
             }],
+            solids: Vec::new(),
         }
     }
 }
 
 impl Scene {
-    /// A default V60 brew (reference recipe; see `KEEP.md` §1).
+    /// A V60 brew: the dripper geometry (support cone + grains-only filter + cup) with a coffee bed
+    /// seeded inside the cone and a water column above it. Origin-centered domain. Bed/water blocks
+    /// are seeded generously and **cone-aware rejection** (in `seed_block`) trims them to the cavity,
+    /// so no grain starts through the filter wall. Dimensions are reference values (`KEEP.md` §2/§4).
     pub fn v60() -> Self {
         Self {
             dose_g: 15.0,
             water_ml: 250.0,
-            ..Self::default()
+            gravity: [0.0, -20.0, 0.0],
+            box_min: [-7.0, -10.0, -7.0],
+            box_max: [7.0, 10.0, 7.0],
+            solids: crate::utils::geometry::v60_dripper(),
+            regions: vec![
+                // Coffee bed: a block spanning the lower cone; rejection trims it to the (grains-only)
+                // filter cavity so the bed is cone-shaped and starts inside the paper.
+                SeedRegion {
+                    min: [-2.5, -2.8, -2.5],
+                    max: [2.5, 0.2, 2.5],
+                    species: Species::Grain,
+                },
+                // Water column above the bed; rejection trims it to the support-cone cavity.
+                SeedRegion {
+                    min: [-2.0, 0.6, -2.0],
+                    max: [2.0, 2.6, 2.0],
+                    species: Species::Water,
+                },
+            ],
         }
     }
 
@@ -138,5 +167,23 @@ impl Scene {
             ],
             ..Self::default()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn v60_has_geometry_enclosed_by_the_domain() {
+        let s = Scene::v60();
+        assert_eq!(s.solids.len(), 3, "support cone + grains-only filter + cup");
+        // The domain encloses the cup floor (-8) and the cone top (+3).
+        assert!(
+            s.box_min[1] <= -8.0,
+            "domain floor reaches below the cup floor"
+        );
+        assert!(s.box_max[1] >= 3.0, "domain top reaches above the cone top");
+        assert!(!s.regions.is_empty(), "v60 seeds a bed + a water column");
     }
 }
