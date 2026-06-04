@@ -48,6 +48,19 @@ pub struct Materials {
     pub grain_mass: f32,
     /// Bed porosity φ (pore/fluid volume fraction of a packed bed) — the Kozeny–Carman input.
     pub porosity: f32,
+
+    // --- wetting / cohesion (Phase 1.4) ---
+    /// Moisture ratio at saturation `r_max` (mass water / mass dry grain). Coffee ≈ 1.5 — grounds
+    /// absorb ~1.5× their dry mass, which is why bloom/drawdown-slowing are pronounced.
+    pub r_max: f32,
+    /// Grain/water density ratio `ρ_s/ρ_w`. Converts absorbed water mass into the grain's swelling
+    /// volume so absorption conserves volume (fluid lost = solid gained).
+    pub rho_ratio: f32,
+    /// Saturation `s ∈ [0,1]` at the cohesion-curve peak (~0.4; capillary bridges are strongest at
+    /// partial saturation, collapse at full saturation). See [`cohesion::for_saturation`].
+    pub s_peak: f32,
+    /// Peak wet cohesion strength `c_max` (curve scale). 0 until calibrated to a wet-dome repose.
+    pub c_max: f32,
 }
 
 impl Default for Materials {
@@ -69,6 +82,12 @@ impl Default for Materials {
             // bed porosity (KEEP.md §1).
             grain_mass: 1.5,
             porosity: 0.40,
+            // Wetting: coffee retains ~1.5× its dry mass; grain density ~1.3× water; cohesion peaks
+            // near 40% saturation. c_max starts at 0 (no wet cohesion until calibrated).
+            r_max: 1.5,
+            rho_ratio: 1.3,
+            s_peak: 0.4,
+            c_max: 0.0,
         }
     }
 }

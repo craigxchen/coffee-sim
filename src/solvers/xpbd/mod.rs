@@ -77,10 +77,18 @@ struct Params {
     buoyancy_scale: f32,
     wake_threshold: f32,
     water_grain_distance: f32,
-    _pad1: u32,
-    _pad2: u32,
-    _pad3: u32,
+    // --- wetting / cohesion (Phase 1.4) ---
+    r_max: f32,           // moisture ratio at saturation (mass water / mass dry grain)
+    rho_ratio: f32,       // ρ_s/ρ_w — converts absorbed water mass → swelling volume
+    s_peak: f32,          // saturation at the cohesion-curve peak
+    c_max: f32,           // peak wet cohesion strength (0 until calibrated)
+    k_abs: f32,           // absorption rate constant (1/s)
+    absorb_roundoff: f32, // f_w deactivation floor (exact-conservation; ≪ pbf_eps)
+    pbf_eps: f32,         // PBF skips water with remaining fraction ≤ this
 }
+
+// Params is uploaded as a uniform and must stay byte-identical to the WGSL `Params`.
+const _: () = assert!(std::mem::size_of::<Params>() == 256);
 
 /// CPU mirror of the WGSL `Status` struct (8 × u32).
 #[repr(C)]
@@ -469,8 +477,8 @@ impl Solver for XpbdSolver {
         let rest_density = kernels::rest_density(s, h, m);
         let dq = cfg.s_corr_dq_ratio * h;
         let s_corr_wq = kernels::w_poly6(dq, h);
-        // Resolve the user-facing drag scale through Kozeny-Carman once at build time. WGSL keeps
-        // the existing 240-byte Params layout by storing this resolved rate in `drag_gamma`.
+        // Resolve the user-facing drag scale through Kozeny-Carman once at build time, stored in
+        // `drag_gamma` (live-porosity drag in a later unit makes this per-particle).
         let permeability = kozeny_carman(mats.grain_diameter, mats.porosity);
         let resolved_drag_gamma = drag_rate(permeability, cfg.drag_gamma);
 
@@ -517,9 +525,13 @@ impl Solver for XpbdSolver {
             buoyancy_scale: cfg.buoyancy_scale,
             wake_threshold: cfg.wake_threshold,
             water_grain_distance: mats.water_grain_distance,
-            _pad1: 0,
-            _pad2: 0,
-            _pad3: 0,
+            r_max: mats.r_max,
+            rho_ratio: mats.rho_ratio,
+            s_peak: mats.s_peak,
+            c_max: mats.c_max,
+            k_abs: cfg.absorb_rate,
+            absorb_roundoff: cfg.absorb_roundoff,
+            pbf_eps: cfg.pbf_eps,
         };
 
         let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
