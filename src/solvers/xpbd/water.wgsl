@@ -16,8 +16,17 @@ fn compute_lambda(@builtin(global_invocation_id) gid: vec3<u32>) {
     let h = params.h;
     let m = params.particle_mass;
     let xi = pred[i].xyz;
+    // Wetting: water carries a remaining-volume fraction f_w in pred.w. A near-empty particle is
+    // skipped (inert), and every water contributes its f_w-weighted mass — so the density solve
+    // matches the actual fluid at the wet front. f_w≡1 (no absorption) ⇒ identical to before.
+    let f_i = pred[i].w;
+    if (f_i <= params.pbf_eps) {
+        lambda[i] = 0.0;
+        c_residual[i] = 0.0;
+        return;
+    }
 
-    var rho = m * w_poly6(0.0, h);
+    var rho = m * f_i * w_poly6(0.0, h);
     var sum_g = vec3<f32>(0.0);
     var sum_g2 = 0.0;
 
@@ -35,11 +44,13 @@ fn compute_lambda(@builtin(global_invocation_id) gid: vec3<u32>) {
                     let j = cell_bucket[cid * params.bucket_capacity + s];
                     if (j == i) { continue; }
                     if (phase[j] != PHASE_WATER) { continue; } // skip grain neighbors
+                    let fj = pred[j].w;
+                    if (fj <= params.pbf_eps) { continue; } // skip near-empty (absorbed) water
                     let d = xi - pred[j].xyz;
                     let r = length(d);
                     if (r >= h) { continue; }
-                    rho = rho + m * w_poly6(r, h);
-                    let gj = m * spiky_grad(d, h, params.spiky_r_min);
+                    rho = rho + m * fj * w_poly6(r, h);
+                    let gj = m * fj * spiky_grad(d, h, params.spiky_r_min);
                     sum_g = sum_g + gj;
                     sum_g2 = sum_g2 + dot(gj, gj);
                 }
@@ -110,6 +121,12 @@ fn compute_dp(@builtin(global_invocation_id) gid: vec3<u32>) {
     let m = params.particle_mass;
     let xi = pred[i].xyz;
     let lam_i = lambda[i];
+    // Skip near-empty (absorbed) water; weight neighbor contributions by their f_w (pred.w) to match
+    // compute_lambda. f_w≡1 (no absorption) ⇒ identical to before.
+    if (pred[i].w <= params.pbf_eps) {
+        dp[i] = vec4<f32>(0.0);
+        return;
+    }
 
     var sum = vec3<f32>(0.0);
     let base = cell_coord(xi);
@@ -126,13 +143,15 @@ fn compute_dp(@builtin(global_invocation_id) gid: vec3<u32>) {
                     let j = cell_bucket[cid * params.bucket_capacity + s];
                     if (j == i) { continue; }
                     if (phase[j] != PHASE_WATER) { continue; } // skip grain neighbors
+                    let fj = pred[j].w;
+                    if (fj <= params.pbf_eps) { continue; } // skip near-empty (absorbed) water
                     let d = xi - pred[j].xyz;
                     let r = length(d);
                     if (r >= h) { continue; }
                     let wr = w_poly6(r, h);
                     let ratio = wr / params.s_corr_wq;
                     let scorr = -params.s_corr_k * pow(ratio, params.s_corr_n);
-                    let gj = m * spiky_grad(d, h, params.spiky_r_min);
+                    let gj = m * fj * spiky_grad(d, h, params.spiky_r_min);
                     sum = sum + (lam_i + lambda[j] + scorr) * gj;
                 }
             }

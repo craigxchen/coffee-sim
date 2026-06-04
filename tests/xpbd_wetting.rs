@@ -417,3 +417,48 @@ fn dry_grain_wets_monotonically_toward_capacity() {
     }
     assert!(prev > 0.0, "grain never wetted");
 }
+
+#[test]
+fn wetting_with_full_solve_conserves_volume_and_stays_finite() {
+    let Some(gpu) = GpuContext::new_headless() else {
+        eprintln!("xpbd_wetting: no GPU adapter; skipping.");
+        return;
+    };
+    let mats = Materials::default();
+    // Full physics ON (density, bed, drag, buoyancy) PLUS absorption — the realistic mixed path,
+    // exercising the f_w-weighted PBF density solve against the absorption bookkeeping.
+    let cfg = Config {
+        absorb_rate: 0.5,
+        ..Config::default()
+    };
+    let mut solver = XpbdSolver::build(&mixed_scene(), &mats, &cfg, &gpu);
+    let phase = solver.read_phases();
+    let v_w = solver.water_particle_volume();
+
+    let initial = total_volume(&solver.read_moisture(), &phase, v_w);
+    for _ in 0..150 {
+        solver.step(1.0 / 60.0, &EmissionInput::default());
+    }
+    let pos = solver.read_positions();
+    let moisture = solver.read_moisture();
+
+    // Only the wetting passes touch pos.w, so volume conservation holds even with the full solve.
+    let final_vol = total_volume(&moisture, &phase, v_w);
+    assert!(
+        (final_vol - initial).abs() <= 1.0e-3 * initial.max(1.0),
+        "volume drifted under full solve: {initial} -> {final_vol}"
+    );
+    // No blow-up at the wet front.
+    assert!(
+        pos.iter()
+            .all(|p| p[0].is_finite() && p[1].is_finite() && p[2].is_finite()),
+        "non-finite position (wet-front blow-up)"
+    );
+    assert!(
+        moisture
+            .iter()
+            .zip(&phase)
+            .any(|(&m, &p)| p == 1 && m > 1.0e-5),
+        "no absorption"
+    );
+}
