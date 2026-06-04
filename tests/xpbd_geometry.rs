@@ -115,10 +115,12 @@ fn water_in_cone_settles_without_bouncing() {
         species_mask: MASK_ALL,
         friction: 0.3,
     };
-    let mut mats = Materials::default();
-    mats.particle_spacing = 0.5;
-    mats.support_radius = 1.0;
-    mats.grain_diameter = 0.5;
+    let mats = Materials {
+        particle_spacing: 0.5,
+        support_radius: 1.0,
+        grain_diameter: 0.5,
+        ..Materials::default()
+    };
     let scene = Scene {
         dose_g: 0.0,
         water_ml: 0.0,
@@ -244,4 +246,64 @@ fn no_solids_path_is_inert() {
         !solver.diagnostics().overflow,
         "no grid overflow without solids"
     );
+}
+
+/// End-to-end V60: with a permeable bed (fine water through a coarser bed), water passes the
+/// grains-only filter and drains through the cone apex into the cup, while the grains stay trapped
+/// above the filter tip. Conservation (no particle lost), finiteness, and no grid overflow hold.
+#[test]
+fn v60_water_drains_into_cup_grains_trapped() {
+    let Some(gpu) = GpuContext::new_headless() else {
+        eprintln!("xpbd_geometry: no GPU adapter; skipping.");
+        return;
+    };
+    // Calibrated V60 mats (see examples/water_app.rs SCENE=v60): fine water, coarser permeable bed,
+    // grains ~1.25x water density so the bed holds and water threads through instead of squeezing.
+    let mats = Materials {
+        particle_spacing: 0.5,
+        support_radius: 1.0,
+        grain_diameter: 1.0,
+        water_grain_distance: 0.35,
+        grain_mass: 10.0,
+        ..Materials::default()
+    };
+    let scene = Scene::v60();
+    let mut solver = XpbdSolver::build(&scene, &mats, &Config::default(), &gpu);
+    let phase = solver.read_phases();
+    let n0 = phase.len();
+    let nw0 = phase.iter().filter(|&&p| p == 0).count();
+    let ng0 = phase.iter().filter(|&&p| p == 1).count();
+    assert!(nw0 > 0 && ng0 > 0, "v60 seeds water and grains");
+    let input = EmissionInput::default();
+    for _ in 0..400 {
+        solver.step(1.0 / 60.0, &input);
+    }
+    let pos = solver.read_positions();
+    let phase2 = solver.read_phases();
+    // Conservation: no particle created or destroyed (absorption off by default).
+    assert_eq!(pos.len(), n0, "particle count conserved");
+    let mut in_cup = 0u32;
+    let mut grain_min_y = f32::INFINITY;
+    for (p, &ph) in pos.iter().zip(&phase2) {
+        let pt = Vec3::new(p[0], p[1], p[2]);
+        assert!(pt.is_finite(), "finite position");
+        let r = (p[0] * p[0] + p[2] * p[2]).sqrt();
+        if ph == 0 {
+            if r < 3.0 && p[1] > -8.0 && p[1] < -3.5 {
+                in_cup += 1; // inside the cup volume
+            }
+        } else {
+            grain_min_y = grain_min_y.min(p[1]);
+        }
+    }
+    assert!(
+        in_cup > 0,
+        "water passed the filter + apex and reached the cup ({in_cup} particles)"
+    );
+    assert!(
+        grain_min_y > -3.4,
+        "grains stay trapped above the filter tip (min grain y {grain_min_y})"
+    );
+    solver.sample_diagnostics();
+    assert!(!solver.diagnostics().overflow, "no grid overflow");
 }

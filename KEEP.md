@@ -39,7 +39,9 @@ _Source: `crates/sim-wasm/src/mpm_3d/{shader.rs,state.rs}`_
   change one, re-check the other for overflow.
 - Velocity cap clamps grid momentum to keep the fixed-point encoding from overflowing.
 - Safe-normalize: return ZERO when `len ≤ EPSILON` (guards NaNs in gradients / contact normals).
-- SDF: cone + cylinder interior eval (V60 filter + cup) and trilinear 3D-texture sampling for gradients.
+- SDF: cone + cylinder interior eval (V60 filter + cup). The rewrite evaluates these **analytically**
+  per particle (`utils/sdf.rs`) with analytic gradients — NOT v1's baked 3D-texture + trilinear sampling,
+  which aliased a circular cone on the Cartesian grid and trapped water on the wall.
 
 ## 4. V60 dripper / filter SDF geometry  → `utils/geometry/`
 _Source: `crates/sim-wasm/src/mpm_3d/{filter.rs,bed.rs,shader.rs}`_

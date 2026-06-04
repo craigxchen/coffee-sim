@@ -18,7 +18,7 @@ Wraps `wgpu`: device + queue, buffer/bind-group/pipeline creation helpers, the s
 A single uniform-grid hash, **binned once per step for all particle species** (cell = SPH support radius; counting/radix sort; cell-start/cell-count arrays). This is the cross-solver neighbor infrastructure — XPBD and SPH+MPM both query it for water-water, grain-grain, and water-grain neighbors. Not owned by any solver.
 
 ### `sdf.rs` — SDF helpers
-Sample/gradient of a signed distance field; **position-level collision projection** (push a particle out along the gradient) for position-based solvers; baked dripper SDFs from `geometry/`. Robust, unconditionally stable boundary handling — the reason the primary avoids SPH boundary-particle machinery.
+Sample/gradient of a signed distance field; **position-level collision projection** (push a particle out along the gradient) for position-based solvers; **analytic** dripper SDF primitives from `geometry/` (a small array of cones/cylinders evaluated per particle — not a baked texture, which aliases a circular cone on a Cartesian grid). Robust, unconditionally stable boundary handling — the reason the primary avoids SPH boundary-particle machinery.
 
 ### `kernels.rs` — kernels + math
 SPH/MPM smoothing kernels (cubic/quadratic B-spline, poly6, spiky) and gradients; small math helpers (quaternion/rotation, safe normalize, clamps). Shared so solvers don't re-derive them.

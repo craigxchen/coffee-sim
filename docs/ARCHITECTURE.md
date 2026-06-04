@@ -39,7 +39,7 @@ Rationale: it is the only single-codebase path that reaches desktop, mobile, and
 coffee-sim/                         # repo root = workspace + package "coffee-sim"
 ├── Cargo.toml                      # workspace + package manifest
 ├── KEEP.md                         # salvaged reference values from the v1 MPM codebase
-├── assets/                         # data ONLY: dripper SDF textures, calibration tables, presets
+├── assets/                         # data ONLY: calibration tables, presets (dripper SDFs are analytic, in geometry/)
 ├── examples/                       # runnable scenarios (phase0_noop, v60_pourover, compare_solvers, …)
 ├── docs/
 │   ├── ARCHITECTURE.md             # ← this document

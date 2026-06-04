@@ -140,6 +140,17 @@ impl ApplicationHandler for App {
             mats.grain_mass = 40.0; // denser than the fine water so the heavy wall holds and grains
                                     // sink rather than float under (density-aware) buoyancy
         }
+        if scene_kind == "v60" {
+            // Fine water (spacing 0.5) through a COARSER coffee bed (grain_diameter 1.0) with a small
+            // water↔grain contact, so water threads the bed and drains through the cone apex into the
+            // cup instead of pooling and squeezing. Grains ~1.25× water density (coffee-like) so the
+            // bed holds against buoyancy. (Ignores SPACING — these are the calibrated V60 values.)
+            mats.particle_spacing = 0.5;
+            mats.support_radius = 1.0;
+            mats.grain_diameter = 1.0;
+            mats.water_grain_distance = 0.35;
+            mats.grain_mass = 10.0;
+        }
         // WET=1 turns on Phase 1.4 wetting (mixed scenes): grains absorb water, swell, darken, gain
         // capillary cohesion, and drag rises with local packing. Off by default (mechanical coupling
         // only). Wire the grain saturation tint so wetting is visible.
