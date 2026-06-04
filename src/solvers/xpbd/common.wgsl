@@ -434,10 +434,12 @@ fn apply_dp(@builtin(global_invocation_id) gid: vec3<u32>) {
     var proposed = pred[i].xyz + d;
 
     // Static-solid (SDF) push-out, selective by species: push a penetrating particle out along the
-    // cavity gradient by the penetration depth. The standoff is the grain radius (the bed contact
-    // value; per-species tuning deferred). No-op when num_solids == 0, so AABB-only scenes are
-    // byte-unchanged. solid_union returns FREE for non-applicable species (e.g. water vs the filter).
-    let contact = 0.5 * params.grain_diameter;
+    // cavity gradient. Water projects to the wall *surface* (offset 0, exactly like the box clamp —
+    // a fluid point; purely dissipative). Grains keep a radius standoff (a solid body rests its
+    // surface on the wall). A positive offset for water re-injects an outward velocity on every fast
+    // impact (a bounce), since the particle is pushed past where it arrived. No-op when num_solids ==
+    // 0, so AABB-only scenes are byte-unchanged; solid_union returns FREE for non-applicable species.
+    let contact = select(0.0, 0.5 * params.grain_diameter, phase[i] == PHASE_GRAIN);
     var sdf_n = vec3<f32>(0.0, 0.0, 0.0);
     var sdf_mag = 0.0;
     var sdf_mu = params.floor_mu;

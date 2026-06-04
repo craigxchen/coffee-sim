@@ -44,10 +44,11 @@ fn closed_cone() -> SdfPrimitive {
     }
 }
 
-/// One water particle dropped into a cup settles on the floor at the contact standoff, never below
-/// it — proving the push-out enforces a positive contact offset (Codex round 5) and never penetrates.
+/// One water particle dropped into a cup settles on the floor surface without penetrating and at
+/// near-rest — water projects to the wall surface (offset 0, like the box clamp; a positive offset
+/// would re-inject an outward velocity on impact = a bounce).
 #[test]
-fn single_water_particle_rests_at_the_contact_offset() {
+fn single_water_particle_rests_on_the_floor() {
     let Some(gpu) = GpuContext::new_headless() else {
         eprintln!("xpbd_geometry: no GPU adapter; skipping.");
         return;
@@ -76,7 +77,6 @@ fn single_water_particle_rests_at_the_contact_offset() {
     let pos = solver.read_positions();
     let vel = solver.read_velocities();
     assert!(!pos.is_empty(), "seeded at least one particle");
-    let contact = 0.5 * mats.grain_diameter;
     let p = Vec3::new(pos[0][0], pos[0][1], pos[0][2]);
     let v = Vec3::new(vel[0][0], vel[0][1], vel[0][2]);
     assert!(p.is_finite() && v.is_finite(), "finite state");
@@ -86,10 +86,76 @@ fn single_water_particle_rests_at_the_contact_offset() {
         "water must not penetrate the cup floor: signed {s}"
     );
     assert!(
-        (s - contact).abs() < 0.2,
-        "water rests at the contact offset {contact} (got signed {s})"
+        s < 0.3,
+        "water rests on the floor surface (offset 0): signed {s}"
     );
     assert!(v.length() < 1.0, "settled to near rest: |v| {}", v.length());
+}
+
+/// Regression for the contact-offset bounce: water poured into a closed cone settles to low speed.
+/// A positive water contact offset re-injected an outward velocity on every wall impact, leaving a
+/// handful of particles pinned at high speed indefinitely; projecting to the surface is dissipative.
+#[test]
+fn water_in_cone_settles_without_bouncing() {
+    let Some(gpu) = GpuContext::new_headless() else {
+        eprintln!("xpbd_geometry: no GPU adapter; skipping.");
+        return;
+    };
+    let cone = SdfPrimitive {
+        kind: SolidKind::Cone {
+            center: Vec3::ZERO,
+            apex_y: -3.0,
+            top_y: 3.0,
+            apex_r: 0.6,
+            top_r: 4.6834,
+            thickness: 0.05,
+            hole_radius: 0.6,
+            apex_open: false, // closed: water pools, isolating the wall interaction
+        },
+        species_mask: MASK_ALL,
+        friction: 0.3,
+    };
+    let mut mats = Materials::default();
+    mats.particle_spacing = 0.5;
+    mats.support_radius = 1.0;
+    mats.grain_diameter = 0.5;
+    let scene = Scene {
+        dose_g: 0.0,
+        water_ml: 0.0,
+        gravity: [0.0, -20.0, 0.0],
+        box_min: [-7.0, -10.0, -7.0],
+        box_max: [7.0, 10.0, 7.0],
+        regions: vec![SeedRegion {
+            min: [-2.0, 0.6, -2.0],
+            max: [2.0, 2.6, 2.0],
+            species: Species::Water,
+        }],
+        solids: vec![cone],
+    };
+    let mut solver = XpbdSolver::build(&scene, &mats, &Config::default(), &gpu);
+    let input = EmissionInput::default();
+    for _ in 0..200 {
+        solver.step(1.0 / 60.0, &input);
+    }
+    let vel = solver.read_velocities();
+    assert!(!vel.is_empty());
+    let mut sum = 0.0f32;
+    let mut fast = 0u32;
+    for v in &vel {
+        let s = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+        assert!(s.is_finite(), "finite velocity");
+        sum += s;
+        if s > 12.0 {
+            fast += 1;
+        }
+    }
+    let mean = sum / vel.len() as f32;
+    // Settled pool: low mean speed and at most a rare transient spike (not a persistent bouncing set).
+    assert!(mean < 3.0, "water settled (mean |v| {mean})");
+    assert!(
+        fast <= 2,
+        "no persistent high-speed bouncing ({fast} particles |v|>12)"
+    );
 }
 
 /// Grains poured into a closed-tip cone settle into the cavity and never penetrate the slanted wall
