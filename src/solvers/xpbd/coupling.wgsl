@@ -373,7 +373,17 @@ fn apply_drag_pred(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
     if (i >= params.particle_count) { return; }
     let dv = vel[i].xyz - vel_frozen[i].xyz;
+    var p = pred[i].xyz + params.dt * dv;
+    // Static-solid push-out (push-out + species gate only; friction is owned by apply_dp/finalize, so
+    // the drag micro-step needs neither pos nor the floor_mu machinery). No-op when num_solids == 0.
+    if (params.num_solids > 0u) {
+        let hit = solid_union(p, phase[i]);
+        let contact = 0.5 * params.grain_diameter;
+        if (hit.dist < contact) {
+            p = p + (contact - hit.dist) * hit.grad;
+        }
+    }
     // Preserve the moisture snapshot in pred.w — this runs in the drag/buoyancy subcycle before
     // absorption, so zeroing .w here would wipe the per-frame snapshot the wetting passes read.
-    pred[i] = vec4<f32>(clamp(pred[i].xyz + params.dt * dv, params.box_min.xyz, params.box_max.xyz), pred[i].w);
+    pred[i] = vec4<f32>(clamp(p, params.box_min.xyz, params.box_max.xyz), pred[i].w);
 }
