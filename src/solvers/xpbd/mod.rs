@@ -121,6 +121,9 @@ struct Pipelines {
     buoyancy_grain: wgpu::ComputePipeline,
     buoyancy_water: wgpu::ComputePipeline,
     apply_drag_pred: wgpu::ComputePipeline,
+    wet_count: wgpu::ComputePipeline,
+    wet_water: wgpu::ComputePipeline,
+    wet_grain: wgpu::ComputePipeline,
     apply_dp: wgpu::ComputePipeline,
     finalize: wgpu::ComputePipeline,
     xsph: wgpu::ComputePipeline,
@@ -143,6 +146,9 @@ struct BindGroups {
     buoyancy_grain: wgpu::BindGroup,
     buoyancy_water: wgpu::BindGroup,
     apply_drag_pred: wgpu::BindGroup,
+    wet_count: wgpu::BindGroup,
+    wet_water: wgpu::BindGroup,
+    wet_grain: wgpu::BindGroup,
     apply_dp: wgpu::BindGroup,
     finalize: wgpu::BindGroup,
     xsph: wgpu::BindGroup,
@@ -334,6 +340,12 @@ impl XpbdSolver {
     /// the moisture snapshot; a test asserts it survives every `pred` writer through a full step.
     pub fn read_pred(&self) -> Vec<[f32; 4]> {
         self.read_vec4(&self.pred)
+    }
+
+    /// Single water-particle volume `V_w = particle_mass / rest_density` (dev/test only). Lets a
+    /// conservation test convert the water moisture lane `f_w` into an absolute volume.
+    pub fn water_particle_volume(&self) -> f32 {
+        self.params.particle_mass / self.params.rest_density
     }
 
     /// Overwrite current particle velocities (dev/test only).
@@ -626,6 +638,8 @@ impl Solver for XpbdSolver {
             f32s,
             wgpu::BufferUsages::empty(),
         );
+        // Per-particle eligible-opposite-species neighbor count for the wetting allocation (u32).
+        let wet_count = Self::storage(&device, "xpbd-wet-count", f32s, wgpu::BufferUsages::empty());
         let cell_count = Self::storage(
             &device,
             "xpbd-cellcount",
@@ -658,15 +672,16 @@ impl Solver for XpbdSolver {
             mapped_at_creation: false,
         });
 
-        // WGSL has no imports: assemble the one module from the three concern files. `common`
-        // declares Params/Status/bindings + shared kernels; `water` and `bed` add the
-        // per-species solves. Module-scope declarations are order-independent.
+        // WGSL has no imports: assemble the one module from the concern files. `common` declares
+        // Params/Status/bindings + shared kernels; `water`/`bed`/`coupling`/`wetting` add the
+        // per-species + interphase solves. Module-scope declarations are order-independent.
         let shader_src = format!(
-            "{}\n{}\n{}\n{}",
+            "{}\n{}\n{}\n{}\n{}",
             include_str!("common.wgsl"),
             include_str!("water.wgsl"),
             include_str!("bed.wgsl"),
             include_str!("coupling.wgsl"),
+            include_str!("wetting.wgsl"),
         );
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("xpbd"),
@@ -699,6 +714,9 @@ impl Solver for XpbdSolver {
             buoyancy_grain: make("buoyancy_grain"),
             buoyancy_water: make("buoyancy_water"),
             apply_drag_pred: make("apply_drag_pred"),
+            wet_count: make("wet_count"),
+            wet_water: make("wet_water"),
+            wet_grain: make("wet_grain"),
             apply_dp: make("apply_dp"),
             finalize: make("finalize"),
             xsph: make("xsph"),
@@ -894,6 +912,42 @@ impl Solver for XpbdSolver {
             apply_drag_pred: bg(
                 &pipelines.apply_drag_pred,
                 &[(0, &params_buf), (2, &pred), (3, &vel), (15, &vel_frozen)],
+            ),
+            wet_count: bg(
+                &pipelines.wet_count,
+                &[
+                    (0, &params_buf),
+                    (2, &pred),
+                    (8, &cell_count),
+                    (9, &cell_bucket),
+                    (11, &phase),
+                    (17, &wet_count),
+                ],
+            ),
+            wet_water: bg(
+                &pipelines.wet_water,
+                &[
+                    (0, &params_buf),
+                    (1, &pos),
+                    (2, &pred),
+                    (8, &cell_count),
+                    (9, &cell_bucket),
+                    (11, &phase),
+                    (17, &wet_count),
+                ],
+            ),
+            wet_grain: bg(
+                &pipelines.wet_grain,
+                &[
+                    (0, &params_buf),
+                    (1, &pos),
+                    (2, &pred),
+                    (3, &vel),
+                    (8, &cell_count),
+                    (9, &cell_bucket),
+                    (11, &phase),
+                    (17, &wet_count),
+                ],
             ),
             apply_dp: bg(
                 &pipelines.apply_dp,
@@ -1203,6 +1257,18 @@ impl Solver for XpbdSolver {
                         0,
                         (self.particle_count as u64) * 16,
                     );
+                }
+
+                // Wetting / absorption (mixed scenes; opt-in via absorb_rate>0). Runs last in the
+                // substep — after finalize/xsph so it reads final positions/velocities and its grain
+                // momentum merge isn't clobbered by the xsph velocity copy. Reads the frozen pred.w
+                // snapshot, writes the new moisture to pos.w; the next predict mirrors it.
+                if mixed && self.params.k_abs > 0.0 {
+                    pass(&mut enc, &p.grid_clear, &b.grid_clear, "grid_clear", nc);
+                    pass(&mut enc, &p.grid_fill, &b.grid_fill, "grid_fill", np);
+                    pass(&mut enc, &p.wet_count, &b.wet_count, "wet_count", np);
+                    pass(&mut enc, &p.wet_water, &b.wet_water, "wet_water", np);
+                    pass(&mut enc, &p.wet_grain, &b.wet_grain, "wet_grain", np);
                 }
             }
         }
