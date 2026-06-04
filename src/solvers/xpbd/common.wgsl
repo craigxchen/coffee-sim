@@ -142,6 +142,21 @@ fn spiky_grad(d: vec3<f32>, h: f32, r_min: f32) -> vec3<f32> {
     return -coeff * t * t * dir;
 }
 
+// --- Phase-1.4 swelling + effective mass (from the moisture lane: grain pred.w = V_abs, water = f_w).
+// A grain swells by exactly the absorbed volume; its mass gains the absorbed water's mass; a water
+// shrinks proportionally. Dry/full state (V_abs=0, f_w=1) ⇒ the original constants exactly.
+fn grain_eff_volume(v_abs: f32) -> f32 { return params.grain_volume + v_abs; }
+fn grain_eff_diameter(v_abs: f32) -> f32 {
+    return params.grain_diameter * pow(grain_eff_volume(v_abs) / params.grain_volume, 1.0 / 3.0);
+}
+fn grain_eff_mass(v_abs: f32) -> f32 { return params.grain_mass + params.rest_density * v_abs; }
+fn water_eff_mass(f_w: f32) -> f32 { return params.particle_mass * f_w; }
+// Effective mass of a particle from its phase + moisture-lane value `w` (grain V_abs / water f_w).
+fn eff_mass(ph: u32, w: f32) -> f32 {
+    if (ph == PHASE_GRAIN) { return grain_eff_mass(w); }
+    return water_eff_mass(w);
+}
+
 fn cell_coord(p: vec3<f32>) -> vec3<i32> {
     let rel = (p - params.grid_origin.xyz) / params.cell_size;
     let dims = vec3<i32>(params.grid_dims.xyz);

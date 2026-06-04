@@ -19,7 +19,11 @@ fn bed_project(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
     if (i >= params.particle_count) { return; }
     if (phase[i] != PHASE_GRAIN) { return; }
-    let d = params.grain_diameter;
+    // Swelling: this grain's effective contact diameter + mass grow with its absorbed volume
+    // (pred.w = V_abs). Dry grains (V_abs=0) reduce to grain_diameter / grain_mass exactly.
+    let v_abs_i = pred[i].w;
+    let d_i = grain_eff_diameter(v_abs_i);
+    let m_i = grain_eff_mass(v_abs_i);
     let xi = pred[i].xyz;
     let prev_i = pos[i].xyz;
 
@@ -42,9 +46,16 @@ fn bed_project(@builtin(global_invocation_id) gid: vec3<u32>) {
                     let j = cell_bucket[cid * params.bucket_capacity + s];
                     if (j == i) { continue; }
                     if (phase[j] != PHASE_GRAIN) { continue; } // grain contacts only
+                    // Per-pair swollen contact distance (sum of effective radii) + cohesion reach,
+                    // and an effective inverse-mass split so a heavier (wetter) grain moves less.
+                    // All reduce to the dry constants + ½/½ when both grains are dry.
+                    let d_j = grain_eff_diameter(pred[j].w);
+                    let d = 0.5 * (d_i + d_j);
+                    let coh = params.cohesion_range * d / params.grain_diameter;
+                    let w_i = grain_eff_mass(pred[j].w) / (m_i + grain_eff_mass(pred[j].w));
                     let dvec = xi - pred[j].xyz;
                     var r = length(dvec);
-                    if (r >= params.cohesion_range) { continue; }
+                    if (r >= coh) { continue; }
                     var n: vec3<f32>;
                     if (r < 1e-6) {
                         n = vec3<f32>(0.0, 1.0, 0.0); // deterministic separation for coincident grains
@@ -53,18 +64,18 @@ fn bed_project(@builtin(global_invocation_id) gid: vec3<u32>) {
                         n = dvec / r;
                     }
                     if (r < d) {
-                        // --- non-penetration (½/½ split between the two mobile grains) ---
+                        // --- non-penetration (effective inverse-mass split) ---
                         let overlap = d - r;
                         max_pen = max(max_pen, overlap);
-                        let push = overlap * 0.5;
+                        let push = overlap * w_i;
                         separation = separation + n * push;
                         normal_mag = normal_mag + push;
-                        // --- tangential relative displacement this frame (this grain's ½ share) ---
+                        // --- tangential relative displacement this frame (this grain's share) ---
                         let rel = (xi - prev_i) - (pred[j].xyz - pos[j].xyz);
-                        tangential = tangential - (rel - dot(rel, n) * n) * 0.5;
+                        tangential = tangential - (rel - dot(rel, n) * n) * w_i;
                     } else if (params.dry_cohesion > 0.0) {
                         // --- light dry cohesion just past contact (linear falloff) ---
-                        let f = params.dry_cohesion * (1.0 - (r - d) / (params.cohesion_range - d));
+                        let f = params.dry_cohesion * (1.0 - (r - d) / (coh - d));
                         separation = separation - n * f; // pull i toward j (direction −n)
                     }
                 }
@@ -84,5 +95,5 @@ fn bed_project(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     dp[i] = vec4<f32>(separation + friction, 0.0);
-    c_residual[i] = max_pen / d;
+    c_residual[i] = max_pen / d_i;
 }

@@ -462,3 +462,59 @@ fn wetting_with_full_solve_conserves_volume_and_stays_finite() {
         "no absorption"
     );
 }
+
+#[test]
+fn swelling_pushes_contacting_grains_apart() {
+    let Some(gpu) = GpuContext::new_headless() else {
+        eprintln!("xpbd_wetting: no GPU adapter; skipping.");
+        return;
+    };
+    let mats = Materials::default();
+    // Two grains exactly touching (centers grain_diameter apart) with water around them. Density off
+    // (water just needs to sit near the grains to wet them); bed contact ON so swelling shows.
+    let d = mats.grain_diameter;
+    let scene = Scene {
+        gravity: [0.0, 0.0, 0.0],
+        box_min: [0.0, 0.0, 0.0],
+        box_max: [8.0, 8.0, 8.0],
+        regions: vec![
+            point([4.0, 4.0, 4.0], Species::Grain),
+            point([4.0 + d, 4.0, 4.0], Species::Grain),
+            point([4.0 + 0.5 * d, 5.0, 4.0], Species::Water),
+            point([4.0 + 0.5 * d, 3.0, 4.0], Species::Water),
+            point([4.0, 4.0, 5.0], Species::Water),
+            point([4.0 + d, 4.0, 3.0], Species::Water),
+        ],
+        ..Scene::default()
+    };
+    let cfg = Config {
+        max_iters: 0,
+        drag_subiters: 0,
+        buoyancy_scale: 0.0,
+        xsph_viscosity_c: 0.0,
+        grain_sleep_speed: 0.0,
+        absorb_rate: 0.5,
+        ..Config::default()
+    };
+    let mut solver = XpbdSolver::build(&scene, &mats, &cfg, &gpu);
+    let phase = solver.read_phases();
+    assert_eq!(&phase[0..2], &[1, 1]);
+
+    let gap = |p: &[[f32; 4]]| {
+        ((p[0][0] - p[1][0]).powi(2) + (p[0][1] - p[1][1]).powi(2) + (p[0][2] - p[1][2]).powi(2))
+            .sqrt()
+    };
+    let gap0 = gap(&solver.read_positions());
+    for _ in 0..150 {
+        solver.step(1.0 / 60.0, &EmissionInput::default());
+    }
+    let gap1 = gap(&solver.read_positions());
+    let v_abs = solver.read_moisture();
+
+    assert!(v_abs[0] > 1.0e-4 && v_abs[1] > 1.0e-4, "grains did not wet");
+    // Swollen grains (d_eff > d) overlap at the original spacing, so contact pushes them apart.
+    assert!(
+        gap1 > gap0 + 0.02,
+        "wetted grains did not swell apart: {gap0} -> {gap1}"
+    );
+}
