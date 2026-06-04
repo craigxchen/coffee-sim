@@ -74,6 +74,27 @@ fn main() {
     let phase = solver.read_phases();
     let input = EmissionInput::default();
 
+    // PROF=1: time N steps (no rendering) and dump per-pass timings, then exit.
+    if std::env::var("PROF").is_ok() {
+        for _ in 0..30 {
+            solver.step(1.0 / 60.0, &input); // warm up
+        }
+        let t0 = std::time::Instant::now();
+        let n = 120;
+        for _ in 0..n {
+            solver.step(1.0 / 60.0, &input);
+        }
+        let ms = t0.elapsed().as_secs_f32() * 1000.0 / n as f32;
+        eprintln!("PROF: {} particles, {ms:.2} ms/step ({:.0} fps)", phase.len(), 1000.0 / ms);
+        solver.sample_diagnostics();
+        let mut passes = solver.profile().passes;
+        passes.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        for (label, us) in passes.iter().take(20) {
+            eprintln!("  {label:24} {us:8.1} µs");
+        }
+        return;
+    }
+
     let mut renderer = Renderer::new(&gpu, FORMAT, (W, H), 0.5 * mats.particle_spacing);
     renderer.set_grain_radius_scale(mats.grain_diameter / mats.particle_spacing);
     // Grain saturation tint: V_cap = r_max·rho_ratio·(π/6·d³); pass 1/V_cap so wet grains darken.
