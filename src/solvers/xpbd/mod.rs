@@ -52,7 +52,7 @@ struct Params {
     spiky_r_min: f32,
     cell_size: f32,
     particle_count: u32,
-    _pad_bucket: u32, // (was bucket_capacity; the counting-sort grid has no fixed buckets)
+    num_solids: u32, // count of static SDF solids in the `solids` storage buffer (0 = none)
     min_iters: u32,
     max_iters: u32,
     residual_tolerance: f32,
@@ -89,6 +89,65 @@ struct Params {
 
 // Params is uploaded as a uniform and must stay byte-identical to the WGSL `Params`.
 const _: () = assert!(std::mem::size_of::<Params>() == 256);
+
+/// GPU record for one static SDF solid — byte-identical to the WGSL `Primitive` (64 bytes,
+/// vec4-aligned). Cone radii in `a` are OUTER wall radii; the cavity surface is `outer − thickness`.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct Primitive {
+    kind: u32,         // 0 = cone, 1 = cylinder
+    species_mask: u32, // MASK_* bits
+    friction: f32,
+    flags: u32,  // bit0 = apex_open
+    a: [f32; 4], // cone:(apex_y, apex_r, top_y, top_r)  cyl:(floor_y, rim_y, radius, _)
+    b: [f32; 4], // cone:(thickness, hole_radius, center_x, center_z)  cyl:(center_x, center_z, _, _)
+    c: [f32; 4], // reserved
+}
+
+// Primitive is a storage-buffer element and must stay byte-identical to the WGSL `Primitive`.
+const _: () = assert!(std::mem::size_of::<Primitive>() == 64);
+
+/// Pack a scene's analytic solids into the GPU `Primitive` layout.
+fn pack_solids(solids: &[crate::utils::sdf::SdfPrimitive]) -> Vec<Primitive> {
+    use crate::utils::sdf::SolidKind;
+    solids
+        .iter()
+        .map(|s| match s.kind {
+            SolidKind::Cone {
+                center,
+                apex_y,
+                top_y,
+                apex_r,
+                top_r,
+                thickness,
+                hole_radius,
+                apex_open,
+            } => Primitive {
+                kind: 0,
+                species_mask: s.species_mask,
+                friction: s.friction,
+                flags: u32::from(apex_open),
+                a: [apex_y, apex_r, top_y, top_r],
+                b: [thickness, hole_radius, center.x, center.z],
+                c: [0.0; 4],
+            },
+            SolidKind::Cylinder {
+                center,
+                floor_y,
+                rim_y,
+                radius,
+            } => Primitive {
+                kind: 1,
+                species_mask: s.species_mask,
+                friction: s.friction,
+                flags: 0,
+                a: [floor_y, rim_y, radius, 0.0],
+                b: [center.x, center.z, 0.0, 0.0],
+                c: [0.0; 4],
+            },
+        })
+        .collect()
+}
 
 /// CPU mirror of the WGSL `Status` struct (8 × u32).
 #[repr(C)]
@@ -212,6 +271,10 @@ pub struct XpbdSolver {
     status: wgpu::Buffer,
     status_readback: wgpu::Buffer,
     pos_readback: wgpu::Buffer,
+    // Static SDF geometry (binding 19). Created here (U4) and bound by the collision passes in U5,
+    // which removes this allow once the field is read.
+    #[allow(dead_code)]
+    solids: wgpu::Buffer,
 
     pipelines: Pipelines,
     bind_groups: BindGroups,
@@ -598,7 +661,7 @@ impl Solver for XpbdSolver {
             spiky_r_min: cfg.spiky_r_min_ratio * h,
             cell_size,
             particle_count,
-            _pad_bucket: 0,
+            num_solids: scene.solids.len() as u32,
             min_iters: cfg.min_iters,
             max_iters: param_iters,
             residual_tolerance,
@@ -726,6 +789,19 @@ impl Solver for XpbdSolver {
             (particle_count.max(1) as u64) * 4,
             wgpu::BufferUsages::empty(),
         );
+        // Static SDF geometry (binding 19, read-only). Built-time-immutable; an empty scene gets a
+        // 1-element dummy (params.num_solids = 0 makes the union skip it). Bound only by the
+        // collision passes (added in U5); other kernels never reference it, so their layouts are
+        // unchanged and the 8-storage-buffer budget holds.
+        let mut packed = pack_solids(&scene.solids);
+        if packed.is_empty() {
+            packed.push(Primitive::zeroed());
+        }
+        let solids = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("xpbd-solids"),
+            contents: bytemuck::cast_slice(&packed),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
         let status = Self::storage(
             &device,
             "xpbd-status",
@@ -1139,6 +1215,7 @@ impl Solver for XpbdSolver {
             status,
             status_readback,
             pos_readback,
+            solids,
             pipelines,
             bind_groups,
             ts,
