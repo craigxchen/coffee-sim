@@ -157,6 +157,21 @@ fn eff_mass(ph: u32, w: f32) -> f32 {
     return water_eff_mass(w);
 }
 
+// Saturation→cohesion curve (mirrors models::cohesion::for_saturation): a piecewise-linear bump,
+// 0 at dry (s=0) and full saturation (s=1), peak c_max at s_peak, with s = V_abs / V_cap.
+fn wet_cohesion(v_abs: f32) -> f32 {
+    let v_cap = params.r_max * params.rho_ratio * params.grain_volume;
+    let s = clamp(v_abs / max(v_cap, 1.0e-12), 0.0, 1.0);
+    let sp = clamp(params.s_peak, 1.0e-6, 1.0 - 1.0e-6);
+    var g: f32;
+    if (s <= sp) {
+        g = s / sp;
+    } else {
+        g = (1.0 - s) / (1.0 - sp);
+    }
+    return params.c_max * g;
+}
+
 fn cell_coord(p: vec3<f32>) -> vec3<i32> {
     let rel = (p - params.grid_origin.xyz) / params.cell_size;
     let dims = vec3<i32>(params.grid_dims.xyz);
