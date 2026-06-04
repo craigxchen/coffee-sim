@@ -73,10 +73,15 @@ fn bed_project(@builtin(global_invocation_id) gid: vec3<u32>) {
                         // --- tangential relative displacement this frame (this grain's share) ---
                         let rel = (xi - prev_i) - (pred[j].xyz - pos[j].xyz);
                         tangential = tangential - (rel - dot(rel, n) * n) * w_i;
-                    } else if (params.dry_cohesion > 0.0) {
-                        // --- light dry cohesion just past contact (linear falloff) ---
-                        let f = params.dry_cohesion * (1.0 - (r - d) / (coh - d));
-                        separation = separation - n * f; // pull i toward j (direction −n)
+                    } else {
+                        // --- cohesion just past contact (linear falloff): dry baseline + the
+                        // capillary (wet) curve, min-combined so a wet grain can't glue a dry one.
+                        let coh_str = params.dry_cohesion
+                            + min(wet_cohesion(v_abs_i), wet_cohesion(pred[j].w));
+                        if (coh_str > 0.0) {
+                            let f = coh_str * (1.0 - (r - d) / (coh - d));
+                            separation = separation - n * f; // pull i toward j (direction −n)
+                        }
                     }
                 }
             }

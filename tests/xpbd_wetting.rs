@@ -587,3 +587,60 @@ fn live_porosity_drag_path_conserves_momentum() {
         "drag+absorption momentum drift {drift} (scale {scale})"
     );
 }
+
+#[test]
+fn wet_cohesion_holds_grains_tighter_than_no_cohesion() {
+    let Some(gpu) = GpuContext::new_headless() else {
+        eprintln!("xpbd_wetting: no GPU adapter; skipping.");
+        return;
+    };
+    // Two grains just past dry contact (within the cohesion reach), water around them, gravity off.
+    // s_peak high + modest r_max so cohesion rises monotonically as they wet and d_eff stays below
+    // the gap (so the pair is in the cohesion regime, not the non-penetration regime).
+    let d = 1.0;
+    let gap0 = 1.15 * d;
+    let scene = Scene {
+        gravity: [0.0, 0.0, 0.0],
+        box_min: [0.0, 0.0, 0.0],
+        box_max: [8.0, 8.0, 8.0],
+        regions: vec![
+            point([4.0, 4.0, 4.0], Species::Grain),
+            point([4.0 + gap0, 4.0, 4.0], Species::Grain),
+            point([4.0 + 0.5 * gap0, 4.8, 4.0], Species::Water),
+            point([4.0 + 0.5 * gap0, 3.2, 4.0], Species::Water),
+        ],
+        ..Scene::default()
+    };
+    let run = |c_max: f32| -> f32 {
+        let mats = Materials {
+            grain_diameter: d,
+            r_max: 0.3,  // modest swelling so d_eff stays below the gap
+            s_peak: 0.9, // cohesion keeps rising as the grains wet over the run
+            c_max,
+            ..Materials::default()
+        };
+        let cfg = Config {
+            max_iters: 0,
+            drag_subiters: 0,
+            buoyancy_scale: 0.0,
+            xsph_viscosity_c: 0.0,
+            grain_sleep_speed: 0.0,
+            absorb_rate: 0.5,
+            ..Config::default()
+        };
+        let mut solver = XpbdSolver::build(&scene, &mats, &cfg, &gpu);
+        for _ in 0..60 {
+            solver.step(1.0 / 60.0, &EmissionInput::default());
+        }
+        let p = solver.read_positions();
+        ((p[0][0] - p[1][0]).powi(2) + (p[0][1] - p[1][1]).powi(2) + (p[0][2] - p[1][2]).powi(2))
+            .sqrt()
+    };
+    let gap_cohesive = run(3.0);
+    let gap_none = run(0.0);
+    // Same wetting/swelling in both runs; only cohesion differs, so it must hold the pair tighter.
+    assert!(
+        gap_cohesive < gap_none - 0.01,
+        "wet cohesion did not tighten the pair: cohesive {gap_cohesive} vs none {gap_none}"
+    );
+}
