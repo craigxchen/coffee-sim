@@ -431,25 +431,65 @@ fn apply_dp(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (dl > params.max_correction) {
         d = d * (params.max_correction / dl);
     }
-    let proposed = pred[i].xyz + d;
+    var proposed = pred[i].xyz + d;
+
+    // Static-solid (SDF) push-out, selective by species: push a penetrating particle out along the
+    // cavity gradient by the penetration depth. The standoff is the grain radius (the bed contact
+    // value; per-species tuning deferred). No-op when num_solids == 0, so AABB-only scenes are
+    // byte-unchanged. solid_union returns FREE for non-applicable species (e.g. water vs the filter).
+    let contact = 0.5 * params.grain_diameter;
+    var sdf_n = vec3<f32>(0.0, 0.0, 0.0);
+    var sdf_mag = 0.0;
+    var sdf_mu = params.floor_mu;
+    if (params.num_solids > 0u) {
+        let hit = solid_union(proposed, phase[i]);
+        if (hit.dist < contact) {
+            sdf_mag = contact - hit.dist;
+            proposed = proposed + sdf_mag * hit.grad;
+            sdf_n = hit.grad;
+            sdf_mu = hit.friction;
+        }
+    }
+
     let clamped = clamp(proposed, params.box_min.xyz, params.box_max.xyz);
 
     if (phase[i] == PHASE_GRAIN) {
-        // The box clamp IS the boundary normal response; its magnitude is the normal correction.
-        // Apply Coulomb friction along the wall: remove the grain's tangential drift (relative to
-        // its frame-start position) up to floor_mu · |normal correction|. This is what stops the
-        // pile from sliding flat on the floor — without it there is no angle of repose.
+        // The boundary normal response is the box clamp delta and/or the SDF push above. Apply
+        // Coulomb friction along the *dominant* boundary: remove the grain's tangential drift
+        // (relative to its frame-start position) up to mu · |normal correction|, using the solid's
+        // friction when the SDF push dominated, else floor_mu. This is the angle-of-repose mechanism.
         let push = clamped - proposed;
-        let nmag = length(push);
+        let box_mag = length(push);
         var newp = clamped;
+        var n = vec3<f32>(0.0, 0.0, 0.0);
+        var nmag = 0.0;
+        var mu = params.floor_mu;
+        if (box_mag >= sdf_mag) {
+            if (box_mag > 1e-6) {
+                n = push / box_mag;
+                nmag = box_mag;
+                mu = params.floor_mu;
+            }
+        } else {
+            n = sdf_n;
+            nmag = sdf_mag;
+            mu = sdf_mu;
+        }
         if (nmag > 1e-6) {
-            let n = push / nmag;
             let disp = newp - pos[i].xyz;
             let tang = disp - dot(disp, n) * n;
             let tlen = length(tang);
             if (tlen > 1e-8) {
-                let remove = min(tlen, params.floor_mu * nmag);
+                let remove = min(tlen, mu * nmag);
                 newp = newp - (tang / tlen) * remove;
+            }
+            // Post-friction SDF recheck: the tangential slide can re-enter a wall (only the box is
+            // re-clamped below), so re-project out of the solid first, then re-clamp to the box.
+            if (params.num_solids > 0u) {
+                let h2 = solid_union(newp, phase[i]);
+                if (h2.dist < contact) {
+                    newp = newp + (contact - h2.dist) * h2.grad;
+                }
             }
             newp = clamp(newp, params.box_min.xyz, params.box_max.xyz);
         }

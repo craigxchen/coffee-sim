@@ -271,11 +271,8 @@ pub struct XpbdSolver {
     status: wgpu::Buffer,
     status_readback: wgpu::Buffer,
     pos_readback: wgpu::Buffer,
-    // Static SDF geometry (binding 19). Created here (U4) and bound by the collision passes in U5,
-    // which removes this allow once the field is read.
-    #[allow(dead_code)]
-    solids: wgpu::Buffer,
-
+    // The `solids` buffer (binding 19) is not held here: like dp / c_residual it lives only in the
+    // collision bind groups, which keep its GPU resource alive (geometry is static, never re-uploaded).
     pipelines: Pipelines,
     bind_groups: BindGroups,
     ts: Option<Timestamps>,
@@ -343,53 +340,6 @@ fn seed_block(scene: &Scene, mats: &Materials, cfg: &Config) -> (Vec<[f32; 4]>, 
         }
     }
     (pos, phase)
-}
-
-#[cfg(test)]
-mod seed_tests {
-    use super::*;
-
-    /// The V60 scene's cone-aware rejection seeds both species strictly inside their cavities.
-    #[test]
-    fn v60_seeds_inside_the_cavity() {
-        let scene = Scene::v60();
-        let (pos, phase) = seed_block(&scene, &Materials::default(), &Config::default());
-        assert!(!pos.is_empty(), "v60 seeds particles");
-        let (mut nw, mut ng) = (0u32, 0u32);
-        for (p, &ph) in pos.iter().zip(&phase) {
-            let c =
-                crate::utils::sdf::nearest(&scene.solids, glam::Vec3::new(p[0], p[1], p[2]), ph);
-            assert!(
-                c.signed >= 0.0,
-                "seed (phase {ph}) at {:?} is outside its cavity: signed {}",
-                [p[0], p[1], p[2]],
-                c.signed
-            );
-            if ph == 0 {
-                nw += 1
-            } else {
-                ng += 1
-            }
-        }
-        assert!(
-            nw > 0 && ng > 0,
-            "both species seeded (water {nw}, grain {ng})"
-        );
-    }
-
-    /// Existing AABB scenes carry no solids, so rejection is a no-op for them.
-    #[test]
-    fn aabb_scenes_have_no_solids() {
-        for s in [
-            Scene::default(),
-            Scene::dam_break(),
-            Scene::bed_drop(),
-            Scene::dam_through_sand(),
-            Scene::pour_over(),
-        ] {
-            assert!(s.solids.is_empty());
-        }
-    }
 }
 
 impl XpbdSolver {
@@ -1080,7 +1030,14 @@ impl Solver for XpbdSolver {
             ),
             apply_drag_pred: bg(
                 &pipelines.apply_drag_pred,
-                &[(0, &params_buf), (2, &pred), (3, &vel), (15, &vel_frozen)],
+                &[
+                    (0, &params_buf),
+                    (2, &pred),
+                    (3, &vel),
+                    (11, &phase),
+                    (15, &vel_frozen),
+                    (19, &solids),
+                ],
             ),
             wet_count: bg(
                 &pipelines.wet_count,
@@ -1127,6 +1084,7 @@ impl Solver for XpbdSolver {
                     (6, &dp),
                     (10, &status),
                     (11, &phase),
+                    (19, &solids),
                 ],
             ),
             finalize: bg(
@@ -1215,7 +1173,6 @@ impl Solver for XpbdSolver {
             status,
             status_readback,
             pos_readback,
-            solids,
             pipelines,
             bind_groups,
             ts,
@@ -1564,4 +1521,51 @@ fn dispatch_pass(
     pass.set_bind_group(0, Some(bind_group), &[]);
     pass.dispatch_workgroups(groups, 1, 1);
     *dispatches += 1;
+}
+
+#[cfg(test)]
+mod seed_tests {
+    use super::*;
+
+    /// The V60 scene's cone-aware rejection seeds both species strictly inside their cavities.
+    #[test]
+    fn v60_seeds_inside_the_cavity() {
+        let scene = Scene::v60();
+        let (pos, phase) = seed_block(&scene, &Materials::default(), &Config::default());
+        assert!(!pos.is_empty(), "v60 seeds particles");
+        let (mut nw, mut ng) = (0u32, 0u32);
+        for (p, &ph) in pos.iter().zip(&phase) {
+            let c =
+                crate::utils::sdf::nearest(&scene.solids, glam::Vec3::new(p[0], p[1], p[2]), ph);
+            assert!(
+                c.signed >= 0.0,
+                "seed (phase {ph}) at {:?} is outside its cavity: signed {}",
+                [p[0], p[1], p[2]],
+                c.signed
+            );
+            if ph == 0 {
+                nw += 1
+            } else {
+                ng += 1
+            }
+        }
+        assert!(
+            nw > 0 && ng > 0,
+            "both species seeded (water {nw}, grain {ng})"
+        );
+    }
+
+    /// Existing AABB scenes carry no solids, so rejection is a no-op for them.
+    #[test]
+    fn aabb_scenes_have_no_solids() {
+        for s in [
+            Scene::default(),
+            Scene::dam_break(),
+            Scene::bed_drop(),
+            Scene::dam_through_sand(),
+            Scene::pour_over(),
+        ] {
+            assert!(s.solids.is_empty());
+        }
+    }
 }
