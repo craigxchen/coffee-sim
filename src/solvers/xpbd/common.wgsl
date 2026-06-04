@@ -32,7 +32,7 @@ struct Params {
     spiky_r_min: f32,         // ε_r · h
     cell_size: f32,           // = h
     particle_count: u32,
-    bucket_capacity: u32,     // K
+    _pad_bucket: u32,         // (was bucket_capacity; counting-sort grid has no fixed buckets)
     min_iters: u32,
     max_iters: u32,
     residual_tolerance: f32,
@@ -86,8 +86,12 @@ struct Status {
 @group(0) @binding(5) var<storage, read_write> lambda: array<f32>;
 @group(0) @binding(6) var<storage, read_write> dp: array<vec4<f32>>;
 @group(0) @binding(7) var<storage, read_write> c_residual: array<f32>;
-@group(0) @binding(8) var<storage, read_write> cell_count: array<atomic<u32>>;
-@group(0) @binding(9) var<storage, read_write> cell_bucket: array<u32>;
+// Counting-sort spatial hash (no fixed buckets / overflow): cell_start is the exclusive prefix sum
+// of per-cell counts (num_cells+1 entries), and sorted_indices holds particle indices grouped by
+// cell. Gather cell c = sorted_indices[cell_start[c] .. cell_start[c+1]]. cell_count (binding 18) is
+// the transient counter used only while (re)building the grid.
+@group(0) @binding(8) var<storage, read_write> cell_start: array<u32>;
+@group(0) @binding(9) var<storage, read_write> sorted_indices: array<u32>;
 @group(0) @binding(10) var<storage, read_write> status: Status;
 @group(0) @binding(11) var<storage, read_write> phase: array<u32>;
 // Per-grain accumulated normal-correction magnitude this frame (reset in predict). The Coulomb
@@ -110,6 +114,8 @@ struct Status {
 // (# unsaturated grains), grain → N_g (# non-empty waters). Written by wet_count, read by both
 // transfer passes so the two-sided allocation take_wg is identical (and conservation-safe).
 @group(0) @binding(17) var<storage, read_write> wet_neighbors: array<u32>;
+// Transient per-cell particle counter for the counting-sort grid build (count → scan → scatter).
+@group(0) @binding(18) var<storage, read_write> cell_count: array<atomic<u32>>;
 
 const PI: f32 = 3.14159265358979;
 
@@ -214,18 +220,70 @@ fn grid_clear(@builtin(global_invocation_id) gid: vec3<u32>) {
     atomicStore(&cell_count[c], 0u);
 }
 
+// Counting-sort grid build: grid_clear (zero cell_count) → grid_count → grid_scan → grid_clear →
+// grid_scatter. No fixed buckets, so no overflow and no wasted memory — every neighbor is gathered.
+
 @compute @workgroup_size(256)
-fn grid_fill(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn grid_count(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
     if (i >= params.particle_count) { return; }
     let cell = cell_id(cell_coord(pred[i].xyz));
     let slot = atomicAdd(&cell_count[cell], 1u);
-    if (slot < params.bucket_capacity) {
-        cell_bucket[cell * params.bucket_capacity + slot] = i;
-        atomicMax(&status.max_occupancy, slot + 1u);
-    } else {
-        atomicStore(&status.overflow, 1u);
+    atomicMax(&status.max_occupancy, slot + 1u);
+}
+
+var<workgroup> scan_tmp: array<u32, 256>;
+var<workgroup> scan_total: u32;
+
+// Single-workgroup exclusive prefix sum of cell_count → cell_start (num_cells+1; the last entry is
+// the total). Dispatched as ONE workgroup; each thread scans a contiguous chunk, thread 0 scans the
+// 256 chunk sums, then each thread writes its chunk's prefixes.
+@compute @workgroup_size(256)
+fn grid_scan(@builtin(local_invocation_id) lid: vec3<u32>) {
+    let n = params.grid_dims.w;
+    let tid = lid.x;
+    let threads = 256u;
+    let chunk = (n + threads - 1u) / threads;
+    let begin = tid * chunk;
+
+    var s = 0u;
+    for (var k = 0u; k < chunk; k = k + 1u) {
+        let idx = begin + k;
+        if (idx < n) { s = s + atomicLoad(&cell_count[idx]); }
     }
+    scan_tmp[tid] = s;
+    workgroupBarrier();
+
+    if (tid == 0u) {
+        var acc = 0u;
+        for (var t = 0u; t < threads; t = t + 1u) {
+            let v = scan_tmp[t];
+            scan_tmp[t] = acc;
+            acc = acc + v;
+        }
+        scan_total = acc;
+    }
+    workgroupBarrier();
+
+    var run = scan_tmp[tid];
+    for (var k = 0u; k < chunk; k = k + 1u) {
+        let idx = begin + k;
+        if (idx < n) {
+            cell_start[idx] = run;
+            run = run + atomicLoad(&cell_count[idx]);
+        }
+    }
+    if (tid == 0u) { cell_start[n] = scan_total; }
+}
+
+@compute @workgroup_size(256)
+fn grid_scatter(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= params.particle_count) { return; }
+    let cell = cell_id(cell_coord(pred[i].xyz));
+    // cell_count was re-zeroed after the scan, so it serves as the per-cell write cursor here.
+    let local = atomicAdd(&cell_count[cell], 1u);
+    sorted_indices[cell_start[cell] + local] = i;
 }
 
 @compute @workgroup_size(256)

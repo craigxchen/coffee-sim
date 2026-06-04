@@ -52,7 +52,7 @@ struct Params {
     spiky_r_min: f32,
     cell_size: f32,
     particle_count: u32,
-    bucket_capacity: u32,
+    _pad_bucket: u32, // (was bucket_capacity; the counting-sort grid has no fixed buckets)
     min_iters: u32,
     max_iters: u32,
     residual_tolerance: f32,
@@ -107,7 +107,9 @@ struct StatusRaw {
 struct Pipelines {
     predict: wgpu::ComputePipeline,
     grid_clear: wgpu::ComputePipeline,
-    grid_fill: wgpu::ComputePipeline,
+    grid_count: wgpu::ComputePipeline,
+    grid_scan: wgpu::ComputePipeline,
+    grid_scatter: wgpu::ComputePipeline,
     compute_lambda: wgpu::ComputePipeline,
     residual_reduce: wgpu::ComputePipeline,
     compute_dp: wgpu::ComputePipeline,
@@ -132,7 +134,9 @@ struct Pipelines {
 struct BindGroups {
     predict: wgpu::BindGroup,
     grid_clear: wgpu::BindGroup,
-    grid_fill: wgpu::BindGroup,
+    grid_count: wgpu::BindGroup,
+    grid_scan: wgpu::BindGroup,
+    grid_scatter: wgpu::BindGroup,
     compute_lambda: wgpu::BindGroup,
     residual_reduce: wgpu::BindGroup,
     compute_dp: wgpu::BindGroup,
@@ -532,7 +536,7 @@ impl Solver for XpbdSolver {
             spiky_r_min: cfg.spiky_r_min_ratio * h,
             cell_size,
             particle_count,
-            bucket_capacity: cfg.bucket_capacity,
+            _pad_bucket: 0,
             min_iters: cfg.min_iters,
             max_iters: param_iters,
             residual_tolerance,
@@ -640,16 +644,24 @@ impl Solver for XpbdSolver {
         );
         // Per-particle eligible-opposite-species neighbor count for the wetting allocation (u32).
         let wet_count = Self::storage(&device, "xpbd-wet-count", f32s, wgpu::BufferUsages::empty());
+        // Counting-sort grid: transient per-cell counter, exclusive-prefix-sum offsets (num_cells+1),
+        // and a contiguous particle-index array (num_particles). No fixed buckets / overflow.
         let cell_count = Self::storage(
             &device,
             "xpbd-cellcount",
             (num_cells as u64) * 4,
             wgpu::BufferUsages::empty(),
         );
-        let cell_bucket = Self::storage(
+        let cell_start = Self::storage(
             &device,
-            "xpbd-cellbucket",
-            (num_cells as u64) * (cfg.bucket_capacity as u64) * 4,
+            "xpbd-cellstart",
+            (num_cells as u64 + 1) * 4,
+            wgpu::BufferUsages::empty(),
+        );
+        let sorted_indices = Self::storage(
+            &device,
+            "xpbd-sorted",
+            (particle_count.max(1) as u64) * 4,
             wgpu::BufferUsages::empty(),
         );
         let status = Self::storage(
@@ -700,7 +712,9 @@ impl Solver for XpbdSolver {
         let pipelines = Pipelines {
             predict: make("predict"),
             grid_clear: make("grid_clear"),
-            grid_fill: make("grid_fill"),
+            grid_count: make("grid_count"),
+            grid_scan: make("grid_scan"),
+            grid_scatter: make("grid_scatter"),
             compute_lambda: make("compute_lambda"),
             residual_reduce: make("residual_reduce"),
             compute_dp: make("compute_dp"),
@@ -751,15 +765,31 @@ impl Solver for XpbdSolver {
                     (14, &fluid_impulse),
                 ],
             ),
-            grid_clear: bg(&pipelines.grid_clear, &[(0, &params_buf), (8, &cell_count)]),
-            grid_fill: bg(
-                &pipelines.grid_fill,
+            grid_clear: bg(
+                &pipelines.grid_clear,
+                &[(0, &params_buf), (18, &cell_count)],
+            ),
+            grid_count: bg(
+                &pipelines.grid_count,
                 &[
                     (0, &params_buf),
                     (2, &pred),
-                    (8, &cell_count),
-                    (9, &cell_bucket),
                     (10, &status),
+                    (18, &cell_count),
+                ],
+            ),
+            grid_scan: bg(
+                &pipelines.grid_scan,
+                &[(0, &params_buf), (8, &cell_start), (18, &cell_count)],
+            ),
+            grid_scatter: bg(
+                &pipelines.grid_scatter,
+                &[
+                    (0, &params_buf),
+                    (2, &pred),
+                    (8, &cell_start),
+                    (9, &sorted_indices),
+                    (18, &cell_count),
                 ],
             ),
             compute_lambda: bg(
@@ -769,8 +799,8 @@ impl Solver for XpbdSolver {
                     (2, &pred),
                     (5, &lambda),
                     (7, &c_residual),
-                    (8, &cell_count),
-                    (9, &cell_bucket),
+                    (8, &cell_start),
+                    (9, &sorted_indices),
                     (10, &status),
                     (11, &phase),
                     (13, &alpha_s),
@@ -787,8 +817,8 @@ impl Solver for XpbdSolver {
                     (2, &pred),
                     (5, &lambda),
                     (6, &dp),
-                    (8, &cell_count),
-                    (9, &cell_bucket),
+                    (8, &cell_start),
+                    (9, &sorted_indices),
                     (10, &status),
                     (11, &phase),
                     (13, &alpha_s),
@@ -802,8 +832,8 @@ impl Solver for XpbdSolver {
                     (2, &pred),
                     (6, &dp),
                     (7, &c_residual),
-                    (8, &cell_count),
-                    (9, &cell_bucket),
+                    (8, &cell_start),
+                    (9, &sorted_indices),
                     (11, &phase),
                     (12, &normal_impulse),
                 ],
@@ -813,8 +843,8 @@ impl Solver for XpbdSolver {
                 &[
                     (0, &params_buf),
                     (2, &pred),
-                    (8, &cell_count),
-                    (9, &cell_bucket),
+                    (8, &cell_start),
+                    (9, &sorted_indices),
                     (11, &phase),
                     (13, &alpha_s),
                 ],
@@ -825,8 +855,8 @@ impl Solver for XpbdSolver {
                     (0, &params_buf),
                     (2, &pred),
                     (6, &dp),
-                    (8, &cell_count),
-                    (9, &cell_bucket),
+                    (8, &cell_start),
+                    (9, &sorted_indices),
                     (10, &status),
                     (11, &phase),
                 ],
@@ -837,8 +867,8 @@ impl Solver for XpbdSolver {
                     (0, &params_buf),
                     (2, &pred),
                     (6, &dp),
-                    (8, &cell_count),
-                    (9, &cell_bucket),
+                    (8, &cell_start),
+                    (9, &sorted_indices),
                     (10, &status),
                     (11, &phase),
                 ],
@@ -848,8 +878,8 @@ impl Solver for XpbdSolver {
                 &[
                     (0, &params_buf),
                     (2, &pred),
-                    (8, &cell_count),
-                    (9, &cell_bucket),
+                    (8, &cell_start),
+                    (9, &sorted_indices),
                     (11, &phase),
                     (13, &alpha_s),
                     (16, &coupling_scale),
@@ -861,8 +891,8 @@ impl Solver for XpbdSolver {
                     (0, &params_buf),
                     (2, &pred),
                     (3, &vel),
-                    (8, &cell_count),
-                    (9, &cell_bucket),
+                    (8, &cell_start),
+                    (9, &sorted_indices),
                     (11, &phase),
                     (14, &fluid_impulse),
                     (15, &vel_frozen),
@@ -875,8 +905,8 @@ impl Solver for XpbdSolver {
                     (0, &params_buf),
                     (2, &pred),
                     (3, &vel),
-                    (8, &cell_count),
-                    (9, &cell_bucket),
+                    (8, &cell_start),
+                    (9, &sorted_indices),
                     (11, &phase),
                     (14, &fluid_impulse),
                     (15, &vel_frozen),
@@ -890,8 +920,8 @@ impl Solver for XpbdSolver {
                     (2, &pred),
                     (3, &vel),
                     (5, &lambda),
-                    (8, &cell_count),
-                    (9, &cell_bucket),
+                    (8, &cell_start),
+                    (9, &sorted_indices),
                     (11, &phase),
                     (14, &fluid_impulse),
                     (15, &vel_frozen),
@@ -904,8 +934,8 @@ impl Solver for XpbdSolver {
                     (2, &pred),
                     (3, &vel),
                     (5, &lambda),
-                    (8, &cell_count),
-                    (9, &cell_bucket),
+                    (8, &cell_start),
+                    (9, &sorted_indices),
                     (11, &phase),
                     (15, &vel_frozen),
                 ],
@@ -919,8 +949,8 @@ impl Solver for XpbdSolver {
                 &[
                     (0, &params_buf),
                     (2, &pred),
-                    (8, &cell_count),
-                    (9, &cell_bucket),
+                    (8, &cell_start),
+                    (9, &sorted_indices),
                     (11, &phase),
                     (17, &wet_count),
                 ],
@@ -931,8 +961,8 @@ impl Solver for XpbdSolver {
                     (0, &params_buf),
                     (1, &pos),
                     (2, &pred),
-                    (8, &cell_count),
-                    (9, &cell_bucket),
+                    (8, &cell_start),
+                    (9, &sorted_indices),
                     (11, &phase),
                     (17, &wet_count),
                 ],
@@ -944,8 +974,8 @@ impl Solver for XpbdSolver {
                     (1, &pos),
                     (2, &pred),
                     (3, &vel),
-                    (8, &cell_count),
-                    (9, &cell_bucket),
+                    (8, &cell_start),
+                    (9, &sorted_indices),
                     (11, &phase),
                     (17, &wet_count),
                 ],
@@ -980,8 +1010,8 @@ impl Solver for XpbdSolver {
                     (1, &pos),
                     (3, &vel),
                     (4, &vel_smoothed),
-                    (8, &cell_count),
-                    (9, &cell_bucket),
+                    (8, &cell_start),
+                    (9, &sorted_indices),
                     (11, &phase),
                 ],
             ),
@@ -1112,7 +1142,16 @@ impl Solver for XpbdSolver {
                     for it in 0..self.water_iters {
                         if it % self.water_regrid == 0 {
                             pass(&mut enc, &p.grid_clear, &b.grid_clear, "grid_clear", nc);
-                            pass(&mut enc, &p.grid_fill, &b.grid_fill, "grid_fill", np);
+                            pass(&mut enc, &p.grid_count, &b.grid_count, "grid_count", np);
+                            pass(&mut enc, &p.grid_scan, &b.grid_scan, "grid_scan", 1);
+                            pass(&mut enc, &p.grid_clear, &b.grid_clear, "grid_clear", nc);
+                            pass(
+                                &mut enc,
+                                &p.grid_scatter,
+                                &b.grid_scatter,
+                                "grid_scatter",
+                                np,
+                            );
                         }
                         if mixed {
                             // Solid fraction (live from current pred) → pore-modulated water target.
@@ -1165,7 +1204,16 @@ impl Solver for XpbdSolver {
 
                 if mixed && self.drag_subiters > 0 {
                     pass(&mut enc, &p.grid_clear, &b.grid_clear, "grid_clear", nc);
-                    pass(&mut enc, &p.grid_fill, &b.grid_fill, "grid_fill", np);
+                    pass(&mut enc, &p.grid_count, &b.grid_count, "grid_count", np);
+                    pass(&mut enc, &p.grid_scan, &b.grid_scan, "grid_scan", 1);
+                    pass(&mut enc, &p.grid_clear, &b.grid_clear, "grid_clear", nc);
+                    pass(
+                        &mut enc,
+                        &p.grid_scatter,
+                        &b.grid_scatter,
+                        "grid_scatter",
+                        np,
+                    );
                     pass(
                         &mut enc,
                         &p.compute_coupling_scale,
@@ -1195,7 +1243,16 @@ impl Solver for XpbdSolver {
 
                 if mixed && self.params.buoyancy_scale > 0.0 {
                     pass(&mut enc, &p.grid_clear, &b.grid_clear, "grid_clear", nc);
-                    pass(&mut enc, &p.grid_fill, &b.grid_fill, "grid_fill", np);
+                    pass(&mut enc, &p.grid_count, &b.grid_count, "grid_count", np);
+                    pass(&mut enc, &p.grid_scan, &b.grid_scan, "grid_scan", 1);
+                    pass(&mut enc, &p.grid_clear, &b.grid_clear, "grid_clear", nc);
+                    pass(
+                        &mut enc,
+                        &p.grid_scatter,
+                        &b.grid_scatter,
+                        "grid_scatter",
+                        np,
+                    );
                     enc.copy_buffer_to_buffer(
                         self.vel.as_ref(),
                         0,
@@ -1230,7 +1287,16 @@ impl Solver for XpbdSolver {
                     for it in 0..self.bed_iters {
                         if it % self.bed_regrid == 0 {
                             pass(&mut enc, &p.grid_clear, &b.grid_clear, "grid_clear", nc);
-                            pass(&mut enc, &p.grid_fill, &b.grid_fill, "grid_fill", np);
+                            pass(&mut enc, &p.grid_count, &b.grid_count, "grid_count", np);
+                            pass(&mut enc, &p.grid_scan, &b.grid_scan, "grid_scan", 1);
+                            pass(&mut enc, &p.grid_clear, &b.grid_clear, "grid_clear", nc);
+                            pass(
+                                &mut enc,
+                                &p.grid_scatter,
+                                &b.grid_scatter,
+                                "grid_scatter",
+                                np,
+                            );
                         }
                         pass(&mut enc, &p.bed_project, &b.bed_project, "bed_project", np);
                         pass(&mut enc, &p.apply_dp, &b.apply_dp, "apply_dp", np);
@@ -1266,7 +1332,16 @@ impl Solver for XpbdSolver {
                 // snapshot, writes the new moisture to pos.w; the next predict mirrors it.
                 if mixed && self.params.k_abs > 0.0 {
                     pass(&mut enc, &p.grid_clear, &b.grid_clear, "grid_clear", nc);
-                    pass(&mut enc, &p.grid_fill, &b.grid_fill, "grid_fill", np);
+                    pass(&mut enc, &p.grid_count, &b.grid_count, "grid_count", np);
+                    pass(&mut enc, &p.grid_scan, &b.grid_scan, "grid_scan", 1);
+                    pass(&mut enc, &p.grid_clear, &b.grid_clear, "grid_clear", nc);
+                    pass(
+                        &mut enc,
+                        &p.grid_scatter,
+                        &b.grid_scatter,
+                        "grid_scatter",
+                        np,
+                    );
                     pass(&mut enc, &p.wet_count, &b.wet_count, "wet_count", np);
                     pass(&mut enc, &p.wet_water, &b.wet_water, "wet_water", np);
                     pass(&mut enc, &p.wet_grain, &b.wet_grain, "wet_grain", np);
