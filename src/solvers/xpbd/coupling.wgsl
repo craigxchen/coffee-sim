@@ -38,7 +38,9 @@ fn compute_fractions(@builtin(global_invocation_id) gid: vec3<u32>) {
                     if (phase[j] != PHASE_GRAIN) { continue; } // solid fraction from grains only
                     let r = length(xi - pred[j].xyz);
                     if (r >= h) { continue; }
-                    a_s = a_s + params.grain_volume * w_poly6(r, h);
+                    // Swollen grains occupy more space: use the effective volume V_eff = V_dry + V_abs
+                    // (grain pred.w = V_abs). Dry grains (V_abs=0) ⇒ params.grain_volume, unchanged.
+                    a_s = a_s + grain_eff_volume(pred[j].w) * w_poly6(r, h);
                 }
             }
         }
