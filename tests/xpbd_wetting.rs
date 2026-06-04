@@ -644,3 +644,94 @@ fn wet_cohesion_holds_grains_tighter_than_no_cohesion() {
         "wet cohesion did not tighten the pair: cohesive {gap_cohesive} vs none {gap_none}"
     );
 }
+
+/// A dense mixed scene (many particles per grid cell) with the full solve + absorption. This is the
+/// regime where the old fixed 64-slot buckets overflowed and broke the gather symmetry → ~5% volume
+/// gain; the counting-sort grid makes conservation exact regardless of density.
+#[test]
+fn dense_scene_absorption_conserves_volume() {
+    let Some(gpu) = GpuContext::new_headless() else {
+        eprintln!("xpbd_wetting: no GPU adapter; skipping.");
+        return;
+    };
+    let mats = Materials::default();
+    let scene = Scene {
+        box_max: [16.0, 24.0, 16.0],
+        regions: vec![
+            // A packed grain bed + a water column dropped onto it — dense cells under gravity.
+            SeedRegion {
+                min: [3.0, 2.0, 3.0],
+                max: [13.0, 7.0, 13.0],
+                species: Species::Grain,
+            },
+            SeedRegion {
+                min: [4.0, 9.0, 4.0],
+                max: [12.0, 16.0, 12.0],
+                species: Species::Water,
+            },
+        ],
+        ..Scene::default()
+    };
+    let cfg = Config {
+        absorb_rate: 0.5,
+        ..Config::default()
+    };
+    let mut solver = XpbdSolver::build(&scene, &mats, &cfg, &gpu);
+    let phase = solver.read_phases();
+    let v_w = solver.water_particle_volume();
+    assert!(
+        phase.len() > 800,
+        "scene not dense enough to stress the grid"
+    );
+
+    let initial = total_volume(&solver.read_moisture(), &phase, v_w);
+    for _ in 0..150 {
+        solver.step(1.0 / 60.0, &EmissionInput::default());
+    }
+    let moisture = solver.read_moisture();
+    let final_vol = total_volume(&moisture, &phase, v_w);
+    // Counting-sort grid ⇒ no overflow ⇒ exact (the old buckets leaked several percent here).
+    assert!(
+        (final_vol - initial).abs() <= 1.0e-3 * initial,
+        "dense-scene volume drifted: {initial} -> {final_vol}"
+    );
+    assert!(
+        moisture
+            .iter()
+            .zip(&phase)
+            .any(|(&m, &p)| p == 1 && m > 1.0e-4),
+        "no absorption in dense scene"
+    );
+}
+
+#[test]
+fn fine_grind_high_rmax_absorption_is_stable() {
+    let Some(gpu) = GpuContext::new_headless() else {
+        eprintln!("xpbd_wetting: no GPU adapter; skipping.");
+        return;
+    };
+    // Fine grind (small grain) + high r_max = the stiffest case (high drag, large swelling).
+    let mats = Materials {
+        r_max: 2.0,
+        ..Materials::default()
+    };
+    let cfg = Config {
+        absorb_rate: 0.8,
+        ..Config::default()
+    };
+    let mut solver = XpbdSolver::build(&mixed_scene(), &mats, &cfg, &gpu);
+    for _ in 0..200 {
+        solver.step(1.0 / 60.0, &EmissionInput::default());
+    }
+    let pos = solver.read_positions();
+    let moisture = solver.read_moisture();
+    assert!(
+        pos.iter()
+            .all(|p| p[0].is_finite() && p[1].is_finite() && p[2].is_finite()),
+        "non-finite position (blow-up at fine grind / high r_max)"
+    );
+    assert!(
+        moisture.iter().all(|m| m.is_finite() && *m >= 0.0),
+        "non-finite or negative moisture"
+    );
+}
