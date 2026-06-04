@@ -85,7 +85,11 @@ fn main() {
             solver.step(1.0 / 60.0, &input);
         }
         let ms = t0.elapsed().as_secs_f32() * 1000.0 / n as f32;
-        eprintln!("PROF: {} particles, {ms:.2} ms/step ({:.0} fps)", phase.len(), 1000.0 / ms);
+        eprintln!(
+            "PROF: {} particles, {ms:.2} ms/step ({:.0} fps)",
+            phase.len(),
+            1000.0 / ms
+        );
         solver.sample_diagnostics();
         let mut passes = solver.profile().passes;
         passes.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
