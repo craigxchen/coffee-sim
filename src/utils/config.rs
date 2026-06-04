@@ -84,6 +84,17 @@ pub struct Config {
     pub buoyancy_scale: f32,
     /// A grain skips its static dead-band when its frame fluid-impulse exceeds this (wake). (step 2)
     pub wake_threshold: f32,
+
+    // --- wetting / cohesion (Phase 1.4) ---
+    /// Absorption rate constant `k_abs` (1/s) in the bounded uptake `(1−e^{−k·dt})`. Higher = a
+    /// grain saturates faster once wet (~0.5 ⇒ ~2 s time constant). (step 4)
+    pub absorb_rate: f32,
+    /// Remaining-volume floor: a water particle is deactivated only when `f_w ≤ this` (drives
+    /// exact volume conservation — must be ≪ `pbf_eps`). (step 4)
+    pub absorb_roundoff: f32,
+    /// PBF skips a water particle's density contribution when `f_w ≤ this` (stability near the wet
+    /// front). Larger than `absorb_roundoff`, so skipped water is still absorption-eligible. (step 4)
+    pub pbf_eps: f32,
 }
 
 impl Default for Config {
@@ -139,6 +150,11 @@ impl Default for Config {
             drag_subiters: 4,
             buoyancy_scale: 1.0,
             wake_threshold: 0.05,
+            // Wetting: ~2 s saturation time constant; deactivate water only at a tiny remaining
+            // fraction (exact conservation), skip it from PBF well above that.
+            absorb_rate: 0.5,
+            absorb_roundoff: 1.0e-3,
+            pbf_eps: 0.05,
         }
     }
 }

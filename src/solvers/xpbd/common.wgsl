@@ -57,9 +57,14 @@ struct Params {
     buoyancy_scale: f32,
     wake_threshold: f32,
     water_grain_distance: f32, // water↔grain exclusion contact (≤ grain spacing lets water thread pores)
-    _pad1: u32,
-    _pad2: u32,
-    _pad3: u32,
+    // --- wetting / cohesion (Phase 1.4) ---
+    r_max: f32,                // moisture ratio at saturation (mass water / mass dry grain)
+    rho_ratio: f32,            // ρ_s/ρ_w — converts absorbed water mass → swelling volume
+    s_peak: f32,               // saturation at the cohesion-curve peak
+    c_max: f32,                // peak wet cohesion strength (0 until calibrated)
+    k_abs: f32,                // absorption rate constant (1/s)
+    absorb_roundoff: f32,      // f_w deactivation floor (exact-conservation; ≪ pbf_eps)
+    pbf_eps: f32,              // PBF skips water with remaining fraction ≤ this
 };
 
 struct Status {
