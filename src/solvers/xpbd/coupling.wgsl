@@ -335,5 +335,7 @@ fn apply_drag_pred(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
     if (i >= params.particle_count) { return; }
     let dv = vel[i].xyz - vel_frozen[i].xyz;
-    pred[i] = vec4<f32>(clamp(pred[i].xyz + params.dt * dv, params.box_min.xyz, params.box_max.xyz), 0.0);
+    // Preserve the moisture snapshot in pred.w — this runs in the drag/buoyancy subcycle before
+    // absorption, so zeroing .w here would wipe the per-frame snapshot the wetting passes read.
+    pred[i] = vec4<f32>(clamp(pred[i].xyz + params.dt * dv, params.box_min.xyz, params.box_max.xyz), pred[i].w);
 }

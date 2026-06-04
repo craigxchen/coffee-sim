@@ -194,6 +194,7 @@ pub struct XpbdSolver {
     params_buf: wgpu::Buffer,
     pos: Arc<wgpu::Buffer>,
     vel: Arc<wgpu::Buffer>,
+    pred: wgpu::Buffer, // retained for read_pred (test: pred.w mirror survives the frame)
     vel_smoothed: wgpu::Buffer,
     vel_frozen: wgpu::Buffer,
     lambda: wgpu::Buffer,
@@ -226,9 +227,11 @@ fn seed_block(scene: &Scene, mats: &Materials, cfg: &Config) -> (Vec<[f32; 4]>, 
         // Water seeds at the (fine) particle spacing; grains seed at their (possibly coarser)
         // contact diameter, so a sand wall can have pores larger than the water that flows through
         // it. When grain_diameter == particle_spacing (the default), both seed identically.
-        let (s, tag) = match region.species {
-            Species::Water => (mats.particle_spacing, 0u32),
-            Species::Grain => (mats.grain_diameter, 1u32),
+        // The 4th lane carries Phase-1.4 moisture state, seeded per species: water = remaining
+        // volume fraction f_w (1 = full), grain = absorbed volume V_abs (0 = dry).
+        let (s, tag, w0) = match region.species {
+            Species::Water => (mats.particle_spacing, 0u32, 1.0f32),
+            Species::Grain => (mats.grain_diameter, 1u32, 0.0f32),
         };
         let jitter = cfg.seed_jitter * s;
         let nx = (((hi[0] - lo[0]) / s).floor() as i32).max(0);
@@ -244,7 +247,7 @@ fn seed_block(scene: &Scene, mats: &Materials, cfg: &Config) -> (Vec<[f32; 4]>, 
                         lo[0] + i as f32 * s + jx,
                         lo[1] + j as f32 * s + jy,
                         lo[2] + k as f32 * s + jz,
-                        0.0,
+                        w0,
                     ]);
                     phase.push(tag);
                 }
@@ -316,6 +319,21 @@ impl XpbdSolver {
     /// Read back current particle velocities (dev/test only — stalls the GPU).
     pub fn read_velocities(&self) -> Vec<[f32; 4]> {
         self.read_vec4(self.vel.as_ref())
+    }
+
+    /// Read back the per-particle moisture lane `pos.w` (dev/test only — stalls the GPU):
+    /// water = remaining-volume fraction `f_w` (1 = full), grain = absorbed volume `V_abs`.
+    pub fn read_moisture(&self) -> Vec<f32> {
+        self.read_vec4(self.pos.as_ref())
+            .iter()
+            .map(|p| p[3])
+            .collect()
+    }
+
+    /// Read back the predicted-position buffer (dev/test only — stalls the GPU). `pred.w` mirrors
+    /// the moisture snapshot; a test asserts it survives every `pred` writer through a full step.
+    pub fn read_pred(&self) -> Vec<[f32; 4]> {
+        self.read_vec4(&self.pred)
     }
 
     /// Overwrite current particle velocities (dev/test only).
@@ -552,7 +570,8 @@ impl Solver for XpbdSolver {
                     | wgpu::BufferUsages::COPY_SRC,
             }),
         );
-        let pred = Self::storage(&device, "xpbd-pred", vec4, wgpu::BufferUsages::empty());
+        // COPY_SRC so read_pred can read back pred.w (test: moisture mirror survives the frame).
+        let pred = Self::storage(&device, "xpbd-pred", vec4, wgpu::BufferUsages::COPY_SRC);
         let vel = Arc::new(Self::storage(
             &device,
             "xpbd-vel",
@@ -965,6 +984,7 @@ impl Solver for XpbdSolver {
             params_buf,
             pos,
             vel,
+            pred,
             vel_smoothed,
             vel_frozen,
             lambda,

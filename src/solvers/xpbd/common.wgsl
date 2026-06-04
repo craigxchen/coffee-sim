@@ -168,7 +168,9 @@ fn predict(@builtin(global_invocation_id) gid: vec3<u32>) {
     let v = vel[i].xyz;
     let g = params.gravity.xyz;
     let np = p + params.dt * v + (params.dt * params.dt) * g;
-    pred[i] = vec4<f32>(np, 0.0);
+    // Mirror the moisture lane (pos.w) into pred.w so the predicted-state kernels can read it; the
+    // absorption passes treat pred.w as the frozen per-frame snapshot.
+    pred[i] = vec4<f32>(np, pos[i].w);
 }
 
 @compute @workgroup_size(256)
@@ -225,9 +227,9 @@ fn apply_dp(@builtin(global_invocation_id) gid: vec3<u32>) {
             }
             newp = clamp(newp, params.box_min.xyz, params.box_max.xyz);
         }
-        pred[i] = vec4<f32>(newp, 0.0);
+        pred[i] = vec4<f32>(newp, pred[i].w); // preserve the moisture snapshot in pred.w
     } else {
-        pred[i] = vec4<f32>(clamped, 0.0);
+        pred[i] = vec4<f32>(clamped, pred[i].w); // preserve the moisture snapshot in pred.w
     }
 }
 
@@ -260,5 +262,5 @@ fn finalize(@builtin(global_invocation_id) gid: vec3<u32>) {
         v = v * (params.max_speed / sp);
     }
     vel[i] = vec4<f32>(v, 0.0);
-    pos[i] = vec4<f32>(xi, 0.0);
+    pos[i] = vec4<f32>(xi, pos[i].w); // preserve the persistent moisture lane (pos.w)
 }
