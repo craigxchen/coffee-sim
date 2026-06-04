@@ -8,6 +8,7 @@
 
 pub mod cohesion;
 pub mod permeability;
+pub mod wetting;
 
 /// Coffee + water material parameters and presets.
 ///
