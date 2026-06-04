@@ -1,7 +1,7 @@
 ---
 title: "feat: Phase 1.4 — Wetting + Cohesion (volume-conserving absorption + swelling)"
 type: feat
-status: active
+status: completed
 date: 2026-06-03
 origin: docs/plans/solver_xpbd.md (step 4), docs/plans/models.md (phase 2)
 deepened: 2026-06-03
