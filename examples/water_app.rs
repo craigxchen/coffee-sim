@@ -135,7 +135,8 @@ impl ApplicationHandler for App {
             mats.support_radius = 1.0;
             mats.grain_diameter = 1.5;
             mats.water_grain_distance = 0.4;
-            mats.grain_mass = 12.0;
+            mats.grain_mass = 40.0; // denser than the fine water so the heavy wall holds and grains
+                                    // sink rather than float under (density-aware) buoyancy
         }
         // WET=1 turns on Phase 1.4 wetting (mixed scenes): grains absorb water, swell, darken, gain
         // capillary cohesion, and drag rises with local packing. Off by default (mechanical coupling

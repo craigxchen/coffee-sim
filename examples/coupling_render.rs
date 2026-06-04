@@ -37,7 +37,8 @@ fn main() {
         mats.support_radius = 1.0;
         mats.grain_diameter = 1.5; // 3× the water spacing → coarse grains, real pores
         mats.water_grain_distance = 0.4; // fine water threads the gaps
-        mats.grain_mass = 12.0; // a coarse grain is much heavier than a water particle
+        mats.grain_mass = 40.0; // denser than the fine water (ρ_grain > rest_density) so the heavy
+                                // wall holds AND grains sink rather than float under buoyancy
     }
     if let Some(gm) = std::env::var("GRAIN_MASS")
         .ok()
@@ -58,6 +59,13 @@ fn main() {
     if wet {
         cfg.absorb_rate = 0.5;
         mats.c_max = 2.0;
+    }
+    // Diagnostic overrides to isolate which force launches grains: BUOY=buoyancy_scale, CMAX=c_max.
+    if let Some(b) = std::env::var("BUOY").ok().and_then(|s| s.parse().ok()) {
+        cfg.buoyancy_scale = b;
+    }
+    if let Some(c) = std::env::var("CMAX").ok().and_then(|s| s.parse().ok()) {
+        mats.c_max = c;
     }
     let mut solver = XpbdSolver::build(&scene, &mats, &cfg, &gpu);
     let phase = solver.read_phases();
