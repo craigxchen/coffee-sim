@@ -46,11 +46,16 @@ fn main() {
     };
     std::fs::create_dir_all("/tmp/coffee-pour").unwrap();
 
+    // Resolution: SPACING scales particle size; count scales ~1/spacing³. The V60 length ratios
+    // (grain_diameter = 2·spacing, water↔grain = 0.7·spacing, h = 2·spacing) are preserved so the
+    // physics is resolution-consistent; grain_mass is fixed (the grain/water density contrast is
+    // scale-invariant). Default 0.12 ≈ ~16k particles (realistic); 0.18 ≈ ~5k (faster); 0.1 ≈ ~50k.
+    let s = env_f32("SPACING", 0.12).max(0.06);
     let mats = Materials {
-        particle_spacing: 0.5,
-        support_radius: 1.0,
-        grain_diameter: 1.0,
-        water_grain_distance: 0.35,
+        particle_spacing: s,
+        support_radius: 2.0 * s,
+        grain_diameter: 2.0 * s,
+        water_grain_distance: 0.7 * s,
         grain_mass: 10.0,
         ..Materials::default()
     };

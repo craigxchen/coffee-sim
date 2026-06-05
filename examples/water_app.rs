@@ -187,7 +187,7 @@ impl ApplicationHandler for App {
             mats.grain_mass = 40.0; // denser than the fine water so the heavy wall holds and grains
                                     // sink rather than float under (density-aware) buoyancy
         }
-        if scene_kind == "v60" || scene_kind == "v60pour" {
+        if scene_kind == "v60" {
             // Fine water (spacing 0.5) through a COARSER coffee bed (grain_diameter 1.0) with a small
             // water↔grain contact, so water threads the bed and drains through the cone apex into the
             // cup instead of pooling and squeezing. Grains ~1.25× water density (coffee-like) so the
@@ -196,6 +196,24 @@ impl ApplicationHandler for App {
             mats.support_radius = 1.0;
             mats.grain_diameter = 1.0;
             mats.water_grain_distance = 0.35;
+            mats.grain_mass = 10.0;
+        }
+        if scene_kind == "v60pour" {
+            // Same V60 length RATIOS as `v60` (grain_diameter = 2·spacing, water↔grain = 0.7·spacing,
+            // h = 2·spacing) but resolution-tunable: SPACING sets the particle size, and the count
+            // scales ~1/spacing³ (default 0.12 ≈ ~16k particles for a realistic bed+brew; 0.18 ≈ ~5k
+            // lighter; 0.1 ≈ ~50k heavier). grain_mass is fixed — the grain/water density contrast is
+            // scale-invariant. The small V60 box keeps the neighbor grid well within budget at these
+            // resolutions, so the global 0.25 floor (a big-box guard) doesn't apply here.
+            let r = std::env::var("SPACING")
+                .ok()
+                .and_then(|s| s.parse::<f32>().ok())
+                .unwrap_or(0.12)
+                .max(0.08);
+            mats.particle_spacing = r;
+            mats.support_radius = 2.0 * r;
+            mats.grain_diameter = 2.0 * r;
+            mats.water_grain_distance = 0.7 * r;
             mats.grain_mass = 10.0;
         }
         // WET=1 turns on Phase 1.4 wetting (mixed scenes): grains absorb water, swell, darken, gain
