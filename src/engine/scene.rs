@@ -103,6 +103,28 @@ impl Scene {
         }
     }
 
+    /// A V60 **pour** brew: the dripper geometry + a seeded coffee bed, with water arriving via a
+    /// continuous pour (no seeded water column). `declares_pour()` is true (`pour_water_ml > 0`), so
+    /// the solver sizes its particle pool with headroom for the dose and runs the water passes; a
+    /// driver feeds `EmissionInput` from a pour recipe. Same bed/geometry as [`Scene::v60`].
+    pub fn v60_pour() -> Self {
+        Self {
+            dose_g: 15.0,
+            water_ml: 0.0,
+            pour_water_ml: 250.0,
+            gravity: [0.0, -20.0, 0.0],
+            box_min: [-7.0, -10.0, -7.0],
+            box_max: [7.0, 10.0, 7.0],
+            solids: crate::utils::geometry::v60_dripper(),
+            // Coffee bed only; water is poured in. Rejection trims it to the filter cavity.
+            regions: vec![SeedRegion {
+                min: [-2.5, -2.8, -2.5],
+                max: [2.5, 0.2, 2.5],
+                species: Species::Grain,
+            }],
+        }
+    }
+
     /// A dam-break: a tall water column released in a box. The water-core gate scene.
     pub fn dam_break() -> Self {
         Self::default()
