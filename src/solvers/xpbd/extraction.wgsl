@@ -169,3 +169,68 @@ fn dissolve_water(@builtin(global_invocation_id) gid: vec3<u32>) {
     // headroom cap). T lane preserved.
     chem[i] = vec4<f32>(cf.x + total / (f_w * v_w), cf.y, cf.z, cf.w);
 }
+
+// --- Thermal exchange (U6) -------------------------------------------------------------------------
+// Per-particle lumped heat conduction + ambient loss. The temperature lane differs by species
+// (grain T = chem.z, water T = chem.y), so read/write go through phase-aware helpers. Capacity
+// C = effective_mass · specific_heat (water mass scales with f_w; wet-grain mass includes the
+// absorbed water ρ·V_abs). Runs after dissolution on a FRESH chem_frozen snapshot, so it preserves
+// the post-dissolution c/pools (it writes only the T lane). Reads `pos` for moisture/position (same
+// rationale as the dissolution passes); the grid was rebuilt for diss_count and is still valid.
+
+fn th_temp(ph: u32, cf: vec4<f32>) -> f32 {
+    return select(cf.y, cf.z, ph == PHASE_GRAIN); // water T at .y, grain T at .z
+}
+fn th_capacity(ph: u32, w: f32) -> f32 {
+    let cp = select(params.cp_water, params.cp_grain, ph == PHASE_GRAIN);
+    return eff_mass(ph, w) * cp;
+}
+
+@compute @workgroup_size(256)
+fn thermal_exchange(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= params.particle_count) { return; }
+    let ph_i = phase[i];
+    let cf_i = chem_frozen[i];
+    let t_i = th_temp(ph_i, cf_i);
+    let c_i = th_capacity(ph_i, pos[i].w);
+
+    var q_sum = 0.0;
+    let xi = pos[i].xyz;
+    let base = cell_coord(xi);
+    for (var dz = -1; dz <= 1; dz = dz + 1) {
+        for (var dy = -1; dy <= 1; dy = dy + 1) {
+            for (var dx = -1; dx <= 1; dx = dx + 1) {
+                let nc = base + vec3<i32>(dx, dy, dz);
+                if (nc.x < 0 || nc.y < 0 || nc.z < 0) { continue; }
+                let dims = vec3<i32>(params.grid_dims.xyz);
+                if (nc.x >= dims.x || nc.y >= dims.y || nc.z >= dims.z) { continue; }
+                let cid = cell_id(nc);
+                let lo = cell_start[cid];
+                let hi = cell_start[cid + 1u];
+                for (var s = lo; s < hi; s = s + 1u) {
+                    let j = sorted_indices[s];
+                    if (j == i) { continue; }
+                    if (length(xi - pos[j].xyz) >= params.h) { continue; }
+                    let ph_j = phase[j];
+                    let c_j = th_capacity(ph_j, pos[j].w);
+                    if (c_j <= 1e-6) { continue; } // empty neighbor carries no heat
+                    let t_j = th_temp(ph_j, chem_frozen[j]);
+                    // Antisymmetric pair heat (q_ji = −q_ij) → Σ C·T conserved across the pass.
+                    q_sum = q_sum + th_pair_heat(t_i, c_i, t_j, c_j, params.kappa, params.dt);
+                }
+            }
+        }
+    }
+
+    var t_new = t_i;
+    if (c_i > 1e-6) { t_new = t_i + q_sum / c_i; } // zero-capacity particle exchanges nothing
+    t_new = t_new + th_ambient(t_new, params.t_amb, params.h_amb, params.dt);
+
+    // Write only the T lane, preserving the post-dissolution c/pools from the frozen snapshot.
+    if (ph_i == PHASE_GRAIN) {
+        chem[i] = vec4<f32>(cf_i.x, cf_i.y, t_new, cf_i.w);
+    } else {
+        chem[i] = vec4<f32>(cf_i.x, t_new, cf_i.z, cf_i.w);
+    }
+}

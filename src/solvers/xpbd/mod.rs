@@ -205,6 +205,7 @@ struct Pipelines {
     diss_count: wgpu::ComputePipeline,
     dissolve_grain: wgpu::ComputePipeline,
     dissolve_water: wgpu::ComputePipeline,
+    thermal_exchange: wgpu::ComputePipeline,
     apply_dp: wgpu::ComputePipeline,
     finalize: wgpu::ComputePipeline,
     xsph: wgpu::ComputePipeline,
@@ -235,6 +236,7 @@ struct BindGroups {
     diss_count: wgpu::BindGroup,
     dissolve_grain: wgpu::BindGroup,
     dissolve_water: wgpu::BindGroup,
+    thermal_exchange: wgpu::BindGroup,
     apply_dp: wgpu::BindGroup,
     finalize: wgpu::BindGroup,
     xsph: wgpu::BindGroup,
@@ -957,6 +959,7 @@ impl Solver for XpbdSolver {
             diss_count: make("diss_count"),
             dissolve_grain: make("dissolve_grain"),
             dissolve_water: make("dissolve_water"),
+            thermal_exchange: make("thermal_exchange"),
             apply_dp: make("apply_dp"),
             finalize: make("finalize"),
             xsph: make("xsph"),
@@ -1248,6 +1251,18 @@ impl Solver for XpbdSolver {
                     (11, &phase),
                     (20, &chem),
                     (21, &diss_neighbors),
+                    (22, &chem_frozen),
+                ],
+            ),
+            thermal_exchange: bg(
+                &pipelines.thermal_exchange,
+                &[
+                    (0, &params_buf),
+                    (1, &pos),
+                    (8, &cell_start),
+                    (9, &sorted_indices),
+                    (11, &phase),
+                    (20, &chem),
                     (22, &chem_frozen),
                 ],
             ),
@@ -1661,6 +1676,23 @@ impl Solver for XpbdSolver {
                         &p.dissolve_water,
                         &b.dissolve_water,
                         "dissolve_water",
+                        np,
+                    );
+                    // Thermal exchange + ambient loss (U6). Re-snapshot the post-dissolution chem so
+                    // the pass preserves the updated c/pools (it writes only the T lane), then run on
+                    // the still-valid grid. T evolved here feeds the NEXT substep's k_T (one-step lag).
+                    enc.copy_buffer_to_buffer(
+                        self.chem.as_ref(),
+                        0,
+                        &self.chem_frozen,
+                        0,
+                        (self.particle_count as u64) * 16,
+                    );
+                    pass(
+                        &mut enc,
+                        &p.thermal_exchange,
+                        &b.thermal_exchange,
+                        "thermal_exchange",
                         np,
                     );
                 }
