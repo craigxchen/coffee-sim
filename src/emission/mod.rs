@@ -1,8 +1,10 @@
 //! Particle emission (coffee + water) as its own block, so emitting each species can be
 //! tested independently to verify their physics in isolation.
 //!
-//! Phase 0: the `EmissionInput` control type (the per-frame input handed to the active
-//! solver). The emission logic itself lands later.
+//! `EmissionInput` is the per-frame control handed to the active solver; [`pour`] is the recipe
+//! layer (time-windowed flow + spatial pattern) a driver samples to produce it.
+
+pub mod pour;
 
 /// A discrete pour event delivered alongside the continuous controls.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
