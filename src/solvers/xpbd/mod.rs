@@ -25,6 +25,9 @@ use crate::utils::kernels;
 const WG: u32 = 256;
 /// Rebuild the neighbor grid every this-many solver iterations (anti-stale-grid).
 const REGRID_INTERVAL: u32 = 4;
+/// Volume scale (KEEP.md §27): mL per sim-unit³. Converts a scene's pour dose (mL) into a particle
+/// capacity (and the emission rate, in the pour-emission unit).
+const ML_PER_SIM_UNIT3: f32 = 5.20;
 
 fn groups(n: u32) -> u32 {
     n.div_ceil(WG)
@@ -266,7 +269,12 @@ pub struct XpbdSolver {
     device: wgpu::Device,
     queue: wgpu::Queue,
     params: Params,
-    particle_count: u32,
+    /// Allocated particle-pool size (buffers are sized to this). `= seed_count + pour headroom`;
+    /// equals `active_count` for non-pour scenes.
+    capacity: u32,
+    /// Live particle count actually simulated this frame (dispatch size + `params.particle_count`).
+    /// Starts at the seed count; grows as the pour activates dormant pool slots.
+    active_count: u32,
     num_cells: u32,
     substeps: u32,
     /// Which species are present (from the scene's seed regions) — selects the per-frame passes.
@@ -327,6 +335,10 @@ pub struct XpbdSolver {
     initial_positions: Vec<[f32; 4]>,
     initial_phases: Vec<u32>,
     initial_chem: Vec<[f32; 4]>,
+    /// Host mirror of the per-particle phase tag for ALL `active_count` particles (the seed plus any
+    /// pour-emitted water), grown as particles are activated. Host readouts (`sample_extraction`,
+    /// `read_temperature`) index this rather than the seed-only `initial_phases`.
+    phase_mirror: Vec<u32>,
 }
 
 /// Catch-cup geometry (a cylinder cavity) used to scope the TDS readout to pooled cup water.
@@ -431,16 +443,23 @@ impl XpbdSolver {
     /// Re-seed the particles to the original block (exact, deterministic): positions, phase
     /// tags, and zeroed velocities. (`normal_impulse` is reset every frame in `predict`.)
     fn seed(&mut self) {
+        // Reset the live set to the seed (drops any pour-emitted particles); writes only the seed
+        // range — dormant pool slots stay inert. `params.particle_count = active_count` is refreshed
+        // each frame in step().
+        self.active_count = self.initial_positions.len() as u32;
         self.queue
             .write_buffer(&self.pos, 0, bytemuck::cast_slice(&self.initial_positions));
         self.queue
             .write_buffer(&self.phase, 0, bytemuck::cast_slice(&self.initial_phases));
-        let zeros = vec![[0.0f32; 4]; self.particle_count as usize];
+        let zeros = vec![[0.0f32; 4]; self.initial_positions.len()];
         self.queue
             .write_buffer(&self.vel, 0, bytemuck::cast_slice(&zeros));
         // Re-seed chem/thermal state (pools, c=0, pour temperature) so a reset restarts the brew.
         self.queue
             .write_buffer(&self.chem, 0, bytemuck::cast_slice(&self.initial_chem));
+        // Restore the host phase mirror to the seed baseline.
+        self.phase_mirror.clear();
+        self.phase_mirror.extend_from_slice(&self.initial_phases);
         // Clear the yield/TDS cache so metrics() reports 0 after a reset (matching the re-zeroed
         // chem) rather than stale values until the next sample_diagnostics.
         self.cached_yield = 0.0;
@@ -449,7 +468,7 @@ impl XpbdSolver {
 
     /// Blocking GPU→CPU read-back of a `vec4` particle buffer (dev/test only — stalls).
     fn read_vec4(&self, src: &wgpu::Buffer) -> Vec<[f32; 4]> {
-        let size = (self.particle_count as u64) * 16;
+        let size = (self.active_count as u64) * 16;
         let mut enc = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -515,7 +534,7 @@ impl XpbdSolver {
     pub fn write_velocities_for_test(&self, velocities: &[[f32; 4]]) {
         assert_eq!(
             velocities.len(),
-            self.particle_count as usize,
+            self.active_count as usize,
             "velocity seed length must match particle count"
         );
         self.queue
@@ -527,7 +546,7 @@ impl XpbdSolver {
     pub fn write_chem_for_test(&self, chem: &[[f32; 4]]) {
         assert_eq!(
             chem.len(),
-            self.particle_count as usize,
+            self.active_count as usize,
             "chem seed length must match particle count"
         );
         self.queue
@@ -555,7 +574,7 @@ impl XpbdSolver {
     pub fn write_lambdas_for_test(&self, lambdas: &[f32]) {
         assert_eq!(
             lambdas.len(),
-            self.particle_count as usize,
+            self.active_count as usize,
             "lambda seed length must match particle count"
         );
         self.queue
@@ -564,7 +583,7 @@ impl XpbdSolver {
 
     /// Read back per-particle phase tags (0=water, 1=grain) (dev/test only — stalls the GPU).
     pub fn read_phases(&self) -> Vec<u32> {
-        let size = (self.particle_count as u64) * 4;
+        let size = (self.active_count as u64) * 4;
         let mut enc = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -671,8 +690,8 @@ impl XpbdSolver {
         let mut cup_solute = 0.0f32;
         let mut cup_water_mass = 0.0f32;
         for (i, (c, p)) in chem.iter().zip(&pos).enumerate() {
-            if self.initial_phases[i] != 0 {
-                continue; // water only
+            if self.phase_mirror[i] != 0 {
+                continue; // water only (mirror covers seed + pour-emitted particles)
             }
             let f_w = p[3];
             if f_w <= self.params.absorb_roundoff {
@@ -704,6 +723,22 @@ impl XpbdSolver {
         self.cached_diag
     }
 
+    /// Live particle count currently simulated (grows as the pour activates pool slots) (dev/test).
+    pub fn active_count(&self) -> u32 {
+        self.active_count
+    }
+
+    /// Allocated particle-pool capacity (buffer size in particles) (dev/test).
+    pub fn pool_capacity(&self) -> u32 {
+        self.capacity
+    }
+
+    /// Whether the per-frame water/coupling/wetting/extraction passes run (true if a water region is
+    /// seeded OR the scene declares a pour) (dev/test).
+    pub fn has_water_passes(&self) -> bool {
+        self.has_water
+    }
+
     /// Read back per-particle water concentration `c` (chem `.x`; for a grain `.x` is its fast pool).
     /// Dev/test/inspection only — stalls the GPU.
     pub fn read_concentration(&self) -> Vec<f32> {
@@ -718,7 +753,7 @@ impl XpbdSolver {
     pub fn read_temperature(&self) -> Vec<f32> {
         self.read_vec4(self.chem.as_ref())
             .iter()
-            .zip(&self.initial_phases)
+            .zip(&self.phase_mirror)
             .map(|(c, &ph)| if ph == 0 { c[1] } else { c[2] })
             .collect()
     }
@@ -733,11 +768,14 @@ impl Solver for XpbdSolver {
         let m = mats.particle_mass;
 
         let (positions, phases) = seed_block(scene, mats, cfg);
-        let particle_count = positions.len() as u32;
+        let seed_count = positions.len() as u32;
 
         // Which species are present drives the per-frame passes. The grain bed solves contacts
         // (harder to converge than water): its own iteration cap + more frequent grid rebuild.
-        let has_water = scene.regions.iter().any(|r| r.species == Species::Water);
+        // A declared pour means water WILL be present even if no water region is seeded, so the
+        // water/coupling/wetting/extraction passes must be selected.
+        let has_water =
+            scene.regions.iter().any(|r| r.species == Species::Water) || scene.declares_pour();
         let has_grain = scene.regions.iter().any(|r| r.species == Species::Grain);
         let water_iters = cfg.max_iters;
         let water_regrid = REGRID_INTERVAL;
@@ -763,6 +801,18 @@ impl Solver for XpbdSolver {
         let num_cells = nx * ny * nz;
 
         let rest_density = kernels::rest_density(s, h, m);
+        // Particle pool: buffers are sized to `capacity` = the seed plus headroom for a declared pour
+        // dose (KTD-7: water_ml / 5.20 ml·unit⁻³ / V_w particles). `active_count` (the live, dispatched
+        // set) starts at the seed and grows as the pour activates dormant slots. Non-pour scenes get
+        // `capacity == active_count == seed_count`, so the layout/dispatch is byte-identical to before.
+        let v_w = m / rest_density;
+        let dose_headroom = if scene.declares_pour() {
+            (scene.pour_water_ml / ML_PER_SIM_UNIT3 / v_w).ceil() as u32
+        } else {
+            0
+        };
+        let capacity = seed_count + dose_headroom;
+        let active_count = seed_count;
         let dq = cfg.s_corr_dq_ratio * h;
         let s_corr_wq = kernels::w_poly6(dq, h);
         // Resolve the user-facing drag scale through Kozeny-Carman once at build time, stored in
@@ -789,7 +839,7 @@ impl Solver for XpbdSolver {
             max_speed: cfg.max_speed,
             spiky_r_min: cfg.spiky_r_min_ratio * h,
             cell_size,
-            particle_count,
+            particle_count: active_count, // live count; grows as the pour activates pool slots
             num_solids: scene.solids.len() as u32,
             min_iters: cfg.min_iters,
             max_iters: param_iters,
@@ -845,18 +895,18 @@ impl Solver for XpbdSolver {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
-        let n = particle_count.max(1) as u64;
+        // Buffers are sized to `capacity` (the pool); the seed data is written into the first
+        // `seed_count` slots below (dormant slots `[seed_count, capacity)` are never dispatched).
+        let n = capacity.max(1) as u64;
         let vec4 = n * 16;
         let f32s = n * 4;
-        let pos = Arc::new(
-            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("xpbd-pos"),
-                contents: bytemuck::cast_slice(&positions),
-                usage: wgpu::BufferUsages::STORAGE
-                    | wgpu::BufferUsages::COPY_DST
-                    | wgpu::BufferUsages::COPY_SRC,
-            }),
-        );
+        let pos = Arc::new(Self::storage(
+            &device,
+            "xpbd-pos",
+            vec4,
+            wgpu::BufferUsages::COPY_SRC,
+        ));
+        queue.write_buffer(&pos, 0, bytemuck::cast_slice(&positions));
         // COPY_SRC so read_pred can read back pred.w (test: moisture mirror survives the frame).
         let pred = Self::storage(&device, "xpbd-pred", vec4, wgpu::BufferUsages::COPY_SRC);
         let vel = Arc::new(Self::storage(
@@ -883,15 +933,13 @@ impl Solver for XpbdSolver {
             Self::storage(&device, "xpbd-cresidual", f32s, wgpu::BufferUsages::empty());
         // Per-particle species tag (exposed to the renderer for color-by-phase) and the per-grain
         // accumulated-normal-impulse buffer (the friction budget; reset each frame in predict).
-        let phase = Arc::new(
-            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("xpbd-phase"),
-                contents: bytemuck::cast_slice(&phases),
-                usage: wgpu::BufferUsages::STORAGE
-                    | wgpu::BufferUsages::COPY_DST
-                    | wgpu::BufferUsages::COPY_SRC,
-            }),
-        );
+        let phase = Arc::new(Self::storage(
+            &device,
+            "xpbd-phase",
+            f32s,
+            wgpu::BufferUsages::COPY_SRC,
+        ));
+        queue.write_buffer(&phase, 0, bytemuck::cast_slice(&phases));
         let normal_impulse = Self::storage(
             &device,
             "xpbd-normal-impulse",
@@ -932,7 +980,7 @@ impl Solver for XpbdSolver {
         let sorted_indices = Self::storage(
             &device,
             "xpbd-sorted",
-            (particle_count.max(1) as u64) * 4,
+            (capacity.max(1) as u64) * 4,
             wgpu::BufferUsages::empty(),
         );
         // Static SDF geometry (binding 19, read-only). Built-time-immutable; an empty scene gets a
@@ -975,15 +1023,13 @@ impl Solver for XpbdSolver {
             }),
             _ => None,
         });
-        let chem = Arc::new(
-            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("xpbd-chem"),
-                contents: bytemuck::cast_slice(&initial_chem),
-                usage: wgpu::BufferUsages::STORAGE
-                    | wgpu::BufferUsages::COPY_SRC
-                    | wgpu::BufferUsages::COPY_DST,
-            }),
-        );
+        let chem = Arc::new(Self::storage(
+            &device,
+            "xpbd-chem",
+            vec4,
+            wgpu::BufferUsages::COPY_SRC,
+        ));
+        queue.write_buffer(&chem, 0, bytemuck::cast_slice(&initial_chem));
         let chem_frozen = Self::storage(
             &device,
             "xpbd-chem-frozen",
@@ -1454,7 +1500,8 @@ impl Solver for XpbdSolver {
             device,
             queue,
             params,
-            particle_count,
+            capacity,
+            active_count,
             num_cells,
             substeps: cfg.substeps.max(1),
             has_water,
@@ -1488,6 +1535,7 @@ impl Solver for XpbdSolver {
             cached_yield: 0.0,
             cached_tds: 0.0,
             initial_positions: positions,
+            phase_mirror: phases.clone(),
             initial_phases: phases,
             initial_chem,
         }
@@ -1498,11 +1546,16 @@ impl Solver for XpbdSolver {
     }
 
     fn step(&mut self, dt: f32, _input: &EmissionInput) {
+        // Pool invariant: the live set never exceeds the allocated capacity (U2's emit() clamps to it).
+        debug_assert!(self.active_count <= self.capacity);
         self.params.dt = dt / self.substeps as f32;
+        // The live set the kernels guard against (i >= particle_count returns) — refreshed each frame
+        // so pour-grown active_count takes effect (U2 wires emission before this upload).
+        self.params.particle_count = self.active_count;
         self.queue
             .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&self.params));
 
-        let np = groups(self.particle_count);
+        let np = groups(self.active_count);
         let nc = groups(self.num_cells);
         let mut cursor = 0u32;
         let mut labels: Vec<String> = Vec::new();
@@ -1632,7 +1685,7 @@ impl Solver for XpbdSolver {
                             0,
                             &self.vel_frozen,
                             0,
-                            (self.particle_count as u64) * 16,
+                            (self.active_count as u64) * 16,
                         );
                         pass(&mut enc, &p.drag_water, &b.drag_water, "drag_water", np);
                         pass(&mut enc, &p.drag_grain, &b.drag_grain, "drag_grain", np);
@@ -1663,7 +1716,7 @@ impl Solver for XpbdSolver {
                         0,
                         &self.vel_frozen,
                         0,
-                        (self.particle_count as u64) * 16,
+                        (self.active_count as u64) * 16,
                     );
                     pass(
                         &mut enc,
@@ -1727,7 +1780,7 @@ impl Solver for XpbdSolver {
                         0,
                         &self.vel,
                         0,
-                        (self.particle_count as u64) * 16,
+                        (self.active_count as u64) * 16,
                     );
                 }
 
@@ -1776,7 +1829,7 @@ impl Solver for XpbdSolver {
                         0,
                         &self.chem_frozen,
                         0,
-                        (self.particle_count as u64) * 16,
+                        (self.active_count as u64) * 16,
                     );
                     pass(&mut enc, &p.diss_count, &b.diss_count, "diss_count", np);
                     pass(
@@ -1801,7 +1854,7 @@ impl Solver for XpbdSolver {
                         0,
                         &self.chem_frozen,
                         0,
-                        (self.particle_count as u64) * 16,
+                        (self.active_count as u64) * 16,
                     );
                     pass(
                         &mut enc,
@@ -1832,7 +1885,7 @@ impl Solver for XpbdSolver {
 
     fn particles(&self) -> ParticleBuffers {
         ParticleBuffers {
-            particle_count: self.particle_count,
+            particle_count: self.active_count,
             position: Some(Arc::clone(&self.pos)),
             velocity: Some(Arc::clone(&self.vel)),
             phase_tag: Some(Arc::clone(&self.phase)),
@@ -1846,7 +1899,7 @@ impl Solver for XpbdSolver {
 
     fn metrics(&self) -> Metrics {
         Metrics {
-            particle_count: self.particle_count,
+            particle_count: self.active_count,
             iteration_count: self.cached_diag.effective_iters,
             extraction_yield: self.cached_yield,
             tds: self.cached_tds,

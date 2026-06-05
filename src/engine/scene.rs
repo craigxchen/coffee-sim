@@ -31,6 +31,10 @@ pub struct Scene {
     pub dose_g: f32,
     /// Brew water (milliliters) — placeholder for the recipe-driven scenes.
     pub water_ml: f32,
+    /// Water delivered by a continuous pour over the brew (mL). `0` = no pour (water comes only from
+    /// the seeded regions; the solver sizes its particle pool to exactly the seed). `> 0` opts a scene
+    /// into pour emission and sizes the pool with headroom for the dosed water. (Phase: pour emission.)
+    pub pour_water_ml: f32,
 
     /// Gravity vector (scene units / s²).
     pub gravity: [f32; 3],
@@ -50,6 +54,7 @@ impl Default for Scene {
         Self {
             dose_g: 0.0,
             water_ml: 0.0,
+            pour_water_ml: 0.0,
             gravity: [0.0, -20.0, 0.0],
             box_min: [0.0, 0.0, 0.0],
             box_max: [32.0, 40.0, 32.0],
@@ -75,6 +80,7 @@ impl Scene {
         Self {
             dose_g: 15.0,
             water_ml: 250.0,
+            pour_water_ml: 0.0, // fixed-column V60; the continuous-pour variant is `v60_pour()`
             gravity: [0.0, -20.0, 0.0],
             box_min: [-7.0, -10.0, -7.0],
             box_max: [7.0, 10.0, 7.0],
@@ -167,6 +173,12 @@ impl Scene {
             ],
             ..Self::default()
         }
+    }
+
+    /// Whether this scene injects water over the brew (pour emission). When true the solver sizes its
+    /// particle pool with headroom for `pour_water_ml`; when false the pool is exactly the seed.
+    pub fn declares_pour(&self) -> bool {
+        self.pour_water_ml > 0.0
     }
 }
 
