@@ -290,6 +290,13 @@ pub struct XpbdSolver {
     pos_readback: wgpu::Buffer,
     // The `solids` buffer (binding 19) is not held here: like dp / c_residual it lives only in the
     // collision bind groups, which keep its GPU resource alive (geometry is static, never re-uploaded).
+    // Phase 1.5 chem/thermal state: `chem` (b20, live) is retained for readback (yield/TDS), the
+    // snapshot copy, re-seeding, and exposure as concentration/temperature; `chem_frozen` (b22) is the
+    // per-substep snapshot the chem passes read.
+    chem: Arc<wgpu::Buffer>,
+    // Read by the chem passes' bind groups + the snapshot copy in U5/U6, which removes this allow.
+    #[allow(dead_code)]
+    chem_frozen: wgpu::Buffer,
     pipelines: Pipelines,
     bind_groups: BindGroups,
     ts: Option<Timestamps>,
@@ -298,9 +305,10 @@ pub struct XpbdSolver {
     cached_diag: XpbdDiagnostics,
     cached_passes: Vec<(String, f32)>,
 
-    // retained for reset (exact re-seed of the initial block + phase tags)
+    // retained for reset (exact re-seed of the initial block + phase tags + chem state)
     initial_positions: Vec<[f32; 4]>,
     initial_phases: Vec<u32>,
+    initial_chem: Vec<[f32; 4]>,
 }
 
 /// Seed the scene's initial particles on a jittered lattice, one block per region. Returns
@@ -359,6 +367,24 @@ fn seed_block(scene: &Scene, mats: &Materials, cfg: &Config) -> (Vec<[f32; 4]>, 
     (pos, phase)
 }
 
+/// Seed the per-particle chem/thermal state (Phase 1.5), one vec4 per particle matching the phase
+/// tags: grain = (s_f, s_s, T_g, _) with the soluble dose `soluble_fraction·grain_mass` split into the
+/// fast/slow pools; water = (c=0, T_w, _, _). Both species start at the pour temperature.
+fn seed_chem(phases: &[u32], mats: &Materials) -> Vec<[f32; 4]> {
+    let extractable = mats.soluble_fraction * mats.grain_mass;
+    let (s_f, s_s) = crate::models::extraction::split(extractable, mats.fast_fraction);
+    phases
+        .iter()
+        .map(|&ph| {
+            if ph == 1 {
+                [s_f, s_s, mats.pour_t, 0.0] // grain: two pools + grain temperature
+            } else {
+                [0.0, mats.pour_t, 0.0, 0.0] // water: concentration 0, water temperature
+            }
+        })
+        .collect()
+}
+
 impl XpbdSolver {
     fn storage(
         device: &wgpu::Device,
@@ -384,6 +410,9 @@ impl XpbdSolver {
         let zeros = vec![[0.0f32; 4]; self.particle_count as usize];
         self.queue
             .write_buffer(&self.vel, 0, bytemuck::cast_slice(&zeros));
+        // Re-seed chem/thermal state (pools, c=0, pour temperature) so a reset restarts the brew.
+        self.queue
+            .write_buffer(&self.chem, 0, bytemuck::cast_slice(&self.initial_chem));
     }
 
     /// Blocking GPU→CPU read-back of a `vec4` particle buffer (dev/test only — stalls).
@@ -430,6 +459,12 @@ impl XpbdSolver {
             .iter()
             .map(|p| p[3])
             .collect()
+    }
+
+    /// Read back the per-particle chem/thermal lanes (dev/test only — stalls the GPU): grain =
+    /// (s_f, s_s, T_g, _), water = (c, T_w, _, _). Used by the extraction tests + yield/TDS readout.
+    pub fn read_chem(&self) -> Vec<[f32; 4]> {
+        self.read_vec4(self.chem.as_ref())
     }
 
     /// Read back the predicted-position buffer (dev/test only — stalls the GPU). `pred.w` mirrors
@@ -786,6 +821,28 @@ impl Solver for XpbdSolver {
             contents: bytemuck::cast_slice(&packed),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
+        // Per-particle chem/thermal state (Phase 1.5), one vec4 per particle: grain lanes
+        // (s_f, s_s, T_g, _), water lanes (c, T_w, _, _). `chem` is the live buffer (binding 20,
+        // readback for yield/TDS + the snapshot copy); `chem_frozen` (binding 22) is the per-substep
+        // snapshot the dissolution/thermal passes read while writing the live buffer (no read/write
+        // race). Bound only by the chem passes (U5/U6); other kernels never touch it. Seeded per
+        // species: grains carry the soluble dose split into the two pools, water starts at c=0, pour T.
+        let initial_chem = seed_chem(&phases, mats);
+        let chem = Arc::new(
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("xpbd-chem"),
+                contents: bytemuck::cast_slice(&initial_chem),
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_SRC
+                    | wgpu::BufferUsages::COPY_DST,
+            }),
+        );
+        let chem_frozen = Self::storage(
+            &device,
+            "xpbd-chem-frozen",
+            vec4,
+            wgpu::BufferUsages::empty(),
+        );
         let status = Self::storage(
             &device,
             "xpbd-status",
@@ -1207,6 +1264,8 @@ impl Solver for XpbdSolver {
             status,
             status_readback,
             pos_readback,
+            chem,
+            chem_frozen,
             pipelines,
             bind_groups,
             ts,
@@ -1215,6 +1274,7 @@ impl Solver for XpbdSolver {
             cached_passes: Vec::new(),
             initial_positions: positions,
             initial_phases: phases,
+            initial_chem,
         }
     }
 
@@ -1501,6 +1561,10 @@ impl Solver for XpbdSolver {
             position: Some(Arc::clone(&self.pos)),
             velocity: Some(Arc::clone(&self.vel)),
             phase_tag: Some(Arc::clone(&self.phase)),
+            // The chem buffer carries both lanes: water concentration `c` (.x) and temperature `T`
+            // (.y). The renderer reads the relevant lane per field; both share the one buffer.
+            concentration: Some(Arc::clone(&self.chem)),
+            temperature: Some(Arc::clone(&self.chem)),
             ..Default::default()
         }
     }

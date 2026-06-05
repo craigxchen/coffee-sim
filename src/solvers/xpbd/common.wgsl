@@ -260,6 +260,51 @@ fn solid_union(p: vec3<f32>, phase: u32) -> SolidHit {
     return best;
 }
 
+// --- Phase 1.5 chem/thermal state + kinetics (mirrors models/extraction.rs + models/thermal.rs) ---
+// Per-particle vec4: grain (s_f, s_s, T_g, _), water (c, T_w, _, _). `chem` is the live buffer;
+// `chem_frozen` is the per-substep snapshot the dissolution/thermal passes read (so writes to live
+// `chem` don't race the reads). Referenced only by the chem passes (U5/U6).
+@group(0) @binding(20) var<storage, read_write> chem: array<vec4<f32>>;
+@group(0) @binding(22) var<storage, read> chem_frozen: array<vec4<f32>>;
+
+// Normalized Arrhenius (1 at t_ref, exponent-clamped for finiteness).
+fn ex_arrhenius(t: f32, ea_over_r: f32, t_ref: f32) -> f32 {
+    if (t <= 1e-6 || t_ref <= 1e-6) { return 1.0; }
+    let arg = -ea_over_r * (1.0 / t - 1.0 / t_ref);
+    return exp(clamp(arg, -30.0, 30.0));
+}
+fn ex_area(d_p: f32, d_ref: f32) -> f32 {
+    if (d_p <= 1e-6) { return 1.0; }
+    return d_ref / d_p;
+}
+fn ex_flux(u_rel: f32, u_half: f32) -> f32 {
+    let u = max(u_rel, 0.0);
+    return clamp(u / (u + max(u_half, 1e-6)), 0.0, 1.0);
+}
+fn ex_wet_gate(saturation: f32, s_on: f32) -> f32 {
+    if (s_on <= 1e-6) { return select(0.0, 1.0, saturation > 0.0); }
+    return smoothstep(0.0, s_on, saturation);
+}
+fn ex_driving(c: f32, c_sat: f32) -> f32 {
+    if (c_sat <= 1e-6) { return 0.0; }
+    return clamp(1.0 - c / c_sat, 0.0, 1.0);
+}
+fn ex_release(pool: f32, k_eff: f32, dt: f32) -> f32 {
+    let frac = 1.0 - exp(-max(k_eff, 0.0) * max(dt, 0.0));
+    return clamp(pool * frac, 0.0, max(pool, 0.0));
+}
+// Capacity-weighted pair heat from j into i, symmetrically clamped (antisymmetric → conserves energy).
+fn th_pair_heat(t_i: f32, c_i: f32, t_j: f32, c_j: f32, kappa: f32, dt: f32) -> f32 {
+    let sum = c_i + c_j;
+    if (sum <= 1e-6) { return 0.0; }
+    let raw = max(kappa, 0.0) * (t_j - t_i) * max(dt, 0.0);
+    let cap = (c_i * c_j / sum) * (t_j - t_i);
+    return clamp(raw, min(cap, 0.0), max(cap, 0.0));
+}
+fn th_ambient(t: f32, t_amb: f32, h_amb: f32, dt: f32) -> f32 {
+    return -clamp(h_amb * dt, 0.0, 1.0) * (t - t_amb);
+}
+
 fn w_poly6(r: f32, h: f32) -> f32 {
     if (r >= h) { return 0.0; }
     let t = h * h - r * r;
