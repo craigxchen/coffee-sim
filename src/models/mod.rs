@@ -63,6 +63,35 @@ pub struct Materials {
     pub s_peak: f32,
     /// Peak wet cohesion strength `c_max` (curve scale). 0 until calibrated to a wet-dome repose.
     pub c_max: f32,
+
+    // --- extraction / thermal (Phase 1.5) ---
+    /// Base fast/slow-pool dissolution rate constants (1/s). Fast = surfaces/fines, slow = interiors.
+    pub k0_fast: f32,
+    pub k0_slow: f32,
+    /// Arrhenius `Ea/R` (temperature sensitivity of extraction) and reference temperature
+    /// (`k_T(t_ref) = 1`). Temperatures are a normalized scale (pour ≈ `t_ref`, ambient below).
+    pub ea_over_r: f32,
+    pub t_ref: f32,
+    /// Max solute concentration `c_sat` (8% by mass; the `(1−c/c_sat)` driving force → 0 here).
+    pub c_sat: f32,
+    /// Fraction of the soluble dose in the fast pool, and the soluble fraction of the dry dose
+    /// (≈0.28 — only this much of a grain is extractable). Used to seed the grain pools.
+    pub fast_fraction: f32,
+    pub soluble_fraction: f32,
+    /// Reference grind diameter for the surface-area factor (`area ∝ d_ref/d_p`).
+    pub d_ref: f32,
+    /// Flux half-saturation for the flow→extraction bridge `u/(u+u_half)`.
+    pub u_half: f32,
+    /// Moisture-gate onset saturation (a grain below this is too dry to extract).
+    pub s_on: f32,
+    /// Thermal pair conductance `κ`, per-species specific heats (`C = mass·cp`), ambient heat-loss
+    /// rate, ambient temperature, and the initial brew-water (pour) temperature. Normalized scale.
+    pub kappa: f32,
+    pub cp_water: f32,
+    pub cp_grain: f32,
+    pub h_amb: f32,
+    pub t_amb: f32,
+    pub pour_t: f32,
 }
 
 impl Default for Materials {
@@ -90,6 +119,25 @@ impl Default for Materials {
             rho_ratio: 1.3,
             s_peak: 0.4,
             c_max: 0.0,
+            // Extraction/thermal (Phase 1.5) — KEEP.md §1 kinetics + a normalized thermal scale.
+            // These are reference values; calibration to the yield/TDS band is U7. Extraction is
+            // OFF until a scene sets Config.extract_rate > 0, so these defaults don't perturb suites.
+            k0_fast: 0.18,
+            k0_slow: 0.018,
+            ea_over_r: 6.0,
+            t_ref: 1.0,
+            c_sat: 0.08,
+            fast_fraction: 0.30,
+            soluble_fraction: 0.28,
+            d_ref: 1.0,
+            u_half: 1.0,
+            s_on: 0.1,
+            kappa: 2.0,
+            cp_water: 1.0,
+            cp_grain: 1.0,
+            h_amb: 0.02,
+            t_amb: 0.85,
+            pour_t: 1.0,
         }
     }
 }

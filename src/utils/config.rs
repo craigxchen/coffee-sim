@@ -91,6 +91,9 @@ pub struct Config {
     /// PBF skips a water particle's density contribution when `f_w ≤ this` (stability near the wet
     /// front). Larger than `absorb_roundoff`, so skipped water is still absorption-eligible. (step 4)
     pub pbf_eps: f32,
+    /// Extraction/thermal opt-in gate (step 5). 0 = the extraction + thermal passes don't run, so
+    /// existing scenes are byte-unchanged; a brew scene sets it > 0 to enable dissolution kinetics.
+    pub extract_rate: f32,
 }
 
 impl Default for Config {
@@ -151,6 +154,8 @@ impl Default for Config {
             absorb_rate: 0.0,
             absorb_roundoff: 1.0e-3,
             pbf_eps: 0.05,
+            // Extraction/thermal OFF by default (step 5; like absorb_rate): a brew scene opts in.
+            extract_rate: 0.0,
         }
     }
 }

@@ -85,10 +85,27 @@ struct Params {
     k_abs: f32,           // absorption rate constant (1/s)
     absorb_roundoff: f32, // f_w deactivation floor (exact-conservation; ≪ pbf_eps)
     pbf_eps: f32,         // PBF skips water with remaining fraction ≤ this
+    // --- extraction + thermal (Phase 1.5) ---
+    extract_rate: f32, // opt-in gate (0 = extraction/thermal off; existing scenes byte-unchanged)
+    k0_fast: f32,      // base fast-pool dissolution rate (1/s)
+    k0_slow: f32,      // base slow-pool dissolution rate (1/s)
+    ea_over_r: f32,    // Arrhenius Ea/R (temperature sensitivity)
+    t_ref: f32,        // Arrhenius reference temperature (k_T(t_ref)=1)
+    c_sat: f32,        // max solute concentration (driving force → 0 here)
+    d_ref: f32,        // reference grind diameter for surface area ∝ 1/d
+    u_half: f32,       // flux half-saturation (saturating flow→extraction bridge)
+    s_on: f32,         // moisture-gate onset saturation (dry grain doesn't extract)
+    kappa: f32,        // thermal conductance (pair heat κ)
+    cp_water: f32,     // water specific heat (C_water = particle_mass·f_w·cp_water)
+    cp_grain: f32,     // grain specific heat (C_grain = grain_eff_mass·cp_grain)
+    h_amb: f32,        // ambient heat-loss rate
+    t_amb: f32,        // ambient temperature
+    _pad_chem0: f32,
+    _pad_chem1: f32,
 }
 
 // Params is uploaded as a uniform and must stay byte-identical to the WGSL `Params`.
-const _: () = assert!(std::mem::size_of::<Params>() == 256);
+const _: () = assert!(std::mem::size_of::<Params>() == 320);
 
 /// GPU record for one static SDF solid — byte-identical to the WGSL `Primitive` (64 bytes,
 /// vec4-aligned). Cone radii in `a` are OUTER wall radii; the cavity surface is `outer − thickness`.
@@ -641,6 +658,23 @@ impl Solver for XpbdSolver {
             k_abs: cfg.absorb_rate,
             absorb_roundoff: cfg.absorb_roundoff,
             pbf_eps: cfg.pbf_eps,
+            // --- extraction + thermal (Phase 1.5) ---
+            extract_rate: cfg.extract_rate,
+            k0_fast: mats.k0_fast,
+            k0_slow: mats.k0_slow,
+            ea_over_r: mats.ea_over_r,
+            t_ref: mats.t_ref,
+            c_sat: mats.c_sat,
+            d_ref: mats.d_ref,
+            u_half: mats.u_half,
+            s_on: mats.s_on,
+            kappa: mats.kappa,
+            cp_water: mats.cp_water,
+            cp_grain: mats.cp_grain,
+            h_amb: mats.h_amb,
+            t_amb: mats.t_amb,
+            _pad_chem0: 0.0,
+            _pad_chem1: 0.0,
         };
 
         let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
