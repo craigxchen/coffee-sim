@@ -64,6 +64,7 @@ fn main() {
     let cone_scene = Scene {
         dose_g: 0.0,
         water_ml: 0.0,
+        pour_water_ml: 0.0,
         gravity: [0.0, -20.0, 0.0],
         box_min: [-6.0, -2.0, -6.0],
         box_max: [6.0, 12.0, 6.0],
@@ -82,6 +83,7 @@ fn main() {
     let cup_scene = Scene {
         dose_g: 0.0,
         water_ml: 0.0,
+        pour_water_ml: 0.0,
         gravity: [0.0, -20.0, 0.0],
         box_min: [-5.0, -2.0, -5.0],
         box_max: [5.0, 12.0, 5.0],

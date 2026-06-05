@@ -59,6 +59,7 @@ fn single_water_particle_rests_on_the_floor() {
     let scene = Scene {
         dose_g: 0.0,
         water_ml: 0.0,
+        pour_water_ml: 0.0,
         gravity: [0.0, -20.0, 0.0],
         box_min: [-5.0, -2.0, -5.0],
         box_max: [5.0, 12.0, 5.0],
@@ -124,6 +125,7 @@ fn water_in_cone_settles_without_bouncing() {
     let scene = Scene {
         dose_g: 0.0,
         water_ml: 0.0,
+        pour_water_ml: 0.0,
         gravity: [0.0, -20.0, 0.0],
         box_min: [-7.0, -10.0, -7.0],
         box_max: [7.0, 10.0, 7.0],
@@ -173,6 +175,7 @@ fn grains_rest_in_cone_without_penetration() {
     let scene = Scene {
         dose_g: 0.0,
         water_ml: 0.0,
+        pour_water_ml: 0.0,
         gravity: [0.0, -20.0, 0.0],
         box_min: [-6.0, -2.0, -6.0],
         box_max: [6.0, 12.0, 6.0],
