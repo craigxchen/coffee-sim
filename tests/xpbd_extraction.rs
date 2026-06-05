@@ -219,8 +219,17 @@ fn dry_grain_does_not_extract() {
         solver.step(DT, &EmissionInput::default());
     }
     let after = solver.read_chem();
-    for (i, (a, b)) in before.iter().zip(&after).enumerate() {
-        assert_eq!(a, b, "dry grain extracted at particle {i}");
+    // Only the SOLUTE lanes must be frozen (the thermal pass legitimately evolves the T lanes):
+    // grain pools (.x,.y) and water concentration (.x) unchanged.
+    for (i, ((a, b), &ph)) in before.iter().zip(&after).zip(&phase).enumerate() {
+        if ph == 1 {
+            assert_eq!((a[0], a[1]), (b[0], b[1]), "dry grain pools changed at {i}");
+        } else {
+            assert_eq!(
+                a[0], b[0],
+                "water gained concentration from dry grains at {i}"
+            );
+        }
     }
 }
 
@@ -516,5 +525,168 @@ fn cpu_gpu_parity_single_pair() {
     assert!(
         (grain_loss - water_gain).abs() <= 1.0e-6,
         "pair not conserved: grain lost {grain_loss}, water gained {water_gain}"
+    );
+}
+
+// --- U6: thermal exchange + temperature-gated extraction -----------------------------------------
+
+/// Enthalpy `Σ C_i·T_i` with dry grains (`V_abs=0`) + full water (`f_w=1`): C_water =
+/// particle_mass·cp_water, C_grain = grain_mass·cp_grain.
+fn enthalpy(chem: &[[f32; 4]], phase: &[u32], mats: &Materials) -> f32 {
+    chem.iter()
+        .zip(phase)
+        .map(|(c, &ph)| {
+            if ph == 1 {
+                mats.grain_mass * mats.cp_grain * c[2] // grain T at .z
+            } else {
+                mats.particle_mass * mats.cp_water * c[1] // water T at .y
+            }
+        })
+        .sum()
+}
+
+/// Seed temperatures: water hot, grain cool (dry grains, so dissolution is a no-op and only thermal
+/// exchange acts).
+fn seed_temperatures(solver: &XpbdSolver, phase: &[u32], t_water: f32, t_grain: f32) {
+    let mut chem = solver.read_chem();
+    for (c, &ph) in chem.iter_mut().zip(phase) {
+        if ph == 1 {
+            c[2] = t_grain;
+        } else {
+            c[1] = t_water;
+        }
+    }
+    solver.write_chem_for_test(&chem);
+}
+
+/// THE thermal gate: with deliberately UNEQUAL heat capacities and ambient loss off, total enthalpy
+/// `Σ C_i·T_i` is invariant across exchange (a plain symmetric ΔT would fail this).
+#[test]
+fn thermal_exchange_conserves_enthalpy_with_unequal_capacities() {
+    let Some(gpu) = GpuContext::new_headless() else {
+        eprintln!("xpbd_extraction: no GPU adapter; skipping.");
+        return;
+    };
+    // Deliberately unequal capacities: C_grain = 1.5·2.0 = 3.0 vs C_water = 1.0·1.0 = 1.0. Ambient
+    // OFF (h_amb=0) so the only temperature change is the pairwise (antisymmetric) exchange.
+    let mats = Materials {
+        cp_grain: 2.0,
+        h_amb: 0.0,
+        ..Materials::default()
+    };
+    let mut solver = XpbdSolver::build(&wet_blob_scene(), &mats, &extract_isolation_config(), &gpu);
+    let phase = solver.read_phases();
+    seed_temperatures(&solver, &phase, 1.0, 0.4); // hot water, cool (dry) grains
+
+    let initial = enthalpy(&solver.read_chem(), &phase, &mats);
+    for step in 0..40 {
+        solver.step(DT, &EmissionInput::default());
+        let h = enthalpy(&solver.read_chem(), &phase, &mats);
+        assert!(
+            (h - initial).abs() <= 1.0e-4 * initial.max(1.0),
+            "enthalpy leaked at step {step}: {initial} -> {h}"
+        );
+    }
+
+    // ...and exchange was non-trivial: the hot/cool spread shrank toward equilibrium.
+    let chem = solver.read_chem();
+    let (mut min_t, mut max_t) = (f32::MAX, f32::MIN);
+    for (c, &ph) in chem.iter().zip(&phase) {
+        let t = if ph == 1 { c[2] } else { c[1] };
+        min_t = min_t.min(t);
+        max_t = max_t.max(t);
+    }
+    assert!(
+        max_t - min_t < 0.6 - 0.01,
+        "temperatures did not relax (spread {} ~ initial 0.6)",
+        max_t - min_t
+    );
+}
+
+/// Relaxation + ambient: a hot blob converges toward equilibrium, and ambient loss cools the whole
+/// system toward `t_amb`.
+#[test]
+fn thermal_relaxes_and_ambient_cools_toward_t_amb() {
+    let Some(gpu) = GpuContext::new_headless() else {
+        eprintln!("xpbd_extraction: no GPU adapter; skipping.");
+        return;
+    };
+    // Ambient ON, pulling everything toward t_amb=0.5 from a uniformly hot start.
+    let mats = Materials {
+        h_amb: 0.1,
+        t_amb: 0.5,
+        ..Materials::default()
+    };
+    let mut solver = XpbdSolver::build(&wet_blob_scene(), &mats, &extract_isolation_config(), &gpu);
+    let phase = solver.read_phases();
+    seed_temperatures(&solver, &phase, 1.0, 1.0); // uniformly hot
+
+    let mean_t = |solver: &XpbdSolver| -> f32 {
+        let chem = solver.read_chem();
+        let sum: f32 = chem
+            .iter()
+            .zip(&phase)
+            .map(|(c, &ph)| if ph == 1 { c[2] } else { c[1] })
+            .sum();
+        sum / chem.len() as f32
+    };
+
+    let t0 = mean_t(&solver);
+    for _ in 0..100 {
+        solver.step(DT, &EmissionInput::default());
+    }
+    let t1 = mean_t(&solver);
+
+    // Cooled toward t_amb but not past it.
+    assert!(
+        t1 < t0 - 0.05 && t1 > mats.t_amb - 0.01,
+        "ambient cooling off: {t0} -> {t1} (t_amb {})",
+        mats.t_amb
+    );
+}
+
+/// R9: a cooler pour extracts less. Two brews identical but for `pour_t` → lower yield at lower T
+/// (the dissolution `k_T` Arrhenius reads the grain temperature).
+#[test]
+fn cooler_pour_lowers_extraction() {
+    let Some(gpu) = GpuContext::new_headless() else {
+        eprintln!("xpbd_extraction: no GPU adapter; skipping.");
+        return;
+    };
+    let scene = Scene {
+        gravity: [0.0, 0.0, 0.0],
+        box_min: [0.0, 0.0, 0.0],
+        box_max: [8.0, 8.0, 8.0],
+        regions: vec![
+            point([4.0, 4.0, 4.0], Species::Grain),
+            point([4.5, 4.0, 4.0], Species::Water),
+        ],
+        ..Scene::default()
+    };
+    // Returns total water solute extracted after N steps at pour temperature `pour_t`. Ambient off
+    // so the grain temperature stays at pour_t (water+grain seeded equal ⇒ no internal gradient),
+    // isolating the Arrhenius temperature dependence.
+    let run = |pour_t: f32| -> f32 {
+        let mats = Materials {
+            pour_t,
+            h_amb: 0.0,
+            ..Materials::default()
+        };
+        let v_cap = capacity(&mats);
+        let mut solver = XpbdSolver::build(&scene, &mats, &extract_isolation_config(), &gpu);
+        let phase = solver.read_phases();
+        prewet(&solver, &phase, 0.8, v_cap);
+        seed_water_flow(&solver, &phase, 0.5);
+        for _ in 0..10 {
+            solver.step(DT, &EmissionInput::default());
+        }
+        let v_w = solver.water_particle_volume();
+        solver.read_chem()[1][0] * v_w // water solute (c·V_w, f_w=1)
+    };
+    let hot = run(1.0);
+    let cool = run(0.7);
+    assert!(
+        hot > 1.0e-6 && cool < hot - 1.0e-7,
+        "cooler pour did not lower extraction: hot {hot}, cool {cool}"
     );
 }
