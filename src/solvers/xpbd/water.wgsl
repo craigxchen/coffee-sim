@@ -178,6 +178,11 @@ fn xsph(@builtin(global_invocation_id) gid: vec3<u32>) {
     let xi = pos[i].xyz;
     let vi = vel[i].xyz;
     var dv = vec3<f32>(0.0);
+    // Per-particle volume V_w = m/ρ₀ normalizes the kernel sum (standard XSPH: Δv = c·Σ (m_j/ρ_j)
+    // (v_j−v_i) W). Without it, Σ W_poly6 ∝ 1/h³ grows as the resolution refines, so a fixed xsph_c
+    // overshoots (amplifies velocity instead of smoothing it) at fine spacing — a resolution-dependent
+    // eruption. With it, Σ V_w·W ≈ 1 (dimensionless), so xsph_c behaves consistently at any spacing.
+    let v_w = params.particle_mass / params.rest_density;
 
     let base = cell_coord(xi);
     for (var dz = -1; dz <= 1; dz = dz + 1) {
@@ -196,7 +201,7 @@ fn xsph(@builtin(global_invocation_id) gid: vec3<u32>) {
                     let d = xi - pos[j].xyz;
                     let r = length(d);
                     if (r >= h) { continue; }
-                    dv = dv + (vel[j].xyz - vi) * w_poly6(r, h);
+                    dv = dv + (vel[j].xyz - vi) * (w_poly6(r, h) * v_w);
                 }
             }
         }

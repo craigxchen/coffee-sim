@@ -557,3 +557,56 @@ fn v60_pour_emission_is_deterministic() {
         "yield not sane across runs: {y1}, {y2}"
     );
 }
+
+/// Regression for the XSPH resolution-normalization bug: emitting water at FINE spacing into the full
+/// solve must stay velocity-bounded (≤ max_speed). Before the fix, the unnormalized XSPH sum (∝1/h³)
+/// overshot at fine spacing and amplified velocity post-clamp — vmax exploded to 10^5+ and the inlet
+/// sprayed everywhere. The default-spacing `emission_into_full_solve_does_not_erupt` missed it because
+/// at spacing 1.0 the kernel sum is tame.
+#[test]
+fn fine_resolution_emission_stays_bounded() {
+    let Some(gpu) = GpuContext::new_headless() else {
+        eprintln!("xpbd_emission: no GPU adapter; skipping.");
+        return;
+    };
+    // Fine water (spacing 0.15) — the regime that erupted before the XSPH normalization fix.
+    let s = 0.15;
+    let mats = Materials {
+        particle_spacing: s,
+        support_radius: 2.0 * s,
+        grain_diameter: 2.0 * s,
+        ..Materials::default()
+    };
+    let cfg = Config::default(); // full water solve (incl. XSPH) on
+    let scene = Scene {
+        pour_water_ml: 3000.0,
+        gravity: [0.0, -20.0, 0.0],
+        box_min: [0.0, 0.0, 0.0],
+        box_max: [6.0, 12.0, 6.0],
+        regions: vec![],
+        ..Scene::default()
+    };
+    let mut solver = XpbdSolver::build(&scene, &mats, &cfg, &gpu);
+    for _ in 0..240 {
+        solver.step(DT, &pour([3.0, 10.0, 3.0], 8.0));
+    }
+    assert!(
+        solver.active_count() > 500,
+        "too little emitted ({}) to stress the inlet",
+        solver.active_count()
+    );
+    let pos = solver.read_positions();
+    let vel = solver.read_velocities();
+    assert!(
+        pos.iter().all(|p| p.iter().all(|c| c.is_finite())),
+        "non-finite position at fine resolution (eruption)"
+    );
+    let vmax = vel
+        .iter()
+        .map(|v| (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt())
+        .fold(0.0f32, f32::max);
+    assert!(
+        vmax <= cfg.max_speed + 1.0,
+        "fine-resolution emission velocity blew past max_speed (XSPH normalization regression): vmax {vmax}"
+    );
+}
