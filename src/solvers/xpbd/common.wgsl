@@ -266,6 +266,10 @@ fn solid_union(p: vec3<f32>, phase: u32) -> SolidHit {
 // `chem` don't race the reads). Referenced only by the chem passes (U5/U6).
 @group(0) @binding(20) var<storage, read_write> chem: array<vec4<f32>>;
 @group(0) @binding(22) var<storage, read> chem_frozen: array<vec4<f32>>;
+// Per-particle dissolution scratch (b21): grain → (N_w eligible-water count, flux_g aggregate relative
+// speed), water → (N_g eligible-grain count, _). Written by diss_count, read by both transfer passes so
+// each recomputes the identical per-grain release/take. Transient within the extraction sub-stage.
+@group(0) @binding(21) var<storage, read_write> diss_neighbors: array<vec2<f32>>;
 
 // Normalized Arrhenius (1 at t_ref, exponent-clamped for finiteness).
 fn ex_arrhenius(t: f32, ea_over_r: f32, t_ref: f32) -> f32 {

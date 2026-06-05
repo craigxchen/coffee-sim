@@ -202,6 +202,9 @@ struct Pipelines {
     wet_count: wgpu::ComputePipeline,
     wet_water: wgpu::ComputePipeline,
     wet_grain: wgpu::ComputePipeline,
+    diss_count: wgpu::ComputePipeline,
+    dissolve_grain: wgpu::ComputePipeline,
+    dissolve_water: wgpu::ComputePipeline,
     apply_dp: wgpu::ComputePipeline,
     finalize: wgpu::ComputePipeline,
     xsph: wgpu::ComputePipeline,
@@ -229,6 +232,9 @@ struct BindGroups {
     wet_count: wgpu::BindGroup,
     wet_water: wgpu::BindGroup,
     wet_grain: wgpu::BindGroup,
+    diss_count: wgpu::BindGroup,
+    dissolve_grain: wgpu::BindGroup,
+    dissolve_water: wgpu::BindGroup,
     apply_dp: wgpu::BindGroup,
     finalize: wgpu::BindGroup,
     xsph: wgpu::BindGroup,
@@ -294,8 +300,7 @@ pub struct XpbdSolver {
     // snapshot copy, re-seeding, and exposure as concentration/temperature; `chem_frozen` (b22) is the
     // per-substep snapshot the chem passes read.
     chem: Arc<wgpu::Buffer>,
-    // Read by the chem passes' bind groups + the snapshot copy in U5/U6, which removes this allow.
-    #[allow(dead_code)]
+    // The per-substep snapshot the dissolution/thermal passes read while writing the live `chem`.
     chem_frozen: wgpu::Buffer,
     pipelines: Pipelines,
     bind_groups: BindGroups,
@@ -488,6 +493,35 @@ impl XpbdSolver {
         );
         self.queue
             .write_buffer(&self.vel, 0, bytemuck::cast_slice(velocities));
+    }
+
+    /// Overwrite the per-particle chem/thermal lanes (dev/test only): grain = (s_f, s_s, T_g, _),
+    /// water = (c, T_w, _, _). Lets a test pre-seed a saturated water field or a known thermal state.
+    pub fn write_chem_for_test(&self, chem: &[[f32; 4]]) {
+        assert_eq!(
+            chem.len(),
+            self.particle_count as usize,
+            "chem seed length must match particle count"
+        );
+        self.queue
+            .write_buffer(self.chem.as_ref(), 0, bytemuck::cast_slice(chem));
+    }
+
+    /// Overwrite the per-particle moisture lane `pos.w` (dev/test only): water `f_w`, grain `V_abs`.
+    /// Lets a test pre-wet grains so the dissolution pass runs with `absorb_rate=0` (constant `f_w`),
+    /// isolating solute conservation from the wetting volume transfer.
+    pub fn write_moisture_for_test(&self, moisture: &[f32]) {
+        let mut pos = self.read_vec4(self.pos.as_ref());
+        assert_eq!(
+            pos.len(),
+            moisture.len(),
+            "moisture seed length must match particle count"
+        );
+        for (p, &m) in pos.iter_mut().zip(moisture) {
+            p[3] = m;
+        }
+        self.queue
+            .write_buffer(self.pos.as_ref(), 0, bytemuck::cast_slice(&pos));
     }
 
     /// Overwrite current water Lagrange multipliers (dev/test only).
@@ -843,6 +877,15 @@ impl Solver for XpbdSolver {
             vec4,
             wgpu::BufferUsages::empty(),
         );
+        // Per-particle dissolution scratch (binding 21), one vec2<f32> each: grain → (N_w, flux_g),
+        // water → (N_g, _). Written by diss_count, read by both transfer passes. Bound only by the
+        // dissolution passes (U5).
+        let diss_neighbors = Self::storage(
+            &device,
+            "xpbd-diss-neighbors",
+            n * 8,
+            wgpu::BufferUsages::empty(),
+        );
         let status = Self::storage(
             &device,
             "xpbd-status",
@@ -867,12 +910,13 @@ impl Solver for XpbdSolver {
         // Params/Status/bindings + shared kernels; `water`/`bed`/`coupling`/`wetting` add the
         // per-species + interphase solves. Module-scope declarations are order-independent.
         let shader_src = format!(
-            "{}\n{}\n{}\n{}\n{}",
+            "{}\n{}\n{}\n{}\n{}\n{}",
             include_str!("common.wgsl"),
             include_str!("water.wgsl"),
             include_str!("bed.wgsl"),
             include_str!("coupling.wgsl"),
             include_str!("wetting.wgsl"),
+            include_str!("extraction.wgsl"),
         );
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("xpbd"),
@@ -910,6 +954,9 @@ impl Solver for XpbdSolver {
             wet_count: make("wet_count"),
             wet_water: make("wet_water"),
             wet_grain: make("wet_grain"),
+            diss_count: make("diss_count"),
+            dissolve_grain: make("dissolve_grain"),
+            dissolve_water: make("dissolve_water"),
             apply_dp: make("apply_dp"),
             finalize: make("finalize"),
             xsph: make("xsph"),
@@ -1164,6 +1211,44 @@ impl Solver for XpbdSolver {
                     (9, &sorted_indices),
                     (11, &phase),
                     (17, &wet_count),
+                ],
+            ),
+            diss_count: bg(
+                &pipelines.diss_count,
+                &[
+                    (0, &params_buf),
+                    (1, &pos),
+                    (3, &vel),
+                    (8, &cell_start),
+                    (9, &sorted_indices),
+                    (11, &phase),
+                    (21, &diss_neighbors),
+                ],
+            ),
+            dissolve_grain: bg(
+                &pipelines.dissolve_grain,
+                &[
+                    (0, &params_buf),
+                    (1, &pos),
+                    (8, &cell_start),
+                    (9, &sorted_indices),
+                    (11, &phase),
+                    (20, &chem),
+                    (21, &diss_neighbors),
+                    (22, &chem_frozen),
+                ],
+            ),
+            dissolve_water: bg(
+                &pipelines.dissolve_water,
+                &[
+                    (0, &params_buf),
+                    (1, &pos),
+                    (8, &cell_start),
+                    (9, &sorted_indices),
+                    (11, &phase),
+                    (20, &chem),
+                    (21, &diss_neighbors),
+                    (22, &chem_frozen),
                 ],
             ),
             apply_dp: bg(
@@ -1535,6 +1620,49 @@ impl Solver for XpbdSolver {
                     pass(&mut enc, &p.wet_count, &b.wet_count, "wet_count", np);
                     pass(&mut enc, &p.wet_water, &b.wet_water, "wet_water", np);
                     pass(&mut enc, &p.wet_grain, &b.wet_grain, "wet_grain", np);
+                }
+
+                // Extraction / dissolution (mixed scenes; opt-in via extract_rate>0). Wet grains
+                // dissolve two-pool solute into overlapping water's concentration, conserving the
+                // solute inventory exactly. Reads the frozen pred.w moisture (same snapshot wetting
+                // used) + a frozen chem copy; writes only the live chem buffer. Rebuilds the grid
+                // itself so it's independent of the wetting block's gate.
+                if mixed && self.params.extract_rate > 0.0 {
+                    pass(&mut enc, &p.grid_clear, &b.grid_clear, "grid_clear", nc);
+                    pass(&mut enc, &p.grid_count, &b.grid_count, "grid_count", np);
+                    pass(&mut enc, &p.grid_scan, &b.grid_scan, "grid_scan", 1);
+                    pass(&mut enc, &p.grid_clear, &b.grid_clear, "grid_clear", nc);
+                    pass(
+                        &mut enc,
+                        &p.grid_scatter,
+                        &b.grid_scatter,
+                        "grid_scatter",
+                        np,
+                    );
+                    // Snapshot the live chem so both transfer passes read a frozen state while
+                    // writing disjoint slots of the live buffer (race-free conservation).
+                    enc.copy_buffer_to_buffer(
+                        self.chem.as_ref(),
+                        0,
+                        &self.chem_frozen,
+                        0,
+                        (self.particle_count as u64) * 16,
+                    );
+                    pass(&mut enc, &p.diss_count, &b.diss_count, "diss_count", np);
+                    pass(
+                        &mut enc,
+                        &p.dissolve_grain,
+                        &b.dissolve_grain,
+                        "dissolve_grain",
+                        np,
+                    );
+                    pass(
+                        &mut enc,
+                        &p.dissolve_water,
+                        &b.dissolve_water,
+                        "dissolve_water",
+                        np,
+                    );
                 }
             }
         }
