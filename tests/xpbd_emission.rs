@@ -428,3 +428,132 @@ fn reset_event_clears_emitter_backlog() {
         "Reset event should not emit; backlog must be cleared, not drained"
     );
 }
+
+// --- U4: V60 pour scene + integration gates ------------------------------------------------------
+
+/// Build the V60 pour brew (calibrated permeable bed + wetting + extraction on).
+fn v60_pour_solver(gpu: &GpuContext) -> XpbdSolver {
+    let mats = Materials {
+        particle_spacing: 0.5,
+        support_radius: 1.0,
+        grain_diameter: 1.0,
+        water_grain_distance: 0.35,
+        grain_mass: 10.0,
+        ..Materials::default()
+    };
+    let cfg = Config {
+        absorb_rate: 0.5,
+        extract_rate: 1.0,
+        ..Config::default()
+    };
+    XpbdSolver::build(&Scene::v60_pour(), &mats, &cfg, gpu)
+}
+
+/// Integration gate: poured water threads the bed and reaches the cup, yield rises over the brew,
+/// the pool capacity is honored, the run stays finite, and water VOLUME is conserved under the source
+/// (emitted = in-domain water + absorbed-into-grains).
+#[test]
+fn v60_pour_through_rises_and_conserves() {
+    let Some(gpu) = GpuContext::new_headless() else {
+        eprintln!("xpbd_emission: no GPU adapter; skipping.");
+        return;
+    };
+    let mut solver = v60_pour_solver(&gpu);
+    let cap = solver.pool_capacity();
+    let v_w = solver.water_particle_volume();
+    let rho_w = 1.0 / v_w; // particle_mass = 1
+    assert!(cap > 0);
+    let kettle = [0.0, 2.5, 0.0];
+    let flow = 8.0; // sim-volume/s (raw EmissionInput.flow_rate; the example's mL/s is /5.20 of this)
+
+    let mut yields = Vec::new();
+    for step in 1..=900 {
+        solver.step(DT, &pour(kettle, flow));
+        assert!(
+            solver.active_count() <= cap,
+            "active_count {} exceeded pool capacity {cap}",
+            solver.active_count()
+        );
+        if step % 300 == 0 {
+            solver.sample_diagnostics();
+            yields.push(solver.metrics().extraction_yield);
+        }
+    }
+    solver.sample_diagnostics();
+    let m = solver.metrics();
+
+    // Pour-through: water reached the cup (TDS readout is cup-region only ⇒ nonzero means cup water).
+    assert!(m.tds > 0.0, "no water reached the cup (TDS still 0)");
+    // Yield rose over the brew and is finite/positive (absolute band is deferred calibration).
+    let last_yield = *yields.last().unwrap();
+    assert!(
+        last_yield > yields[0] && last_yield > 0.0,
+        "yield did not rise over the pour: {yields:?}"
+    );
+    // Stability.
+    let pos = solver.read_positions();
+    assert!(
+        pos.iter()
+            .all(|p| p[0].is_finite() && p[1].is_finite() && p[2].is_finite()),
+        "non-finite position during pour brew"
+    );
+    // Water-volume conservation under the source: emitted = in-domain water + absorbed-into-grains.
+    let phase = solver.read_phases();
+    let moisture = solver.read_moisture();
+    let emitted_vol = solver.total_emitted_water_mass() / rho_w;
+    let mut in_domain = 0.0f32;
+    for (&ph, &mw) in phase.iter().zip(&moisture) {
+        in_domain += if ph == 0 { mw * v_w } else { mw }; // water f_w·V_w; grain V_abs
+    }
+    assert!(emitted_vol > 0.0, "nothing emitted");
+    assert!(
+        (in_domain - emitted_vol).abs() <= 0.02 * emitted_vol,
+        "water not conserved under pour: emitted {emitted_vol} vs in-domain {in_domain}"
+    );
+    // Grains stayed trapped in the bed (mean grain y near its seeded band, not drained to the cup).
+    let mean_grain_y: f32 = phase
+        .iter()
+        .zip(&pos)
+        .filter(|(&p, _)| p == 1)
+        .map(|(_, p)| p[1])
+        .sum::<f32>()
+        / phase.iter().filter(|&&p| p == 1).count().max(1) as f32;
+    assert!(
+        mean_grain_y > -3.0,
+        "grains washed out of the bed (mean y {mean_grain_y})"
+    );
+}
+
+/// Determinism of the pour MECHANISM: emission is CPU-side (deterministic cursor + accumulator,
+/// independent of the GPU solve), so the emitted particle count is bit-exact across identical runs.
+/// The downstream yield is NOT asserted bit/band-equal: it comes from the mixed GPU solve, which is
+/// chaotic and not bit-reproducible (grid-scatter atomic order varies — documented project-wide; the
+/// bed suite gates only loose aggregate bands for the same reason). Here we just sanity-check yield is
+/// finite + positive in both runs.
+#[test]
+fn v60_pour_emission_is_deterministic() {
+    let Some(gpu) = GpuContext::new_headless() else {
+        eprintln!("xpbd_emission: no GPU adapter; skipping.");
+        return;
+    };
+    // `flow` here is sim-volume/s (the raw EmissionInput.flow_rate), NOT mL/s — the example's `FLOW`
+    // is mL/s and divides by 5.20 first.
+    let run = || {
+        let mut solver = v60_pour_solver(&gpu);
+        for _ in 0..300 {
+            solver.step(DT, &pour([0.0, 2.5, 0.0], 8.0));
+        }
+        solver.sample_diagnostics();
+        (solver.active_count(), solver.metrics().extraction_yield)
+    };
+    let (n1, y1) = run();
+    let (n2, y2) = run();
+    assert_eq!(
+        n1, n2,
+        "emitted count not deterministic (CPU-side emission must be bit-exact)"
+    );
+    assert!(
+        y1.is_finite() && y1 > 0.0 && y2.is_finite() && y2 > 0.0,
+        "yield not sane across runs: {y1}, {y2}"
+    );
+}
