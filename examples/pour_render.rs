@@ -1,0 +1,209 @@
+//! Offscreen VISUAL of the V60 continuous pour: water is injected at the kettle over the brew,
+//! threads the (invisible) grain bed in the cone, drains through the apex, and pools in the cup.
+//! The renderer draws only particles — water (blue) + grains (brown, darkening as they wet) — so the
+//! invisible cone/cup geometry reads from the shapes the particles take. Writes PPM frames to
+//! /tmp/coffee-pour/ at several timepoints across the brew.
+//!
+//! Run: `cargo run --release --example pour_render`  (env: `FLOW=` mL/s).
+
+use coffee_sim::emission::pour::{PourCommand, PourPattern, PourScript};
+use coffee_sim::emission::{EmissionInput, PourEvent};
+use coffee_sim::engine::Scene;
+use coffee_sim::models::Materials;
+use coffee_sim::solvers::base::Solver;
+use coffee_sim::solvers::xpbd::XpbdSolver;
+use coffee_sim::ui::{OrbitCamera, Renderer};
+use coffee_sim::utils::config::Config;
+use coffee_sim::utils::gpu::GpuContext;
+use glam::Vec3;
+
+const W: u32 = 768; // multiple of 64 so bytes_per_row (W·4) respects the 256-byte copy alignment
+const H: u32 = 768;
+const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
+const ML_PER_SIM_UNIT3: f32 = 5.20;
+
+fn env_f32(key: &str, default: f32) -> f32 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+fn pour_input(script: &PourScript, t: f32, bed_radius: f32, kettle_y: f32) -> EmissionInput {
+    let (nx, nz, flow_ml) = script.sample(t);
+    EmissionInput {
+        kettle_pos: [nx * bed_radius, kettle_y, nz * bed_radius],
+        flow_rate: flow_ml / ML_PER_SIM_UNIT3,
+        pour_angle: 0.0,
+        event: PourEvent::None,
+    }
+}
+
+fn main() {
+    let Some(gpu) = GpuContext::new_headless() else {
+        eprintln!("pour_render: no GPU adapter; cannot run.");
+        return;
+    };
+    std::fs::create_dir_all("/tmp/coffee-pour").unwrap();
+
+    let mats = Materials {
+        particle_spacing: 0.5,
+        support_radius: 1.0,
+        grain_diameter: 1.0,
+        water_grain_distance: 0.35,
+        grain_mass: 10.0,
+        ..Materials::default()
+    };
+    let cfg = Config {
+        absorb_rate: 0.5,
+        extract_rate: 1.0,
+        ..Config::default()
+    };
+    let flow = env_f32("FLOW", 12.0);
+    let script = PourScript {
+        commands: vec![
+            PourCommand {
+                t_start: 0.0,
+                t_end: 2.5,
+                flow_rate: flow,
+                pattern: PourPattern::Center,
+            },
+            PourCommand {
+                t_start: 3.0,
+                t_end: 12.0,
+                flow_rate: flow,
+                pattern: PourPattern::Spiral {
+                    freq_hz: 0.6,
+                    r_min: 0.1,
+                    r_max: 0.7,
+                },
+            },
+        ],
+    };
+
+    let scene = Scene::v60_pour();
+    let mut solver = XpbdSolver::build(&scene, &mats, &cfg, &gpu);
+
+    // Renderer: grains sized to the contact diameter, tinted by saturation (dry → wet darkens).
+    let grain_volume = std::f32::consts::FRAC_PI_6 * mats.grain_diameter.powi(3);
+    let v_cap = mats.r_max * mats.rho_ratio * grain_volume;
+    let mut renderer = Renderer::new(&gpu, FORMAT, (W, H), 0.5 * mats.particle_spacing);
+    renderer.set_grain_radius_scale(mats.grain_diameter / mats.particle_spacing);
+    renderer.set_moisture_scale(1.0 / v_cap);
+
+    // Frame TIGHTLY on the dripper+cup region (not the whole domain) so the small bed, the incoming
+    // stream, and the cup pool fill the frame. Near-side, slightly-above view for the cross-section.
+    let mut camera = OrbitCamera::framing(Vec3::new(-3.5, -8.5, -3.5), Vec3::new(3.5, 3.5, 3.5));
+    camera.orbit(0.30, -0.18);
+
+    // Timepoints (frames): initial bed, bloom landing, pouring through, draining, cup filling.
+    let shots: [(u32, &str); 6] = [
+        (0, "0_bed"),
+        (90, "1_bloom"),
+        (240, "2_pourthrough"),
+        (450, "3_draining"),
+        (720, "4_cup"),
+        (1020, "5_late"),
+    ];
+    let dt = 1.0 / 60.0;
+    let mut next = 0usize;
+    let last = shots.last().unwrap().0;
+
+    for step in 0..=last {
+        if next < shots.len() && shots[next].0 == step {
+            let path = format!("/tmp/coffee-pour/frame_{}.ppm", shots[next].1);
+            dump_frame(&gpu, &mut renderer, &solver, &camera, &path);
+            solver.sample_diagnostics();
+            let m = solver.metrics();
+            eprintln!(
+                "  t={:>5.2}s  active={:>4}  yield={:>5.2}%  TDS={:>5.3}%  -> {path}",
+                step as f32 * dt,
+                solver.active_count(),
+                100.0 * m.extraction_yield,
+                100.0 * m.tds,
+            );
+            next += 1;
+        }
+        let t = step as f32 * dt;
+        solver.step(dt, &pour_input(&script, t, 2.0, 2.5));
+    }
+    eprintln!(
+        "wrote /tmp/coffee-pour/frame_*.ppm  (convert: sips -s format png frame_X.ppm --out X.png)"
+    );
+}
+
+fn dump_frame(
+    gpu: &GpuContext,
+    renderer: &mut Renderer,
+    solver: &XpbdSolver,
+    camera: &OrbitCamera,
+    path: &str,
+) {
+    let target = gpu.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("pour-render"),
+        size: wgpu::Extent3d {
+            width: W,
+            height: H,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: FORMAT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let view = target.create_view(&wgpu::TextureViewDescriptor::default());
+    let bytes_per_row = W * 4;
+    let readback = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("readback"),
+        size: (bytes_per_row * H) as u64,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+
+    renderer.render(&view, &solver.particles(), camera);
+    let mut enc = gpu
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+    enc.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+            texture: &target,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyBufferInfo {
+            buffer: &readback,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(bytes_per_row),
+                rows_per_image: Some(H),
+            },
+        },
+        wgpu::Extent3d {
+            width: W,
+            height: H,
+            depth_or_array_layers: 1,
+        },
+    );
+    gpu.queue.submit(Some(enc.finish()));
+    let slice = readback.slice(..);
+    let (tx, rx) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |r| {
+        let _ = tx.send(r);
+    });
+    let _ = gpu.device.poll(wgpu::PollType::Wait {
+        submission_index: None,
+        timeout: None,
+    });
+    rx.recv().unwrap().unwrap();
+    let data = slice.get_mapped_range();
+    let mut ppm = format!("P6\n{W} {H}\n255\n").into_bytes();
+    for px in data.chunks_exact(4) {
+        ppm.extend_from_slice(&px[0..3]);
+    }
+    drop(data);
+    readback.unmap();
+    std::fs::write(path, &ppm).unwrap();
+}
