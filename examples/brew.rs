@@ -77,10 +77,14 @@ fn main() {
     );
 
     println!(
-        "V60 brew: {n_water} water + {n_grain} grain | absorb={} extract={} | dose(soluble)={inv0:.4}",
+        "V60 brew: {n_water} water + {n_grain} grain | absorb={} extract={} | solute0={inv0:.4}",
         cfg.absorb_rate, cfg.extract_rate
     );
-    println!("  step    t(s)   yield%    TDS%   meanT   inventory   leak%");
+    println!(
+        "  (yield = dissolved / total dry mass; absolute-band calibration deferred — see U7 notes)"
+    );
+    // `drift%` is the wetting absorption sink (solute carried into the grounds), not a numerical leak.
+    println!("  step    t(s)   yield%    TDS%   meanT   inventory   drift%");
     let input = EmissionInput::default();
     let sample_every = (steps / 15).max(1);
     for step in 1..=steps {
@@ -97,9 +101,9 @@ fn main() {
                 v_w,
                 cfg.absorb_roundoff,
             );
-            let leak = 100.0 * (inv - inv0) / inv0.max(1.0e-9);
+            let drift = 100.0 * (inv - inv0) / inv0.max(1.0e-9);
             println!(
-                "  {step:>5}  {:>5.2}  {:>6.2}  {:>6.3}  {:>6.3}  {inv:>9.4}  {leak:>6.2}",
+                "  {step:>5}  {:>5.2}  {:>6.2}  {:>6.3}  {:>6.3}  {inv:>9.4}  {drift:>6.2}",
                 step as f32 / 60.0,
                 100.0 * m.extraction_yield,
                 100.0 * m.tds,

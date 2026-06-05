@@ -313,8 +313,9 @@ pub struct XpbdSolver {
     cached_passes: Vec<(String, f32)>,
 
     // --- extraction yield/TDS readout (Phase 1.5 U7) ---
-    /// Total initial soluble dose `Σ grain (s_f+s_s)` — the yield denominator (set at build/reset).
-    soluble_dose: f32,
+    /// Total dry-coffee dose `grain_mass · n_grain` — the yield denominator (real-coffee convention:
+    /// yield = dissolved solute / total dry mass, so yield ≤ `soluble_fraction`). Set at build.
+    total_dose: f32,
     /// Catch-cup region (from the scene's cylinder solid) for the TDS readout; `None` ⇒ TDS = 0.
     cup: Option<CupRegion>,
     /// Cached yield/TDS, refreshed by `sample_diagnostics` (the stalling cache point) and returned
@@ -655,8 +656,8 @@ impl XpbdSolver {
     /// cup water mass, over the catch-cup region. All water volumes scale by the remaining fraction
     /// `f_w` (deactivated water `f_w ≤ roundoff` is excluded). Phase is the immutable seed tag.
     fn sample_extraction(&mut self) {
-        if self.soluble_dose <= 1.0e-9 {
-            return; // no soluble dose (e.g. water-only scene) ⇒ yield/TDS stay 0
+        if self.total_dose <= 1.0e-9 {
+            return; // no coffee dose (e.g. water-only scene) ⇒ yield/TDS stay 0
         }
         let chem = self.read_vec4(self.chem.as_ref());
         let pos = self.read_vec4(self.pos.as_ref());
@@ -687,7 +688,7 @@ impl XpbdSolver {
                 }
             }
         }
-        self.cached_yield = dissolved / self.soluble_dose;
+        self.cached_yield = dissolved / self.total_dose;
         self.cached_tds = if cup_water_mass > 1.0e-9 {
             cup_solute / cup_water_mass
         } else {
@@ -950,14 +951,11 @@ impl Solver for XpbdSolver {
         // race). Bound only by the chem passes (U5/U6); other kernels never touch it. Seeded per
         // species: grains carry the soluble dose split into the two pools, water starts at c=0, pour T.
         let initial_chem = seed_chem(&phases, mats);
-        // Yield denominator: the total seeded soluble dose Σ grain (s_f+s_s). Cup region for TDS:
-        // the scene's catch cylinder (if any), scoping TDS to pooled cup water.
-        let soluble_dose: f32 = initial_chem
-            .iter()
-            .zip(&phases)
-            .filter(|(_, &ph)| ph == 1)
-            .map(|(c, _)| c[0] + c[1])
-            .sum();
+        // Yield denominator: the total dry-coffee dose = grain_mass · n_grain (real-coffee
+        // convention; yield ≤ soluble_fraction). Cup region for TDS: the scene's catch cylinder
+        // (if any), scoping TDS to pooled cup water.
+        let n_grain = phases.iter().filter(|&&ph| ph == 1).count() as f32;
+        let total_dose = mats.grain_mass * n_grain;
         let cup = scene.solids.iter().find_map(|p| match p.kind {
             crate::utils::sdf::SolidKind::Cylinder {
                 center,
@@ -1481,7 +1479,7 @@ impl Solver for XpbdSolver {
             dispatches: 0,
             cached_diag: XpbdDiagnostics::default(),
             cached_passes: Vec::new(),
-            soluble_dose,
+            total_dose,
             cup,
             cached_yield: 0.0,
             cached_tds: 0.0,

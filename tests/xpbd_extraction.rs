@@ -749,3 +749,63 @@ fn brew_populates_finite_yield_and_tds() {
     assert_eq!(temp.len(), phase.len());
     assert!(temp.iter().all(|t| t.is_finite()));
 }
+
+/// Combined path (wetting + extraction co-active): the solute inventory drifts DOWN by a small,
+/// bounded amount — the *physical absorption sink* (water absorbed into grains carries its dissolved
+/// solute into the grounds, which have no dissolved-solute lane; real spent grounds retain TDS).
+/// This is NOT a numerical leak: the dissolution pass conserves exactly in isolation
+/// (`dissolution_conserves_solute_inventory`); the drift appears only because `f_w` changes under
+/// wetting. The decision (reviewed) is to model it as a sink and bound it, not rescale it away.
+#[test]
+fn combined_wetting_extraction_drift_is_a_bounded_sink() {
+    let Some(gpu) = GpuContext::new_headless() else {
+        eprintln!("xpbd_extraction: no GPU adapter; skipping.");
+        return;
+    };
+    let mats = Materials::default();
+    // Both wetting AND extraction on, mechanical solve off, gravity off; water flow for flux.
+    let cfg = Config {
+        max_iters: 0,
+        bed_max_iters: 0,
+        drag_subiters: 0,
+        buoyancy_scale: 0.0,
+        xsph_viscosity_c: 0.0,
+        grain_sleep_speed: 0.0,
+        absorb_rate: 0.5, // wetting ON → f_w changes (the sink mechanism)
+        extract_rate: 1.0,
+        ..Config::default()
+    };
+    let mut solver = XpbdSolver::build(&wet_blob_scene(), &mats, &cfg, &gpu);
+    let phase = solver.read_phases();
+    let v_w = solver.water_particle_volume();
+    seed_water_flow(&solver, &phase, 0.3);
+
+    let initial = solute_inventory(&solver.read_chem(), &solver.read_moisture(), &phase, v_w);
+    for _ in 0..60 {
+        solver.step(DT, &EmissionInput::default());
+    }
+    let chem = solver.read_chem();
+    let moisture = solver.read_moisture();
+    let inv = solute_inventory(&chem, &moisture, &phase, v_w);
+    let drift = (inv - initial) / initial.max(1.0e-9);
+
+    // Down-only (a sink never creates solute) and small/bounded.
+    assert!(
+        drift <= 1.0e-5 && drift > -0.05,
+        "drift not a small sink: {drift} ({initial} -> {inv})"
+    );
+    // Non-vacuous: both wetting (a grain wetted) and extraction (some water gained c) happened.
+    assert!(
+        moisture
+            .iter()
+            .zip(&phase)
+            .any(|(&m, &p)| p == 1 && m > 1.0e-5),
+        "no wetting occurred"
+    );
+    assert!(
+        chem.iter()
+            .zip(&phase)
+            .any(|(c, &p)| p == 0 && c[0] > 1.0e-6),
+        "no extraction occurred"
+    );
+}
