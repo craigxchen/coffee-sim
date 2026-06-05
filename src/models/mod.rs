@@ -7,6 +7,7 @@
 //! tables land in later steps; their target values from v1 are recorded in `KEEP.md`.
 
 pub mod cohesion;
+pub mod extraction;
 pub mod permeability;
 pub mod wetting;
 
