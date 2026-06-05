@@ -690,3 +690,62 @@ fn cooler_pour_lowers_extraction() {
         "cooler pour did not lower extraction: hot {hot}, cool {cool}"
     );
 }
+
+/// U7: a real V60 brew populates `metrics().extraction_yield`/`tds` (were always 0) with finite,
+/// physical values, and the `c_sat` cap holds in the full mixed solve. (Band calibration is tracked
+/// separately — this only asserts the readout is wired and sane.)
+#[test]
+fn brew_populates_finite_yield_and_tds() {
+    let Some(gpu) = GpuContext::new_headless() else {
+        eprintln!("xpbd_extraction: no GPU adapter; skipping.");
+        return;
+    };
+    // Calibrated permeable V60 bed (SDF phase) + wetting + extraction on.
+    let mats = Materials {
+        particle_spacing: 0.5,
+        support_radius: 1.0,
+        grain_diameter: 1.0,
+        water_grain_distance: 0.35,
+        grain_mass: 10.0,
+        ..Materials::default()
+    };
+    let cfg = Config {
+        absorb_rate: 0.5,
+        extract_rate: 1.0,
+        ..Config::default()
+    };
+    let scene = Scene::v60();
+    let mut solver = XpbdSolver::build(&scene, &mats, &cfg, &gpu);
+    let phase = solver.read_phases();
+    for _ in 0..150 {
+        solver.step(DT, &EmissionInput::default());
+    }
+    solver.sample_diagnostics();
+    let m = solver.metrics();
+
+    assert!(
+        m.extraction_yield.is_finite() && m.extraction_yield > 0.0,
+        "yield not populated: {}",
+        m.extraction_yield
+    );
+    assert!(
+        m.tds.is_finite() && m.tds >= 0.0,
+        "tds not finite: {}",
+        m.tds
+    );
+    // The c_sat cap holds in the full mixed solve (every water concentration ≤ c_sat).
+    let conc = solver.read_concentration();
+    for (c, &ph) in conc.iter().zip(&phase) {
+        if ph == 0 {
+            assert!(
+                *c <= mats.c_sat + 1.0e-4,
+                "water exceeded c_sat in brew: {c} > {}",
+                mats.c_sat
+            );
+        }
+    }
+    // Readout hooks return finite, correctly-sized vectors.
+    let temp = solver.read_temperature();
+    assert_eq!(temp.len(), phase.len());
+    assert!(temp.iter().all(|t| t.is_finite()));
+}
