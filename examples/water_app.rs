@@ -5,7 +5,10 @@
 //! part; `ui::Renderer` is portable wgpu/WGSL.
 //!
 //! Run: `cargo run --example water_app` (water dam) · `SCENE=bed` (dry coffee bed) ·
-//! `SCENE=pour` (water poured onto a bed) · `SCENE=dam` (dam-break through a porous sand wall).
+//! `SCENE=pour` (water poured onto a bed) · `SCENE=dam` (dam-break through a porous sand wall) ·
+//! `SCENE=v60` (V60 dripper, fixed water column) · `SCENE=v60pour` (V60 with a live continuous
+//! pour — water streams in from a recipe, threads the bed, drains through the apex into the cup;
+//! grains wet+darken and extract).
 //! `SPACING` scales particle size/count. `WET=1` (mixed scenes) turns on wetting: grains absorb
 //! water, swell, darken, and clump (Phase 1.4) — e.g. `WET=1 SCENE=pour`.
 //! Controls: drag = orbit · scroll / pinch = zoom · two-finger drag = pan ·
@@ -14,6 +17,8 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use coffee_sim::emission::pour::{PourCommand, PourPattern, PourScript};
+use coffee_sim::emission::PourEvent;
 use coffee_sim::engine::Scene;
 use coffee_sim::models::Materials;
 use coffee_sim::solvers::base::Solver;
@@ -30,6 +35,44 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
+/// mL per sim-unit³ (KEEP.md §27) — converts a pour recipe's mL/s into the solver's volumetric flow.
+const ML_PER_SIM_UNIT3: f32 = 5.20;
+
+/// A spiral pour recipe for the live V60 brew (loops every ~14 s so the live view keeps pouring).
+fn brew_recipe() -> PourScript {
+    PourScript {
+        commands: vec![
+            PourCommand {
+                t_start: 0.0,
+                t_end: 2.5,
+                flow_rate: 12.0,
+                pattern: PourPattern::Center,
+            },
+            PourCommand {
+                t_start: 3.0,
+                t_end: 14.0,
+                flow_rate: 12.0,
+                pattern: PourPattern::Spiral {
+                    freq_hz: 0.6,
+                    r_min: 0.1,
+                    r_max: 0.7,
+                },
+            },
+        ],
+    }
+}
+
+/// Map a recipe sample to the per-frame pour input (normalized x,z → world by bed radius; mL/s → sim).
+fn pour_input(script: &PourScript, t: f32) -> EmissionInput {
+    let (nx, nz, flow_ml) = script.sample(t);
+    EmissionInput {
+        kettle_pos: [nx * 2.0, 2.5, nz * 2.0],
+        flow_rate: flow_ml / ML_PER_SIM_UNIT3,
+        pour_angle: 0.0,
+        event: PourEvent::None,
+    }
+}
+
 const ORBIT_SENS: f32 = 0.006;
 const PAN_SENS: f32 = 1.0 / 250.0;
 
@@ -43,6 +86,9 @@ struct State {
     scene: Scene,
     camera: OrbitCamera,
     input: EmissionInput,
+    /// Pour recipe + brew time when running a continuous-pour scene (`None` = no pour, static input).
+    pour: Option<PourScript>,
+    brew_t: f32,
     scene_label: &'static str,
     paused: bool,
     dragging: bool,
@@ -120,6 +166,7 @@ impl ApplicationHandler for App {
             "pour" => (Scene::pour_over(), "pour-over"),
             "dam" => (Scene::dam_through_sand(), "dam→sand"),
             "v60" => (Scene::v60(), "v60"),
+            "v60pour" => (Scene::v60_pour(), "v60 pour"),
             _ => (Scene::dam_break(), "water"),
         };
         let mut mats = Materials {
@@ -140,7 +187,7 @@ impl ApplicationHandler for App {
             mats.grain_mass = 40.0; // denser than the fine water so the heavy wall holds and grains
                                     // sink rather than float under (density-aware) buoyancy
         }
-        if scene_kind == "v60" {
+        if scene_kind == "v60" || scene_kind == "v60pour" {
             // Fine water (spacing 0.5) through a COARSER coffee bed (grain_diameter 1.0) with a small
             // water↔grain contact, so water threads the bed and drains through the cone apex into the
             // cup instead of pooling and squeezing. Grains ~1.25× water density (coffee-like) so the
@@ -161,6 +208,12 @@ impl ApplicationHandler for App {
             // bed; larger values overpower non-penetration and ball the grains up.
             mats.c_max = 0.3;
         }
+        if scene_kind == "v60pour" {
+            // The brew showcase: grains wet (and visibly darken) as the pour soaks them, and extract.
+            cfg.absorb_rate = 0.5;
+            cfg.extract_rate = 1.0;
+        }
+        let pour = (scene_kind == "v60pour").then(brew_recipe);
         let solver = XpbdSolver::build(&scene, &mats, &cfg, &gpu);
         let mut renderer = Renderer::new(
             &gpu,
@@ -185,6 +238,8 @@ impl ApplicationHandler for App {
             scene,
             camera,
             input: EmissionInput::default(),
+            pour,
+            brew_t: 0.0,
             scene_label,
             paused: false,
             dragging: false,
@@ -216,6 +271,7 @@ impl ApplicationHandler for App {
                             KeyCode::KeyR => {
                                 let scene = st.scene.clone();
                                 st.solver.reset(&scene);
+                                st.brew_t = 0.0;
                             }
                             KeyCode::Escape => event_loop.exit(),
                             _ => {}
@@ -257,7 +313,19 @@ impl ApplicationHandler for App {
 
             WindowEvent::RedrawRequested => {
                 if !st.paused {
-                    st.solver.step(1.0 / 60.0, &st.input);
+                    // In a pour scene, sample the recipe at the brew time for this frame's input;
+                    // otherwise the static (no-flow) default. Loop the recipe so the live view keeps
+                    // pouring once the cup fills.
+                    let input = match &st.pour {
+                        Some(script) => {
+                            let i =
+                                pour_input(script, st.brew_t % script.total_duration().max(1.0));
+                            st.brew_t += 1.0 / 60.0;
+                            i
+                        }
+                        None => st.input,
+                    };
+                    st.solver.step(1.0 / 60.0, &input);
                 }
                 let frame = match st.surface.get_current_texture() {
                     wgpu::CurrentSurfaceTexture::Success(f)
