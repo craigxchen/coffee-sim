@@ -441,6 +441,10 @@ impl XpbdSolver {
         // Re-seed chem/thermal state (pools, c=0, pour temperature) so a reset restarts the brew.
         self.queue
             .write_buffer(&self.chem, 0, bytemuck::cast_slice(&self.initial_chem));
+        // Clear the yield/TDS cache so metrics() reports 0 after a reset (matching the re-zeroed
+        // chem) rather than stale values until the next sample_diagnostics.
+        self.cached_yield = 0.0;
+        self.cached_tds = 0.0;
     }
 
     /// Blocking GPU→CPU read-back of a `vec4` particle buffer (dev/test only — stalls).

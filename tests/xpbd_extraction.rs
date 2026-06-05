@@ -809,3 +809,42 @@ fn combined_wetting_extraction_drift_is_a_bounded_sink() {
         "no extraction occurred"
     );
 }
+
+/// reset() clears the yield/TDS cache, so metrics() reports 0 after a reset (matching the re-zeroed
+/// chem) rather than stale values from the prior brew until the next sample_diagnostics.
+#[test]
+fn reset_clears_yield_tds_cache() {
+    let Some(gpu) = GpuContext::new_headless() else {
+        eprintln!("xpbd_extraction: no GPU adapter; skipping.");
+        return;
+    };
+    let mats = Materials {
+        particle_spacing: 0.5,
+        support_radius: 1.0,
+        grain_diameter: 1.0,
+        water_grain_distance: 0.35,
+        grain_mass: 10.0,
+        ..Materials::default()
+    };
+    let cfg = Config {
+        absorb_rate: 0.5,
+        extract_rate: 1.0,
+        ..Config::default()
+    };
+    let scene = Scene::v60();
+    let mut solver = XpbdSolver::build(&scene, &mats, &cfg, &gpu);
+    for _ in 0..120 {
+        solver.step(DT, &EmissionInput::default());
+    }
+    solver.sample_diagnostics();
+    assert!(
+        solver.metrics().extraction_yield > 0.0,
+        "brew should have produced nonzero yield before reset"
+    );
+
+    solver.reset(&scene);
+    // No sample_diagnostics after reset: metrics() must already read 0 (cache cleared), not stale.
+    let m = solver.metrics();
+    assert_eq!(m.extraction_yield, 0.0, "yield cache not cleared on reset");
+    assert_eq!(m.tds, 0.0, "tds cache not cleared on reset");
+}
