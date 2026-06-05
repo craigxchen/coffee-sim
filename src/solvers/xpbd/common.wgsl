@@ -65,6 +65,23 @@ struct Params {
     k_abs: f32,                // absorption rate constant (1/s)
     absorb_roundoff: f32,      // f_w deactivation floor (exact-conservation; ≪ pbf_eps)
     pbf_eps: f32,              // PBF skips water with remaining fraction ≤ this
+    // --- extraction + thermal (Phase 1.5) ---
+    extract_rate: f32,         // opt-in gate (0 = off)
+    k0_fast: f32,
+    k0_slow: f32,
+    ea_over_r: f32,
+    t_ref: f32,
+    c_sat: f32,
+    d_ref: f32,
+    u_half: f32,
+    s_on: f32,
+    kappa: f32,
+    cp_water: f32,
+    cp_grain: f32,
+    h_amb: f32,
+    t_amb: f32,
+    _pad_chem0: f32,
+    _pad_chem1: f32,
 };
 
 struct Status {
