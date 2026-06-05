@@ -94,6 +94,14 @@ pub struct Config {
     /// Extraction/thermal opt-in gate (step 5). 0 = the extraction + thermal passes don't run, so
     /// existing scenes are byte-unchanged; a brew scene sets it > 0 to enable dissolution kinetics.
     pub extract_rate: f32,
+
+    // --- pour emission (spout settings) ---
+    /// Pour spout nozzle radius (scene units). With the discharge coefficient it sets the effective
+    /// flux area `A_eff = π·r²·discharge_coeff`, which fixes the stream's exit speed from the flow
+    /// rate and the emitted-layer particle count (so the inlet packs to the fluid's rest density).
+    pub nozzle_radius: f32,
+    /// Orifice discharge coefficient `∈ (0,1]` (vena-contracta loss). Folded into `A_eff`.
+    pub discharge_coeff: f32,
 }
 
 impl Default for Config {
@@ -156,6 +164,9 @@ impl Default for Config {
             pbf_eps: 0.05,
             // Extraction/thermal OFF by default (step 5; like absorb_rate): a brew scene opts in.
             extract_rate: 0.0,
+            // Pour spout: a thin stream by default; a pour scene tunes these to its grind/flow.
+            nozzle_radius: 0.5,
+            discharge_coeff: 1.0,
         }
     }
 }
