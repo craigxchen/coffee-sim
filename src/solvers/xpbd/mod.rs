@@ -312,10 +312,30 @@ pub struct XpbdSolver {
     cached_diag: XpbdDiagnostics,
     cached_passes: Vec<(String, f32)>,
 
+    // --- extraction yield/TDS readout (Phase 1.5 U7) ---
+    /// Total initial soluble dose `Σ grain (s_f+s_s)` — the yield denominator (set at build/reset).
+    soluble_dose: f32,
+    /// Catch-cup region (from the scene's cylinder solid) for the TDS readout; `None` ⇒ TDS = 0.
+    cup: Option<CupRegion>,
+    /// Cached yield/TDS, refreshed by `sample_diagnostics` (the stalling cache point) and returned
+    /// by `metrics()` without a GPU sync.
+    cached_yield: f32,
+    cached_tds: f32,
+
     // retained for reset (exact re-seed of the initial block + phase tags + chem state)
     initial_positions: Vec<[f32; 4]>,
     initial_phases: Vec<u32>,
     initial_chem: Vec<[f32; 4]>,
+}
+
+/// Catch-cup geometry (a cylinder cavity) used to scope the TDS readout to pooled cup water.
+#[derive(Clone, Copy)]
+struct CupRegion {
+    cx: f32,
+    cz: f32,
+    radius: f32,
+    y_min: f32,
+    y_max: f32,
 }
 
 /// Seed the scene's initial particles on a jittered lattice, one block per region. Returns
@@ -626,10 +646,76 @@ impl XpbdSolver {
                 self.cached_passes = passes;
             }
         }
+
+        self.sample_extraction();
+    }
+
+    /// Refresh the cached yield/TDS from the current chem + positions (a blocking readback, folded
+    /// into `sample_diagnostics`). Yield = dissolved solute / total soluble dose; TDS = cup solute /
+    /// cup water mass, over the catch-cup region. All water volumes scale by the remaining fraction
+    /// `f_w` (deactivated water `f_w ≤ roundoff` is excluded). Phase is the immutable seed tag.
+    fn sample_extraction(&mut self) {
+        if self.soluble_dose <= 1.0e-9 {
+            return; // no soluble dose (e.g. water-only scene) ⇒ yield/TDS stay 0
+        }
+        let chem = self.read_vec4(self.chem.as_ref());
+        let pos = self.read_vec4(self.pos.as_ref());
+        let v_w = self.params.particle_mass / self.params.rest_density;
+        let rho_w = self.params.rest_density;
+        let mut dissolved = 0.0f32;
+        let mut cup_solute = 0.0f32;
+        let mut cup_water_mass = 0.0f32;
+        for (i, (c, p)) in chem.iter().zip(&pos).enumerate() {
+            if self.initial_phases[i] != 0 {
+                continue; // water only
+            }
+            let f_w = p[3];
+            if f_w <= self.params.absorb_roundoff {
+                continue; // deactivated water carries no solute
+            }
+            let solute = c[0] * f_w * v_w; // c·(f_w·V_w)
+            dissolved += solute;
+            if let Some(cup) = self.cup {
+                let dx = p[0] - cup.cx;
+                let dz = p[2] - cup.cz;
+                if dx * dx + dz * dz < cup.radius * cup.radius
+                    && p[1] >= cup.y_min
+                    && p[1] <= cup.y_max
+                {
+                    cup_solute += solute;
+                    cup_water_mass += f_w * v_w * rho_w; // = f_w · particle_mass
+                }
+            }
+        }
+        self.cached_yield = dissolved / self.soluble_dose;
+        self.cached_tds = if cup_water_mass > 1.0e-9 {
+            cup_solute / cup_water_mass
+        } else {
+            0.0
+        };
     }
 
     pub fn diagnostics(&self) -> XpbdDiagnostics {
         self.cached_diag
+    }
+
+    /// Read back per-particle water concentration `c` (chem `.x`; for a grain `.x` is its fast pool).
+    /// Dev/test/inspection only — stalls the GPU.
+    pub fn read_concentration(&self) -> Vec<f32> {
+        self.read_vec4(self.chem.as_ref())
+            .iter()
+            .map(|c| c[0])
+            .collect()
+    }
+
+    /// Read back per-particle temperature (phase-aware: water `T` is chem `.y`, grain `T` is `.z`).
+    /// Dev/test/inspection only — stalls the GPU.
+    pub fn read_temperature(&self) -> Vec<f32> {
+        self.read_vec4(self.chem.as_ref())
+            .iter()
+            .zip(&self.initial_phases)
+            .map(|(c, &ph)| if ph == 0 { c[1] } else { c[2] })
+            .collect()
     }
 }
 
@@ -864,6 +950,29 @@ impl Solver for XpbdSolver {
         // race). Bound only by the chem passes (U5/U6); other kernels never touch it. Seeded per
         // species: grains carry the soluble dose split into the two pools, water starts at c=0, pour T.
         let initial_chem = seed_chem(&phases, mats);
+        // Yield denominator: the total seeded soluble dose Σ grain (s_f+s_s). Cup region for TDS:
+        // the scene's catch cylinder (if any), scoping TDS to pooled cup water.
+        let soluble_dose: f32 = initial_chem
+            .iter()
+            .zip(&phases)
+            .filter(|(_, &ph)| ph == 1)
+            .map(|(c, _)| c[0] + c[1])
+            .sum();
+        let cup = scene.solids.iter().find_map(|p| match p.kind {
+            crate::utils::sdf::SolidKind::Cylinder {
+                center,
+                floor_y,
+                rim_y,
+                radius,
+            } => Some(CupRegion {
+                cx: center.x,
+                cz: center.z,
+                radius,
+                y_min: floor_y,
+                y_max: rim_y,
+            }),
+            _ => None,
+        });
         let chem = Arc::new(
             device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("xpbd-chem"),
@@ -1372,6 +1481,10 @@ impl Solver for XpbdSolver {
             dispatches: 0,
             cached_diag: XpbdDiagnostics::default(),
             cached_passes: Vec::new(),
+            soluble_dose,
+            cup,
+            cached_yield: 0.0,
+            cached_tds: 0.0,
             initial_positions: positions,
             initial_phases: phases,
             initial_chem,
@@ -1733,6 +1846,8 @@ impl Solver for XpbdSolver {
         Metrics {
             particle_count: self.particle_count,
             iteration_count: self.cached_diag.effective_iters,
+            extraction_yield: self.cached_yield,
+            tds: self.cached_tds,
             ..Default::default()
         }
     }
