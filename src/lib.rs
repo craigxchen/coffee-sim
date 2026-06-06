@@ -14,6 +14,9 @@ pub mod solvers;
 pub mod ui;
 pub mod utils;
 
+#[cfg(target_arch = "wasm32")]
+mod web;
+
 // Seam re-exports for ergonomic top-level use.
 pub use emission::{EmissionInput, PourEvent};
 pub use engine::registry::{build_solver, info_for, Catalog, SolverId};

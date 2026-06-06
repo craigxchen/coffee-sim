@@ -18,6 +18,7 @@ target/
 
 # wasm-pack build output
 pkg/
+www/pkg/
 
 # Claude Code
 .claude/
