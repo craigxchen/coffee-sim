@@ -1541,6 +1541,7 @@ impl Solver for XpbdSolver {
                     (9, &sorted_indices),
                     (11, &phase),
                     (13, &alpha_s),
+                    (20, &chem), // lodged fines (chem.w) → α_s deviation (Phase 6); 6 storage buffers
                 ],
             ),
             exclude_water: bg(

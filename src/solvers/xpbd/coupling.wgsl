@@ -22,6 +22,7 @@ fn compute_fractions(@builtin(global_invocation_id) gid: vec3<u32>) {
     let h = params.h;
     let xi = pred[i].xyz;
     var a_s = 0.0;
+    var fines_dev = 0.0; // Σ_j (lodged fines − uniform baseline)·W from grain neighbors (Phase 6)
     let base = cell_coord(xi);
     for (var dz = -1; dz <= 1; dz = dz + 1) {
         for (var dy = -1; dy <= 1; dy = dy + 1) {
@@ -41,12 +42,23 @@ fn compute_fractions(@builtin(global_invocation_id) gid: vec3<u32>) {
                     if (r >= h) { continue; }
                     // Swollen grains occupy more space: use the effective volume V_eff = V_dry + V_abs
                     // (grain pred.w = V_abs). Dry grains (V_abs=0) ⇒ params.grain_volume, unchanged.
-                    a_s = a_s + grain_eff_volume(pred[j].w) * w_poly6(r, h);
+                    let w = w_poly6(r, h);
+                    a_s = a_s + grain_eff_volume(pred[j].w) * w;
+                    // Migration-induced fines deviation from the seeded baseline (grain chem.w).
+                    fines_dev = fines_dev + (chem[j].w - params.fines.y) * w;
                 }
             }
         }
     }
-    alpha_s[i] = min(a_s, params.packing_limit);
+    // Grain-skeleton packing clamp first, then the fines pore-clogging deviation ON TOP (KTD-2):
+    // lodged fines fill the pore space the packing limit leaves open, so accumulation can push α_s
+    // above packing_limit (toward the φ_f floor) while erosion opens channels. Baseline-relative, so
+    // fines_rate=0 leaves α_s exactly min(a_s, packing_limit) — byte-unchanged.
+    var result = min(a_s, params.packing_limit);
+    if (params.fines.x > 0.0) {
+        result = clamp(result + fines_dev, 0.0, 0.95); // 0.95 = 1 − φ_f_min (porosity_drag_factor)
+    }
+    alpha_s[i] = result;
 }
 
 // Water↔grain contact separation for one pair, opposite-mass weighted. Both passes call this with
