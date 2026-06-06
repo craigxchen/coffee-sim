@@ -128,7 +128,10 @@ struct Status {
 // same snapshot so every pair computes equal-and-opposite impulses without atomics.
 @group(0) @binding(15) var<storage, read_write> vel_frozen: array<vec4<f32>>;
 // Per-particle drag blend cap computed from the opposite-phase neighbor count.
-@group(0) @binding(16) var<storage, read_write> coupling_scale: array<f32>;
+// Per-particle drag pairing data. Legacy/global path: (.x = capped β, .y = unused). Harmonic-k path
+// (fines active): (.x = raw drag rate ∝ 1/k_local, .y = anti-overshoot cap) — drag_delta_for_pair
+// forms the symmetric harmonic-mean-k pair scale from these.
+@group(0) @binding(16) var<storage, read_write> coupling_scale: array<vec2<f32>>;
 // Per-particle count of ELIGIBLE opposite-species neighbors for absorption (wetting): water → N_w
 // (# unsaturated grains), grain → N_g (# non-empty waters). Written by wet_count, read by both
 // transfer passes so the two-sided allocation take_wg is identical (and conservation-safe).

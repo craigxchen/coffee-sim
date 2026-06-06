@@ -319,6 +319,62 @@ fn drag_conserves_momentum_and_damps_relative_velocity() {
     );
 }
 
+/// R5 (Phase 6): with fines active the drag pair-combiner switches to harmonic-mean-k (the
+/// arithmetic mean of the per-particle rates). It is symmetric in (i,j), so the pair impulse stays
+/// equal-and-opposite and momentum is still conserved — and it is genuinely exercised here because
+/// the water (with a grain neighbor) and the grain (with none) carry different per-particle rates.
+#[test]
+fn harmonic_drag_combiner_conserves_momentum() {
+    let Some(gpu) = GpuContext::new_headless() else {
+        eprintln!("xpbd_coupling: no GPU adapter; skipping.");
+        return;
+    };
+    let scene = Scene {
+        gravity: [0.0, 0.0, 0.0],
+        box_min: [0.0, 0.0, 0.0],
+        box_max: [8.0, 8.0, 8.0],
+        regions: vec![
+            SeedRegion {
+                min: [3.0, 4.0, 4.0],
+                max: [3.0, 4.0, 4.0],
+                species: Species::Water,
+            },
+            SeedRegion {
+                min: [4.0, 4.0, 4.0],
+                max: [4.0, 4.0, 4.0],
+                species: Species::Grain,
+            },
+        ],
+        ..Scene::default()
+    };
+    let mats = Materials {
+        grain_mass: 2.0,
+        grain_diameter: 0.5,
+        ..Materials::default()
+    };
+    // fines_rate > 0 engages the harmonic combiner; fines_fraction = 0 keeps the transfer a no-op,
+    // so this isolates the drag combiner.
+    let cfg = Config {
+        fines_rate: 2.0,
+        ..drag_only_config()
+    };
+    let mut solver = XpbdSolver::build(&scene, &mats, &cfg, &gpu);
+    let phase = solver.read_phases();
+    assert_eq!(phase, vec![0, 1]);
+    solver.write_velocities_for_test(&[[1.0, 0.0, 0.0, 0.0], [-0.25, 0.0, 0.0, 0.0]]);
+    let input = EmissionInput::default();
+    let p0 = momentum(&solver.read_velocities(), &phase, &mats);
+    for step in 0..8 {
+        solver.step(1.0 / 60.0, &input);
+        let p = momentum(&solver.read_velocities(), &phase, &mats);
+        let drift = pnorm([p[0] - p0[0], p[1] - p0[1], p[2] - p0[2]]);
+        assert!(
+            drift < 2.0e-4,
+            "harmonic-drag momentum drift at step {step}: {drift}"
+        );
+    }
+}
+
 #[test]
 fn drag_dense_blob_is_dissipative_at_fine_grind() {
     let Some(gpu) = GpuContext::new_headless() else {
