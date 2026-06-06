@@ -92,6 +92,22 @@ fn fines_by_species(chem: &[[f32; 4]], phase: &[u32]) -> (f32, f32) {
     (grain, water)
 }
 
+/// Mean y of the water particles (drawdown proxy: lower = drained farther).
+fn water_mean_y(pos: &[[f32; 4]], phase: &[u32]) -> f32 {
+    let (mut sum, mut n) = (0.0f32, 0.0f32);
+    for (p, &ph) in pos.iter().zip(phase) {
+        if ph == 0 {
+            sum += p[1];
+            n += 1.0;
+        }
+    }
+    if n > 0.0 {
+        sum / n
+    } else {
+        0.0
+    }
+}
+
 #[test]
 fn fines_erosion_conserves_volume() {
     let Some(gpu) = GpuContext::new_headless() else {
@@ -295,6 +311,108 @@ fn fines_transfer_writes_no_velocity() {
     assert!(
         vmax < 1e-6,
         "fines transfer imparted velocity ({vmax}); it must write only chem.w"
+    );
+}
+
+#[test]
+fn fines_clog_raises_drag_and_slows_drawdown() {
+    let Some(gpu) = GpuContext::new_headless() else {
+        eprintln!("xpbd_fines: no GPU adapter; skipping.");
+        return;
+    };
+    // crit_flux huge → the transfer is frozen (no erosion/deposition), so a written clog persists.
+    // This isolates the fines→permeability response (U4) from the transfer (U2).
+    let mats = Materials {
+        fines_fraction: 0.1,
+        fines_crit_flux: 1.0e6,
+        ..Materials::default()
+    };
+    let cfg = Config {
+        xsph_viscosity_c: 0.0,
+        fines_rate: 2.0,
+        ..Config::default()
+    };
+    let grain_volume = std::f32::consts::FRAC_PI_6 * mats.grain_diameter.powi(3);
+    let seed = coffee_sim::models::fines::fines_seed(grain_volume, mats.fines_fraction);
+    let input = EmissionInput::default();
+
+    let run = |clog: f32| {
+        let mut solver = XpbdSolver::build(&Scene::pour_over(), &mats, &cfg, &gpu);
+        if clog > 0.0 {
+            let mut chem = solver.read_chem();
+            let phase = solver.read_phases();
+            for (c, &ph) in chem.iter_mut().zip(&phase) {
+                if ph == 1 {
+                    c[3] = seed + clog; // uniformly clog every grain above the baseline
+                }
+            }
+            solver.write_chem_for_test(&chem);
+        }
+        for _ in 0..120 {
+            solver.step(DT, &input);
+        }
+        let pos = solver.read_positions();
+        let phase = solver.read_phases();
+        water_mean_y(&pos, &phase)
+    };
+
+    let baseline = run(0.0);
+    let clogged = run(0.3 * grain_volume);
+    eprintln!("drawdown water mean y: baseline {baseline:.3}, clogged {clogged:.3}");
+    assert!(
+        clogged > baseline + 0.1,
+        "fines clog did not slow drawdown: clogged {clogged:.3} vs baseline {baseline:.3}"
+    );
+}
+
+#[test]
+fn fines_extreme_clog_stays_stable() {
+    let Some(gpu) = GpuContext::new_headless() else {
+        eprintln!("xpbd_fines: no GPU adapter; skipping.");
+        return;
+    };
+    let mats = Materials {
+        fines_fraction: 0.1,
+        fines_crit_flux: 1.0e6,
+        ..Materials::default()
+    };
+    let cfg = Config {
+        fines_rate: 2.0,
+        ..Config::default()
+    };
+    let grain_volume = std::f32::consts::FRAC_PI_6 * mats.grain_diameter.powi(3);
+    let mut solver = XpbdSolver::build(&Scene::pour_over(), &mats, &cfg, &gpu);
+
+    // Drive every grain's lodged fines far past the α_s clamp ceiling (the numerically stiffest
+    // case — the φ_f / pore-fraction floors and the correction cap must hold).
+    let mut chem = solver.read_chem();
+    let phase = solver.read_phases();
+    for (c, &ph) in chem.iter_mut().zip(&phase) {
+        if ph == 1 {
+            c[3] = 5.0 * grain_volume;
+        }
+    }
+    solver.write_chem_for_test(&chem);
+
+    let input = EmissionInput::default();
+    for _ in 0..120 {
+        solver.step(DT, &input);
+    }
+    let vel = solver.read_velocities();
+    let vmax = vel
+        .iter()
+        .map(|v| (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt())
+        .fold(0.0f32, f32::max);
+    assert!(
+        vmax.is_finite() && vmax <= cfg.max_speed + 1e-3,
+        "extreme clog blew up: vmax {vmax}"
+    );
+    assert!(
+        solver
+            .read_positions()
+            .iter()
+            .all(|p| p[0].is_finite() && p[1].is_finite() && p[2].is_finite()),
+        "extreme clog produced non-finite positions"
     );
 }
 
