@@ -149,7 +149,13 @@ fn main() {
             }
         }
     }
-    dump_frame(&gpu, &mut renderer, &solver, &camera, "/tmp/coffee-pour/deep.ppm");
+    dump_frame(
+        &gpu,
+        &mut renderer,
+        &solver,
+        &camera,
+        "/tmp/coffee-pour/deep.ppm",
+    );
     eprintln!("MAX CUP BUBBLE vy = {max_bubble:.1}");
 }
 
