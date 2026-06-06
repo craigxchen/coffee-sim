@@ -1739,6 +1739,67 @@ fn sparse_pressure_tracks_dense_within_nondeterminism() {
     }
 }
 
+/// U5 measurement: active-tile fraction across representative scenes. A low
+/// fraction means the sparse path skips most of the grid (large potential win);
+/// a high fraction (saturated/high-fill) approaches the dense workload and may
+/// regress after over-dispatch overhead. Diagnostic — not a hard perf gate
+/// (run with --nocapture to read the fractions).
+#[test]
+fn sparse_active_tile_fraction_by_scene() {
+    let Some((device, queue)) = create_test_device() else {
+        eprintln!("skipping: no GPU adapter");
+        return;
+    };
+    // (name, settings ctor, pour exit speed, seed saturated bed)
+    let scenes: &[(&str, fn() -> MpmSettings, f32, bool)] = &[
+        (
+            "center_pour",
+            MpmSettings::benchmark_center_pour,
+            DEFAULT_BREW.high_pour_exit_speed_m_s,
+            false,
+        ),
+        (
+            "water_block",
+            MpmSettings::benchmark_filter_water_block,
+            DEFAULT_BREW.high_pour_exit_speed_m_s,
+            false,
+        ),
+        (
+            "free_stream",
+            MpmSettings::benchmark_free_stream,
+            DEFAULT_BREW.high_pour_exit_speed_m_s,
+            false,
+        ),
+        (
+            "saturated_bed",
+            MpmSettings::debug_uniform_bed_saturation,
+            0.0,
+            true,
+        ),
+    ];
+    for &(name, ctor, exit_speed, seed) in scenes {
+        let mut settings = ctor();
+        settings.sparse_pressure = true;
+        let total_tiles = state::tile_count(settings.grid_dims);
+        let mut sim = MpmSim3D::new(&device, &queue, settings);
+        if seed {
+            sim.seed_uniform_bed_saturation(&queue);
+        }
+        sim.set_exit_speed_m_s(exit_speed);
+        for _ in 0..40 {
+            sim.step_frame(&device, &queue, 1.0 / 60.0);
+        }
+        let tiles = readback_sparse_tiles(&sim, &device, &queue);
+        let active = tiles[0];
+        let frac = active as f32 / total_tiles.max(1) as f32;
+        eprintln!(
+            "{name}: active_tiles={active}/{total_tiles} ({:.2}%)",
+            frac * 100.0
+        );
+        assert!(frac <= 1.0, "{name}: active-tile fraction exceeds 1.0");
+    }
+}
+
 #[test]
 fn active_pour_rest_volume_loss_matches_bed_gain() {
     let Some((device, queue)) = create_test_device() else {
