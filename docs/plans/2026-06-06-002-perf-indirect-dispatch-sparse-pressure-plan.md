@@ -1,11 +1,32 @@
 ---
 title: "perf: Indirect-dispatch sparse RBGS pressure solve (v2)"
 type: perf
-status: active
+status: reverted
 date: 2026-06-06
 ---
 
 # perf: Indirect-dispatch sparse RBGS pressure solve (v2)
+
+## Outcome — implemented, measured, reverted (2026-06-06)
+
+U1–U5 were fully implemented and validated (compaction exact, equivalence within
+the dense noise floor, ~106/11,600 tiles dispatched), but the indirect path was
+**reverted** at the keep/exit gate. Clean same-session three-way on Apple M5 / Metal
+(`pressure_solve`): dense 40.5 ms → v1-sparse 20.9 ms (1.93×) → indirect 19.3 ms
+(only **~1.10×** over v1-sparse, far short of the ~2.2× the Pre-flight Gate projected).
+
+Root cause, confirmed by A/B: the ~9.8 ms gap is **inherent per-`dispatch_workgroups_indirect`
+overhead on the Metal+wgpu stack** (~1,800 indirect calls/frame), *not* wgpu's
+`VALIDATION_INDIRECT_CALL` pass — disabling that flag recovered only ~2%. Indirect's
+per-call overhead essentially trades places with v1-sparse's early-return overhead,
+leaving a non-recoverable ~10% edge. Per the keep/exit criterion, ~10% does not justify
+the third code path + tier machinery (capability gate, 12-buffer tier, second bind group,
+compaction, dual pipeline layouts). v1-sparse (PR #18, 1.93× over dense) is the shipped
+sparse path. The implementation lives on branch `perf/indirect-dispatch-pressure` for
+reference; do not re-attempt indirect dispatch on this stack without new hardware/driver
+evidence that per-call overhead has dropped.
+
+---
 
 ## Summary
 
