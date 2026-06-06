@@ -118,10 +118,15 @@ impl Default for Config {
             // Under-relax the Jacobi position solve (ω<1) — stabilizes it and keeps
             // per-iteration moves within a grid cell (the grid is rebuilt once/frame).
             position_relaxation: 0.5,
-            // Artificial pressure (Monaghan anti-clustering): standard strength. With
-            // compression-only λ it's the only short-range repulsion keeping spacing.
+            // Artificial pressure (Monaghan anti-clustering): the only short-range repulsion keeping
+            // spacing under compression-only λ. The SHARP exponent (n=16, vs the textbook ~4) confines
+            // it to genuine pairing range (r → 0): it's ~0 at rest spacing yet stronger than n=4 at
+            // r→0. A softer exponent has a long tail that, on a thin airborne stream (free fall, where
+            // s_corr is one-sided with nothing to cancel it), accumulates into lateral spread and
+            // disperses the column — water in flight should stay ballistic/coherent. Sharpening keeps
+            // dense fluid pair-stable (dam-break: no clumping) while leaving the free stream alone.
             s_corr_k: 0.1,
-            s_corr_n: 4.0,
+            s_corr_n: 16.0,
             s_corr_dq_ratio: 0.2,
             spiky_r_min_ratio: 0.01,
             // Compression-only correction (λ ≤ 0): resist over-density but apply NO cohesive

@@ -785,6 +785,11 @@ impl XpbdSolver {
         self.capacity
     }
 
+    /// Total spatial-hash cell count `nx·ny·nz` (dev/test scaling diagnostics).
+    pub fn grid_cell_count(&self) -> u32 {
+        self.params.grid_dims[3]
+    }
+
     /// Whether the per-frame water/coupling/wetting/extraction passes run (true if a water region is
     /// seeded OR the scene declares a pour) (dev/test).
     pub fn has_water_passes(&self) -> bool {
@@ -1168,9 +1173,9 @@ impl Solver for XpbdSolver {
             wgpu::BufferUsages::empty(),
         );
         // Static SDF geometry (binding 19, read-only). Built-time-immutable; an empty scene gets a
-        // 1-element dummy (params.num_solids = 0 makes the union skip it). Bound only by the
-        // collision passes (added in U5); other kernels never reference it, so their layouts are
-        // unchanged and the 8-storage-buffer budget holds.
+        // 1-element dummy (params.num_solids = 0 makes the union skip it). Bound by the kernels that
+        // query the geometry — the position-solve collision passes and `finalize` (wall velocity
+        // response). Each stays within the 8-storage-buffer budget (finalize is at 7).
         let mut packed = pack_solids(&scene.solids);
         if packed.is_empty() {
             packed.push(Primitive::zeroed());
@@ -1629,6 +1634,7 @@ impl Solver for XpbdSolver {
                     (7, &c_residual),
                     (11, &phase),
                     (14, &fluid_impulse),
+                    (19, &solids),
                 ],
             ),
             xsph: bg(
