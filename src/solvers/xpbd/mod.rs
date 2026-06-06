@@ -215,6 +215,9 @@ struct Pipelines {
     dissolve_grain: wgpu::ComputePipeline,
     dissolve_water: wgpu::ComputePipeline,
     thermal_exchange: wgpu::ComputePipeline,
+    fines_count: wgpu::ComputePipeline,
+    fines_grain: wgpu::ComputePipeline,
+    fines_water: wgpu::ComputePipeline,
     apply_dp: wgpu::ComputePipeline,
     finalize: wgpu::ComputePipeline,
     xsph: wgpu::ComputePipeline,
@@ -250,6 +253,9 @@ struct BindGroups {
     dissolve_grain: wgpu::BindGroup,
     dissolve_water: wgpu::BindGroup,
     thermal_exchange: wgpu::BindGroup,
+    fines_count: wgpu::BindGroup,
+    fines_grain: wgpu::BindGroup,
+    fines_water: wgpu::BindGroup,
     apply_dp: wgpu::BindGroup,
     finalize: wgpu::BindGroup,
     xsph: wgpu::BindGroup,
@@ -1323,13 +1329,14 @@ impl Solver for XpbdSolver {
         // Params/Status/bindings + shared kernels; `water`/`bed`/`coupling`/`wetting` add the
         // per-species + interphase solves. Module-scope declarations are order-independent.
         let shader_src = format!(
-            "{}\n{}\n{}\n{}\n{}\n{}",
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}",
             include_str!("common.wgsl"),
             include_str!("water.wgsl"),
             include_str!("bed.wgsl"),
             include_str!("coupling.wgsl"),
             include_str!("wetting.wgsl"),
             include_str!("extraction.wgsl"),
+            include_str!("fines.wgsl"),
         );
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("xpbd"),
@@ -1375,6 +1382,9 @@ impl Solver for XpbdSolver {
             dissolve_grain: make("dissolve_grain"),
             dissolve_water: make("dissolve_water"),
             thermal_exchange: make("thermal_exchange"),
+            fines_count: make("fines_count"),
+            fines_grain: make("fines_grain"),
+            fines_water: make("fines_water"),
             apply_dp: make("apply_dp"),
             finalize: make("finalize"),
             xsph: make("xsph"),
@@ -1720,6 +1730,48 @@ impl Solver for XpbdSolver {
                     (22, &chem_frozen),
                 ],
             ),
+            // Fines transfer (Phase 6): reuses the wetting neighbor-count buffer (binding 17) — the
+            // wetting block has finished for the substep. Count is eligibility-only (5 storage);
+            // the transfers read live vel for the per-pair flux and write only chem.w (8 storage).
+            fines_count: bg(
+                &pipelines.fines_count,
+                &[
+                    (0, &params_buf),
+                    (1, &pos),
+                    (8, &cell_start),
+                    (9, &sorted_indices),
+                    (11, &phase),
+                    (17, &wet_count),
+                ],
+            ),
+            fines_grain: bg(
+                &pipelines.fines_grain,
+                &[
+                    (0, &params_buf),
+                    (1, &pos),
+                    (3, &vel),
+                    (8, &cell_start),
+                    (9, &sorted_indices),
+                    (11, &phase),
+                    (17, &wet_count),
+                    (20, &chem),
+                    (22, &chem_frozen),
+                ],
+            ),
+            fines_water: bg(
+                &pipelines.fines_water,
+                &[
+                    (0, &params_buf),
+                    (1, &pos),
+                    (3, &vel),
+                    (8, &cell_start),
+                    (9, &sorted_indices),
+                    (11, &phase),
+                    (17, &wet_count),
+                    (20, &chem),
+                    (22, &chem_frozen),
+                ],
+            ),
             apply_dp: bg(
                 &pipelines.apply_dp,
                 &[
@@ -1763,7 +1815,9 @@ impl Solver for XpbdSolver {
             // Generous upper bound: water density loop (≈6 passes/iter) + bed contact loop
             // (≈4 passes/iter) + coupling/finalize overhead; clamped to the query-set cap.
             // Water loop is ≈7 passes/iter with the boundary pass (solid scenes); 6 covers it loosely.
-            let passes_per_step = 12 + 7 * water_iters + 5 * bed_iters;
+            // Baseline covers coupling/finalize + the wetting/extraction/fines blocks (~8 passes
+            // each, gated); water loop ≈7 passes/iter, bed ≈5.
+            let passes_per_step = 20 + 7 * water_iters + 5 * bed_iters;
             let capacity = (2 * passes_per_step * cfg.substeps).clamp(2, 512);
             let qset = device.create_query_set(&wgpu::QuerySetDescriptor {
                 label: Some("xpbd-timestamps"),
@@ -2258,6 +2312,37 @@ impl Solver for XpbdSolver {
                         "thermal_exchange",
                         np,
                     );
+                }
+
+                // Fines migration (mixed scenes; opt-in via fines_rate>0). Grains shed fines into
+                // fast-flowing water and water deposits them where flow slackens — a massless,
+                // volume-conserving scalar transfer that writes only chem.w (no velocity writes, so
+                // momentum is untouched). Reads live post-wetting pos/pos.w + a frozen chem copy;
+                // rebuilds the grid itself so it's independent of the wetting/extraction gates.
+                if mixed && self.params.fines[0] > 0.0 {
+                    pass(&mut enc, &p.grid_clear, &b.grid_clear, "grid_clear", nc);
+                    pass(&mut enc, &p.grid_count, &b.grid_count, "grid_count", np);
+                    pass(&mut enc, &p.grid_scan, &b.grid_scan, "grid_scan", 1);
+                    pass(&mut enc, &p.grid_clear, &b.grid_clear, "grid_clear", nc);
+                    pass(
+                        &mut enc,
+                        &p.grid_scatter,
+                        &b.grid_scatter,
+                        "grid_scatter",
+                        np,
+                    );
+                    // Snapshot live chem so both transfer passes read a frozen state while writing
+                    // disjoint chem.w slots (race-free, conservation-safe).
+                    enc.copy_buffer_to_buffer(
+                        self.chem.as_ref(),
+                        0,
+                        &self.chem_frozen,
+                        0,
+                        (self.active_count as u64) * 16,
+                    );
+                    pass(&mut enc, &p.fines_count, &b.fines_count, "fines_count", np);
+                    pass(&mut enc, &p.fines_grain, &b.fines_grain, "fines_grain", np);
+                    pass(&mut enc, &p.fines_water, &b.fines_water, "fines_water", np);
                 }
             }
         }
