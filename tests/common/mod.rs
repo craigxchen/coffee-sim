@@ -1,14 +1,20 @@
 //! Shared support for the analytic physics-validation tests.
 //!
-//! Deliberately minimal: it ships only what the free-fall integrator test
-//! (`tests/xpbd_integrator.rs`) exercises — an exact-compare helper and the
-//! closed-form free-fall references. Density reconstruction and a
-//! phenomenon-keyed tolerance table are intentionally NOT here; they belong to
-//! the later analytic tests that first need them.
+//! Deliberately minimal: it ships only what the analytic tests actually exercise
+//! — an exact-compare helper, the closed-form free-fall references, and a CPU
+//! SPH density reconstruction (added when the rest-lattice / hydrostatic tests
+//! first needed it). A phenomenon-keyed tolerance table is still deferred until a
+//! test needs it.
 //!
 //! The comparator is a float32 ROUND-OFF budget, not a physics tolerance band:
 //! the references below are exact algebraic identities, so the only discrepancy
 //! from the GPU is f32 round-off (see the per-call tolerances in the test).
+//!
+//! Each integration-test binary compiles this module fresh and uses a different
+//! subset of it, so unused helpers are expected per-binary — allow dead code.
+#![allow(dead_code)]
+
+use coffee_sim::utils::kernels::w_poly6;
 
 /// Assert each component of a read-back f32 vector matches its f64 reference
 /// within `abs_tol + rel_tol * |expected|`. Panics with the axis, expected,
@@ -70,4 +76,30 @@ pub fn continuous_reference(x0: [f64; 3], v0: [f64; 3], g: [f64; 3], dt: f64, n:
         pos[k] = x0[k] + v0[k] * t + 0.5 * g[k] * t * t;
     }
     pos
+}
+
+/// Reconstruct per-particle SPH density on the CPU from positions, mirroring the
+/// GPU density constraint and `kernels::rest_density`:
+///   ρ_i = Σ_j m · W_poly6(|x_i − x_j|, h)   (the j == i self term included).
+/// Returns `(density, neighbour_count)` per particle so callers can filter to
+/// interior particles (full neighbourhoods) and exclude the physically-deficient
+/// free surface. O(N²) — fine for the modest particle counts these tests use.
+///
+/// `pos` carries the moisture lane in `.w`; only `.xyz` is read here.
+pub fn reconstruct_density(pos: &[[f32; 4]], h: f32, mass: f32) -> Vec<(f32, usize)> {
+    pos.iter()
+        .map(|&pi| {
+            let mut rho = mass * w_poly6(0.0, h);
+            let mut neighbours = 0usize;
+            for &pj in pos {
+                let dx = [pi[0] - pj[0], pi[1] - pj[1], pi[2] - pj[2]];
+                let r = (dx[0] * dx[0] + dx[1] * dx[1] + dx[2] * dx[2]).sqrt();
+                if r > 0.0 && r < h {
+                    rho += mass * w_poly6(r, h);
+                    neighbours += 1;
+                }
+            }
+            (rho, neighbours)
+        })
+        .collect()
 }
