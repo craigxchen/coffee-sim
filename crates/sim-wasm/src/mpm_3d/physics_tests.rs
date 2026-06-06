@@ -54,6 +54,17 @@ fn create_test_device() -> Option<(wgpu::Device, wgpu::Queue)> {
     )
 }
 
+/// Resolve the adapter's pressure tier and create a device with the matching
+/// limits, mirroring the production renderer/profiler path. The indirect tests
+/// skip when the tier is not `Indirect`.
+fn create_test_device_with_tier() -> Option<(wgpu::Device, wgpu::Queue, PressureTier)> {
+    let adapter = request_adapter()?;
+    let tier = pressure_tier(&adapter);
+    let (device, queue) =
+        create_device_with_limits(&adapter, required_limits(tier), "coffee-sim tier device")?;
+    Some((device, queue, tier))
+}
+
 fn write_uniform_water_solute(queue: &wgpu::Queue, sim: &MpmSim3D, solute_per_particle: f32) {
     let mut affine_data = vec![[0.0_f32; 12]; sim.num_water as usize];
     for affine in &mut affine_data {
@@ -360,6 +371,76 @@ fn readback_sparse_tiles(sim: &MpmSim3D, device: &wgpu::Device, queue: &wgpu::Qu
     drop(view);
     staging.unmap();
     data
+}
+
+/// Read back the Indirect-tier `active_tile_list` (full `tile_count` u32s) and
+/// `indirect_args` (`[x, y, z]`). Only valid when the sim is on the Indirect
+/// tier (the buffers are `None` otherwise).
+fn readback_indirect(
+    sim: &MpmSim3D,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+) -> (Vec<u32>, [u32; 3]) {
+    let list_buf = sim
+        .buffers
+        .active_tile_list
+        .as_ref()
+        .expect("active_tile_list on the Indirect tier");
+    let args_buf = sim
+        .buffers
+        .indirect_args
+        .as_ref()
+        .expect("indirect_args on the Indirect tier");
+    let list_len = state::tile_count(sim.settings.grid_dims) as usize;
+    let list_size = (list_len * std::mem::size_of::<u32>()) as u64;
+    let args_size = (3 * std::mem::size_of::<u32>()) as u64;
+
+    let list_staging = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("active tile list readback"),
+        size: list_size,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let args_staging = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("indirect args readback"),
+        size: args_size,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("indirect readback"),
+    });
+    encoder.copy_buffer_to_buffer(list_buf, 0, &list_staging, 0, list_size);
+    encoder.copy_buffer_to_buffer(args_buf, 0, &args_staging, 0, args_size);
+    queue.submit(Some(encoder.finish()));
+
+    let list_slice = list_staging.slice(..);
+    let args_slice = args_staging.slice(..);
+    let (tx, rx) = mpsc::channel();
+    let tx2 = tx.clone();
+    list_slice.map_async(wgpu::MapMode::Read, move |result| {
+        tx.send(result).expect("active tile list map callback");
+    });
+    args_slice.map_async(wgpu::MapMode::Read, move |result| {
+        tx2.send(result).expect("indirect args map callback");
+    });
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+    rx.recv().expect("map recv").expect("active tile list map");
+    rx.recv().expect("map recv").expect("indirect args map");
+
+    let list_view = list_slice.get_mapped_range();
+    let list = cast_slice::<u8, u32>(&list_view).to_vec();
+    drop(list_view);
+    list_staging.unmap();
+
+    let args_view = args_slice.get_mapped_range();
+    let args_vec = cast_slice::<u8, u32>(&args_view).to_vec();
+    let args = [args_vec[0], args_vec[1], args_vec[2]];
+    drop(args_view);
+    args_staging.unmap();
+
+    (list, args)
 }
 
 fn readback_bed_extract_data(
@@ -1754,6 +1835,191 @@ fn sparse_pressure_tracks_dense_within_nondeterminism() {
             sparse_diff <= budget,
             "frame {frame}: sparse diverged beyond the dense noise floor: \
              sparse_vs_dense={sparse_diff} dense_vs_dense={noise} budget={budget} len={}",
+            a.len(),
+        );
+    }
+}
+
+/// U5 PRIMARY compaction guard. After a turbulent center-pour frame on the
+/// Indirect tier, the compaction must reproduce the marked-tile set exactly:
+/// `indirect_args[0]` (the dispatch count) equals the number of set flags, and
+/// the set of `active_tile_list[0..count]` ids equals the set of set-flag tile
+/// ids. A dropped/duplicated tile from an `atomicAdd` race or off-by-one shows
+/// up as a set mismatch here even when it would stay inside the noise-floor
+/// budget of the equivalence test. `indirect_args[1..3]` must stay `[1, 1]`.
+#[test]
+fn indirect_compaction_matches_marked_tiles() {
+    let Some((device, queue, tier)) = create_test_device_with_tier() else {
+        eprintln!("skipping: no GPU adapter");
+        return;
+    };
+    if tier != PressureTier::Indirect {
+        eprintln!("skipping indirect_compaction_matches_marked_tiles: adapter tier is {tier:?}");
+        return;
+    }
+    let mut settings = MpmSettings::benchmark_center_pour();
+    settings.sparse_pressure = true;
+    let mut sim = MpmSim3D::new_with_tier(&device, &queue, settings, PressureTier::Indirect);
+    sim.set_exit_speed_m_s(DEFAULT_BREW.high_pour_exit_speed_m_s);
+    for _ in 0..30 {
+        sim.step_frame(&device, &queue, 1.0 / 60.0);
+    }
+
+    let tiles = readback_sparse_tiles(&sim, &device, &queue);
+    let set_flag_ids: std::collections::BTreeSet<u32> = tiles[state::SPARSE_TILE_HEADER as usize..]
+        .iter()
+        .enumerate()
+        .filter_map(|(tid, &flag)| (flag != 0).then_some(tid as u32))
+        .collect();
+
+    let (list, args) = readback_indirect(&sim, &device, &queue);
+    let count = args[0] as usize;
+    let total_tiles = state::tile_count(sim.settings.grid_dims);
+    eprintln!(
+        "indirect dispatch count={count} set_flags={} total_tiles={total_tiles}",
+        set_flag_ids.len()
+    );
+
+    assert!(
+        count > 0,
+        "no tiles compacted; pour did not activate any tile"
+    );
+    assert_eq!(
+        count,
+        set_flag_ids.len(),
+        "indirect_args[0] must equal the number of set tile flags"
+    );
+    assert_eq!(args[1], 1, "indirect_args[1] (y) must stay 1");
+    assert_eq!(args[2], 1, "indirect_args[2] (z) must stay 1");
+
+    let listed_ids: std::collections::BTreeSet<u32> = list[..count].iter().copied().collect();
+    assert_eq!(
+        listed_ids.len(),
+        count,
+        "active_tile_list[0..count] has duplicate ids (atomicAdd race?)"
+    );
+    assert_eq!(
+        listed_ids, set_flag_ids,
+        "active_tile_list set must equal the set of marked tiles"
+    );
+}
+
+/// U5: the indirect dispatch count is far below `tile_count` on a center pour —
+/// the whole point of the indirect path (≈1% active vs over-dispatching all
+/// ~11,600 tiles per sweep).
+#[test]
+fn indirect_dispatch_count_far_below_tile_count() {
+    let Some((device, queue, tier)) = create_test_device_with_tier() else {
+        eprintln!("skipping: no GPU adapter");
+        return;
+    };
+    if tier != PressureTier::Indirect {
+        eprintln!(
+            "skipping indirect_dispatch_count_far_below_tile_count: adapter tier is {tier:?}"
+        );
+        return;
+    }
+    let mut settings = MpmSettings::benchmark_center_pour();
+    settings.sparse_pressure = true;
+    let mut sim = MpmSim3D::new_with_tier(&device, &queue, settings, PressureTier::Indirect);
+    sim.set_exit_speed_m_s(DEFAULT_BREW.high_pour_exit_speed_m_s);
+    for _ in 0..30 {
+        sim.step_frame(&device, &queue, 1.0 / 60.0);
+    }
+    let (_list, args) = readback_indirect(&sim, &device, &queue);
+    let count = args[0];
+    let total_tiles = state::tile_count(sim.settings.grid_dims);
+    let frac = count as f32 / total_tiles.max(1) as f32;
+    eprintln!(
+        "indirect dispatch count={count}/{total_tiles} ({:.2}%)",
+        frac * 100.0
+    );
+    assert!(count > 0, "center pour activated no tiles");
+    assert!(
+        count * 5 < total_tiles,
+        "indirect dispatch count {count} is not far below tile_count {total_tiles} \
+         (center pour should activate well under 20% of tiles)"
+    );
+}
+
+/// U5: empty frame (no fluid) compacts to zero workgroups. A 0-workgroup
+/// indirect dispatch is a valid no-op.
+#[test]
+fn indirect_empty_frame_dispatches_zero() {
+    let Some((device, queue, tier)) = create_test_device_with_tier() else {
+        eprintln!("skipping: no GPU adapter");
+        return;
+    };
+    if tier != PressureTier::Indirect {
+        eprintln!("skipping indirect_empty_frame_dispatches_zero: adapter tier is {tier:?}");
+        return;
+    }
+    let mut settings = MpmSettings::benchmark_center_pour();
+    settings.sparse_pressure = true;
+    let mut sim = MpmSim3D::new_with_tier(&device, &queue, settings, PressureTier::Indirect);
+    // No pour: keep the exit speed at zero so no water is emitted.
+    sim.set_exit_speed_m_s(0.0);
+    for _ in 0..3 {
+        sim.step_frame(&device, &queue, 1.0 / 60.0);
+    }
+    let (_list, args) = readback_indirect(&sim, &device, &queue);
+    assert_eq!(
+        args[0], 0,
+        "an empty (no-fluid) frame must compact to zero active tiles"
+    );
+    assert_eq!(args[1], 1);
+    assert_eq!(args[2], 1);
+}
+
+/// U4 equivalence: the indirect path tracks the dense path within the sim's
+/// run-to-run noise floor — same structure as
+/// `sparse_pressure_tracks_dense_within_nondeterminism`, but the third sim runs
+/// the indirect dispatch. Skips when the adapter is not on the Indirect tier.
+#[test]
+fn indirect_pressure_tracks_dense_within_nondeterminism() {
+    let Some((device, queue, tier)) = create_test_device_with_tier() else {
+        eprintln!("skipping: no GPU adapter");
+        return;
+    };
+    if tier != PressureTier::Indirect {
+        eprintln!(
+            "skipping indirect_pressure_tracks_dense_within_nondeterminism: adapter tier is {tier:?}"
+        );
+        return;
+    }
+    let mk = |sparse: bool| {
+        let mut settings = MpmSettings::benchmark_center_pour();
+        settings.sparse_pressure = sparse;
+        // Both dense and indirect sims are built on the Indirect tier; the
+        // dispatch branch keys on `sparse_pressure`, so the dense runs stay
+        // dense even on the Indirect tier.
+        let mut sim = MpmSim3D::new_with_tier(&device, &queue, settings, PressureTier::Indirect);
+        sim.set_exit_speed_m_s(DEFAULT_BREW.high_pour_exit_speed_m_s);
+        sim
+    };
+    let bits = |sim: &MpmSim3D| -> Vec<u32> {
+        readback_particle_data(sim, &device, &queue, "indirect-eq")
+            .iter()
+            .map(|f| f.to_bits())
+            .collect()
+    };
+    let mismatch = |a: &[u32], b: &[u32]| a.iter().zip(b).filter(|(x, y)| x != y).count();
+
+    let (mut dense_a, mut dense_b, mut indirect) = (mk(false), mk(false), mk(true));
+    for frame in 1..=8u32 {
+        dense_a.step_frame(&device, &queue, 1.0 / 60.0);
+        dense_b.step_frame(&device, &queue, 1.0 / 60.0);
+        indirect.step_frame(&device, &queue, 1.0 / 60.0);
+
+        let (a, b, s) = (bits(&dense_a), bits(&dense_b), bits(&indirect));
+        assert!(!a.is_empty(), "no particles simulated; pour did not run");
+        let noise = mismatch(&a, &b);
+        let indirect_diff = mismatch(&a, &s);
+        let budget = 2 * noise + 64;
+        assert!(
+            indirect_diff <= budget,
+            "frame {frame}: indirect diverged beyond the dense noise floor: \
+             indirect_vs_dense={indirect_diff} dense_vs_dense={noise} budget={budget} len={}",
             a.len(),
         );
     }
