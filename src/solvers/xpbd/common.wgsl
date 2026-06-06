@@ -82,6 +82,8 @@ struct Params {
     t_amb: f32,
     _pad_chem0: f32,
     _pad_chem1: f32,
+    // --- fines migration (Phase 6); vec4-aligned tail ---
+    fines: vec4<f32>,         // (rate/gate, seed, crit_flux, _) — fines.x>0 enables migration
 };
 
 struct Status {

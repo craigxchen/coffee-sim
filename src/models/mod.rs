@@ -8,6 +8,7 @@
 
 pub mod cohesion;
 pub mod extraction;
+pub mod fines;
 pub mod permeability;
 pub mod thermal;
 pub mod wetting;
@@ -92,6 +93,15 @@ pub struct Materials {
     pub h_amb: f32,
     pub t_amb: f32,
     pub pour_t: f32,
+
+    // --- fines migration (Phase 6) ---
+    /// Fraction of a grain's volume that is detachable fines (the seeded per-grain inventory =
+    /// `fines_fraction · grain_volume`). 0 = no fines (default; the feature is off until a brew
+    /// scene sets this **and** `Config::fines_rate > 0`). See [`fines::fines_seed`].
+    pub fines_fraction: f32,
+    /// Critical Darcy flux (reduced sim units) where erosion and deposition balance — the
+    /// zero-crossing of [`fines::net_rate`]. Above it fines scour loose; below it they settle.
+    pub fines_crit_flux: f32,
 }
 
 impl Default for Materials {
@@ -138,6 +148,10 @@ impl Default for Materials {
             h_amb: 0.02,
             t_amb: 0.85,
             pour_t: 1.0,
+            // Fines OFF by default (like absorb_rate/extract_rate): a brew scene opts in by setting
+            // fines_fraction > 0 alongside Config.fines_rate > 0.
+            fines_fraction: 0.0,
+            fines_crit_flux: fines::CRIT_FLUX_DEFAULT,
         }
     }
 }

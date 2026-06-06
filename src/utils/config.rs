@@ -95,6 +95,12 @@ pub struct Config {
     /// existing scenes are byte-unchanged; a brew scene sets it > 0 to enable dissolution kinetics.
     pub extract_rate: f32,
 
+    // --- fines migration (Phase 6) ---
+    /// Fines erosion/deposition rate scale + opt-in gate (1/s). 0 = the fines transfer pass and the
+    /// fines→permeability deviation don't run, so existing scenes are byte-unchanged; a brew scene
+    /// sets it > 0 (alongside `Materials::fines_fraction > 0`) to enable migration. (step 6)
+    pub fines_rate: f32,
+
     // --- pour emission (spout settings) ---
     /// Pour spout nozzle radius (scene units). With the discharge coefficient it sets the effective
     /// flux area `A_eff = π·r²·discharge_coeff`, which fixes the stream's exit speed from the flow
@@ -169,6 +175,8 @@ impl Default for Config {
             pbf_eps: 0.05,
             // Extraction/thermal OFF by default (step 5; like absorb_rate): a brew scene opts in.
             extract_rate: 0.0,
+            // Fines OFF by default (step 6; like extract_rate): a brew scene opts in.
+            fines_rate: 0.0,
             // Pour spout: a thin stream by default; a pour scene tunes these to its grind/flow.
             nozzle_radius: 0.5,
             discharge_coeff: 1.0,
