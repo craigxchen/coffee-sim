@@ -1,7 +1,7 @@
 ---
 title: "perf: Sparse RBGS pressure solve via tile over-dispatch"
 type: perf
-status: active
+status: completed
 date: 2026-06-06
 ---
 
