@@ -192,6 +192,7 @@ struct Pipelines {
     grid_reorder_a: wgpu::ComputePipeline,
     grid_reorder_b: wgpu::ComputePipeline,
     grid_reorder_identity: wgpu::ComputePipeline,
+    compute_boundary: wgpu::ComputePipeline,
     compute_lambda: wgpu::ComputePipeline,
     residual_reduce: wgpu::ComputePipeline,
     compute_dp: wgpu::ComputePipeline,
@@ -226,6 +227,7 @@ struct BindGroups {
     grid_reorder_a: wgpu::BindGroup,
     grid_reorder_b: wgpu::BindGroup,
     grid_reorder_identity: wgpu::BindGroup,
+    compute_boundary: wgpu::BindGroup,
     compute_lambda: wgpu::BindGroup,
     residual_reduce: wgpu::BindGroup,
     compute_dp: wgpu::BindGroup,
@@ -286,6 +288,8 @@ pub struct XpbdSolver {
     /// Which species are present (from the scene's seed regions) — selects the per-frame passes.
     has_water: bool,
     has_grain: bool,
+    /// Whether the scene has SDF solids — gates the water-boundary density-compensation pass.
+    has_solids: bool,
     /// Water density-solve iteration cap + grid-rebuild interval.
     water_iters: u32,
     water_regrid: u32,
@@ -979,6 +983,7 @@ impl Solver for XpbdSolver {
         let has_water =
             scene.regions.iter().any(|r| r.species == Species::Water) || scene.declares_pour();
         let has_grain = scene.regions.iter().any(|r| r.species == Species::Grain);
+        let has_solids = !scene.solids.is_empty();
         let water_iters = cfg.max_iters;
         let water_regrid = REGRID_INTERVAL;
         let bed_iters = cfg.bed_max_iters;
@@ -1334,6 +1339,7 @@ impl Solver for XpbdSolver {
             grid_reorder_a: make("grid_reorder_a"),
             grid_reorder_b: make("grid_reorder_b"),
             grid_reorder_identity: make("grid_reorder_identity"),
+            compute_boundary: make("compute_boundary"),
             compute_lambda: make("compute_lambda"),
             residual_reduce: make("residual_reduce"),
             compute_dp: make("compute_dp"),
@@ -1442,6 +1448,17 @@ impl Solver for XpbdSolver {
             grid_reorder_identity: bg(
                 &pipelines.grid_reorder_identity,
                 &[(0, &params_buf), (9, &sorted_indices)],
+            ),
+            compute_boundary: bg(
+                &pipelines.compute_boundary,
+                &[
+                    (0, &params_buf),
+                    (2, &pred),
+                    (7, &c_residual),
+                    (10, &status),
+                    (11, &phase),
+                    (19, &solids),
+                ],
             ),
             compute_lambda: bg(
                 &pipelines.compute_lambda,
@@ -1730,7 +1747,8 @@ impl Solver for XpbdSolver {
         let ts = if gpu.timestamps_supported {
             // Generous upper bound: water density loop (≈6 passes/iter) + bed contact loop
             // (≈4 passes/iter) + coupling/finalize overhead; clamped to the query-set cap.
-            let passes_per_step = 12 + 6 * water_iters + 5 * bed_iters;
+            // Water loop is ≈7 passes/iter with the boundary pass (solid scenes); 6 covers it loosely.
+            let passes_per_step = 12 + 7 * water_iters + 5 * bed_iters;
             let capacity = (2 * passes_per_step * cfg.substeps).clamp(2, 512);
             let qset = device.create_query_set(&wgpu::QuerySetDescriptor {
                 label: Some("xpbd-timestamps"),
@@ -1772,6 +1790,7 @@ impl Solver for XpbdSolver {
             substeps: cfg.substeps.max(1),
             has_water,
             has_grain,
+            has_solids,
             water_iters,
             water_regrid,
             bed_iters,
@@ -1968,6 +1987,17 @@ impl Solver for XpbdSolver {
                                 &p.compute_fractions,
                                 &b.compute_fractions,
                                 "compute_fractions",
+                                np,
+                            );
+                        }
+                        if self.has_solids {
+                            // Wall density compensation into c_residual (consumed by compute_lambda,
+                            // then overwritten with the convergence residual). Solid scenes only.
+                            pass(
+                                &mut enc,
+                                &p.compute_boundary,
+                                &b.compute_boundary,
+                                "compute_boundary",
                                 np,
                             );
                         }

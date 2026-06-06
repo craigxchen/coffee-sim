@@ -7,6 +7,25 @@
 // the water constraint (and grain particles skip the water solve entirely). For a single-species
 // water scene the guards are pass-throughs, so water behaviour is unchanged.
 
+// Wall density compensation, precomputed into c_residual for compute_lambda to add (see the note
+// there). Its own pass because compute_lambda already binds 8 storage buffers (the WebGPU limit)
+// and cannot also bind `solids`; this pass binds `solids` but few others. Dispatched only when the
+// scene has SDF solids, so AABB-only scenes never run it and c_residual stays the residual buffer.
+@compute @workgroup_size(256)
+fn compute_boundary(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= params.particle_count) { return; }
+    if (status.converged != 0u) { return; }
+    c_residual[i] = 0.0;
+    if (phase[i] != PHASE_WATER) { return; }
+    let f_i = pred[i].w;
+    if (f_i <= params.pbf_eps) { return; }
+    let hit = solid_union(pred[i].xyz, PHASE_WATER);
+    if (hit.dist < params.h) {
+        c_residual[i] = params.rest_density * f_i * boundary_psi(hit.dist, params.h);
+    }
+}
+
 @compute @workgroup_size(256)
 fn compute_lambda(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
@@ -57,6 +76,18 @@ fn compute_lambda(@builtin(global_invocation_id) gid: vec3<u32>) {
                 }
             }
         }
+    }
+
+    // Boundary (wall) density compensation: a near-wall particle's kernel is partly cut off by the
+    // solid, so the fluid-only sum above under-reads — strongest at the cup's floor/side corner,
+    // where the deficit hid genuine over-packing and let it accumulate into squeeze-out eruptions.
+    // The cut-off fraction ρ₀·f_i·ψ(d) was precomputed by `compute_boundary` into c_residual (a
+    // scratch handoff — compute_lambda needs `solids`, but is already at the 8-storage-buffer limit,
+    // so a separate pass that CAN bind `solids` stages the value here). Overwritten with the real
+    // residual at the end of this kernel. Solid scenes only; AABB-only scenes never dispatch the
+    // boundary pass, so c_residual is untouched and this term is skipped (byte-unchanged).
+    if (params.num_solids > 0u) {
+        rho = rho + c_residual[i];
     }
 
     // Pore-modulated rest density: where grains are present the water target is ρ₀·(1−α_s), so
