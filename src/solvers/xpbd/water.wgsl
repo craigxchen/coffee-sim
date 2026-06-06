@@ -112,7 +112,12 @@ var<workgroup> sdata: array<f32, 256>;
 
 @compute @workgroup_size(256)
 fn residual_reduce(@builtin(local_invocation_id) lid: vec3<u32>) {
-    if (status.converged != 0u) { return; }
+    // No early `return` on status.converged here: a return gated on a read_write storage read is
+    // non-uniform control flow, and the workgroupBarrier()s below must be reached uniformly by every
+    // invocation (WGSL spec). The browser's Tint compiler rejects the early-out — failing the whole
+    // module — while native naga tolerates it. Instead we always run the (single-workgroup, cheap)
+    // reduction and gate only the bookkeeping write, which leaves `status` untouched once converged —
+    // observably identical to the early-out, and valid uniform control flow on both compilers.
     let tid = lid.x;
     var local_max = 0.0;
     var i = tid;
@@ -132,7 +137,7 @@ fn residual_reduce(@builtin(local_invocation_id) lid: vec3<u32>) {
         workgroupBarrier();
         stride = stride / 2u;
     }
-    if (tid == 0u) {
+    if (tid == 0u && status.converged == 0u) {
         let gmax = sdata[0];
         status.residual_bits = bitcast<u32>(gmax);
         status.iters_done = status.iters_done + 1u;
