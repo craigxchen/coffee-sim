@@ -62,6 +62,9 @@ struct ContactResult {
 @group(0) @binding(9) var<storage, read_write> bed_delta: array<atomic<i32>>;
 @group(0) @binding(10) var<storage, read_write> metrics: array<atomic<u32>>;
 @group(0) @binding(11) var sdf_class_tex: texture_3d<u32>;
+// Sparse-pressure tile metadata: slot 0 = active tile count, slot 1 reserved,
+// slots 2.. = one flag per TILE_SIZE^3 tile. See state.rs `sparse_tiles`.
+@group(0) @binding(12) var<storage, read_write> sparse_tiles: array<atomic<u32>>;
 
 // Metrics slot layout — keep in sync with `METRICS_SLOT_COUNT` in state.rs.
 const OBSTACLE_WALL_THICKNESS: f32 = 0.4;
@@ -181,6 +184,35 @@ fn scratch_div_idx(cell: u32) -> u32 { return grid_mom_x_idx(cell); }
 // viscosity reuses the momentum lanes as velocity scratch.
 fn scratch_packing_idx(cell: u32) -> u32 { return grid_mom_y_idx(cell); }
 fn scratch_kind_idx(cell: u32) -> u32 { return grid_mom_z_idx(cell); }
+
+// ── sparse-pressure tiles ──
+// One TILE_SIZE^3 = 64-cell tile maps to one @workgroup_size(64) sparse RBGS
+// workgroup. Tile ids are linear in (tx, ty, tz) with x fastest, mirroring the
+// cell index layout. Keep TILE_SIZE / SPARSE_TILE_HEADER in sync with state.rs.
+const TILE_SIZE: u32 = 4u;
+const SPARSE_TILE_HEADER: u32 = 2u;
+const SPARSE_ACTIVE_COUNT_IDX: u32 = 0u;
+fn tile_dim_x() -> u32 { return (gx() + TILE_SIZE - 1u) / TILE_SIZE; }
+fn tile_dim_y() -> u32 { return (gy() + TILE_SIZE - 1u) / TILE_SIZE; }
+fn tile_dim_z() -> u32 { return (gz() + TILE_SIZE - 1u) / TILE_SIZE; }
+fn tile_count() -> u32 { return tile_dim_x() * tile_dim_y() * tile_dim_z(); }
+fn tile_id_of(ix: u32, iy: u32, iz: u32) -> u32 {
+    return (ix / TILE_SIZE)
+        + (iy / TILE_SIZE) * tile_dim_x()
+        + (iz / TILE_SIZE) * tile_dim_x() * tile_dim_y();
+}
+fn tile_flag_idx(tile_id: u32) -> u32 { return SPARSE_TILE_HEADER + tile_id; }
+// Mark the owning tile of a fluid cell active. atomicExchange makes the first
+// writer per tile bump the active count exactly once; later writers see the
+// flag already set and skip the add (so the count stays bounded by tile_count
+// even when the clear pass is skipped on the dense path).
+fn mark_tile_active(ix: u32, iy: u32, iz: u32) {
+    let tid = tile_id_of(ix, iy, iz);
+    let old = atomicExchange(&sparse_tiles[tile_flag_idx(tid)], 1u);
+    if old == 0u {
+        atomicAdd(&sparse_tiles[SPARSE_ACTIVE_COUNT_IDX], 1u);
+    }
+}
 // A quadratic-B-spline particle deposits at most `nominal_mass * 0.75^3 ≈
 // 0.42 * nominal_mass` to its peak cell. The threshold must stay strictly
 // below that peak or isolated particles never register as fluid. Matching
@@ -1618,6 +1650,12 @@ fn classify_cells(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
 
+    // This cell is fluid: mark its tile active so the sparse RBGS sweeps visit
+    // it. Marking is unconditional (cheap vs the per-cell atomics above) and
+    // bounded; the sparse RBGS dispatch and the per-substep clear are the
+    // toggle-gated parts (mod.rs), so the dense path adds no extra dispatch.
+    mark_tile_active(ix_val, iy_val, iz_val);
+
     // Central-difference divergence using cell-centered velocities. No-flow
     // boundaries (off-grid faces and CELL_SOLID neighbors) use a ghost-mirror
     // on the normal velocity component: v_ghost.n = -v_self.n. That makes
@@ -2831,6 +2869,18 @@ fn metrics_clear(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
     if idx >= METRICS_SLOT_COUNT { return; }
     atomicStore(&metrics[idx], 0u);
+}
+
+// ── sparse_tiles_clear ──
+
+// Zero the active count, the reserved slot, and every per-tile flag before
+// classify_cells re-marks the active tiles for this substep. Dispatched only
+// when the sparse pressure path is enabled (mod.rs / profiler.rs).
+@compute @workgroup_size(64)
+fn sparse_tiles_clear(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if idx >= SPARSE_TILE_HEADER + tile_count() { return; }
+    atomicStore(&sparse_tiles[idx], 0u);
 }
 
 // ── bed_lookup_clear ──

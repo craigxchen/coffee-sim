@@ -44,6 +44,37 @@ pub(crate) const METRICS_RESIDUAL_SUM_FP_SCALE: f32 = 16.0;
 pub(crate) const METRICS_MASS_FP_SCALE: f32 = 1024.0;
 pub(crate) const METRICS_SOLUTE_FP_SCALE: f32 = 65536.0;
 
+/// Edge length (cells) of one sparse-pressure tile. One `@workgroup_size(64)`
+/// invocation maps exactly to one `TILE_SIZE^3` = 64-cell tile, so this must
+/// stay 4 to match the sparse RBGS workgroup size. Keep in sync with the WGSL
+/// `tile_*` helpers in `shader.rs`.
+pub(crate) const TILE_SIZE: u32 = 4;
+/// Header u32 slots preceding the per-tile flag array in the `sparse_tiles`
+/// buffer: slot 0 = active tile count, slot 1 = reserved. Keep in sync with
+/// `SPARSE_TILE_HEADER` in `shader.rs`.
+pub(crate) const SPARSE_TILE_HEADER: u32 = 2;
+
+/// Tile grid dimensions (ceil-divided) for a cell grid.
+pub(crate) fn tile_dims(grid_dims: [u32; 3]) -> [u32; 3] {
+    [
+        grid_dims[0].div_ceil(TILE_SIZE),
+        grid_dims[1].div_ceil(TILE_SIZE),
+        grid_dims[2].div_ceil(TILE_SIZE),
+    ]
+}
+
+/// Total number of `TILE_SIZE^3` tiles covering the cell grid (partial edge
+/// tiles included).
+pub(crate) fn tile_count(grid_dims: [u32; 3]) -> u32 {
+    let [tx, ty, tz] = tile_dims(grid_dims);
+    tx * ty * tz
+}
+
+/// Total u32 slots in the `sparse_tiles` buffer: header + one flag per tile.
+pub(crate) fn sparse_tile_slot_count(grid_dims: [u32; 3]) -> u32 {
+    SPARSE_TILE_HEADER + tile_count(grid_dims)
+}
+
 const SDF_NO_CONSTRAINT: f32 = 999.0;
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -97,6 +128,13 @@ pub(crate) struct MpmBuffers {
     /// `MpmBuffers`; currently unread while `refresh_metrics` is stubbed.
     #[allow(dead_code)]
     pub metrics_staging: wgpu::Buffer,
+    /// Sparse-pressure tile metadata (binding 12). Layout:
+    /// `u32[SPARSE_TILE_HEADER + tile_count]` — slot 0 = active tile count,
+    /// slot 1 = reserved, slots 2.. = one flag per `TILE_SIZE^3` tile.
+    /// Allocated once; written by `classify_cells` (tile marking) and
+    /// `sparse_tiles_clear`, read by the sparse RBGS sweeps. GPU-only except
+    /// on-demand readback (COPY_SRC) for tests/measurement.
+    pub sparse_tiles: wgpu::Buffer,
 }
 
 impl MpmBuffers {
@@ -196,6 +234,17 @@ impl MpmBuffers {
             mapped_at_creation: false,
         });
 
+        let sparse_tiles_size =
+            (sparse_tile_slot_count(settings.grid_dims) as usize * size_of::<u32>()) as u64;
+        let sparse_tiles = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("mpm sparse tiles"),
+            size: sparse_tiles_size,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
         let sdf_data = generate_sdf_data(settings);
         let sdf_class_data = generate_sdf_class_data(settings, &sdf_data);
         let (sdf_texture, sdf_view) = create_sdf_texture(device, queue, &sdf_data);
@@ -218,6 +267,7 @@ impl MpmBuffers {
             uniform_buffer,
             metrics,
             metrics_staging,
+            sparse_tiles,
         }
     }
 }

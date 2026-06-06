@@ -6,6 +6,7 @@ use super::state::MpmBuffers;
 pub(crate) struct MpmPipelines {
     pub bind_group: wgpu::BindGroup,
     pub metrics_clear: wgpu::ComputePipeline,
+    pub sparse_tiles_clear: wgpu::ComputePipeline,
     pub bed_lookup_clear: wgpu::ComputePipeline,
     pub bed_lookup_scatter: wgpu::ComputePipeline,
     pub p2g: wgpu::ComputePipeline,
@@ -83,6 +84,8 @@ impl MpmPipelines {
                     },
                     count: None,
                 },
+                // 12: sparse-pressure tile metadata (flags + active count)
+                storage_entry(12),
             ],
         });
 
@@ -138,6 +141,10 @@ impl MpmPipelines {
                     binding: 11,
                     resource: wgpu::BindingResource::TextureView(&buffers.sdf_class_view),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 12,
+                    resource: buffers.sparse_tiles.as_entire_binding(),
+                },
             ],
         });
 
@@ -166,6 +173,7 @@ impl MpmPipelines {
         Self {
             bind_group,
             metrics_clear: make("metrics_clear"),
+            sparse_tiles_clear: make("sparse_tiles_clear"),
             bed_lookup_clear: make("bed_lookup_clear"),
             bed_lookup_scatter: make("bed_lookup_scatter"),
             p2g: make("p2g"),
