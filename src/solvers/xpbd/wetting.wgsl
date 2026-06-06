@@ -15,9 +15,16 @@
 // moisture lane convention (pos.w / its frozen mirror pred.w): water = f_w ∈ [0,1], grain = V_abs ≥ 0.
 
 fn wet_v_cap() -> f32 { return params.r_max * params.rho_ratio * params.grain_volume; }
+// Saturation cutoff: a grain within `absorb_roundoff` of capacity is treated as full. Mirrors the
+// water lane's `absorb_roundoff` f_w deactivation floor. Without it the demand asymptotes toward
+// V_cap forever, and once the per-step `take` drops below the near-capacity grain's f32 ulp the grain
+// rounds its gain away (`v_abs + take == v_abs`) while the water still records the loss — a one-signed
+// volume sink that only shows up in the deep tail. Flooring demand to 0 here stops that tail cleanly.
+fn wet_sat_cutoff() -> f32 { let c = wet_v_cap(); return c - c * params.absorb_roundoff; }
 fn wet_v_water() -> f32 { return params.particle_mass / params.rest_density; }
 fn wet_demand(v_abs: f32) -> f32 {
-    return max(wet_v_cap() - v_abs, 0.0) * (1.0 - exp(-params.k_abs * params.dt));
+    if (v_abs >= wet_sat_cutoff()) { return 0.0; }
+    return (wet_v_cap() - v_abs) * (1.0 - exp(-params.k_abs * params.dt));
 }
 
 // Per-particle count of ELIGIBLE opposite-species neighbors in range (from the frozen pred.w):
@@ -29,7 +36,7 @@ fn wet_count(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (i >= params.particle_count) { return; }
     let ph_i = phase[i];
     let xi = pred[i].xyz;
-    let v_cap = wet_v_cap();
+    let cutoff = wet_sat_cutoff();
     var n = 0u;
     let base = cell_coord(xi);
     for (var dz = -1; dz <= 1; dz = dz + 1) {
@@ -52,7 +59,7 @@ fn wet_count(@builtin(global_invocation_id) gid: vec3<u32>) {
                     if (ph_j == PHASE_WATER) {
                         if (pred[j].w > params.absorb_roundoff) { n = n + 1u; } // non-empty water
                     } else {
-                        if (pred[j].w < v_cap) { n = n + 1u; } // unsaturated grain (demand > 0)
+                        if (pred[j].w < cutoff) { n = n + 1u; } // unsaturated grain (demand > 0)
                     }
                 }
             }
@@ -70,7 +77,7 @@ fn wet_water(@builtin(global_invocation_id) gid: vec3<u32>) {
     let n_w = f32(wet_neighbors[i]);
     if (f_w <= params.absorb_roundoff || n_w <= 0.0) { return; } // inert / no eligible grains
 
-    let v_cap = wet_v_cap();
+    let cutoff = wet_sat_cutoff();
     let v_w = wet_v_water();
     let xi = pred[i].xyz;
     var total = 0.0;
@@ -91,7 +98,7 @@ fn wet_water(@builtin(global_invocation_id) gid: vec3<u32>) {
                     let r = length(xi - pred[j].xyz);
                     if (r >= params.h) { continue; }
                     let v_abs_g = pred[j].w;
-                    if (v_abs_g >= v_cap) { continue; } // saturated grain ineligible
+                    if (v_abs_g >= cutoff) { continue; } // saturated grain ineligible
                     let n_g = f32(wet_neighbors[j]);
                     if (n_g <= 0.0) { continue; }
                     total = total + min(f_w * v_w / n_w, wet_demand(v_abs_g) / n_g);

@@ -737,3 +737,98 @@ fn fine_grind_high_rmax_absorption_is_stable() {
         "non-finite or negative moisture"
     );
 }
+
+/// A static (gravity-off, no-solve) interleaved water/grain lattice: one grain + one adjacent water
+/// per 2-unit cell, every pair within h. With gravity off and no position solve, `predict` leaves
+/// `pred == pos` — particles never move, so the neighbor set is fixed and absorption runs into its
+/// deep asymptotic tail against the SAME pairs. That's the regime that exposes a saturated-tail leak.
+fn static_interleaved_scene(reps: i32) -> Scene {
+    let mut regions = Vec::new();
+    for k in 0..reps {
+        for j in 0..reps {
+            for i in 0..reps {
+                let x = 2.0 + i as f32 * 2.0;
+                let y = 2.0 + j as f32 * 2.0;
+                let z = 2.0 + k as f32 * 2.0;
+                regions.push(point([x, y, z], Species::Grain));
+                regions.push(point([x + 0.8, y, z], Species::Water));
+            }
+        }
+    }
+    let extent = 4.0 + reps as f32 * 2.0;
+    Scene {
+        gravity: [0.0, 0.0, 0.0],
+        box_min: [0.0, 0.0, 0.0],
+        box_max: [extent, extent, extent],
+        regions,
+        ..Scene::default()
+    }
+}
+
+/// Volume conservation in the SATURATED TAIL — the long-run regression the short gates miss.
+///
+/// In the capacity-limited regime (grains asymptote toward `V_cap` while leftover water still has
+/// giveable `f_w`), `wet_demand` returns ever-tinier *positive* values forever. The water lane records
+/// each vanishing loss (small `f_w` magnitude ⇒ fine f32 ulp), but the near-capacity grain rounds its
+/// matching gain away (`v_abs + take` with `v_abs ≈ V_cap` ⇒ coarse ulp) ⇒ a one-signed volume sink
+/// that only dominates after ~1000+ steps. The existing 120–150-step gates never reach it. This runs
+/// long, past saturation, and pins the post-saturation slope to ~0.
+#[test]
+fn absorption_conserves_volume_in_saturated_tail() {
+    let Some(gpu) = GpuContext::new_headless() else {
+        eprintln!("xpbd_wetting: no GPU adapter; skipping.");
+        return;
+    };
+    // Default r_max=1.5 ⇒ capacity-limited: grains saturate near V_cap with water left over.
+    let mats = Materials::default();
+    let scene = static_interleaved_scene(8); // 512 grain + 512 water
+    let mut solver = XpbdSolver::build(&scene, &mats, &absorb_only_config(), &gpu);
+    let phase = solver.read_phases();
+    let v_w = solver.water_particle_volume();
+
+    let initial = total_volume(&solver.read_moisture(), &phase, v_w);
+    // Run well past saturation into the deep asymptotic tail.
+    for _ in 0..2000 {
+        solver.step(1.0 / 60.0, &EmissionInput::default());
+    }
+    let total_a = total_volume(&solver.read_moisture(), &phase, v_w);
+    for _ in 0..1000 {
+        solver.step(1.0 / 60.0, &EmissionInput::default());
+    }
+    let m_b = solver.read_moisture();
+    let total_b = total_volume(&m_b, &phase, v_w);
+
+    // Non-vacuous: grains actually reached near-saturation AND water is left over (the leaking regime).
+    let v_cap = capacity(&mats);
+    let n_grain = phase.iter().filter(|&&p| p == 1).count() as f32;
+    let grain_vol: f32 = m_b
+        .iter()
+        .zip(&phase)
+        .filter(|(_, &p)| p == 1)
+        .map(|(&v, _)| v)
+        .sum();
+    assert!(
+        grain_vol / n_grain > 0.6 * v_cap,
+        "grains not near saturation ({}/{n_grain} = {} vs cap {v_cap}) — tail not exercised",
+        grain_vol,
+        grain_vol / n_grain
+    );
+    let water_vol: f32 = m_b
+        .iter()
+        .zip(&phase)
+        .filter(|(_, &p)| p == 0)
+        .map(|(&v, _)| v * v_w)
+        .sum();
+    assert!(
+        water_vol > 1.0,
+        "no leftover water ({water_vol}) — not the capacity-limited regime"
+    );
+
+    // Post-saturation, total volume must stay ~flat. The leak makes it fall linearly (~7e-3 over this
+    // 1000-step window for this scene); a floored grain demand keeps it bit-stable.
+    let tail_drift = (total_b - total_a).abs();
+    assert!(
+        tail_drift <= 1.0e-3,
+        "volume leaked in the saturated tail: {total_a} -> {total_b} (Δ {tail_drift}); initial {initial}"
+    );
+}
