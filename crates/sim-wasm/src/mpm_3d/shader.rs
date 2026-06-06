@@ -1736,7 +1736,12 @@ fn pressure_update(idx: u32, target_parity: u32) {
 
     let kind = cell_kind_load(idx);
     if !is_fluid_kind(kind) {
-        pressure_store(idx, 0.0);
+        // Non-fluid cells already hold zero pressure: the grid buffer is
+        // cleared each substep and classify_cells zeroes every in-bounds cell
+        // before classifying. Their pressure is never read as a value (the
+        // averaging stencil only sums is_fluid_kind neighbors), so re-zeroing
+        // here is redundant — and it costs a store to every air/solid cell on
+        // every red/black sweep. Skip it.
         return;
     }
 
