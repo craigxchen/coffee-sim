@@ -24,15 +24,19 @@ fn fines_susp_cap(f_w: f32) -> f32 {
 // Lodged fines fill pore space; cap at one grain volume so the α_s deviation stays bounded.
 fn fines_lodged_cap() -> f32 { return params.grain_volume; }
 
-// Signed transfer rate constant from local flux (mirror of models::fines::net_rate). Positive ⇒
-// erosion (grain→water), negative ⇒ deposition (water→grain), zero at the critical flux.
-fn fines_net_rate(flux: f32) -> f32 {
-    let f = max(flux, 0.0);
-    let c = max(params.fines.z, 1.0e-6);
-    return params.fines.x * (f - c) / (f + c);
+// Deep-bed filtration: two flow-driven processes (mirror of models::fines). Grains RELEASE lodged
+// fines into the flowing water (mobilization) and suspended fines STRAIN back onto grains as the
+// water flows past (capture). Straining concentrates fines where the most water funnels through —
+// the converging outlet / filter — so the bed clogs there and drawdown slows. Equal coefficients let
+// advection carry released fines downstream before they re-strain, building the bottom clog.
+const FINES_RELEASE_COEF: f32 = 1.0;
+const FINES_STRAIN_COEF: f32 = 1.0;
+// Per-step transfer fraction: 1 − e^{−coef·rate·(flux/crit)·dt} ∈ [0,1). Scales with local flux
+// normalized by crit_flux (params.fines.z): zero at rest, and a huge crit_flux freezes the transfer.
+fn fines_flow_frac(flux: f32, coef: f32) -> f32 {
+    let x = coef * params.fines.x * (max(flux, 0.0) / max(params.fines.z, 1.0e-6)) * params.dt;
+    return 1.0 - exp(-x);
 }
-// Bounded per-step transfer fraction from a signed rate: 1 − e^{−|k|·dt} ∈ [0,1).
-fn fines_frac(k: f32) -> f32 { return 1.0 - exp(-abs(k) * params.dt); }
 
 // Symmetric roundoff floor: a sub-threshold take is zeroed identically on both sides, so the
 // asymptotic tail can't generate a one-signed sub-ulp leak (the wet_sat_cutoff lesson). Applied to
@@ -104,19 +108,21 @@ fn fines_grain(@builtin(global_invocation_id) gid: vec3<u32>) {
                     if (r >= params.h) { continue; }
                     let n_j = f32(wet_neighbors[j]);
                     if (n_j <= 0.0) { continue; }
-                    let k = fines_net_rate(length(vel[j].xyz - vi));
-                    let frac = fines_frac(k);
-                    if (k >= 0.0) {
-                        // erosion grain→water: grain loses. Capped by grain source + water headroom.
-                        let erodable = frac * f_grain / n_i;
-                        let w_headroom = max(fines_susp_cap(pos[j].w) - chem_frozen[j].w, 0.0) / n_j;
-                        delta = delta - fines_floor(min(erodable, w_headroom));
-                    } else {
-                        // deposition water→grain: grain gains. Capped by water source + grain headroom.
-                        let depositable = frac * chem_frozen[j].w / n_j;
-                        let g_headroom = lodged_headroom / n_i;
-                        delta = delta + fines_floor(min(depositable, g_headroom));
-                    }
+                    let flux = length(vel[j].xyz - vi);
+                    // Release (grain→water): grain sheds lodged fines, capped by water headroom.
+                    let rel_frac = fines_flow_frac(flux, FINES_RELEASE_COEF);
+                    let release = fines_floor(min(
+                        rel_frac * f_grain / n_i,
+                        max(fines_susp_cap(pos[j].w) - chem_frozen[j].w, 0.0) / n_j,
+                    ));
+                    // Strain (water→grain): suspended fines deposit onto this grain, capped by its
+                    // lodged headroom.
+                    let str_frac = fines_flow_frac(flux, FINES_STRAIN_COEF);
+                    let strain = fines_floor(min(
+                        str_frac * chem_frozen[j].w / n_j,
+                        lodged_headroom / n_i,
+                    ));
+                    delta = delta + strain - release; // grain gains strained fines, loses released
                 }
             }
         }
@@ -132,7 +138,6 @@ fn fines_water(@builtin(global_invocation_id) gid: vec3<u32>) {
     let n_i = f32(wet_neighbors[i]);
     if (n_i <= 0.0) { return; }
     let f_water = chem_frozen[i].w; // suspended fines (frozen)
-    let susp_headroom = max(fines_susp_cap(pos[i].w) - f_water, 0.0);
     let xi = pos[i].xyz;
     let vi = vel[i].xyz;
     var delta = 0.0; // net change to this water's suspended fines
@@ -155,19 +160,21 @@ fn fines_water(@builtin(global_invocation_id) gid: vec3<u32>) {
                     let n_j = f32(wet_neighbors[j]); // grain's water-neighbor count
                     if (n_j <= 0.0) { continue; }
                     let f_grain_j = chem_frozen[j].w;
-                    let k = fines_net_rate(length(vi - vel[j].xyz));
-                    let frac = fines_frac(k);
-                    if (k >= 0.0) {
-                        // erosion grain→water: water gains. IDENTICAL operands to the grain pass.
-                        let erodable = frac * f_grain_j / n_j;
-                        let w_headroom = susp_headroom / n_i;
-                        delta = delta + fines_floor(min(erodable, w_headroom));
-                    } else {
-                        // deposition water→grain: water loses. IDENTICAL operands to the grain pass.
-                        let depositable = frac * f_water / n_i;
-                        let g_headroom = max(fines_lodged_cap() - f_grain_j, 0.0) / n_j;
-                        delta = delta - fines_floor(min(depositable, g_headroom));
-                    }
+                    let flux = length(vi - vel[j].xyz);
+                    // Release (grain→water): water gains shed fines. IDENTICAL operands to the grain
+                    // pass (frozen state, same n's, same flux) ⇒ grain-loss == water-gain exactly.
+                    let rel_frac = fines_flow_frac(flux, FINES_RELEASE_COEF);
+                    let release = fines_floor(min(
+                        rel_frac * f_grain_j / n_j,
+                        max(fines_susp_cap(pos[i].w) - f_water, 0.0) / n_i,
+                    ));
+                    // Strain (water→grain): this water deposits suspended fines onto the grain.
+                    let str_frac = fines_flow_frac(flux, FINES_STRAIN_COEF);
+                    let strain = fines_floor(min(
+                        str_frac * f_water / n_i,
+                        max(fines_lodged_cap() - f_grain_j, 0.0) / n_j,
+                    ));
+                    delta = delta + release - strain; // water gains released fines, loses strained
                 }
             }
         }

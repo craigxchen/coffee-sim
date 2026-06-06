@@ -1,9 +1,10 @@
 //! Fines migration model (shared physics, Phase 6).
 //!
-//! Coffee *fines* (broken-cell fragments, dust) are a small, mobile sub-grain population that
-//! detaches from grains under flow, rides the draining water (Lagrangian — advected for free on the
-//! carrying water particle), and re-deposits where the flow slackens — locally clogging the pore
-//! space, lowering permeability, and slowing drawdown. We model them as a conserved, **massless**
+//! Coffee *fines* (broken-cell fragments, dust) are a small, mobile sub-grain population. They are
+//! **released** from grains into the flowing water (mobilization), ride the draining water
+//! (Lagrangian — advected for free on the carrying water particle), and **strain** back onto the
+//! grain matrix as the water flows past (deep-bed filtration). We model them as a conserved,
+//! **massless**
 //! transported scalar: a volume that occupies pore space (so it shows up in the local solid
 //! fraction `α_s` and thus permeability) but carries no inertial mass — so the transfer moves a
 //! conserved scalar only, writes no velocities, and perturbs no momentum. They are NOT a separate
@@ -15,9 +16,9 @@
 
 const EPS: f32 = 1.0e-6;
 
-/// Default critical Darcy flux (reduced sim units) at which erosion and deposition balance —
-/// the zero-crossing of [`net_rate`]. Calibration-pending; only consulted when fines are enabled
-/// (`Materials::fines_fraction > 0` and `Config::fines_rate > 0`).
+/// Default Darcy-flux normalization (reduced sim units) for the release/strain transfer fractions
+/// ([`flow_fraction`]); larger slows transfer, a huge value freezes it. Calibration-pending; only
+/// consulted when fines are enabled (`Materials::fines_fraction > 0` and `Config::fines_rate > 0`).
 pub const CRIT_FLUX_DEFAULT: f32 = 0.5;
 
 /// Per-grain seeded fines inventory (volume units): `fines_fraction · grain_volume`. Seeded
@@ -29,16 +30,24 @@ pub fn fines_seed(grain_volume: f32, fines_fraction: f32) -> f32 {
     grain_volume * fines_fraction.max(0.0)
 }
 
-/// Signed fines transfer rate constant (1/s) as a function of local Darcy flux
-/// `|v_water − v_grain|`. Positive ⇒ erosion (grain → suspended), negative ⇒ deposition
-/// (suspended → grain), zero at the critical flux. Bounded in `(−rate, rate)`, monotone increasing
-/// in flux, single zero-crossing at `crit_flux`: fast flow scours fines loose, slack flow lets them
-/// settle. `rate` is the overall scale (`Config::fines_rate`).
+/// Deep-bed filtration coefficients (relative to `Config::fines_rate`). Two flow-driven processes
+/// run together: grains **release** lodged fines into the flowing water (mobilization), and
+/// suspended fines **strain** back onto grains as the water flows past them (capture). Straining
+/// concentrates fines where the most water funnels through — the converging outlet / filter — so the
+/// bed clogs there and drawdown slows (real pour-over: fines clog the paper). Equal coefficients let
+/// advection carry released fines downstream before they re-strain, building the bottom clog.
+pub const RELEASE_COEF: f32 = 1.0;
+pub const STRAIN_COEF: f32 = 1.0;
+
+/// Per-step transfer fraction for a flow-driven fines process: `1 − e^{−coef·rate·(flux/crit)·dt}`
+/// ∈ `[0,1)`. Both release and straining scale with the local Darcy flux normalized by `crit_flux`,
+/// so a stagnant bed neither releases nor strains (no transfer at zero flux), and a very large
+/// `crit_flux` effectively freezes the transfer (used by tests to isolate the permeability response).
+/// Monotone increasing in flux, bounded below 1.
 #[inline]
-pub fn net_rate(flux: f32, crit_flux: f32, rate: f32) -> f32 {
-    let f = flux.max(0.0);
-    let c = crit_flux.max(EPS);
-    rate * (f - c) / (f + c)
+pub fn flow_fraction(flux: f32, crit_flux: f32, rate: f32, dt: f32, coef: f32) -> f32 {
+    let x = coef.max(0.0) * rate.max(0.0) * (flux.max(0.0) / crit_flux.max(EPS)) * dt.max(0.0);
+    1.0 - (-x).exp()
 }
 
 #[cfg(test)]
@@ -53,26 +62,30 @@ mod tests {
     }
 
     #[test]
-    fn net_rate_crosses_zero_once_at_crit_flux() {
-        let (crit, rate) = (0.5, 2.0);
-        assert!(net_rate(crit, crit, rate).abs() < 1e-6, "zero at crit flux");
-        assert!(net_rate(0.0, crit, rate) < 0.0, "no flow ⇒ deposition");
-        assert!(net_rate(5.0, crit, rate) > 0.0, "fast flow ⇒ erosion");
+    fn flow_fraction_is_zero_at_rest_and_grows_with_flux() {
+        let (crit, rate, dt) = (0.5, 2.0, 1.0 / 60.0);
+        assert_eq!(
+            flow_fraction(0.0, crit, rate, dt, 1.0),
+            0.0,
+            "stagnant ⇒ no transfer"
+        );
+        let mut prev = -1.0;
+        for &f in &[0.0, 0.1, 0.5, 1.0, 5.0, 100.0] {
+            let frac = flow_fraction(f, crit, rate, dt, 1.0);
+            assert!(frac >= prev, "monotone increasing in flux (at flux={f})");
+            assert!((0.0..1.0).contains(&frac), "bounded in [0,1): {frac}");
+            prev = frac;
+        }
     }
 
     #[test]
-    fn net_rate_is_monotone_and_bounded() {
-        let (crit, rate) = (0.5, 2.0);
-        let fluxes = [0.0, 0.1, 0.25, 0.5, 1.0, 2.0, 10.0, 100.0];
-        let mut prev = f32::NEG_INFINITY;
-        for &f in &fluxes {
-            let r = net_rate(f, crit, rate);
-            assert!(r > prev, "monotone increasing in flux (at flux={f})");
-            assert!(r.abs() <= rate, "bounded by |rate| (at flux={f})");
-            prev = r;
-        }
-        // No-flow deposition saturates at exactly −rate; erosion approaches +rate.
-        assert!((net_rate(0.0, crit, rate) + rate).abs() < 1e-6);
-        assert!(net_rate(1.0e6, crit, rate) > rate - 1e-3);
+    fn large_crit_flux_freezes_the_transfer() {
+        // A huge crit_flux normalizes the flux to ~0, so neither process moves fines — lets a test
+        // hold a manual clog fixed and isolate the permeability response.
+        let frac = flow_fraction(5.0, 1.0e6, 2.0, 1.0 / 60.0, 1.0);
+        assert!(
+            frac < 1e-4,
+            "huge crit_flux should freeze transfer, got {frac}"
+        );
     }
 }
