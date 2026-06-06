@@ -589,6 +589,36 @@ fn finalize(@builtin(global_invocation_id) gid: vec3<u32>) {
         if (fluid_impulse[i] <= params.wake_threshold && length(v) < params.grain_sleep_speed) {
             v = vec3<f32>(0.0);
         }
+    } else if (params.num_solids > 0u) {
+        // Canonical XPBD static-collision VELOCITY response (Müller et al. 2020). apply_dp already
+        // clamped POSITION out of the wall; here we set the post-collision VELOCITY independently of
+        // that push (the cure for wall "eruption": otherwise v=(pred-pos)/dt folds the outward push
+        // into v and the particle is flung off). One pass over the blocking solids: at a contacted
+        // surface split v, cancel the normal component (restitution 0 — inelastic; NOT a v·n≥0 clamp,
+        // which would permit the eruption) and apply Coulomb friction. A cup's side and floor meet in
+        // a concave corner where the nearest-face normal cancels only one axis, so on a cylinder floor
+        // we additionally zero v.y — both axes handled without a second sweep over `solids`.
+        let contact = 0.25 * params.h;
+        for (var s = 0u; s < params.num_solids; s = s + 1u) {
+            let prim = solids[s];
+            if ((prim.species_mask & (1u << phase[i])) == 0u) { continue; }
+            let hit = solid_cavity(prim, xi);
+            if (hit.dist < contact) {
+                let n = hit.grad; // unit (sdf_normalize3)
+                let vn = dot(v, n);
+                v = v - vn * n; // restitution 0: cancel normal velocity, decoupled from the push
+                let vt = length(v);
+                if (vt > 1e-6) {
+                    let fric = min(hit.friction * abs(vn), vt); // Coulomb: bounded by the normal impulse
+                    v = v - (v / vt) * fric;
+                }
+            }
+            if (prim.kind == 1u
+                && xi.y - prim.a.x < contact
+                && length(vec2<f32>(xi.x - prim.b.x, xi.z - prim.b.y)) < prim.a.z) {
+                v.y = 0.0; // concave corner: the floor axis the side normal can't cancel
+            }
+        }
     }
 
     let sp = length(v);
