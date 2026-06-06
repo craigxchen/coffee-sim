@@ -55,7 +55,7 @@ pub(crate) const TILE_SIZE: u32 = 4;
 pub(crate) const SPARSE_TILE_HEADER: u32 = 2;
 
 /// Tile grid dimensions (ceil-divided) for a cell grid.
-pub(crate) fn tile_dims(grid_dims: [u32; 3]) -> [u32; 3] {
+fn tile_dims(grid_dims: [u32; 3]) -> [u32; 3] {
     [
         grid_dims[0].div_ceil(TILE_SIZE),
         grid_dims[1].div_ceil(TILE_SIZE),
