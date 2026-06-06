@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Coffee Sim | 3D Pourover</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main class="layout">
+      <section class="sidebar">
+        <p class="eyebrow">Coffee Sim / XPBD</p>
+        <h1>V60 Pourover</h1>
+        <p class="lede">
+          GPU XPBD fluid simulation with a V60 cone boundary and porous coffee bed.
+          Drag to orbit, scroll to zoom, and adjust water velocity to change the stream.
+        </p>
+        <div class="controls">
+          <button id="toggle">Pause</button>
+          <button id="reset">Reset</button>
+        </div>
+        <div class="control-panel">
+          <div class="slider-field">
+            <span>Scenes</span>
+          </div>
+          <div id="scene-panel-main" class="scene-panel controls">
+            <button id="scene-center-pour">Center Pour</button>
+            <button id="scene-free-stream">Water Only</button>
+          </div>
+        </div>
+        <div class="control-panel">
+          <label class="slider-field" for="water-velocity">
+            <span>Water Velocity</span>
+            <output id="water-velocity-value">0.12 m/s</output>
+          </label>
+          <input id="water-velocity" type="range" min="0" max="0.60" step="0.01" value="0.12" />
+        </div>
+        <div class="control-panel">
+          <div class="slider-field">
+            <span>Spout Position</span>
+            <output id="spout-plane-value">(0.0, 0.0)</output>
+          </div>
+          <div class="spout-control">
+            <div
+              id="spout-plane"
+              class="spout-plane"
+              role="slider"
+              tabindex="0"
+              aria-label="Spout X/Z position"
+              aria-valuemin="-6"
+              aria-valuemax="6"
+              aria-valuenow="0"
+              aria-valuetext="X 0.0, Z 0.0"
+            >
+              <span class="spout-plane-axis spout-plane-axis-x"></span>
+              <span class="spout-plane-axis spout-plane-axis-z"></span>
+              <span id="spout-plane-marker" class="spout-plane-marker"></span>
+            </div>
+            <label class="height-control" for="spout-height">
+              <span>Height</span>
+              <input id="spout-height" type="range" min="0.5" max="5.0" step="0.1" value="2.5" />
+              <output id="spout-height-value">2.5</output>
+            </label>
+          </div>
+        </div>
+        <dl class="stats">
+          <div>
+            <dt>Particles</dt>
+            <dd id="particles">0</dd>
+          </div>
+          <div>
+            <dt>FPS</dt>
+            <dd id="fps">0</dd>
+          </div>
+        </dl>
+        <dl class="stats">
+          <div>
+            <dt>Yield</dt>
+            <dd id="extraction-yield">0.0%</dd>
+          </div>
+          <div>
+            <dt>Cup TDS</dt>
+            <dd id="cup-tds">0.00%</dd>
+          </div>
+          <div>
+            <dt>Evenness</dt>
+            <dd id="evenness">1.00</dd>
+          </div>
+          <div>
+            <dt>Drawdown</dt>
+            <dd id="drawdown-time">0.0s</dd>
+          </div>
+        </dl>
+      </section>
+      <section class="viewer">
+        <canvas id="sim-canvas"></canvas>
+        <div class="cross-section-overlay" aria-hidden="true">
+          <span>Center Cross-Section</span>
+        </div>
+        <div class="view-cube" role="img" aria-label="Camera orientation">
+          <div id="view-cube-stage" class="view-cube-stage">
+            <span class="view-cube-face view-cube-face-front">+Z</span>
+            <span class="view-cube-face view-cube-face-back">-Z</span>
+            <span class="view-cube-face view-cube-face-right">+X</span>
+            <span class="view-cube-face view-cube-face-left">-X</span>
+            <span class="view-cube-face view-cube-face-top">+Y</span>
+            <span class="view-cube-face view-cube-face-bottom">-Y</span>
+          </div>
+        </div>
+      </section>
+    </main>
+    <script type="module" src="./main.js"></script>
+  </body>
+</html>
