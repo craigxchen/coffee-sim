@@ -139,40 +139,37 @@ fn fines_erosion_conserves_volume() {
 }
 
 #[test]
-fn fines_deposit_from_stagnant_water() {
+fn fines_strain_onto_grains_during_flow() {
     let Some(gpu) = GpuContext::new_headless() else {
         eprintln!("xpbd_fines: no GPU adapter; skipping.");
         return;
     };
-    let mats = fines_active_materials();
-    // Isolated deposition: zero gravity + every mechanical pass off, so nothing moves and the local
-    // flux is 0 everywhere → net_rate < 0 (deposition) for every water↔grain pair. A thin water
-    // layer sits one unit above a grain layer (within h), pre-loaded with suspended fines.
+    // Isolated straining (deep-bed filtration): grains start EMPTY (fines_fraction = 0, so no
+    // release), water is pre-loaded with suspended fines and falls through the grain layer. As it
+    // flows past the grains the suspended fines strain out onto them → water loses, grains gain.
+    let mats = Materials {
+        fines_fraction: 0.0,
+        water_grain_distance: 0.5, // water threads the bed so it flows past the grains
+        ..Materials::default()
+    };
     let scene = Scene {
-        gravity: [0.0, 0.0, 0.0],
         box_min: [0.0, 0.0, 0.0],
         box_max: [8.0, 8.0, 8.0],
         regions: vec![
             SeedRegion {
                 min: [2.0, 2.0, 2.0],
-                max: [5.0, 2.0, 5.0],
+                max: [5.0, 3.0, 5.0],
                 species: Species::Grain,
             },
             SeedRegion {
-                min: [2.0, 3.0, 2.0],
-                max: [5.0, 3.0, 5.0],
+                min: [2.0, 4.0, 2.0],
+                max: [5.0, 5.0, 5.0],
                 species: Species::Water,
             },
         ],
         ..Scene::default()
     };
     let cfg = Config {
-        max_iters: 0,
-        bed_max_iters: 0,
-        drag_subiters: 0,
-        buoyancy_scale: 0.0,
-        xsph_viscosity_c: 0.0,
-        grain_sleep_speed: 0.0,
         fines_rate: 2.0,
         ..Config::default()
     };
@@ -192,8 +189,9 @@ fn fines_deposit_from_stagnant_water() {
     let (grain_before, water_before) = fines_by_species(&before, &phase);
     let total_before = total_fines(&before);
     assert!(water_before > 0.0, "test setup: water must carry fines");
+    assert!(grain_before < 1e-6, "test setup: grains start empty");
 
-    for _ in 0..30 {
+    for _ in 0..60 {
         solver.step(DT, &EmissionInput::default());
     }
     let chem = solver.read_chem();
@@ -202,16 +200,16 @@ fn fines_deposit_from_stagnant_water() {
 
     assert!(
         (total_fines(&chem) - total_before).abs() < 1e-3 * total_before,
-        "fines volume not conserved during deposition: {} vs {total_before}",
+        "fines volume not conserved during straining: {} vs {total_before}",
         total_fines(&chem)
     );
     assert!(
         water_after < water_before,
-        "no deposition: stagnant water kept its suspended fines ({water_after} vs {water_before})"
+        "no straining: flowing water kept all its suspended fines ({water_after} vs {water_before})"
     );
     assert!(
         grain_after > grain_before,
-        "deposited fines did not land on grains ({grain_after} vs {grain_before})"
+        "strained fines did not land on grains ({grain_after} vs {grain_before})"
     );
 }
 
@@ -260,9 +258,11 @@ fn fines_transfer_writes_no_velocity() {
         return;
     };
     let mats = fines_active_materials();
-    // Mechanics fully off (incl. drag, so the harmonic-k combiner is never invoked) + zero gravity:
-    // nothing should ever impart velocity. With fines transferring (pre-seeded suspended fines),
-    // every velocity must stay 0 — proving the fines passes write only chem.w, never vel.
+    // Mechanics fully off (incl. drag, so the harmonic-k combiner is never invoked) + zero gravity.
+    // Water is given a constant downward velocity so it flows past the grains (flux > 0 ⇒ the fines
+    // release/strain transfer is ACTIVE), but with no forces, predict+finalize preserve velocity
+    // exactly. So every velocity must stay at its seeded value — proving the fines passes write only
+    // chem.w, never vel.
     let scene = Scene {
         gravity: [0.0, 0.0, 0.0],
         box_min: [0.0, 0.0, 0.0],
@@ -270,12 +270,12 @@ fn fines_transfer_writes_no_velocity() {
         regions: vec![
             SeedRegion {
                 min: [2.0, 2.0, 2.0],
-                max: [5.0, 2.0, 5.0],
+                max: [5.0, 3.0, 5.0],
                 species: Species::Grain,
             },
             SeedRegion {
-                min: [2.0, 3.0, 2.0],
-                max: [5.0, 3.0, 5.0],
+                min: [2.0, 4.0, 2.0],
+                max: [5.0, 5.0, 5.0],
                 species: Species::Water,
             },
         ],
@@ -292,25 +292,36 @@ fn fines_transfer_writes_no_velocity() {
         ..Config::default()
     };
     let mut solver = XpbdSolver::build(&scene, &mats, &cfg, &gpu);
-    let mut chem = solver.read_chem();
     let phase = solver.read_phases();
-    for (c, &ph) in chem.iter_mut().zip(&phase) {
-        if ph == 0 {
-            c[3] = 0.05; // pre-load suspended fines so the transfer is active
-        }
-    }
-    solver.write_chem_for_test(&chem);
-    for _ in 0..30 {
+    let vel0: Vec<[f32; 4]> = phase
+        .iter()
+        .map(|&ph| {
+            if ph == 0 {
+                [0.0, -1.0, 0.0, 0.0]
+            } else {
+                [0.0; 4]
+            }
+        })
+        .collect();
+    solver.write_velocities_for_test(&vel0);
+    for _ in 0..20 {
         solver.step(DT, &EmissionInput::default());
     }
-    let vmax = solver
-        .read_velocities()
+    let vel = solver.read_velocities();
+    let phase = solver.read_phases();
+    let worst = vel
         .iter()
-        .map(|v| (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt())
+        .zip(&phase)
+        .map(|(v, &ph)| {
+            let expect_vy = if ph == 0 { -1.0 } else { 0.0 };
+            (v[0]).abs().max((v[1] - expect_vy).abs()).max((v[2]).abs())
+        })
         .fold(0.0f32, f32::max);
+    // Tolerance well above the predict→finalize f32 round-trip drift (~1e-5 over 20 steps) but far
+    // below any real velocity write (a stray impulse would be O(0.1)).
     assert!(
-        vmax < 1e-6,
-        "fines transfer imparted velocity ({vmax}); it must write only chem.w"
+        worst < 1e-3,
+        "fines transfer perturbed velocity (worst Δ {worst}); it must write only chem.w"
     );
 }
 
