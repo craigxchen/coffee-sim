@@ -1852,6 +1852,53 @@ fn pressure_rbgs_black(@builtin(global_invocation_id) gid: vec3<u32>) {
     pressure_update(idx, 1u);
 }
 
+// Sparse RBGS: one workgroup per tile (over-dispatched to tile_count). Inactive
+// tiles return immediately; active tiles map their 64 threads to the 64 cells of
+// the 4x4x4 tile and call the same pressure_update as the dense path. Because a
+// color sweep updates each cell independently of same-color cells, the tiled
+// traversal is bit-identical to the dense linear traversal.
+fn pressure_rbgs_sparse(tile_id: u32, local: u32, parity: u32) {
+    if tile_id >= tile_count() { return; }
+    if atomicLoad(&sparse_tiles[tile_flag_idx(tile_id)]) == 0u { return; }
+
+    let ntx = tile_dim_x();
+    let nty = tile_dim_y();
+    let tz = tile_id / (ntx * nty);
+    let trem = tile_id % (ntx * nty);
+    let ty = trem / ntx;
+    let tx = trem % ntx;
+
+    let lz = local / (TILE_SIZE * TILE_SIZE);
+    let lrem = local % (TILE_SIZE * TILE_SIZE);
+    let ly = lrem / TILE_SIZE;
+    let lx = lrem % TILE_SIZE;
+
+    let ix = tx * TILE_SIZE + lx;
+    let iy = ty * TILE_SIZE + ly;
+    let iz = tz * TILE_SIZE + lz;
+    // Partial edge tiles (e.g. the top Y layer when gy is not a multiple of
+    // TILE_SIZE) over-cover the grid; drop the out-of-bounds lanes.
+    if ix >= gx() || iy >= gy() || iz >= gz() { return; }
+
+    pressure_update(cell_index(ix, iy, iz), parity);
+}
+
+@compute @workgroup_size(64)
+fn pressure_rbgs_red_sparse(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+) {
+    pressure_rbgs_sparse(wid.x, lid.x, 0u);
+}
+
+@compute @workgroup_size(64)
+fn pressure_rbgs_black_sparse(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+) {
+    pressure_rbgs_sparse(wid.x, lid.x, 1u);
+}
+
 // ── project_pressure ──
 
 @compute @workgroup_size(64)

@@ -29,8 +29,8 @@ use filter_mesh::FilterMesh;
 use inflow::{EmissionResult, InflowState, SpoutSettings, MASS_UNITS_PER_ML};
 use pipelines::MpmPipelines;
 use state::{
-    sparse_tile_slot_count, MpmBuffers, MpmUniforms, FP_SCALE, FP_VALUE_LIMIT, MAX_VELOCITY,
-    METRICS_DIV_FP_SCALE, METRICS_SLOT_COUNT, NUM_THREADS, SDF_RES,
+    sparse_tile_slot_count, tile_count, MpmBuffers, MpmUniforms, FP_SCALE, FP_VALUE_LIMIT,
+    MAX_VELOCITY, METRICS_DIV_FP_SCALE, METRICS_SLOT_COUNT, NUM_THREADS, SDF_RES,
 };
 
 const TARGET_BED_RETENTION_ML: f32 = DEFAULT_BREW.target_bed_retention_ml;
@@ -1600,6 +1600,10 @@ impl MpmSim3D {
             let sparse_pressure = self.settings.sparse_pressure;
             let sparse_clear_wg =
                 dispatch_size(sparse_tile_slot_count(self.settings.grid_dims), NUM_THREADS);
+            // Sparse RBGS over-dispatches one workgroup per tile (each workgroup
+            // is a 4x4x4 = 64-cell tile), so the count is tile_count, not
+            // tile_count/NUM_THREADS.
+            let tile_wg = tile_count(self.settings.grid_dims);
 
             let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("mpm step"),
@@ -1657,10 +1661,17 @@ impl MpmSim3D {
                 pass.dispatch_workgroups(cell_wg, 1, 1);
 
                 for _ in 0..pressure_pairs {
-                    pass.set_pipeline(&self.pipelines.pressure_rbgs_red);
-                    pass.dispatch_workgroups(cell_wg, 1, 1);
-                    pass.set_pipeline(&self.pipelines.pressure_rbgs_black);
-                    pass.dispatch_workgroups(cell_wg, 1, 1);
+                    if sparse_pressure {
+                        pass.set_pipeline(&self.pipelines.pressure_rbgs_red_sparse);
+                        pass.dispatch_workgroups(tile_wg, 1, 1);
+                        pass.set_pipeline(&self.pipelines.pressure_rbgs_black_sparse);
+                        pass.dispatch_workgroups(tile_wg, 1, 1);
+                    } else {
+                        pass.set_pipeline(&self.pipelines.pressure_rbgs_red);
+                        pass.dispatch_workgroups(cell_wg, 1, 1);
+                        pass.set_pipeline(&self.pipelines.pressure_rbgs_black);
+                        pass.dispatch_workgroups(cell_wg, 1, 1);
+                    }
                 }
 
                 pass.set_pipeline(&self.pipelines.project_pressure);
