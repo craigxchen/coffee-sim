@@ -46,7 +46,7 @@ use serde::Serialize;
 
 use super::inflow::{EmissionResult, MASS_UNITS_PER_ML, PARTICLES_PER_ML};
 use super::state::{sparse_tile_slot_count, tile_count, METRICS_SLOT_COUNT, NUM_THREADS};
-use super::{dispatch_size, required_limits, MpmSettings, MpmSim3D};
+use super::{dispatch_size, required_limits, MpmSettings, MpmSim3D, PressureTier};
 
 /// Query-set slots to allocate per substep. One substep records ~23 passes ×
 /// 2 timestamps; 64 leaves comfortable headroom.
@@ -258,9 +258,11 @@ fn step_frame_instrumented(
         let bed_wg = dispatch_size(sim.num_bed, NUM_THREADS);
         let metrics_wg = dispatch_size(METRICS_SLOT_COUNT as u32, 8);
         let sparse_pressure = sim.settings.sparse_pressure;
+        let indirect = sparse_pressure && sim.tier == PressureTier::Indirect;
         let sparse_clear_wg =
             dispatch_size(sparse_tile_slot_count(sim.settings.grid_dims), NUM_THREADS);
         let tile_wg = tile_count(sim.settings.grid_dims);
+        let compaction_wg = dispatch_size(tile_count(sim.settings.grid_dims), NUM_THREADS);
 
         // 3. Encode all passes, each in its own timestamped compute pass.
         let t_encode = Instant::now();
@@ -345,8 +347,45 @@ fn step_frame_instrumented(
             cell_wg,
         );
 
+        // Indirect tier: reset the indirect args (x=0) and compact the marked
+        // tiles into the active-tile list before the sweeps. These bind the
+        // extra groups (group(1) list, group(2) args), so they can't use the
+        // group(0)-only `timed_pass` helper. Timed separately from
+        // `pressure_solve` so the per-substep compaction cost is visible.
+        if indirect {
+            let active_bg = p
+                .active_tile_bind_group
+                .as_ref()
+                .expect("active_tile_bind_group on the Indirect tier");
+            let args_bg = p
+                .indirect_args_bind_group
+                .as_ref()
+                .expect("indirect_args_bind_group on the Indirect tier");
+            let init = p
+                .indirect_args_init
+                .as_ref()
+                .expect("indirect_args_init on the Indirect tier");
+            let compaction = p
+                .sparse_compaction
+                .as_ref()
+                .expect("sparse_compaction on the Indirect tier");
+            let timestamp_writes = rec.writes("sparse_compaction");
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("sparse_compaction"),
+                timestamp_writes,
+            });
+            pass.set_bind_group(0, bg, &[]);
+            pass.set_bind_group(1, active_bg, &[]);
+            pass.set_bind_group(2, args_bg, &[]);
+            pass.set_pipeline(init);
+            pass.dispatch_workgroups(1, 1, 1);
+            pass.set_pipeline(compaction);
+            pass.dispatch_workgroups(compaction_wg, 1, 1);
+        }
+
         // Pressure: interleaved red/black GS in a single pass (matches production).
-        // Sparse over-dispatches one workgroup per tile; dense one per 64 cells.
+        // Indirect dispatches exactly active_tile_count workgroups per sweep;
+        // sparse over-dispatches one workgroup per tile; dense one per 64 cells.
         {
             let timestamp_writes = rec.writes("pressure_solve");
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -354,8 +393,32 @@ fn step_frame_instrumented(
                 timestamp_writes,
             });
             pass.set_bind_group(0, bg, &[]);
+            if indirect {
+                pass.set_bind_group(
+                    1,
+                    p.active_tile_bind_group
+                        .as_ref()
+                        .expect("active_tile_bind_group on the Indirect tier"),
+                    &[],
+                );
+            }
+            let indirect_args = sim.buffers.indirect_args.as_ref();
             for _ in 0..pressure_pairs {
-                if sparse_pressure {
+                if indirect {
+                    let args = indirect_args.expect("indirect_args on the Indirect tier");
+                    pass.set_pipeline(
+                        p.pressure_rbgs_red_indirect
+                            .as_ref()
+                            .expect("pressure_rbgs_red_indirect on the Indirect tier"),
+                    );
+                    pass.dispatch_workgroups_indirect(args, 0);
+                    pass.set_pipeline(
+                        p.pressure_rbgs_black_indirect
+                            .as_ref()
+                            .expect("pressure_rbgs_black_indirect on the Indirect tier"),
+                    );
+                    pass.dispatch_workgroups_indirect(args, 0);
+                } else if sparse_pressure {
                     pass.set_pipeline(&p.pressure_rbgs_red_sparse);
                     pass.dispatch_workgroups(tile_wg, 1, 1);
                     pass.set_pipeline(&p.pressure_rbgs_black_sparse);
