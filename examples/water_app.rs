@@ -38,27 +38,20 @@ use winit::window::{Window, WindowId};
 /// mL per sim-unit³ (KEEP.md §27) — converts a pour recipe's mL/s into the solver's volumetric flow.
 const ML_PER_SIM_UNIT3: f32 = 5.20;
 
-/// A spiral pour recipe for the live V60 brew (loops every ~14 s so the live view keeps pouring).
+/// A center pour recipe for the live V60 brew: a fixed straight-down stream at the bed center (loops
+/// so the live view keeps pouring). Center, not spiral, so the kettle stays put and the stream falls
+/// straight down from one point.
 fn brew_recipe() -> PourScript {
     PourScript {
-        commands: vec![
-            PourCommand {
-                t_start: 0.0,
-                t_end: 2.5,
-                flow_rate: 12.0,
-                pattern: PourPattern::Center,
-            },
-            PourCommand {
-                t_start: 3.0,
-                t_end: 14.0,
-                flow_rate: 12.0,
-                pattern: PourPattern::Spiral {
-                    freq_hz: 0.6,
-                    r_min: 0.1,
-                    r_max: 0.7,
-                },
-            },
-        ],
+        commands: vec![PourCommand {
+            t_start: 0.0,
+            t_end: 12.0,
+            // 5 mL/s — a realistic active pour. The bed accepts water only as fast as it
+            // percolates; at the old 12 mL/s the excess backs up and the density solve expels it
+            // upward (spray that looks like "bouncing off the walls"). A sustainable rate pools/drains.
+            flow_rate: 5.0,
+            pattern: PourPattern::Center,
+        }],
     }
 }
 
@@ -199,12 +192,12 @@ impl ApplicationHandler for App {
             mats.grain_mass = 10.0;
         }
         if scene_kind == "v60pour" {
-            // Same V60 length RATIOS as `v60` (grain_diameter = 2·spacing, water↔grain = 0.7·spacing,
-            // h = 2·spacing) but resolution-tunable: SPACING sets the particle size, and the count
-            // scales ~1/spacing³ (default 0.12 ≈ ~16k particles for a realistic bed+brew; 0.18 ≈ ~5k
-            // lighter; 0.1 ≈ ~50k heavier). grain_mass is fixed — the grain/water density contrast is
-            // scale-invariant. The small V60 box keeps the neighbor grid well within budget at these
-            // resolutions, so the global 0.25 floor (a big-box guard) doesn't apply here.
+            // Same V60 length RATIOS as `v60` (grain_diameter = 2·spacing, h = 2·spacing) but
+            // resolution-tunable: SPACING sets the particle size, and the count scales ~1/spacing³
+            // (default 0.12 ≈ ~16k particles for a realistic bed+brew; 0.18 ≈ ~5k lighter; 0.1 ≈ ~50k
+            // heavier). grain_mass is fixed — the grain/water density contrast is scale-invariant. The
+            // small V60 box keeps the neighbor grid well within budget at these resolutions, so the
+            // global 0.25 floor (a big-box guard) doesn't apply here.
             let r = std::env::var("SPACING")
                 .ok()
                 .and_then(|s| s.parse::<f32>().ok())
@@ -213,7 +206,11 @@ impl ApplicationHandler for App {
             mats.particle_spacing = r;
             mats.support_radius = 2.0 * r;
             mats.grain_diameter = 2.0 * r;
-            mats.water_grain_distance = 0.7 * r;
+            // water↔grain contact = 1.2·spacing: grains render at radius 1.0·spacing, so water rests
+            // ON the bed (visibly interacting) rather than threading INSIDE the grain spheres (which
+            // 0.7·spacing allowed — water centers crossed into the grains and read as "passing
+            // through"). Still porous enough to drain through the bed into the cup.
+            mats.water_grain_distance = 1.2 * r;
             mats.grain_mass = 10.0;
         }
         // WET=1 turns on Phase 1.4 wetting (mixed scenes): grains absorb water, swell, darken, gain
@@ -230,6 +227,13 @@ impl ApplicationHandler for App {
             // The brew showcase: grains wet (and visibly darken) as the pour soaks them, and extract.
             cfg.absorb_rate = 0.5;
             cfg.extract_rate = 1.0;
+            // Nozzle radius 0.25 (default 0.5): the emitted layer disc has this radius, so 0.5 gave a
+            // 1.0-wide descending CURTAIN. 0.25 makes a tight straight-down column ("funnel down").
+            cfg.nozzle_radius = 0.25;
+            // Velocity backstop 25 (default 50): safety net for the wall contact-response — just above
+            // the deepest legitimate fall (~20), below the ~28 domain-crossing speed; caps any residual
+            // transient pressure burst without clipping real flow.
+            cfg.max_speed = 25.0;
         }
         let pour = (scene_kind == "v60pour").then(brew_recipe);
         let solver = XpbdSolver::build(&scene, &mats, &cfg, &gpu);

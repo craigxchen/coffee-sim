@@ -47,43 +47,50 @@ fn main() {
     std::fs::create_dir_all("/tmp/coffee-pour").unwrap();
 
     // Resolution: SPACING scales particle size; count scales ~1/spacing³. The V60 length ratios
-    // (grain_diameter = 2·spacing, water↔grain = 0.7·spacing, h = 2·spacing) are preserved so the
-    // physics is resolution-consistent; grain_mass is fixed (the grain/water density contrast is
+    // (grain_diameter = 2·spacing, h = 2·spacing) are preserved so the physics is
+    // resolution-consistent; grain_mass is fixed (the grain/water density contrast is
     // scale-invariant). Default 0.12 ≈ ~16k particles (realistic); 0.18 ≈ ~5k (faster); 0.1 ≈ ~50k.
     let s = env_f32("SPACING", 0.12).max(0.06);
     let mats = Materials {
         particle_spacing: s,
         support_radius: 2.0 * s,
         grain_diameter: 2.0 * s,
-        water_grain_distance: 0.7 * s,
+        // water↔grain contact = 1.2·spacing: grains render at radius 1.0·spacing, so water must
+        // rest at ≥ that to sit ON the bed (visibly interacting) instead of threading INSIDE the
+        // grain spheres — 0.7·spacing let water centers cross into the grains and read as "passing
+        // through". Still porous enough to drain (water reaches the cup).
+        water_grain_distance: 1.2 * s,
         grain_mass: 10.0,
         ..Materials::default()
     };
     let cfg = Config {
         absorb_rate: 0.5,
         extract_rate: 1.0,
+        // Nozzle radius 0.25 (default 0.5): each emitted layer is a disc of this radius, so 0.5 gave a
+        // 1.0-wide descending CURTAIN. 0.25 makes it a tight straight-down column ("funnel down").
+        nozzle_radius: 0.25,
+        // Velocity backstop 25 (default 50): the canonical wall contact-response in finalize is the
+        // real anti-eruption fix; this is the safety net — 25 is just above the deepest legitimate
+        // fall (kettle→cup ≈ 20) and below the ~28 domain-crossing speed, so it never clips real flow
+        // but caps any residual transient pressure burst before it can fling a stray across the box.
+        max_speed: 25.0,
+        xsph_viscosity_c: env_f32("VISC", 0.05),
+        s_corr_n: env_f32("SCN", 16.0),
         ..Config::default()
     };
-    let flow = env_f32("FLOW", 12.0);
+    // 5 mL/s — a realistic active pour. The bed only accepts water as fast as it percolates; at the
+    // old firehose 12 mL/s water backs up at the bed and the density solve EXPELS the excess upward
+    // (a position-correction velocity injection, worse at smaller dt), which looks like spray
+    // "bouncing off the walls". A sustainable rate lets it pool and drain instead.
+    let flow = env_f32("FLOW", 5.0);
+    // Center pour: a fixed straight-down stream at the bed center (not a wandering spiral).
     let script = PourScript {
-        commands: vec![
-            PourCommand {
-                t_start: 0.0,
-                t_end: 2.5,
-                flow_rate: flow,
-                pattern: PourPattern::Center,
-            },
-            PourCommand {
-                t_start: 3.0,
-                t_end: 12.0,
-                flow_rate: flow,
-                pattern: PourPattern::Spiral {
-                    freq_hz: 0.6,
-                    r_min: 0.1,
-                    r_max: 0.7,
-                },
-            },
-        ],
+        commands: vec![PourCommand {
+            t_start: 0.0,
+            t_end: 12.0,
+            flow_rate: flow,
+            pattern: PourPattern::Center,
+        }],
     };
 
     let scene = Scene::v60_pour();
@@ -110,31 +117,40 @@ fn main() {
         (720, "4_cup"),
         (1020, "5_late"),
     ];
+    let _ = &shots;
     let dt = 1.0 / 60.0;
-    let mut next = 0usize;
-    let last = shots.last().unwrap().0;
-
+    let last = env_f32("STEPS", 1020.0) as u32;
+    let mut max_bubble = 0.0f32;
     for step in 0..=last {
-        if next < shots.len() && shots[next].0 == step {
-            let path = format!("/tmp/coffee-pour/frame_{}.ppm", shots[next].1);
-            dump_frame(&gpu, &mut renderer, &solver, &camera, &path);
-            solver.sample_diagnostics();
-            let m = solver.metrics();
-            eprintln!(
-                "  t={:>5.2}s  active={:>4}  yield={:>5.2}%  TDS={:>5.3}%  -> {path}",
-                step as f32 * dt,
-                solver.active_count(),
-                100.0 * m.extraction_yield,
-                100.0 * m.tds,
-            );
-            next += 1;
-        }
         let t = step as f32 * dt;
-        solver.step(dt, &pour_input(&script, t, 2.0, 2.5));
+        solver.step(dt, &pour_input(&script, t % 12.0, 2.0, 2.5)); // LOOP the pour (fill the cup deep)
+        if step % 60 == 0 {
+            let vel = solver.read_velocities();
+            let pos = solver.read_positions();
+            let ph = solver.read_phases();
+            let mut bub = 0u32;
+            let mut bmax = 0.0f32;
+            for ((v, q), &p) in vel.iter().zip(&pos).zip(&ph) {
+                if p != 0 {
+                    continue;
+                }
+                if q[1] < -3.5 && v[1] > 3.0 {
+                    bub += 1;
+                    bmax = bmax.max(v[1]);
+                }
+            }
+            max_bubble = max_bubble.max(bmax);
+            if step % 300 == 0 || bub > 5 {
+                eprintln!(
+                    "  t={:>5.1}s active={:>5} cup-bubble(vy>3) count={bub:>3} max={bmax:.1}",
+                    t,
+                    solver.active_count(),
+                );
+            }
+        }
     }
-    eprintln!(
-        "wrote /tmp/coffee-pour/frame_*.ppm  (convert: sips -s format png frame_X.ppm --out X.png)"
-    );
+    dump_frame(&gpu, &mut renderer, &solver, &camera, "/tmp/coffee-pour/deep.ppm");
+    eprintln!("MAX CUP BUBBLE vy = {max_bubble:.1}");
 }
 
 fn dump_frame(
