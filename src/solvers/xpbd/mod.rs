@@ -355,6 +355,12 @@ pub struct XpbdSolver {
     /// by `metrics()` without a GPU sync.
     cached_yield: f32,
     cached_tds: f32,
+    /// Channeling/drawdown diagnostics (Phase 6), refreshed by `sample_channeling`. `cached_evenness`
+    /// ∈ (0,1] is flow uniformity across the bed; `cached_drawdown_time` latches the sim time when
+    /// the active-water centroid first descends below the bed centroid. `sim_time` accumulates `dt`.
+    cached_evenness: f32,
+    cached_drawdown_time: f32,
+    sim_time: f32,
 
     /// Pour-emission state (water injected over the brew). Inactive when no pour drives it.
     inflow: Inflow,
@@ -546,6 +552,9 @@ impl XpbdSolver {
         // chem) rather than stale values until the next sample_diagnostics.
         self.cached_yield = 0.0;
         self.cached_tds = 0.0;
+        self.cached_evenness = 1.0;
+        self.cached_drawdown_time = 0.0;
+        self.sim_time = 0.0;
     }
 
     /// Blocking GPU→CPU read-back of a `vec4` particle buffer (dev/test only — stalls).
@@ -754,6 +763,7 @@ impl XpbdSolver {
         }
 
         self.sample_extraction();
+        self.sample_channeling();
     }
 
     /// Refresh the cached yield/TDS from the current chem + positions (a blocking readback, folded
@@ -798,6 +808,105 @@ impl XpbdSolver {
             cup_solute / cup_water_mass
         } else {
             0.0
+        };
+    }
+
+    /// Refresh the channeling/drawdown diagnostics (Phase 6) from a position+velocity+phase snapshot
+    /// (blocking readbacks, folded into `sample_diagnostics`; the three reads share one GPU slot
+    /// ordering since no step intervenes). `evenness ∈ (0,1]` is the flow uniformity across the bed
+    /// cross-section — the coefficient of variation of the volume-weighted downward water flux
+    /// `max(-v_y,0)·f_w·V_w` over BINS×BINS horizontal bins that contain grains, mapped to
+    /// `1/(1+CoV)` (1 = perfectly even; a channel concentrates flux → low). `drawdown_time` latches
+    /// `sim_time` when ≥2% of the active water first drains into the catch cup (cup-less scenes never
+    /// latch, so drawdown stays 0).
+    fn sample_channeling(&mut self) {
+        let pos = self.read_positions();
+        let vel = self.read_velocities();
+        let phase = self.read_phases();
+        let v_w = self.params.particle_mass / self.params.rest_density;
+        let eps = self.params.pbf_eps;
+
+        // Bed extent from grain positions (this snapshot's slot order).
+        let (mut gx0, mut gx1) = (f32::INFINITY, f32::NEG_INFINITY);
+        let (mut gz0, mut gz1) = (f32::INFINITY, f32::NEG_INFINITY);
+        let (mut gy0, mut gy1) = (f32::INFINITY, f32::NEG_INFINITY);
+        let mut gn = 0.0f32;
+        for (p, &ph) in pos.iter().zip(&phase) {
+            if ph == 1 {
+                gx0 = gx0.min(p[0]);
+                gx1 = gx1.max(p[0]);
+                gz0 = gz0.min(p[2]);
+                gz1 = gz1.max(p[2]);
+                gy0 = gy0.min(p[1]);
+                gy1 = gy1.max(p[1]);
+                gn += 1.0;
+            }
+        }
+        if gn < 1.0 {
+            self.cached_evenness = 1.0; // no bed ⇒ no channeling notion
+            return;
+        }
+
+        // Drawdown latch: sim time when ≥5% of the active water has first drained into the catch cup
+        // (the physical drawdown event). Cup-less scenes (no outlet) never latch — drawdown stays 0.
+        if let Some(cup) = self.cup {
+            let (mut cup_n, mut tot_n) = (0.0f32, 0.0f32);
+            for (p, &ph) in pos.iter().zip(&phase) {
+                if ph == 0 && p[3] > eps {
+                    tot_n += 1.0;
+                    let dx = p[0] - cup.cx;
+                    let dz = p[2] - cup.cz;
+                    if dx * dx + dz * dz < cup.radius * cup.radius
+                        && p[1] >= cup.y_min
+                        && p[1] <= cup.y_max
+                    {
+                        cup_n += 1.0;
+                    }
+                }
+            }
+            if tot_n >= 1.0 && self.cached_drawdown_time == 0.0 && cup_n / tot_n > 0.02 {
+                self.cached_drawdown_time = self.sim_time;
+            }
+        }
+
+        // Flow uniformity: bin downward water flux over the bed (x,z) footprint; score only bins that
+        // contain grains (the bed), counting grain-bins with no water as 0 flux (a dry patch = a
+        // channel elsewhere). Excludes the inlet stream / cup by gating water to the bed y-band ± h.
+        const BINS: usize = 4;
+        let mut flux = [[0.0f32; BINS]; BINS];
+        let mut has_grain = [[false; BINS]; BINS];
+        let wx = (gx1 - gx0).max(1.0e-6);
+        let wz = (gz1 - gz0).max(1.0e-6);
+        for (i, (p, &ph)) in pos.iter().zip(&phase).enumerate() {
+            let bx = (((p[0] - gx0) / wx * BINS as f32) as i32).clamp(0, BINS as i32 - 1) as usize;
+            let bz = (((p[2] - gz0) / wz * BINS as f32) as i32).clamp(0, BINS as i32 - 1) as usize;
+            if ph == 1 {
+                if p[1] >= gy0 && p[1] <= gy1 {
+                    has_grain[bx][bz] = true;
+                }
+            } else if p[3] > eps && p[1] >= gy0 - self.params.h && p[1] <= gy1 + self.params.h {
+                flux[bx][bz] += (-vel[i][1]).max(0.0) * p[3] * v_w;
+            }
+        }
+        let mut vals: Vec<f32> = Vec::new();
+        for x in 0..BINS {
+            for z in 0..BINS {
+                if has_grain[x][z] {
+                    vals.push(flux[x][z]);
+                }
+            }
+        }
+        self.cached_evenness = if vals.len() >= 2 {
+            let mean = vals.iter().sum::<f32>() / vals.len() as f32;
+            if mean > 1.0e-9 {
+                let var =
+                    vals.iter().map(|q| (q - mean) * (q - mean)).sum::<f32>() / vals.len() as f32;
+                1.0 / (1.0 + var.sqrt() / mean) // 1/(1+CoV) ∈ (0,1]
+            } else {
+                1.0 // no flow ⇒ trivially even
+            }
+        } else {
+            1.0
         };
     }
 
@@ -1895,6 +2004,9 @@ impl Solver for XpbdSolver {
             cup,
             cached_yield: 0.0,
             cached_tds: 0.0,
+            cached_evenness: 1.0,
+            cached_drawdown_time: 0.0,
+            sim_time: 0.0,
             inflow: Inflow {
                 nozzle_radius: cfg.nozzle_radius,
                 discharge_coeff: cfg.discharge_coeff,
@@ -1919,8 +2031,9 @@ impl Solver for XpbdSolver {
     }
 
     fn step(&mut self, dt: f32, input: &EmissionInput) {
-        // Pour emission first (grows active_count for this frame); no-op when not pouring. Uses the
-        // full frame dt (flow integrated once per frame, then simulated by all substeps).
+        self.sim_time += dt; // elapsed brew time (for the latched drawdown_time)
+                             // Pour emission first (grows active_count for this frame); no-op when not pouring. Uses the
+                             // full frame dt (flow integrated once per frame, then simulated by all substeps).
         self.emit(input, dt);
         // Pool invariant: the live set never exceeds the allocated capacity (emit() clamps to it).
         debug_assert!(self.active_count <= self.capacity);
@@ -2385,7 +2498,8 @@ impl Solver for XpbdSolver {
             iteration_count: self.cached_diag.effective_iters,
             extraction_yield: self.cached_yield,
             tds: self.cached_tds,
-            ..Default::default()
+            evenness: self.cached_evenness,
+            drawdown_time: self.cached_drawdown_time,
         }
     }
 
