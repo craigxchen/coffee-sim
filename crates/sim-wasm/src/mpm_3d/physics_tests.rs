@@ -47,7 +47,11 @@ fn create_device_with_limits(
 
 fn create_test_device() -> Option<(wgpu::Device, wgpu::Queue)> {
     let adapter = request_adapter()?;
-    create_device_with_limits(&adapter, required_limits(), "coffee-sim test device")
+    create_device_with_limits(
+        &adapter,
+        required_limits(PressureTier::Sparse),
+        "coffee-sim test device",
+    )
 }
 
 fn write_uniform_water_solute(queue: &wgpu::Queue, sim: &MpmSim3D, solute_per_particle: f32) {
@@ -1536,14 +1540,30 @@ fn debug_scene_seed_dispatch_matches_scene_type() {
 // ── Pipeline validation ──
 
 #[test]
+fn required_limits_storage_buffers_by_tier() {
+    assert_eq!(
+        required_limits(PressureTier::Indirect).max_storage_buffers_per_shader_stage,
+        12,
+        "indirect tier needs the 10 baseline buffers + active-list + indirect-args",
+    );
+    assert_eq!(
+        required_limits(PressureTier::Sparse).max_storage_buffers_per_shader_stage,
+        10,
+        "sparse baseline (dense + v1 over-dispatch) stays at 10 buffers",
+    );
+}
+
+#[test]
 fn pipelines_fit_within_required_limits() {
     let Some(adapter) = request_adapter() else {
         eprintln!("skipping: no GPU adapter available");
         return;
     };
-    let Some((device, queue)) =
-        create_device_with_limits(&adapter, required_limits(), "required-limits device")
-    else {
+    let Some((device, queue)) = create_device_with_limits(
+        &adapter,
+        required_limits(PressureTier::Sparse),
+        "required-limits device",
+    ) else {
         eprintln!("skipping: adapter does not support required limits");
         return;
     };

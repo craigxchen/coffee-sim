@@ -676,10 +676,11 @@ fn profile_mpm_pipeline() {
         wgpu::Features::empty()
     };
 
+    let tier = super::pressure_tier(&adapter);
     let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("coffee-sim profiler device"),
         required_features,
-        required_limits: required_limits(),
+        required_limits: required_limits(tier),
         memory_hints: wgpu::MemoryHints::Performance,
         trace: wgpu::Trace::default(),
         experimental_features: wgpu::ExperimentalFeatures::disabled(),
@@ -709,7 +710,7 @@ fn profile_mpm_pipeline() {
         );
     }
 
-    let mut sim = MpmSim3D::new(&device, &queue, settings);
+    let mut sim = MpmSim3D::new_with_tier(&device, &queue, settings, tier);
 
     // Warm up: fill the pour, settle the bed, warm the driver.
     for _ in 0..warmup {

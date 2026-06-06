@@ -417,6 +417,7 @@ pub(crate) struct Renderer {
     uploaded_filter_mesh_key: Option<u64>,
     depth_texture: wgpu::Texture,
     depth_view: wgpu::TextureView,
+    pressure_tier: crate::mpm_3d::PressureTier,
 }
 
 impl Renderer {
@@ -440,11 +441,12 @@ impl Renderer {
             .await
             .map_err(js_error)?;
 
+        let pressure_tier = crate::mpm_3d::pressure_tier(&adapter);
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("coffee-sim device"),
                 required_features: wgpu::Features::empty(),
-                required_limits: crate::mpm_3d::required_limits(),
+                required_limits: crate::mpm_3d::required_limits(pressure_tier),
                 memory_hints: wgpu::MemoryHints::Performance,
                 trace: wgpu::Trace::default(),
                 experimental_features: wgpu::ExperimentalFeatures::disabled(),
@@ -983,11 +985,16 @@ impl Renderer {
             uploaded_filter_mesh_key: None,
             depth_texture,
             depth_view,
+            pressure_tier,
         })
     }
 
     pub(crate) fn device(&self) -> &wgpu::Device {
         &self.device
+    }
+
+    pub(crate) fn pressure_tier(&self) -> crate::mpm_3d::PressureTier {
+        self.pressure_tier
     }
 
     pub(crate) fn queue(&self) -> &wgpu::Queue {
