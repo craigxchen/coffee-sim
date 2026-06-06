@@ -38,6 +38,8 @@ pub struct Renderer {
     grain_radius_scale: f32,
     /// `1/V_cap` for the grain saturation tint (0 = no tint).
     moisture_inv_cap: f32,
+    /// Whether to draw the corner orientation cube. Off on web (the frontend uses a CSS view-cube).
+    draw_gizmo: bool,
 
     depth: wgpu::TextureView,
 
@@ -203,7 +205,14 @@ impl Renderer {
             cube_vcount: cube.len() as u32,
             axis_vbuf,
             axis_vcount: axes.len() as u32,
+            draw_gizmo: true,
         }
+    }
+
+    /// Enable/disable the corner orientation-cube pass. The web frontend disables it and renders a
+    /// CSS view-cube instead (driven by the camera yaw/pitch).
+    pub fn set_gizmo_enabled(&mut self, on: bool) {
+        self.draw_gizmo = on;
     }
 
     /// Set the render-radius multiplier for grain particles (1.0 = same as water). Use when grains
@@ -328,7 +337,8 @@ impl Renderer {
         }
 
         // Pass 2: orientation cube in the bottom-right corner (keep color, fresh depth).
-        {
+        // Skipped on web (the frontend draws a CSS view-cube from the camera yaw/pitch).
+        if self.draw_gizmo {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("gizmo"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
