@@ -1183,10 +1183,11 @@ impl Solver for XpbdSolver {
             f32s,
             wgpu::BufferUsages::empty(),
         );
+        // vec2<f32> per particle (legacy: (β,_); harmonic-k: (rate, cap)) — twice f32s.
         let coupling_scale = Self::storage(
             &device,
             "xpbd-coupling-scale",
-            f32s,
+            2 * f32s,
             wgpu::BufferUsages::empty(),
         );
         // Per-particle eligible-opposite-species neighbor count for the wetting allocation (u32).

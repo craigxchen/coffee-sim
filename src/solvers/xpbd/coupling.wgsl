@@ -145,10 +145,6 @@ fn beta_from_rate(rate: f32) -> f32 {
     return x / (1.0 + x); // implicit: rate→∞ ⇒ β→1 (no overshoot); bounds rate·dt
 }
 
-fn drag_pair_beta() -> f32 {
-    return beta_from_rate(params.drag_gamma);
-}
-
 // Live-porosity drag (wetting only): the local drag rate scales with local permeability k(φ_f),
 // φ_f = 1−α_s, relative to the reference porosity the build-time rate was resolved at. The K-C
 // d²/180 cancels in the ratio, so this is a pure porosity factor. As the bed wets/swells, α_s↑ ⇒
@@ -169,12 +165,12 @@ fn compute_coupling_scale(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (i >= params.particle_count) { return; }
     let ph_i = phase[i];
     let xi = pred[i].xyz;
-    // Per-particle drag blend: global rate, or the local-porosity rate when wetting is active. The
-    // result is the FULL per-pair scale (the multi-neighbor cap is folded in below), so drag uses
-    // min(scale_i, scale_j) directly — which, for the global rate, equals the old beta·min(c_i,c_j).
-    var beta_i = drag_pair_beta();
-    if (params.k_abs > 0.0) {
-        beta_i = beta_from_rate(params.drag_gamma * porosity_drag_factor(alpha_s[i]));
+    // Per-particle drag RATE: the local-porosity-modulated rate when wetting OR fines are active
+    // (both change local k via α_s), else the global rate. The fines clause extends the
+    // live-porosity gate so a no-wetting fines scene still drives drag from local permeability.
+    var rate_i = params.drag_gamma;
+    if (params.k_abs > 0.0 || params.fines.x > 0.0) {
+        rate_i = params.drag_gamma * porosity_drag_factor(alpha_s[i]);
     }
     var n = 0.0;
 
@@ -201,15 +197,33 @@ fn compute_coupling_scale(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
 
-    // Cap so Σ_j min(scale_i, scale_j) ≤ β_max (anti-overshoot). min(beta_i, β_max/N) = beta_i·c_i
-    // with the old cap c_i = min(1, β_max/(N·beta_i)), so the global-rate path is unchanged.
-    coupling_scale[i] = min(beta_i, params.drag_beta_max / max(n, 1.0));
+    // Cap so Σ_j s ≤ β_max (anti-overshoot): each pair scale ≤ β_max/N.
+    let cap_i = params.drag_beta_max / max(n, 1.0);
+    if (params.fines.x > 0.0) {
+        // Harmonic-k path: store the raw rate + the cap. drag_delta_for_pair forms the symmetric
+        // harmonic-mean-k pair scale (= arithmetic mean of rates, since rate ∝ 1/k) and caps it.
+        coupling_scale[i] = vec2<f32>(rate_i, cap_i);
+    } else {
+        // Legacy/global path (byte-identical): capped β in .x; drag uses min(β_i, β_j) as before.
+        coupling_scale[i] = vec2<f32>(min(beta_from_rate(rate_i), cap_i), 0.0);
+    }
 }
 
 fn drag_delta_for_pair(i: u32, j: u32, self_phase: u32) -> vec3<f32> {
-    // coupling_scale already folds in the (possibly local-porosity) rate + the cap, so the symmetric
-    // pair scale is just min of the two. Effective masses (swelling) keep momentum conserved.
-    let s = min(coupling_scale[i], coupling_scale[j]);
+    let cs_i = coupling_scale[i];
+    let cs_j = coupling_scale[j];
+    var s: f32;
+    if (params.fines.x > 0.0) {
+        // Harmonic mean of the per-particle permeabilities ⟺ arithmetic mean of their drag rates
+        // (rate ∝ 1/k) — dominated by the lower-k / higher-resistance side, so a clog barrier holds
+        // at its edge instead of leaking (min(rate) would pick the clear side). Symmetric in (i,j),
+        // so the pair impulse stays equal-and-opposite (momentum conserved).
+        let rate_pair = 0.5 * (cs_i.x + cs_j.x);
+        s = min(beta_from_rate(rate_pair), min(cs_i.y, cs_j.y));
+    } else {
+        s = min(cs_i.x, cs_j.x); // legacy/global: min of capped betas (byte-identical)
+    }
+    // Effective masses (swelling) keep momentum conserved.
     let m_i = eff_mass(self_phase, pred[i].w);
     let m_j = eff_mass(phase[j], pred[j].w);
     return s * (m_j / (m_i + m_j)) * (vel_frozen[j].xyz - vel_frozen[i].xyz);

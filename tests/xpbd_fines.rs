@@ -238,47 +238,63 @@ fn fines_conserve_volume_in_saturated_tail() {
 }
 
 #[test]
-fn fines_do_not_perturb_momentum() {
+fn fines_transfer_writes_no_velocity() {
     let Some(gpu) = GpuContext::new_headless() else {
         eprintln!("xpbd_fines: no GPU adapter; skipping.");
         return;
     };
     let mats = fines_active_materials();
-    let momentum = |fines_rate: f32| -> [f32; 3] {
-        let cfg = Config {
-            fines_rate,
-            ..fines_active_config()
-        };
-        let mut solver = XpbdSolver::build(&mixed_scene(), &mats, &cfg, &gpu);
-        for _ in 0..60 {
-            solver.step(DT, &EmissionInput::default());
-        }
-        let vel = solver.read_velocities();
-        let phase = solver.read_phases();
-        vel.iter().zip(&phase).fold([0.0; 3], |mut acc, (v, &ph)| {
-            let m = if ph == 1 {
-                mats.grain_mass
-            } else {
-                mats.particle_mass
-            };
-            acc[0] += m * v[0];
-            acc[1] += m * v[1];
-            acc[2] += m * v[2];
-            acc
-        })
+    // Mechanics fully off (incl. drag, so the harmonic-k combiner is never invoked) + zero gravity:
+    // nothing should ever impart velocity. With fines transferring (pre-seeded suspended fines),
+    // every velocity must stay 0 — proving the fines passes write only chem.w, never vel.
+    let scene = Scene {
+        gravity: [0.0, 0.0, 0.0],
+        box_min: [0.0, 0.0, 0.0],
+        box_max: [8.0, 8.0, 8.0],
+        regions: vec![
+            SeedRegion {
+                min: [2.0, 2.0, 2.0],
+                max: [5.0, 2.0, 5.0],
+                species: Species::Grain,
+            },
+            SeedRegion {
+                min: [2.0, 3.0, 2.0],
+                max: [5.0, 3.0, 5.0],
+                species: Species::Water,
+            },
+        ],
+        ..Scene::default()
     };
-    // Fines (U2) write only chem.w — no velocity writes — so the mechanical evolution is identical
-    // up to the reorder's run-to-run nondeterminism. A momentum write-through would diverge O(1).
-    let off = momentum(0.0);
-    let on = momentum(2.0);
-    let mag = (off[0] * off[0] + off[1] * off[1] + off[2] * off[2])
-        .sqrt()
-        .max(1.0);
-    let diff =
-        ((on[0] - off[0]).powi(2) + (on[1] - off[1]).powi(2) + (on[2] - off[2]).powi(2)).sqrt();
+    let cfg = Config {
+        max_iters: 0,
+        bed_max_iters: 0,
+        drag_subiters: 0,
+        buoyancy_scale: 0.0,
+        xsph_viscosity_c: 0.0,
+        grain_sleep_speed: 0.0,
+        fines_rate: 2.0,
+        ..Config::default()
+    };
+    let mut solver = XpbdSolver::build(&scene, &mats, &cfg, &gpu);
+    let mut chem = solver.read_chem();
+    let phase = solver.read_phases();
+    for (c, &ph) in chem.iter_mut().zip(&phase) {
+        if ph == 0 {
+            c[3] = 0.05; // pre-load suspended fines so the transfer is active
+        }
+    }
+    solver.write_chem_for_test(&chem);
+    for _ in 0..30 {
+        solver.step(DT, &EmissionInput::default());
+    }
+    let vmax = solver
+        .read_velocities()
+        .iter()
+        .map(|v| (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt())
+        .fold(0.0f32, f32::max);
     assert!(
-        diff < 5e-2 * mag,
-        "fines perturbed momentum: |Δp|={diff} vs |p|={mag} (fines must not write velocities)"
+        vmax < 1e-6,
+        "fines transfer imparted velocity ({vmax}); it must write only chem.w"
     );
 }
 
