@@ -1899,6 +1899,90 @@ fn pressure_rbgs_black_sparse(
     pressure_rbgs_sparse(wid.x, lid.x, 1u);
 }
 
+// ── indirect-dispatch sparse pressure (Indirect tier only) ──
+//
+// These bindings and entry points are only referenced by the indirect /
+// compaction pipelines, which use the group(0)+group(1)[+group(2)] layouts
+// built on the Indirect tier. They are inert on the Sparse tier (the pipelines
+// are never created), so the v1 single-group(0) pipelines are unchanged.
+//
+// group(1): the compacted active-tile list — written by compaction, read by the
+//   indirect RBGS sweeps. Bound during both compaction and the solve.
+// group(2): the indirect dispatch args [x, y, z] — written by compaction, then
+//   consumed by dispatch_workgroups_indirect (NOT bound during the solve, per
+//   the WebGPU usage-scope rule that an INDIRECT buffer can't also be a writable
+//   storage binding in the same dispatch). atomic<u32> for the compaction
+//   atomicAdd; dispatch_workgroups_indirect reads it as raw u32, same layout.
+@group(1) @binding(0) var<storage, read_write> active_tile_list: array<u32>;
+@group(2) @binding(0) var<storage, read_write> indirect_args: array<atomic<u32>>;
+
+// Initialize the indirect args to [0, 1, 1] each substep before compaction:
+// x (the dispatch count / append cursor) starts at 0; y and z stay 1.
+@compute @workgroup_size(1)
+fn indirect_args_init() {
+    atomicStore(&indirect_args[0], 0u);
+    atomicStore(&indirect_args[1], 1u);
+    atomicStore(&indirect_args[2], 1u);
+}
+
+// Compaction: one thread per tile (over-dispatched to tile_count). Each active
+// tile appends its id to active_tile_list at an atomically-bumped slot; the
+// final indirect_args[0] equals the active-tile count. Order is unspecified —
+// RBGS is order-independent across tiles. Inactive tiles do nothing.
+@compute @workgroup_size(64)
+fn sparse_compaction(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let tid = gid.x;
+    if tid >= tile_count() { return; }
+    if atomicLoad(&sparse_tiles[tile_flag_idx(tid)]) == 0u { return; }
+    let i = atomicAdd(&indirect_args[0], 1u);
+    active_tile_list[i] = tid;
+}
+
+// Indirect sparse RBGS: identical tile->cell mapping as pressure_rbgs_sparse,
+// but the tile id comes from the pre-filtered active_tile_list (so no flag gate
+// and no tile_id >= tile_count guard — the list holds only valid active tiles).
+// Dispatched via dispatch_workgroups_indirect with exactly active_tile_count
+// workgroups, so workgroup_id.x indexes the list directly.
+fn pressure_rbgs_indirect(list_idx: u32, local: u32, parity: u32) {
+    let tile_id = active_tile_list[list_idx];
+
+    let ntx = tile_dim_x();
+    let nty = tile_dim_y();
+    let tz = tile_id / (ntx * nty);
+    let trem = tile_id % (ntx * nty);
+    let ty = trem / ntx;
+    let tx = trem % ntx;
+
+    let lz = local / (TILE_SIZE * TILE_SIZE);
+    let lrem = local % (TILE_SIZE * TILE_SIZE);
+    let ly = lrem / TILE_SIZE;
+    let lx = lrem % TILE_SIZE;
+
+    let ix = tx * TILE_SIZE + lx;
+    let iy = ty * TILE_SIZE + ly;
+    let iz = tz * TILE_SIZE + lz;
+    // Partial edge tiles over-cover the grid; drop the out-of-bounds lanes.
+    if ix >= gx() || iy >= gy() || iz >= gz() { return; }
+
+    pressure_update(cell_index(ix, iy, iz), parity);
+}
+
+@compute @workgroup_size(64)
+fn pressure_rbgs_red_indirect(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+) {
+    pressure_rbgs_indirect(wid.x, lid.x, 0u);
+}
+
+@compute @workgroup_size(64)
+fn pressure_rbgs_black_indirect(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+) {
+    pressure_rbgs_indirect(wid.x, lid.x, 1u);
+}
+
 // ── project_pressure ──
 
 @compute @workgroup_size(64)

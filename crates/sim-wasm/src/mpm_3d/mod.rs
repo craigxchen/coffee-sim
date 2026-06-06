@@ -736,8 +736,6 @@ pub(crate) struct MpmSim3D {
     latest_metrics: MetricsSnapshot,
     /// Resolved pressure-solve capability tier. Gates whether the indirect
     /// dispatch path is available; the dense/sparse choice is `sparse_pressure`.
-    /// Read by the dispatch selection in U4; allow until then.
-    #[allow(dead_code)]
     tier: PressureTier,
 }
 
@@ -755,8 +753,8 @@ impl MpmSim3D {
         settings: MpmSettings,
         tier: PressureTier,
     ) -> Self {
-        let buffers = MpmBuffers::new(device, queue, &settings);
-        let pipelines = MpmPipelines::new(device, &buffers);
+        let buffers = MpmBuffers::new(device, queue, &settings, tier);
+        let pipelines = MpmPipelines::new(device, &buffers, tier);
         let mut inflow = InflowState::new(units::sim_speed_from_meters_per_second(
             settings.initial_water_speed_m_s,
         ));
@@ -1654,12 +1652,18 @@ impl MpmSim3D {
 
             let metrics_wg = dispatch_size(METRICS_SLOT_COUNT as u32, 8);
             let sparse_pressure = self.settings.sparse_pressure;
+            // Indirect dispatch is used only when sparse is on AND the adapter
+            // resolved to the Indirect tier; otherwise sparse falls back to the
+            // v1 over-dispatch, and `sparse_pressure=false` is dense.
+            let indirect = sparse_pressure && self.tier == PressureTier::Indirect;
             let sparse_clear_wg =
                 dispatch_size(sparse_tile_slot_count(self.settings.grid_dims), NUM_THREADS);
             // Sparse RBGS over-dispatches one workgroup per tile (each workgroup
             // is a 4x4x4 = 64-cell tile), so the count is tile_count, not
             // tile_count/NUM_THREADS.
             let tile_wg = tile_count(self.settings.grid_dims);
+            // Compaction over-dispatches one thread per tile (workgroup_size 64).
+            let compaction_wg = dispatch_size(tile_count(self.settings.grid_dims), NUM_THREADS);
 
             let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("mpm step"),
@@ -1672,6 +1676,30 @@ impl MpmSim3D {
                     timestamp_writes: None,
                 });
                 pass.set_bind_group(0, &self.pipelines.bind_group, &[]);
+                // On the indirect path, group(1) (active-tile list) and group(2)
+                // (indirect args) are bound once and persist for the compaction
+                // and indirect-solve dispatches below. group(2) is only required
+                // by compaction; leaving it bound for the solve is harmless since
+                // the solve pipelines don't reference it (and indirect_args is
+                // the dispatch source, never a binding during the solve).
+                if indirect {
+                    pass.set_bind_group(
+                        1,
+                        self.pipelines
+                            .active_tile_bind_group
+                            .as_ref()
+                            .expect("active_tile_bind_group on the Indirect tier"),
+                        &[],
+                    );
+                    pass.set_bind_group(
+                        2,
+                        self.pipelines
+                            .indirect_args_bind_group
+                            .as_ref()
+                            .expect("indirect_args_bind_group on the Indirect tier"),
+                        &[],
+                    );
+                }
 
                 // 1a. metrics_clear (fresh per-substep observability counters)
                 if metrics_wg > 0 {
@@ -1708,7 +1736,18 @@ impl MpmSim3D {
                 //
                 // Sparse path: rebuild the per-tile active flags each substep
                 // before classify_cells re-marks them. Gated on the toggle so
-                // the dense default path issues no extra dispatch.
+                // the dense default path issues no extra dispatch. The indirect
+                // path also resets the indirect args (x=0) before the flags so
+                // compaction's append cursor starts fresh.
+                if indirect {
+                    pass.set_pipeline(
+                        self.pipelines
+                            .indirect_args_init
+                            .as_ref()
+                            .expect("indirect_args_init on the Indirect tier"),
+                    );
+                    pass.dispatch_workgroups(1, 1, 1);
+                }
                 if sparse_pressure {
                     pass.set_pipeline(&self.pipelines.sparse_tiles_clear);
                     pass.dispatch_workgroups(sparse_clear_wg, 1, 1);
@@ -1716,8 +1755,37 @@ impl MpmSim3D {
                 pass.set_pipeline(&self.pipelines.classify_cells);
                 pass.dispatch_workgroups(cell_wg, 1, 1);
 
+                // Indirect path: compact the marked tiles into active_tile_list
+                // and set indirect_args.x = active_tile_count before the sweeps.
+                if indirect {
+                    pass.set_pipeline(
+                        self.pipelines
+                            .sparse_compaction
+                            .as_ref()
+                            .expect("sparse_compaction on the Indirect tier"),
+                    );
+                    pass.dispatch_workgroups(compaction_wg, 1, 1);
+                }
+
+                let indirect_args = self.buffers.indirect_args.as_ref();
                 for _ in 0..pressure_pairs {
-                    if sparse_pressure {
+                    if indirect {
+                        let args = indirect_args.expect("indirect_args on the Indirect tier");
+                        pass.set_pipeline(
+                            self.pipelines
+                                .pressure_rbgs_red_indirect
+                                .as_ref()
+                                .expect("pressure_rbgs_red_indirect on the Indirect tier"),
+                        );
+                        pass.dispatch_workgroups_indirect(args, 0);
+                        pass.set_pipeline(
+                            self.pipelines
+                                .pressure_rbgs_black_indirect
+                                .as_ref()
+                                .expect("pressure_rbgs_black_indirect on the Indirect tier"),
+                        );
+                        pass.dispatch_workgroups_indirect(args, 0);
+                    } else if sparse_pressure {
                         pass.set_pipeline(&self.pipelines.pressure_rbgs_red_sparse);
                         pass.dispatch_workgroups(tile_wg, 1, 1);
                         pass.set_pipeline(&self.pipelines.pressure_rbgs_black_sparse);

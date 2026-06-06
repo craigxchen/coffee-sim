@@ -3,7 +3,7 @@ use std::mem::size_of;
 use bytemuck::{Pod, Zeroable};
 use coffee_sim_core::Vec3;
 
-use super::{units, MpmSettings, Obstacle, OBSTACLE_WALL_THICKNESS};
+use super::{units, MpmSettings, Obstacle, PressureTier, OBSTACLE_WALL_THICKNESS};
 
 // FP_SCALE derivation: 2^18 = 262144. With particle_mass=1.0, max ~50 particles
 // contributing per cell (quadratic B-spline, max weight 0.5625), worst-case mass
@@ -135,10 +135,29 @@ pub(crate) struct MpmBuffers {
     /// `sparse_tiles_clear`, read by the sparse RBGS sweeps. GPU-only except
     /// on-demand readback (COPY_SRC) for tests/measurement.
     pub sparse_tiles: wgpu::Buffer,
+    /// Compacted list of active tile ids (Indirect tier only). Layout:
+    /// `u32[tile_count]`; the first `indirect_args[0]` entries hold the active
+    /// tile ids written by the compaction pass, read by the indirect RBGS
+    /// sweeps (workgroup `k` processes `active_tile_list[k]`). `None` on the
+    /// Sparse tier so the v1 bind group/layout is byte-for-byte unchanged.
+    /// COPY_SRC for test readback.
+    pub active_tile_list: Option<wgpu::Buffer>,
+    /// Indirect dispatch args (Indirect tier only). Layout: `u32[3]` = `[x, y,
+    /// z]`. Written by the compaction pass (`x` = active tile count via
+    /// `atomicAdd`, `y = z = 1`), consumed by `dispatch_workgroups_indirect`.
+    /// Never bound as a writable storage resource during the solve (KTD3 /
+    /// WebGPU usage-scope rule). `None` on the Sparse tier. COPY_SRC for test
+    /// readback.
+    pub indirect_args: Option<wgpu::Buffer>,
 }
 
 impl MpmBuffers {
-    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, settings: &MpmSettings) -> Self {
+    pub fn new(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        settings: &MpmSettings,
+        tier: PressureTier,
+    ) -> Self {
         let max_p = settings.max_particles as usize;
         let [gx, gy, gz] = settings.grid_dims;
         let total_cells = (gx * gy * gz) as usize;
@@ -245,6 +264,32 @@ impl MpmBuffers {
             mapped_at_creation: false,
         });
 
+        // Indirect-tier-only resources: the compacted active-tile list and the
+        // indirect dispatch args. Allocated once. `None` on the Sparse tier so
+        // the bind group/layout stay byte-for-byte v1.
+        let (active_tile_list, indirect_args) = if tier == PressureTier::Indirect {
+            let active_tile_list = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("mpm active tile list"),
+                size: (tile_count(settings.grid_dims) as usize * size_of::<u32>()) as u64,
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_DST
+                    | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+            let indirect_args = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("mpm indirect args"),
+                size: (3 * size_of::<u32>()) as u64,
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::INDIRECT
+                    | wgpu::BufferUsages::COPY_DST
+                    | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+            (Some(active_tile_list), Some(indirect_args))
+        } else {
+            (None, None)
+        };
+
         let sdf_data = generate_sdf_data(settings);
         let sdf_class_data = generate_sdf_class_data(settings, &sdf_data);
         let (sdf_texture, sdf_view) = create_sdf_texture(device, queue, &sdf_data);
@@ -268,6 +313,8 @@ impl MpmBuffers {
             metrics,
             metrics_staging,
             sparse_tiles,
+            active_tile_list,
+            indirect_args,
         }
     }
 }
