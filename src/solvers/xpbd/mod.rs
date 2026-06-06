@@ -105,10 +105,12 @@ struct Params {
     t_amb: f32,        // ambient temperature
     _pad_chem0: f32,
     _pad_chem1: f32,
+    // --- fines migration (Phase 6); vec4-aligned tail (rate/gate, seed, crit_flux, _) ---
+    fines: [f32; 4],
 }
 
 // Params is uploaded as a uniform and must stay byte-identical to the WGSL `Params`.
-const _: () = assert!(std::mem::size_of::<Params>() == 320);
+const _: () = assert!(std::mem::size_of::<Params>() == 336);
 
 /// GPU record for one static SDF solid — byte-identical to the WGSL `Primitive` (64 bytes,
 /// vec4-aligned). Cone radii in `a` are OUTER wall radii; the cavity surface is `outer − thickness`.
@@ -476,13 +478,18 @@ fn seed_block(scene: &Scene, mats: &Materials, cfg: &Config) -> (Vec<[f32; 4]>, 
 fn seed_chem(phases: &[u32], mats: &Materials) -> Vec<[f32; 4]> {
     let extractable = mats.soluble_fraction * mats.grain_mass;
     let (s_f, s_s) = crate::models::extraction::split(extractable, mats.fast_fraction);
+    // chem.w carries lodged fines (grain) / suspended fines (water); seeded uniformly onto grains
+    // so only the migration-induced deviation from this baseline changes permeability (KTD-2).
+    // fines_fraction = 0 (default) ⇒ seed 0.0, identical to the pre-fines layout.
+    let grain_volume = std::f32::consts::FRAC_PI_6 * mats.grain_diameter.powi(3);
+    let fines_seed = crate::models::fines::fines_seed(grain_volume, mats.fines_fraction);
     phases
         .iter()
         .map(|&ph| {
             if ph == 1 {
-                [s_f, s_s, mats.pour_t, 0.0] // grain: two pools + grain temperature
+                [s_f, s_s, mats.pour_t, fines_seed] // grain: two pools + grain temp + lodged fines
             } else {
-                [0.0, mats.pour_t, 0.0, 0.0] // water: concentration 0, water temperature
+                [0.0, mats.pour_t, 0.0, 0.0] // water: concentration 0, water temp, _, suspended fines 0
             }
         })
         .collect()
@@ -1094,6 +1101,14 @@ impl Solver for XpbdSolver {
             t_amb: mats.t_amb,
             _pad_chem0: 0.0,
             _pad_chem1: 0.0,
+            // Fines: gate/scale from Config, per-grain seed + critical flux from Materials. When
+            // fines_rate == 0 (default) no fines kernel runs and the seed lane stays inert.
+            fines: [
+                cfg.fines_rate,
+                crate::models::fines::fines_seed(grain_volume, mats.fines_fraction),
+                mats.fines_crit_flux,
+                0.0,
+            ],
         };
 
         let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
