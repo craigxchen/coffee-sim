@@ -348,6 +348,26 @@ fn spiky_grad(d: vec3<f32>, h: f32, r_min: f32) -> vec3<f32> {
     return -coeff * t * t * dir;
 }
 
+// Analytic boundary (wall) density compensation — the SPH wall-deficiency fix. A solid wall cuts
+// off the part of a near-wall particle's kernel sphere that lies in the solid, so the fluid-only
+// density sum under-reads even when the fluid is packed (worst at a concave corner, neighbors gone
+// on two sides). `boundary_psi(d)` is the fraction of the poly6 kernel MASS beyond a plane at
+// signed distance d (cavity interior positive): ψ(h)=0, ψ(0)=0.5, ψ(−h)=1. Adding ρ₀·ψ back makes
+// near-wall water read its TRUE density, so the compression-only solve relieves over-packed corners
+// continuously instead of storing the compression and releasing it as a squeeze-out eruption.
+// Exact closed form: ψ(d) = ∫_{z>d} W_poly6 dV = 0.5 − (315/256)·poly(d/h), poly the cap integral.
+// Explicit products (not pow) so a penetrating d<0 (t<0) stays finite — pow(negative,·) is NaN.
+fn boundary_psi(d: f32, h: f32) -> f32 {
+    let t = clamp(d / h, -1.0, 1.0);
+    let t2 = t * t;
+    let t3 = t2 * t;
+    let t5 = t3 * t2;
+    let t7 = t5 * t2;
+    let t9 = t7 * t2;
+    let poly = t - (4.0 / 3.0) * t3 + (6.0 / 5.0) * t5 - (4.0 / 7.0) * t7 + (1.0 / 9.0) * t9;
+    return 0.5 - (315.0 / 256.0) * poly;
+}
+
 // --- Phase-1.4 swelling + effective mass (from the moisture lane: grain pred.w = V_abs, water = f_w).
 // A grain swells by exactly the absorbed volume; its mass gains the absorbed water's mass; a water
 // shrinks proportionally. Dry/full state (V_abs=0, f_w=1) ⇒ the original constants exactly.
