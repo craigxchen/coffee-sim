@@ -271,6 +271,16 @@ fn solid_union(p: vec3<f32>, phase: u32) -> SolidHit {
 // each recomputes the identical per-grain release/take. Transient within the extraction sub-stage.
 @group(0) @binding(21) var<storage, read_write> diss_neighbors: array<vec2<f32>>;
 
+// Particle-reorder scratch (cell-order locality). Once per water-loop rebuild the persistent payload
+// is gathered into cell order so the density-solve neighbor gathers read contiguous memory. Only the
+// water density loop reorders; later blocks inherit the cell-sorted layout (so their reads stay
+// consistent and their gathers are near-contiguous for free). Bound only by the grid_reorder_* passes.
+@group(0) @binding(23) var<storage, read_write> pos_scratch: array<vec4<f32>>;
+@group(0) @binding(24) var<storage, read_write> pred_scratch: array<vec4<f32>>;
+@group(0) @binding(25) var<storage, read_write> vel_scratch: array<vec4<f32>>;
+@group(0) @binding(26) var<storage, read_write> chem_scratch: array<vec4<f32>>;
+@group(0) @binding(27) var<storage, read_write> phase_scratch: array<u32>;
+
 // Normalized Arrhenius (1 at t_ref, exponent-clamped for finiteness).
 fn ex_arrhenius(t: f32, ea_over_r: f32, t_ref: f32) -> f32 {
     if (t <= 1e-6 || t_ref <= 1e-6) { return 1.0; }
@@ -484,6 +494,41 @@ fn grid_scatter(@builtin(global_invocation_id) gid: vec3<u32>) {
     // cell_count was re-zeroed after the scan, so it serves as the per-cell write cursor here.
     let local = atomicAdd(&cell_count[cell], 1u);
     sorted_indices[cell_start[cell] + local] = i;
+}
+
+// Cell-order reorder (memory locality). After grid_scatter, sorted_indices[slot] = the old index of
+// the particle that belongs at `slot`. grid_reorder_a/b GATHER the persistent payload into scratch by
+// that mapping (read pre-reorder source, write scratch); the host copies scratch back, then
+// grid_reorder_identity rewrites sorted_indices to the identity permutation. The unchanged neighbor
+// loops then gather `j = sorted_indices[s] = s` ⇒ contiguous reads. Split into two passes so each
+// stays within the 8-storage-buffer budget; both read the same (still-original) sorted_indices, so
+// there is no chunk hazard. active-range only (dormant pool slots are never dispatched).
+@compute @workgroup_size(256)
+fn grid_reorder_a(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let slot = gid.x;
+    if (slot >= params.particle_count) { return; }
+    let src = sorted_indices[slot];
+    pos_scratch[slot] = pos[src];
+    pred_scratch[slot] = pred[src];
+    vel_scratch[slot] = vel[src];
+}
+
+@compute @workgroup_size(256)
+fn grid_reorder_b(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let slot = gid.x;
+    if (slot >= params.particle_count) { return; }
+    let src = sorted_indices[slot];
+    chem_scratch[slot] = chem[src];
+    phase_scratch[slot] = phase[src];
+}
+
+// Runs AFTER all gathers + copy-backs: the payload is now cell-sorted, so sorted_indices is the
+// identity permutation and the existing `j = sorted_indices[s]` gathers read contiguous memory.
+@compute @workgroup_size(256)
+fn grid_reorder_identity(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let slot = gid.x;
+    if (slot >= params.particle_count) { return; }
+    sorted_indices[slot] = slot;
 }
 
 @compute @workgroup_size(256)

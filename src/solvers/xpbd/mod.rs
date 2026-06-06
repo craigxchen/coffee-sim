@@ -189,6 +189,9 @@ struct Pipelines {
     grid_count: wgpu::ComputePipeline,
     grid_scan: wgpu::ComputePipeline,
     grid_scatter: wgpu::ComputePipeline,
+    grid_reorder_a: wgpu::ComputePipeline,
+    grid_reorder_b: wgpu::ComputePipeline,
+    grid_reorder_identity: wgpu::ComputePipeline,
     compute_lambda: wgpu::ComputePipeline,
     residual_reduce: wgpu::ComputePipeline,
     compute_dp: wgpu::ComputePipeline,
@@ -220,6 +223,9 @@ struct BindGroups {
     grid_count: wgpu::BindGroup,
     grid_scan: wgpu::BindGroup,
     grid_scatter: wgpu::BindGroup,
+    grid_reorder_a: wgpu::BindGroup,
+    grid_reorder_b: wgpu::BindGroup,
+    grid_reorder_identity: wgpu::BindGroup,
     compute_lambda: wgpu::BindGroup,
     residual_reduce: wgpu::BindGroup,
     compute_dp: wgpu::BindGroup,
@@ -312,6 +318,13 @@ pub struct XpbdSolver {
     chem: Arc<wgpu::Buffer>,
     // The per-substep snapshot the dissolution/thermal passes read while writing the live `chem`.
     chem_frozen: wgpu::Buffer,
+    // Cell-order reorder scratch (gather targets for the water-loop locality reorder; copied back into
+    // the live buffers each rebuild). Sized to capacity; only the active range is touched.
+    pos_scratch: wgpu::Buffer,
+    pred_scratch: wgpu::Buffer,
+    vel_scratch: wgpu::Buffer,
+    chem_scratch: wgpu::Buffer,
+    phase_scratch: wgpu::Buffer,
     pipelines: Pipelines,
     bind_groups: BindGroups,
     ts: Option<Timestamps>,
@@ -1225,6 +1238,38 @@ impl Solver for XpbdSolver {
             vec4,
             wgpu::BufferUsages::empty(),
         );
+        // Cell-order reorder scratch: gather targets for the water-loop locality reorder. COPY_SRC so
+        // each is copied back into its live buffer after the gather.
+        let pos_scratch = Self::storage(
+            &device,
+            "xpbd-pos-scratch",
+            vec4,
+            wgpu::BufferUsages::COPY_SRC,
+        );
+        let pred_scratch = Self::storage(
+            &device,
+            "xpbd-pred-scratch",
+            vec4,
+            wgpu::BufferUsages::COPY_SRC,
+        );
+        let vel_scratch = Self::storage(
+            &device,
+            "xpbd-vel-scratch",
+            vec4,
+            wgpu::BufferUsages::COPY_SRC,
+        );
+        let chem_scratch = Self::storage(
+            &device,
+            "xpbd-chem-scratch",
+            vec4,
+            wgpu::BufferUsages::COPY_SRC,
+        );
+        let phase_scratch = Self::storage(
+            &device,
+            "xpbd-phase-scratch",
+            f32s,
+            wgpu::BufferUsages::COPY_SRC,
+        );
         // Per-particle dissolution scratch (binding 21), one vec2<f32> each: grain → (N_w, flux_g),
         // water → (N_g, _). Written by diss_count, read by both transfer passes. Bound only by the
         // dissolution passes (U5).
@@ -1286,6 +1331,9 @@ impl Solver for XpbdSolver {
             grid_count: make("grid_count"),
             grid_scan: make("grid_scan"),
             grid_scatter: make("grid_scatter"),
+            grid_reorder_a: make("grid_reorder_a"),
+            grid_reorder_b: make("grid_reorder_b"),
+            grid_reorder_identity: make("grid_reorder_identity"),
             compute_lambda: make("compute_lambda"),
             residual_reduce: make("residual_reduce"),
             compute_dp: make("compute_dp"),
@@ -1366,6 +1414,34 @@ impl Solver for XpbdSolver {
                     (9, &sorted_indices),
                     (18, &cell_count),
                 ],
+            ),
+            grid_reorder_a: bg(
+                &pipelines.grid_reorder_a,
+                &[
+                    (0, &params_buf),
+                    (1, &pos),
+                    (2, &pred),
+                    (3, &vel),
+                    (9, &sorted_indices),
+                    (23, &pos_scratch),
+                    (24, &pred_scratch),
+                    (25, &vel_scratch),
+                ],
+            ),
+            grid_reorder_b: bg(
+                &pipelines.grid_reorder_b,
+                &[
+                    (0, &params_buf),
+                    (9, &sorted_indices),
+                    (11, &phase),
+                    (20, &chem),
+                    (26, &chem_scratch),
+                    (27, &phase_scratch),
+                ],
+            ),
+            grid_reorder_identity: bg(
+                &pipelines.grid_reorder_identity,
+                &[(0, &params_buf), (9, &sorted_indices)],
             ),
             compute_lambda: bg(
                 &pipelines.compute_lambda,
@@ -1714,6 +1790,11 @@ impl Solver for XpbdSolver {
             pos_readback,
             chem,
             chem_frozen,
+            pos_scratch,
+            pred_scratch,
+            vel_scratch,
+            chem_scratch,
+            phase_scratch,
             pipelines,
             bind_groups,
             ts,
@@ -1813,6 +1894,70 @@ impl Solver for XpbdSolver {
                                 &p.grid_scatter,
                                 &b.grid_scatter,
                                 "grid_scatter",
+                                np,
+                            );
+                            // Cell-order reorder (memory locality): gather the persistent payload
+                            // (pos/pred/vel/chem/phase) into cell order, then set sorted_indices to
+                            // identity so the density gathers below read contiguous memory. Water-loop
+                            // only — later blocks inherit this cell-sorted layout (reads stay
+                            // consistent, gathers stay near-contiguous). Single shared mapping
+                            // (sorted_indices read-only until the identity write) → no chunk hazard.
+                            let nbytes_v4 = (self.active_count as u64) * 16;
+                            let nbytes_u32 = (self.active_count as u64) * 4;
+                            pass(
+                                &mut enc,
+                                &p.grid_reorder_a,
+                                &b.grid_reorder_a,
+                                "grid_reorder_a",
+                                np,
+                            );
+                            enc.copy_buffer_to_buffer(
+                                &self.pos_scratch,
+                                0,
+                                &self.pos,
+                                0,
+                                nbytes_v4,
+                            );
+                            enc.copy_buffer_to_buffer(
+                                &self.pred_scratch,
+                                0,
+                                &self.pred,
+                                0,
+                                nbytes_v4,
+                            );
+                            enc.copy_buffer_to_buffer(
+                                &self.vel_scratch,
+                                0,
+                                &self.vel,
+                                0,
+                                nbytes_v4,
+                            );
+                            pass(
+                                &mut enc,
+                                &p.grid_reorder_b,
+                                &b.grid_reorder_b,
+                                "grid_reorder_b",
+                                np,
+                            );
+                            enc.copy_buffer_to_buffer(
+                                &self.chem_scratch,
+                                0,
+                                &self.chem,
+                                0,
+                                nbytes_v4,
+                            );
+                            enc.copy_buffer_to_buffer(
+                                &self.phase_scratch,
+                                0,
+                                &self.phase,
+                                0,
+                                nbytes_u32,
+                            );
+                            pass(
+                                &mut enc,
+                                &p.grid_reorder_identity,
+                                &b.grid_reorder_identity,
+                                "grid_reorder_identity",
                                 np,
                             );
                         }

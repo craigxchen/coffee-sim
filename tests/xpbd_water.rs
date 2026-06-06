@@ -175,15 +175,24 @@ fn same_seed_is_reproducible() {
         s.read_positions()
     };
     let (a, b) = (run(&gpu), run(&gpu));
-    let mean_diff: f32 = a
+    // The cell-order reorder permutes slot assignment non-deterministically (atomic scatter), so a
+    // per-index comparison is meaningless. Reproducibility is a SET property: every particle in run
+    // A must have a near-coincident counterpart in run B. Mean nearest-neighbor distance — robust to
+    // slot permutation. (The residual is the pre-existing float-summation-order divergence, present
+    // with or without the reorder; the reorder only adds the slot shuffle this metric sees through.)
+    let mean_nn: f32 = a
         .iter()
-        .zip(&b)
-        .map(|(p, q)| dist2(*p, *q).sqrt())
+        .map(|p| {
+            b.iter()
+                .map(|q| dist2(*p, *q))
+                .fold(f32::INFINITY, f32::min)
+                .sqrt()
+        })
         .sum::<f32>()
         / a.len() as f32;
-    eprintln!("reproducibility mean per-particle diff after 10 frames: {mean_diff:.5}");
+    eprintln!("reproducibility mean nearest-neighbor diff after 10 frames: {mean_nn:.5}");
     assert!(
-        mean_diff < 0.05,
-        "not reproducible: mean diff {mean_diff:.5}"
+        mean_nn < 0.05,
+        "not reproducible as a set: mean nn diff {mean_nn:.5}"
     );
 }

@@ -126,16 +126,26 @@ fn dormant_capacity_is_inert() {
     let pa = base.read_positions();
     let pb = withcap.read_positions();
     assert_eq!(pa.len(), pb.len());
-    for (i, (a, b)) in pa.iter().zip(&pb).enumerate() {
-        for k in 0..4 {
-            assert!(
-                (a[k] - b[k]).abs() <= 1.0e-6,
-                "dormant capacity perturbed particle {i} lane {k}: {} vs {}",
-                a[k],
-                b[k]
-            );
-        }
-    }
+    // Dormant capacity must not perturb the active sim. The cell-order reorder assigns slots
+    // non-deterministically (atomic scatter), so "inert" is a SET property, not a per-slot one:
+    // every active (position, moisture) tuple in `base` must have a near-coincident match in
+    // `withcap`. The tolerance sits above the float-summation-order non-determinism floor (~1e-5,
+    // present run-to-run with or without dormant capacity) and far below any real perturbation a
+    // dormant-slot leak would cause (O(particle_spacing) ≈ 1).
+    let d2 = |a: &[f32; 4], b: &[f32; 4]| (0..4).map(|k| (a[k] - b[k]).powi(2)).sum::<f32>();
+    let max_nn: f32 = pa
+        .iter()
+        .map(|a| {
+            pb.iter()
+                .map(|b| d2(a, b))
+                .fold(f32::INFINITY, f32::min)
+                .sqrt()
+        })
+        .fold(0.0, f32::max);
+    assert!(
+        max_nn < 1.0e-3,
+        "dormant capacity perturbed the active sim: max nearest-neighbor {max_nn}"
+    );
 }
 
 /// Pass selection: a grain-only scene that declares a pour must still enable the water passes (else

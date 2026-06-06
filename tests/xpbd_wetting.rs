@@ -150,13 +150,15 @@ fn moisture_lane_survives_steps_with_drag_and_buoyancy() {
         &Config::default(),
         &gpu,
     );
-    let phase = solver.read_phases();
     let input = EmissionInput::default();
 
     for _ in 0..30 {
         solver.step(1.0 / 60.0, &input);
     }
 
+    // Read phase in the SAME post-step snapshot as moisture: the cell-order reorder permutes slots,
+    // so phase[i] and moisture[i] only refer to the same particle when read from one snapshot.
+    let phase = solver.read_phases();
     // No absorption pass exists yet (U5), so the moisture lane must be byte-for-byte unchanged.
     let moisture = solver.read_moisture();
     for (i, (&ph, &m)) in phase.iter().zip(&moisture).enumerate() {
