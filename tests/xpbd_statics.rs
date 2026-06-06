@@ -168,3 +168,121 @@ fn rest_lattice_is_a_quiet_fixed_point_across_resolutions() {
         );
     }
 }
+
+fn column_scene(gravity_y: f32) -> Scene {
+    Scene {
+        dose_g: 0.0,
+        water_ml: 0.0,
+        pour_water_ml: 0.0,
+        gravity: [0.0, gravity_y, 0.0],
+        box_min: [0.0, 0.0, 0.0],
+        box_max: [10.0, 30.0, 10.0],
+        regions: vec![SeedRegion {
+            min: [0.5, 0.5, 0.5],
+            max: [9.5, 24.0, 9.5],
+            species: Species::Water,
+        }],
+        solids: Vec::new(),
+    }
+}
+
+/// Bin interior particles by depth and return the per-bin mean density excess
+/// `mean(ρ/ρ₀ − 1)`, ordered bottom → top, for bins with enough samples.
+fn depth_profile(pos: &[[f32; 4]], dens: &[(f32, usize)], rho0: f32, bins: usize) -> Vec<f32> {
+    let interior: Vec<(f32, f32)> = pos
+        .iter()
+        .zip(dens)
+        .filter(|(p, (_, nbr))| *nbr >= 24 && p[0] > 2.5 && p[0] < 7.5 && p[2] > 2.5 && p[2] < 7.5)
+        .map(|(p, (d, _))| (p[1], d / rho0 - 1.0))
+        .collect();
+    let (mut ymin, mut ymax) = (f32::INFINITY, f32::NEG_INFINITY);
+    for &(y, _) in &interior {
+        ymin = ymin.min(y);
+        ymax = ymax.max(y);
+    }
+    let span = (ymax - ymin).max(1e-3);
+    let mut sum = vec![0.0f32; bins];
+    let mut cnt = vec![0usize; bins];
+    for &(y, c) in &interior {
+        let b = (((y - ymin) / span) * bins as f32).floor() as usize;
+        let b = b.min(bins - 1);
+        sum[b] += c;
+        cnt[b] += 1;
+    }
+    (0..bins)
+        .filter(|&b| cnt[b] >= 8)
+        .map(|b| sum[b] / cnt[b] as f32)
+        .collect()
+}
+
+/// Under hydrostatic load the fluid stays incompressible: ρ(z) = ρ₀ at every
+/// depth (the closed-form incompressible limit), even at 2× gravity, where a
+/// compressible fluid would stratify as ρ ∝ g·depth. This is the testable
+/// replacement for "pressure ∝ depth": PBF carries the hydrostatic balance in
+/// the implicit constraint (no readable pressure / density gradient of the
+/// magnitude P=ρgh would imply), so what is observable is that the density holds
+/// ρ₀ under load, with only a sub-percent residual compression in the correct
+/// direction. Returns `(max depth-bin |C|, bottom−top ΔC)` per gravity.
+#[test]
+fn fluid_stays_incompressible_under_hydrostatic_load() {
+    let Some(gpu) = GpuContext::new_headless() else {
+        eprintln!("xpbd_statics: no GPU adapter; skipping.");
+        return;
+    };
+    let mats = Materials::default();
+    let h = mats.support_radius;
+    let m = mats.particle_mass;
+    let rho0 = kernels::rest_density(mats.particle_spacing, h, m);
+    let cfg = Config::default();
+
+    let probe = |g: f32| -> (f32, f32) {
+        let scene = column_scene(g);
+        let mut solver = XpbdSolver::build(&scene, &mats, &cfg, &gpu);
+        let input = EmissionInput::default();
+        for _ in 0..400 {
+            solver.step(1.0 / 60.0, &input);
+        }
+        let pos = solver.read_positions();
+        let dens = reconstruct_density(&pos, h, m);
+        let prof = depth_profile(&pos, &dens, rho0, 6);
+        assert!(
+            prof.len() >= 4,
+            "g={g}: too few depth bins ({})",
+            prof.len()
+        );
+        let max_abs = prof.iter().map(|c| c.abs()).fold(0.0, f32::max);
+        let bottom_top = prof[0] - prof[prof.len() - 1];
+        (max_abs, bottom_top)
+    };
+
+    let (max_c_1g, dc_1g) = probe(-20.0);
+    let (max_c_2g, dc_2g) = probe(-40.0);
+
+    // (1) Incompressible at every depth, at 1g and 2g: ρ stays within ~1% of ρ₀
+    //     under load (observed ~0.3% at 1g, ~0.76% at 2g). A compressible fluid
+    //     would show order-of-magnitude-larger stratification.
+    assert!(
+        max_c_1g < 1.5e-2,
+        "1g: fluid compressed under load, max depth |C| = {max_c_1g}"
+    );
+    assert!(
+        max_c_2g < 1.5e-2,
+        "2g: fluid compressed under load, max depth |C| = {max_c_2g}"
+    );
+
+    // (2) The sub-percent residual is genuine hydrostatic compression: denser at
+    //     depth (bottom − top > 0), and larger under stronger gravity — confirming
+    //     the tiny gradient tracks the load rather than being noise.
+    assert!(
+        dc_1g > 5e-4,
+        "1g: no hydrostatic compression structure (ΔC = {dc_1g})"
+    );
+    assert!(
+        dc_2g > 5e-4,
+        "2g: no hydrostatic compression structure (ΔC = {dc_2g})"
+    );
+    assert!(
+        dc_2g > dc_1g,
+        "doubling gravity did not increase compression (1g ΔC = {dc_1g}, 2g ΔC = {dc_2g})"
+    );
+}
