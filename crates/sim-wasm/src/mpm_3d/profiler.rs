@@ -15,6 +15,7 @@
 //!
 //! Tunable via environment variables:
 //! - `COFFEE_SIM_PROFILE_SCENE`   scene preset: `center_pour` (default) | `free_stream` | `water_block`
+//! - `COFFEE_SIM_PROFILE_SPARSE_PRESSURE`  `1`/`true` routes the pressure solve through the sparse tile RBGS path (default dense)
 //! - `COFFEE_SIM_PROFILE_WARMUP`  frames to run before measuring (default 60)
 //! - `COFFEE_SIM_PROFILE_FRAMES`  instrumented frames to measure (default 120)
 //! - `COFFEE_SIM_PROFILE_CAL`     production `step_frame` calibration frames (default 30)
@@ -44,7 +45,7 @@ use bytemuck::cast_slice;
 use serde::Serialize;
 
 use super::inflow::{EmissionResult, MASS_UNITS_PER_ML, PARTICLES_PER_ML};
-use super::state::{METRICS_SLOT_COUNT, NUM_THREADS};
+use super::state::{sparse_tile_slot_count, tile_count, METRICS_SLOT_COUNT, NUM_THREADS};
 use super::{dispatch_size, required_limits, MpmSettings, MpmSim3D};
 
 /// Query-set slots to allocate per substep. One substep records ~23 passes ×
@@ -256,6 +257,10 @@ fn step_frame_instrumented(
         let particle_wg = dispatch_size(num_particles, NUM_THREADS);
         let bed_wg = dispatch_size(sim.num_bed, NUM_THREADS);
         let metrics_wg = dispatch_size(METRICS_SLOT_COUNT as u32, 8);
+        let sparse_pressure = sim.settings.sparse_pressure;
+        let sparse_clear_wg =
+            dispatch_size(sparse_tile_slot_count(sim.settings.grid_dims), NUM_THREADS);
+        let tile_wg = tile_count(sim.settings.grid_dims);
 
         // 3. Encode all passes, each in its own timestamped compute pass.
         let t_encode = Instant::now();
@@ -321,6 +326,16 @@ fn step_frame_instrumented(
             &p.boundary_project,
             cell_wg,
         );
+        if sparse_pressure {
+            timed_pass(
+                &mut encoder,
+                &mut rec,
+                bg,
+                "sparse_tiles_clear",
+                &p.sparse_tiles_clear,
+                sparse_clear_wg,
+            );
+        }
         timed_pass(
             &mut encoder,
             &mut rec,
@@ -331,6 +346,7 @@ fn step_frame_instrumented(
         );
 
         // Pressure: interleaved red/black GS in a single pass (matches production).
+        // Sparse over-dispatches one workgroup per tile; dense one per 64 cells.
         {
             let timestamp_writes = rec.writes("pressure_solve");
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -339,10 +355,17 @@ fn step_frame_instrumented(
             });
             pass.set_bind_group(0, bg, &[]);
             for _ in 0..pressure_pairs {
-                pass.set_pipeline(&p.pressure_rbgs_red);
-                pass.dispatch_workgroups(cell_wg, 1, 1);
-                pass.set_pipeline(&p.pressure_rbgs_black);
-                pass.dispatch_workgroups(cell_wg, 1, 1);
+                if sparse_pressure {
+                    pass.set_pipeline(&p.pressure_rbgs_red_sparse);
+                    pass.dispatch_workgroups(tile_wg, 1, 1);
+                    pass.set_pipeline(&p.pressure_rbgs_black_sparse);
+                    pass.dispatch_workgroups(tile_wg, 1, 1);
+                } else {
+                    pass.set_pipeline(&p.pressure_rbgs_red);
+                    pass.dispatch_workgroups(cell_wg, 1, 1);
+                    pass.set_pipeline(&p.pressure_rbgs_black);
+                    pass.dispatch_workgroups(cell_wg, 1, 1);
+                }
             }
         }
 
@@ -669,7 +692,10 @@ fn profile_mpm_pipeline() {
     let measured = env_u32_or("COFFEE_SIM_PROFILE_FRAMES", DEFAULT_MEASURED_FRAMES);
     let calibration = env_u32_or("COFFEE_SIM_PROFILE_CAL", DEFAULT_CALIBRATION_FRAMES);
 
-    let settings = scene_settings(&scene);
+    let mut settings = scene_settings(&scene);
+    settings.sparse_pressure = std::env::var("COFFEE_SIM_PROFILE_SPARSE_PRESSURE")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
     let grid_dims = settings.grid_dims;
     let total_cells = grid_dims[0] * grid_dims[1] * grid_dims[2];
     let max_particles = settings.max_particles;
