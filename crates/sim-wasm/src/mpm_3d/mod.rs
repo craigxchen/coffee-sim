@@ -29,8 +29,8 @@ use filter_mesh::FilterMesh;
 use inflow::{EmissionResult, InflowState, SpoutSettings, MASS_UNITS_PER_ML};
 use pipelines::MpmPipelines;
 use state::{
-    MpmBuffers, MpmUniforms, FP_SCALE, FP_VALUE_LIMIT, MAX_VELOCITY, METRICS_DIV_FP_SCALE,
-    METRICS_SLOT_COUNT, NUM_THREADS, SDF_RES,
+    sparse_tile_slot_count, MpmBuffers, MpmUniforms, FP_SCALE, FP_VALUE_LIMIT, MAX_VELOCITY,
+    METRICS_DIV_FP_SCALE, METRICS_SLOT_COUNT, NUM_THREADS, SDF_RES,
 };
 
 const TARGET_BED_RETENTION_ML: f32 = DEFAULT_BREW.target_bed_retention_ml;
@@ -296,6 +296,11 @@ pub(crate) struct MpmSettings {
     pub pressure_residual_target: f32,
     pub pressure_rbgs_max_pairs: u32,
     pub use_sdf_cache: bool,
+    /// Route the pressure solve through the sparse tile-flagged RBGS path
+    /// instead of the dense full-grid sweeps. Default off; the dense path stays
+    /// the production default and the equivalence reference. When off, the
+    /// per-substep tile clear is skipped so the dense path adds no dispatch.
+    pub sparse_pressure: bool,
     pub obstacles: Vec<Obstacle>,
     pub spout: SpoutSettings,
     pub initial_water_speed_m_s: f32,
@@ -328,6 +333,7 @@ impl MpmSettings {
             pressure_residual_target: 0.0,
             pressure_rbgs_max_pairs: 40,
             use_sdf_cache: true,
+            sparse_pressure: false,
             obstacles: vec![
                 v60_support_cone(&filter),
                 Obstacle::Cylinder {
@@ -1591,6 +1597,9 @@ impl MpmSim3D {
             let bed_wg = dispatch_size(self.num_bed, NUM_THREADS);
 
             let metrics_wg = dispatch_size(METRICS_SLOT_COUNT as u32, 8);
+            let sparse_pressure = self.settings.sparse_pressure;
+            let sparse_clear_wg =
+                dispatch_size(sparse_tile_slot_count(self.settings.grid_dims), NUM_THREADS);
 
             let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("mpm step"),
@@ -1636,6 +1645,14 @@ impl MpmSim3D {
 
                 // Pressure projection: classify cells, RBGS pressure
                 // solve, velocity correction, then re-project boundaries.
+                //
+                // Sparse path: rebuild the per-tile active flags each substep
+                // before classify_cells re-marks them. Gated on the toggle so
+                // the dense default path issues no extra dispatch.
+                if sparse_pressure {
+                    pass.set_pipeline(&self.pipelines.sparse_tiles_clear);
+                    pass.dispatch_workgroups(sparse_clear_wg, 1, 1);
+                }
                 pass.set_pipeline(&self.pipelines.classify_cells);
                 pass.dispatch_workgroups(cell_wg, 1, 1);
 
