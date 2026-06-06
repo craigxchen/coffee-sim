@@ -264,7 +264,12 @@ impl WasmSim3D {
 
         let settings = MpmSettings::default_v60();
         let renderer = Renderer::new(canvas, &settings).await?;
-        let sim = MpmSim3D::new(renderer.device(), renderer.queue(), settings);
+        let sim = MpmSim3D::new_with_tier(
+            renderer.device(),
+            renderer.queue(),
+            settings,
+            renderer.pressure_tier(),
+        );
         let camera = OrbitCamera::new(sim.settings().bounds_size);
         Ok(Self {
             sim,

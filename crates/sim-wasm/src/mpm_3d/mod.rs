@@ -37,17 +37,55 @@ const TARGET_BED_RETENTION_ML: f32 = DEFAULT_BREW.target_bed_retention_ml;
 pub(crate) const CONTACT_OFFSET: f32 = 0.05;
 pub(crate) const OBSTACLE_WALL_THICKNESS: f32 = 0.4;
 
-/// Device limits required by the MPM compute pipeline.
+/// Pressure-solve capability tier resolved from the adapter.
 ///
-/// The MPM bind group holds 9 storage buffers (particles, affine, grid,
-/// grid_vel, render_data, bed_extract, bed_lookup, bed_delta, metrics) plus
-/// one SDF texture. This stays within the 10-buffer cap that some WebGPU
-/// adapters enforce. Any
-/// `request_device` site that uses this pipeline must use these limits, and
-/// `mpm_pipelines_fit_within_required_limits` pins the invariant.
-pub(crate) fn required_limits() -> wgpu::Limits {
+/// `Indirect` means the adapter can run the indirect-dispatch sparse path: it
+/// needs 12 storage buffers per stage (the 10 baseline + the active-tile list +
+/// the indirect-args buffer) and `INDIRECT_EXECUTION`. `Sparse` is the 10-buffer
+/// baseline that runs the dense and v1 over-dispatch sparse paths. Whether a run
+/// is dense or sparse within the `Sparse` tier is the `sparse_pressure` toggle,
+/// not a capability — so there is no separate `Dense` tier (a sub-10-buffer
+/// adapter can't run the pipeline at all, which is the pre-existing floor).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PressureTier {
+    Indirect,
+    Sparse,
+}
+
+/// Resolve the pressure-solve tier from the adapter. `Indirect` requires both
+/// 12 storage buffers per stage and `INDIRECT_EXECUTION`; otherwise the
+/// 10-buffer `Sparse` baseline applies. Note: the WebGPU/browser backend
+/// reports `INDIRECT_EXECUTION` present unconditionally, so there the 12-buffer
+/// check (above the spec baseline of 8) is what gates the indirect tier out.
+pub(crate) fn pressure_tier(adapter: &wgpu::Adapter) -> PressureTier {
+    let has_buffers = adapter.limits().max_storage_buffers_per_shader_stage >= 12;
+    let has_indirect = adapter
+        .get_downlevel_capabilities()
+        .flags
+        .contains(wgpu::DownlevelFlags::INDIRECT_EXECUTION);
+    if has_buffers && has_indirect {
+        PressureTier::Indirect
+    } else {
+        PressureTier::Sparse
+    }
+}
+
+/// Device limits required by the MPM compute pipeline, per tier.
+///
+/// The MPM bind group holds 10 storage buffers in the `Sparse` baseline
+/// (particles, affine, grid, grid_vel, render_data, bed_extract, bed_lookup,
+/// bed_delta, metrics, sparse_tiles) plus two SDF textures. The `Indirect` tier
+/// adds the active-tile list and indirect-args buffers (12 total). Every
+/// `request_device` site that uses this pipeline must request the limits for the
+/// tier it resolved, and `pipelines_fit_within_required_limits` pins the
+/// `Sparse`-tier invariant.
+pub(crate) fn required_limits(tier: PressureTier) -> wgpu::Limits {
+    let max_storage_buffers_per_shader_stage = match tier {
+        PressureTier::Indirect => 12,
+        PressureTier::Sparse => 10,
+    };
     wgpu::Limits {
-        max_storage_buffers_per_shader_stage: 10,
+        max_storage_buffers_per_shader_stage,
         ..wgpu::Limits::default()
     }
 }
@@ -696,10 +734,27 @@ pub(crate) struct MpmSim3D {
     total_dropped_particles: u32,
     last_pressure_rbgs_pairs: u32,
     latest_metrics: MetricsSnapshot,
+    /// Resolved pressure-solve capability tier. Gates whether the indirect
+    /// dispatch path is available; the dense/sparse choice is `sparse_pressure`.
+    /// Read by the dispatch selection in U4; allow until then.
+    #[allow(dead_code)]
+    tier: PressureTier,
 }
 
 impl MpmSim3D {
+    /// Construct with the default `Sparse` tier (dense + v1 over-dispatch only).
+    /// The renderer/profiler use [`new_with_tier`](Self::new_with_tier) to enable
+    /// the indirect path on capable adapters.
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, settings: MpmSettings) -> Self {
+        Self::new_with_tier(device, queue, settings, PressureTier::Sparse)
+    }
+
+    pub fn new_with_tier(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        settings: MpmSettings,
+        tier: PressureTier,
+    ) -> Self {
         let buffers = MpmBuffers::new(device, queue, &settings);
         let pipelines = MpmPipelines::new(device, &buffers);
         let mut inflow = InflowState::new(units::sim_speed_from_meters_per_second(
@@ -723,6 +778,7 @@ impl MpmSim3D {
             total_dropped_particles: 0,
             last_pressure_rbgs_pairs: 0,
             latest_metrics: MetricsSnapshot::default(),
+            tier,
         };
 
         sim.init_bed(queue);
@@ -2500,7 +2556,7 @@ mod tests {
         let proposed_grid_lanes = 6_u64;
         let proposed_grid_bytes =
             proposed_grid_lanes * total_cells * std::mem::size_of::<i32>() as u64;
-        let limit = required_limits().max_storage_buffer_binding_size as u64;
+        let limit = required_limits(PressureTier::Sparse).max_storage_buffer_binding_size as u64;
 
         assert!(
             proposed_grid_bytes <= limit,
