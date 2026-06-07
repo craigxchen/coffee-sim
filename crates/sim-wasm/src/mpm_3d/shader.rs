@@ -2107,6 +2107,40 @@ fn project_pressure(@builtin(global_invocation_id) gid: vec3<u32>) {
         v = v * (vel_cap() / speed);
     }
     grid_vel[idx] = vec4<f32>(v, gv.w);
+
+    // R-H +side free-surface faces. A fluid cell's UPPER face shared with an air
+    // cell is that air cell's own LOWER face. Air cells skip this pass, so without
+    // this the surface face is never projected and a divergence residual lingers
+    // at the free surface (the pool never reaches a clean rest). Correct it here
+    // from this fluid cell, which is its ONLY writer: the air cell never runs, and
+    // each of the air cell's three lower faces is owned by a distinct lower
+    // neighbour, so the per-component stores target disjoint lanes and do not race.
+    // Air Dirichlet p=0, weight = self_fill (matching the lower-face air handling):
+    // v_face -= dt*fw*(p_air - p_here)/dx = +dt*fw*p_here/dx pushes the surface out.
+    if ix_val + 1u < gx() {
+        let nu = cell_index(ix_val + 1u, iy_val, iz_val);
+        let nku = cell_kind_load(nu);
+        if !is_fluid_kind(nku) && !is_solid_kind(nku) {
+            let fw = pressure_face_weight(kind, self_fill, nu, nku);
+            grid_vel[nu].x = grid_vel[nu].x + dt() * fw * p_here * inv_dx();
+        }
+    }
+    if iy_val + 1u < gy() {
+        let nu = cell_index(ix_val, iy_val + 1u, iz_val);
+        let nku = cell_kind_load(nu);
+        if !is_fluid_kind(nku) && !is_solid_kind(nku) {
+            let fw = pressure_face_weight(kind, self_fill, nu, nku);
+            grid_vel[nu].y = grid_vel[nu].y + dt() * fw * p_here * inv_dx();
+        }
+    }
+    if iz_val + 1u < gz() {
+        let nu = cell_index(ix_val, iy_val, iz_val + 1u);
+        let nku = cell_kind_load(nu);
+        if !is_fluid_kind(nku) && !is_solid_kind(nku) {
+            let fw = pressure_face_weight(kind, self_fill, nu, nku);
+            grid_vel[nu].z = grid_vel[nu].z + dt() * fw * p_here * inv_dx();
+        }
+    }
 }
 
 // ── pressure_residual ──
@@ -2442,15 +2476,32 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>) {
                 if cell.x < 0 || cell.y < 0 || cell.z < 0 { continue; }
                 if u32(cell.x) >= gx() || u32(cell.y) >= gy() || u32(cell.z) >= gz() { continue; }
                 let ci = cell_index(u32(cell.x), u32(cell.y), u32(cell.z));
-                if grid_vel[ci].w <= 1e-6 { continue; }
+                var surface_face = false;
+                if grid_vel[ci].w <= 1e-6 {
+                    // R-H: ci's -x face is shared with the cell at x-1. When ci is
+                    // air but that lower neighbour holds fluid, this is a free-surface
+                    // face that project_pressure corrected (+side air-face fix) — keep
+                    // it so the surface particle gathers the projected velocity.
+                    // Pure-air faces (neither side fluid) are still skipped.
+                    if cell.x <= 0
+                        || grid_vel[cell_index(u32(cell.x - 1), u32(cell.y), u32(cell.z))].w <= 1e-6 {
+                        continue;
+                    }
+                    surface_face = true;
+                }
                 let w = sxw[i] * wy[j] * wz[k];
                 let vx = grid_vel[ci].x;
-                let dpos = vec3<f32>(f32(i) - sfx.x, f32(j) - fx.y, f32(k) - fx.z) * cell_dx;
                 new_v.x += w * vx;
-                new_C0.x += w * B * vx * dpos.x;
-                new_C1.x += w * B * vx * dpos.y;
-                new_C2.x += w * B * vx * dpos.z;
                 support_x += w;
+                // Surface faces feed the PIC velocity but not the APIC affine: the
+                // B=4/dx^2 gain would amplify any residual in the projected air-face
+                // velocity into a self-pumping surface mode over a long settle.
+                if !surface_face {
+                    let dpos = vec3<f32>(f32(i) - sfx.x, f32(j) - fx.y, f32(k) - fx.z) * cell_dx;
+                    new_C0.x += w * B * vx * dpos.x;
+                    new_C1.x += w * B * vx * dpos.y;
+                    new_C2.x += w * B * vx * dpos.z;
+                }
             }
         }
     }
@@ -2461,15 +2512,26 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>) {
                 if cell.x < 0 || cell.y < 0 || cell.z < 0 { continue; }
                 if u32(cell.x) >= gx() || u32(cell.y) >= gy() || u32(cell.z) >= gz() { continue; }
                 let ci = cell_index(u32(cell.x), u32(cell.y), u32(cell.z));
-                if grid_vel[ci].w <= 1e-6 { continue; }
+                var surface_face = false;
+                if grid_vel[ci].w <= 1e-6 {
+                    // R-H: ci's -y face is shared with the cell at y-1 — keep it when
+                    // that lower neighbour holds fluid (the pool's top free surface).
+                    if cell.y <= 0
+                        || grid_vel[cell_index(u32(cell.x), u32(cell.y - 1), u32(cell.z))].w <= 1e-6 {
+                        continue;
+                    }
+                    surface_face = true;
+                }
                 let w = wx[i] * syw[j] * wz[k];
                 let vy = grid_vel[ci].y;
-                let dpos = vec3<f32>(f32(i) - fx.x, f32(j) - sfx.y, f32(k) - fx.z) * cell_dx;
                 new_v.y += w * vy;
-                new_C0.y += w * B * vy * dpos.x;
-                new_C1.y += w * B * vy * dpos.y;
-                new_C2.y += w * B * vy * dpos.z;
                 support_y += w;
+                if !surface_face {
+                    let dpos = vec3<f32>(f32(i) - fx.x, f32(j) - sfx.y, f32(k) - fx.z) * cell_dx;
+                    new_C0.y += w * B * vy * dpos.x;
+                    new_C1.y += w * B * vy * dpos.y;
+                    new_C2.y += w * B * vy * dpos.z;
+                }
             }
         }
     }
@@ -2480,15 +2542,26 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>) {
                 if cell.x < 0 || cell.y < 0 || cell.z < 0 { continue; }
                 if u32(cell.x) >= gx() || u32(cell.y) >= gy() || u32(cell.z) >= gz() { continue; }
                 let ci = cell_index(u32(cell.x), u32(cell.y), u32(cell.z));
-                if grid_vel[ci].w <= 1e-6 { continue; }
+                var surface_face = false;
+                if grid_vel[ci].w <= 1e-6 {
+                    // R-H: ci's -z face is shared with the cell at z-1 — keep it when
+                    // that lower neighbour holds fluid (a free-surface face).
+                    if cell.z <= 0
+                        || grid_vel[cell_index(u32(cell.x), u32(cell.y), u32(cell.z - 1))].w <= 1e-6 {
+                        continue;
+                    }
+                    surface_face = true;
+                }
                 let w = wx[i] * wy[j] * szw[k];
                 let vz = grid_vel[ci].z;
-                let dpos = vec3<f32>(f32(i) - fx.x, f32(j) - fx.y, f32(k) - sfx.z) * cell_dx;
                 new_v.z += w * vz;
-                new_C0.z += w * B * vz * dpos.x;
-                new_C1.z += w * B * vz * dpos.y;
-                new_C2.z += w * B * vz * dpos.z;
                 support_z += w;
+                if !surface_face {
+                    let dpos = vec3<f32>(f32(i) - fx.x, f32(j) - fx.y, f32(k) - sfx.z) * cell_dx;
+                    new_C0.z += w * B * vz * dpos.x;
+                    new_C1.z += w * B * vz * dpos.y;
+                    new_C2.z += w * B * vz * dpos.z;
+                }
             }
         }
     }
@@ -2610,6 +2683,22 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>) {
     let lo = u.grid_origin.xyz + vec3<f32>(margin);
     let hi = u.bounds_max.xyz - vec3<f32>(margin);
     new_pos = clamp(new_pos, lo, hi);
+
+    // Wall-collision APIC fix. resolve_sdf_contact zeroed the particle's inward
+    // normal velocity, but the affine matrix still carries the pre-collision
+    // normal velocity gradient; left intact it reloads normal momentum into the
+    // grid on the next p2g (mass_p*vp + C*dpos) — the wall-jitter / energy-pump
+    // feedback loop. Project the wall-normal direction out of every affine column
+    // so the affine cannot regenerate normal momentum at the boundary:
+    // C' = (I - n nᵀ) C, i.e. C_d -= n (n · C_d) for each column.
+    if sample_sdf(new_pos) < contact_offset() {
+        let cn = sdf_gradient(new_pos);
+        if length(cn) > 1e-6 {
+            new_C0 = new_C0 - cn * dot(cn, new_C0);
+            new_C1 = new_C1 - cn * dot(cn, new_C1);
+            new_C2 = new_C2 - cn * dot(cn, new_C2);
+        }
+    }
 
     particles[pid].pos = vec4<f32>(new_pos, J_new);
     particles[pid].vel = vec4<f32>(new_v, mass_p);
