@@ -1,6 +1,6 @@
 ---
 title: "feat: Wireframe rendering of SDF solid boundaries (V60 cone + cup)"
-status: active
+status: completed
 date: 2026-06-06
 type: feat
 ---
