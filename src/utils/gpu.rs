@@ -7,13 +7,11 @@ use wgpu::{Adapter, Device, Instance, Queue};
 
 /// Wraps the `wgpu` device + queue and the data needed to create resources.
 ///
-/// Targets the **WebGPU-guaranteed baseline limits** (`wgpu::Limits::default()`) even on
-/// native, so the storage-buffer binding ceiling (8 per stage) that broke v1's DFSPH path
-/// on the browser bites here first — we never silently exceed what WebGPU guarantees (v1
-/// raised `max_storage_buffers_per_shader_stage` to 10). Requests `TIMESTAMP_QUERY` only
-/// when the adapter advertises it. Headless for now: no surface (rendering arrives with
-/// `ui`). The same request path compiles to WASM + WebGPU — native only wraps the async
-/// init in `pollster::block_on`.
+/// Targets the WebGPU baseline limits except `max_storage_buffers_per_shader_stage`, which is
+/// raised to **16** — the real per-stage storage-buffer ceiling for this project's device/browser
+/// targets. Requests `TIMESTAMP_QUERY` only when the adapter advertises it. Headless for now: no
+/// surface (rendering arrives with `ui`). The same request path compiles to WASM + WebGPU — native
+/// only wraps the async init in `pollster::block_on`.
 pub struct GpuContext {
     pub instance: Instance,
     pub adapter: Adapter,
@@ -110,9 +108,12 @@ impl GpuContext {
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("coffee-sim device"),
                 required_features,
-                // WebGPU baseline. Do NOT raise max_storage_buffers_per_shader_stage above 8
-                // (v1's mistake) — it must stay portable to the browser.
-                required_limits: wgpu::Limits::default(),
+                // 16 storage buffers per stage is the real device/browser ceiling for this project's
+                // targets. All other limits stay at the WebGPU baseline for portability.
+                required_limits: wgpu::Limits {
+                    max_storage_buffers_per_shader_stage: 16,
+                    ..wgpu::Limits::default()
+                },
                 memory_hints: wgpu::MemoryHints::Performance,
                 trace: wgpu::Trace::default(),
                 experimental_features: wgpu::ExperimentalFeatures::disabled(),

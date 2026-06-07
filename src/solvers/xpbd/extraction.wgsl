@@ -17,7 +17,7 @@
 // matching the rebuilt grid) and the POST-WETTING moisture (pos.w) — the grain's current saturation
 // gates extraction and the water's current volume sizes the headroom. The dissolution passes write
 // only `chem`, so reading `pos` is race-free. (Using `pos` for both also keeps both transfer passes
-// at exactly 8 storage buffers — no room for a separate `pred` binding.)
+// lean — no separate `pred` binding needed.)
 //
 // Eligibility (identical on all three passes): opposite species within `h`, and both particles
 // "active" — grain wet (pos.w = V_abs > absorb_roundoff) and water mobile (pos.w = f_w > roundoff).

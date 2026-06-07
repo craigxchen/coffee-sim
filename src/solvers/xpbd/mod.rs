@@ -1433,7 +1433,7 @@ impl Solver for XpbdSolver {
         // Static SDF geometry (binding 19, read-only). Built-time-immutable; an empty scene gets a
         // 1-element dummy (params.num_solids = 0 makes the union skip it). Bound by the kernels that
         // query the geometry — the position-solve collision passes and `finalize` (wall velocity
-        // response). Each stays within the 8-storage-buffer budget (finalize is at 7).
+        // response). Each stays within the 16-storage-buffer budget (finalize is at 7).
         let mut packed = pack_solids(&scene.solids);
         if packed.is_empty() {
             packed.push(Primitive::zeroed());
