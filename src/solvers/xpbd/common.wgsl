@@ -80,7 +80,7 @@ struct Params {
     cp_grain: f32,
     h_amb: f32,
     t_amb: f32,
-    _pad_chem0: f32,
+    coupling_h: f32,          // α_s/drag coupling radius h_c; PBF keeps params.h
     _pad_chem1: f32,
     // --- fines migration (Phase 6); vec4-aligned tail ---
     fines: vec4<f32>,         // (rate/gate, seed, crit_flux, _) — fines.x>0 enables migration

@@ -49,6 +49,11 @@ pub struct Materials {
     // --- coupling (water ↔ bed) ---
     /// Per-grain particle mass (grains are denser than water; sets the interphase mass weighting).
     pub grain_mass: f32,
+    /// Water↔grain coupling/porosity support radius `h_c`.
+    ///
+    /// `0` means derive it at solver build time: keep legacy single-resolution scenes on the water
+    /// PBF radius, and widen only when grains are coarser than water.
+    pub coupling_radius: f32,
     /// Bed porosity φ (pore/fluid volume fraction of a packed bed) — the Kozeny–Carman input.
     pub porosity: f32,
 
@@ -122,6 +127,7 @@ impl Default for Materials {
             // Coupling: grains a bit denser than water (a settled bed resists being lifted); 40%
             // bed porosity (KEEP.md §1).
             grain_mass: 1.5,
+            coupling_radius: 0.0,
             porosity: 0.40,
             // Wetting: coffee retains ~1.5× its dry mass; grain density ~1.3× water; cohesion peaks
             // near 40% saturation. c_max starts at 0 (no wet cohesion until calibrated).

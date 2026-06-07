@@ -19,7 +19,7 @@
 fn compute_fractions(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
     if (i >= params.particle_count) { return; }
-    let h = params.h;
+    let h = params.coupling_h;
     let xi = pred[i].xyz;
     var a_s = 0.0;
     var fines_dev = 0.0; // Σ_j (lodged fines − uniform baseline)·W from grain neighbors (Phase 6)
@@ -164,7 +164,7 @@ fn beta_from_rate(rate: f32) -> f32 {
 // porosity discontinuity — deferred.)
 const WET_REF_POROSITY: f32 = 0.40; // must match Materials.porosity (build-time drag resolution)
 fn porosity_drag_factor(a_s: f32) -> f32 {
-    let phi = clamp(1.0 - a_s, 0.05, 0.999); // clamp away from 0 (K-C diverges)
+    let phi = clamp(1.0 - a_s, 0.35, 0.999); // K-C/drag porosity floor: finite dense-bed drag
     let pr = WET_REF_POROSITY;
     let num = pr * pr * pr * (1.0 - phi) * (1.0 - phi);
     let den = phi * phi * phi * (1.0 - pr) * (1.0 - pr);
@@ -202,7 +202,7 @@ fn compute_coupling_scale(@builtin(global_invocation_id) gid: vec3<u32>) {
                     if (j == i) { continue; }
                     if (phase[j] == ph_i) { continue; }
                     let r = length(xi - pred[j].xyz);
-                    if (r >= params.h) { continue; }
+                    if (r >= params.coupling_h) { continue; }
                     n = n + 1.0;
                 }
             }
@@ -214,10 +214,10 @@ fn compute_coupling_scale(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (params.fines.x > 0.0) {
         // Harmonic-k path: store the raw rate + the cap. drag_delta_for_pair forms the symmetric
         // harmonic-mean-k pair scale (= arithmetic mean of rates, since rate ∝ 1/k) and caps it.
-        coupling_scale[i] = vec2<f32>(rate_i, cap_i);
+        coupling_scale[i] = vec2<f32>(rate_i, n);
     } else {
-        // Legacy/global path (byte-identical): capped β in .x; drag uses min(β_i, β_j) as before.
-        coupling_scale[i] = vec2<f32>(min(beta_from_rate(rate_i), cap_i), 0.0);
+        // Legacy/global path: capped β in .x; .y carries the diagnostic opposite-phase count.
+        coupling_scale[i] = vec2<f32>(min(beta_from_rate(rate_i), cap_i), n);
     }
 }
 
@@ -231,7 +231,8 @@ fn drag_delta_for_pair(i: u32, j: u32, self_phase: u32) -> vec3<f32> {
         // at its edge instead of leaking (min(rate) would pick the clear side). Symmetric in (i,j),
         // so the pair impulse stays equal-and-opposite (momentum conserved).
         let rate_pair = 0.5 * (cs_i.x + cs_j.x);
-        s = min(beta_from_rate(rate_pair), min(cs_i.y, cs_j.y));
+        let cap_pair = params.drag_beta_max / max(max(cs_i.y, cs_j.y), 1.0);
+        s = min(beta_from_rate(rate_pair), cap_pair);
     } else {
         s = min(cs_i.x, cs_j.x); // legacy/global: min of capped betas (byte-identical)
     }
@@ -264,7 +265,7 @@ fn drag_water(@builtin(global_invocation_id) gid: vec3<u32>) {
                     let j = sorted_indices[s];
                     if (phase[j] != PHASE_GRAIN) { continue; }
                     let r = length(xi - pred[j].xyz);
-                    if (r >= params.h) { continue; }
+                    if (r >= params.coupling_h) { continue; }
                     dv = dv + drag_delta_for_pair(i, j, PHASE_WATER);
                 }
             }
@@ -298,7 +299,7 @@ fn drag_grain(@builtin(global_invocation_id) gid: vec3<u32>) {
                     let j = sorted_indices[s];
                     if (phase[j] != PHASE_WATER) { continue; }
                     let r = length(xi - pred[j].xyz);
-                    if (r >= params.h) { continue; }
+                    if (r >= params.coupling_h) { continue; }
                     dv = dv + drag_delta_for_pair(i, j, PHASE_GRAIN);
                 }
             }
