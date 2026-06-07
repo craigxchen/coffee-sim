@@ -443,9 +443,13 @@ fn wetting_with_full_solve_conserves_volume_and_stays_finite() {
     }
     let pos = solver.read_positions();
     let moisture = solver.read_moisture();
+    // Re-read phase paired with the final moisture: the cell-order reorder permutes the particle
+    // array each step, so the step-0 labels no longer match step-150 moisture (see
+    // dense_scene_absorption_conserves_volume).
+    let phase_final = solver.read_phases();
 
     // Only the wetting passes touch pos.w, so volume conservation holds even with the full solve.
-    let final_vol = total_volume(&moisture, &phase, v_w);
+    let final_vol = total_volume(&moisture, &phase_final, v_w);
     assert!(
         (final_vol - initial).abs() <= 1.0e-3 * initial.max(1.0),
         "volume drifted under full solve: {initial} -> {final_vol}"
@@ -459,7 +463,7 @@ fn wetting_with_full_solve_conserves_volume_and_stays_finite() {
     assert!(
         moisture
             .iter()
-            .zip(&phase)
+            .zip(&phase_final)
             .any(|(&m, &p)| p == 1 && m > 1.0e-5),
         "no absorption"
     );
@@ -690,8 +694,13 @@ fn dense_scene_absorption_conserves_volume() {
     for _ in 0..150 {
         solver.step(1.0 / 60.0, &EmissionInput::default());
     }
+    // Re-read phase at the SAME point as the final moisture: the cell-order particle reorder permutes
+    // the particle array every step, so the step-0 `phase` labels no longer line up with step-150
+    // moisture. Classifying water (f_w·V_w) vs grain (V_abs) with a stale phase array corrupts the
+    // volume sum (here by ~0.2%). Both volume reads must pair phase+moisture from one snapshot.
+    let phase_final = solver.read_phases();
     let moisture = solver.read_moisture();
-    let final_vol = total_volume(&moisture, &phase, v_w);
+    let final_vol = total_volume(&moisture, &phase_final, v_w);
     // Counting-sort grid ⇒ no overflow ⇒ exact (the old buckets leaked several percent here).
     assert!(
         (final_vol - initial).abs() <= 1.0e-3 * initial,
@@ -700,7 +709,7 @@ fn dense_scene_absorption_conserves_volume() {
     assert!(
         moisture
             .iter()
-            .zip(&phase)
+            .zip(&phase_final)
             .any(|(&m, &p)| p == 1 && m > 1.0e-4),
         "no absorption in dense scene"
     );

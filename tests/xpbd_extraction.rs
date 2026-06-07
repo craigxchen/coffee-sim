@@ -195,9 +195,14 @@ fn no_extraction_without_opt_in() {
         solver.step(DT, &EmissionInput::default());
     }
     let after = solver.read_chem();
-    for (i, (a, b)) in before.iter().zip(&after).enumerate() {
-        assert_eq!(a, b, "chem drifted at particle {i} with extraction off");
-    }
+    // The cell-order particle reorder permutes the particle array each step, so `after` is a
+    // permutation of `before` even with extraction off (no chem value changes). Compare as a
+    // multiset, not index-by-index, to assert "no chem moved" without the reorder false-positive.
+    let mut bf: Vec<f32> = before.iter().flatten().copied().collect();
+    let mut af: Vec<f32> = after.iter().flatten().copied().collect();
+    bf.sort_by(f32::total_cmp);
+    af.sort_by(f32::total_cmp);
+    assert_eq!(bf, af, "chem values changed with extraction off");
 }
 
 /// The moisture gate (R1): a dry grain (never wetted) releases nothing and water `c` stays 0.
@@ -705,7 +710,7 @@ fn brew_populates_finite_yield_and_tds() {
         particle_spacing: 0.5,
         support_radius: 1.0,
         grain_diameter: 1.0,
-        water_grain_distance: 0.35,
+        min_pore_fraction: 0.35,
         grain_mass: 10.0,
         ..Materials::default()
     };
@@ -733,9 +738,12 @@ fn brew_populates_finite_yield_and_tds() {
         "tds not finite: {}",
         m.tds
     );
-    // The c_sat cap holds in the full mixed solve (every water concentration ≤ c_sat).
+    // The c_sat cap holds in the full mixed solve (every water concentration ≤ c_sat). Re-read
+    // phase paired with the concentration: the cell-order reorder permutes the particle array, so
+    // the step-0 labels would misclassify grains (high solute lane) as water and false-trip the cap.
     let conc = solver.read_concentration();
-    for (c, &ph) in conc.iter().zip(&phase) {
+    let phase_final = solver.read_phases();
+    for (c, &ph) in conc.iter().zip(&phase_final) {
         if ph == 0 {
             assert!(
                 *c <= mats.c_sat + 1.0e-4,
@@ -822,7 +830,7 @@ fn reset_clears_yield_tds_cache() {
         particle_spacing: 0.5,
         support_radius: 1.0,
         grain_diameter: 1.0,
-        water_grain_distance: 0.35,
+        min_pore_fraction: 0.35,
         grain_mass: 10.0,
         ..Materials::default()
     };
