@@ -261,12 +261,12 @@ fn v60_water_drains_into_cup_grains_trapped() {
         return;
     };
     // Calibrated V60 mats (see examples/water_app.rs SCENE=v60): fine water, coarser permeable bed,
-    // grains ~1.25x water density so the bed holds and water threads through instead of squeezing.
+    // grains ~1.25x water density so the bed holds and water threads through the pore field.
     let mats = Materials {
         particle_spacing: 0.5,
         support_radius: 1.0,
         grain_diameter: 1.0,
-        water_grain_distance: 0.35,
+        min_pore_fraction: 0.35,
         grain_mass: 10.0,
         ..Materials::default()
     };

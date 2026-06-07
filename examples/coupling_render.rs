@@ -36,7 +36,7 @@ fn main() {
         mats.particle_spacing = 0.5;
         mats.support_radius = 1.0;
         mats.grain_diameter = 1.5; // 3× the water spacing → coarse grains, real pores
-        mats.water_grain_distance = 0.4; // fine water threads the gaps
+        mats.min_pore_fraction = 0.4;
         mats.grain_mass = 40.0; // denser than the fine water (ρ_grain > rest_density) so the heavy
                                 // wall holds AND grains sink rather than float under buoyancy
     }
@@ -46,8 +46,8 @@ fn main() {
     {
         mats.grain_mass = gm; // heavy grains hold the wall against the surge
     }
-    if let Some(wg) = std::env::var("WGDIST").ok().and_then(|s| s.parse().ok()) {
-        mats.water_grain_distance = wg; // < grain spacing ⇒ water threads the packed wall's pores
+    if let Some(min_pore) = std::env::var("MINPORE").ok().and_then(|s| s.parse().ok()) {
+        mats.min_pore_fraction = min_pore;
     }
     let mut cfg = Config::default();
     if let Some(ds) = std::env::var("DRAGSUB").ok().and_then(|s| s.parse().ok()) {

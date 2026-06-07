@@ -122,13 +122,13 @@ fn coarse_grind_draws_down_sooner_than_fine() {
     // below the bed centroid → the drawdown latch fires. Coarser grind → higher permeability → drains
     // sooner → smaller drawdown_time. Sample every few steps so the latch is checked during the run.
     let run = |grain_diameter: f32| -> f32 {
-        // Calibrated V60 mats (matching the geometry drain test): fine water threads a coarser
-        // permeable bed (water_grain_distance < grain spacing). grain_diameter is the lever.
+        // Calibrated V60 mats (matching the geometry drain test): fine water threads the pore field
+        // of a coarser permeable bed. grain_diameter is the lever.
         let mats = Materials {
             particle_spacing: 0.5,
             support_radius: 1.0,
             grain_diameter,
-            water_grain_distance: 0.35,
+            min_pore_fraction: 0.35,
             grain_mass: 10.0,
             ..Materials::default()
         };
@@ -181,7 +181,7 @@ fn v60_brew_mats(fines_fraction: f32) -> Materials {
         particle_spacing: 0.5,
         support_radius: 1.0,
         grain_diameter: 1.0,
-        water_grain_distance: 0.35,
+        min_pore_fraction: 0.35,
         grain_mass: 10.0,
         fines_fraction,
         ..Materials::default()
@@ -240,10 +240,10 @@ fn channeling_emerges_from_nonuniform_inflow_and_fines_amplify() {
         return;
     };
     let input = EmissionInput::default();
-    // Threading bed so water flows down through it (water_grain_distance < grain spacing).
+    // Threading bed so water flows down through the porosity field.
     let run = |concentrated: bool, fines: bool| -> f32 {
         let mats = Materials {
-            water_grain_distance: 0.5,
+            min_pore_fraction: 0.5,
             grain_mass: 6.0,
             fines_fraction: if fines { 0.15 } else { 0.0 },
             ..Materials::default()

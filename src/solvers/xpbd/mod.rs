@@ -73,12 +73,12 @@ struct Params {
     grain_mass: f32,
     grain_volume: f32, // (π/6)·grain_diameter³ — effective volume for the α_s sum
     packing_limit: f32,
-    exclusion_relax: f32,
+    min_pore_fraction: f32,
     drag_scale: f32,
     drag_beta_max: f32,
     buoyancy_scale: f32,
     wake_threshold: f32,
-    water_grain_distance: f32,
+    _pad_coupling0: f32,
     // --- wetting / cohesion (Phase 1.4) ---
     r_max: f32,           // moisture ratio at saturation (mass water / mass dry grain)
     rho_ratio: f32,       // ρ_s/ρ_w — converts absorbed water mass → swelling volume
@@ -199,8 +199,6 @@ struct Pipelines {
     compute_dp: wgpu::ComputePipeline,
     bed_project: wgpu::ComputePipeline,
     compute_fractions: wgpu::ComputePipeline,
-    exclude_water: wgpu::ComputePipeline,
-    exclude_grain: wgpu::ComputePipeline,
     compute_coupling_scale: wgpu::ComputePipeline,
     drag_water: wgpu::ComputePipeline,
     drag_grain: wgpu::ComputePipeline,
@@ -237,8 +235,6 @@ struct BindGroups {
     compute_dp: wgpu::BindGroup,
     bed_project: wgpu::BindGroup,
     compute_fractions: wgpu::BindGroup,
-    exclude_water: wgpu::BindGroup,
-    exclude_grain: wgpu::BindGroup,
     compute_coupling_scale: wgpu::BindGroup,
     drag_water: wgpu::BindGroup,
     drag_grain: wgpu::BindGroup,
@@ -1230,14 +1226,16 @@ impl Solver for XpbdSolver {
         };
         let grain_volume = std::f32::consts::FRAC_PI_6 * mats.grain_diameter.powi(3);
 
-        // Grid cell must cover the largest neighbor query. Keep legacy single-resolution scenes
-        // byte-stable (`grain_diameter <= h` => h_c=h); widen only when water is finer than grains.
+        // Coupling/porosity kernel `h_c` is fixed to the FLUID resolution (the SPH support radius
+        // h), NOT the grain diameter. A grain-size-scaled kernel makes the α_s smoothing volume a
+        // moving target: finer grind → smaller kernel → a concentrated local-porosity spike that
+        // chokes flow and inverts the grind→drawdown ordering. A constant (grind-independent)
+        // smoothing volume lets the physical Kozeny–Carman 1/d² permeability dictate the order.
+        const COUPLING_KERNEL_FACTOR: f32 = 2.5;
         let coupling_h = if mats.coupling_radius > 0.0 {
             mats.coupling_radius
-        } else if mats.grain_diameter > h {
-            2.5 * mats.grain_diameter
         } else {
-            h
+            COUPLING_KERNEL_FACTOR * h
         };
         let cell_size = h.max(mats.grain_diameter).max(coupling_h);
         let nx = (((scene.box_max[0] - scene.box_min[0]) / cell_size).ceil() as u32).max(1);
@@ -1297,12 +1295,12 @@ impl Solver for XpbdSolver {
             grain_mass: mats.grain_mass,
             grain_volume,
             packing_limit: cfg.packing_limit,
-            exclusion_relax: cfg.exclusion_relax,
+            min_pore_fraction: mats.min_pore_fraction,
             drag_scale: cfg.drag_scale,
             drag_beta_max: cfg.drag_beta_max,
             buoyancy_scale: cfg.buoyancy_scale,
             wake_threshold: cfg.wake_threshold,
-            water_grain_distance: mats.water_grain_distance,
+            _pad_coupling0: 0.0,
             r_max: mats.r_max,
             rho_ratio: mats.rho_ratio,
             s_peak: mats.s_peak,
@@ -1588,8 +1586,6 @@ impl Solver for XpbdSolver {
             compute_dp: make("compute_dp"),
             bed_project: make("bed_project"),
             compute_fractions: make("compute_fractions"),
-            exclude_water: make("exclude_water"),
-            exclude_grain: make("exclude_grain"),
             compute_coupling_scale: make("compute_coupling_scale"),
             drag_water: make("drag_water"),
             drag_grain: make("drag_grain"),
@@ -1762,30 +1758,6 @@ impl Solver for XpbdSolver {
                     (11, &phase),
                     (13, &alpha_s),
                     (20, &chem), // lodged fines (chem.w) → α_s deviation (Phase 6); 6 storage buffers
-                ],
-            ),
-            exclude_water: bg(
-                &pipelines.exclude_water,
-                &[
-                    (0, &params_buf),
-                    (2, &pred),
-                    (6, &dp),
-                    (8, &cell_start),
-                    (9, &sorted_indices),
-                    (10, &status),
-                    (11, &phase),
-                ],
-            ),
-            exclude_grain: bg(
-                &pipelines.exclude_grain,
-                &[
-                    (0, &params_buf),
-                    (2, &pred),
-                    (6, &dp),
-                    (8, &cell_start),
-                    (9, &sorted_indices),
-                    (10, &status),
-                    (11, &phase),
                 ],
             ),
             compute_coupling_scale: bg(
@@ -2171,10 +2143,10 @@ impl Solver for XpbdSolver {
                 label: Some("xpbd-frame"),
             });
 
-        // Pass sequence is chosen from which species are present. Water runs the density solve
-        // (+ grain exclusion when mixed); grain runs the contact subcycle; mixed runs both, with
-        // the bed contact AFTER the water/fluid passes so grains respond. Single-species scenes
-        // keep their adaptive early-exit (residual_reduce); mixed runs fixed iteration counts.
+        // Pass sequence is chosen from which species are present. Water runs the density solve;
+        // grain runs the contact subcycle; mixed runs both, with the bed contact AFTER the
+        // water/fluid passes so grains respond. Single-species scenes keep their adaptive early-exit
+        // (residual_reduce); mixed runs fixed iteration counts.
         let mixed = self.has_water && self.has_grain;
         let p = &self.pipelines;
         let b = &self.bind_groups;
@@ -2308,23 +2280,6 @@ impl Solver for XpbdSolver {
                             np,
                         );
                         pass(&mut enc, &p.compute_dp, &b.compute_dp, "compute_dp", np);
-                        if mixed {
-                            // Grain exclusion (A.2), two-way: water out of grain bodies + reaction.
-                            pass(
-                                &mut enc,
-                                &p.exclude_water,
-                                &b.exclude_water,
-                                "exclude_water",
-                                np,
-                            );
-                            pass(
-                                &mut enc,
-                                &p.exclude_grain,
-                                &b.exclude_grain,
-                                "exclude_grain",
-                                np,
-                            );
-                        }
                         pass(&mut enc, &p.apply_dp, &b.apply_dp, "apply_dp", np);
                         // Adaptive early-exit only for single-species water (mixed runs fixed iters).
                         if !mixed {

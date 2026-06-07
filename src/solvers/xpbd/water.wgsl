@@ -90,10 +90,10 @@ fn compute_lambda(@builtin(global_invocation_id) gid: vec3<u32>) {
         rho = rho + c_residual[i];
     }
 
-    // Pore-modulated rest density: where grains are present the water target is ρ₀·(1−α_s), so
-    // pore water packs to fill only the pore fraction (α_s+α_f=1) instead of full ρ₀ — which would
-    // over-fill and get expelled. α_s=0 (single-species water) → unmodulated ρ₀ (identical).
-    let pore = max(1.0 - alpha_s[i], 0.05);
+    // Pore-modulated rest density: where grains are present the water target is
+    // ρ₀·(1−min(α_s, 1−ε_floor)), so pore water fills only the available pore fraction while a
+    // packed-bed floor prevents over-packing into solid volume.
+    let pore = 1.0 - min(alpha_s[i], 1.0 - params.min_pore_fraction);
     let inv_rho0 = 1.0 / (params.rest_density * pore);
     let c = rho * inv_rho0 - 1.0;
     let denom = (dot(sum_g, sum_g) + sum_g2) * inv_rho0 * inv_rho0 + params.relaxation_eps;
@@ -153,7 +153,10 @@ fn compute_dp(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
     if (i >= params.particle_count) { return; }
     if (status.converged != 0u) { return; }
-    if (phase[i] != PHASE_WATER) { return; } // grains are projected by bed_project
+    if (phase[i] != PHASE_WATER) {
+        dp[i] = vec4<f32>(0.0);
+        return; // grains are projected by bed_project; water-loop correction is a clean no-op
+    }
     let h = params.h;
     let m = params.particle_mass;
     let xi = pred[i].xyz;
@@ -195,7 +198,7 @@ fn compute_dp(@builtin(global_invocation_id) gid: vec3<u32>) {
             }
         }
     }
-    let pore = max(1.0 - alpha_s[i], 0.05);
+    let pore = 1.0 - min(alpha_s[i], 1.0 - params.min_pore_fraction);
     let inv_rho0 = 1.0 / (params.rest_density * pore);
     dp[i] = vec4<f32>(sum * inv_rho0, 0.0);
 }

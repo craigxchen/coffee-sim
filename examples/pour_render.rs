@@ -55,11 +55,6 @@ fn main() {
         particle_spacing: s,
         support_radius: 2.0 * s,
         grain_diameter: 2.0 * s,
-        // water↔grain contact = 1.2·spacing: grains render at radius 1.0·spacing, so water must
-        // rest at ≥ that to sit ON the bed (visibly interacting) instead of threading INSIDE the
-        // grain spheres — 0.7·spacing let water centers cross into the grains and read as "passing
-        // through". Still porous enough to drain (water reaches the cup).
-        water_grain_distance: 1.2 * s,
         grain_mass: 10.0,
         ..Materials::default()
     };

@@ -175,7 +175,7 @@ impl Scene {
 
     /// A pour-over: a grain bed on the floor with a water column above it — the first **mixed**
     /// water+grain scene, the water/bed-coupling gate. The bed settles, then water pools on /
-    /// drains through it (drainage needs the drag step; exclusion alone keeps water off the floor).
+    /// drains through it under the porosity field and Darcy drag.
     pub fn pour_over() -> Self {
         Self {
             box_max: [48.0, 40.0, 48.0],
