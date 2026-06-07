@@ -51,12 +51,12 @@ struct Params {
     grain_mass: f32,
     grain_volume: f32,        // (π/6)·grain_diameter³ — effective volume for the α_s sum
     packing_limit: f32,       // α_s clamp (~0.64)
-    exclusion_relax: f32,     // under-relaxation on the A.2 correction
+    min_pore_fraction: f32,   // ε_floor in the water density target
     drag_scale: f32,
     drag_beta_max: f32,
     buoyancy_scale: f32,
     wake_threshold: f32,
-    water_grain_distance: f32, // water↔grain exclusion contact (≤ grain spacing lets water thread pores)
+    _pad_coupling0: f32,
     // --- wetting / cohesion (Phase 1.4) ---
     r_max: f32,                // moisture ratio at saturation (mass water / mass dry grain)
     rho_ratio: f32,            // ρ_s/ρ_w — converts absorbed water mass → swelling volume
@@ -118,8 +118,8 @@ struct Status {
 @group(0) @binding(12) var<storage, read_write> normal_impulse: array<f32>;
 // Per-particle solid fraction α_s = Σ grain V_g W (clamped to the packing limit). Computed each
 // iteration by compute_fractions in mixed scenes; zero in single-species scenes (so the water
-// density solve is unmodulated there). The water target becomes ρ₀·(1−α_s) → pore water packs to
-// the pore fraction (drainage-ready), and the geometric exclusion keeps water out of grain bodies.
+// density solve is unmodulated there). The water target becomes ρ₀·(floored pore fraction), so
+// pore water packs to the available volume without a water↔grain collision.
 @group(0) @binding(13) var<storage, read_write> alpha_s: array<f32>;
 // Per-grain accumulated |water↔grain drag impulse| this frame; it wakes the static dead-band
 // under fluid load. Reset in predict, written by drag_grain, read in finalize.

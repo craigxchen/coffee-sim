@@ -126,7 +126,7 @@ fn main() {
         particle_spacing: 0.5,
         support_radius: 1.0,
         grain_diameter: 1.0,
-        water_grain_distance: 0.35,
+        min_pore_fraction: 0.35,
         grain_mass: 10.0,
         ..Materials::default()
     };

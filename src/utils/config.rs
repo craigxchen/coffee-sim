@@ -68,8 +68,6 @@ pub struct Config {
     // --- water/bed coupling (mixed scenes) ---
     /// Solid-fraction packing clamp on `α_s` (~0.64 random close packing).
     pub packing_limit: f32,
-    /// Under-relaxation on the grain-exclusion position correction (A.2).
-    pub exclusion_relax: f32,
     /// Reduced-unit Darcy drag scale multiplying `150·(1−ε)²/(ε³·d²)`.
     pub drag_scale: f32,
     /// Per-subiter aggregate drag cap `β_max < 1` (anti-overshoot). (step 2)
@@ -161,8 +159,7 @@ impl Default for Config {
             grain_sleep_speed: 0.2,
             // Coupling: Darcy drag is computed per-particle from local porosity in WGSL.
             packing_limit: 0.64,
-            exclusion_relax: 0.5,
-            drag_scale: 0.02,
+            drag_scale: 0.30,
             drag_beta_max: 0.8,
             drag_subiters: 4,
             buoyancy_scale: 1.0,

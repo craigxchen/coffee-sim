@@ -37,7 +37,6 @@ fn mats_for(s: f32) -> Materials {
         particle_spacing: s,
         support_radius: 2.0 * s,
         grain_diameter: 2.0 * s,
-        water_grain_distance: 0.7 * s,
         grain_mass: 10.0,
         ..Materials::default()
     }

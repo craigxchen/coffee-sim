@@ -149,7 +149,7 @@ fn fines_strain_onto_grains_during_flow() {
     // flows past the grains the suspended fines strain out onto them → water loses, grains gain.
     let mats = Materials {
         fines_fraction: 0.0,
-        water_grain_distance: 0.5, // water threads the bed so it flows past the grains
+        min_pore_fraction: 0.5, // water threads the porosity field so it flows past the grains
         ..Materials::default()
     };
     let scene = Scene {
@@ -368,7 +368,10 @@ fn fines_clog_raises_drag_and_slows_drawdown() {
     };
 
     let baseline = run(0.0);
-    let clogged = run(0.3 * grain_volume);
+    // A heavy clog (0.6·grain_volume of extra fines on every grain): the drawdown-slowdown effect
+    // must clear GPU run-to-run scatter (~±0.02 on the gap). 0.3·gv left the gap right at the 0.1
+    // threshold and flaked ~1-in-5; doubling the clog drives a robust, clearly-detectable slowdown.
+    let clogged = run(0.6 * grain_volume);
     eprintln!("drawdown water mean y: baseline {baseline:.3}, clogged {clogged:.3}");
     assert!(
         clogged > baseline + 0.1,

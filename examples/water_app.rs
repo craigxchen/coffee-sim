@@ -171,24 +171,24 @@ impl ApplicationHandler for App {
         };
         if scene_kind == "dam" {
             // Fine water through a COARSE sand wall: water at a fine spacing, grains at a larger
-            // contact diameter so the wall has pores the water threads. Heavy grains hold the wall;
-            // the small water↔grain contact lets fine water flow through the gaps. (Ignores SPACING.)
+            // contact diameter so the wall has pores the water threads. Heavy grains hold the wall.
+            // (Ignores SPACING.)
             mats.particle_spacing = 0.5;
             mats.support_radius = 1.0;
             mats.grain_diameter = 1.5;
-            mats.water_grain_distance = 0.4;
+            mats.min_pore_fraction = 0.4;
             mats.grain_mass = 40.0; // denser than the fine water so the heavy wall holds and grains
                                     // sink rather than float under (density-aware) buoyancy
         }
         if scene_kind == "v60" {
-            // Fine water (spacing 0.5) through a COARSER coffee bed (grain_diameter 1.0) with a small
-            // water↔grain contact, so water threads the bed and drains through the cone apex into the
-            // cup instead of pooling and squeezing. Grains ~1.25× water density (coffee-like) so the
-            // bed holds against buoyancy. (Ignores SPACING — these are the calibrated V60 values.)
+            // Fine water (spacing 0.5) through a COARSER coffee bed (grain_diameter 1.0). Water
+            // threads the pore field and drains through the cone apex into the cup. Grains ~1.25×
+            // water density (coffee-like) so the bed holds against buoyancy. (Ignores SPACING —
+            // these are the calibrated V60 values.)
             mats.particle_spacing = 0.5;
             mats.support_radius = 1.0;
             mats.grain_diameter = 1.0;
-            mats.water_grain_distance = 0.35;
+            mats.min_pore_fraction = 0.35;
             mats.grain_mass = 10.0;
         }
         if scene_kind == "v60pour" {
@@ -206,11 +206,6 @@ impl ApplicationHandler for App {
             mats.particle_spacing = r;
             mats.support_radius = 2.0 * r;
             mats.grain_diameter = 2.0 * r;
-            // water↔grain contact = 1.2·spacing: grains render at radius 1.0·spacing, so water rests
-            // ON the bed (visibly interacting) rather than threading INSIDE the grain spheres (which
-            // 0.7·spacing allowed — water centers crossed into the grains and read as "passing
-            // through"). Still porous enough to drain through the bed into the cup.
-            mats.water_grain_distance = 1.2 * r;
             mats.grain_mass = 10.0;
         }
         // WET=1 turns on Phase 1.4 wetting (mixed scenes): grains absorb water, swell, darken, gain

@@ -304,7 +304,6 @@ fn setup_for(kind: WebScene) -> (Scene, Materials, Config) {
                 particle_spacing: r,
                 support_radius: 2.0 * r,
                 grain_diameter: 2.0 * r,
-                water_grain_distance: 1.2 * r,
                 grain_mass: 10.0,
                 ..Materials::default()
             };
