@@ -1,6 +1,6 @@
 ---
 title: "feat: Center cross-section inset (2D z-slice into the corner panel)"
-status: active
+status: completed
 date: 2026-06-06
 type: feat
 ---
