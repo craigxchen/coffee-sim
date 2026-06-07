@@ -7,8 +7,10 @@ use glam::{Mat4, Vec3};
 use wgpu::util::DeviceExt;
 
 use crate::ui::camera::OrbitCamera;
+use crate::ui::wireframe::{solid_wireframe, LineVertex};
 use crate::utils::buffers::ParticleBuffers;
 use crate::utils::gpu::GpuContext;
+use crate::utils::sdf::SdfPrimitive;
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 /// Speed mapped to the top of the color ramp.
@@ -27,6 +29,12 @@ struct CameraUniform {
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct GizmoUniform {
     mvp: [[f32; 4]; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct WireUniform {
+    view_proj: [[f32; 4]; 4],
 }
 
 pub struct Renderer {
@@ -54,6 +62,14 @@ pub struct Renderer {
     cube_vcount: u32,
     axis_vbuf: wgpu::Buffer,
     axis_vcount: u32,
+
+    // Solid-boundary wireframe (cone/cup): a LineList pass drawn in the scene depth. The vertex
+    // buffer is (re)built by `set_solids` on scene change; `None`/0 ⇒ the pass is skipped.
+    wire_buf: wgpu::Buffer,
+    wire_bg: wgpu::BindGroup,
+    wire_pipeline: wgpu::RenderPipeline,
+    wire_vbuf: Option<wgpu::Buffer>,
+    wire_vcount: u32,
 }
 
 impl Renderer {
@@ -187,6 +203,65 @@ impl Renderer {
             cache: None,
         });
 
+        // --- wireframe pipeline (solid boundaries) ---
+        let wire_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("wire-uniform"),
+            size: std::mem::size_of::<WireUniform>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let wire_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("wire-bgl"),
+            entries: &[uniform_entry(0, wgpu::ShaderStages::VERTEX)],
+        });
+        let wire_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("wire-bg"),
+            layout: &wire_bgl,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wire_buf.as_entire_binding(),
+            }],
+        });
+        let wire_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("wireframe"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("wireframe.wgsl").into()),
+        });
+        let wire_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("wireframe"),
+            layout: Some(
+                &device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("wire-layout"),
+                    bind_group_layouts: &[Some(&wire_bgl)],
+                    immediate_size: 0,
+                }),
+            ),
+            vertex: wgpu::VertexState {
+                module: &wire_shader,
+                entry_point: Some("vs"),
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<LineVertex>() as u64,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3],
+                }],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &wire_shader,
+                entry_point: Some("fs"),
+                targets: &[Some(format.into())],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::LineList,
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(depth_state()),
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
         Self {
             device,
             queue,
@@ -206,7 +281,33 @@ impl Renderer {
             axis_vbuf,
             axis_vcount: axes.len() as u32,
             draw_gizmo: true,
+            wire_buf,
+            wire_bg,
+            wire_pipeline,
+            wire_vbuf: None,
+            wire_vcount: 0,
         }
+    }
+
+    /// (Re)build the solid-boundary wireframe from a scene's solids. Call on scene load/rebuild.
+    /// An empty solid list clears the geometry so the wireframe pass is skipped (solid-free scenes
+    /// render unchanged).
+    pub fn set_solids(&mut self, solids: &[SdfPrimitive]) {
+        let verts = solid_wireframe(solids);
+        if verts.is_empty() {
+            self.wire_vbuf = None;
+            self.wire_vcount = 0;
+            return;
+        }
+        self.wire_vbuf = Some(
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("wireframe-lines"),
+                    contents: bytemuck::cast_slice(&verts),
+                    usage: wgpu::BufferUsages::VERTEX,
+                }),
+        );
+        self.wire_vcount = verts.len() as u32;
     }
 
     /// Enable/disable the corner orientation-cube pass. The web frontend disables it and renders a
@@ -267,6 +368,13 @@ impl Renderer {
         };
         self.queue
             .write_buffer(&self.gizmo_buf, 0, bytemuck::bytes_of(&gizmo_u));
+
+        // Wireframe uniform: the full scene view-projection (reuse the particle camera's value).
+        let wire_u = WireUniform {
+            view_proj: cam_u.view_proj,
+        };
+        self.queue
+            .write_buffer(&self.wire_buf, 0, bytemuck::bytes_of(&wire_u));
 
         let particle_bg = particles
             .position
@@ -336,7 +444,35 @@ impl Renderer {
             }
         }
 
-        // Pass 2: orientation cube in the bottom-right corner (keep color, fresh depth).
+        // Pass 2: solid-boundary wireframe (cone/cup). Keep the particle color, and LOAD the
+        // particle depth (not clear) so lines depth-test against the particles — lines behind
+        // opaque particles are occluded, lines in front show. Skipped when there are no solids.
+        if let Some(vbuf) = &self.wire_vbuf {
+            if self.wire_vcount > 0 {
+                let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("wireframe"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: target,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
+                    depth_stencil_attachment: Some(depth_attachment_load(&self.depth)),
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                pass.set_pipeline(&self.wire_pipeline);
+                pass.set_bind_group(0, &self.wire_bg, &[]);
+                pass.set_vertex_buffer(0, vbuf.slice(..));
+                pass.draw(0..self.wire_vcount, 0..1);
+            }
+        }
+
+        // Pass 3: orientation cube in the bottom-right corner (keep color, fresh depth).
         // Skipped on web (the frontend draws a CSS view-cube from the camera yaw/pitch).
         if self.draw_gizmo {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -409,6 +545,19 @@ fn depth_attachment(view: &wgpu::TextureView) -> wgpu::RenderPassDepthStencilAtt
         view,
         depth_ops: Some(wgpu::Operations {
             load: wgpu::LoadOp::Clear(1.0),
+            store: wgpu::StoreOp::Store,
+        }),
+        stencil_ops: None,
+    }
+}
+
+/// Like [`depth_attachment`] but **loads** the existing depth instead of clearing it, so a later
+/// pass depth-tests against what an earlier pass wrote (the wireframe vs. the particles).
+fn depth_attachment_load(view: &wgpu::TextureView) -> wgpu::RenderPassDepthStencilAttachment<'_> {
+    wgpu::RenderPassDepthStencilAttachment {
+        view,
+        depth_ops: Some(wgpu::Operations {
+            load: wgpu::LoadOp::Load,
             store: wgpu::StoreOp::Store,
         }),
         stencil_ops: None,
