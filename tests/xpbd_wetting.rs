@@ -715,6 +715,73 @@ fn dense_scene_absorption_conserves_volume() {
     );
 }
 
+/// U6 conservation gate: a long-run (≥2000-step) saturated bed. Absorption asymptotes into the deep
+/// tail where the per-step transfer drops below a near-capacity grain's f32 ulp — the regime where a
+/// one-signed rounding leak historically hid (fixed by wet_sat_cutoff flooring demand to 0). Volume
+/// must stay conserved all the way into the saturated tail, not just over the first ~150 steps.
+#[test]
+fn saturated_tail_conserves_volume_over_long_run() {
+    let Some(gpu) = GpuContext::new_headless() else {
+        eprintln!("xpbd_wetting: no GPU adapter; skipping.");
+        return;
+    };
+    let mats = Materials::default();
+    let scene = Scene {
+        box_max: [16.0, 24.0, 16.0],
+        regions: vec![
+            SeedRegion {
+                min: [3.0, 2.0, 3.0],
+                max: [13.0, 7.0, 13.0],
+                species: Species::Grain,
+            },
+            SeedRegion {
+                min: [4.0, 9.0, 4.0],
+                max: [12.0, 16.0, 12.0],
+                species: Species::Water,
+            },
+        ],
+        ..Scene::default()
+    };
+    // High absorption rate so the bed drives deep into the saturated tail within the run.
+    let cfg = Config {
+        absorb_rate: 2.0,
+        ..Config::default()
+    };
+    let mut solver = XpbdSolver::build(&scene, &mats, &cfg, &gpu);
+    let v_w = solver.water_particle_volume();
+    let initial = total_volume(&solver.read_moisture(), &solver.read_phases(), v_w);
+    for _ in 0..2000 {
+        solver.step(1.0 / 60.0, &EmissionInput::default());
+    }
+    // Re-read phase paired with moisture (the reorder permutes the particle array — see
+    // dense_scene_absorption_conserves_volume).
+    let phase = solver.read_phases();
+    let moisture = solver.read_moisture();
+    let final_vol = total_volume(&moisture, &phase, v_w);
+    assert!(
+        (final_vol - initial).abs() <= 1.0e-3 * initial,
+        "saturated-tail volume drifted over the long run: {initial} -> {final_vol}"
+    );
+    // Confirm we actually reached the tail: a substantial share of grain capacity is filled, so the
+    // per-step transfer really is in the asymptotic (ulp-sensitive) regime.
+    let v_cap = Materials::default().r_max * Materials::default().rho_ratio * {
+        let d = Materials::default().grain_diameter;
+        std::f32::consts::FRAC_PI_6 * d * d * d
+    };
+    let grain_fill: f32 = moisture
+        .iter()
+        .zip(&phase)
+        .filter(|(_, &p)| p == 1)
+        .map(|(&m, _)| m)
+        .sum::<f32>();
+    let grain_n = phase.iter().filter(|&&p| p == 1).count().max(1) as f32;
+    assert!(
+        grain_fill / grain_n > 0.5 * v_cap,
+        "bed did not reach the saturated tail: mean fill {} vs cap {v_cap}",
+        grain_fill / grain_n
+    );
+}
+
 #[test]
 fn fine_grind_high_rmax_absorption_is_stable() {
     let Some(gpu) = GpuContext::new_headless() else {

@@ -620,3 +620,50 @@ fn fine_resolution_emission_stays_bounded() {
         "fine-resolution emission velocity blew past max_speed (XSPH normalization regression): vmax {vmax}"
     );
 }
+
+/// U6: the re-grounded coupling makes the bed RESPOND to the pour — grains in the impingement zone
+/// move (they were identically frozen before U2/U3/U4) — while the dense packed bed stays STABLE: no
+/// grain reaches a fluidized speed. A gentle V60 pour compacts and surface-disturbs rather than
+/// churns (see the U6 agitation analysis), so the response is gated as a BAND: nonzero but
+/// sub-fluidization. A future drag re-calibration (e.g. for more visible agitation) must keep both
+/// bounds — this is the stability ceiling and the "it actually moves" floor.
+#[test]
+fn pour_response_is_present_but_sub_fluidization() {
+    let Some(gpu) = GpuContext::new_headless() else {
+        eprintln!("xpbd_emission: no GPU adapter; skipping.");
+        return;
+    };
+    let mut solver = v60_pour_solver(&gpu);
+    let kettle = [0.0, 2.5, 0.0];
+    let mut max_grain = 0.0f32;
+    let mut zone_peak = 0.0f32; // peak speed of an impingement-zone grain over the steady window
+    for step in 1..=480 {
+        solver.step(DT, &pour(kettle, 8.0));
+        if step >= 300 && step % 20 == 0 {
+            let pos = solver.read_positions();
+            let vel = solver.read_velocities();
+            let phase = solver.read_phases();
+            for ((p, v), &ph) in pos.iter().zip(&vel).zip(&phase) {
+                if ph != 1 {
+                    continue; // grains only
+                }
+                let sp = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+                max_grain = max_grain.max(sp);
+                let r = (p[0] * p[0] + p[2] * p[2]).sqrt();
+                if r < 1.2 {
+                    zone_peak = zone_peak.max(sp);
+                }
+            }
+        }
+    }
+    // Floor — the pour mobilizes the impingement zone (was identically 0 before the re-grounding).
+    assert!(
+        zone_peak > 0.015,
+        "pour did not mobilize the impingement zone at all: zone peak {zone_peak:.4}"
+    );
+    // Ceiling — the dense bed stays a bed; no grain reaches a fluidized speed under the gentle pour.
+    assert!(
+        max_grain < 0.5,
+        "bed fluidized under the pour: max grain speed {max_grain:.4}"
+    );
+}
