@@ -936,19 +936,88 @@ fn imposed_flow_mobilizes_grain_probe_and_weak_drag_does_not() {
         ((y1 - y0).abs(), fluid_impulse, resistance)
     };
 
-    let (moved, impulse, resistance) = run(Config::default().drag_scale);
-    let (control_moved, control_impulse, _) = run(0.0);
+    let (moved, flow, _resistance) = run(Config::default().drag_scale);
+    let (control_moved, control_flow, _) = run(0.0);
+    // The wake signal is now the local water flow speed (KTD-9), so the imposed flow registers in BOTH
+    // runs — the gate keys on flow, not on drag strength.
     assert!(
-        impulse > resistance + 1.0e-5,
-        "drag impulse should exceed the measured yield budget: impulse {impulse:.6}, resistance {resistance:.6}"
+        flow > 0.2 && control_flow > 0.2,
+        "imposed flow should register as a wake signal in both runs: {flow:.4} / {control_flow:.4}"
     );
+    // But only real drag mobilizes the grain: strong drag moves it; with drag off the same flow leaves
+    // it nearly static (the wake gate alone imparts no momentum).
     assert!(
         moved > 1.0e-3,
         "strong imposed flow did not mobilize the grain probe: displacement {moved:.6}"
     );
     assert!(
-        control_impulse <= 1.0e-7 && control_moved < moved * 0.1,
-        "weak-drag control should stay nearly static: moved {control_moved:.6}, impulse {control_impulse:.6}, strong moved {moved:.6}"
+        control_moved < moved * 0.1,
+        "weak-drag control should stay nearly static: control {control_moved:.6}, strong {moved:.6}"
+    );
+}
+
+#[test]
+fn buoyancy_does_not_wake_a_static_saturated_bed() {
+    let Some(gpu) = GpuContext::new_headless() else {
+        eprintln!("xpbd_coupling: no GPU adapter; skipping.");
+        return;
+    };
+    // KTD-9: the wake signal is DRAG-ONLY (local flow speed). A grain cluster submerged in static
+    // water with buoyancy active sees zero relative flow, so the wake signal stays ≈0 and the bed
+    // sleeps — buoyancy alone cannot lift it out of the static dead-band. Before the buoyancy/drag
+    // wake split, buoyancy_grain wrote fluid_impulse and a hydrostatic saturated bed crept upward.
+    // Same stable geometry as imposed_flow_mobilizes_grain_probe (a small grain cluster ringed by
+    // water) — but the water is left STATIC and buoyancy is switched on. With zero relative flow the
+    // wake signal must stay ≈0 even though buoyancy is pushing the submerged grains every frame.
+    let grains = vec![
+        [5.0, 5.0, 5.0],
+        [4.2, 5.0, 5.0],
+        [5.8, 5.0, 5.0],
+        [5.0, 5.0, 4.2],
+        [5.0, 5.0, 5.8],
+        [4.2, 4.2, 5.0],
+        [5.8, 4.2, 5.0],
+        [5.0, 4.2, 4.2],
+        [5.0, 4.2, 5.8],
+    ];
+    let mut waters = ring_points(8, [5.0, 5.8, 5.0], 0.7);
+    waters.push([5.0, 6.0, 5.0]);
+    let scene = point_scene(&waters, &grains, [10.0, 10.0, 10.0]);
+    let mats = Materials {
+        grain_mass: 1.5,
+        grain_diameter: 1.0,
+        coupling_radius: 2.5,
+        ..Materials::default()
+    };
+    let cfg = Config {
+        drag_scale: Config::default().drag_scale,
+        drag_beta_max: 0.85,
+        drag_subiters: 4,
+        buoyancy_scale: 4.0, // buoyancy strongly active — it must still not feed the wake signal
+        grain_sleep_speed: 0.2,
+        wake_threshold: 0.3,
+        ..drag_only_config()
+    };
+    let mut solver = XpbdSolver::build(&scene, &mats, &cfg, &gpu);
+    let phase = solver.read_phases();
+    let input = EmissionInput::default();
+    // Water velocities default to zero (static) — the only difference from the mobilization test, which
+    // seeds a -4 downward flow. The drag-only wake signal must stay below the gate over a short window
+    // (before buoyancy/gravity develop any real flow).
+    let mut max_grain_wake = 0.0f32;
+    for _ in 0..5 {
+        solver.step(1.0 / 60.0, &input);
+        let fi = solver.read_fluid_impulse();
+        for (k, &ph) in phase.iter().enumerate() {
+            if ph == 1 {
+                max_grain_wake = max_grain_wake.max(fi[k]);
+            }
+        }
+    }
+    assert!(
+        max_grain_wake < cfg.wake_threshold,
+        "buoyancy/static water inflated the drag-only wake signal: {max_grain_wake:.4} >= {:.4}",
+        cfg.wake_threshold
     );
 }
 

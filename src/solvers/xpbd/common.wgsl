@@ -121,8 +121,10 @@ struct Status {
 // density solve is unmodulated there). The water target becomes ρ₀·(floored pore fraction), so
 // pore water packs to the available volume without a water↔grain collision.
 @group(0) @binding(13) var<storage, read_write> alpha_s: array<f32>;
-// Per-grain accumulated |water↔grain drag impulse| this frame; it wakes the static dead-band
-// under fluid load. Reset in predict, written by drag_grain, read in finalize.
+// Per-grain local relative flow speed |mean(v_water) − v_grain| (KTD-9 drag-only wake signal): it
+// keeps a grain in moving water out of the static dead-band. Reset in predict, written once per
+// substep by compute_coupling_scale (before the Jacobi drag subiters → dt/subiter-invariant; no
+// buoyancy contribution), read in finalize.
 @group(0) @binding(14) var<storage, read_write> fluid_impulse: array<f32>;
 // Frozen velocity snapshot for symmetric water↔grain drag gathers. Both drag passes read the
 // same snapshot so every pair computes equal-and-opposite impulses without atomics.
@@ -436,7 +438,7 @@ fn predict(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     if (i >= params.particle_count) { return; }
     normal_impulse[i] = 0.0; // reset the per-frame friction-budget accumulator (grains)
-    fluid_impulse[i] = 0.0; // reset the per-frame water↔grain wake signal
+    fluid_impulse[i] = 0.0; // reset the wake signal (compute_coupling_scale overwrites it when drag runs)
     let p = pos[i].xyz;
     let v = vel[i].xyz;
     let g = params.gravity.xyz;
@@ -653,7 +655,9 @@ fn finalize(@builtin(global_invocation_id) gid: vec3<u32>) {
         // Static-yield regularization (NOT freezing): below a small speed a grain is treated as
         // at rest. Gravity and the contact solve still run for it every frame, so an unsupported
         // grain immediately re-accelerates and penetration is never masked — this only removes
-        // the sub-threshold numerical jitter a Jacobi contact pile never fully shakes off.
+        // the sub-threshold numerical jitter a Jacobi contact pile never fully shakes off. The
+        // wake gate (KTD-9) holds a grain out of the dead-band while the local water flow speed
+        // exceeds wake_threshold, so the pour mobilizes the surface but a still/saturated bed sleeps.
         if (fluid_impulse[i] <= params.wake_threshold && length(v) < params.grain_sleep_speed) {
             v = vec3<f32>(0.0);
         }

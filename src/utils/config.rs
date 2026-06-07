@@ -76,7 +76,9 @@ pub struct Config {
     pub drag_subiters: u32,
     /// Buoyancy impulse scale on the PBF `λ` pressure proxy. 0 disables buoyancy. (step 3)
     pub buoyancy_scale: f32,
-    /// A grain skips its static dead-band when its frame fluid-impulse exceeds this (wake). (step 2)
+    /// A grain skips its static dead-band while the local water flow speed `|mean(v_water)−v_grain|`
+    /// (scene units/s) exceeds this — a drag-only, dt/subiter-invariant wake gate (KTD-9). A still or
+    /// hydrostatic saturated bed reads ≈0 and sleeps; the pour mobilizes the surface. (step 2)
     pub wake_threshold: f32,
 
     // --- wetting / cohesion (Phase 1.4) ---
@@ -163,7 +165,7 @@ impl Default for Config {
             drag_beta_max: 0.8,
             drag_subiters: 4,
             buoyancy_scale: 1.0,
-            wake_threshold: 0.05,
+            wake_threshold: 0.3, // local water flow speed (units/s) above grain_sleep_speed (KTD-9)
             // Wetting OFF by default (like drag_subiters=0): scenes opt in with absorb_rate>0 until
             // the feature is calibrated. ~2 s saturation time constant when enabled; deactivate
             // water only at a tiny remaining fraction (exact conservation), skip from PBF above that.
