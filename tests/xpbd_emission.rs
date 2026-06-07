@@ -667,3 +667,169 @@ fn pour_response_is_present_but_sub_fluidization() {
         "bed fluidized under the pour: max grain speed {max_grain:.4}"
     );
 }
+
+/// U6 (plan 2026-06-07-001): the structural wall pressure force keeps water from climbing/sticking
+/// to the cup wall — the gate that REPLACES the deleted `v.y=0` heuristic. Uses a splash-robust
+/// quantile of wall-region water height (not raw max), gated by occupancy. Also asserts floor-wall
+/// seam stability (finite, bounded speed, no leak through the floor or wall at the concave corner).
+#[test]
+fn wall_pressure_force_prevents_climb() {
+    let Some(gpu) = GpuContext::new_headless() else {
+        eprintln!("xpbd_emission: no GPU adapter; skipping.");
+        return;
+    };
+    let r = 0.3_f32;
+    let mats = Materials {
+        particle_spacing: r,
+        support_radius: 2.0 * r,
+        ..Materials::default()
+    };
+    let cfg = Config {
+        nozzle_radius: 0.25,
+        max_speed: 25.0,
+        ..Config::default()
+    };
+    let mut solver = XpbdSolver::build(&Scene::v60_pour_water_only(), &mats, &cfg, &gpu);
+    let kettle = [0.0, 2.5, 0.0];
+    // cup: cylinder radius 3.0, floor y=-8.0, rim y=-3.5.
+    let mut wall_ys: Vec<f32> = Vec::new(); // wall-region (r∈[2.6,3.2]) water heights over the window
+    let mut bulk_top = f32::MIN; // mid-pool surface (r∈[0.5,2.0]), the reference "pool height"
+    let mut seam_vmax = 0.0f32; // peak speed of seam water (near floor∧wall)
+    let mut all_finite = true;
+    let mut max_r = 0.0f32; // furthest water radius (leak through the cup wall?)
+    let mut min_y = f32::MAX; // lowest water (leak through the floor?)
+    for step in 1..=480 {
+        solver.step(DT, &pour(kettle, 8.0));
+        if step >= 300 && step % 20 == 0 {
+            let pos = solver.read_positions();
+            let vel = solver.read_velocities();
+            let phase = solver.read_phases();
+            for ((p, v), &ph) in pos.iter().zip(&vel).zip(&phase) {
+                if ph != 0 {
+                    continue;
+                }
+                if !p.iter().all(|c| c.is_finite()) {
+                    all_finite = false;
+                    continue;
+                }
+                let rr = (p[0] * p[0] + p[2] * p[2]).sqrt();
+                // only count water actually inside the cup (below the rim) for wall/leak metrics
+                if p[1] < -3.5 {
+                    max_r = max_r.max(rr);
+                    min_y = min_y.min(p[1]);
+                }
+                if rr > 2.6 && rr < 3.2 {
+                    wall_ys.push(p[1]);
+                }
+                if rr > 0.5 && rr < 2.0 {
+                    bulk_top = bulk_top.max(p[1]);
+                }
+                if rr > 2.5 && p[1] < -7.0 {
+                    seam_vmax = seam_vmax.max((v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt());
+                }
+            }
+        }
+    }
+    assert!(all_finite, "non-finite water position (eruption)");
+    assert!(
+        wall_ys.len() > 200,
+        "not enough wall-region water sampled ({}) — scene/probe mismatch",
+        wall_ys.len()
+    );
+    wall_ys.sort_by(f32::total_cmp);
+    let p95 = wall_ys[((0.95 * (wall_ys.len() - 1) as f32) as usize).min(wall_ys.len() - 1)];
+    eprintln!(
+        "no-climb: wall p95={p95:.3} (rim -3.5, floor -8.0), bulk_top={bulk_top:.3}, seam_vmax={seam_vmax:.3}, max_r={max_r:.3}, min_y={min_y:.3}"
+    );
+    // No climb: the wall-region 95th-percentile height stays at/below the rim AND does not rise above
+    // the bulk pool surface (no detached sheet). Baseline climbed to ~-3.16 (above rim); heuristic
+    // -3.63; the structural force keeps it at the pool surface (measured ~-6.6).
+    assert!(
+        p95 <= -3.5,
+        "water climbed above the cup rim: wall p95 {p95:.3} > rim -3.5"
+    );
+    assert!(
+        p95 <= bulk_top + 0.6,
+        "wall water forms a sheet above the pool surface: wall p95 {p95:.3} vs bulk top {bulk_top:.3}"
+    );
+    // Floor-wall seam stability: bounded speed, no leak through the floor (y≥-8) or wall (r≤3+margin).
+    assert!(
+        seam_vmax < 25.0,
+        "floor-wall seam erupted: seam vmax {seam_vmax:.3}"
+    );
+    assert!(
+        min_y >= -8.0 - 0.5 && max_r <= 3.0 + 0.5,
+        "water leaked through the seam: min_y {min_y:.3} (floor -8.0), max_r {max_r:.3} (wall 3.0)"
+    );
+}
+
+/// U6 sign diagnostic (Codex r1/r2): the wall pressure GRADIENT `g_b` points TOWARD the wall, and the
+/// applied force `λ_i·g_b` (over-density λ_i<0) points INTO the fluid. Deterministic — a sign flip
+/// here would silently add to the climb, so integration gates alone are insufficient.
+#[test]
+fn wall_boundary_force_sign_is_correct() {
+    let Some(gpu) = GpuContext::new_headless() else {
+        eprintln!("xpbd_emission: no GPU adapter; skipping.");
+        return;
+    };
+    let r = 0.3_f32;
+    let mats = Materials {
+        particle_spacing: r,
+        support_radius: 2.0 * r,
+        ..Materials::default()
+    };
+    let cfg = Config {
+        nozzle_radius: 0.25,
+        max_speed: 25.0,
+        ..Config::default()
+    };
+    let mut solver = XpbdSolver::build(&Scene::v60_pour_water_only(), &mats, &cfg, &gpu);
+    let kettle = [0.0, 2.5, 0.0];
+    for _ in 0..360 {
+        solver.step(DT, &pour(kettle, 8.0));
+    }
+    let pos = solver.read_positions();
+    let phase = solver.read_phases();
+    let gb = solver.read_boundary_grad();
+    let lam = solver.read_lambda();
+    // For cup-wall water (r≈3, above the floor corner) the inward SDF normal is radial-inward
+    // n̂ = (-x,0,-z)/r. Check g_b points toward the wall (dot<0) and λ·g_b into the fluid (dot>0).
+    let mut checked = 0u32;
+    let (mut grad_ok, mut force_ok) = (0u32, 0u32);
+    for i in 0..pos.len() {
+        if phase[i] != 0 {
+            continue;
+        }
+        let (x, y, z) = (pos[i][0], pos[i][1], pos[i][2]);
+        let rr = (x * x + z * z).sqrt();
+        if !(rr > 2.7 && rr < 3.05 && y > -7.0 && y < -4.0) {
+            continue; // cup wall, clear of the floor corner and the rim
+        }
+        let g = [gb[i][0], gb[i][1], gb[i][2]];
+        let gmag = (g[0] * g[0] + g[1] * g[1] + g[2] * g[2]).sqrt();
+        if gmag < 1.0e-6 {
+            continue; // not near enough to register a wall gradient
+        }
+        let n = [-x / rr, 0.0, -z / rr]; // inward (toward axis = into the fluid)
+        let dot_gn = g[0] * n[0] + g[1] * n[1] + g[2] * n[2];
+        checked += 1;
+        if dot_gn < 0.0 {
+            grad_ok += 1; // g_b points toward the wall (away from the inward normal)
+        }
+        if lam[i] < 0.0 && lam[i] * dot_gn > 0.0 {
+            force_ok += 1; // over-dense ⇒ λ·g_b points into the fluid (repulsion)
+        }
+    }
+    eprintln!("sign: checked={checked} grad_toward_wall={grad_ok} force_into_fluid={force_ok}");
+    assert!(checked > 20, "too few wall-gradient samples ({checked})");
+    // The gradient direction is deterministic geometry — it must hold for ~all samples.
+    assert!(
+        grad_ok as f32 > 0.95 * checked as f32,
+        "g_b sign wrong: only {grad_ok}/{checked} point toward the wall"
+    );
+    // The repulsion holds wherever the particle is over-dense (λ<0); some samples may be λ≈0.
+    assert!(
+        force_ok > 0,
+        "no over-dense wall sample showed λ·g_b pointing into the fluid"
+    );
+}
