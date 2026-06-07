@@ -125,6 +125,24 @@ impl Scene {
         }
     }
 
+    /// A V60 **pour into the empty dripper** — the same support cone + grains-only filter + cup
+    /// geometry as [`Scene::v60_pour`] but with **NO coffee bed**: water is poured into the clean
+    /// cone and drains through the filter apex into the cup (the filter only blocks grains, so it
+    /// passes water freely). `declares_pour()` is true, so the live velocity/spout controls drive the
+    /// pour. Lets you watch the pour stream + drainage geometry without the grounds.
+    pub fn v60_pour_water_only() -> Self {
+        Self {
+            dose_g: 0.0,
+            water_ml: 0.0,
+            pour_water_ml: 250.0,
+            gravity: [0.0, -20.0, 0.0],
+            box_min: [-7.0, -10.0, -7.0],
+            box_max: [7.0, 10.0, 7.0],
+            solids: crate::utils::geometry::v60_dripper(),
+            regions: vec![], // water only — no coffee bed
+        }
+    }
+
     /// A dam-break: a tall water column released in a box. The water-core gate scene.
     pub fn dam_break() -> Self {
         Self::default()
