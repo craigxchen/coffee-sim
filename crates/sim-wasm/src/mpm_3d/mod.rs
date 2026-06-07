@@ -333,7 +333,7 @@ impl MpmSettings {
             pressure_residual_target: 0.0,
             pressure_rbgs_max_pairs: 40,
             use_sdf_cache: true,
-            sparse_pressure: false,
+            sparse_pressure: true,
             obstacles: vec![
                 v60_support_cone(&filter),
                 Obstacle::Cylinder {
