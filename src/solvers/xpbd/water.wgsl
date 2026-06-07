@@ -18,12 +18,19 @@ fn compute_boundary(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (i >= params.particle_count) { return; }
     if (status.converged != 0u) { return; }
     c_residual[i] = 0.0;
+    boundary_grad[i] = vec4<f32>(0.0); // reset each iteration: stale only when converged (then unread)
     if (phase[i] != PHASE_WATER) { return; }
     let f_i = pred[i].w;
     if (f_i <= params.pbf_eps) { return; }
     let hit = solid_union(pred[i].xyz, PHASE_WATER);
     if (hit.dist < params.h) {
         c_residual[i] = params.rest_density * f_i * boundary_psi(hit.dist, params.h);
+        // Wall pressure GRADIENT (matches the density term above): g_b = ρ₀·f_i·ψ'(d)·n̂. ψ'<0 and
+        // n̂=hit.grad points into the fluid, so g_b points TOWARD the wall — it is the constraint
+        // gradient, NOT the force. compute_dp applies λ_i·g_b; over-density (λ_i<0) flips it to push
+        // INTO the fluid (the wall-normal repulsion). Do NOT negate g_b — λ_i carries the sign.
+        let g_b = params.rest_density * f_i * boundary_psi_deriv(hit.dist, params.h) * hit.grad;
+        boundary_grad[i] = vec4<f32>(g_b, 0.0);
     }
 }
 
@@ -89,6 +96,10 @@ fn compute_lambda(@builtin(global_invocation_id) gid: vec3<u32>) {
     // boundary pass, so c_residual is untouched and this term is skipped (byte-unchanged).
     if (params.num_solids > 0u) {
         rho = rho + c_residual[i];
+        // Matching wall-pressure GRADIENT (compute_boundary staged g_b in boundary_grad). The wall
+        // is a fixed boundary, so it contributes to ∇_{p_i}C_i (the self term → dot(sum_g,sum_g) in
+        // the denominator) but NOT to sum_g2 (no boundary DOF). g_b=0 when far from any wall.
+        sum_g = sum_g + boundary_grad[i].xyz;
     }
 
     // Pore-modulated rest density: where grains are present the water target is
@@ -198,6 +209,13 @@ fn compute_dp(@builtin(global_invocation_id) gid: vec3<u32>) {
                 }
             }
         }
+    }
+    // Wall-normal pressure force: the boundary's contribution to Δp_i is λ_i·g_b (only λ_i — the wall
+    // has no λ_j; no s_corr — that is fluid-fluid). g_b points toward the wall, so for an over-dense
+    // particle (λ_i<0) this pushes INTO the fluid — the missing repulsion that stops wall-climbing.
+    // g_b=0 away from walls, and the term is gated to solid scenes (AABB stays byte-identical).
+    if (params.num_solids > 0u) {
+        sum = sum + lam_i * boundary_grad[i].xyz;
     }
     let pore = 1.0 - min(alpha_s[i], 1.0 - params.min_pore_fraction);
     let inv_rho0 = 1.0 / (params.rest_density * pore);
