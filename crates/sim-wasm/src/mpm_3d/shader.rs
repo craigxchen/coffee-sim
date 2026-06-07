@@ -65,6 +65,11 @@ struct ContactResult {
 // Sparse-pressure tile metadata: slot 0 = active tile count, slot 1 reserved,
 // slots 2.. = one flag per TILE_SIZE^3 tile. See state.rs `sparse_tiles`.
 @group(0) @binding(12) var<storage, read_write> sparse_tiles: array<atomic<u32>>;
+// MAC staggered per-face mass accumulators: 3 atomic fixed-point lanes per cell
+// (mass_x, mass_y, mass_z). Written by p2g (U2+), consumed by grid_update to
+// normalize face velocities. Declared in U1 ahead of the transfer migration;
+// no kernel writes it yet (host-side clear only).
+@group(0) @binding(13) var<storage, read_write> face_mass: array<atomic<i32>>;
 
 // Metrics slot layout — keep in sync with `METRICS_SLOT_COUNT` in state.rs.
 const OBSTACLE_WALL_THICKNESS: f32 = 0.4;
@@ -184,6 +189,18 @@ fn scratch_div_idx(cell: u32) -> u32 { return grid_mom_x_idx(cell); }
 // viscosity reuses the momentum lanes as velocity scratch.
 fn scratch_packing_idx(cell: u32) -> u32 { return grid_mom_y_idx(cell); }
 fn scratch_kind_idx(cell: u32) -> u32 { return grid_mom_z_idx(cell); }
+
+// ── MAC staggered convention (U1 scaffolding) ──
+// Each cell owns the velocity samples on its LOWER faces: grid_vel[i] holds
+// (vx at i's -x face, vy at i's -y face, vz at i's -z face, occupancy). A cell's
+// +x face velocity is therefore grid_vel[cell_index(ix+1, iy, iz)].x, etc.
+// Domain-boundary upper faces carry no stored sample and are handled by no-flow
+// BCs. Per-face mass lives in the dedicated `face_mass` atomic buffer with the
+// same 3-lane layout (mass_x, mass_y, mass_z). These helpers are introduced in
+// U1; the transfer/projection kernels begin using them in U2+.
+fn face_mass_x_idx(cell: u32) -> u32 { return cell; }
+fn face_mass_y_idx(cell: u32) -> u32 { return total_cells() + cell; }
+fn face_mass_z_idx(cell: u32) -> u32 { return 2u * total_cells() + cell; }
 
 // ── sparse-pressure tiles ──
 // One TILE_SIZE^3 = 64-cell tile maps to one @workgroup_size(64) sparse RBGS

@@ -88,6 +88,8 @@ impl MpmPipelines {
                 },
                 // 12: sparse-pressure tile metadata (flags + active count)
                 storage_entry(12),
+                // 13: MAC staggered per-face mass accumulators
+                storage_entry(13),
             ],
         });
 
@@ -146,6 +148,10 @@ impl MpmPipelines {
                 wgpu::BindGroupEntry {
                     binding: 12,
                     resource: buffers.sparse_tiles.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 13,
+                    resource: buffers.face_mass.as_entire_binding(),
                 },
             ],
         });

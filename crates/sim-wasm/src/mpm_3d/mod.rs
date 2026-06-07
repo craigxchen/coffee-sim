@@ -39,15 +39,15 @@ pub(crate) const OBSTACLE_WALL_THICKNESS: f32 = 0.4;
 
 /// Device limits required by the MPM compute pipeline.
 ///
-/// The MPM bind group holds 9 storage buffers (particles, affine, grid,
-/// grid_vel, render_data, bed_extract, bed_lookup, bed_delta, metrics) plus
-/// one SDF texture. This stays within the 10-buffer cap that some WebGPU
-/// adapters enforce. Any
+/// The MPM bind group holds 11 storage buffers (particles, affine, grid,
+/// grid_vel, face_mass, render_data, bed_extract, bed_lookup, bed_delta,
+/// metrics, sparse_tiles) plus two 3D textures. The device storage-buffer
+/// ceiling is 16 (fine for 2022+ GPUs), so 11 is well within budget. Any
 /// `request_device` site that uses this pipeline must use these limits, and
 /// `mpm_pipelines_fit_within_required_limits` pins the invariant.
 pub(crate) fn required_limits() -> wgpu::Limits {
     wgpu::Limits {
-        max_storage_buffers_per_shader_stage: 10,
+        max_storage_buffers_per_shader_stage: 11,
         ..wgpu::Limits::default()
     }
 }
@@ -1610,6 +1610,7 @@ impl MpmSim3D {
             });
             encoder.clear_buffer(&self.buffers.grid, 0, None);
             encoder.clear_buffer(&self.buffers.grid_vel, 0, None);
+            encoder.clear_buffer(&self.buffers.face_mass, 0, None);
             {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("mpm compute"),

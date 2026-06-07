@@ -109,6 +109,11 @@ pub(crate) struct MpmBuffers {
     pub affine: wgpu::Buffer,
     pub grid: wgpu::Buffer,
     pub grid_vel: wgpu::Buffer,
+    /// MAC staggered per-face mass accumulators (binding 13). Atomic fixed-point,
+    /// 3 lanes/cell (mass_x, mass_y, mass_z). Written by P2G, consumed by
+    /// grid_update to normalize face velocities. Declared in U1 ahead of the
+    /// transfer migration that writes it. GPU-only.
+    pub face_mass: wgpu::Buffer,
     pub bed_lookup: wgpu::Buffer,
     pub bed_delta: wgpu::Buffer,
     pub _sdf_texture: wgpu::Texture,
@@ -171,6 +176,14 @@ impl MpmBuffers {
         let grid_vel = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("mpm grid vel"),
             size: (total_cells * 16) as u64, // vec4<f32>
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // MAC staggered per-face mass: 3 atomic fixed-point lanes per cell.
+        let face_mass = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("mpm face mass"),
+            size: (3 * total_cells * size_of::<i32>()) as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -256,6 +269,7 @@ impl MpmBuffers {
             affine,
             grid,
             grid_vel,
+            face_mass,
             bed_lookup,
             bed_delta,
             _sdf_texture: sdf_texture,
