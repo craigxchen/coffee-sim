@@ -317,14 +317,20 @@ fn setup_for(kind: WebScene) -> (Scene, Materials, Config) {
             (scene, mats, cfg)
         }
         WebScene::WaterOnly => {
+            // Same V60 cone+cup as CenterPour, just no coffee — match its water resolution and pour
+            // nozzle so the stream/drainage look identical, minus the grounds (no absorb/extract).
+            let r = 0.16_f32;
             let mats = Materials {
-                particle_spacing: 0.5,
-                support_radius: 1.0,
-                particle_mass: 1.0,
-                grain_diameter: 0.5,
+                particle_spacing: r,
+                support_radius: 2.0 * r,
                 ..Materials::default()
             };
-            (scene, mats, Config::default())
+            let cfg = Config {
+                nozzle_radius: 0.25,
+                max_speed: 25.0,
+                ..Config::default()
+            };
+            (scene, mats, cfg)
         }
     }
 }

@@ -52,18 +52,19 @@ impl WebScene {
         }
     }
 
-    /// The `Scene` to build. CenterPour declares a pour (the live velocity/spout controls feed
-    /// `EmissionInput`); WaterOnly is a bed-less dam where the pour controls have no effect.
+    /// The `Scene` to build. Both scenes pour into the same V60 cone+cup geometry (the live
+    /// velocity/spout controls feed `EmissionInput`); CenterPour has a coffee bed, WaterOnly does not.
     pub fn build(self) -> Scene {
         match self {
             Self::CenterPour => Scene::v60_pour(),
-            Self::WaterOnly => Scene::dam_break(),
+            Self::WaterOnly => Scene::v60_pour_water_only(),
         }
     }
 
-    /// Whether this scene accepts the live pour controls (Center Pour does; Water Only doesn't).
+    /// Whether this scene accepts the live pour controls. Both V60 scenes do (water is poured into
+    /// the cone in each).
     pub fn accepts_pour(self) -> bool {
-        matches!(self, Self::CenterPour)
+        matches!(self, Self::CenterPour | Self::WaterOnly)
     }
 }
 
@@ -118,9 +119,9 @@ mod tests {
         assert_eq!(WebScene::from_id("center-pour"), Some(WebScene::CenterPour));
         assert_eq!(WebScene::from_id("water-only"), Some(WebScene::WaterOnly));
         assert_eq!(WebScene::from_id("nope"), None);
-        // CenterPour accepts the live pour controls; WaterOnly does not.
+        // Both V60 scenes accept the live pour controls (water is poured into the cone in each).
         assert!(WebScene::CenterPour.accepts_pour());
-        assert!(!WebScene::WaterOnly.accepts_pour());
+        assert!(WebScene::WaterOnly.accepts_pour());
         // Both build a scene.
         let _ = WebScene::CenterPour.build();
         let _ = WebScene::WaterOnly.build();
