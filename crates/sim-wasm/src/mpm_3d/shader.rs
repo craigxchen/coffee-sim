@@ -202,6 +202,29 @@ fn face_mass_x_idx(cell: u32) -> u32 { return cell; }
 fn face_mass_y_idx(cell: u32) -> u32 { return total_cells() + cell; }
 fn face_mass_z_idx(cell: u32) -> u32 { return 2u * total_cells() + cell; }
 
+// Cell-centred velocity reconstructed from the MAC staggered faces: average each
+// component's two opposing faces (cell c's own lower face grid_vel[c] and the
+// +axis neighbour's lower face). Used only by advection-style consumers
+// (bed_dynamics) that need a single velocity vector at the cell centre; the
+// projection always operates on the faces directly. An off-grid upper face falls
+// back to the lower face alone (no-flow upper boundary). The caller is
+// responsible for the in-grid bounds check on `cell`.
+fn mac_cell_velocity(cell: vec3<i32>) -> vec3<f32> {
+    let ci = cell_index(u32(cell.x), u32(cell.y), u32(cell.z));
+    let lo = grid_vel[ci].xyz;
+    var v = lo;
+    if u32(cell.x + 1) < gx() {
+        v.x = 0.5 * (lo.x + grid_vel[cell_index(u32(cell.x + 1), u32(cell.y), u32(cell.z))].x);
+    }
+    if u32(cell.y + 1) < gy() {
+        v.y = 0.5 * (lo.y + grid_vel[cell_index(u32(cell.x), u32(cell.y + 1), u32(cell.z))].y);
+    }
+    if u32(cell.z + 1) < gz() {
+        v.z = 0.5 * (lo.z + grid_vel[cell_index(u32(cell.x), u32(cell.y), u32(cell.z + 1))].z);
+    }
+    return v;
+}
+
 // ── sparse-pressure tiles ──
 // One TILE_SIZE^3 = 64-cell tile maps to one @workgroup_size(64) sparse RBGS
 // workgroup. Tile ids are linear in (tx, ty, tz) with x fastest, mirroring the
@@ -754,6 +777,20 @@ fn sdf_class_is_solid(cell: vec3<i32>) -> bool {
     return sample_sdf(cell_center_from_cell(cell)) < 0.0;
 }
 
+// A lower MAC face is a no-flow boundary when the cell on its far side is
+// off-grid or solid — the same neighbour-cell predicate the compact
+// divergence/projection use to gate face flux, so boundary_project zeros exactly
+// the faces the solve treats as closed (operator-consistent BCs).
+fn mac_face_is_closed(neighbor: vec3<i32>) -> bool {
+    if neighbor.x < 0 || neighbor.y < 0 || neighbor.z < 0 {
+        return true;
+    }
+    if u32(neighbor.x) >= gx() || u32(neighbor.y) >= gy() || u32(neighbor.z) >= gz() {
+        return true;
+    }
+    return sdf_class_is_solid(neighbor);
+}
+
 fn is_fluid_kind(kind: i32) -> bool {
     // Surface and bed-coupled cells participate in the pressure solve so
     // hydrostatic pressure can build up in shallow puddles and water inside the
@@ -889,21 +926,22 @@ fn velocity_divergence_with_solid_mirrors(
     cell: vec3<i32>,
     cell_center: vec3<f32>,
 ) -> f32 {
-    let self_vel = grid_vel[idx].xyz;
+    // MAC compact divergence (matches classify_cells): one-sided difference of
+    // staggered face velocities, with solid/off-grid faces treated as no-flow.
     let dx_vec = dx();
-    var vxm = -self_vel.x;
-    var vxp = -self_vel.x;
-    var vym = -self_vel.y;
-    var vyp = -self_vel.y;
-    var vzm = -self_vel.z;
-    var vzp = -self_vel.z;
+    var vx_lo = 0.0;
+    var vx_hi = 0.0;
+    var vy_lo = 0.0;
+    var vy_hi = 0.0;
+    var vz_lo = 0.0;
+    var vz_hi = 0.0;
     if cell.x > 0
         && select(
             sample_sdf(cell_center + vec3<f32>(-dx_vec, 0.0, 0.0)) >= 0.0,
             !sdf_class_is_solid(cell + vec3<i32>(-1, 0, 0)),
             use_sdf_cache(),
         ) {
-        vxm = grid_vel[cell_index(u32(cell.x - 1), u32(cell.y), u32(cell.z))].x;
+        vx_lo = grid_vel[idx].x;
     }
     if u32(cell.x + 1) < gx()
         && select(
@@ -911,7 +949,7 @@ fn velocity_divergence_with_solid_mirrors(
             !sdf_class_is_solid(cell + vec3<i32>(1, 0, 0)),
             use_sdf_cache(),
         ) {
-        vxp = grid_vel[cell_index(u32(cell.x + 1), u32(cell.y), u32(cell.z))].x;
+        vx_hi = grid_vel[cell_index(u32(cell.x + 1), u32(cell.y), u32(cell.z))].x;
     }
     if cell.y > 0
         && select(
@@ -919,7 +957,7 @@ fn velocity_divergence_with_solid_mirrors(
             !sdf_class_is_solid(cell + vec3<i32>(0, -1, 0)),
             use_sdf_cache(),
         ) {
-        vym = grid_vel[cell_index(u32(cell.x), u32(cell.y - 1), u32(cell.z))].y;
+        vy_lo = grid_vel[idx].y;
     }
     if u32(cell.y + 1) < gy()
         && select(
@@ -927,7 +965,7 @@ fn velocity_divergence_with_solid_mirrors(
             !sdf_class_is_solid(cell + vec3<i32>(0, 1, 0)),
             use_sdf_cache(),
         ) {
-        vyp = grid_vel[cell_index(u32(cell.x), u32(cell.y + 1), u32(cell.z))].y;
+        vy_hi = grid_vel[cell_index(u32(cell.x), u32(cell.y + 1), u32(cell.z))].y;
     }
     if cell.z > 0
         && select(
@@ -935,7 +973,7 @@ fn velocity_divergence_with_solid_mirrors(
             !sdf_class_is_solid(cell + vec3<i32>(0, 0, -1)),
             use_sdf_cache(),
         ) {
-        vzm = grid_vel[cell_index(u32(cell.x), u32(cell.y), u32(cell.z - 1))].z;
+        vz_lo = grid_vel[idx].z;
     }
     if u32(cell.z + 1) < gz()
         && select(
@@ -943,10 +981,10 @@ fn velocity_divergence_with_solid_mirrors(
             !sdf_class_is_solid(cell + vec3<i32>(0, 0, 1)),
             use_sdf_cache(),
         ) {
-        vzp = grid_vel[cell_index(u32(cell.x), u32(cell.y), u32(cell.z + 1))].z;
+        vz_hi = grid_vel[cell_index(u32(cell.x), u32(cell.y), u32(cell.z + 1))].z;
     }
 
-    return 0.5 * inv_dx() * ((vxp - vxm) + (vyp - vym) + (vzp - vzm));
+    return ((vx_hi - vx_lo) + (vy_hi - vy_lo) + (vz_hi - vz_lo)) * inv_dx();
 }
 
 fn world_to_cell(position: vec3<f32>) -> vec3<i32> {
@@ -1378,7 +1416,9 @@ fn p2g(@builtin(global_invocation_id) gid: vec3<u32>) {
     let base = vec3<i32>(floor(grid_pos - 0.5));
     let fx = grid_pos - vec3<f32>(base);
 
-    // Quadratic B-spline weights
+    // Cell-centered quadratic B-spline weights. Used for the cell mass
+    // (occupancy `.w`) and rest/current volume scatter, and for the two
+    // NON-staggered axes of each velocity component.
     var wx: array<f32, 3>;
     var wy: array<f32, 3>;
     var wz: array<f32, 3>;
@@ -1392,9 +1432,32 @@ fn p2g(@builtin(global_invocation_id) gid: vec3<u32>) {
     wz[1] = 0.75 - (fx.z - 1.0) * (fx.z - 1.0);
     wz[2] = 0.5 * (fx.z - 0.5) * (fx.z - 0.5);
 
+    // Staggered (MAC face) bases/weights. Each velocity component lives on the
+    // faces normal to its own axis — its sample sits half a cell forward on that
+    // axis — so shift the grid position by +0.5 on every axis; the staggered
+    // sample for the C-component then reads sbase/sfx on axis C and base/fx on
+    // the other two. Face node f is stored at cell index f (the cell's -axis
+    // face); see the MAC convention block by the grid helpers.
+    let gshift = grid_pos + vec3<f32>(0.5);
+    let sbase = vec3<i32>(floor(gshift - 0.5)); // == floor(grid_pos)
+    let sfx = gshift - vec3<f32>(sbase);         // in [0.5, 1.5)
+    var sxw: array<f32, 3>;
+    var syw: array<f32, 3>;
+    var szw: array<f32, 3>;
+    sxw[0] = 0.5 * (1.5 - sfx.x) * (1.5 - sfx.x);
+    sxw[1] = 0.75 - (sfx.x - 1.0) * (sfx.x - 1.0);
+    sxw[2] = 0.5 * (sfx.x - 0.5) * (sfx.x - 0.5);
+    syw[0] = 0.5 * (1.5 - sfx.y) * (1.5 - sfx.y);
+    syw[1] = 0.75 - (sfx.y - 1.0) * (sfx.y - 1.0);
+    syw[2] = 0.5 * (sfx.y - 0.5) * (sfx.y - 0.5);
+    szw[0] = 0.5 * (1.5 - sfx.z) * (1.5 - sfx.z);
+    szw[1] = 0.75 - (sfx.z - 1.0) * (sfx.z - 1.0);
+    szw[2] = 0.5 * (sfx.z - 0.5) * (sfx.z - 0.5);
+
     // APIC affine state is stored by spatial-gradient columns:
-    // C0=dv/dx, C1=dv/dy, C2=dv/dz. P2G must apply C*dpos with the
-    // same orientation that g2p reconstructs below.
+    // C0=dv/dx, C1=dv/dy, C2=dv/dz. Each velocity component c uses the row
+    // (C0.c, C1.c, C2.c) dotted with the offset to that component's staggered
+    // node — the MAC-APIC per-component transfer.
     let C0 = a.col0.xyz;
     let C1 = a.col1.xyz;
     let C2 = a.col2.xyz;
@@ -1403,50 +1466,87 @@ fn p2g(@builtin(global_invocation_id) gid: vec3<u32>) {
     let cell_dx = dx();
     let rest_particle_volume = p_vol() * mass_p / max(nominal_mass(), 1e-6);
     let current_particle_volume = rest_particle_volume * clamp_particle_j(J);
+    let limit_m = 1.0e9;
 
+    // ── Cell-centered scatter: mass (occupancy) + rest/current volume ──
     for (var i = 0u; i < 3u; i++) {
         for (var j = 0u; j < 3u; j++) {
             for (var k = 0u; k < 3u; k++) {
-                let offset = vec3<i32>(vec3<u32>(i, j, k));
-                let cell = base + offset;
-
+                let cell = base + vec3<i32>(vec3<u32>(i, j, k));
                 if cell.x < 0 || cell.y < 0 || cell.z < 0 { continue; }
                 if u32(cell.x) >= gx() || u32(cell.y) >= gy() || u32(cell.z) >= gz() { continue; }
-
                 let w = wx[i] * wy[j] * wz[k];
-                let dpos = (vec3<f32>(offset) - fx) * cell_dx;
-
-                let mass_contrib = w * mass_p;
-                let rest_volume_contrib = w * rest_particle_volume;
-                let current_volume_contrib = w * current_particle_volume;
-                let affine_mom = mass_p * (C0 * dpos.x + C1 * dpos.y + C2 * dpos.z);
-                let mom = w * (mass_p * vp + affine_mom);
-
                 let ci = cell_index(u32(cell.x), u32(cell.y), u32(cell.z));
-                // Overflow probe: each per-cell per-axis term must stay below
-                // `i32::MAX`. The tightest channel in practice is momentum,
-                // which is mass_contrib * v_cap scaled by FP. We log any single
-                // contribution that comes within ~50% of the int limit so
-                // accumulation headroom stays visible from the HUD once the
-                // readback path is re-enabled.
-                let limit_m = 1.0e9;
-                let mass_fp = mass_contrib * fp;
-                let rest_volume_fp = rest_volume_contrib * fp;
-                let current_volume_fp = current_volume_contrib * fp;
-                let mom_x_fp = mom.x * fp;
-                let mom_y_fp = mom.y * fp;
-                let mom_z_fp = mom.z * fp;
-                if abs(mass_fp) > limit_m || abs(mom_x_fp) > limit_m
-                    || abs(mom_y_fp) > limit_m || abs(mom_z_fp) > limit_m
-                    || abs(rest_volume_fp) > limit_m || abs(current_volume_fp) > limit_m {
+                let mass_fp = w * mass_p * fp;
+                let rest_volume_fp = w * rest_particle_volume * fp;
+                let current_volume_fp = w * current_particle_volume * fp;
+                if abs(mass_fp) > limit_m || abs(rest_volume_fp) > limit_m
+                    || abs(current_volume_fp) > limit_m {
                     atomicAdd(&metrics[METRIC_MASS_OVERFLOW_FIRES_IDX], 1u);
                 }
                 atomicAdd(&grid[grid_mass_idx(ci)], i32(mass_fp));
-                atomicAdd(&grid[grid_mom_x_idx(ci)], i32(mom_x_fp));
-                atomicAdd(&grid[grid_mom_y_idx(ci)], i32(mom_y_fp));
-                atomicAdd(&grid[grid_mom_z_idx(ci)], i32(mom_z_fp));
                 atomicAdd(&grid[grid_rest_volume_idx(ci)], i32(rest_volume_fp));
                 atomicAdd(&grid[grid_current_volume_idx(ci)], i32(current_volume_fp));
+            }
+        }
+    }
+
+    // ── Staggered x-momentum + per-face mass (vx on x-faces) ──
+    for (var i = 0u; i < 3u; i++) {
+        for (var j = 0u; j < 3u; j++) {
+            for (var k = 0u; k < 3u; k++) {
+                let cell = vec3<i32>(sbase.x + i32(i), base.y + i32(j), base.z + i32(k));
+                if cell.x < 0 || cell.y < 0 || cell.z < 0 { continue; }
+                if u32(cell.x) >= gx() || u32(cell.y) >= gy() || u32(cell.z) >= gz() { continue; }
+                let w = sxw[i] * wy[j] * wz[k];
+                let dpos = vec3<f32>(f32(i) - sfx.x, f32(j) - fx.y, f32(k) - fx.z) * cell_dx;
+                let affine_x = mass_p * (C0.x * dpos.x + C1.x * dpos.y + C2.x * dpos.z);
+                let mom_fp = w * (mass_p * vp.x + affine_x) * fp;
+                let mass_fp = w * mass_p * fp;
+                if abs(mom_fp) > limit_m { atomicAdd(&metrics[METRIC_MASS_OVERFLOW_FIRES_IDX], 1u); }
+                let ci = cell_index(u32(cell.x), u32(cell.y), u32(cell.z));
+                atomicAdd(&grid[grid_mom_x_idx(ci)], i32(mom_fp));
+                atomicAdd(&face_mass[face_mass_x_idx(ci)], i32(mass_fp));
+            }
+        }
+    }
+
+    // ── Staggered y-momentum + per-face mass (vy on y-faces) ──
+    for (var i = 0u; i < 3u; i++) {
+        for (var j = 0u; j < 3u; j++) {
+            for (var k = 0u; k < 3u; k++) {
+                let cell = vec3<i32>(base.x + i32(i), sbase.y + i32(j), base.z + i32(k));
+                if cell.x < 0 || cell.y < 0 || cell.z < 0 { continue; }
+                if u32(cell.x) >= gx() || u32(cell.y) >= gy() || u32(cell.z) >= gz() { continue; }
+                let w = wx[i] * syw[j] * wz[k];
+                let dpos = vec3<f32>(f32(i) - fx.x, f32(j) - sfx.y, f32(k) - fx.z) * cell_dx;
+                let affine_y = mass_p * (C0.y * dpos.x + C1.y * dpos.y + C2.y * dpos.z);
+                let mom_fp = w * (mass_p * vp.y + affine_y) * fp;
+                let mass_fp = w * mass_p * fp;
+                if abs(mom_fp) > limit_m { atomicAdd(&metrics[METRIC_MASS_OVERFLOW_FIRES_IDX], 1u); }
+                let ci = cell_index(u32(cell.x), u32(cell.y), u32(cell.z));
+                atomicAdd(&grid[grid_mom_y_idx(ci)], i32(mom_fp));
+                atomicAdd(&face_mass[face_mass_y_idx(ci)], i32(mass_fp));
+            }
+        }
+    }
+
+    // ── Staggered z-momentum + per-face mass (vz on z-faces) ──
+    for (var i = 0u; i < 3u; i++) {
+        for (var j = 0u; j < 3u; j++) {
+            for (var k = 0u; k < 3u; k++) {
+                let cell = vec3<i32>(base.x + i32(i), base.y + i32(j), sbase.z + i32(k));
+                if cell.x < 0 || cell.y < 0 || cell.z < 0 { continue; }
+                if u32(cell.x) >= gx() || u32(cell.y) >= gy() || u32(cell.z) >= gz() { continue; }
+                let w = wx[i] * wy[j] * szw[k];
+                let dpos = vec3<f32>(f32(i) - fx.x, f32(j) - fx.y, f32(k) - sfx.z) * cell_dx;
+                let affine_z = mass_p * (C0.z * dpos.x + C1.z * dpos.y + C2.z * dpos.z);
+                let mom_fp = w * (mass_p * vp.z + affine_z) * fp;
+                let mass_fp = w * mass_p * fp;
+                if abs(mom_fp) > limit_m { atomicAdd(&metrics[METRIC_MASS_OVERFLOW_FIRES_IDX], 1u); }
+                let ci = cell_index(u32(cell.x), u32(cell.y), u32(cell.z));
+                atomicAdd(&grid[grid_mom_z_idx(ci)], i32(mom_fp));
+                atomicAdd(&face_mass[face_mass_z_idx(ci)], i32(mass_fp));
             }
         }
     }
@@ -1460,26 +1560,35 @@ fn grid_update(@builtin(global_invocation_id) gid: vec3<u32>) {
     if idx >= total_cells() { return; }
 
     let inv_fp = inv_fp_scale();
-    let mass = f32(atomicLoad(&grid[grid_mass_idx(idx)])) * inv_fp;
+    // Cell mass is the occupancy stored in grid_vel.w; classify/surface/
+    // viscosity/packing/G2P-support/sparse-tile/bed gates all read it.
+    let cell_mass = f32(atomicLoad(&grid[grid_mass_idx(idx)])) * inv_fp;
 
-    if mass < 1e-6 {
-        return;
+    // MAC: each velocity component is normalized by the mass on ITS OWN face.
+    // An empty face stays at zero (no-flow). Gravity acts on the y-face fluid.
+    let mass_x = f32(atomicLoad(&face_mass[face_mass_x_idx(idx)])) * inv_fp;
+    let mass_y = f32(atomicLoad(&face_mass[face_mass_y_idx(idx)])) * inv_fp;
+    let mass_z = f32(atomicLoad(&face_mass[face_mass_z_idx(idx)])) * inv_fp;
+
+    var v = vec3<f32>(0.0);
+    if mass_x > 1e-6 {
+        v.x = f32(atomicLoad(&grid[grid_mom_x_idx(idx)])) * inv_fp / mass_x;
+    }
+    if mass_y > 1e-6 {
+        v.y = f32(atomicLoad(&grid[grid_mom_y_idx(idx)])) * inv_fp / mass_y;
+        v.y += gravity() * dt();
+    }
+    if mass_z > 1e-6 {
+        v.z = f32(atomicLoad(&grid[grid_mom_z_idx(idx)])) * inv_fp / mass_z;
     }
 
-    var v = vec3<f32>(
-        f32(atomicLoad(&grid[grid_mom_x_idx(idx)])) * inv_fp / mass,
-        f32(atomicLoad(&grid[grid_mom_y_idx(idx)])) * inv_fp / mass,
-        f32(atomicLoad(&grid[grid_mom_z_idx(idx)])) * inv_fp / mass,
-    );
+    // Per-face stability clamp. A MAC cell has no single velocity vector to cap
+    // by magnitude (the components live on different faces), so clamp each
+    // face component to the speed cap independently.
+    let cap = vel_cap();
+    v = clamp(v, vec3<f32>(-cap), vec3<f32>(cap));
 
-    v.y += gravity() * dt();
-
-    let speed = length(v);
-    if speed > vel_cap() {
-        v = v * (vel_cap() / speed);
-    }
-
-    grid_vel[idx] = vec4<f32>(v, mass);
+    grid_vel[idx] = vec4<f32>(v, cell_mass);
 }
 
 // ── viscosity ──
@@ -1687,21 +1796,27 @@ fn classify_cells(@builtin(global_invocation_id) gid: vec3<u32>) {
     // writes cell_kind — reading a neighbor's kind here races against other
     // workgroups. The cached mask is generated from the same cell-center SDF
     // probe and avoids repeated texture interpolation in the hot path.
-    let self_vel = grid_vel[idx].xyz;
+    // MAC compact divergence: one-sided difference of staggered face velocities.
+    // div_c = ((vx[+x] - vx[-x]) + (vy..) + (vz..)) / dx, where cell c's -axis
+    // face is grid_vel[c] and its +axis face is the lower face of the next cell
+    // (grid_vel[c+axis]). Solid/off-grid faces are no-flow (zero flux), matching
+    // the Neumann handling in pressure_update / project_pressure. This compact
+    // form composes with the face-weighted gradient so that D·G equals the
+    // solve's weighted Laplacian (consistent projection).
     let dx_vec = dx();
-    var vxm = -self_vel.x;
-    var vxp = -self_vel.x;
-    var vym = -self_vel.y;
-    var vyp = -self_vel.y;
-    var vzm = -self_vel.z;
-    var vzp = -self_vel.z;
+    var vx_lo = 0.0;
+    var vx_hi = 0.0;
+    var vy_lo = 0.0;
+    var vy_hi = 0.0;
+    var vz_lo = 0.0;
+    var vz_hi = 0.0;
     if ix_val > 0u
         && select(
             sample_sdf(cell_center + vec3<f32>(-dx_vec, 0.0, 0.0)) >= 0.0,
             !sdf_class_is_solid(vec3<i32>(i32(ix_val) - 1, i32(iy_val), i32(iz_val))),
             use_sdf_cache(),
         ) {
-        vxm = grid_vel[cell_index(ix_val - 1u, iy_val, iz_val)].x;
+        vx_lo = grid_vel[idx].x;
     }
     if ix_val + 1u < gx()
         && select(
@@ -1709,7 +1824,7 @@ fn classify_cells(@builtin(global_invocation_id) gid: vec3<u32>) {
             !sdf_class_is_solid(vec3<i32>(i32(ix_val) + 1, i32(iy_val), i32(iz_val))),
             use_sdf_cache(),
         ) {
-        vxp = grid_vel[cell_index(ix_val + 1u, iy_val, iz_val)].x;
+        vx_hi = grid_vel[cell_index(ix_val + 1u, iy_val, iz_val)].x;
     }
     if iy_val > 0u
         && select(
@@ -1717,7 +1832,7 @@ fn classify_cells(@builtin(global_invocation_id) gid: vec3<u32>) {
             !sdf_class_is_solid(vec3<i32>(i32(ix_val), i32(iy_val) - 1, i32(iz_val))),
             use_sdf_cache(),
         ) {
-        vym = grid_vel[cell_index(ix_val, iy_val - 1u, iz_val)].y;
+        vy_lo = grid_vel[idx].y;
     }
     if iy_val + 1u < gy()
         && select(
@@ -1725,7 +1840,7 @@ fn classify_cells(@builtin(global_invocation_id) gid: vec3<u32>) {
             !sdf_class_is_solid(vec3<i32>(i32(ix_val), i32(iy_val) + 1, i32(iz_val))),
             use_sdf_cache(),
         ) {
-        vyp = grid_vel[cell_index(ix_val, iy_val + 1u, iz_val)].y;
+        vy_hi = grid_vel[cell_index(ix_val, iy_val + 1u, iz_val)].y;
     }
     if iz_val > 0u
         && select(
@@ -1733,7 +1848,7 @@ fn classify_cells(@builtin(global_invocation_id) gid: vec3<u32>) {
             !sdf_class_is_solid(vec3<i32>(i32(ix_val), i32(iy_val), i32(iz_val) - 1)),
             use_sdf_cache(),
         ) {
-        vzm = grid_vel[cell_index(ix_val, iy_val, iz_val - 1u)].z;
+        vz_lo = grid_vel[idx].z;
     }
     if iz_val + 1u < gz()
         && select(
@@ -1741,10 +1856,10 @@ fn classify_cells(@builtin(global_invocation_id) gid: vec3<u32>) {
             !sdf_class_is_solid(vec3<i32>(i32(ix_val), i32(iy_val), i32(iz_val) + 1)),
             use_sdf_cache(),
         ) {
-        vzp = grid_vel[cell_index(ix_val, iy_val, iz_val + 1u)].z;
+        vz_hi = grid_vel[cell_index(ix_val, iy_val, iz_val + 1u)].z;
     }
 
-    let div = 0.5 * inv_dx() * ((vxp - vxm) + (vyp - vym) + (vzp - vzm));
+    let div = ((vx_hi - vx_lo) + (vy_hi - vy_lo) + (vz_hi - vz_lo)) * inv_dx();
     let rest_volume = rest_volume_load(idx);
     let current_volume = current_volume_load(idx);
     var target_divergence = volume_projection_target_divergence(rest_volume, current_volume);
@@ -1938,56 +2053,41 @@ fn project_pressure(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     let p_here = pressure_load(idx);
     let self_fill = liquid_fill_fraction(idx, kind);
-    let cell = vec3<i32>(i32(ix_val), i32(iy_val), i32(iz_val));
-    // Solid/off-grid neighbors keep the mirror pressure, while air and fluid
-    // faces blend toward the neighboring pressure by the liquid face weight.
-    let p_xm = pressure_weighted_or_mirror(
-        cell + vec3<i32>(-1, 0, 0),
-        p_here,
-        kind,
-        self_fill,
-    );
-    let p_xp = pressure_weighted_or_mirror(
-        cell + vec3<i32>(1, 0, 0),
-        p_here,
-        kind,
-        self_fill,
-    );
-    let p_ym = pressure_weighted_or_mirror(
-        cell + vec3<i32>(0, -1, 0),
-        p_here,
-        kind,
-        self_fill,
-    );
-    let p_yp = pressure_weighted_or_mirror(
-        cell + vec3<i32>(0, 1, 0),
-        p_here,
-        kind,
-        self_fill,
-    );
-    let p_zm = pressure_weighted_or_mirror(
-        cell + vec3<i32>(0, 0, -1),
-        p_here,
-        kind,
-        self_fill,
-    );
-    let p_zp = pressure_weighted_or_mirror(
-        cell + vec3<i32>(0, 0, 1),
-        p_here,
-        kind,
-        self_fill,
-    );
 
-    // Finite-volume pressure force from the two face pressures in each axis.
-    // This preserves the central gradient for full cells, while fractional
-    // free-surface faces only contribute through their face pressure blend.
-    let grad_p = 0.5 * inv_dx() * vec3<f32>(
-        (p_xp - p_here) + (p_here - p_xm),
-        (p_yp - p_here) + (p_here - p_ym),
-        (p_zp - p_here) + (p_here - p_zm),
-    );
+    // MAC weighted gradient applied directly to cell c's three LOWER faces
+    // (grid_vel[c].xyz = c's -x/-y/-z faces, the faces c uniquely owns). Each
+    // correction is -dt * face_weight * (p_here - p_lower_neighbor) / dx using
+    // the SAME pressure_face_weight the solve used: 0 at solids (no-flow), and
+    // air neighbors contribute p=0 (Dirichlet). No average-back — this compact
+    // per-face gradient composes with the compact divergence so D·G equals the
+    // solve's weighted Laplacian (interior projection is exact). The +x/+y/+z
+    // faces are the lower faces of the next cells; +side fluid/air free-surface
+    // faces are a known follow-up (the self_fill RHS scaling leaves a small
+    // residual there).
+    var grad = vec3<f32>(0.0);
+    if ix_val > 0u {
+        let n = cell_index(ix_val - 1u, iy_val, iz_val);
+        let nk = cell_kind_load(n);
+        let fw = pressure_face_weight(kind, self_fill, n, nk);
+        let p_n = select(0.0, pressure_load(n), is_fluid_kind(nk));
+        grad.x = fw * (p_here - p_n) * inv_dx();
+    }
+    if iy_val > 0u {
+        let n = cell_index(ix_val, iy_val - 1u, iz_val);
+        let nk = cell_kind_load(n);
+        let fw = pressure_face_weight(kind, self_fill, n, nk);
+        let p_n = select(0.0, pressure_load(n), is_fluid_kind(nk));
+        grad.y = fw * (p_here - p_n) * inv_dx();
+    }
+    if iz_val > 0u {
+        let n = cell_index(ix_val, iy_val, iz_val - 1u);
+        let nk = cell_kind_load(n);
+        let fw = pressure_face_weight(kind, self_fill, n, nk);
+        let p_n = select(0.0, pressure_load(n), is_fluid_kind(nk));
+        grad.z = fw * (p_here - p_n) * inv_dx();
+    }
 
-    var v = gv.xyz - dt() * grad_p;
+    var v = gv.xyz - dt() * grad;
     if kind == CELL_BED_COUPLED {
         let bed_idx = bed_lookup_load(idx);
         if bed_idx >= 0 && u32(bed_idx) < num_bed() {
@@ -2156,6 +2256,13 @@ fn packing_apply(@builtin(global_invocation_id) gid: vec3<u32>) {
     let p_zm = packing_pressure_or_mirror(cell + vec3<i32>(0, 0, -1), p_here);
     let p_zp = packing_pressure_or_mirror(cell + vec3<i32>(0, 0, 1), p_here);
 
+    // Packing pressure is a direct per-cell bulk_K*overpack corrective, NOT an
+    // iteratively-smoothed solve field. A compact stride-1 gradient is sensitive
+    // to its cell-to-cell (checkerboard) noise and oscillates the pool; the
+    // stride-2 central gradient is checkerboard-blind and stable. Because packing
+    // is a one-shot nudge (no D·G consistency requirement, unlike the solved
+    // pressure projection), keep the stable central form. The half-cell offset
+    // versus the MAC faces is acceptable for this small corrective.
     let grad_packing = 0.5 * inv_dx() * vec3<f32>(
         p_xp - p_xm,
         p_yp - p_ym,
@@ -2187,38 +2294,41 @@ fn boundary_project(@builtin(global_invocation_id) gid: vec3<u32>) {
     let rem = idx % (gx() * gy());
     let iy_val = rem / gx();
     let ix_val = rem % gx();
+    let cell = vec3<i32>(i32(ix_val), i32(iy_val), i32(iz_val));
     let origin = u.grid_origin.xyz;
-    let cell_pos = origin
-        + (vec3<f32>(f32(ix_val), f32(iy_val), f32(iz_val)) + vec3<f32>(0.5)) * dx();
 
-    // SDF collision
-    let sdf_val = sample_sdf(cell_pos);
-    if sdf_val < contact_offset() {
-        let n = sdf_gradient(cell_pos);
-        let vn = dot(v, n);
-        if vn < 0.0 {
-            v = v - n * vn * (1.0 + restitution());
-            // Friction: reduce tangential component
-            let vt = v - n * dot(v, n);
-            let vt_len = length(vt);
-            if vt_len > 1e-6 {
-                let friction_impulse = min(friction() * abs(vn), vt_len);
-                v = v - vt * (friction_impulse / vt_len);
-            }
-        }
+    // MAC face no-flow boundary conditions. Each velocity component lives on cell
+    // idx's own LOWER face (vx@-x, vy@-y, vz@-z; see the MAC convention block).
+    // A lower face is no-flow when the cell across it is solid/off-grid, using the
+    // SAME neighbour-cell predicate as the compact divergence/projection so the
+    // velocities g2p reads match the no-flux faces the solve assumed (operator
+    // consistency). A fluid cell's UPPER face against a solid is that solid cell's
+    // own lower face, zeroed by its pass; a genuinely solid cell carries no flow.
+    // This per-face form replaces the collocated reflection, whose single
+    // cell-centre dot(v, n) mixed the three staggered faces and injected pool
+    // energy on MAC. Tangential wall friction and sloped-wall non-penetration
+    // stay in g2p's per-particle resolve_sdf_contact (full-vector SDF reflection).
+    if sdf_class_is_solid(cell) {
+        grid_vel[idx] = vec4<f32>(0.0, 0.0, 0.0, gv.w);
+        return;
     }
+    if mac_face_is_closed(cell + vec3<i32>(-1, 0, 0)) { v.x = 0.0; }
+    if mac_face_is_closed(cell + vec3<i32>(0, -1, 0)) { v.y = 0.0; }
+    if mac_face_is_closed(cell + vec3<i32>(0, 0, -1)) { v.z = 0.0; }
 
-    // Box boundary
+    // Box boundary: zero the inward normal face velocity at the domain margin.
+    let cell_center = origin
+        + (vec3<f32>(f32(ix_val), f32(iy_val), f32(iz_val)) + vec3<f32>(0.5)) * dx();
     let margin = 2.0 * dx();
-    let bmin = u.grid_origin.xyz + vec3<f32>(margin);
+    let bmin = origin + vec3<f32>(margin);
     let bmax = u.bounds_max.xyz - vec3<f32>(margin);
 
-    if cell_pos.x < bmin.x && v.x < 0.0 { v.x = 0.0; }
-    if cell_pos.x > bmax.x && v.x > 0.0 { v.x = 0.0; }
-    if cell_pos.y < bmin.y && v.y < 0.0 { v.y = 0.0; }
-    if cell_pos.y > bmax.y && v.y > 0.0 { v.y = 0.0; }
-    if cell_pos.z < bmin.z && v.z < 0.0 { v.z = 0.0; }
-    if cell_pos.z > bmax.z && v.z > 0.0 { v.z = 0.0; }
+    if cell_center.x < bmin.x && v.x < 0.0 { v.x = 0.0; }
+    if cell_center.x > bmax.x && v.x > 0.0 { v.x = 0.0; }
+    if cell_center.y < bmin.y && v.y < 0.0 { v.y = 0.0; }
+    if cell_center.y > bmax.y && v.y > 0.0 { v.y = 0.0; }
+    if cell_center.z < bmin.z && v.z < 0.0 { v.z = 0.0; }
+    if cell_center.z > bmax.z && v.z > 0.0 { v.z = 0.0; }
 
     grid_vel[idx] = vec4<f32>(v, gv.w);
 }
@@ -2263,6 +2373,24 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>) {
     wz[1] = 0.75 - (fx.z - 1.0) * (fx.z - 1.0);
     wz[2] = 0.5 * (fx.z - 0.5) * (fx.z - 0.5);
 
+    // Staggered (MAC face) bases/weights — mirror p2g so the gather reads each
+    // velocity component from the same faces the scatter wrote.
+    let gshift = grid_pos + vec3<f32>(0.5);
+    let sbase = vec3<i32>(floor(gshift - 0.5));
+    let sfx = gshift - vec3<f32>(sbase);
+    var sxw: array<f32, 3>;
+    var syw: array<f32, 3>;
+    var szw: array<f32, 3>;
+    sxw[0] = 0.5 * (1.5 - sfx.x) * (1.5 - sfx.x);
+    sxw[1] = 0.75 - (sfx.x - 1.0) * (sfx.x - 1.0);
+    sxw[2] = 0.5 * (sfx.x - 0.5) * (sfx.x - 0.5);
+    syw[0] = 0.5 * (1.5 - sfx.y) * (1.5 - sfx.y);
+    syw[1] = 0.75 - (sfx.y - 1.0) * (sfx.y - 1.0);
+    syw[2] = 0.5 * (sfx.y - 0.5) * (sfx.y - 0.5);
+    szw[0] = 0.5 * (1.5 - sfx.z) * (1.5 - sfx.z);
+    szw[1] = 0.75 - (sfx.z - 1.0) * (sfx.z - 1.0);
+    szw[2] = 0.5 * (sfx.z - 0.5) * (sfx.z - 0.5);
+
     var new_v = vec3<f32>(0.0);
     var new_C0 = vec3<f32>(0.0);
     var new_C1 = vec3<f32>(0.0);
@@ -2272,31 +2400,24 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>) {
     var bed_overlap_weight = 0.0;
     var bed_velocity_sum = vec3<f32>(0.0);
     var bed_permeability_sum = 0.0;
+    var support_x = 0.0;
+    var support_y = 0.0;
+    var support_z = 0.0;
 
     let B = 4.0 * inv_dx() * inv_dx();
     let cell_dx = dx();
 
+    // Cell-centered loop: occupancy support, local grid mass, and bed overlap.
     for (var i = 0u; i < 3u; i++) {
         for (var j = 0u; j < 3u; j++) {
             for (var k = 0u; k < 3u; k++) {
-                let offset = vec3<i32>(vec3<u32>(i, j, k));
-                let cell = base + offset;
-
+                let cell = base + vec3<i32>(vec3<u32>(i, j, k));
                 if cell.x < 0 || cell.y < 0 || cell.z < 0 { continue; }
                 if u32(cell.x) >= gx() || u32(cell.y) >= gy() || u32(cell.z) >= gz() { continue; }
-
                 let w = wx[i] * wy[j] * wz[k];
                 let ci = cell_index(u32(cell.x), u32(cell.y), u32(cell.z));
-                let grid_v = grid_vel[ci].xyz;
-                let dpos = (vec3<f32>(offset) - fx) * cell_dx;
                 let grid_mass = grid_vel[ci].w;
-
                 if grid_mass > 1e-6 {
-                    new_v += w * grid_v;
-                    // APIC: C = B * sum(w * v * dpos^T)
-                    new_C0 += w * B * grid_v * dpos.x;
-                    new_C1 += w * B * grid_v * dpos.y;
-                    new_C2 += w * B * grid_v * dpos.z;
                     supported_weight += w;
                     local_grid_mass += w * grid_mass;
                 }
@@ -2310,18 +2431,89 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
 
+    // Staggered velocity + APIC affine gather, one loop per component. Each reads
+    // its own faces (sbase on that axis, base on the others); a face contributes
+    // only where its owning cell holds fluid (grid_vel.w). C-row for component c
+    // is (dvc/dx, dvc/dy, dvc/dz) = B * sum(w * vc * dpos).
+    for (var i = 0u; i < 3u; i++) {
+        for (var j = 0u; j < 3u; j++) {
+            for (var k = 0u; k < 3u; k++) {
+                let cell = vec3<i32>(sbase.x + i32(i), base.y + i32(j), base.z + i32(k));
+                if cell.x < 0 || cell.y < 0 || cell.z < 0 { continue; }
+                if u32(cell.x) >= gx() || u32(cell.y) >= gy() || u32(cell.z) >= gz() { continue; }
+                let ci = cell_index(u32(cell.x), u32(cell.y), u32(cell.z));
+                if grid_vel[ci].w <= 1e-6 { continue; }
+                let w = sxw[i] * wy[j] * wz[k];
+                let vx = grid_vel[ci].x;
+                let dpos = vec3<f32>(f32(i) - sfx.x, f32(j) - fx.y, f32(k) - fx.z) * cell_dx;
+                new_v.x += w * vx;
+                new_C0.x += w * B * vx * dpos.x;
+                new_C1.x += w * B * vx * dpos.y;
+                new_C2.x += w * B * vx * dpos.z;
+                support_x += w;
+            }
+        }
+    }
+    for (var i = 0u; i < 3u; i++) {
+        for (var j = 0u; j < 3u; j++) {
+            for (var k = 0u; k < 3u; k++) {
+                let cell = vec3<i32>(base.x + i32(i), sbase.y + i32(j), base.z + i32(k));
+                if cell.x < 0 || cell.y < 0 || cell.z < 0 { continue; }
+                if u32(cell.x) >= gx() || u32(cell.y) >= gy() || u32(cell.z) >= gz() { continue; }
+                let ci = cell_index(u32(cell.x), u32(cell.y), u32(cell.z));
+                if grid_vel[ci].w <= 1e-6 { continue; }
+                let w = wx[i] * syw[j] * wz[k];
+                let vy = grid_vel[ci].y;
+                let dpos = vec3<f32>(f32(i) - fx.x, f32(j) - sfx.y, f32(k) - fx.z) * cell_dx;
+                new_v.y += w * vy;
+                new_C0.y += w * B * vy * dpos.x;
+                new_C1.y += w * B * vy * dpos.y;
+                new_C2.y += w * B * vy * dpos.z;
+                support_y += w;
+            }
+        }
+    }
+    for (var i = 0u; i < 3u; i++) {
+        for (var j = 0u; j < 3u; j++) {
+            for (var k = 0u; k < 3u; k++) {
+                let cell = vec3<i32>(base.x + i32(i), base.y + i32(j), sbase.z + i32(k));
+                if cell.x < 0 || cell.y < 0 || cell.z < 0 { continue; }
+                if u32(cell.x) >= gx() || u32(cell.y) >= gy() || u32(cell.z) >= gz() { continue; }
+                let ci = cell_index(u32(cell.x), u32(cell.y), u32(cell.z));
+                if grid_vel[ci].w <= 1e-6 { continue; }
+                let w = wx[i] * wy[j] * szw[k];
+                let vz = grid_vel[ci].z;
+                let dpos = vec3<f32>(f32(i) - fx.x, f32(j) - fx.y, f32(k) - sfx.z) * cell_dx;
+                new_v.z += w * vz;
+                new_C0.z += w * B * vz * dpos.x;
+                new_C1.z += w * B * vz * dpos.y;
+                new_C2.z += w * B * vz * dpos.z;
+                support_z += w;
+            }
+        }
+    }
+
+    // Per-component normalization (sparse-stream safe: average each component
+    // only over its supported faces, mirroring the collocated supported_weight
+    // divide).
+    if support_x > 1e-6 {
+        let inv = 1.0 / support_x;
+        new_v.x *= inv; new_C0.x *= inv; new_C1.x *= inv; new_C2.x *= inv;
+    }
+    if support_y > 1e-6 {
+        let inv = 1.0 / support_y;
+        new_v.y *= inv; new_C0.y *= inv; new_C1.y *= inv; new_C2.y *= inv;
+    }
+    if support_z > 1e-6 {
+        let inv = 1.0 / support_z;
+        new_v.z *= inv; new_C0.z *= inv; new_C1.z *= inv; new_C2.z *= inv;
+    }
+
     // Sparse jets suffer strong PIC-style dissipation because empty stencil nodes
     // contribute zero velocity. When support is weak, preserve more of the
     // particle's previous ballistic motion instead of letting the stream stall.
     let support_ratio = clamp(supported_weight, 0.0, 1.0);
     var j_update_support = support_ratio;
-    if supported_weight > 1e-6 {
-        let inv_supported = 1.0 / supported_weight;
-        new_v *= inv_supported;
-        new_C0 *= inv_supported;
-        new_C1 *= inv_supported;
-        new_C2 *= inv_supported;
-    }
     let in_cup_volume =
         xp.y < -3.5 && dot(xp.xz, xp.xz) < (3.0 + contact_offset()) * (3.0 + contact_offset());
     let dense_support_ratio =
@@ -2633,7 +2825,10 @@ fn bed_dynamics(@builtin(global_invocation_id) gid: vec3<u32>) {
                 let w = wx[i] * wy[j] * wz[k];
                 let ci = cell_index(u32(cell.x), u32(cell.y), u32(cell.z));
                 let gv = grid_vel[ci];
-                water_v += w * gv.xyz;
+                // MAC: gv.xyz are cell ci's lower faces, not a cell-centred
+                // velocity. Reconstruct the cell-centred water velocity for this
+                // advection-only coupling; occupancy (.w) stays cell-centred.
+                water_v += w * mac_cell_velocity(cell);
                 water_mass += w * gv.w;
 
                 let support_bid = bed_lookup_load(ci);
@@ -3009,7 +3204,12 @@ mod tests {
 
     #[test]
     fn apic_columns_are_applied_without_transpose() {
-        assert!(MPM_COMPUTE_SHADER.contains("C0 * dpos.x + C1 * dpos.y + C2 * dpos.z"));
+        // MAC-APIC applies the affine per velocity component at that component's
+        // own staggered offset: row (C0.c, C1.c, C2.c) dotted with dpos, never a
+        // transposed column dot.
+        assert!(MPM_COMPUTE_SHADER.contains("C0.x * dpos.x + C1.x * dpos.y + C2.x * dpos.z"));
+        assert!(MPM_COMPUTE_SHADER.contains("C0.y * dpos.x + C1.y * dpos.y + C2.y * dpos.z"));
+        assert!(MPM_COMPUTE_SHADER.contains("C0.z * dpos.x + C1.z * dpos.y + C2.z * dpos.z"));
         assert!(!MPM_COMPUTE_SHADER.contains("dot(aff_col0, dpos)"));
     }
 }
