@@ -275,6 +275,7 @@ fn step_frame_instrumented(
         // is still captured in the per-substep `gpu_wait` total.
         encoder.clear_buffer(&sim.buffers.grid, 0, None);
         encoder.clear_buffer(&sim.buffers.grid_vel, 0, None);
+        encoder.clear_buffer(&sim.buffers.face_mass, 0, None);
 
         let bg = &sim.pipelines.bind_group;
         let p = &sim.pipelines;
