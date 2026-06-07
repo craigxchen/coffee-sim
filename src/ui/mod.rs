@@ -8,6 +8,8 @@
 
 pub mod camera;
 pub mod render;
+pub mod wireframe;
 
 pub use camera::OrbitCamera;
 pub use render::Renderer;
+pub use wireframe::{solid_wireframe, LineVertex};

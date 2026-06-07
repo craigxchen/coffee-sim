@@ -247,6 +247,7 @@ impl ApplicationHandler for App {
         let v_cap =
             mats.r_max * mats.rho_ratio * std::f32::consts::FRAC_PI_6 * mats.grain_diameter.powi(3);
         renderer.set_moisture_scale(1.0 / v_cap);
+        renderer.set_solids(&scene.solids); // draw the dripper cone / cup wireframe
         let camera = OrbitCamera::framing(Vec3::from(scene.box_min), Vec3::from(scene.box_max));
 
         window.request_redraw();

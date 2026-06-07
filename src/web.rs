@@ -82,6 +82,7 @@ impl CoffeeSimApp {
         let mut renderer =
             Renderer::new(&gpu, format, (width, height), 0.5 * mats.particle_spacing);
         configure_renderer(&mut renderer, &mats);
+        renderer.set_solids(&scene.solids); // draw the dripper cone / cup wireframe
         renderer.set_gizmo_enabled(false); // the frontend draws a CSS view-cube
 
         let camera = OrbitCamera::framing(Vec3::from(scene.box_min), Vec3::from(scene.box_max));
@@ -280,6 +281,7 @@ impl CoffeeSimApp {
         let (scene, mats, cfg) = setup_for(kind);
         self.solver = XpbdSolver::build(&scene, &mats, &cfg, &self.gpu);
         configure_renderer(&mut self.renderer, &mats);
+        self.renderer.set_solids(&scene.solids); // refresh the cone / cup wireframe for the new scene
         self.camera = OrbitCamera::framing(Vec3::from(scene.box_min), Vec3::from(scene.box_max));
         self.scene_kind = kind;
         self.scene = scene;
