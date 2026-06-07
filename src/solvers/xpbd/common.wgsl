@@ -526,7 +526,7 @@ fn grid_scatter(@builtin(global_invocation_id) gid: vec3<u32>) {
 // that mapping (read pre-reorder source, write scratch); the host copies scratch back, then
 // grid_reorder_identity rewrites sorted_indices to the identity permutation. The unchanged neighbor
 // loops then gather `j = sorted_indices[s] = s` ⇒ contiguous reads. Split into two passes so each
-// stays within the 8-storage-buffer budget; both read the same (still-original) sorted_indices, so
+// stays within the storage-buffer budget; both read the same (still-original) sorted_indices, so
 // there is no chunk hazard. active-range only (dormant pool slots are never dispatched).
 @compute @workgroup_size(256)
 fn grid_reorder_a(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -683,6 +683,14 @@ fn finalize(@builtin(global_invocation_id) gid: vec3<u32>) {
                 if (vt > 1e-6) {
                     let fric = min(hit.friction * abs(vn), vt); // Coulomb: bounded by the normal impulse
                     v = v - (v / vt) * fric;
+                }
+                // No-upward-slip wall condition for water: the PBF boundary under-density lets a
+                // confined pool over-pressure UP the wall, and Coulomb friction can't hold the slider
+                // (it scales with the ~0 normal velocity), so a thin sheet climbs above the surface.
+                // Cancel the UPWARD wall-tangential velocity; downward drainage is untouched. No-op for
+                // grains (their wall standoff + repose friction already handle this).
+                if (phase[i] != PHASE_GRAIN && v.y > 0.0) {
+                    v.y = 0.0;
                 }
             }
             if (prim.kind == 1u

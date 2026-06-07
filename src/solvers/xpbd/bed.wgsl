@@ -10,7 +10,7 @@
 // correction is load-scaled (a deep grain is pushed harder, every iteration) and stays non-zero
 // at static rest, so the pile holds a true repose without any freeze hack.
 //
-// To stay within the WebGPU 8-storage-buffer limit this kernel does NOT bind `status`: the
+// This kernel keeps its binding set minimal and does NOT bind `status`: the
 // convergence early-exit is enforced by `apply_dp`/`residual_reduce`, so a wasted projection
 // after convergence is harmless (its dp is never applied).
 

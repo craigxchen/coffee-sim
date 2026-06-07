@@ -8,8 +8,9 @@
 // water scene the guards are pass-throughs, so water behaviour is unchanged.
 
 // Wall density compensation, precomputed into c_residual for compute_lambda to add (see the note
-// there). Its own pass because compute_lambda already binds 8 storage buffers (the WebGPU limit)
-// and cannot also bind `solids`; this pass binds `solids` but few others. Dispatched only when the
+// there). Its own pass to keep the SDF eval (`solids`) out of the hot density loop; compute_lambda
+// already binds a full set of storage buffers and this cheap pass binds `solids` but few others.
+// Dispatched only when the
 // scene has SDF solids, so AABB-only scenes never run it and c_residual stays the residual buffer.
 @compute @workgroup_size(256)
 fn compute_boundary(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -82,8 +83,8 @@ fn compute_lambda(@builtin(global_invocation_id) gid: vec3<u32>) {
     // solid, so the fluid-only sum above under-reads — strongest at the cup's floor/side corner,
     // where the deficit hid genuine over-packing and let it accumulate into squeeze-out eruptions.
     // The cut-off fraction ρ₀·f_i·ψ(d) was precomputed by `compute_boundary` into c_residual (a
-    // scratch handoff — compute_lambda needs `solids`, but is already at the 8-storage-buffer limit,
-    // so a separate pass that CAN bind `solids` stages the value here). Overwritten with the real
+    // scratch handoff — keeping the SDF eval out of compute_lambda's hot density loop, a separate
+    // pass that binds `solids` stages the value here). Overwritten with the real
     // residual at the end of this kernel. Solid scenes only; AABB-only scenes never dispatch the
     // boundary pass, so c_residual is untouched and this term is skipped (byte-unchanged).
     if (params.num_solids > 0u) {

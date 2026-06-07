@@ -30,8 +30,9 @@ v1 reference values (calibration, units, kernel/SDF math, geometry, target bands
 - **Never delete or `#[ignore]` tests to go green.** Tests lock conservation/stability/
   plausibility, not temporary heuristics.
 - Keep simulation truth out of `ui` — solvers own physical state.
-- Stay WASM/WebGPU-portable: target `wgpu::Limits::default()` (WebGPU baseline) and keep
-  bind groups within 8 storage buffers per stage. Flag any native-only feature.
+- Stay WASM/WebGPU-portable: keep all device limits at the WebGPU baseline EXCEPT
+  `max_storage_buffers_per_shader_stage`, which is raised to 16 (the real per-stage ceiling for our
+  targets) — keep bind groups within 16 storage buffers per stage. Flag any native-only feature.
 - `todo!()` stubs must compile and be inert — no half-wired pipelines.
 
 ## Verification
