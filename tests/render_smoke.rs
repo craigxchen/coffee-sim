@@ -116,14 +116,15 @@ fn renders_a_frame_offscreen() {
     );
 }
 
-/// Render into an offscreen target of `size` and count pixels that deviate from the clear color.
-fn render_and_count(
+/// Render into an offscreen `size`×`size` target and return the tight RGBA8 pixel buffer.
+/// (`size` must keep `size*4` a multiple of 256 — 256 and 128 both satisfy this.)
+fn render_rgba(
     gpu: &GpuContext,
     renderer: &Renderer,
     particles: &ParticleBuffers,
     camera: &OrbitCamera,
     size: u32,
-) -> usize {
+) -> Vec<u8> {
     let target = gpu.device.create_texture(&wgpu::TextureDescriptor {
         label: Some("offscreen"),
         size: wgpu::Extent3d {
@@ -185,17 +186,45 @@ fn render_and_count(
     });
     rx.recv().unwrap().unwrap();
     let data = slice.get_mapped_range();
-
-    let clear = [56i32, 63, 75];
-    let mut drawn = 0usize;
-    for px in data.chunks_exact(4) {
-        if (0..3).any(|c| (px[c] as i32 - clear[c]).abs() > 25) {
-            drawn += 1;
-        }
-    }
+    let out = data.to_vec();
     drop(data);
     readback.unmap();
-    drawn
+    out
+}
+
+/// Does an RGBA pixel deviate from the clear color (≈ something was drawn)?
+fn is_drawn(px: &[u8]) -> bool {
+    let clear = [56i32, 63, 75];
+    (0..3).any(|c| (px[c] as i32 - clear[c]).abs() > 25)
+}
+
+/// Render and count pixels that deviate from the clear color across the whole frame.
+fn render_and_count(
+    gpu: &GpuContext,
+    renderer: &Renderer,
+    particles: &ParticleBuffers,
+    camera: &OrbitCamera,
+    size: u32,
+) -> usize {
+    render_rgba(gpu, renderer, particles, camera, size)
+        .chunks_exact(4)
+        .filter(|px| is_drawn(px))
+        .count()
+}
+
+/// Count drawn pixels within a sub-rectangle `(x, y, w, h)` of a tight `size`×`size` RGBA buffer.
+fn count_in_rect(rgba: &[u8], size: u32, rect: (u32, u32, u32, u32)) -> usize {
+    let (rx, ry, rw, rh) = rect;
+    let mut n = 0;
+    for yy in ry..(ry + rh).min(size) {
+        for xx in rx..(rx + rw).min(size) {
+            let i = ((yy * size + xx) * 4) as usize;
+            if is_drawn(&rgba[i..i + 4]) {
+                n += 1;
+            }
+        }
+    }
+    n
 }
 
 /// The wireframe pass draws the V60 cone + cup: with the solids set, more non-background pixels
@@ -262,4 +291,55 @@ fn resize_after_set_solids_renders() {
     renderer.resize((SIZE / 2, SIZE / 2));
     let drawn = render_and_count(&gpu, &renderer, &particles, &camera, SIZE / 2);
     assert!(drawn > 50, "renders after resize ({drawn} px)");
+}
+
+/// The cross-section inset renders a 2D center slice into the top-right corner: enabling it adds
+/// pixels in the top-right quadrant over the same scene with it disabled, and it is a safe no-op
+/// when there are no particles.
+#[test]
+fn cross_section_inset_renders_a_slice() {
+    let Some(gpu) = GpuContext::new_headless() else {
+        eprintln!("cross-section smoke: no GPU adapter; skipping.");
+        return;
+    };
+
+    let scene = Scene::v60_pour();
+    let mut solver = XpbdSolver::build(&scene, &Materials::default(), &Config::default(), &gpu);
+    let input = EmissionInput::default();
+    for _ in 0..30 {
+        solver.step(1.0 / 60.0, &input);
+    }
+    let particles = solver.particles();
+    let camera = OrbitCamera::framing(Vec3::from(scene.box_min), Vec3::from(scene.box_max));
+
+    let mut renderer = Renderer::new(&gpu, FORMAT, (SIZE, SIZE), 0.5);
+    renderer.set_gizmo_enabled(false); // isolate the inset (the gizmo would fill the corner)
+
+    // The inset sits in the top-right; that quadrant should gain pixels when the slice is on.
+    let quadrant = (SIZE / 2, 0, SIZE / 2, SIZE / 2);
+
+    renderer.set_cross_section_enabled(false);
+    let off = render_rgba(&gpu, &renderer, &particles, &camera, SIZE);
+    let off_n = count_in_rect(&off, SIZE, quadrant);
+
+    renderer.set_cross_section_enabled(true);
+    let on = render_rgba(&gpu, &renderer, &particles, &camera, SIZE);
+    let on_n = count_in_rect(&on, SIZE, quadrant);
+
+    eprintln!("cross-section smoke: {off_n} px off, {on_n} px on (top-right quadrant)");
+    assert!(
+        on_n > off_n && on_n - off_n > 50,
+        "the inset slice adds substantial pixels in the top-right ({on_n} vs {off_n})"
+    );
+
+    // No particles → the inset pass is a safe no-op (no panic, nothing drawn).
+    let empty = ParticleBuffers {
+        particle_count: 0,
+        ..Default::default()
+    };
+    let blank = render_and_count(&gpu, &renderer, &empty, &camera, SIZE);
+    assert_eq!(
+        blank, 0,
+        "no particles + gizmo off → blank frame even with the cross-section enabled"
+    );
 }

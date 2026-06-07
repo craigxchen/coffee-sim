@@ -159,10 +159,12 @@ impl CoffeeSimApp {
             .resize((self.config.width, self.config.height));
     }
 
-    /// Resize with a DPR-scaled backing size; the CSS size is kept for API parity with v1.
+    /// Resize with a DPR-scaled backing size; the CSS size feeds the renderer so the cross-section
+    /// inset lines up with the `.cross-section-overlay` CSS frame (DPR = device px / CSS px).
     #[wasm_bindgen(js_name = resizeWithCssSize)]
-    pub fn resize_with_css_size(&mut self, width: u32, height: u32, _css_w: f32, _css_h: f32) {
+    pub fn resize_with_css_size(&mut self, width: u32, height: u32, css_w: f32, css_h: f32) {
         self.resize(width, height);
+        self.renderer.set_css_size(css_w, css_h);
     }
 
     // --- scenes ---

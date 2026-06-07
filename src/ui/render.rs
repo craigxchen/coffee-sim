@@ -16,6 +16,18 @@ const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 /// Speed mapped to the top of the color ramp.
 const COLOR_MAX_SPEED: f32 = 25.0;
 
+// Center cross-section slice (v1 parity: a fixed orthographic z-slice into the corner inset).
+/// World-space vertical center of the slice ortho window.
+const CROSS_CENTER_Y: f32 = -0.5;
+/// Ortho window height (world units); width = height × aspect.
+const CROSS_H: f32 = 7.4;
+/// Inset aspect ratio (matches the `.cross-section-overlay` CSS box).
+const CROSS_ASPECT: f32 = 1.38;
+/// Half-thickness of the rendered z-slab (world units ≈ a couple of particle layers at the center).
+const CROSS_HALF_WIDTH: f32 = 0.5;
+/// Inset margin from the top/right edge, in CSS px (matches the CSS box).
+const CROSS_MARGIN_CSS: f32 = 16.0;
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct CameraUniform {
@@ -23,6 +35,7 @@ struct CameraUniform {
     right: [f32; 4],
     up: [f32; 4],
     params: [f32; 4], // x = radius, y = inv color-max-speed
+    clip: [f32; 4],   // x = z_center, y = half_width, z = slab-enabled (>0.5), w = unused
 }
 
 #[repr(C)]
@@ -48,10 +61,17 @@ pub struct Renderer {
     moisture_inv_cap: f32,
     /// Whether to draw the corner orientation cube. Off on web (the frontend uses a CSS view-cube).
     draw_gizmo: bool,
+    /// Whether to draw the center cross-section slice into the corner inset (on by default).
+    xsection_enabled: bool,
+    /// CSS (layout) size of the canvas, when known (web). Used to derive DPR so the inset viewport
+    /// lines up with the `.cross-section-overlay` CSS frame. `None` ⇒ assume DPR 1 (native).
+    css_size: Option<(f32, f32)>,
 
     depth: wgpu::TextureView,
 
     camera_buf: wgpu::Buffer,
+    /// Orthographic camera uniform for the cross-section slice (reuses the particle pipeline).
+    xsection_buf: wgpu::Buffer,
     particle_pipeline: wgpu::RenderPipeline,
     particle_bgl: wgpu::BindGroupLayout,
 
@@ -87,6 +107,12 @@ impl Renderer {
         // --- particle pipeline ---
         let camera_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("camera-uniform"),
+            size: std::mem::size_of::<CameraUniform>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let xsection_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("xsection-camera-uniform"),
             size: std::mem::size_of::<CameraUniform>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
@@ -269,8 +295,11 @@ impl Renderer {
             radius,
             grain_radius_scale: 1.0,
             moisture_inv_cap: 0.0,
+            xsection_enabled: true,
+            css_size: None,
             depth,
             camera_buf,
+            xsection_buf,
             particle_pipeline,
             particle_bgl,
             gizmo_buf,
@@ -316,6 +345,34 @@ impl Renderer {
         self.draw_gizmo = on;
     }
 
+    /// Enable/disable the center cross-section slice inset (on by default).
+    pub fn set_cross_section_enabled(&mut self, on: bool) {
+        self.xsection_enabled = on;
+    }
+
+    /// Tell the renderer the canvas CSS (layout) size so the cross-section inset viewport lines up
+    /// with the `.cross-section-overlay` CSS frame (DPR = device px / CSS px). Web calls this from
+    /// `resizeWithCssSize`; native leaves it unset (DPR 1).
+    pub fn set_css_size(&mut self, css_w: f32, css_h: f32) {
+        self.css_size = Some((css_w.max(1.0), css_h.max(1.0)));
+    }
+
+    /// The cross-section inset viewport rect (device px, top-left origin) matching the CSS box:
+    /// top/right margin `CROSS_MARGIN_CSS`, width `clamp(150, 24%, 280)` CSS px, aspect `CROSS_ASPECT`.
+    fn inset_rect(&self) -> (f32, f32, f32, f32) {
+        let dw = self.size.0 as f32;
+        let dh = self.size.1 as f32;
+        let css_w = self.css_size.map(|(w, _)| w).unwrap_or(dw);
+        let dpr = if css_w > 0.0 { dw / css_w } else { 1.0 };
+        let margin = CROSS_MARGIN_CSS * dpr;
+        let width_css = (0.24 * css_w).clamp(150.0, 280.0);
+        let w = (width_css * dpr).min(dw);
+        let h = (w / CROSS_ASPECT).min(dh);
+        let x = (dw - margin - w).max(0.0);
+        let y = margin.min((dh - h).max(0.0));
+        (x, y, w, h)
+    }
+
     /// Set the render-radius multiplier for grain particles (1.0 = same as water). Use when grains
     /// are coarser than the water (e.g. a porous sand wall) so they draw at their true size.
     pub fn set_grain_radius_scale(&mut self, scale: f32) {
@@ -357,6 +414,7 @@ impl Renderer {
                 self.grain_radius_scale,
                 self.moisture_inv_cap,
             ],
+            clip: [0.0; 4], // main pass: slab clip disabled
         };
         self.queue
             .write_buffer(&self.camera_buf, 0, bytemuck::bytes_of(&cam_u));
@@ -376,35 +434,68 @@ impl Renderer {
         self.queue
             .write_buffer(&self.wire_buf, 0, bytemuck::bytes_of(&wire_u));
 
-        let particle_bg = particles
-            .position
-            .as_ref()
-            .zip(particles.velocity.as_ref())
-            .zip(particles.phase_tag.as_ref())
-            .map(|((pos, vel), phase)| {
-                self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("particle-bg"),
-                    layout: &self.particle_bgl,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: self.camera_buf.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: pos.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 2,
-                            resource: vel.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 3,
-                            resource: phase.as_entire_binding(),
-                        },
-                    ],
+        // Cross-section uniform: a FIXED orthographic center z-slice (independent of the orbit
+        // camera). Looks head-on down -z (x→right, y→up) at the (0, CROSS_CENTER_Y) window; the slab
+        // clip (clip.z=1) keeps only |z| ≤ CROSS_HALF_WIDTH so the inset shows a thin 2D slice.
+        let cross_w = CROSS_H * CROSS_ASPECT;
+        let xs_proj = Mat4::orthographic_rh(
+            -0.5 * cross_w,
+            0.5 * cross_w,
+            CROSS_CENTER_Y - 0.5 * CROSS_H,
+            CROSS_CENTER_Y + 0.5 * CROSS_H,
+            0.1,
+            200.0,
+        );
+        let xs_view = Mat4::look_at_rh(
+            Vec3::new(0.0, CROSS_CENTER_Y, 50.0),
+            Vec3::new(0.0, CROSS_CENTER_Y, 0.0),
+            Vec3::Y,
+        );
+        let xs_u = CameraUniform {
+            view_proj: (xs_proj * xs_view).to_cols_array_2d(),
+            right: [1.0, 0.0, 0.0, 0.0],
+            up: [0.0, 1.0, 0.0, 0.0],
+            params: cam_u.params,
+            clip: [0.0, CROSS_HALF_WIDTH, 1.0, 0.0], // z_center=0, half_width, slab enabled
+        };
+        self.queue
+            .write_buffer(&self.xsection_buf, 0, bytemuck::bytes_of(&xs_u));
+
+        // Both the main and cross-section passes bind the same particle storage buffers; only the
+        // camera uniform differs (perspective vs. orthographic+slab).
+        let make_bg = |label: &str, uniform: &wgpu::Buffer| {
+            particles
+                .position
+                .as_ref()
+                .zip(particles.velocity.as_ref())
+                .zip(particles.phase_tag.as_ref())
+                .map(|((pos, vel), phase)| {
+                    self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some(label),
+                        layout: &self.particle_bgl,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: uniform.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: pos.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: vel.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 3,
+                                resource: phase.as_entire_binding(),
+                            },
+                        ],
+                    })
                 })
-            });
+        };
+        let particle_bg = make_bg("particle-bg", &self.camera_buf);
+        let xsection_bg = make_bg("xsection-bg", &self.xsection_buf);
 
         let mut enc = self
             .device
@@ -505,6 +596,37 @@ impl Renderer {
             pass.draw(0..self.cube_vcount, 0..1);
             pass.set_vertex_buffer(0, self.axis_vbuf.slice(..));
             pass.draw(0..self.axis_vcount, 0..1);
+        }
+
+        // Pass 4: center cross-section slice into the corner inset (v1 parity). Keeps the existing
+        // color, clears depth for its own sort, restricts rasterization to the inset viewport, and
+        // reuses the particle pipeline with the orthographic + slab-clip uniform.
+        if self.xsection_enabled {
+            if let (Some(bg), n) = (&xsection_bg, particles.particle_count) {
+                let (x, y, w, h) = self.inset_rect();
+                if n > 0 && w >= 1.0 && h >= 1.0 {
+                    let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("cross-section"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: target,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Load,
+                                store: wgpu::StoreOp::Store,
+                            },
+                            depth_slice: None,
+                        })],
+                        depth_stencil_attachment: Some(depth_attachment(&self.depth)),
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                        multiview_mask: None,
+                    });
+                    pass.set_viewport(x, y, w, h, 0.0, 1.0);
+                    pass.set_pipeline(&self.particle_pipeline);
+                    pass.set_bind_group(0, bg, &[]);
+                    pass.draw(0..6, 0..n);
+                }
+            }
         }
 
         self.queue.submit(Some(enc.finish()));

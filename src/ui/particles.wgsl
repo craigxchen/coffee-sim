@@ -6,6 +6,7 @@ struct Camera {
     right: vec4<f32>,   // camera right in world space (xyz)
     up: vec4<f32>,      // camera up in world space (xyz)
     params: vec4<f32>,  // x = radius, y = inv color-max-speed, z = grain radius scale, w = 1/V_cap (moisture tint)
+    clip: vec4<f32>,    // x = z_center, y = half_width, z = slab-enabled (>0.5), w = unused
 };
 
 @group(0) @binding(0) var<uniform> cam: Camera;
@@ -31,6 +32,13 @@ fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VsOut
     );
     let c = corners[vi];
     let p = positions[ii].xyz;
+    // Cross-section slab cull: when enabled (clip.z>0.5), drop instances outside the center z-slab
+    // so the inset shows a thin 2D slice. Off (clip.z==0) for the main pass → no effect.
+    if (cam.clip.z > 0.5 && abs(p.z - cam.clip.x) > cam.clip.y) {
+        var culled: VsOut;
+        culled.clip = vec4<f32>(2.0, 2.0, 2.0, 1.0); // outside NDC → impostor quad discarded
+        return culled;
+    }
     // params.z = grain radius scale (grains can be coarser than water); water = 1×.
     let scale = select(1.0, cam.params.z, phases[ii] == PHASE_GRAIN);
     let radius = cam.params.x * scale;
