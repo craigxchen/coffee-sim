@@ -8,7 +8,7 @@
 
 use coffee_sim::engine::scene::{SeedRegion, Species};
 use coffee_sim::engine::Scene;
-use coffee_sim::models::permeability::{drag_rate, kozeny_carman};
+use coffee_sim::models::permeability::darcy_drag_rate;
 use coffee_sim::models::Materials;
 use coffee_sim::solvers::base::Solver;
 use coffee_sim::solvers::xpbd::XpbdSolver;
@@ -109,12 +109,48 @@ fn water_values(values: &[f32], phase: &[u32]) -> Vec<f32> {
         .collect()
 }
 
+fn point_scene(waters: &[[f32; 3]], grains: &[[f32; 3]], box_max: [f32; 3]) -> Scene {
+    let regions = waters
+        .iter()
+        .map(|&p| SeedRegion {
+            min: p,
+            max: p,
+            species: Species::Water,
+        })
+        .chain(grains.iter().map(|&p| SeedRegion {
+            min: p,
+            max: p,
+            species: Species::Grain,
+        }))
+        .collect();
+    Scene {
+        gravity: [0.0, 0.0, 0.0],
+        box_min: [0.0, 0.0, 0.0],
+        box_max,
+        regions,
+        ..Scene::default()
+    }
+}
+
+fn ring_points(n: usize, center: [f32; 3], radius: f32) -> Vec<[f32; 3]> {
+    (0..n)
+        .map(|i| {
+            let a = std::f32::consts::TAU * i as f32 / n as f32;
+            [
+                center[0] + radius * a.cos(),
+                center[1],
+                center[2] + radius * a.sin(),
+            ]
+        })
+        .collect()
+}
+
 fn drag_only_config() -> Config {
     Config {
         max_iters: 0,
         bed_max_iters: 0,
         xsph_viscosity_c: 0.0,
-        drag_gamma: 0.02,
+        drag_scale: 0.02,
         drag_beta_max: 0.8,
         drag_subiters: 4,
         grain_sleep_speed: 0.0,
@@ -233,18 +269,11 @@ fn porosity_drag_factor_uses_dense_bed_epsilon_floor() {
 
     let counts = solver.read_coupling_scale();
     let max_rate = counts.iter().map(|c| c[0]).fold(0.0, f32::max);
-    let pr = 0.40f32;
     let eps_floor = 0.35f32;
-    let floor_factor =
-        pr.powi(3) * (1.0 - eps_floor).powi(2) / (eps_floor.powi(3) * (1.0 - pr).powi(2));
-    let resolved = drag_rate(
-        kozeny_carman(mats.grain_diameter, mats.porosity),
-        cfg.drag_gamma,
-    );
+    let resolved = darcy_drag_rate(mats.grain_diameter, eps_floor, cfg.drag_scale);
     assert!(
-        max_rate.is_finite() && max_rate <= resolved * floor_factor * 1.001,
-        "ε floor should keep live porosity drag finite and capped: max_rate {max_rate}, floor cap {}",
-        resolved * floor_factor
+        max_rate.is_finite() && max_rate <= resolved * 1.001,
+        "ε floor should keep live porosity drag finite and capped: max_rate {max_rate}, floor cap {resolved}",
     );
 }
 
@@ -576,7 +605,11 @@ fn drag_conserves_momentum_and_damps_relative_velocity() {
         grain_diameter: 0.5,
         ..Materials::default()
     };
-    let mut solver = XpbdSolver::build(&scene, &mats, &drag_only_config(), &gpu);
+    let cfg = Config {
+        drag_scale: 5000.0,
+        ..drag_only_config()
+    };
+    let mut solver = XpbdSolver::build(&scene, &mats, &cfg, &gpu);
     let phase = solver.read_phases();
     assert_eq!(phase, vec![0, 1]);
     solver.write_velocities_for_test(&[[1.0, 0.0, 0.0, 0.0], [-0.25, 0.0, 0.0, 0.0]]);
@@ -605,10 +638,232 @@ fn drag_conserves_momentum_and_damps_relative_velocity() {
     );
 }
 
-/// R5 (Phase 6): with fines active the drag pair-combiner switches to harmonic-mean-k (the
-/// arithmetic mean of the per-particle rates). It is symmetric in (i,j), so the pair impulse stays
-/// equal-and-opposite and momentum is still conserved — and it is genuinely exercised here because
-/// the water (with a grain neighbor) and the grain (with none) carry different per-particle rates.
+#[test]
+fn darcy_drag_conserves_momentum_under_asymmetric_porosity() {
+    let Some(gpu) = GpuContext::new_headless() else {
+        eprintln!("xpbd_coupling: no GPU adapter; skipping.");
+        return;
+    };
+    let scene = point_scene(&[[3.0, 4.0, 4.0]], &[[4.0, 4.0, 4.0]], [8.0, 8.0, 8.0]);
+    let mats = Materials {
+        grain_mass: 2.0,
+        grain_diameter: 1.0,
+        coupling_radius: 2.0,
+        ..Materials::default()
+    };
+    let cfg = Config {
+        drag_scale: 2.0,
+        drag_beta_max: 0.9,
+        drag_subiters: 1,
+        ..drag_only_config()
+    };
+    let mut solver = XpbdSolver::build(&scene, &mats, &cfg, &gpu);
+    let phase = solver.read_phases();
+    assert_eq!(phase, vec![0, 1]);
+    solver.write_velocities_for_test(&[[2.0, 0.0, 0.0, 0.0], [-0.5, 0.0, 0.0, 0.0]]);
+
+    let p0 = momentum(&solver.read_velocities(), &phase, &mats);
+    let ke0 = kinetic_energy(&solver.read_velocities(), &phase, &mats);
+    solver.step(1.0 / 60.0, &EmissionInput::default());
+    let vel = solver.read_velocities();
+    let p1 = momentum(&vel, &phase, &mats);
+    let ke1 = kinetic_energy(&vel, &phase, &mats);
+    let drift = pnorm([p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]]);
+    assert!(
+        drift < 2.0e-4,
+        "asymmetric-porosity drag momentum drift: {drift}"
+    );
+    assert!(ke1 <= ke0 + 1.0e-5, "drag increased KE: {ke0} -> {ke1}");
+
+    let cs = solver.read_coupling_scale();
+    assert!(
+        (cs[0][0] - cs[1][0]).abs() > 1.0e-3,
+        "test should exercise asymmetric local porosity, got beta_w {:.6}, beta_g {:.6}",
+        cs[0][0],
+        cs[1][0]
+    );
+}
+
+#[test]
+fn drag_neighbor_cap_prevents_neighbor_count_overdamping() {
+    let Some(gpu) = GpuContext::new_headless() else {
+        eprintln!("xpbd_coupling: no GPU adapter; skipping.");
+        return;
+    };
+
+    let run = |water_count: usize| {
+        let center = [5.0, 5.0, 5.0];
+        let waters = ring_points(water_count, center, 0.9);
+        let scene = point_scene(&waters, &[center], [10.0, 10.0, 10.0]);
+        let mats = Materials {
+            grain_mass: 3.0,
+            grain_diameter: 1.0,
+            coupling_radius: 2.5,
+            ..Materials::default()
+        };
+        let cfg = Config {
+            drag_scale: 50.0,
+            drag_beta_max: 0.6,
+            drag_subiters: 1,
+            ..drag_only_config()
+        };
+        let mut solver = XpbdSolver::build(&scene, &mats, &cfg, &gpu);
+        let phase = solver.read_phases();
+        let seeded: Vec<[f32; 4]> = phase
+            .iter()
+            .map(|&ph| {
+                if ph == 0 {
+                    [1.0, 0.0, 0.0, 0.0]
+                } else {
+                    [0.0; 4]
+                }
+            })
+            .collect();
+        solver.write_velocities_for_test(&seeded);
+        solver.step(1.0 / 60.0, &EmissionInput::default());
+        let grain = phase.iter().position(|&ph| ph == 1).unwrap();
+        solver.read_velocities()[grain][0]
+    };
+
+    let few = run(4);
+    let many = run(12);
+    let rel = ((many - few) / few.max(1.0e-6)).abs();
+    assert!(
+        rel < 0.15,
+        "aggregate drag should not grow with neighbor count: N=4 {few:.6}, N=12 {many:.6}"
+    );
+}
+
+#[test]
+fn drag_resolution_refinement_preserves_grain_impulse() {
+    let Some(gpu) = GpuContext::new_headless() else {
+        eprintln!("xpbd_coupling: no GPU adapter; skipping.");
+        return;
+    };
+
+    let run = |spacing: f32, support_radius: f32, water_count: usize| {
+        let center = [6.0, 6.0, 6.0];
+        let waters = ring_points(water_count, center, 1.0);
+        let scene = point_scene(&waters, &[center], [12.0, 12.0, 12.0]);
+        let mats = Materials {
+            particle_spacing: spacing,
+            support_radius,
+            grain_mass: 8.0,
+            grain_diameter: 4.0,
+            coupling_radius: 4.0,
+            ..Materials::default()
+        };
+        let cfg = Config {
+            drag_scale: 0.001,
+            drag_beta_max: 0.95,
+            drag_subiters: 1,
+            ..drag_only_config()
+        };
+        let mut solver = XpbdSolver::build(&scene, &mats, &cfg, &gpu);
+        let phase = solver.read_phases();
+        let seeded: Vec<[f32; 4]> = phase
+            .iter()
+            .map(|&ph| {
+                if ph == 0 {
+                    [1.0, 0.0, 0.0, 0.0]
+                } else {
+                    [0.0; 4]
+                }
+            })
+            .collect();
+        solver.write_velocities_for_test(&seeded);
+        solver.step(1.0 / 60.0, &EmissionInput::default());
+        let grain = phase.iter().position(|&ph| ph == 1).unwrap();
+        solver.read_velocities()[grain][0]
+    };
+
+    let coarse = run(1.0, 2.0, 8);
+    let fine = run(0.5, 1.0, 64);
+    let ratio = fine / coarse.max(1.0e-8);
+    assert!(
+        (0.70..=1.30).contains(&ratio),
+        "refining water particles should preserve grain drag impulse: coarse {coarse:.6}, fine {fine:.6}, ratio {ratio:.3}"
+    );
+}
+
+#[test]
+fn imposed_flow_mobilizes_grain_probe_and_weak_drag_does_not() {
+    let Some(gpu) = GpuContext::new_headless() else {
+        eprintln!("xpbd_coupling: no GPU adapter; skipping.");
+        return;
+    };
+
+    let run = |drag_scale: f32| {
+        let target = [5.0, 5.0, 5.0];
+        let grains = vec![
+            target,
+            [4.2, 5.0, 5.0],
+            [5.8, 5.0, 5.0],
+            [5.0, 5.0, 4.2],
+            [5.0, 5.0, 5.8],
+            [4.2, 4.2, 5.0],
+            [5.8, 4.2, 5.0],
+            [5.0, 4.2, 4.2],
+            [5.0, 4.2, 5.8],
+        ];
+        let mut waters = ring_points(8, [5.0, 5.8, 5.0], 0.7);
+        waters.push([5.0, 6.0, 5.0]);
+        let scene = point_scene(&waters, &grains, [10.0, 10.0, 10.0]);
+        let mats = Materials {
+            grain_mass: 1.5,
+            grain_diameter: 1.0,
+            coupling_radius: 2.5,
+            ..Materials::default()
+        };
+        let cfg = Config {
+            drag_scale,
+            drag_beta_max: 0.85,
+            drag_subiters: 4,
+            wake_threshold: 0.01,
+            grain_sleep_speed: 0.2,
+            ..drag_only_config()
+        };
+        let mut solver = XpbdSolver::build(&scene, &mats, &cfg, &gpu);
+        let phase = solver.read_phases();
+        let grain = phase.iter().position(|&ph| ph == 1).unwrap();
+        let seeded: Vec<[f32; 4]> = phase
+            .iter()
+            .map(|&ph| {
+                if ph == 0 {
+                    [0.0, -4.0, 0.0, 0.0]
+                } else {
+                    [0.0; 4]
+                }
+            })
+            .collect();
+        solver.write_velocities_for_test(&seeded);
+        let y0 = solver.read_positions()[grain][1];
+        solver.step(1.0 / 60.0, &EmissionInput::default());
+        let y1 = solver.read_positions()[grain][1];
+        let fluid_impulse = solver.read_fluid_impulse()[grain];
+        let normal_impulse = solver.read_normal_impulse()[grain];
+        let resistance = mats.friction_mu * normal_impulse;
+        ((y1 - y0).abs(), fluid_impulse, resistance)
+    };
+
+    let (moved, impulse, resistance) = run(Config::default().drag_scale);
+    let (control_moved, control_impulse, _) = run(0.0);
+    assert!(
+        impulse > resistance + 1.0e-5,
+        "drag impulse should exceed the measured yield budget: impulse {impulse:.6}, resistance {resistance:.6}"
+    );
+    assert!(
+        moved > 1.0e-3,
+        "strong imposed flow did not mobilize the grain probe: displacement {moved:.6}"
+    );
+    assert!(
+        control_impulse <= 1.0e-7 && control_moved < moved * 0.1,
+        "weak-drag control should stay nearly static: moved {control_moved:.6}, impulse {control_impulse:.6}, strong moved {moved:.6}"
+    );
+}
+
+/// Fines active still runs through the same symmetric Darcy pair scale. This keeps the former
+/// fines-gated path covered while ensuring it no longer diverges from the default coupling math.
 #[test]
 fn harmonic_drag_combiner_conserves_momentum() {
     let Some(gpu) = GpuContext::new_headless() else {

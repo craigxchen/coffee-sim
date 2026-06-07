@@ -13,7 +13,6 @@ use wgpu::util::DeviceExt;
 use crate::emission::EmissionInput;
 use crate::engine::scene::Species;
 use crate::engine::{Metrics, Scene};
-use crate::models::permeability::{drag_rate, kozeny_carman};
 use crate::models::Materials;
 use crate::profiling::Profile;
 use crate::solvers::base::Solver;
@@ -75,7 +74,7 @@ struct Params {
     grain_volume: f32, // (π/6)·grain_diameter³ — effective volume for the α_s sum
     packing_limit: f32,
     exclusion_relax: f32,
-    drag_gamma: f32,
+    drag_scale: f32,
     drag_beta_max: f32,
     buoyancy_scale: f32,
     wake_threshold: f32,
@@ -322,7 +321,9 @@ pub struct XpbdSolver {
     vel_smoothed: wgpu::Buffer,
     vel_frozen: wgpu::Buffer,
     lambda: wgpu::Buffer,
+    normal_impulse: wgpu::Buffer,
     alpha_s: wgpu::Buffer,
+    fluid_impulse: wgpu::Buffer,
     coupling_scale: wgpu::Buffer,
     phase: Arc<wgpu::Buffer>,
     status: wgpu::Buffer,
@@ -668,6 +669,16 @@ impl XpbdSolver {
         drop(data);
         readback.unmap();
         out
+    }
+
+    /// Read back the grain contact normal-impulse budget (dev/test only — stalls the GPU).
+    pub fn read_normal_impulse(&self) -> Vec<f32> {
+        self.read_f32(&self.normal_impulse)
+    }
+
+    /// Read back the accumulated water↔grain drag impulse/wake signal (dev/test only — stalls GPU).
+    pub fn read_fluid_impulse(&self) -> Vec<f32> {
+        self.read_f32(&self.fluid_impulse)
     }
 
     /// Overwrite current particle velocities (dev/test only).
@@ -1249,11 +1260,6 @@ impl Solver for XpbdSolver {
         let active_count = seed_count;
         let dq = cfg.s_corr_dq_ratio * h;
         let s_corr_wq = kernels::w_poly6(dq, h);
-        // Resolve the user-facing drag scale through Kozeny-Carman once at build time, stored in
-        // `drag_gamma` (live-porosity drag in a later unit makes this per-particle).
-        let permeability = kozeny_carman(mats.grain_diameter, mats.porosity);
-        let resolved_drag_gamma = drag_rate(permeability, cfg.drag_gamma);
-
         let params = Params {
             box_min: [scene.box_min[0], scene.box_min[1], scene.box_min[2], 0.0],
             box_max: [scene.box_max[0], scene.box_max[1], scene.box_max[2], 0.0],
@@ -1292,7 +1298,7 @@ impl Solver for XpbdSolver {
             grain_volume,
             packing_limit: cfg.packing_limit,
             exclusion_relax: cfg.exclusion_relax,
-            drag_gamma: resolved_drag_gamma,
+            drag_scale: cfg.drag_scale,
             drag_beta_max: cfg.drag_beta_max,
             buoyancy_scale: cfg.buoyancy_scale,
             wake_threshold: cfg.wake_threshold,
@@ -1386,7 +1392,7 @@ impl Solver for XpbdSolver {
             &device,
             "xpbd-normal-impulse",
             f32s,
-            wgpu::BufferUsages::empty(),
+            wgpu::BufferUsages::COPY_SRC,
         );
         // Per-particle solid fraction α_s (coupling). Zero-initialized by wgpu, so single-species
         // scenes (which never run compute_fractions) read α_s=0 → the water solve is unmodulated.
@@ -1395,9 +1401,9 @@ impl Solver for XpbdSolver {
             &device,
             "xpbd-fluid-impulse",
             f32s,
-            wgpu::BufferUsages::empty(),
+            wgpu::BufferUsages::COPY_SRC,
         );
-        // vec2<f32> per particle (legacy: (β,_); harmonic-k: (rate, cap)) — twice f32s.
+        // vec2<f32> per particle: (local Darcy β_i, opposite-phase neighbor count N_i).
         let coupling_scale = Self::storage(
             &device,
             "xpbd-coupling-scale",
@@ -2088,7 +2094,9 @@ impl Solver for XpbdSolver {
             vel_smoothed,
             vel_frozen,
             lambda,
+            normal_impulse,
             alpha_s,
+            fluid_impulse,
             coupling_scale,
             phase,
             status,
