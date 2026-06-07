@@ -1,5 +1,8 @@
 //! Packed-bed permeability models shared by solvers.
 
+/// Viscous Kozeny-Carman / Ergun coefficient used for packed-bed Darcy drag.
+pub const DARCY_VISCOUS_COEFF: f32 = 150.0;
+
 /// Kozeny-Carman permeability for a packed bed of roughly spherical grains.
 ///
 /// `d` is grain diameter and `phi` is bed porosity. Smaller grains lower permeability and
@@ -8,17 +11,22 @@
 pub fn kozeny_carman(d: f32, phi: f32) -> f32 {
     let phi = phi.clamp(1.0e-4, 0.999);
     let solid = (1.0 - phi).max(1.0e-4);
-    d * d * phi.powi(3) / (180.0 * solid.powi(2))
+    d * d * phi.powi(3) / (DARCY_VISCOUS_COEFF * solid.powi(2))
 }
 
 /// Resolve the solver drag rate from permeability.
-pub fn drag_rate(k: f32, gamma: f32) -> f32 {
-    gamma / k.max(1.0e-9)
+pub fn drag_rate(k: f32, scale: f32) -> f32 {
+    scale / k.max(1.0e-9)
+}
+
+/// Local Darcy drag rate in reduced solver units.
+pub fn darcy_drag_rate(d: f32, phi: f32, scale: f32) -> f32 {
+    drag_rate(kozeny_carman(d, phi), scale)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{drag_rate, kozeny_carman};
+    use super::{darcy_drag_rate, drag_rate, kozeny_carman, DARCY_VISCOUS_COEFF};
 
     #[test]
     fn finer_grind_has_lower_permeability_and_higher_drag() {
@@ -33,13 +41,13 @@ mod tests {
 
     /// Quantitative Kozeny–Carman law: permeability matches the closed form and
     /// scales as `d²` at fixed porosity, so the solver's resolved drag rate
-    /// (`γ = drag_gamma / k`, wired in `solvers::xpbd::build`) scales as `d⁻²`.
+    /// (`β = drag_scale / k`) scales as `d⁻²`.
     /// This pins the grind→flow exponent the ordinal test above only orders.
     #[test]
     fn permeability_obeys_kozeny_carman_scaling() {
         let phi: f32 = 0.40;
-        // k(d) = d²·φ³ / (180·(1−φ)²), exact to float precision.
-        let closed = |d: f32| d * d * phi.powi(3) / (180.0 * (1.0 - phi).powi(2));
+        // k(d) = d²·φ³ / (150·(1−φ)²), exact to float precision.
+        let closed = |d: f32| d * d * phi.powi(3) / (DARCY_VISCOUS_COEFF * (1.0 - phi).powi(2));
         for &d in &[0.4f32, 0.6, 1.0, 1.5, 2.0] {
             let (k, e) = (kozeny_carman(d, phi), closed(d));
             assert!((k - e).abs() <= 1e-6 * e, "k({d}) = {k}, closed form {e}");
@@ -52,7 +60,7 @@ mod tests {
             "k(2d)/k(d) = {k_ratio}, expected 4"
         );
 
-        // The solver wires γ = drag_gamma / k, so resolved drag ∝ d⁻²: halving the
+        // The solver wires β = drag_scale / k, so resolved drag ∝ d⁻²: halving the
         // grain diameter quadruples the drag rate (the grind→flow knob).
         let gamma = 0.02;
         let drag_ratio =
@@ -69,6 +77,13 @@ mod tests {
         assert!(
             (phi_ratio - closed_phi).abs() <= 1e-5 * closed_phi,
             "φ-scaling {phi_ratio} vs {closed_phi}"
+        );
+
+        let beta = darcy_drag_rate(1.0, phi, gamma);
+        let closed_beta = gamma * DARCY_VISCOUS_COEFF * (1.0 - phi).powi(2) / phi.powi(3);
+        assert!(
+            (beta - closed_beta).abs() <= 1.0e-5 * closed_beta,
+            "Darcy beta {beta} vs closed form {closed_beta}"
         );
     }
 }

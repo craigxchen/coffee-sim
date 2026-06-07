@@ -8,9 +8,9 @@
 //     particles: water can't pass through grain bodies, so it rests on / sits in the bed. Run as a
 //     symmetric pair of gathers (exclude_water + exclude_grain) reading the same predicted
 //     positions, with opposite-mass weights → momentum-conserving without float atomics.
-//  3. implicit drag — symmetric frozen-velocity gathers using the Kozeny-Carman-resolved drag
-//     rate in params.drag_gamma. The same pair scale is used by both phases, so each pair impulse
-//     is equal-and-opposite to float tolerance.
+//  3. capped-pair Darcy drag — symmetric frozen-velocity gathers using local Kozeny-Carman
+//     porosity rates and the opposite-phase neighbor count. The same pair scale is used by both
+//     phases, so each pair impulse is equal-and-opposite to float tolerance.
 //  4. buoyancy / pressure-gradient lift — symmetric gathers over the converged water λ field.
 //     PBF λ is non-positive under compression in this solver, so pressure is −λ. The grain pass
 //     applies +J/m_g and the water pass applies −J/m_w for the same pair, avoiding float atomics.
@@ -152,23 +152,31 @@ fn exclude_grain(@builtin(global_invocation_id) gid: vec3<u32>) {
     dp[i] = vec4<f32>(push, 0.0);
 }
 
-fn beta_from_rate(rate: f32) -> f32 {
-    let x = max(rate * params.dt, 0.0);
-    return x / (1.0 + x); // implicit: rate→∞ ⇒ β→1 (no overshoot); bounds rate·dt
+fn drag_alpha_for_particle_from_alpha(i: u32, ph_i: u32, base_alpha: f32) -> f32 {
+    var a = base_alpha;
+    // α_s excludes self to keep the water density field a neighbor sum. For a grain's own Darcy
+    // probe, include its occupied volume so an isolated or surface grain still carries a finite
+    // packed-bed resistance in the symmetric harmonic pair rate.
+    if (ph_i == PHASE_GRAIN) {
+        a = a + grain_eff_volume(pred[i].w) * w_poly6(0.0, params.coupling_h);
+    }
+    return min(a, 0.95);
 }
 
-// Live-porosity drag (wetting only): the local drag rate scales with local permeability k(φ_f),
-// φ_f = 1−α_s, relative to the reference porosity the build-time rate was resolved at. The K-C
-// d²/180 cancels in the ratio, so this is a pure porosity factor. As the bed wets/swells, α_s↑ ⇒
-// φ_f↓ ⇒ k↓ ⇒ rate↑ ⇒ drainage slows. (Bulk-correct; a harmonic-k pair blend would be sharper at a
-// porosity discontinuity — deferred.)
-const WET_REF_POROSITY: f32 = 0.40; // must match Materials.porosity (build-time drag resolution)
-fn porosity_drag_factor(a_s: f32) -> f32 {
-    let phi = clamp(1.0 - a_s, 0.35, 0.999); // K-C/drag porosity floor: finite dense-bed drag
-    let pr = WET_REF_POROSITY;
-    let num = pr * pr * pr * (1.0 - phi) * (1.0 - phi);
-    let den = phi * phi * phi * (1.0 - pr) * (1.0 - pr);
-    return num / max(den, 1.0e-12); // k_ref / k_local
+fn darcy_beta_from_alpha(a_s: f32) -> f32 {
+    let eps = clamp(1.0 - a_s, 0.35, 0.999);
+    let solid = 1.0 - eps;
+    let d2 = max(params.grain_diameter * params.grain_diameter, 1.0e-8);
+    return params.drag_scale * 150.0 * solid * solid / max(eps * eps * eps * d2, 1.0e-12);
+}
+
+fn harmonic_pair(a: f32, b: f32) -> f32 {
+    return (2.0 * a * b) / max(a + b, 1.0e-12);
+}
+
+fn particle_volume(ph: u32, w: f32) -> f32 {
+    if (ph == PHASE_GRAIN) { return grain_eff_volume(w); }
+    return max(water_eff_mass(w) / max(params.rest_density, 1.0e-12), 0.0);
 }
 
 @compute @workgroup_size(256)
@@ -177,13 +185,7 @@ fn compute_coupling_scale(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (i >= params.particle_count) { return; }
     let ph_i = phase[i];
     let xi = pred[i].xyz;
-    // Per-particle drag RATE: the local-porosity-modulated rate when wetting OR fines are active
-    // (both change local k via α_s), else the global rate. The fines clause extends the
-    // live-porosity gate so a no-wetting fines scene still drives drag from local permeability.
-    var rate_i = params.drag_gamma;
-    if (params.k_abs > 0.0 || params.fines.x > 0.0) {
-        rate_i = params.drag_gamma * porosity_drag_factor(alpha_s[i]);
-    }
+    var a_scan = 0.0;
     var n = 0.0;
 
     let base = cell_coord(xi);
@@ -200,42 +202,38 @@ fn compute_coupling_scale(@builtin(global_invocation_id) gid: vec3<u32>) {
                 for (var s = lo; s < hi; s = s + 1u) {
                     let j = sorted_indices[s];
                     if (j == i) { continue; }
-                    if (phase[j] == ph_i) { continue; }
                     let r = length(xi - pred[j].xyz);
                     if (r >= params.coupling_h) { continue; }
-                    n = n + 1.0;
+                    if (phase[j] == PHASE_GRAIN) {
+                        a_scan = a_scan + grain_eff_volume(pred[j].w) * w_poly6(r, params.coupling_h);
+                    }
+                    if (phase[j] != ph_i) {
+                        n = n + 1.0;
+                    }
                 }
             }
         }
     }
 
-    // Cap so Σ_j s ≤ β_max (anti-overshoot): each pair scale ≤ β_max/N.
-    let cap_i = params.drag_beta_max / max(n, 1.0);
-    if (params.fines.x > 0.0) {
-        // Harmonic-k path: store the raw rate + the cap. drag_delta_for_pair forms the symmetric
-        // harmonic-mean-k pair scale (= arithmetic mean of rates, since rate ∝ 1/k) and caps it.
-        coupling_scale[i] = vec2<f32>(rate_i, n);
-    } else {
-        // Legacy/global path: capped β in .x; .y carries the diagnostic opposite-phase count.
-        coupling_scale[i] = vec2<f32>(min(beta_from_rate(rate_i), cap_i), n);
-    }
+    let a_from_neighbors = min(a_scan, params.packing_limit);
+    let beta_i = darcy_beta_from_alpha(drag_alpha_for_particle_from_alpha(
+        i,
+        ph_i,
+        max(alpha_s[i], a_from_neighbors),
+    ));
+    coupling_scale[i] = vec2<f32>(beta_i, n);
 }
 
 fn drag_delta_for_pair(i: u32, j: u32, self_phase: u32) -> vec3<f32> {
     let cs_i = coupling_scale[i];
     let cs_j = coupling_scale[j];
-    var s: f32;
-    if (params.fines.x > 0.0) {
-        // Harmonic mean of the per-particle permeabilities ⟺ arithmetic mean of their drag rates
-        // (rate ∝ 1/k) — dominated by the lower-k / higher-resistance side, so a clog barrier holds
-        // at its edge instead of leaking (min(rate) would pick the clear side). Symmetric in (i,j),
-        // so the pair impulse stays equal-and-opposite (momentum conserved).
-        let rate_pair = 0.5 * (cs_i.x + cs_j.x);
-        let cap_pair = params.drag_beta_max / max(max(cs_i.y, cs_j.y), 1.0);
-        s = min(beta_from_rate(rate_pair), cap_pair);
-    } else {
-        s = min(cs_i.x, cs_j.x); // legacy/global: min of capped betas (byte-identical)
-    }
+    let beta_pair = harmonic_pair(cs_i.x, cs_j.x);
+    let cap_pair = params.drag_beta_max / max(max(cs_i.y, cs_j.y), 1.0);
+    let v_pair = harmonic_pair(
+        particle_volume(self_phase, pred[i].w),
+        particle_volume(phase[j], pred[j].w),
+    );
+    let s = min(cap_pair, max(beta_pair, 0.0) * v_pair * params.dt);
     // Effective masses (swelling) keep momentum conserved.
     let m_i = eff_mass(self_phase, pred[i].w);
     let m_j = eff_mass(phase[j], pred[j].w);

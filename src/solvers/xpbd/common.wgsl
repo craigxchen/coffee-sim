@@ -52,7 +52,7 @@ struct Params {
     grain_volume: f32,        // (π/6)·grain_diameter³ — effective volume for the α_s sum
     packing_limit: f32,       // α_s clamp (~0.64)
     exclusion_relax: f32,     // under-relaxation on the A.2 correction
-    drag_gamma: f32,
+    drag_scale: f32,
     drag_beta_max: f32,
     buoyancy_scale: f32,
     wake_threshold: f32,
@@ -127,10 +127,8 @@ struct Status {
 // Frozen velocity snapshot for symmetric water↔grain drag gathers. Both drag passes read the
 // same snapshot so every pair computes equal-and-opposite impulses without atomics.
 @group(0) @binding(15) var<storage, read_write> vel_frozen: array<vec4<f32>>;
-// Per-particle drag blend cap computed from the opposite-phase neighbor count.
-// Per-particle drag pairing data. Legacy/global path: (.x = capped β, .y = unused). Harmonic-k path
-// (fines active): (.x = raw drag rate ∝ 1/k_local, .y = anti-overshoot cap) — drag_delta_for_pair
-// forms the symmetric harmonic-mean-k pair scale from these.
+// Per-particle drag pairing data: (.x = raw local Darcy rate β_i, .y = opposite-phase neighbor
+// count N_i). drag_delta_for_pair forms the symmetric harmonic pair rate and caps by β_max/N.
 @group(0) @binding(16) var<storage, read_write> coupling_scale: array<vec2<f32>>;
 // Per-particle count of ELIGIBLE opposite-species neighbors for absorption (wetting): water → N_w
 // (# unsaturated grains), grain → N_g (# non-empty waters). Written by wet_count, read by both
