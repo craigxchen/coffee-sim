@@ -103,7 +103,7 @@ struct Params {
     cp_grain: f32,     // grain specific heat (C_grain = grain_eff_mass·cp_grain)
     h_amb: f32,        // ambient heat-loss rate
     t_amb: f32,        // ambient temperature
-    _pad_chem0: f32,
+    coupling_h: f32,
     _pad_chem1: f32,
     // --- fines migration (Phase 6); vec4-aligned tail (rate/gate, seed, crit_flux, _) ---
     fines: [f32; 4],
@@ -279,6 +279,10 @@ pub struct XpbdDiagnostics {
     pub effective_iters: u32,
     /// Final max constraint residual: over-density (water) or normalized penetration (grain).
     pub residual: f32,
+    /// Mean opposite-phase neighbor count from the latest coupling-scale pass.
+    pub coupling_neighbors_avg: f32,
+    /// Max opposite-phase neighbor count from the latest coupling-scale pass.
+    pub coupling_neighbors_max: f32,
 }
 
 pub struct XpbdSolver {
@@ -318,6 +322,8 @@ pub struct XpbdSolver {
     vel_smoothed: wgpu::Buffer,
     vel_frozen: wgpu::Buffer,
     lambda: wgpu::Buffer,
+    alpha_s: wgpu::Buffer,
+    coupling_scale: wgpu::Buffer,
     phase: Arc<wgpu::Buffer>,
     status: wgpu::Buffer,
     status_readback: wgpu::Buffer,
@@ -621,6 +627,49 @@ impl XpbdSolver {
         self.params.particle_mass / self.params.rest_density
     }
 
+    /// Coupling/porosity support radius `h_c` (dev/test only).
+    pub fn coupling_radius(&self) -> f32 {
+        self.params.coupling_h
+    }
+
+    /// Read back per-particle solid fraction α_s (dev/test only — stalls the GPU).
+    pub fn read_alpha_s(&self) -> Vec<f32> {
+        self.read_f32(&self.alpha_s)
+    }
+
+    /// Read back per-particle coupling scale/count lanes (dev/test only — stalls the GPU).
+    pub fn read_coupling_scale(&self) -> Vec<[f32; 2]> {
+        let size = (self.active_count as u64) * 8;
+        let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("vec2-readback"),
+            size: size.max(4),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut enc = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("vec2-readback"),
+            });
+        enc.copy_buffer_to_buffer(&self.coupling_scale, 0, &readback, 0, size);
+        self.queue.submit(Some(enc.finish()));
+        let slice = readback.slice(0..size);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        let _ = self.device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        });
+        rx.recv().unwrap().unwrap();
+        let data = slice.get_mapped_range();
+        let out: Vec<[f32; 2]> = bytemuck::cast_slice(&data).to_vec();
+        drop(data);
+        readback.unmap();
+        out
+    }
+
     /// Overwrite current particle velocities (dev/test only).
     pub fn write_velocities_for_test(&self, velocities: &[[f32; 4]]) {
         assert_eq!(
@@ -699,6 +748,32 @@ impl XpbdSolver {
         out
     }
 
+    fn read_f32(&self, src: &wgpu::Buffer) -> Vec<f32> {
+        let size = (self.active_count as u64) * 4;
+        let mut enc = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("f32-readback"),
+            });
+        enc.copy_buffer_to_buffer(src, 0, &self.pos_readback, 0, size);
+        self.queue.submit(Some(enc.finish()));
+        let slice = self.pos_readback.slice(0..size);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        let _ = self.device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        });
+        rx.recv().unwrap().unwrap();
+        let data = slice.get_mapped_range();
+        let out: Vec<f32> = bytemuck::cast_slice(&data).to_vec();
+        drop(data);
+        self.pos_readback.unmap();
+        out
+    }
+
     /// Sample GPU diagnostics (status + per-pass timestamps) into the caches that
     /// `metrics()`/`profile()` return. Blocks (dev/test/periodic only).
     pub fn sample_diagnostics(&mut self) {
@@ -733,7 +808,31 @@ impl XpbdSolver {
             max_occupancy: raw.max_occupancy,
             effective_iters: raw.effective_iters,
             residual: f32::from_bits(raw.residual_bits),
+            coupling_neighbors_avg: self.cached_diag.coupling_neighbors_avg,
+            coupling_neighbors_max: self.cached_diag.coupling_neighbors_max,
         };
+
+        // Coupling neighbor-count diagnostics piggyback on coupling_scale.y, avoiding another
+        // storage binding in the already-tight drag passes.
+        if self.has_water && self.has_grain {
+            let counts = self.read_coupling_scale();
+            let mut sum = 0.0f32;
+            let mut n = 0.0f32;
+            let mut max_count = 0.0f32;
+            for c in counts {
+                let count = c[1];
+                if count.is_finite() {
+                    sum += count;
+                    n += 1.0;
+                    max_count = max_count.max(count);
+                }
+            }
+            self.cached_diag.coupling_neighbors_avg = if n > 0.0 { sum / n } else { 0.0 };
+            self.cached_diag.coupling_neighbors_max = max_count;
+        } else {
+            self.cached_diag.coupling_neighbors_avg = 0.0;
+            self.cached_diag.coupling_neighbors_max = 0.0;
+        }
 
         // --- timestamps ---
         if let Some(ts) = &self.ts {
@@ -1120,10 +1219,16 @@ impl Solver for XpbdSolver {
         };
         let grain_volume = std::f32::consts::FRAC_PI_6 * mats.grain_diameter.powi(3);
 
-        // Grid cell must cover the largest neighbor query: the water support radius h, OR the
-        // grain contact diameter when grains are coarser than the water (so grain neighbors aren't
-        // missed). For single-resolution scenes (grain_diameter ≤ h) this is just h.
-        let cell_size = h.max(mats.grain_diameter);
+        // Grid cell must cover the largest neighbor query. Keep legacy single-resolution scenes
+        // byte-stable (`grain_diameter <= h` => h_c=h); widen only when water is finer than grains.
+        let coupling_h = if mats.coupling_radius > 0.0 {
+            mats.coupling_radius
+        } else if mats.grain_diameter > h {
+            2.5 * mats.grain_diameter
+        } else {
+            h
+        };
+        let cell_size = h.max(mats.grain_diameter).max(coupling_h);
         let nx = (((scene.box_max[0] - scene.box_min[0]) / cell_size).ceil() as u32).max(1);
         let ny = (((scene.box_max[1] - scene.box_min[1]) / cell_size).ceil() as u32).max(1);
         let nz = (((scene.box_max[2] - scene.box_min[2]) / cell_size).ceil() as u32).max(1);
@@ -1214,7 +1319,7 @@ impl Solver for XpbdSolver {
             cp_grain: mats.cp_grain,
             h_amb: mats.h_amb,
             t_amb: mats.t_amb,
-            _pad_chem0: 0.0,
+            coupling_h,
             _pad_chem1: 0.0,
             // Fines: gate/scale from Config, per-grain seed + critical flux from Materials. When
             // fines_rate == 0 (default) no fines kernel runs and the seed lane stays inert.
@@ -1285,7 +1390,7 @@ impl Solver for XpbdSolver {
         );
         // Per-particle solid fraction α_s (coupling). Zero-initialized by wgpu, so single-species
         // scenes (which never run compute_fractions) read α_s=0 → the water solve is unmodulated.
-        let alpha_s = Self::storage(&device, "xpbd-alpha-s", f32s, wgpu::BufferUsages::empty());
+        let alpha_s = Self::storage(&device, "xpbd-alpha-s", f32s, wgpu::BufferUsages::COPY_SRC);
         let fluid_impulse = Self::storage(
             &device,
             "xpbd-fluid-impulse",
@@ -1297,7 +1402,7 @@ impl Solver for XpbdSolver {
             &device,
             "xpbd-coupling-scale",
             2 * f32s,
-            wgpu::BufferUsages::empty(),
+            wgpu::BufferUsages::COPY_SRC,
         );
         // Per-particle eligible-opposite-species neighbor count for the wetting allocation (u32).
         let wet_count = Self::storage(&device, "xpbd-wet-count", f32s, wgpu::BufferUsages::empty());
@@ -1983,6 +2088,8 @@ impl Solver for XpbdSolver {
             vel_smoothed,
             vel_frozen,
             lambda,
+            alpha_s,
+            coupling_scale,
             phase,
             status,
             status_readback,

@@ -8,6 +8,7 @@
 
 use coffee_sim::engine::scene::{SeedRegion, Species};
 use coffee_sim::engine::Scene;
+use coffee_sim::models::permeability::{drag_rate, kozeny_carman};
 use coffee_sim::models::Materials;
 use coffee_sim::solvers::base::Solver;
 use coffee_sim::solvers::xpbd::XpbdSolver;
@@ -60,6 +61,54 @@ fn pnorm(p: [f32; 3]) -> f32 {
     (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt()
 }
 
+fn coupling_probe_config() -> Config {
+    Config {
+        max_iters: 1,
+        min_iters: 1,
+        bed_max_iters: 0,
+        xsph_viscosity_c: 0.0,
+        exclusion_relax: 0.0,
+        drag_subiters: 1,
+        buoyancy_scale: 0.0,
+        seed_jitter: 0.0,
+        ..Config::default()
+    }
+}
+
+fn embedded_bed_scene() -> Scene {
+    Scene {
+        gravity: [0.0, 0.0, 0.0],
+        box_min: [0.0, 0.0, 0.0],
+        box_max: [8.0, 8.0, 8.0],
+        regions: vec![
+            SeedRegion {
+                min: [2.0, 2.0, 2.0],
+                max: [6.0, 6.0, 6.0],
+                species: Species::Grain,
+            },
+            SeedRegion {
+                min: [2.1, 2.1, 2.1],
+                max: [5.9, 5.9, 5.9],
+                species: Species::Water,
+            },
+        ],
+        ..Scene::default()
+    }
+}
+
+fn variance(values: &[f32]) -> f32 {
+    let mean = values.iter().sum::<f32>() / values.len().max(1) as f32;
+    values.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / values.len().max(1) as f32
+}
+
+fn water_values(values: &[f32], phase: &[u32]) -> Vec<f32> {
+    values
+        .iter()
+        .zip(phase)
+        .filter_map(|(&v, &ph)| (ph == 0).then_some(v))
+        .collect()
+}
+
 fn drag_only_config() -> Config {
     Config {
         max_iters: 0,
@@ -83,6 +132,243 @@ fn buoyancy_only_config(scale: f32) -> Config {
         grain_sleep_speed: 0.0,
         wake_threshold: 0.0,
         ..Config::default()
+    }
+}
+
+#[test]
+fn wide_coupling_radius_smooths_and_bounds_alpha_s_for_fine_water() {
+    let Some(gpu) = GpuContext::new_headless() else {
+        eprintln!("xpbd_coupling: no GPU adapter; skipping.");
+        return;
+    };
+    let scene = embedded_bed_scene();
+    let cfg = coupling_probe_config();
+    let baseline_mats = Materials {
+        particle_spacing: 0.45,
+        support_radius: 0.9,
+        grain_diameter: 1.0,
+        coupling_radius: 0.9,
+        ..Materials::default()
+    };
+    let wide_mats = Materials {
+        coupling_radius: 2.5,
+        ..baseline_mats.clone()
+    };
+
+    let mut baseline = XpbdSolver::build(&scene, &baseline_mats, &cfg, &gpu);
+    baseline.step(0.0, &EmissionInput::default());
+    let phase = baseline.read_phases();
+    let baseline_alpha = water_values(&baseline.read_alpha_s(), &phase);
+
+    let mut wide = XpbdSolver::build(&scene, &wide_mats, &cfg, &gpu);
+    wide.step(0.0, &EmissionInput::default());
+    let wide_alpha = water_values(&wide.read_alpha_s(), &wide.read_phases());
+
+    assert_eq!(baseline_alpha.len(), wide_alpha.len());
+    assert!(
+        (wide.coupling_radius() - 2.5).abs() < 1.0e-6,
+        "fine-water bed should use explicit h_c=2.5, got {}",
+        wide.coupling_radius()
+    );
+    assert!(
+        wide_alpha
+            .iter()
+            .all(|&a| (0.0..=cfg.packing_limit + 1.0e-6).contains(&a)),
+        "wide h_c α_s exceeded [0, packing_limit]"
+    );
+    let baseline_var = variance(&baseline_alpha);
+    let wide_var = variance(&wide_alpha);
+    assert!(
+        wide_var < baseline_var * 0.75,
+        "wide h_c should smooth water-sampled α_s: baseline var {baseline_var:.6}, wide var {wide_var:.6}"
+    );
+}
+
+#[test]
+fn porosity_drag_factor_uses_dense_bed_epsilon_floor() {
+    let Some(gpu) = GpuContext::new_headless() else {
+        eprintln!("xpbd_coupling: no GPU adapter; skipping.");
+        return;
+    };
+    let scene = Scene {
+        gravity: [0.0, 0.0, 0.0],
+        box_min: [0.0, 0.0, 0.0],
+        box_max: [8.0, 8.0, 8.0],
+        regions: vec![
+            SeedRegion {
+                min: [4.0, 4.0, 4.0],
+                max: [4.0, 4.0, 4.0],
+                species: Species::Grain,
+            },
+            SeedRegion {
+                min: [4.0, 4.0, 4.0],
+                max: [4.0, 4.0, 4.0],
+                species: Species::Water,
+            },
+        ],
+        ..Scene::default()
+    };
+    let cfg = Config {
+        packing_limit: 0.95,
+        fines_rate: 1.0,
+        ..coupling_probe_config()
+    };
+    let mats = Materials {
+        particle_spacing: 1.0,
+        support_radius: 1.0,
+        grain_diameter: 1.0,
+        coupling_radius: 1.0,
+        ..Materials::default()
+    };
+    let mut solver = XpbdSolver::build(&scene, &mats, &cfg, &gpu);
+    solver.step(0.0, &EmissionInput::default());
+
+    let phase = solver.read_phases();
+    let alpha = water_values(&solver.read_alpha_s(), &phase);
+    assert!(
+        alpha.iter().any(|&a| a > 0.65),
+        "dense probe did not produce α_s above the ε floor trigger: max {:.3}",
+        alpha.iter().copied().fold(0.0, f32::max)
+    );
+
+    let counts = solver.read_coupling_scale();
+    let max_rate = counts.iter().map(|c| c[0]).fold(0.0, f32::max);
+    let pr = 0.40f32;
+    let eps_floor = 0.35f32;
+    let floor_factor =
+        pr.powi(3) * (1.0 - eps_floor).powi(2) / (eps_floor.powi(3) * (1.0 - pr).powi(2));
+    let resolved = drag_rate(
+        kozeny_carman(mats.grain_diameter, mats.porosity),
+        cfg.drag_gamma,
+    );
+    assert!(
+        max_rate.is_finite() && max_rate <= resolved * floor_factor * 1.001,
+        "ε floor should keep live porosity drag finite and capped: max_rate {max_rate}, floor cap {}",
+        resolved * floor_factor
+    );
+}
+
+#[test]
+fn water_pbf_residual_is_unchanged_when_only_coupling_radius_differs() {
+    let Some(gpu) = GpuContext::new_headless() else {
+        eprintln!("xpbd_coupling: no GPU adapter; skipping.");
+        return;
+    };
+    let scene = Scene::dam_break();
+    let cfg = Config {
+        seed_jitter: 0.0,
+        xsph_viscosity_c: 0.0,
+        ..Config::default()
+    };
+    let mats_h = Materials {
+        coupling_radius: 0.0,
+        ..Materials::default()
+    };
+    let mats_hc = Materials {
+        coupling_radius: 6.0,
+        ..Materials::default()
+    };
+    let mut baseline = XpbdSolver::build(&scene, &mats_h, &cfg, &gpu);
+    let mut wide = XpbdSolver::build(&scene, &mats_hc, &cfg, &gpu);
+    for _ in 0..3 {
+        baseline.step(1.0 / 60.0, &EmissionInput::default());
+        wide.step(1.0 / 60.0, &EmissionInput::default());
+    }
+    baseline.sample_diagnostics();
+    wide.sample_diagnostics();
+    let rb = baseline.diagnostics().residual;
+    let rw = wide.diagnostics().residual;
+    assert!(
+        (rb - rw).abs() < 1.0e-5,
+        "pure-water PBF residual should stay on h when h_c differs: h {rb:.8}, h_c {rw:.8}"
+    );
+}
+
+#[test]
+fn coupling_neighbor_count_diagnostics_are_readable() {
+    let Some(gpu) = GpuContext::new_headless() else {
+        eprintln!("xpbd_coupling: no GPU adapter; skipping.");
+        return;
+    };
+    let scene = embedded_bed_scene();
+    let cfg = coupling_probe_config();
+    let mats = Materials {
+        particle_spacing: 0.45,
+        support_radius: 0.9,
+        grain_diameter: 1.0,
+        coupling_radius: 2.5,
+        ..Materials::default()
+    };
+    let mut solver = XpbdSolver::build(&scene, &mats, &cfg, &gpu);
+    solver.step(0.0, &EmissionInput::default());
+    solver.sample_diagnostics();
+    let diag = solver.diagnostics();
+    assert!(
+        diag.coupling_neighbors_avg > 0.0
+            && diag.coupling_neighbors_max >= diag.coupling_neighbors_avg,
+        "expected readable avg/max opposite-phase counts, got avg {:.2}, max {:.2}",
+        diag.coupling_neighbors_avg,
+        diag.coupling_neighbors_max
+    );
+    assert!(
+        diag.coupling_neighbors_max < 1024.0,
+        "wide h_c neighbor count spike exceeded the U1 budget: max {:.0}",
+        diag.coupling_neighbors_max
+    );
+}
+
+#[test]
+fn legacy_single_resolution_alpha_s_is_unchanged_when_hc_resolves_to_h() {
+    let Some(gpu) = GpuContext::new_headless() else {
+        eprintln!("xpbd_coupling: no GPU adapter; skipping.");
+        return;
+    };
+    let scene = Scene {
+        gravity: [0.0, 0.0, 0.0],
+        box_min: [0.0, 0.0, 0.0],
+        box_max: [8.0, 8.0, 8.0],
+        regions: vec![
+            SeedRegion {
+                min: [4.0, 4.0, 4.0],
+                max: [4.0, 4.0, 4.0],
+                species: Species::Grain,
+            },
+            SeedRegion {
+                min: [5.0, 4.0, 4.0],
+                max: [5.0, 4.0, 4.0],
+                species: Species::Water,
+            },
+        ],
+        ..Scene::dam_through_sand()
+    };
+    let cfg = coupling_probe_config();
+    let default_mats = Materials::default();
+    let explicit_mats = Materials {
+        coupling_radius: default_mats.support_radius,
+        ..default_mats.clone()
+    };
+    let mut derived = XpbdSolver::build(&scene, &default_mats, &cfg, &gpu);
+    let mut explicit = XpbdSolver::build(&scene, &explicit_mats, &cfg, &gpu);
+    assert_eq!(
+        derived.coupling_radius().to_bits(),
+        default_mats.support_radius.to_bits(),
+        "legacy single-resolution scene should derive h_c=h"
+    );
+    derived.step(0.0, &EmissionInput::default());
+    explicit.step(0.0, &EmissionInput::default());
+    let a = derived.read_alpha_s();
+    let b = explicit.read_alpha_s();
+    assert_eq!(a.len(), b.len());
+    let mut a_bits: Vec<u32> = a.iter().map(|x| x.to_bits()).collect();
+    let mut b_bits: Vec<u32> = b.iter().map(|x| x.to_bits()).collect();
+    a_bits.sort_unstable();
+    b_bits.sort_unstable();
+    for (idx, (&x, &y)) in a_bits.iter().zip(&b_bits).enumerate() {
+        assert_eq!(
+            x,
+            y,
+            "legacy h_c=h α_s byte-value multiset changed at sorted slot {idx}: {x:#010x} vs {y:#010x}"
+        );
     }
 }
 
