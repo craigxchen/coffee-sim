@@ -138,10 +138,14 @@ struct Status {
 @group(0) @binding(17) var<storage, read_write> wet_neighbors: array<u32>;
 // Transient per-cell particle counter for the counting-sort grid build (count → scan → scatter).
 @group(0) @binding(18) var<storage, read_write> cell_count: array<atomic<u32>>;
+// Wall pressure-gradient g_b = ρ₀·f_i·ψ'(d)·n̂ for near-wall water (.xyz; .w unused). Staged by
+// compute_boundary, read by compute_lambda (constraint Jacobian) + compute_dp (wall-normal force).
+// Bound only by those three passes (absent from every other kernel's auto-derived layout).
+@group(0) @binding(28) var<storage, read_write> boundary_grad: array<vec4<f32>>;
 
 // Static SDF solid geometry (read-only). Each Primitive is a cavity: sample > 0 inside (allowed),
 // < 0 through the wall. Only the collision passes (apply_dp / apply_drag_pred) reach `solid_union`,
-// so this binding is absent from every other kernel's auto-derived layout (8-buffer budget holds).
+// so this binding is absent from every other kernel's auto-derived layout (well within the 16-buffer budget).
 // Byte-identical to the Rust `Primitive` (64 bytes). Cone radii in `a` are OUTER wall radii.
 struct Primitive {
     kind: u32,          // 0 = cone, 1 = cylinder
@@ -371,6 +375,18 @@ fn boundary_psi(d: f32, h: f32) -> f32 {
     let t9 = t7 * t2;
     let poly = t - (4.0 / 3.0) * t3 + (6.0 / 5.0) * t5 - (4.0 / 7.0) * t7 + (1.0 / 9.0) * t9;
     return 0.5 - (315.0 / 256.0) * poly;
+}
+
+// dψ/dd — the analytic derivative of boundary_psi, for the wall PRESSURE-gradient term (the matching
+// force to the density compensation above). poly'(t) = 1 − 4t² + 6t⁴ − 4t⁶ + t⁸ = (1 − t²)⁴, so
+// ψ'(d) = −(315/256)·(1 − t²)⁴ / h, t = d/h. Negative (ψ rises toward the wall) and 0 at |d| ≥ h
+// (clamped t ⇒ (1−t²)=0). Used as g_b = ρ₀·f_i·ψ'(d)·n̂ (n̂ = inward SDF normal): g_b points TOWARD
+// the wall; the applied force is λ_i·g_b, and over-density (λ_i<0) makes it push INTO the fluid.
+fn boundary_psi_deriv(d: f32, h: f32) -> f32 {
+    let t = clamp(d / h, -1.0, 1.0);
+    let u = 1.0 - t * t; // (1 − t²) ≥ 0
+    let u2 = u * u;
+    return -(315.0 / 256.0) * (u2 * u2) / h; // (1 − t²)⁴ / h, negated
 }
 
 // --- Phase-1.4 swelling + effective mass (from the moisture lane: grain pred.w = V_abs, water = f_w).
@@ -684,14 +700,10 @@ fn finalize(@builtin(global_invocation_id) gid: vec3<u32>) {
                     let fric = min(hit.friction * abs(vn), vt); // Coulomb: bounded by the normal impulse
                     v = v - (v / vt) * fric;
                 }
-                // No-upward-slip wall condition for water: the PBF boundary under-density lets a
-                // confined pool over-pressure UP the wall, and Coulomb friction can't hold the slider
-                // (it scales with the ~0 normal velocity), so a thin sheet climbs above the surface.
-                // Cancel the UPWARD wall-tangential velocity; downward drainage is untouched. No-op for
-                // grains (their wall standoff + repose friction already handle this).
-                if (phase[i] != PHASE_GRAIN && v.y > 0.0) {
-                    v.y = 0.0;
-                }
+                // (The former no-upward-slip heuristic for water is gone: the wall now exerts a real
+                // pressure force in the density solve — compute_boundary's g_b + compute_dp's λ_i·g_b —
+                // so a near-wall pool reaches hydrostatic balance and no longer climbs. The structural
+                // fix replaces the velocity hack; see the boundary-pressure-force change.)
             }
             if (prim.kind == 1u
                 && xi.y - prim.a.x < contact

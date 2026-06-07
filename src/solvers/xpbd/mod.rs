@@ -333,6 +333,9 @@ pub struct XpbdSolver {
     chem: Arc<wgpu::Buffer>,
     // The per-substep snapshot the dissolution/thermal passes read while writing the live `chem`.
     chem_frozen: wgpu::Buffer,
+    // Per-particle wall pressure-gradient g_b (binding 28): staged by compute_boundary, read by
+    // compute_lambda (constraint Jacobian) + compute_dp (wall-normal force). Sized to capacity.
+    boundary_grad: wgpu::Buffer,
     // Cell-order reorder scratch (gather targets for the water-loop locality reorder; copied back into
     // the live buffers each rebuild). Sized to capacity; only the active range is touched.
     pos_scratch: wgpu::Buffer,
@@ -597,6 +600,12 @@ impl XpbdSolver {
         self.read_vec4(self.vel.as_ref())
     }
 
+    /// Read back the per-particle PBF multiplier λ (dev/test only — stalls the GPU). Holds the last
+    /// density iteration's value; used by the boundary-force sign gate (over-density ⇒ λ<0).
+    pub fn read_lambda(&self) -> Vec<f32> {
+        self.read_f32(&self.lambda)
+    }
+
     /// Read back the per-particle moisture lane `pos.w` (dev/test only — stalls the GPU):
     /// water = remaining-volume fraction `f_w` (1 = full), grain = absorbed volume `V_abs`.
     pub fn read_moisture(&self) -> Vec<f32> {
@@ -632,6 +641,12 @@ impl XpbdSolver {
     /// Read back per-particle solid fraction α_s (dev/test only — stalls the GPU).
     pub fn read_alpha_s(&self) -> Vec<f32> {
         self.read_f32(&self.alpha_s)
+    }
+
+    /// Read back the per-particle wall pressure-gradient `g_b` (`.xyz`; dev/test only — stalls the
+    /// GPU). Holds the value from the last density iteration; used by the boundary-force sign gate.
+    pub fn read_boundary_grad(&self) -> Vec<[f32; 4]> {
+        self.read_vec4(&self.boundary_grad)
     }
 
     /// Read back per-particle coupling scale/count lanes (dev/test only — stalls the GPU).
@@ -1373,7 +1388,7 @@ impl Solver for XpbdSolver {
             vec4,
             wgpu::BufferUsages::empty(),
         );
-        let lambda = Self::storage(&device, "xpbd-lambda", f32s, wgpu::BufferUsages::empty());
+        let lambda = Self::storage(&device, "xpbd-lambda", f32s, wgpu::BufferUsages::COPY_SRC); // read back by the boundary-force sign gate
         let dp = Self::storage(&device, "xpbd-dp", vec4, wgpu::BufferUsages::empty());
         let c_residual =
             Self::storage(&device, "xpbd-cresidual", f32s, wgpu::BufferUsages::empty());
@@ -1482,6 +1497,15 @@ impl Solver for XpbdSolver {
             "xpbd-chem-frozen",
             vec4,
             wgpu::BufferUsages::empty(),
+        );
+        // Wall pressure-gradient g_b (one vec4 per particle): staged each density iteration by
+        // compute_boundary, consumed by compute_lambda + compute_dp. Inert (allocated, unbound) until
+        // the boundary-force units wire it into those bind groups.
+        let boundary_grad = Self::storage(
+            &device,
+            "xpbd-boundary-grad",
+            vec4,
+            wgpu::BufferUsages::COPY_SRC, // read back by the boundary-force sign gate (read_boundary_grad)
         );
         // Cell-order reorder scratch: gather targets for the water-loop locality reorder. COPY_SRC so
         // each is copied back into its live buffer after the gather.
@@ -1700,6 +1724,7 @@ impl Solver for XpbdSolver {
                     (10, &status),
                     (11, &phase),
                     (19, &solids),
+                    (28, &boundary_grad),
                 ],
             ),
             compute_lambda: bg(
@@ -1714,6 +1739,7 @@ impl Solver for XpbdSolver {
                     (10, &status),
                     (11, &phase),
                     (13, &alpha_s),
+                    (28, &boundary_grad),
                 ],
             ),
             residual_reduce: bg(
@@ -1732,6 +1758,7 @@ impl Solver for XpbdSolver {
                     (10, &status),
                     (11, &phase),
                     (13, &alpha_s),
+                    (28, &boundary_grad),
                 ],
             ),
             bed_project: bg(
@@ -2075,6 +2102,7 @@ impl Solver for XpbdSolver {
             pos_readback,
             chem,
             chem_frozen,
+            boundary_grad,
             pos_scratch,
             pred_scratch,
             vel_scratch,
