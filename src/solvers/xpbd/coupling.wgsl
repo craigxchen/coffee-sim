@@ -92,6 +92,7 @@ fn compute_coupling_scale(@builtin(global_invocation_id) gid: vec3<u32>) {
     let xi = pred[i].xyz;
     var a_scan = 0.0;
     var n = 0.0;
+    var sum_vw = vec3<f32>(0.0); // Σ opposite-phase (water) neighbor velocity — grain wake signal (KTD-9)
 
     let base = cell_coord(xi);
     for (var dz = -1; dz <= 1; dz = dz + 1) {
@@ -114,6 +115,7 @@ fn compute_coupling_scale(@builtin(global_invocation_id) gid: vec3<u32>) {
                     }
                     if (phase[j] != ph_i) {
                         n = n + 1.0;
+                        if (ph_i == PHASE_GRAIN) { sum_vw = sum_vw + vel[j].xyz; }
                     }
                 }
             }
@@ -127,6 +129,18 @@ fn compute_coupling_scale(@builtin(global_invocation_id) gid: vec3<u32>) {
         max(alpha_s[i], a_from_neighbors),
     ));
     coupling_scale[i] = vec2<f32>(beta_i, n);
+
+    // Drag-only, subiter-invariant wake signal (KTD-9): the grain's local relative flow speed
+    // |mean(v_water) − v_grain|, computed once per substep BEFORE the Jacobi drag subiters — so it is
+    // independent of dt / subiter count and never carries a buoyancy contribution (a hydrostatic,
+    // zero-flow saturated bed reads ≈0 and stays asleep). finalize consults it to keep a grain in
+    // moving water awake. Recomputed every substep, so it needs no explicit decay: when the flow
+    // stops it drops to ≈0 on its own and the grain re-sleeps.
+    if (ph_i == PHASE_GRAIN && n > 0.0) {
+        fluid_impulse[i] = length(sum_vw / n - vel[i].xyz);
+    } else {
+        fluid_impulse[i] = 0.0;
+    }
 }
 
 fn drag_delta_for_pair(i: u32, j: u32, self_phase: u32) -> vec3<f32> {
@@ -176,7 +190,6 @@ fn drag_water(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     vel[i] = vec4<f32>(vel_frozen[i].xyz + dv, 0.0);
-    fluid_impulse[i] = fluid_impulse[i]; // keep drag_water's auto-layout at the shared 8 buffers
 }
 
 @compute @workgroup_size(256)
@@ -210,7 +223,6 @@ fn drag_grain(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     vel[i] = vec4<f32>(vel_frozen[i].xyz + dv, 0.0);
-    fluid_impulse[i] = fluid_impulse[i] + params.grain_mass * length(dv);
 }
 
 fn pressure_for_water(i: u32) -> f32 {
@@ -254,7 +266,8 @@ fn buoyancy_grain(@builtin(global_invocation_id) gid: vec3<u32>) {
     // (per pair) keeps momentum conserved. Uniform over this grain's pairs, so scale the total.
     let dv = grain_buoyancy_factor(pred[i].w) * impulse / m_g;
     vel[i] = vec4<f32>(vel_frozen[i].xyz + dv, 0.0);
-    fluid_impulse[i] = fluid_impulse[i] + m_g * length(dv);
+    // (No wake-signal write: the drag-only wake signal is owned by compute_coupling_scale (KTD-9);
+    // buoyancy must not wake a hydrostatic saturated bed.)
 }
 
 @compute @workgroup_size(256)
