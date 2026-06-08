@@ -312,6 +312,14 @@ fn setup_for(kind: WebScene) -> (Scene, Materials, Config) {
                 extract_rate: 1.0,
                 nozzle_radius: 0.25,
                 max_speed: 25.0,
+                // Bed permeability: the explicit Darcy drag has a percolation floor of ~g·dt_substep,
+                // so at substeps=1 the bed out-drains the pour and nothing ponds. Halving the substep
+                // dt (substeps=2) plus a stronger drag cap (more sub-iters, higher β_max) cuts the
+                // drainage rate ~2× and lets a water layer build above the grounds. Scoped to the
+                // coffee scene (the only one with a bed); ~2× solve cost on this lighter scene.
+                substeps: 2,
+                drag_beta_max: 0.92,
+                drag_subiters: 6,
                 ..Config::default()
             };
             (scene, mats, cfg)
@@ -328,6 +336,9 @@ fn setup_for(kind: WebScene) -> (Scene, Materials, Config) {
             let cfg = Config {
                 nozzle_radius: 0.25,
                 max_speed: 25.0,
+                // Less velocity-smoothing at the surface so the pour's impact reads as a
+                // visible outward push/crown instead of dissolving into the pool (0.05 default).
+                xsph_viscosity_c: 0.02,
                 ..Config::default()
             };
             (scene, mats, cfg)
