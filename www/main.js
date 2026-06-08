@@ -33,6 +33,8 @@ const SPOUT_STEP = 0.1;
 const PAN_SPEED = 8.0;
 const ORBIT_SENS = 0.006;
 const ZOOM_BASE = 0.9;
+const PAN_SENS = 1.0 / 250.0; // trackpad two-finger pan (matches native PAN_SENS)
+const PINCH_SENS = 0.02; // trackpad pinch → zoom
 const MAX_RENDER_DPR = 1.5;
 const FIXED_STEP = 1 / 60;
 
@@ -152,11 +154,25 @@ function installListeners() {
     dragging = false;
     lastCursor = null;
   });
+  // CAD-style wheel routing, mirroring the native app (water_app.rs): trackpad pinch → zoom,
+  // trackpad two-finger drag → pan, mouse wheel → zoom. The browser maps a trackpad pinch to a
+  // ctrl+wheel event, a two-finger drag to a pixel-delta wheel (deltaMode 0), and a real mouse wheel
+  // to a line-delta wheel (deltaMode 1) — the same LineDelta/PixelDelta/Pinch split winit reports.
   canvas.addEventListener(
     "wheel",
     (e) => {
       e.preventDefault();
-      app.zoomCamera(Math.pow(ZOOM_BASE, -Math.sign(e.deltaY)));
+      if (!app) return;
+      if (e.ctrlKey) {
+        // pinch
+        app.zoomCamera(Math.pow(ZOOM_BASE, -e.deltaY * PINCH_SENS));
+      } else if (e.deltaMode === 0) {
+        // trackpad two-finger drag → pan
+        app.panCamera(e.deltaX * PAN_SENS, e.deltaY * PAN_SENS);
+      } else {
+        // mouse wheel → zoom
+        app.zoomCamera(Math.pow(ZOOM_BASE, -Math.sign(e.deltaY)));
+      }
     },
     { passive: false },
   );
