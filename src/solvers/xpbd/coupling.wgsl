@@ -311,6 +311,112 @@ fn buoyancy_water(@builtin(global_invocation_id) gid: vec3<u32>) {
     vel[i] = vec4<f32>(vel_frozen[i].xyz + impulse / m_w, 0.0);
 }
 
+// --- water→grain dynamic-pressure impact coupling (the pour crater; KTD-1..5/9) ----------------
+// Per-pair velocity delta for particle `i` (`self_phase`), from one opposite-phase neighbor `j`.
+// Canonical roles are assigned by PHASE (not i/j order), so the shared scalar `s` is identical no
+// matter which pass calls it → the grain (+) and water (−) impulses are exactly equal-and-opposite
+// (momentum-conserving). The stability cap is applied to `s` BEFORE the mass split, so capping never
+// breaks conservation. Reads `vel_frozen` (the stored pre-finalize velocity, which still carries the
+// jet — predict/apply_dp move only `pred`; the cushioning v=(pred−pos)/dt is deferred to finalize).
+fn impact_delta_for_pair(i: u32, j: u32, self_phase: u32) -> vec3<f32> {
+    var wi = i;
+    var gi = j;
+    if (self_phase == PHASE_GRAIN) {
+        wi = j;
+        gi = i;
+    }
+    let d = pred[gi].xyz - pred[wi].xyz; // water → grain
+    let r = length(d);
+    // NaN guard (coincident pair → no defined normal) + range cutoff.
+    if (r < 1.0e-6 || r >= params.coupling_h) {
+        return vec3<f32>(0.0);
+    }
+    let n = d / r;
+    let v_rel = vel_frozen[wi].xyz - vel_frozen[gi].xyz;
+    let approach = max(dot(v_rel, n), 0.0); // 0 unless water moves toward grain
+    if (approach <= 0.0) {
+        return vec3<f32>(0.0);
+    }
+    // Dynamic pressure ~ρv²: quadratic in approach, smoothly gated above drawdown speed.
+    let gate = approach * approach * smoothstep(V_IMPACT_MIN, V_IMPACT_FULL, approach);
+    let w = w_poly6(r, params.coupling_h);
+    let m_w = max(water_eff_mass(pred[wi].w), params.particle_mass * params.pbf_eps);
+    let m_g = grain_eff_mass(pred[gi].w);
+    let mm = m_w + m_g;
+    let s_raw = params.impact_scale * w * gate * params.dt;
+    // Cap the SHARED scalar (KTD-2/5): never reverse approach (min with `approach`), and bound the
+    // larger-side |Δv| to k·coupling_h/dt (CFL). Both act on `s` → equal-and-opposite survives.
+    let cfl = (IMPACT_CFL_K * params.coupling_h / params.dt) / max(m_w / mm, m_g / mm);
+    let s = min(s_raw, min(approach, cfl));
+    // Split: grain gets +s·(m_w/M)·n̂ (down+out at the stagnation); water gets −s·(m_g/M)·n̂.
+    if (self_phase == PHASE_GRAIN) {
+        return (s * m_w / mm) * n;
+    }
+    return (-s * m_g / mm) * n;
+}
+
+@compute @workgroup_size(256)
+fn impact_grain(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= params.particle_count) { return; }
+    if (phase[i] != PHASE_GRAIN) { return; }
+    let xi = pred[i].xyz;
+    var dv = vec3<f32>(0.0);
+
+    let base = cell_coord(xi);
+    for (var dz = -1; dz <= 1; dz = dz + 1) {
+        for (var dy = -1; dy <= 1; dy = dy + 1) {
+            for (var dx = -1; dx <= 1; dx = dx + 1) {
+                let nc = base + vec3<i32>(dx, dy, dz);
+                if (nc.x < 0 || nc.y < 0 || nc.z < 0) { continue; }
+                let dims = vec3<i32>(params.grid_dims.xyz);
+                if (nc.x >= dims.x || nc.y >= dims.y || nc.z >= dims.z) { continue; }
+                let cid = cell_id(nc);
+                let lo = cell_start[cid];
+                let hi = cell_start[cid + 1u];
+                for (var s = lo; s < hi; s = s + 1u) {
+                    let j = sorted_indices[s];
+                    if (phase[j] != PHASE_WATER) { continue; }
+                    dv = dv + impact_delta_for_pair(i, j, PHASE_GRAIN);
+                }
+            }
+        }
+    }
+
+    vel[i] = vec4<f32>(vel_frozen[i].xyz + dv, 0.0);
+}
+
+@compute @workgroup_size(256)
+fn impact_water(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= params.particle_count) { return; }
+    if (phase[i] != PHASE_WATER) { return; }
+    let xi = pred[i].xyz;
+    var dv = vec3<f32>(0.0);
+
+    let base = cell_coord(xi);
+    for (var dz = -1; dz <= 1; dz = dz + 1) {
+        for (var dy = -1; dy <= 1; dy = dy + 1) {
+            for (var dx = -1; dx <= 1; dx = dx + 1) {
+                let nc = base + vec3<i32>(dx, dy, dz);
+                if (nc.x < 0 || nc.y < 0 || nc.z < 0) { continue; }
+                let dims = vec3<i32>(params.grid_dims.xyz);
+                if (nc.x >= dims.x || nc.y >= dims.y || nc.z >= dims.z) { continue; }
+                let cid = cell_id(nc);
+                let lo = cell_start[cid];
+                let hi = cell_start[cid + 1u];
+                for (var s = lo; s < hi; s = s + 1u) {
+                    let j = sorted_indices[s];
+                    if (phase[j] != PHASE_GRAIN) { continue; }
+                    dv = dv + impact_delta_for_pair(i, j, PHASE_WATER);
+                }
+            }
+        }
+    }
+
+    vel[i] = vec4<f32>(vel_frozen[i].xyz + dv, 0.0);
+}
+
 @compute @workgroup_size(256)
 fn apply_drag_pred(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;

@@ -164,8 +164,8 @@ const PI: f32 = 3.14159265358979;
 // Smooth approach-speed threshold: below MIN the term is ~0 (percolation/jitter safe), above FULL the
 // full v² law applies. Set MIN above normal drawdown speed. IMPACT_CFL_K bounds a pair's |Δv| to
 // k·coupling_h/dt (anti-eruption, applied to the shared scalar so it stays momentum-conserving).
-const V_IMPACT_MIN: f32 = 2.0;
-const V_IMPACT_FULL: f32 = 6.0;
+const V_IMPACT_MIN: f32 = 0.5;
+const V_IMPACT_FULL: f32 = 2.5;
 const IMPACT_CFL_K: f32 = 0.5;
 
 // --- SDF cavity geometry (mirrors utils/sdf.rs; interior positive, gradient toward the cavity) ---

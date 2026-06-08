@@ -204,6 +204,8 @@ struct Pipelines {
     drag_grain: wgpu::ComputePipeline,
     buoyancy_grain: wgpu::ComputePipeline,
     buoyancy_water: wgpu::ComputePipeline,
+    impact_grain: wgpu::ComputePipeline,
+    impact_water: wgpu::ComputePipeline,
     apply_drag_pred: wgpu::ComputePipeline,
     wet_count: wgpu::ComputePipeline,
     wet_water: wgpu::ComputePipeline,
@@ -240,6 +242,8 @@ struct BindGroups {
     drag_grain: wgpu::BindGroup,
     buoyancy_grain: wgpu::BindGroup,
     buoyancy_water: wgpu::BindGroup,
+    impact_grain: wgpu::BindGroup,
+    impact_water: wgpu::BindGroup,
     apply_drag_pred: wgpu::BindGroup,
     wet_count: wgpu::BindGroup,
     wet_water: wgpu::BindGroup,
@@ -1615,6 +1619,8 @@ impl Solver for XpbdSolver {
             drag_grain: make("drag_grain"),
             buoyancy_grain: make("buoyancy_grain"),
             buoyancy_water: make("buoyancy_water"),
+            impact_grain: make("impact_grain"),
+            impact_water: make("impact_water"),
             apply_drag_pred: make("apply_drag_pred"),
             wet_count: make("wet_count"),
             wet_water: make("wet_water"),
@@ -1847,6 +1853,31 @@ impl Solver for XpbdSolver {
                     (2, &pred),
                     (3, &vel),
                     (5, &lambda),
+                    (8, &cell_start),
+                    (9, &sorted_indices),
+                    (11, &phase),
+                    (15, &vel_frozen),
+                ],
+            ),
+            // Impact passes don't read lambda — auto-layout omits binding 5, so it must not be bound.
+            impact_grain: bg(
+                &pipelines.impact_grain,
+                &[
+                    (0, &params_buf),
+                    (2, &pred),
+                    (3, &vel),
+                    (8, &cell_start),
+                    (9, &sorted_indices),
+                    (11, &phase),
+                    (15, &vel_frozen),
+                ],
+            ),
+            impact_water: bg(
+                &pipelines.impact_water,
+                &[
+                    (0, &params_buf),
+                    (2, &pred),
+                    (3, &vel),
                     (8, &cell_start),
                     (9, &sorted_indices),
                     (11, &phase),
@@ -2391,6 +2422,52 @@ impl Solver for XpbdSolver {
                         &p.buoyancy_water,
                         &b.buoyancy_water,
                         "buoyancy_water",
+                        np,
+                    );
+                    pass(
+                        &mut enc,
+                        &p.apply_drag_pred,
+                        &b.apply_drag_pred,
+                        "apply_drag_pred",
+                        np,
+                    );
+                }
+
+                // Dynamic-pressure impact coupling (the pour crater). Its OWN freeze/apply block,
+                // once per substep AFTER buoyancy — sharing the drag/buoyancy freeze would overwrite
+                // their velocity deltas (every pass writes vel = vel_frozen + dv). Reads the stored
+                // pre-finalize velocity (still the jet). No-op unless impact_scale > 0.
+                if mixed && self.params.impact_scale > 0.0 {
+                    pass(&mut enc, &p.grid_clear, &b.grid_clear, "grid_clear", nc);
+                    pass(&mut enc, &p.grid_count, &b.grid_count, "grid_count", np);
+                    pass(&mut enc, &p.grid_scan, &b.grid_scan, "grid_scan", 1);
+                    pass(&mut enc, &p.grid_clear, &b.grid_clear, "grid_clear", nc);
+                    pass(
+                        &mut enc,
+                        &p.grid_scatter,
+                        &b.grid_scatter,
+                        "grid_scatter",
+                        np,
+                    );
+                    enc.copy_buffer_to_buffer(
+                        self.vel.as_ref(),
+                        0,
+                        &self.vel_frozen,
+                        0,
+                        (self.active_count as u64) * 16,
+                    );
+                    pass(
+                        &mut enc,
+                        &p.impact_grain,
+                        &b.impact_grain,
+                        "impact_grain",
+                        np,
+                    );
+                    pass(
+                        &mut enc,
+                        &p.impact_water,
+                        &b.impact_water,
+                        "impact_water",
                         np,
                     );
                     pass(
