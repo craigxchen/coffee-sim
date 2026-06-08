@@ -56,7 +56,7 @@ struct Params {
     drag_beta_max: f32,
     buoyancy_scale: f32,
     wake_threshold: f32,
-    _pad_coupling0: f32,
+    impact_scale: f32, // dynamic-pressure crater coupling (was _pad_coupling0; 0 = off)
     // --- wetting / cohesion (Phase 1.4) ---
     r_max: f32,                // moisture ratio at saturation (mass water / mass dry grain)
     rho_ratio: f32,            // ρ_s/ρ_w — converts absorbed water mass → swelling volume
@@ -159,6 +159,14 @@ struct Primitive {
 @group(0) @binding(19) var<storage, read> solids: array<Primitive>;
 
 const PI: f32 = 3.14159265358979;
+
+// --- water→grain dynamic-pressure impact coupling (KTD-1/5; tuned in source during calibration) ---
+// Smooth approach-speed threshold: below MIN the term is ~0 (percolation/jitter safe), above FULL the
+// full v² law applies. Set MIN above normal drawdown speed. IMPACT_CFL_K bounds a pair's |Δv| to
+// k·coupling_h/dt (anti-eruption, applied to the shared scalar so it stays momentum-conserving).
+const V_IMPACT_MIN: f32 = 2.0;
+const V_IMPACT_FULL: f32 = 6.0;
+const IMPACT_CFL_K: f32 = 0.5;
 
 // --- SDF cavity geometry (mirrors utils/sdf.rs; interior positive, gradient toward the cavity) ---
 const SDF_EPS: f32 = 1.0e-6;

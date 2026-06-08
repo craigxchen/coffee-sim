@@ -78,7 +78,7 @@ struct Params {
     drag_beta_max: f32,
     buoyancy_scale: f32,
     wake_threshold: f32,
-    _pad_coupling0: f32,
+    impact_scale: f32, // dynamic-pressure crater coupling (was _pad_coupling0; 0 = off)
     // --- wetting / cohesion (Phase 1.4) ---
     r_max: f32,           // moisture ratio at saturation (mass water / mass dry grain)
     rho_ratio: f32,       // ρ_s/ρ_w — converts absorbed water mass → swelling volume
@@ -1315,7 +1315,7 @@ impl Solver for XpbdSolver {
             drag_beta_max: cfg.drag_beta_max,
             buoyancy_scale: cfg.buoyancy_scale,
             wake_threshold: cfg.wake_threshold,
-            _pad_coupling0: 0.0,
+            impact_scale: cfg.impact_scale,
             r_max: mats.r_max,
             rho_ratio: mats.rho_ratio,
             s_peak: mats.s_peak,

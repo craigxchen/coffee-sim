@@ -80,6 +80,10 @@ pub struct Config {
     /// (scene units/s) exceeds this — a drag-only, dt/subiter-invariant wake gate (KTD-9). A still or
     /// hydrostatic saturated bed reads ≈0 and sleeps; the pour mobilizes the surface. (step 2)
     pub wake_threshold: f32,
+    /// Dynamic-pressure (momentum-flux) impact scale: a center pour's downward water momentum pushes
+    /// grains down/out (crater) via a force ∝ (normal approach velocity)². Momentum-conserving,
+    /// approach-gated. `0` disables the pass (existing scenes byte-unchanged); a brew scene opts in.
+    pub impact_scale: f32,
 
     // --- wetting / cohesion (Phase 1.4) ---
     /// Absorption rate constant `k_abs` (1/s) in the bounded uptake `(1−e^{−k·dt})`. Higher = a
@@ -166,6 +170,7 @@ impl Default for Config {
             drag_subiters: 4,
             buoyancy_scale: 1.0,
             wake_threshold: 0.3, // local water flow speed (units/s) above grain_sleep_speed (KTD-9)
+            impact_scale: 0.0,   // dynamic-pressure crater coupling OFF by default (opt-in per scene)
             // Wetting OFF by default (like drag_subiters=0): scenes opt in with absorb_rate>0 until
             // the feature is calibrated. ~2 s saturation time constant when enabled; deactivate
             // water only at a tiny remaining fraction (exact conservation), skip from PBF above that.
