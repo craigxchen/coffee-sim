@@ -2442,9 +2442,25 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>) {
                 if cell.x < 0 || cell.y < 0 || cell.z < 0 { continue; }
                 if u32(cell.x) >= gx() || u32(cell.y) >= gy() || u32(cell.z) >= gz() { continue; }
                 let ci = cell_index(u32(cell.x), u32(cell.y), u32(cell.z));
-                if grid_vel[ci].w <= 1e-6 { continue; }
+                // APIC free-surface gather with velocity EXTRAPOLATION. ci's -x face
+                // is shared with the cell at x-1. When ci is air but that lower
+                // neighbour holds fluid, this is a free-surface face — but its own
+                // velocity is NOISY (only the fluid side gives it face mass, so
+                // mom/mass is under-resolved and amplified; gathering it pumps).
+                // Instead extrapolate the RELIABLE interior face just below it
+                // (the lower neighbour's same-axis face, fully supported, ~0 for a
+                // settled pool) into this surface position, so the surface particle's
+                // reconstruction is balanced AND energy-neutral (APIC). Pure-air faces
+                // (neither side fluid) are skipped.
+                var vx_src = ci;
+                if grid_vel[ci].w <= 1e-6 {
+                    if cell.x <= 0 { continue; }
+                    let lo = cell_index(u32(cell.x - 1), u32(cell.y), u32(cell.z));
+                    if grid_vel[lo].w <= 1e-6 { continue; }
+                    vx_src = lo;
+                }
                 let w = sxw[i] * wy[j] * wz[k];
-                let vx = grid_vel[ci].x;
+                let vx = grid_vel[vx_src].x;
                 let dpos = vec3<f32>(f32(i) - sfx.x, f32(j) - fx.y, f32(k) - fx.z) * cell_dx;
                 new_v.x += w * vx;
                 new_C0.x += w * B * vx * dpos.x;
@@ -2461,9 +2477,19 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>) {
                 if cell.x < 0 || cell.y < 0 || cell.z < 0 { continue; }
                 if u32(cell.x) >= gx() || u32(cell.y) >= gy() || u32(cell.z) >= gz() { continue; }
                 let ci = cell_index(u32(cell.x), u32(cell.y), u32(cell.z));
-                if grid_vel[ci].w <= 1e-6 { continue; }
+                // APIC free-surface gather + extrapolation (see the x loop): the pool's
+                // top surface. ci's -y face is shared with y-1; on a surface face,
+                // extrapolate the reliable interior face below rather than the noisy
+                // surface face.
+                var vy_src = ci;
+                if grid_vel[ci].w <= 1e-6 {
+                    if cell.y <= 0 { continue; }
+                    let lo = cell_index(u32(cell.x), u32(cell.y - 1), u32(cell.z));
+                    if grid_vel[lo].w <= 1e-6 { continue; }
+                    vy_src = lo;
+                }
                 let w = wx[i] * syw[j] * wz[k];
-                let vy = grid_vel[ci].y;
+                let vy = grid_vel[vy_src].y;
                 let dpos = vec3<f32>(f32(i) - fx.x, f32(j) - sfx.y, f32(k) - fx.z) * cell_dx;
                 new_v.y += w * vy;
                 new_C0.y += w * B * vy * dpos.x;
@@ -2480,9 +2506,17 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>) {
                 if cell.x < 0 || cell.y < 0 || cell.z < 0 { continue; }
                 if u32(cell.x) >= gx() || u32(cell.y) >= gy() || u32(cell.z) >= gz() { continue; }
                 let ci = cell_index(u32(cell.x), u32(cell.y), u32(cell.z));
-                if grid_vel[ci].w <= 1e-6 { continue; }
+                // APIC free-surface gather + extrapolation (see the x loop): ci's -z
+                // face shared with z-1; on a surface face, extrapolate the interior.
+                var vz_src = ci;
+                if grid_vel[ci].w <= 1e-6 {
+                    if cell.z <= 0 { continue; }
+                    let lo = cell_index(u32(cell.x), u32(cell.y), u32(cell.z - 1));
+                    if grid_vel[lo].w <= 1e-6 { continue; }
+                    vz_src = lo;
+                }
                 let w = wx[i] * wy[j] * szw[k];
-                let vz = grid_vel[ci].z;
+                let vz = grid_vel[vz_src].z;
                 let dpos = vec3<f32>(f32(i) - fx.x, f32(j) - fx.y, f32(k) - sfx.z) * cell_dx;
                 new_v.z += w * vz;
                 new_C0.z += w * B * vz * dpos.x;
