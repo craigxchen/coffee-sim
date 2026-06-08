@@ -2596,6 +2596,12 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>) {
     // Advect
     var new_pos = xp + new_v * dt();
 
+    // Capture the pre-contact penetration + velocity for the APIC affine fix
+    // below, before resolve_sdf_contact pushes the particle back out to the
+    // contact band.
+    let pre_contact_sdf = sample_sdf(new_pos);
+    let pre_contact_v = new_v;
+
     // Particle-level boundary projection closes the gap left by the grid-only
     // collision pass so the dripper wall behaves like a hard barrier.
     let mid_pos = mix(xp, new_pos, 0.5);
@@ -2610,6 +2616,24 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>) {
     let lo = u.grid_origin.xyz + vec3<f32>(margin);
     let hi = u.bounds_max.xyz - vec3<f32>(margin);
     new_pos = clamp(new_pos, lo, hi);
+
+    // Wall-collision APIC fix. resolve_sdf_contact zeroed the particle's inward
+    // normal velocity, but the affine matrix still carries the pre-collision
+    // normal velocity gradient; left intact it reloads normal momentum into the
+    // grid on the next p2g (mass_p*vp + C*dpos) — the wall-jitter feedback loop.
+    // Gate strictly on genuine PENETRATION (φ < 0) while moving INTO the wall.
+    // Widening to the whole contact band (φ < contact_offset) clears the affine of
+    // the resting/settling pool layer too and pumps it; restricting to φ < 0 fixes
+    // the genuine reload bug without that side effect. Project the wall-normal
+    // direction out of every affine column: C' = (I - n nᵀ) C.
+    if pre_contact_sdf < 0.0 {
+        let cn = sdf_gradient(new_pos);
+        if length(cn) > 1e-6 && dot(pre_contact_v, cn) < 0.0 {
+            new_C0 = new_C0 - cn * dot(cn, new_C0);
+            new_C1 = new_C1 - cn * dot(cn, new_C1);
+            new_C2 = new_C2 - cn * dot(cn, new_C2);
+        }
+    }
 
     particles[pid].pos = vec4<f32>(new_pos, J_new);
     particles[pid].vel = vec4<f32>(new_v, mass_p);

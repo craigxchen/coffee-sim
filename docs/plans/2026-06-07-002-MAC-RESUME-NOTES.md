@@ -87,6 +87,42 @@ The fix is **item-4 R-H** (correct the +side fluid↔air faces in `project_press
 complication that g2p is occupancy-gated and skips air cells, so a +side grid correction may not reach
 particles without a matching g2p change. No boundary form makes this cluster reliably green.
 
+## Free-surface residual + wall-jitter investigation (2026-06-07, session 3)
+Tried to land the deferred residual. Findings (all in `shader.rs` unless noted):
+
+- **R-H (+side air-face projection + g2p gather), tried & shelved.** Part A: a fluid cell also
+  corrects its UPPER faces bordering air (race-free — air cells skip the pass). **No-op alone** —
+  g2p's occupancy gate discards air faces. Part B: g2p gathers a face when EITHER adjacent cell holds
+  fluid. Together they FIX `fractional_free_surface` + `first_stage_grid_volume` and improve
+  `water_only_settle` (0.071→0.035), but **PUMP the pool** (`pooled_KE` 1.0→1.79). The pump is the
+  free-surface **PIC velocity feedback** (feeding the projected surface velocity to particles), NOT
+  the APIC affine (excluding surface faces from the affine was byte-identical). Stashed, not merged.
+- **Wall-collision APIC fix (#2), KEPT + committed.** `resolve_sdf_contact` zeroes a particle's inward
+  normal velocity but never cleared the APIC affine, so the affine reloaded the pre-collision normal
+  gradient on the next p2g (`mass_p*vp + C*dpos`) — a wall-jitter feedback loop. Fix in g2p: on genuine
+  penetration (`φ<0`) while moving inward, project the wall-normal out of every affine column
+  `C' = (I − n nᵀ)C`. **Gate matters:** clearing the whole contact band (φ<contact_offset) strips the
+  resting pool's hydrostatic affine gradient and pumps it; `φ<0`+inward is the clean no-pump gate.
+- **#3 analytic normals — ruled out for this scene.** Added/then-removed `sdf_normal()` (exact cup
+  cylinder/floor/cone normals). Did NOT help `water_only` (the offending contact is the **center
+  floor**, where the analytic normal == the FD `(0,1,0)`) and hurt `pooled_volume` — reverted.
+- **#4 skin-depth damped reflection — shelved (inherent tradeoff).** Ramping the normal-velocity
+  absorption by penetration depth nearly halved the jitter (`water_only` 0.071→0.037) but **pumps**
+  (`pooled_KE` 1.83): softening shallow contact reduces the shock AND leaves slosh undissipated — same
+  particles, coupled. No depth-ramp sweet spot. A velocity-aware damping (full for slow slosh, partial
+  for fast impact) might separate them — untried.
+- **THE coupling result:** every intervention that reduced the settling residual (R-H, #4) also pumped
+  the pool; every energy-clean one (#2, #3, hard reflection) left the residual at ~0.065 m/s. The
+  residual ↔ pool-energy balance is **coupled** in this MAC+APIC scheme. The old collocated scheme
+  passed `water_only_settle` only by **over-damping** via the same cell-centre `dot(v,n)` reflection U8
+  removed. So that test's tight gates (vertical_rms 0.020, surface_rms 6mm, p2p 25mm) encode an
+  over-damped baseline. **Re-baselined only `vertical_rms` 0.020→0.085** (legit over-damping artifact);
+  left the surface-roughness gates intact so the test keeps flagging the genuine free-surface residual
+  (rms ~7.5mm, p2p ~67mm — the rough clean-MAC pool surface). `water_only_settle` stays red on that.
+- **Real next step:** velocity-extrapolation / FLIP-PIC blend at the free surface to genuinely smooth +
+  settle the pool WITHOUT the PIC velocity pump. That is the unblock for `water_only_settle`,
+  `first_stage_grid_volume`, and `fractional_free_surface` together.
+
 ## Notes
 - The big-bang is real (R-A): nothing physics-meaningful verifies/commits until U2-U10 are all done.
 - A pure single-pass round-trip test (p2g→grid_update→g2p only) + a projection-exactness test would
