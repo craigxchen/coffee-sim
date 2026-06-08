@@ -7,9 +7,10 @@ use wgpu::{Adapter, Device, Instance, Queue};
 
 /// Wraps the `wgpu` device + queue and the data needed to create resources.
 ///
-/// Targets the WebGPU baseline limits except `max_storage_buffers_per_shader_stage`, which is
-/// raised to **16** — the real per-stage storage-buffer ceiling for this project's device/browser
-/// targets. Requests `TIMESTAMP_QUERY` only when the adapter advertises it. Headless for now: no
+/// Targets the WebGPU baseline limits except `max_storage_buffers_per_shader_stage`, which is raised
+/// to the **adapter's reported max** (the boundary-force passes need 9; the spec baseline is 8).
+/// Requesting the adapter's own max — never more — keeps `request_device` portable across native and
+/// browser. Requests `TIMESTAMP_QUERY` only when the adapter advertises it. Headless for now: no
 /// surface (rendering arrives with `ui`). The same request path compiles to WASM + WebGPU — native
 /// only wraps the async init in `pollster::block_on`.
 pub struct GpuContext {
@@ -104,14 +105,19 @@ impl GpuContext {
             wgpu::Features::empty()
         };
 
+        // The boundary-force density passes need 9 storage buffers/stage — above the WebGPU spec
+        // baseline of 8. Request the adapter's REPORTED max for that one field (never more), so
+        // request_device always succeeds: native Metal grants 16+, and modern browsers report their
+        // true device limit (typically ≥10) rather than the 8 floor. Hardcoding 16 broke browsers
+        // whose adapter caps below 16 even when ≥9 is available. All other limits stay at the WebGPU
+        // baseline for portability.
+        let max_storage = adapter.limits().max_storage_buffers_per_shader_stage;
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("coffee-sim device"),
                 required_features,
-                // 16 storage buffers per stage is the real device/browser ceiling for this project's
-                // targets. All other limits stay at the WebGPU baseline for portability.
                 required_limits: wgpu::Limits {
-                    max_storage_buffers_per_shader_stage: 16,
+                    max_storage_buffers_per_shader_stage: max_storage,
                     ..wgpu::Limits::default()
                 },
                 memory_hints: wgpu::MemoryHints::Performance,
