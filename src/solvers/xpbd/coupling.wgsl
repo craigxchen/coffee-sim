@@ -355,6 +355,35 @@ fn impact_delta_for_pair(i: u32, j: u32, self_phase: u32) -> vec3<f32> {
     return (-s * m_g / mm) * n;
 }
 
+// Water↔water dynamic-pressure impact (the pour cavity): the fast stream transfers momentum into the
+// slow pool that PBF's position projection otherwise dissipates, so the stream punches a depression
+// instead of merging flat. Equal masses → a symmetric inelastic normal impulse: `i` (this particle)
+// approaching neighbor `j` decelerates by s/2·n̂ while j gains +s/2·n̂; computed independently per
+// particle, the shared symmetric `s` makes it exactly momentum-conserving. Returns the delta for `i`.
+fn impact_water_water(i: u32, j: u32) -> vec3<f32> {
+    let d = pred[j].xyz - pred[i].xyz; // i → j
+    let r = length(d);
+    if (r < 1.0e-6 || r >= params.coupling_h) {
+        return vec3<f32>(0.0);
+    }
+    let n = d / r;
+    let v_rel = vel_frozen[i].xyz - vel_frozen[j].xyz;
+    let approach = max(dot(v_rel, n), 0.0); // i moving toward j
+    if (approach <= 0.0) {
+        return vec3<f32>(0.0);
+    }
+    // HIGH threshold: only the fast stream punches; slow pool sloshing stays below it (calm bulk).
+    let gate = approach * approach * smoothstep(V_IMPACT_WW_MIN, V_IMPACT_WW_FULL, approach);
+    let w = w_poly6(r, params.coupling_h);
+    let s_raw = params.impact_scale * w * gate * params.dt;
+    // Cap the shared scalar: never reverse approach; bound |Δv|=s/2 ≤ k·coupling_h/dt (equal masses).
+    let cfl = 2.0 * IMPACT_CFL_K * params.coupling_h / params.dt;
+    let s = min(s_raw, min(approach, cfl));
+    // i decelerates along its approach direction (pushed back); j (handled in its own pass) is pushed
+    // forward by +s/2·n̂ — so a falling stream particle drives the pool particle beneath it downward.
+    return (-0.5 * s) * n;
+}
+
 @compute @workgroup_size(256)
 fn impact_grain(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
@@ -407,8 +436,12 @@ fn impact_water(@builtin(global_invocation_id) gid: vec3<u32>) {
                 let hi = cell_start[cid + 1u];
                 for (var s = lo; s < hi; s = s + 1u) {
                     let j = sorted_indices[s];
-                    if (phase[j] != PHASE_GRAIN) { continue; }
-                    dv = dv + impact_delta_for_pair(i, j, PHASE_WATER);
+                    if (j == i) { continue; }
+                    if (phase[j] == PHASE_GRAIN) {
+                        dv = dv + impact_delta_for_pair(i, j, PHASE_WATER); // water↔grain reaction
+                    } else {
+                        dv = dv + impact_water_water(i, j); // water↔water cavity
+                    }
                 }
             }
         }
