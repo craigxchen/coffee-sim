@@ -2433,12 +2433,11 @@ impl Solver for XpbdSolver {
                     );
                 }
 
-                // Dynamic-pressure impact coupling (the pour crater + water cavity). Its OWN
-                // freeze/apply block, once per substep AFTER buoyancy — sharing the drag/buoyancy
-                // freeze would overwrite their velocity deltas (every pass writes vel = vel_frozen
-                // + dv). impact_water handles water↔grain AND water↔water; impact_grain is a no-op
-                // without grains. Runs for any water scene; no-op unless impact_scale > 0.
-                if self.has_water && self.params.impact_scale > 0.0 {
+                // Dynamic-pressure impact coupling (the pour crater). Its OWN freeze/apply block,
+                // once per substep AFTER buoyancy — sharing the drag/buoyancy freeze would overwrite
+                // their velocity deltas (every pass writes vel = vel_frozen + dv). Reads the stored
+                // pre-finalize velocity (still the jet). No-op unless impact_scale > 0.
+                if mixed && self.params.impact_scale > 0.0 {
                     pass(&mut enc, &p.grid_clear, &b.grid_clear, "grid_clear", nc);
                     pass(&mut enc, &p.grid_count, &b.grid_count, "grid_count", np);
                     pass(&mut enc, &p.grid_scan, &b.grid_scan, "grid_scan", 1);
