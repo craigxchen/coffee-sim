@@ -1609,7 +1609,10 @@ impl MpmSim3D {
                 label: Some("mpm step"),
             });
             encoder.clear_buffer(&self.buffers.grid, 0, None);
-            encoder.clear_buffer(&self.buffers.grid_vel, 0, None);
+            // grid_vel is NOT cleared: grid_update overwrites every cell each
+            // substep, so the clear was redundant — and skipping it lets p2g read
+            // the PREVIOUS substep's occupancy (grid_vel.w) to truncate its face
+            // scatter to the same faces g2p gathers (corrected-A adjoint transfer).
             encoder.clear_buffer(&self.buffers.face_mass, 0, None);
             {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {

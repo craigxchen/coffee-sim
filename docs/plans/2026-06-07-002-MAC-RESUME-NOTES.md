@@ -123,6 +123,94 @@ Tried to land the deferred residual. Findings (all in `shader.rs` unless noted):
   settle the pool WITHOUT the PIC velocity pump. That is the unblock for `water_only_settle`,
   `first_stage_grid_volume`, and `fractional_free_surface` together.
 
+## Corrected-A — adjoint truncated+centered transfer (2026-06-08, session 4)
+Implemented the structural transfer rewrite (both models + user endorsed it as "bend fixed AND no
+pump"). Branch `feat/mac-apic-free-surface` off `17b7402`, uncommitted. Changes:
+- **mod.rs**: dropped the redundant `grid_vel` clear (grid_update overwrites every cell) so p2g reads
+  LAST-substep occupancy.
+- **p2g** (3 face-momentum loops): truncated+renormalized+**centered-affine** scatter. Pass 1 sums
+  active weight `wsum` + weighted-mean offset over faces whose owning cell was fluid last substep
+  (`mac_owner_was_fluid`, > 1e-6); pass 2 deposits `w/wsum` momentum with `dposc = dpos − mean` so the
+  truncated stencil carries ZERO net affine momentum. Full-stencil fallback when `wsum ≤ 1e-6`.
+- **g2p**: gate each face gather on per-face mass (the exact set p2g wrote → no one-substep lag),
+  threshold `occupancy_mass_threshold()` (nominal·0.1).
+
+### Result: bend FIXED + mass conserved, but the pump is NOT eliminated — it MOVED.
+`fractional_free_surface` (the bend) and `water_mass_stable` (conservation) PASS. Empirical sweep of
+the g2p face-mass gate threshold (the only free knob), all with the same p2g corrected-A:
+
+| g2p gate | `pooled_KE` pump (gate <1.05) | `water_only` rms / p2p / outlier |
+|---|---|---|
+| cell-occupancy (committed g2p) | 1.753 | — / — / none (max 4.0) |
+| face-mass > 1e-6 | 1.489 | **4.66mm** / 51mm / 33 m/s |
+| face-mass > nominal·0.1 | **1.093** | 6.68mm / 76mm / 31 m/s |
+
+- **The bend is fixed by the CENTERED AFFINE** (the lateral reload is gone), independent of the gate.
+- **The transfer is NOT the pump.** Even a fully-adjoint p2g↔g2p pumps → the pump lives in the
+  free-surface velocity FEEDBACK (g2p PIC + per-component `new_v /= support_x` + projection BC), exactly
+  as session 3 concluded. corrected-A only NARROWED it (1.0→1.09 best vs the old 1.79).
+- **The residual is a single-particle cap-feedback INSTABILITY**, not bulk smear: a poorly-supported
+  surface particle is amplified by `new_v /= support_x` (small per-component support), saturates at
+  `vel_cap` (~31 m/s outlier present at BOTH thresholds), deposits a high-mom face, re-gathers it. The
+  gate threshold only trades WHERE that energy lands (bulk roughness ↔ pump ratio); it can't break the
+  loop. The existing ballistic/`dense_pool_damping` blend keys off `supported_weight` (cell occupancy)
+  which is ≈1 for these particles → it never fires on them.
+- corrected-A's CORE genuinely helps: bulk surface rms 7.5→4.66mm (under the 6mm bar) at the 1e-6 gate.
+- **Recommended next step (NOT yet done):** a per-component support FLOOR / outlier clamp — when a
+  particle's reconstructed speed greatly exceeds its local grid speed (`mac_cell_velocity`) or its
+  per-component `support_{x,y,z}` is tiny, blend toward the cell-centred grid velocity instead of
+  amplifying a single face. Targets ONLY runaway particles (a fast STREAM particle matches its fast
+  local grid → untouched), so it should not re-couple to the bend. This is the standard MPM
+  outlier remedy and the likely unblock for `pooled_KE` + `water_only` p2p together. Did NOT implement
+  unilaterally — it is free-surface reconstruction surgery (session-3 history: high re-coupling risk)
+  and the user (physics reviewer, no-FLIP/PIC, no false-rigid-coupling constraints) should steer it.
+- Full suite this state (nominal·0.1 gate): **82 pass / 6 fail** (vs committed 83/5). Fails: `pooled_KE`
+  (1.093), `water_only_settle` (p2p), `higher_viscosity_damps_pooled_KE` (pump makes viscous>inviscid),
+  `first_stage_grid_volume`, `pooled_volume_stable`, `fine_grind_pools` (flickering bed-couple). All 6
+  trace to the same surface outlier/pump residual, NOT to the transfer.
+
+### The pump is a GROWING SLOSH MODE, not an outlier or velocity memory (session-4 cont.)
+Pursued the "outlier remedy" — and learned the residual is two SEPARATE things:
+- **A single 31 m/s outlier** (present at every gate threshold) → drives `water_only` peak_to_peak only.
+  Particle-level, clampable. But it is ~2.5% of pool KE.
+- **The BULK pump** (settled `rms_speed≈1.8` across ALL 11520 particles = essentially the whole KE) →
+  drives `pooled_KE` (1.093) and `higher_viscosity`. This is NOT the outlier and NOT clampable that way.
+- **Tested: strengthen the in-cup ballistic-preserve damping** (dense floor 0.12→0.03, gated to
+  in_cup_volume so the airborne bend is untouched). It LOWERED absolute pool energy (settled KE
+  4809→2512, near committed's 1893 — visibly calmer pool) **but the pump RATIO got WORSE (1.093→1.218)**.
+  Diagnostic: reducing the preserve drops the baseline but the energy INJECTION continues → ratio
+  unchanged-to-worse. So the pump is **not** velocity memory. Reverted (failed its target + adds a knob).
+- **The momentum vector OSCILLATES** (settled `[-535,326,176]` → late `[220,119,83]`: direction flips):
+  the pump is a low-frequency **surface slosh mode that is GROWING**, fed by the free-surface
+  velocity/pressure-BC interaction (the R-H fractional-cell residual is the prime suspect — projection
+  leaves a little divergence at fractional surface cells → energy accrues in the slosh mode).
+- **Conclusion:** the outlier clamp ALONE makes NO failing test green (they all also fail the bulk-pump
+  gate), so it was not worth adding standalone. Every free-surface lever tried across sessions 3-4
+  (R-H projection 1.79, transfer adjointness 1.09-1.75, preserve damping 1.22) RELOCATES the slosh
+  energy but cannot stop the growth. **The real unblock is a free-surface velocity EXTENSION**
+  (construct ghost/air face velocities — ideally a divergence-free / hydrostatic extrapolation — so the
+  surface gather is unbiased and the projection sees a consistent boundary), which is a substantial new
+  piece and bumps the owner's two-phase / no-FLIP-PIC / no-false-rigid-coupling constraints. Deferred to
+  owner steer.
+
+### DECISIVE FLAW — corrected-A's owning-cell truncation is DIRECTIONALLY ASYMMETRIC (session-4 end)
+Live webapp check (owner) found corrected-A **breaks symmetry**: symmetric debug scenes drift, and the
+airborne stream meanders/disperses instead of falling straight. **Root cause (construction flaw, not
+tunable):** in the lower-face MAC convention the x-face at cell `ci` is OWNED by `ci` but sits on its
+**−x** side. `mac_owner_was_fluid` gates a face on its owning (upper) cell only, so for a symmetric
+fluid blob the −x boundary face is INCLUDED (owning cell fluid) while the +x boundary face is EXCLUDED
+(owning cell is the air cell past the edge). Same on y and z → every truncated deposit is biased toward
+(−x,−y,−z). This breaks the +axis/−axis symmetry AND almost certainly drives the pump's *directed*
+momentum growth (late momentum e.g. `[791,-251,-1058]` — a preferred direction, not isotropic slosh).
+- **corrected-A REVERTED** (stashed: "corrected-A: asymmetric owning-cell truncation"). NOT shippable.
+- **The correct symmetric predicate is "EITHER ADJACENT cell is fluid"** (a fluid↔air face is active
+  regardless of which side the fluid is on), applied identically in p2g deposit AND g2p gather. This is
+  the symmetry-preserving form of corrected-A and may ALSO fix the pump (if the pump is the asymmetric
+  directional injection). Needs a per-axis face helper (x-face ci ↔ cells ci and ci−x̂). Earlier avoided
+  as "more invasive" + session-3's either-adjacent g2p pumped — but that had NO adjoint p2g; with the
+  full corrected-A structure + symmetric predicate it's worth a clean attempt. VERIFY with a symmetry
+  test (mirror a debug scene, assert mirrored fields match) before trusting any pump/bend numbers.
+
 ## Notes
 - The big-bang is real (R-A): nothing physics-meaningful verifies/commits until U2-U10 are all done.
 - A pure single-pass round-trip test (p2g→grid_update→g2p only) + a projection-exactness test would

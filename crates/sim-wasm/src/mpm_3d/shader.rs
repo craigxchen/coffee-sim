@@ -225,6 +225,31 @@ fn mac_cell_velocity(cell: vec3<i32>) -> vec3<f32> {
     return v;
 }
 
+// True if `cell` is in-grid and carried fluid occupancy in the PREVIOUS substep.
+// p2g reads grid_vel.w before grid_update overwrites it (the per-step grid_vel
+// clear is dropped so this lag is one substep). The truncated p2g face scatter
+// uses this to decide face activity via a SYMMETRIC "either adjacent cell is
+// fluid" predicate: a lower MAC face at cell `ci` borders cells `ci` and
+// `ci - axis`, and is active if EITHER held fluid. Gating on the owning (upper)
+// cell alone is one-sided in the lower-face convention — it includes a fluid↔air
+// face on a blob's −axis edge but excludes it on the +axis edge, injecting a
+// (−x,−y,−z) directional bias that breaks symmetry. The symmetric form keeps the
+// truncation adjoint AND isotropic.
+fn mac_cell_fluid(cell: vec3<i32>) -> bool {
+    if cell.x < 0 || cell.y < 0 || cell.z < 0 { return false; }
+    if u32(cell.x) >= gx() || u32(cell.y) >= gy() || u32(cell.z) >= gz() { return false; }
+    return grid_vel[cell_index(u32(cell.x), u32(cell.y), u32(cell.z))].w > 1e-6;
+}
+fn mac_x_face_active(cell: vec3<i32>) -> bool {
+    return mac_cell_fluid(cell) || mac_cell_fluid(cell - vec3<i32>(1, 0, 0));
+}
+fn mac_y_face_active(cell: vec3<i32>) -> bool {
+    return mac_cell_fluid(cell) || mac_cell_fluid(cell - vec3<i32>(0, 1, 0));
+}
+fn mac_z_face_active(cell: vec3<i32>) -> bool {
+    return mac_cell_fluid(cell) || mac_cell_fluid(cell - vec3<i32>(0, 0, 1));
+}
+
 // ── sparse-pressure tiles ──
 // One TILE_SIZE^3 = 64-cell tile maps to one @workgroup_size(64) sparse RBGS
 // workgroup. Tile ids are linear in (tx, ty, tz) with x fastest, mirroring the
@@ -1492,15 +1517,44 @@ fn p2g(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     // ── Staggered x-momentum + per-face mass (vx on x-faces) ──
+    // Truncated+renormalized+centered APIC scatter (corrected-A): deposit only to
+    // faces whose EITHER adjacent cell was fluid last substep (symmetric predicate
+    // — see mac_x_face_active) — the face set g2p gathers — so p2g↔g2p is adjoint
+    // (no free-surface pump). Pass 1 sums the active weight and weighted-mean
+    // offset; pass 2 deposits w/wsum momentum with the affine offset centered
+    // (dpos - mean) so the truncated stencil carries ZERO net affine momentum
+    // (kills the lateral reload that bends the stream) while still depositing the
+    // particle's full linear momentum. No active face → fall back to the full
+    // stencil (cold start, isolated particles).
+    var wsum_x = 0.0;
+    var wdpos_x = vec3<f32>(0.0);
+    for (var i = 0u; i < 3u; i++) {
+        for (var j = 0u; j < 3u; j++) {
+            for (var k = 0u; k < 3u; k++) {
+                let cell = vec3<i32>(sbase.x + i32(i), base.y + i32(j), base.z + i32(k));
+                if !mac_x_face_active(cell) { continue; }
+                let w = sxw[i] * wy[j] * wz[k];
+                let dpos = vec3<f32>(f32(i) - sfx.x, f32(j) - fx.y, f32(k) - fx.z) * cell_dx;
+                wsum_x += w;
+                wdpos_x += w * dpos;
+            }
+        }
+    }
+    let trunc_x = wsum_x > 1e-6;
+    let inv_wsum_x = 1.0 / max(wsum_x, 1e-6);
+    let mean_dpos_x = select(vec3<f32>(0.0), wdpos_x * inv_wsum_x, trunc_x);
     for (var i = 0u; i < 3u; i++) {
         for (var j = 0u; j < 3u; j++) {
             for (var k = 0u; k < 3u; k++) {
                 let cell = vec3<i32>(sbase.x + i32(i), base.y + i32(j), base.z + i32(k));
                 if cell.x < 0 || cell.y < 0 || cell.z < 0 { continue; }
                 if u32(cell.x) >= gx() || u32(cell.y) >= gy() || u32(cell.z) >= gz() { continue; }
-                let w = sxw[i] * wy[j] * wz[k];
+                if trunc_x && !mac_x_face_active(cell) { continue; }
+                var w = sxw[i] * wy[j] * wz[k];
+                if trunc_x { w *= inv_wsum_x; }
                 let dpos = vec3<f32>(f32(i) - sfx.x, f32(j) - fx.y, f32(k) - fx.z) * cell_dx;
-                let affine_x = mass_p * (C0.x * dpos.x + C1.x * dpos.y + C2.x * dpos.z);
+                let dposc = dpos - mean_dpos_x;
+                let affine_x = mass_p * (C0.x * dposc.x + C1.x * dposc.y + C2.x * dposc.z);
                 let mom_fp = w * (mass_p * vp.x + affine_x) * fp;
                 let mass_fp = w * mass_p * fp;
                 if abs(mom_fp) > limit_m { atomicAdd(&metrics[METRIC_MASS_OVERFLOW_FIRES_IDX], 1u); }
@@ -1511,16 +1565,36 @@ fn p2g(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
 
-    // ── Staggered y-momentum + per-face mass (vy on y-faces) ──
+    // ── Staggered y-momentum + per-face mass (vy on y-faces) ── (see x-momentum)
+    var wsum_y = 0.0;
+    var wdpos_y = vec3<f32>(0.0);
+    for (var i = 0u; i < 3u; i++) {
+        for (var j = 0u; j < 3u; j++) {
+            for (var k = 0u; k < 3u; k++) {
+                let cell = vec3<i32>(base.x + i32(i), sbase.y + i32(j), base.z + i32(k));
+                if !mac_y_face_active(cell) { continue; }
+                let w = wx[i] * syw[j] * wz[k];
+                let dpos = vec3<f32>(f32(i) - fx.x, f32(j) - sfx.y, f32(k) - fx.z) * cell_dx;
+                wsum_y += w;
+                wdpos_y += w * dpos;
+            }
+        }
+    }
+    let trunc_y = wsum_y > 1e-6;
+    let inv_wsum_y = 1.0 / max(wsum_y, 1e-6);
+    let mean_dpos_y = select(vec3<f32>(0.0), wdpos_y * inv_wsum_y, trunc_y);
     for (var i = 0u; i < 3u; i++) {
         for (var j = 0u; j < 3u; j++) {
             for (var k = 0u; k < 3u; k++) {
                 let cell = vec3<i32>(base.x + i32(i), sbase.y + i32(j), base.z + i32(k));
                 if cell.x < 0 || cell.y < 0 || cell.z < 0 { continue; }
                 if u32(cell.x) >= gx() || u32(cell.y) >= gy() || u32(cell.z) >= gz() { continue; }
-                let w = wx[i] * syw[j] * wz[k];
+                if trunc_y && !mac_y_face_active(cell) { continue; }
+                var w = wx[i] * syw[j] * wz[k];
+                if trunc_y { w *= inv_wsum_y; }
                 let dpos = vec3<f32>(f32(i) - fx.x, f32(j) - sfx.y, f32(k) - fx.z) * cell_dx;
-                let affine_y = mass_p * (C0.y * dpos.x + C1.y * dpos.y + C2.y * dpos.z);
+                let dposc = dpos - mean_dpos_y;
+                let affine_y = mass_p * (C0.y * dposc.x + C1.y * dposc.y + C2.y * dposc.z);
                 let mom_fp = w * (mass_p * vp.y + affine_y) * fp;
                 let mass_fp = w * mass_p * fp;
                 if abs(mom_fp) > limit_m { atomicAdd(&metrics[METRIC_MASS_OVERFLOW_FIRES_IDX], 1u); }
@@ -1531,16 +1605,36 @@ fn p2g(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
 
-    // ── Staggered z-momentum + per-face mass (vz on z-faces) ──
+    // ── Staggered z-momentum + per-face mass (vz on z-faces) ── (see x-momentum)
+    var wsum_z = 0.0;
+    var wdpos_z = vec3<f32>(0.0);
+    for (var i = 0u; i < 3u; i++) {
+        for (var j = 0u; j < 3u; j++) {
+            for (var k = 0u; k < 3u; k++) {
+                let cell = vec3<i32>(base.x + i32(i), base.y + i32(j), sbase.z + i32(k));
+                if !mac_z_face_active(cell) { continue; }
+                let w = wx[i] * wy[j] * szw[k];
+                let dpos = vec3<f32>(f32(i) - fx.x, f32(j) - fx.y, f32(k) - sfx.z) * cell_dx;
+                wsum_z += w;
+                wdpos_z += w * dpos;
+            }
+        }
+    }
+    let trunc_z = wsum_z > 1e-6;
+    let inv_wsum_z = 1.0 / max(wsum_z, 1e-6);
+    let mean_dpos_z = select(vec3<f32>(0.0), wdpos_z * inv_wsum_z, trunc_z);
     for (var i = 0u; i < 3u; i++) {
         for (var j = 0u; j < 3u; j++) {
             for (var k = 0u; k < 3u; k++) {
                 let cell = vec3<i32>(base.x + i32(i), base.y + i32(j), sbase.z + i32(k));
                 if cell.x < 0 || cell.y < 0 || cell.z < 0 { continue; }
                 if u32(cell.x) >= gx() || u32(cell.y) >= gy() || u32(cell.z) >= gz() { continue; }
-                let w = wx[i] * wy[j] * szw[k];
+                if trunc_z && !mac_z_face_active(cell) { continue; }
+                var w = wx[i] * wy[j] * szw[k];
+                if trunc_z { w *= inv_wsum_z; }
                 let dpos = vec3<f32>(f32(i) - fx.x, f32(j) - fx.y, f32(k) - sfx.z) * cell_dx;
-                let affine_z = mass_p * (C0.z * dpos.x + C1.z * dpos.y + C2.z * dpos.z);
+                let dposc = dpos - mean_dpos_z;
+                let affine_z = mass_p * (C0.z * dposc.x + C1.z * dposc.y + C2.z * dposc.z);
                 let mom_fp = w * (mass_p * vp.z + affine_z) * fp;
                 let mass_fp = w * mass_p * fp;
                 if abs(mom_fp) > limit_m { atomicAdd(&metrics[METRIC_MASS_OVERFLOW_FIRES_IDX], 1u); }
@@ -2442,7 +2536,15 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>) {
                 if cell.x < 0 || cell.y < 0 || cell.z < 0 { continue; }
                 if u32(cell.x) >= gx() || u32(cell.y) >= gy() || u32(cell.z) >= gz() { continue; }
                 let ci = cell_index(u32(cell.x), u32(cell.y), u32(cell.z));
-                if grid_vel[ci].w <= 1e-6 { continue; }
+                // Gate on per-face mass — the faces p2g actually deposited to this
+                // substep — not cell occupancy. This is the truncated set p2g used
+                // (NO one-substep occupancy lag), so the gather is the adjoint of
+                // the scatter: newly-occupied surface cells whose faces p2g left
+                // empty are skipped instead of pulling in 0-velocity faces (the lag
+                // mismatch that pumped the pool). The occupancy_mass_threshold bar
+                // (not 1e-6) also drops dust faces whose v = mom/mass saturates to
+                // vel_cap, the source of the settled-surface velocity outliers.
+                if f32(atomicLoad(&face_mass[face_mass_x_idx(ci)])) * inv_fp_scale() <= occupancy_mass_threshold() { continue; }
                 let w = sxw[i] * wy[j] * wz[k];
                 let vx = grid_vel[ci].x;
                 let dpos = vec3<f32>(f32(i) - sfx.x, f32(j) - fx.y, f32(k) - fx.z) * cell_dx;
@@ -2461,7 +2563,8 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>) {
                 if cell.x < 0 || cell.y < 0 || cell.z < 0 { continue; }
                 if u32(cell.x) >= gx() || u32(cell.y) >= gy() || u32(cell.z) >= gz() { continue; }
                 let ci = cell_index(u32(cell.x), u32(cell.y), u32(cell.z));
-                if grid_vel[ci].w <= 1e-6 { continue; }
+                // Per-face-mass gate (see x-component): adjoint to the truncated p2g.
+                if f32(atomicLoad(&face_mass[face_mass_y_idx(ci)])) * inv_fp_scale() <= occupancy_mass_threshold() { continue; }
                 let w = wx[i] * syw[j] * wz[k];
                 let vy = grid_vel[ci].y;
                 let dpos = vec3<f32>(f32(i) - fx.x, f32(j) - sfx.y, f32(k) - fx.z) * cell_dx;
@@ -2480,7 +2583,8 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>) {
                 if cell.x < 0 || cell.y < 0 || cell.z < 0 { continue; }
                 if u32(cell.x) >= gx() || u32(cell.y) >= gy() || u32(cell.z) >= gz() { continue; }
                 let ci = cell_index(u32(cell.x), u32(cell.y), u32(cell.z));
-                if grid_vel[ci].w <= 1e-6 { continue; }
+                // Per-face-mass gate (see x-component): adjoint to the truncated p2g.
+                if f32(atomicLoad(&face_mass[face_mass_z_idx(ci)])) * inv_fp_scale() <= occupancy_mass_threshold() { continue; }
                 let w = wx[i] * wy[j] * szw[k];
                 let vz = grid_vel[ci].z;
                 let dpos = vec3<f32>(f32(i) - fx.x, f32(j) - fx.y, f32(k) - sfx.z) * cell_dx;
@@ -3229,11 +3333,12 @@ mod tests {
     #[test]
     fn apic_columns_are_applied_without_transpose() {
         // MAC-APIC applies the affine per velocity component at that component's
-        // own staggered offset: row (C0.c, C1.c, C2.c) dotted with dpos, never a
-        // transposed column dot.
-        assert!(MPM_COMPUTE_SHADER.contains("C0.x * dpos.x + C1.x * dpos.y + C2.x * dpos.z"));
-        assert!(MPM_COMPUTE_SHADER.contains("C0.y * dpos.x + C1.y * dpos.y + C2.y * dpos.z"));
-        assert!(MPM_COMPUTE_SHADER.contains("C0.z * dpos.x + C1.z * dpos.y + C2.z * dpos.z"));
+        // own staggered offset: row (C0.c, C1.c, C2.c) dotted with the centered
+        // offset (dposc = dpos - active-mean), never a transposed column dot.
+        // Centering makes the truncated p2g scatter carry zero net affine momentum.
+        assert!(MPM_COMPUTE_SHADER.contains("C0.x * dposc.x + C1.x * dposc.y + C2.x * dposc.z"));
+        assert!(MPM_COMPUTE_SHADER.contains("C0.y * dposc.x + C1.y * dposc.y + C2.y * dposc.z"));
+        assert!(MPM_COMPUTE_SHADER.contains("C0.z * dposc.x + C1.z * dposc.y + C2.z * dposc.z"));
         assert!(!MPM_COMPUTE_SHADER.contains("dot(aff_col0, dpos)"));
     }
 }
