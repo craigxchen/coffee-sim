@@ -167,10 +167,6 @@ const PI: f32 = 3.14159265358979;
 const V_IMPACT_MIN: f32 = 0.5;
 const V_IMPACT_FULL: f32 = 2.5;
 const IMPACT_CFL_K: f32 = 0.5;
-// Water↔water cavity uses a HIGH threshold so only the fast pour stream punches the pool — slow pool
-// sloshing (approach ~1-2) stays below it and isn't damped, keeping the bulk pool calm + draining.
-const V_IMPACT_WW_MIN: f32 = 5.0;
-const V_IMPACT_WW_FULL: f32 = 12.0;
 
 // --- SDF cavity geometry (mirrors utils/sdf.rs; interior positive, gradient toward the cavity) ---
 const SDF_EPS: f32 = 1.0e-6;
