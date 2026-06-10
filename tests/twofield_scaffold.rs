@@ -10,7 +10,9 @@ use coffee_sim::engine::scene::{SeedRegion, Species};
 use coffee_sim::engine::Scene;
 use coffee_sim::models::Materials;
 use coffee_sim::solvers::base::Solver;
-use coffee_sim::solvers::twofield::{TwofieldSolver, MAX_STORAGE_BUFFERS_PER_ENTRY_POINT};
+use coffee_sim::solvers::twofield::{
+    TwofieldSolver, DISPATCHES_PER_FRAME, MAX_STORAGE_BUFFERS_PER_ENTRY_POINT,
+};
 use coffee_sim::utils::config::Config;
 use coffee_sim::utils::gpu::GpuContext;
 
@@ -28,7 +30,7 @@ fn water_only_scene() -> Scene {
 
 /// Build via the registry arm (the three-edit pattern's runtime path) on an EMPTY scene:
 /// one step leaves finite (empty) state, the getters return cached results without a GPU
-/// sync, and the scaffold pass still dispatches (budget is real even at zero particles).
+/// sync, and the transfer pipeline still dispatches (budget is real even at zero particles).
 #[test]
 fn builds_via_registry_and_steps_an_empty_scene() {
     let Some(gpu) = GpuContext::new_headless() else {
@@ -57,10 +59,13 @@ fn builds_via_registry_and_steps_an_empty_scene() {
     assert_eq!(particles.particle_count, 0);
     assert!(
         profile.dispatches_per_frame > 0,
-        "the scaffold pass dispatches even on an empty scene"
+        "the transfer pipeline dispatches even on an empty scene"
     );
+    // Budget gate (R8): dispatches/frame stays pinned to the recorded constant — a new pass
+    // must update the budget, not drift past it silently.
+    assert_eq!(profile.dispatches_per_frame, DISPATCHES_PER_FRAME);
     println!(
-        "twofield U1 budgets (empty scene): dispatches/frame {} | max storage buffers per entry point {}",
+        "twofield budgets (empty scene): dispatches/frame {} | max storage buffers per entry point {}",
         profile.dispatches_per_frame, MAX_STORAGE_BUFFERS_PER_ENTRY_POINT
     );
 }
@@ -105,21 +110,25 @@ fn water_only_scene_has_canonical_layout_and_finite_state() {
     assert_eq!(water, particles.particle_count);
     assert_eq!(solid, 0);
 
-    // Finite state after stepping; the inert pass moves nothing (velocities seed at zero).
+    // Finite state after stepping (U2: the block free-falls under scene gravity).
     let pos = solver.read_positions();
     assert!(
         pos.iter().all(|p| p.iter().all(|x| x.is_finite())),
         "non-finite positions"
     );
 
-    // Deterministic build (R6): a second build seeds byte-identical positions.
-    let twin = TwofieldSolver::build(&scene, &mats, &cfg, &gpu);
+    // Deterministic stepping (R6): a second build stepped identically lands byte-identical —
+    // the fixed-point P2G makes the whole frame order-independent, so this is bit-exact.
+    let mut twin = TwofieldSolver::build(&scene, &mats, &cfg, &gpu);
+    for _ in 0..3 {
+        twin.step(1.0 / 60.0, &EmissionInput::default());
+    }
     assert_eq!(twin.read_positions(), solver.read_positions());
 
     let profile = solver.profile();
-    assert!(profile.dispatches_per_frame > 0);
+    assert_eq!(profile.dispatches_per_frame, DISPATCHES_PER_FRAME);
     println!(
-        "twofield U1 budgets (water-only, {} particles): dispatches/frame {} | max storage buffers per entry point {} | device request 9/stage",
+        "twofield budgets (water-only, {} particles): dispatches/frame {} | max storage buffers per entry point {} | device request 9/stage",
         particles.particle_count, profile.dispatches_per_frame, MAX_STORAGE_BUFFERS_PER_ENTRY_POINT
     );
 }
