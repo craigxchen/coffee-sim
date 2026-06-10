@@ -9,6 +9,14 @@
 //! advects `x ← x + v_new·dt` — semi-implicit Euler, i.e. `common::freefall_reference` with
 //! `substeps = 1`. The weights partition unity and are linearly consistent, so the gather is
 //! exact for the uniform free-fall field and C stays ~0.
+//!
+//! U3 note: the frame now also runs the pressure projection, and the recurrence STILL holds
+//! in free flight because the projection is a no-op there to round-off: every node carrying
+//! mass gathers the SAME uniform velocity (momentum/mass of a uniform field is that field),
+//! a cell is active only when all 8 of its corner nodes carry mass, so every active cell's
+//! divergence — and hence the rhs, the pressure, and the projected Δv — is fixed-point noise
+//! (~1e-5), absorbed by the documented budgets below. The projection is gated on its own
+//! terms in `tests/twofield_pressure.rs`.
 
 // Axis loops (`for a in 0..3`) index several parallel arrays (positions, box bounds, grid
 // dims); the iterator rewrite clippy suggests obscures that symmetry.
@@ -178,6 +186,11 @@ fn p2g_g2p_round_trip_conserves_mass_and_momentum() {
     let cfg = Config::default();
     let mats = Materials::default();
     let mut solver = TwofieldSolver::build(&scene, &mats, &cfg, &gpu);
+    // This gate pins the TRANSFER kernels against a pressureless CPU twin (a random interior
+    // velocity field is far from divergence-free, so the U3 projection would rightly change
+    // it). Zero sweeps make the frame U2-equivalent: the projection applies a zero pressure
+    // field. The projection itself is gated in tests/twofield_pressure.rs.
+    solver.set_pressure_budget_for_test(4, 0, 0);
     let seed = solver.read_positions();
     let n = seed.len();
     assert_eq!(n, 216);

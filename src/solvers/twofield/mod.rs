@@ -8,8 +8,17 @@
 //! U2 adds the APIC water transfers: quadratic B-spline P2G with fixed-point atomics, grid
 //! gravity + boundary conditions, APIC G2P with a per-particle affine C matrix
 //! (`transfers.wgsl`). Per frame: `grid_clear → p2g_water → grid_update → g2p_water`, one
-//! substep (the CFL substep policy is a later-unit decision). No pressure yet — U2 water is
-//! momentum-correct splashing dust; incompressibility lands in U3.
+//! substep (the CFL substep policy is a later-unit decision).
+//!
+//! U3 adds incompressibility (`pressure.wgsl`, KTD-2): a coarse-grid pressure seed plus a
+//! fixed budget of fine damped-Jacobi sweeps on ONE discretely consistent operator family
+//! (pressure at cell centers, corner-trilinear D, G = −Dᵀ by construction, A only ever the
+//! composition −D·M̃⁻¹·G) — no converged Poisson anywhere (R7). The full operator-family and
+//! coarse-seed construction is documented at the top of `pressure.wgsl`; the pre-registered
+//! gates live in `tests/twofield_pressure.rs`. The KTD-2 adaptive-Tait predictor is a STUB
+//! DECISION: deliberately not implemented (knob grid pins Tait ∈ {off}); if a later unit
+//! demonstrates an iteration-budget win it ships behind an opt-in `Config` gate, otherwise it
+//! is removed rather than shipped dormant.
 
 use std::sync::Arc;
 
@@ -32,18 +41,68 @@ fn groups(n: u32) -> u32 {
     n.div_ceil(WG)
 }
 
-/// U2 GPU-budget bookkeeping (R8): the widest entry point's storage-buffer count, derived by
-/// inspection of the bind groups in `build` (the params uniform doesn't count against the
-/// storage limit). Per pass: `p2g_water` 4 (pos, vel, cmat, grid_fp), `grid_update` 3
-/// (grid_fp, grid_vel, solids), `g2p_water` 5 (pos, vel, cmat, grid_vel, solids),
-/// `grid_clear` 1 (grid_fp). Re-derive when passes are added. The device requests 9 storage
-/// buffers per stage (`src/utils/gpu.rs::NEEDED_STORAGE_BUFFERS`) — still NOT raised (KTD-7):
-/// grid mass+momentum share one `array<atomic<i32>>` (stride 4) so the grid costs two bindings,
-/// not five.
+/// U2+U3 GPU-budget bookkeeping (R8): the widest entry point's storage-buffer count, derived
+/// by inspection of the bind groups in `build` (the params uniform doesn't count against the
+/// storage limit). Per pass: `grid_clear` 1, `p2g_water` 4 (pos, vel, cmat, grid_fp),
+/// `grid_update` 3 (grid_fp, grid_vel, solids), `g2p_water` 5 (pos, vel, cmat, grid_vel,
+/// solids); U3 pressure family — `node_setup` 3 (grid_vel, solids, nm), `cell_classify` 5
+/// (grid_vel, solids, cell_meta, pf_a, pf_b), `coarse_node_setup` 2, `coarse_cell_setup` 4
+/// (cell_meta, cmeta, pc_a, pc_b), `jacobi_fine`/`jacobi_coarse` 4, `prolong` 4, `project` 4
+/// (grid_vel, nm, cell_meta, pf), debug taps ≤ 3. Re-derive when passes are added. The device
+/// requests 9 storage buffers per stage (`src/utils/gpu.rs::NEEDED_STORAGE_BUFFERS`) — still
+/// NOT raised (KTD-7).
 pub const MAX_STORAGE_BUFFERS_PER_ENTRY_POINT: u32 = 5;
 
-/// Compute dispatches per frame: grid_clear, p2g_water, grid_update, g2p_water.
-pub const DISPATCHES_PER_FRAME: u32 = 4;
+/// U3 pressure knobs — defaults of the declared knob grid (KTD-9; the grid itself is pinned
+/// in the header of `tests/twofield_pressure.rs`). The coarse ratio is fine cells per coarse
+/// cell per axis (4 → 1/4³ cell count); sweep counts are dispatches, so they are plain Rust
+/// fields driven from `step()` (a Jacobi sweep cannot loop inside one dispatch — WGSL has no
+/// global sync).
+pub const COARSE_RATIO_DEFAULT: u32 = 4;
+pub const COARSE_SWEEPS_DEFAULT: u32 = 8;
+pub const FINE_SWEEPS_DEFAULT: u32 = 8;
+
+/// Damped-Jacobi relaxation factor — a fixed algorithmic constant of the family (mirrors
+/// `JACOBI_OMEGA` in `pressure.wgsl`; the CPU twins import it), NOT a gate knob. Derivation:
+/// the Fourier symbol of A = −D·M⁻¹·G on the corner family gives
+/// λ(diag⁻¹A)(θ) = (8/3)·[sin²(θx/2)cos²(θy/2)cos²(θz/2) + cyc], max 8/3 at θ = (π,0,0), so
+/// Jacobi requires ω < 2/(8/3) = 0.75; ω = 2/3 is the classic weighted-Jacobi choice and
+/// keeps ω·λ_max = 16/9 < 2 with healthy high-frequency smoothing.
+pub const JACOBI_OMEGA: f32 = 2.0 / 3.0;
+
+/// Density-relief time constant in frames (mirrors `DENSITY_RELAX_FRAMES` in pressure.wgsl).
+/// A fixed structural constant like `JACOBI_OMEGA`: it closes the volume-conservation loop
+/// (velocity-only projection cannot see accumulated positional compression), it is not a
+/// gate-tuning knob. Half a second (30 frames): fast enough that equilibrium compaction
+/// drift stays ≈ residual·N·dt ≈ 1% (inside the ±5% band), slow enough that relieving a
+/// seeded over-density (the lattice double-counts the wall layers by ~30%) injects v ~
+/// Δx/τ ≈ 0.6 instead of ~4.5 of slosh — the relief must correct volume, not detonate it.
+pub const DENSITY_RELAX_FRAMES: f32 = 30.0;
+
+/// Free-surface fill-fraction constants (mirror `SURF_FULL_FRAC`/`SURF_MIN_CORNER` in
+/// pressure.wgsl — the ghost-fluid-style fraction weighting documented in its FREE SURFACE
+/// header; refined, not replaced, by U4). Fixed structural constants of the operator family,
+/// not gate knobs: a cell's constraint row is weighted by f = clamp(ρ̄/(0.5·ρ_rest), 0, 1),
+/// so interior rows are exactly f = 1 (a flat surface cuts a cell at ρ̄ ≈ 0.5·ρ_rest — the
+/// taper lives strictly above the mean surface line) and the implicit p = 0 Dirichlet acts
+/// at the surface instead of one cell inside it. ACTIVITY is the min corner-node density ≥
+/// `SURF_MIN_CORNER`·ρ_rest — the particle-presence discriminator that excludes B-spline
+/// smear cells (particle-free, far corner ≤ ~0.05·ρ_rest), whose pressure rows otherwise
+/// hover their dust against gravity and block settling (see the pressure.wgsl FREE SURFACE
+/// header for the observed failure).
+pub const SURF_FULL_FRAC: f32 = 0.5;
+pub const SURF_MIN_CORNER: f32 = 0.1;
+
+/// U3 dispatch increment over U2's 4, at the default knobs: node_setup + cell_classify +
+/// pre-smooth/post-smooth FINE_SWEEPS + residual + coarse_node_setup +
+/// coarse_cell_setup(+restrict) + COARSE_SWEEPS + prolong_add + project. Each Jacobi sweep is
+/// necessarily its own dispatch (no global sync within a dispatch), which is why this lands
+/// above the plan's rough +6–12 guess — recorded honestly per R8.
+pub const U3_PRESSURE_DISPATCHES: u32 = 7 + COARSE_SWEEPS_DEFAULT + FINE_SWEEPS_DEFAULT;
+
+/// Compute dispatches per frame at the default knobs: the U2 transfer pipeline (grid_clear,
+/// p2g_water, grid_update, g2p_water) + the U3 pressure stack.
+pub const DISPATCHES_PER_FRAME: u32 = 4 + U3_PRESSURE_DISPATCHES;
 
 /// Fine-grid cell size as a multiple of the particle spacing. ~2× spacing gives the quadratic
 /// B-spline support (1.5 cells each way) a ≈3-spacing reach with ≈8 particles per cell at rest
@@ -73,10 +132,12 @@ struct Params {
     solid_count: u32,    // particles [water_count, water_count + solid_count) are solid grains
     particle_count: u32, // = water_count + solid_count (kernel live-set guard)
     num_solids: u32,     // count of static SDF solids in the `solids` buffer
+    coarse_dims: [u32; 4], // coarse CELLS per axis (= ceil(fine_cells/ratio)); .w = ratio
+    extra: [f32; 4],     // (rest_density, rho_floor, mass_eps, unused)
 }
 
 // Params is uploaded as a uniform and must stay byte-identical to the WGSL `Params`.
-const _: () = assert!(std::mem::size_of::<Params>() == 112);
+const _: () = assert!(std::mem::size_of::<Params>() == 144);
 
 /// GPU record for one static SDF solid — byte-identical to the WGSL `Primitive` (64 bytes,
 /// vec4-aligned; mirrors the xpbd packing of `utils::sdf` primitives). Cone radii in `a` are
@@ -158,6 +219,12 @@ pub struct TwofieldSolver {
     water_count: u32,
     solid_count: u32,
     num_nodes: u32,
+    num_cells: u32,
+
+    // U3 pressure knobs (KTD-9 grid points; sweep counts = dispatch counts, driven in step).
+    coarse_ratio: u32,
+    coarse_sweeps: u32,
+    fine_sweeps: u32,
 
     params_buf: wgpu::Buffer,
     // Canonical particle state, exposed through `ParticleBuffers`: pos.w carries the moisture
@@ -168,9 +235,18 @@ pub struct TwofieldSolver {
     chem: Arc<wgpu::Buffer>,
     // Per-particle APIC affine matrix C: 3 vec4 rows per particle (see common.wgsl binding 5).
     cmat: wgpu::Buffer,
-    // WATER grid field: fixed-point atomic<i32>, 4 lanes per node (mass, mom.xyz). The float
-    // grid-velocity and solids buffers live only inside the bind groups (no CPU-side access).
+    // WATER grid field: fixed-point atomic<i32>, 4 lanes per node (mass, mom.xyz).
     grid_fp: wgpu::Buffer,
+    // Float grid velocity (.xyz) + node mass (.w) after grid_update; post-projection after
+    // the U3 pressure stack. CPU-readable for the divergence/volume gates.
+    grid_vel: wgpu::Buffer,
+    // U3 pressure-family state (layouts documented in pressure.wgsl): per-node M̃⁻¹, per-cell
+    // (rhs, active, dbg) meta, and the fine pressure ping-pong pair. The coarse mirrors live
+    // only inside the bind groups.
+    nm: wgpu::Buffer,
+    cell_meta: wgpu::Buffer,
+    pf_a: wgpu::Buffer,
+    pf_b: wgpu::Buffer,
     readback: wgpu::Buffer,
 
     pipelines: Pipelines,
@@ -190,6 +266,22 @@ struct Pipelines {
     p2g_water: (wgpu::ComputePipeline, wgpu::BindGroup),
     grid_update: (wgpu::ComputePipeline, wgpu::BindGroup),
     g2p_water: (wgpu::ComputePipeline, wgpu::BindGroup),
+    // U3 pressure family. The Jacobi sweeps ping-pong the pressure pair by swapping which
+    // buffer sits at the src/dst binding indices (two bind-group variants, index = sweep % 2);
+    // prolong/project carry parity variants selecting the final-parity buffer.
+    node_setup: (wgpu::ComputePipeline, wgpu::BindGroup),
+    cell_classify: (wgpu::ComputePipeline, wgpu::BindGroup),
+    residual: (wgpu::ComputePipeline, [wgpu::BindGroup; 2]),
+    coarse_node_setup: (wgpu::ComputePipeline, wgpu::BindGroup),
+    coarse_cell_setup: (wgpu::ComputePipeline, wgpu::BindGroup),
+    jacobi_coarse: (wgpu::ComputePipeline, [wgpu::BindGroup; 2]),
+    // prolong_add variants indexed [current-p parity][coarse-final parity].
+    prolong_add: (wgpu::ComputePipeline, [[wgpu::BindGroup; 2]; 2]),
+    jacobi_fine: (wgpu::ComputePipeline, [wgpu::BindGroup; 2]),
+    project: (wgpu::ComputePipeline, [wgpu::BindGroup; 2]),
+    // Test-only operator taps (never dispatched in step; zero budget impact).
+    dbg_div: (wgpu::ComputePipeline, wgpu::BindGroup),
+    dbg_grad: (wgpu::ComputePipeline, wgpu::BindGroup),
 }
 
 /// Seed the scene's regions into the two-field range layout: ALL water particles first
@@ -269,6 +361,16 @@ fn grid_spec_for(scene: &Scene, mats: &Materials) -> ([f32; 3], f32, [u32; 3]) {
         *d = (extent / h).ceil() as u32 + 3;
     }
     (origin, h, dims)
+}
+
+/// Coarse CELL counts at `ratio` fine cells per coarse cell per axis (fine cells = node dims
+/// − 1; partial coarse cells at the high end clamp their children to the fine range).
+fn coarse_dims_for(dims: [u32; 3], ratio: u32) -> [u32; 3] {
+    [
+        (dims[0] - 1).div_ceil(ratio),
+        (dims[1] - 1).div_ceil(ratio),
+        (dims[2] - 1).div_ceil(ratio),
+    ]
 }
 
 impl TwofieldSolver {
@@ -411,6 +513,153 @@ impl TwofieldSolver {
         self.params.pic_mode = u32::from(pic);
     }
 
+    /// Set the U3 pressure-budget knobs (KTD-9 grid points; dev/test only). `coarse_sweeps =
+    /// 0` is the A/B seed-off arm (the whole coarse stage is skipped, the fine sweeps start
+    /// from p = 0); `coarse_sweeps = fine_sweeps = 0` makes the frame U2-equivalent (the
+    /// projection applies a zero pressure field).
+    pub fn set_pressure_budget_for_test(
+        &mut self,
+        coarse_ratio: u32,
+        coarse_sweeps: u32,
+        fine_sweeps: u32,
+    ) {
+        assert!(
+            coarse_ratio >= COARSE_RATIO_DEFAULT,
+            "coarse buffers are sized for ratio {COARSE_RATIO_DEFAULT} (the densest grid point)"
+        );
+        let d = self.params.grid_dims;
+        let cd = coarse_dims_for([d[0], d[1], d[2]], coarse_ratio);
+        self.params.coarse_dims = [cd[0], cd[1], cd[2], coarse_ratio];
+        self.coarse_ratio = coarse_ratio;
+        self.coarse_sweeps = coarse_sweeps;
+        self.fine_sweeps = fine_sweeps;
+    }
+
+    /// Overwrite particle positions (dev/test only; the .w lane carries moisture).
+    pub fn write_positions_for_test(&self, positions: &[[f32; 4]]) {
+        assert_eq!(
+            positions.len(),
+            self.params.particle_count as usize,
+            "position seed length must match particle count"
+        );
+        self.queue
+            .write_buffer(&self.pos, 0, bytemuck::cast_slice(positions));
+    }
+
+    /// Overwrite the float grid-velocity field (dev/test only — operator gates feed random
+    /// node fields to the dbg taps). Length must equal the node count; .w is the mass lane.
+    pub fn write_grid_velocities_for_test(&self, v: &[[f32; 4]]) {
+        assert_eq!(v.len(), self.num_nodes as usize, "one vec4 per grid node");
+        self.queue
+            .write_buffer(&self.grid_vel, 0, bytemuck::cast_slice(v));
+    }
+
+    /// Overwrite the fine pressure field (slot pf_a, which `dbg_grad` reads; dev/test only).
+    pub fn write_pressure_for_test(&self, p: &[f32]) {
+        assert_eq!(p.len(), self.num_cells as usize, "one f32 per fine cell");
+        self.queue
+            .write_buffer(&self.pf_a, 0, bytemuck::cast_slice(p));
+    }
+
+    /// Read back the float grid velocities (.xyz) + node masses (.w). After `step()` this is
+    /// the post-projection field (dev/test only — stalls).
+    pub fn read_grid_velocities(&self) -> Vec<[f32; 4]> {
+        let bytes = (self.num_nodes as u64) * 16;
+        bytemuck::cast_slice(&self.read_bytes(&self.grid_vel, bytes)).to_vec()
+    }
+
+    /// Read back the per-cell (rhs, active, dbg_div, _) meta (dev/test only — stalls).
+    pub fn read_cell_meta(&self) -> Vec<[f32; 4]> {
+        let bytes = (self.num_cells as u64) * 16;
+        bytemuck::cast_slice(&self.read_bytes(&self.cell_meta, bytes)).to_vec()
+    }
+
+    /// Read back the per-node M̃⁻¹ matrices, 8 floats per node:
+    /// (xx, xy, xz, yy, yz, zz, massy_flag, 0) (dev/test only — stalls).
+    pub fn read_node_matrices(&self) -> Vec<[f32; 8]> {
+        let bytes = (self.num_nodes as u64) * 32;
+        bytemuck::cast_slice(&self.read_bytes(&self.nm, bytes)).to_vec()
+    }
+
+    /// Read back the frame's solved pressure (the final-parity ping-pong buffer the project
+    /// pass consumed; dev/test only — stalls).
+    pub fn read_pressure(&self) -> Vec<f32> {
+        let buf = if self.fine_sweeps.is_multiple_of(2) {
+            &self.pf_a
+        } else {
+            &self.pf_b
+        };
+        let bytes = (self.num_cells as u64) * 4;
+        bytemuck::cast_slice(&self.read_bytes(buf, bytes)).to_vec()
+    }
+
+    /// Read back the per-particle APIC C rows (3 vec4 per particle; dev/test only — stalls).
+    pub fn read_affine_rows(&self) -> Vec<[f32; 4]> {
+        let bytes = (self.params.particle_count as u64) * 48;
+        bytemuck::cast_slice(&self.read_bytes(&self.cmat, bytes)).to_vec()
+    }
+
+    fn run_dbg(&self, pipe: &wgpu::ComputePipeline, bind: &wgpu::BindGroup, n_groups: u32) {
+        let mut enc = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("twofield-dbg"),
+            });
+        {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("twofield-dbg"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(pipe);
+            pass.set_bind_group(0, Some(bind), &[]);
+            pass.dispatch_workgroups(n_groups, 1, 1);
+        }
+        self.queue.submit(Some(enc.finish()));
+    }
+
+    /// Dispatch the test-only `dbg_div` tap: writes the raw masked divergence of the current
+    /// grid-velocity field into `cell_meta.z`. Masks/nm must exist (call after a `step()`).
+    pub fn run_div_for_test(&self) {
+        self.run_dbg(
+            &self.pipelines.dbg_div.0,
+            &self.pipelines.dbg_div.1,
+            groups(self.num_cells).max(1),
+        );
+    }
+
+    /// Dispatch the test-only `dbg_grad` tap: writes the raw masked gradient of pf_a into the
+    /// grid-velocity buffer (overwrites it — test sequences only).
+    pub fn run_grad_for_test(&self) {
+        self.run_dbg(
+            &self.pipelines.dbg_grad.0,
+            &self.pipelines.dbg_grad.1,
+            groups(self.num_nodes).max(1),
+        );
+    }
+
+    /// Fine-sweep split around the coarse correction: pre-smooth half the budget (≥1 — the
+    /// residual restriction needs the boundary-spike content absorbed first, see
+    /// pressure.wgsl), post-smooth the rest. Seed-off runs everything as post-smoothing.
+    fn smooth_split(&self) -> (u32, u32) {
+        let pre = if self.coarse_sweeps > 0 && self.fine_sweeps > 0 {
+            (self.fine_sweeps / 2).max(1)
+        } else {
+            0
+        };
+        (pre, self.fine_sweeps - pre)
+    }
+
+    /// Which ping-pong buffer holds the final pressure (0 = pf_a) — mirrors step()'s parity.
+    fn pressure_parity(&self) -> usize {
+        let (pre, post) = self.smooth_split();
+        let mut par = (pre % 2) as usize;
+        if self.coarse_sweeps > 0 {
+            par ^= 1; // prolong_add flips
+        }
+        par ^= (post % 2) as usize;
+        par
+    }
+
     /// Sample per-pass GPU timestamps into the cache that `profile()` returns. Blocks
     /// (dev/test/periodic only) — the explicit cache point, so the getters never stall.
     pub fn sample_diagnostics(&mut self) {
@@ -453,6 +702,23 @@ impl Solver for TwofieldSolver {
 
         let (origin, cell, dims) = grid_spec_for(scene, mats);
         let num_nodes = dims[0] * dims[1] * dims[2];
+        let num_cells = (dims[0] - 1) * (dims[1] - 1) * (dims[2] - 1);
+        // Coarse buffers are sized once for the densest knob-grid ratio (4 → most coarse
+        // cells); the ratio-8 grid point uses a prefix of them.
+        let cdims = coarse_dims_for(dims, COARSE_RATIO_DEFAULT);
+        let num_ccells = cdims[0] * cdims[1] * cdims[2];
+        let num_cnodes = (cdims[0] + 1) * (cdims[1] + 1) * (cdims[2] + 1);
+        // ρ_rest = particle_mass/spacing³ (the rest node density the M̃⁻¹ floor is keyed to);
+        // mass_eps gates "this node carries water" well above fixed-point decode noise.
+        // The density floor is ρ_rest itself: a dilute (free-surface/splash) node otherwise
+        // receives an invρ-amplified pressure kick (a 0.25·ρ_rest node would get 4× the bulk
+        // Δv), which measurably pumps energy into the surface every frame until eruption.
+        // Flooring at ρ_rest under-kicks dilute nodes instead — they sag, compact, and the
+        // floor releases: stable. The floor enters A and the projection through the SAME M̃⁻¹,
+        // so the operator family stays consistent; proper free-surface treatment is U4.
+        let rest_density = mats.particle_mass / mats.particle_spacing.powi(3);
+        let rho_floor = rest_density;
+        let mass_eps = 1.0e-4 * mats.particle_mass;
 
         let packed = {
             let mut packed = pack_solids(&scene.solids);
@@ -476,6 +742,8 @@ impl Solver for TwofieldSolver {
             solid_count,
             particle_count,
             num_solids: scene.solids.len() as u32,
+            coarse_dims: [cdims[0], cdims[1], cdims[2], COARSE_RATIO_DEFAULT],
+            extra: [rest_density, rho_floor, mass_eps, 0.0],
         };
         let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("twofield-params"),
@@ -511,11 +779,12 @@ impl Solver for TwofieldSolver {
             wgpu::BufferUsages::COPY_SRC,
         ));
         // APIC C matrices: 3 vec4 rows per particle, zero-initialized (C = 0 at rest).
+        // COPY_SRC for the snapshot/replay readback in the U3 divergence-decay gate.
         let cmat = Self::storage(
             &device,
             "twofield-cmat",
             n * 48,
-            wgpu::BufferUsages::empty(),
+            wgpu::BufferUsages::COPY_SRC,
         );
         let grid_bytes = (num_nodes.max(1) as u64) * 16;
         let grid_fp = Self::storage(
@@ -528,6 +797,55 @@ impl Solver for TwofieldSolver {
             &device,
             "twofield-grid-vel",
             grid_bytes,
+            wgpu::BufferUsages::COPY_SRC,
+        );
+        // U3 pressure-family buffers (layouts in pressure.wgsl).
+        let nm = Self::storage(
+            &device,
+            "twofield-nm",
+            (num_nodes.max(1) as u64) * 32,
+            wgpu::BufferUsages::COPY_SRC,
+        );
+        let cell_meta = Self::storage(
+            &device,
+            "twofield-cell-meta",
+            (num_cells.max(1) as u64) * 16,
+            wgpu::BufferUsages::COPY_SRC,
+        );
+        let pf_a = Self::storage(
+            &device,
+            "twofield-pf-a",
+            (num_cells.max(1) as u64) * 4,
+            wgpu::BufferUsages::COPY_SRC,
+        );
+        let pf_b = Self::storage(
+            &device,
+            "twofield-pf-b",
+            (num_cells.max(1) as u64) * 4,
+            wgpu::BufferUsages::COPY_SRC,
+        );
+        let nm_c = Self::storage(
+            &device,
+            "twofield-nm-c",
+            (num_cnodes.max(1) as u64) * 32,
+            wgpu::BufferUsages::empty(),
+        );
+        let cmeta = Self::storage(
+            &device,
+            "twofield-cmeta",
+            (num_ccells.max(1) as u64) * 16,
+            wgpu::BufferUsages::empty(),
+        );
+        let pc_a = Self::storage(
+            &device,
+            "twofield-pc-a",
+            (num_ccells.max(1) as u64) * 4,
+            wgpu::BufferUsages::empty(),
+        );
+        let pc_b = Self::storage(
+            &device,
+            "twofield-pc-b",
+            (num_ccells.max(1) as u64) * 4,
             wgpu::BufferUsages::empty(),
         );
         let solids_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -539,20 +857,23 @@ impl Solver for TwofieldSolver {
             queue.write_buffer(&pos, 0, bytemuck::cast_slice(&positions));
             queue.write_buffer(&phase, 0, bytemuck::cast_slice(&phases));
         }
-        // One readback scratch big enough for the largest readable buffer (particles or grid).
+        // One readback scratch big enough for the largest readable buffer (particle vec4s,
+        // affine rows at 48 B/particle, grid lanes, or the 32 B/node M̃⁻¹ matrices).
         let readback = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("twofield-readback"),
-            size: vec4.max(grid_bytes),
+            size: (n * 48).max(grid_bytes).max((num_nodes.max(1) as u64) * 32),
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
 
         // WGSL has no imports: assemble the one module from the concern files. `common` declares
-        // Params/bindings + shared helpers; `transfers` adds the APIC water passes.
+        // Params/bindings + shared helpers; `transfers` adds the APIC water passes; `pressure`
+        // adds the U3 incompressibility family (bindings 9–16).
         let shader_src = format!(
-            "{}\n{}",
+            "{}\n{}\n{}",
             include_str!("common.wgsl"),
             include_str!("transfers.wgsl"),
+            include_str!("pressure.wgsl"),
         );
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("twofield"),
@@ -621,17 +942,178 @@ impl Solver for TwofieldSolver {
                     (8, &solids_buf),
                 ],
             );
+            // --- U3 pressure family (bindings per pass derived in the budget comment) ---
+            let node_setup = make("node_setup");
+            let node_setup_bind = bg(
+                &node_setup,
+                &[(0, &params_buf), (7, &grid_vel), (8, &solids_buf), (9, &nm)],
+            );
+            let cell_classify = make("cell_classify");
+            let cell_classify_bind = bg(
+                &cell_classify,
+                &[
+                    (0, &params_buf),
+                    (7, &grid_vel),
+                    (8, &solids_buf),
+                    (10, &cell_meta),
+                    (11, &pf_a),
+                    (12, &pf_b),
+                ],
+            );
+            let coarse_node_setup = make("coarse_node_setup");
+            let coarse_node_setup_bind = bg(
+                &coarse_node_setup,
+                &[(0, &params_buf), (9, &nm), (13, &nm_c)],
+            );
+            let coarse_cell_setup = make("coarse_cell_setup");
+            let coarse_cell_setup_bind = bg(
+                &coarse_cell_setup,
+                &[
+                    (0, &params_buf),
+                    (10, &cell_meta),
+                    (14, &cmeta),
+                    (15, &pc_a),
+                    (16, &pc_b),
+                ],
+            );
+            let jacobi_coarse = make("jacobi_coarse");
+            let jacobi_coarse_binds = [
+                bg(
+                    &jacobi_coarse,
+                    &[
+                        (0, &params_buf),
+                        (13, &nm_c),
+                        (14, &cmeta),
+                        (15, &pc_a),
+                        (16, &pc_b),
+                    ],
+                ),
+                bg(
+                    &jacobi_coarse,
+                    &[
+                        (0, &params_buf),
+                        (13, &nm_c),
+                        (14, &cmeta),
+                        (15, &pc_b),
+                        (16, &pc_a),
+                    ],
+                ),
+            ];
+            let residual = make("residual");
+            let residual_binds = [
+                bg(
+                    &residual,
+                    &[(0, &params_buf), (9, &nm), (10, &cell_meta), (11, &pf_a)],
+                ),
+                bg(
+                    &residual,
+                    &[(0, &params_buf), (9, &nm), (10, &cell_meta), (11, &pf_b)],
+                ),
+            ];
+            // prolong_add reads the current pressure (11) + the coarse final-parity buffer
+            // (15) and writes the corrected pressure (12) — variants [p parity][pc parity].
+            let prolong_add = make("prolong_add");
+            let pa = |src: &wgpu::Buffer, dst: &wgpu::Buffer, pc: &wgpu::Buffer| {
+                bg(
+                    &prolong_add,
+                    &[
+                        (0, &params_buf),
+                        (10, &cell_meta),
+                        (14, &cmeta),
+                        (15, pc),
+                        (11, src),
+                        (12, dst),
+                    ],
+                )
+            };
+            let prolong_add_binds = [
+                [pa(&pf_a, &pf_b, &pc_a), pa(&pf_a, &pf_b, &pc_b)],
+                [pa(&pf_b, &pf_a, &pc_a), pa(&pf_b, &pf_a, &pc_b)],
+            ];
+            let jacobi_fine = make("jacobi_fine");
+            let jacobi_fine_binds = [
+                bg(
+                    &jacobi_fine,
+                    &[
+                        (0, &params_buf),
+                        (9, &nm),
+                        (10, &cell_meta),
+                        (11, &pf_a),
+                        (12, &pf_b),
+                    ],
+                ),
+                bg(
+                    &jacobi_fine,
+                    &[
+                        (0, &params_buf),
+                        (9, &nm),
+                        (10, &cell_meta),
+                        (11, &pf_b),
+                        (12, &pf_a),
+                    ],
+                ),
+            ];
+            // Project consumes the fine final-parity buffer (index = fine_sweeps % 2).
+            let project = make("project");
+            let project_binds = [
+                bg(
+                    &project,
+                    &[
+                        (0, &params_buf),
+                        (7, &grid_vel),
+                        (9, &nm),
+                        (10, &cell_meta),
+                        (11, &pf_a),
+                    ],
+                ),
+                bg(
+                    &project,
+                    &[
+                        (0, &params_buf),
+                        (7, &grid_vel),
+                        (9, &nm),
+                        (10, &cell_meta),
+                        (11, &pf_b),
+                    ],
+                ),
+            ];
+            let dbg_div = make("dbg_div");
+            let dbg_div_bind = bg(
+                &dbg_div,
+                &[(0, &params_buf), (7, &grid_vel), (10, &cell_meta)],
+            );
+            let dbg_grad = make("dbg_grad");
+            let dbg_grad_bind = bg(
+                &dbg_grad,
+                &[
+                    (0, &params_buf),
+                    (7, &grid_vel),
+                    (10, &cell_meta),
+                    (11, &pf_a),
+                ],
+            );
             Pipelines {
                 grid_clear: (grid_clear, grid_clear_bind),
                 p2g_water: (p2g, p2g_bind),
                 grid_update: (grid_update, grid_update_bind),
                 g2p_water: (g2p, g2p_bind),
+                node_setup: (node_setup, node_setup_bind),
+                cell_classify: (cell_classify, cell_classify_bind),
+                residual: (residual, residual_binds),
+                coarse_node_setup: (coarse_node_setup, coarse_node_setup_bind),
+                coarse_cell_setup: (coarse_cell_setup, coarse_cell_setup_bind),
+                jacobi_coarse: (jacobi_coarse, jacobi_coarse_binds),
+                prolong_add: (prolong_add, prolong_add_binds),
+                jacobi_fine: (jacobi_fine, jacobi_fine_binds),
+                project: (project, project_binds),
+                dbg_div: (dbg_div, dbg_div_bind),
+                dbg_grad: (dbg_grad, dbg_grad_bind),
             }
         };
 
         let ts = if gpu.timestamps_supported {
-            // 4 passes per frame today; headroom for the U3+ pipeline growth.
-            let capacity = 16u32;
+            // 26 passes per frame at the U3 defaults (2 queries each); headroom for U4+.
+            let capacity = 64u32;
             let qset = device.create_query_set(&wgpu::QuerySetDescriptor {
                 label: Some("twofield-timestamps"),
                 ty: wgpu::QueryType::Timestamp,
@@ -669,6 +1151,10 @@ impl Solver for TwofieldSolver {
             water_count,
             solid_count,
             num_nodes,
+            num_cells,
+            coarse_ratio: COARSE_RATIO_DEFAULT,
+            coarse_sweeps: COARSE_SWEEPS_DEFAULT,
+            fine_sweeps: FINE_SWEEPS_DEFAULT,
             params_buf,
             pos,
             vel,
@@ -676,6 +1162,11 @@ impl Solver for TwofieldSolver {
             chem,
             cmat,
             grid_fp,
+            grid_vel,
+            nm,
+            cell_meta,
+            pf_a,
+            pf_b,
             readback,
             pipelines,
             ts,
@@ -722,18 +1213,118 @@ impl Solver for TwofieldSolver {
                 label: Some("twofield-frame"),
             });
 
-        // The U2 APIC pipeline, one substep per frame. Water passes dispatch at least one
-        // workgroup so the dispatch/profiling path is real even on an empty scene (threads
-        // early-out on the water_count guard).
+        // The U2 transfer pipeline + U3 pressure stack, one substep per frame. Passes dispatch
+        // at least one workgroup so the dispatch/profiling path is real even on an empty scene
+        // (threads early-out on the live-set / mask guards — over-dispatch + early-out, never
+        // indirect dispatch, R8).
         let node_groups = groups(self.num_nodes).max(1);
         let water_groups = groups(self.water_count).max(1);
-        let seq: [(&str, &(wgpu::ComputePipeline, wgpu::BindGroup), u32); 4] = [
-            ("grid_clear", &self.pipelines.grid_clear, node_groups),
-            ("p2g_water", &self.pipelines.p2g_water, water_groups),
-            ("grid_update", &self.pipelines.grid_update, node_groups),
-            ("g2p_water", &self.pipelines.g2p_water, water_groups),
+        let cell_groups = groups(self.num_cells).max(1);
+        let cd = self.params.coarse_dims;
+        let ccell_groups = groups(cd[0] * cd[1] * cd[2]).max(1);
+        let cnode_groups = groups((cd[0] + 1) * (cd[1] + 1) * (cd[2] + 1)).max(1);
+
+        // (label, pipeline, bind group, workgroups) — pressure order per pressure.wgsl header:
+        // node_setup → cell_classify → pre-smooth → residual → coarse correction →
+        // prolong_add → post-smooth → project. `par` tracks which ping-pong buffer holds the
+        // current pressure (0 = pf_a); sweeps and prolong_add flip it.
+        let (pre, post) = self.smooth_split();
+        let mut par = 0usize;
+        let mut seq: Vec<(&str, &wgpu::ComputePipeline, &wgpu::BindGroup, u32)> = vec![
+            (
+                "grid_clear",
+                &self.pipelines.grid_clear.0,
+                &self.pipelines.grid_clear.1,
+                node_groups,
+            ),
+            (
+                "p2g_water",
+                &self.pipelines.p2g_water.0,
+                &self.pipelines.p2g_water.1,
+                water_groups,
+            ),
+            (
+                "grid_update",
+                &self.pipelines.grid_update.0,
+                &self.pipelines.grid_update.1,
+                node_groups,
+            ),
+            (
+                "node_setup",
+                &self.pipelines.node_setup.0,
+                &self.pipelines.node_setup.1,
+                node_groups,
+            ),
+            (
+                "cell_classify",
+                &self.pipelines.cell_classify.0,
+                &self.pipelines.cell_classify.1,
+                cell_groups,
+            ),
         ];
-        for (label, (pipe, bind), g) in seq {
+        let push_sweeps = |seq: &mut Vec<_>, n: u32, par: &mut usize| {
+            for _ in 0..n {
+                seq.push((
+                    "jacobi_fine",
+                    &self.pipelines.jacobi_fine.0,
+                    &self.pipelines.jacobi_fine.1[*par],
+                    cell_groups,
+                ));
+                *par ^= 1;
+            }
+        };
+        push_sweeps(&mut seq, pre, &mut par);
+        if self.coarse_sweeps > 0 {
+            seq.push((
+                "residual",
+                &self.pipelines.residual.0,
+                &self.pipelines.residual.1[par],
+                cell_groups,
+            ));
+            seq.push((
+                "coarse_node_setup",
+                &self.pipelines.coarse_node_setup.0,
+                &self.pipelines.coarse_node_setup.1,
+                cnode_groups,
+            ));
+            seq.push((
+                "coarse_cell_setup",
+                &self.pipelines.coarse_cell_setup.0,
+                &self.pipelines.coarse_cell_setup.1,
+                ccell_groups,
+            ));
+            for s in 0..self.coarse_sweeps {
+                seq.push((
+                    "jacobi_coarse",
+                    &self.pipelines.jacobi_coarse.0,
+                    &self.pipelines.jacobi_coarse.1[(s % 2) as usize],
+                    ccell_groups,
+                ));
+            }
+            let pc_par = (self.coarse_sweeps % 2) as usize;
+            seq.push((
+                "prolong_add",
+                &self.pipelines.prolong_add.0,
+                &self.pipelines.prolong_add.1[par][pc_par],
+                cell_groups,
+            ));
+            par ^= 1;
+        }
+        push_sweeps(&mut seq, post, &mut par);
+        debug_assert_eq!(par, self.pressure_parity());
+        seq.push((
+            "project",
+            &self.pipelines.project.0,
+            &self.pipelines.project.1[par],
+            node_groups,
+        ));
+        seq.push((
+            "g2p_water",
+            &self.pipelines.g2p_water.0,
+            &self.pipelines.g2p_water.1,
+            water_groups,
+        ));
+        for (label, pipe, bind, g) in seq {
             dispatch_pass(
                 &mut enc,
                 pipe,

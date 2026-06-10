@@ -75,9 +75,11 @@ fn p2g_water(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 
 // Convert fixed-point mass/momentum to velocity, apply gravity, then the grid-node boundary
-// treatment: separating/no-penetration against the domain box faces and the scene SDF solids
-// (free slip — only the velocity component INTO the wall is removed, and only when it points
-// in). Writes the result for g2p_water; empty nodes get zero velocity.
+// treatment: no-penetration against the domain box faces and the scene SDF solids — the full
+// normal component is removed at wall nodes (free slip tangentially), matching the U3
+// pressure family's constrained M̃⁻¹ (see the comments at the BC sites; separation stays
+// possible at particle resolution). Writes the result for g2p_water; empty nodes get zero
+// velocity.
 @compute @workgroup_size(256)
 fn grid_update(@builtin(global_invocation_id) gid: vec3<u32>) {
     let n = gid.x;
@@ -86,8 +88,13 @@ fn grid_update(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     let mc = atomicLoad(&grid_fp[n * 4u + 0u]);
     var v = vec3<f32>(0.0);
-    if (mc > 0) {
-        // Counts ratio: FP_SCALE cancels in momentum/mass, no decode round-trip needed.
+    // Mass gate (couples to the cap backstop below): nodes below mass_eps (params.extra.z,
+    // ~26 fixed-point counts) decode a quantization-noise velocity AND are exactly the nodes
+    // the U3 projection cannot correct (M̃⁻¹ = 0 below the same eps in node_setup) — giving
+    // them gravity every frame injects uncorrectable free-fall the surface particles gather
+    // via G2P. They are treated as empty here (v = 0), consistently with the whole pressure
+    // family (cell fractions, M̃⁻¹). The decoded mass is still written for diagnostics.
+    if (fp_decode(mc) > params.extra.z) {
         let inv = 1.0 / f32(mc);
         v = vec3<f32>(
             f32(atomicLoad(&grid_fp[n * 4u + 1u])),
@@ -98,28 +105,39 @@ fn grid_update(@builtin(global_invocation_id) gid: vec3<u32>) {
 
         let c = node_coords(n);
         let xp = params.grid_origin.xyz + vec3<f32>(f32(c.x), f32(c.y), f32(c.z)) * params.grid_origin.w;
-
-        // Domain-box faces: nodes at/outside a face lose the velocity component pointing out of
-        // the domain (separating — motion away from the wall is untouched). The grid origin sits
-        // one cell below box_min, so the node layer AT box_min exists exactly.
         let eps = 1.0e-4;
-        if (xp.x <= params.box_min.x + eps && v.x < 0.0) { v.x = 0.0; }
-        if (xp.y <= params.box_min.y + eps && v.y < 0.0) { v.y = 0.0; }
-        if (xp.z <= params.box_min.z + eps && v.z < 0.0) { v.z = 0.0; }
-        if (xp.x >= params.box_max.x - eps && v.x > 0.0) { v.x = 0.0; }
-        if (xp.y >= params.box_max.y - eps && v.y > 0.0) { v.y = 0.0; }
-        if (xp.z >= params.box_max.z - eps && v.z > 0.0) { v.z = 0.0; }
+
+        // Nodes strictly OUTSIDE the domain box are inside the walls: any mass there is
+        // B-spline smear of wall-clamped particles, so they take the wall's velocity (zero —
+        // mirrored by M̃⁻¹ = 0 in node_setup, so the projection family agrees). Leaving them
+        // live fed up to ~23% unprojected free-fall gather weight to particles clamped at the
+        // box EDGES (per-axis boundary weight 0.125 on the outside node, two axes at an
+        // edge), which then sank at ~quarter gravity forever (observed: the four vertical
+        // edge columns pumped the settled tank into sloshing).
+        if (any(xp < params.box_min.xyz - vec3<f32>(eps))
+            || any(xp > params.box_max.xyz + vec3<f32>(eps))) {
+            grid_vel[n] = vec4<f32>(vec3<f32>(0.0), fp_decode(mc));
+            return;
+        }
+
+        // Domain-box faces: face nodes lose the FULL normal component (free slip tangentially).
+        // This matches the U3 pressure family, whose constrained M̃⁻¹ removes the normal axis at
+        // these nodes entirely — the projection treats v_n as boundary-determined and can
+        // neither see nor correct it, so a one-sided ("separating") grid BC lets scatter noise
+        // rectify into a sustained inward v_n that the closed-wall flux gate measures as fake
+        // volume transport (observed: −5.5 units³/s on a settled tank, tolerance 2). Particle-
+        // level separation is untouched: the G2P backstop only clamps INTO-wall motion.
+        if (xp.x <= params.box_min.x + eps || xp.x >= params.box_max.x - eps) { v.x = 0.0; }
+        if (xp.y <= params.box_min.y + eps || xp.y >= params.box_max.y - eps) { v.y = 0.0; }
+        if (xp.z <= params.box_min.z + eps || xp.z >= params.box_max.z - eps) { v.z = 0.0; }
 
         // Static SDF solids (mirrors utils/sdf.rs conventions): nodes through a wall (signed
-        // distance < 0; the cavity gradient points back INTO the allowed interior) lose the
-        // normal component moving deeper into the wall; tangential flow is free slip.
+        // distance < 0) lose the full normal component; tangential flow is free slip — same
+        // M̃⁻¹-consistency argument as the box faces (node_setup subtracts the whole dyad).
         if (params.num_solids > 0u) {
             let hit = solid_union(xp, PHASE_WATER);
             if (hit.dist < 0.0) {
-                let vn = dot(v, hit.grad);
-                if (vn < 0.0) {
-                    v = v - vn * hit.grad;
-                }
+                v = v - dot(v, hit.grad) * hit.grad;
             }
         }
 
