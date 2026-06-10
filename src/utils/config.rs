@@ -170,7 +170,7 @@ impl Default for Config {
             drag_subiters: 4,
             buoyancy_scale: 1.0,
             wake_threshold: 0.3, // local water flow speed (units/s) above grain_sleep_speed (KTD-9)
-            impact_scale: 0.0,   // dynamic-pressure crater coupling OFF by default (opt-in per scene)
+            impact_scale: 0.0, // dynamic-pressure crater coupling OFF by default (opt-in per scene)
             // Wetting OFF by default (like drag_subiters=0): scenes opt in with absorb_rate>0 until
             // the feature is calibrated. ~2 s saturation time constant when enabled; deactivate
             // water only at a tiny remaining fraction (exact conservation), skip from PBF above that.
