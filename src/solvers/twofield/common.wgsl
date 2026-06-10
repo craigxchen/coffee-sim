@@ -19,7 +19,7 @@
 const PHASE_WATER: u32 = 0u;
 const PHASE_SOLID: u32 = 1u;
 
-// Byte-identical to the Rust `Params` (112 bytes; vec4-aligned tail).
+// Byte-identical to the Rust `Params` (144 bytes; vec4-aligned tail).
 struct Params {
     box_min: vec4<f32>,     // simulation domain (w unused)
     box_max: vec4<f32>,     // (w unused)
@@ -34,6 +34,9 @@ struct Params {
     solid_count: u32,    // particles [water_count, water_count + solid_count) are solid grains
     particle_count: u32, // = water_count + solid_count (kernel live-set guard)
     num_solids: u32,     // count of static SDF solids in the `solids` buffer (0 = none)
+    // U3 pressure stack (pressure.wgsl):
+    coarse_dims: vec4<u32>, // coarse CELLS per axis (= ceil(fine_cells/ratio)); .w = ratio
+    extra: vec4<f32>,       // (rest_density, rho_floor, mass_eps, unused)
 };
 
 @group(0) @binding(0) var<uniform> params: Params;
