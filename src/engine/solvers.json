@@ -16,5 +16,11 @@
     "paradigm": "PositionBased",
     "owns_grid": false,
     "stability": "Unconditional"
+  },
+  "twofield": {
+    "name": "Two-field (water+solid grid)",
+    "paradigm": "Hybrid",
+    "owns_grid": true,
+    "stability": { "CflLimited": { "c": 0.5 } }
   }
 }

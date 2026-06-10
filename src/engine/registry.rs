@@ -10,6 +10,7 @@ use crate::engine::scene::Scene;
 use crate::models::Materials;
 use crate::solvers::base::{Solver, SolverInfo};
 use crate::solvers::noop::{NoopSolverA, NoopSolverB};
+use crate::solvers::twofield::TwofieldSolver;
 use crate::solvers::xpbd::XpbdSolver;
 use crate::utils::config::Config;
 use crate::utils::gpu::GpuContext;
@@ -23,6 +24,7 @@ pub enum SolverId {
     NoopA,
     NoopB,
     Xpbd,
+    Twofield,
 }
 
 impl SolverId {
@@ -31,12 +33,18 @@ impl SolverId {
             SolverId::NoopA => "noop_a",
             SolverId::NoopB => "noop_b",
             SolverId::Xpbd => "xpbd",
+            SolverId::Twofield => "twofield",
         }
     }
 
     /// Every registered solver, for UI dropdowns and comparison sweeps.
     pub fn all() -> &'static [SolverId] {
-        &[SolverId::NoopA, SolverId::NoopB, SolverId::Xpbd]
+        &[
+            SolverId::NoopA,
+            SolverId::NoopB,
+            SolverId::Xpbd,
+            SolverId::Twofield,
+        ]
     }
 }
 
@@ -80,6 +88,7 @@ pub fn build_solver(
         SolverId::NoopA => Box::new(NoopSolverA::build(scene, mats, cfg, gpu)),
         SolverId::NoopB => Box::new(NoopSolverB::build(scene, mats, cfg, gpu)),
         SolverId::Xpbd => Box::new(XpbdSolver::build(scene, mats, cfg, gpu)),
+        SolverId::Twofield => Box::new(TwofieldSolver::build(scene, mats, cfg, gpu)),
     }
 }
 
