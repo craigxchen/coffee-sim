@@ -1,8 +1,9 @@
-//! Twofield U1 scaffold acceptance (headless).
+//! Twofield phase-0 acceptance (headless).
 //!
-//! Builds the inert two-field solver on a tiny water-only scene, runs a handful of steps,
-//! asserts finite state and `dispatches_per_frame > 0`, and prints the U1 GPU budget numbers
-//! the validation ladder tracks from here on (R8). Skips gracefully without a GPU adapter.
+//! Builds the two-field solver on a tiny water-only scene, runs a handful of steps (U2: the
+//! block free-falls through the APIC transfer pipeline), asserts finite state and
+//! `dispatches_per_frame > 0`, and prints the GPU budget numbers the validation ladder tracks
+//! (R8). Skips gracefully without a GPU adapter.
 //!
 //! Run with: `cargo run --example twofield_phase0`
 
@@ -47,7 +48,7 @@ fn main() {
     let metrics = solver.metrics();
     assert!(
         profile.dispatches_per_frame > 0,
-        "the scaffold pass must dispatch every frame"
+        "the transfer pipeline must dispatch every frame"
     );
     assert!(
         metrics.particle_count > 0,
@@ -64,7 +65,7 @@ fn main() {
 
     let (water, solid) = solver.phase_counts();
     println!(
-        "twofield U1 budgets: dispatches/frame {} | max storage buffers per entry point {} | device request 9/stage (src/utils/gpu.rs, not raised in U1)",
+        "twofield budgets: dispatches/frame {} | max storage buffers per entry point {} | device request 9/stage (src/utils/gpu.rs, not raised)",
         profile.dispatches_per_frame, MAX_STORAGE_BUFFERS_PER_ENTRY_POINT
     );
     println!(
