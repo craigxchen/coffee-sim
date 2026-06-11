@@ -19,6 +19,16 @@
 //! DECISION: deliberately not implemented (knob grid pins Tait ∈ {off}); if a later unit
 //! demonstrates an iteration-budget win it ships behind an opt-in `Config` gate, otherwise it
 //! is removed rather than shipped dormant.
+//!
+//! U4 (the L0 exit) adds pour emission and the pour-cavity machinery (`surface.wgsl`,
+//! KTD-6): `EmissionInput` drives the xpbd-shaped volume-consistent arclength-credit emitter
+//! into a pre-allocated water pool (water live range `[0, water_count)` grows toward
+//! `water_capacity`; solids sit AFTER the full pool so the KTD-1 range layout survives
+//! emission — dormant slots are never dispatched); enclosed air pockets are detected by a
+//! fixed-budget grid flood fill from the open (top) boundary and carried as ONE constraint
+//! bubble: a single Lagrange-multiplier scalar λ_b whose value IS the pocket pressure,
+//! represented identically in the coarse solve and the fine sweeps (see surface.wgsl's
+//! BUBBLE REPRESENTATION header). Gates: `tests/twofield_cavity.rs`.
 
 use std::sync::Arc;
 
@@ -41,17 +51,20 @@ fn groups(n: u32) -> u32 {
     n.div_ceil(WG)
 }
 
-/// U2+U3 GPU-budget bookkeeping (R8): the widest entry point's storage-buffer count, derived
-/// by inspection of the bind groups in `build` (the params uniform doesn't count against the
-/// storage limit). Per pass: `grid_clear` 1, `p2g_water` 4 (pos, vel, cmat, grid_fp),
-/// `grid_update` 3 (grid_fp, grid_vel, solids), `g2p_water` 5 (pos, vel, cmat, grid_vel,
-/// solids); U3 pressure family — `node_setup` 3 (grid_vel, solids, nm), `cell_classify` 5
-/// (grid_vel, solids, cell_meta, pf_a, pf_b), `coarse_node_setup` 2, `coarse_cell_setup` 4
-/// (cell_meta, cmeta, pc_a, pc_b), `jacobi_fine`/`jacobi_coarse` 4, `prolong` 4, `project` 4
-/// (grid_vel, nm, cell_meta, pf), debug taps ≤ 3. Re-derive when passes are added. The device
-/// requests 9 storage buffers per stage (`src/utils/gpu.rs::NEEDED_STORAGE_BUFFERS`) — still
-/// NOT raised (KTD-7).
-pub const MAX_STORAGE_BUFFERS_PER_ENTRY_POINT: u32 = 5;
+/// U2+U3+U4 GPU-budget bookkeeping (R8): the widest entry point's storage-buffer count,
+/// derived by inspection of the bind groups in `build` (the params uniform doesn't count
+/// against the storage limit). Per pass: `grid_clear` 2 (grid_fp, cell_cnt), `p2g_water` 5
+/// (pos, vel, cmat, grid_fp, cell_cnt), `grid_update` 3 (grid_fp, grid_vel, solids),
+/// `g2p_water` 5 (pos, vel, cmat, grid_vel, solids); U3 pressure family — `node_setup` 3
+/// (grid_vel, solids, nm),
+/// `cell_classify` 6 (grid_vel, solids, cell_meta, pf_a, pf_b, cell_cnt), `coarse_node_setup` 2,
+/// `coarse_cell_setup` 4 (cell_meta, cmeta, pc_a, pc_b), `jacobi_fine`/`jacobi_coarse` 5
+/// (+bubble), `prolong_add` 6 (cell_meta, cmeta, pc, pf×2, bubble) — the widest, `project` 4,
+/// debug taps ≤ 3; U4 surface family — `flood_init` 2, `flood_sweep` 3, `pocket_mark` 5
+/// (grid_vel, cell_meta, pf×2, bubble), `bubble_fine` 4, `bubble_coarse` 4. Re-derive when
+/// passes are added. The device requests 9 storage buffers per stage
+/// (`src/utils/gpu.rs::NEEDED_STORAGE_BUFFERS`) — still NOT raised (KTD-7).
+pub const MAX_STORAGE_BUFFERS_PER_ENTRY_POINT: u32 = 6;
 
 /// U3 pressure knobs — defaults of the declared knob grid (KTD-9; the grid itself is pinned
 /// in the header of `tests/twofield_pressure.rs`). The coarse ratio is fine cells per coarse
@@ -100,9 +113,28 @@ pub const SURF_MIN_CORNER: f32 = 0.1;
 /// above the plan's rough +6–12 guess — recorded honestly per R8.
 pub const U3_PRESSURE_DISPATCHES: u32 = 7 + COARSE_SWEEPS_DEFAULT + FINE_SWEEPS_DEFAULT;
 
+/// U4 flood-fill sweep budget (fixed structural constant, like JACOBI_OMEGA — NOT a gate
+/// knob): each sweep propagates the OUTSIDE label one 6-neighbor cell, so the budget bounds
+/// the reachable open-air path length in cells. 24 covers every current scene with margin
+/// (tallest air column: the 32-unit tank → 16 cells; the V60 cone detour ≈ 20); cells beyond
+/// the budget would degrade conservatively (extra pocket members with massless nodes — zero
+/// row coupling). Kept EVEN so the final labels land back in the pf_a slot (parity).
+pub const FLOOD_SWEEPS: u32 = 24;
+
+/// U4 dispatch increment at the default knobs: flood_init + FLOOD_SWEEPS + pocket_mark, plus
+/// one single-workgroup bubble-row solve preceding EVERY fine and coarse Jacobi sweep (the
+/// KTD-6 identical-representation requirement — the multiplier relaxes WITH the smoother at
+/// both levels, so neither level can erode the constraint).
+pub const U4_SURFACE_DISPATCHES: u32 =
+    2 + FLOOD_SWEEPS + FINE_SWEEPS_DEFAULT + COARSE_SWEEPS_DEFAULT;
+
 /// Compute dispatches per frame at the default knobs: the U2 transfer pipeline (grid_clear,
-/// p2g_water, grid_update, g2p_water) + the U3 pressure stack.
-pub const DISPATCHES_PER_FRAME: u32 = 4 + U3_PRESSURE_DISPATCHES;
+/// p2g_water, grid_update, g2p_water) + the U3 pressure stack + the U4 surface stack.
+pub const DISPATCHES_PER_FRAME: u32 = 4 + U3_PRESSURE_DISPATCHES + U4_SURFACE_DISPATCHES;
+
+/// Reduced-units volume calibration (KEEP.md §2; mirrors the xpbd constant): mL per scene
+/// unit³ — sizes the pour pool from a scene's declared `pour_water_ml`.
+const ML_PER_SIM_UNIT3: f32 = 5.20;
 
 /// Fine-grid cell size as a multiple of the particle spacing. ~2× spacing gives the quadratic
 /// B-spline support (1.5 cells each way) a ≈3-spacing reach with ≈8 particles per cell at rest
@@ -216,10 +248,18 @@ pub struct TwofieldSolver {
     device: wgpu::Device,
     queue: wgpu::Queue,
     params: Params,
+    /// LIVE water count (grows as the pour activates pool slots); the seed value is
+    /// `initial_water`.
     water_count: u32,
+    /// Allocated water-pool size = seed + dose headroom (KTD-1 layout with emission: water
+    /// pool `[0, water_capacity)`, live `[0, water_count)`, solids
+    /// `[water_capacity, water_capacity + solid_count)` — dormant slots are never dispatched).
+    water_capacity: u32,
     solid_count: u32,
     num_nodes: u32,
     num_cells: u32,
+    /// Pour-emission state (xpbd-shaped volume-consistent emitter).
+    inflow: Inflow,
 
     // U3 pressure knobs (KTD-9 grid points; sweep counts = dispatch counts, driven in step).
     coarse_ratio: u32,
@@ -247,6 +287,8 @@ pub struct TwofieldSolver {
     cell_meta: wgpu::Buffer,
     pf_a: wgpu::Buffer,
     pf_b: wgpu::Buffer,
+    // U4 bubble state: [λ_b, δλ_b] (surface.wgsl binding 17).
+    bubble: wgpu::Buffer,
     readback: wgpu::Buffer,
 
     pipelines: Pipelines,
@@ -256,9 +298,53 @@ pub struct TwofieldSolver {
     dispatches: u32,
     cached_passes: Vec<(String, f32)>,
 
-    // Retained for reset (exact, deterministic re-seed).
+    // Retained for reset (exact, deterministic re-seed; pool-padded layout).
     initial_positions: Vec<[f32; 4]>,
     initial_phases: Vec<u32>,
+    initial_water: u32,
+}
+
+/// Pour-emission state + spout parameters (host-side; mirrors the xpbd `Inflow`). Turns
+/// `EmissionInput` into activated water-pool particles via the volume-consistent
+/// arclength-credit emitter: the volume accumulator (flow/V_w·dt) is the master count budget;
+/// layers release one `particle_spacing` of stream travel apart, each filling a golden-angle
+/// disc, so the inlet packs to the fluid's rest density.
+struct Inflow {
+    // Static (from Config/Materials at build).
+    nozzle_radius: f32,
+    discharge_coeff: f32,
+    spacing: f32,
+    v_w: f32,
+    pour_t: f32,
+    // State.
+    accumulator: f32, // volume budget in particles (carries the sub-particle fraction)
+    axial: f32,       // arclength credit (scene units) toward the next layer
+    last_exit_speed: f32, // drains backlog at the last cadence when flow drops to 0
+    cursor: u64,      // golden-angle determinism across all emitted particles
+    emitted_mass: f32, // running total emitted water mass (conservation accounting)
+}
+
+/// Orthonormal disc basis perpendicular to a (unit) pour direction `dir` (mirrors xpbd).
+fn disc_basis(dir: [f32; 3]) -> ([f32; 3], [f32; 3]) {
+    let cross = |a: [f32; 3], b: [f32; 3]| {
+        [
+            a[1] * b[2] - a[2] * b[1],
+            a[2] * b[0] - a[0] * b[2],
+            a[0] * b[1] - a[1] * b[0],
+        ]
+    };
+    let norm = |v: [f32; 3]| {
+        let l = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt().max(1.0e-9);
+        [v[0] / l, v[1] / l, v[2] / l]
+    };
+    let refv = if dir[1].abs() < 0.9 {
+        [0.0, 1.0, 0.0]
+    } else {
+        [1.0, 0.0, 0.0]
+    };
+    let u = norm(cross(dir, refv));
+    let w = cross(dir, u);
+    (u, w)
 }
 
 struct Pipelines {
@@ -279,6 +365,14 @@ struct Pipelines {
     prolong_add: (wgpu::ComputePipeline, [[wgpu::BindGroup; 2]; 2]),
     jacobi_fine: (wgpu::ComputePipeline, [wgpu::BindGroup; 2]),
     project: (wgpu::ComputePipeline, [wgpu::BindGroup; 2]),
+    // U4 surface family: flood fill (label ping-pong in the pressure slots), pocket marking,
+    // and the single-workgroup bubble-row solves at each level (parity variants like the
+    // sweeps they precede).
+    flood_init: (wgpu::ComputePipeline, wgpu::BindGroup),
+    flood_sweep: (wgpu::ComputePipeline, [wgpu::BindGroup; 2]),
+    pocket_mark: (wgpu::ComputePipeline, wgpu::BindGroup),
+    bubble_fine: (wgpu::ComputePipeline, [wgpu::BindGroup; 2]),
+    bubble_coarse: (wgpu::ComputePipeline, [wgpu::BindGroup; 2]),
     // Test-only operator taps (never dispatched in step; zero budget impact).
     dbg_div: (wgpu::ComputePipeline, wgpu::BindGroup),
     dbg_grad: (wgpu::ComputePipeline, wgpu::BindGroup),
@@ -535,6 +629,152 @@ impl TwofieldSolver {
         self.fine_sweeps = fine_sweeps;
     }
 
+    /// Set the live water count (dev/test only — state-replay support for the decay gates;
+    /// `n` must not exceed the allocated water pool).
+    pub fn set_live_water_for_test(&mut self, n: u32) {
+        assert!(
+            n <= self.water_capacity,
+            "live water {n} exceeds the allocated pool {}",
+            self.water_capacity
+        );
+        self.water_count = n;
+        self.params.water_count = n;
+    }
+
+    /// Read back the bubble state `[λ_b, δλ_b]` (dev/test only — stalls).
+    pub fn read_bubble(&self) -> [f32; 2] {
+        let raw: Vec<f32> = bytemuck::cast_slice(&self.read_bytes(&self.bubble, 8)).to_vec();
+        [raw[0], raw[1]]
+    }
+
+    /// Total water mass emitted by the pour so far (conservation accounting; dev/test).
+    pub fn total_emitted_water_mass(&self) -> f32 {
+        self.inflow.emitted_mass
+    }
+
+    /// Activate pour-emitted water particles for this frame from `EmissionInput` — the
+    /// volume-consistent arclength-credit emitter, ported from the xpbd solver (see its
+    /// `emit` for the derivations): the volume accumulator (flow/V_w·dt) is the master count
+    /// budget; layers release one `particle_spacing` of stream travel apart, each filling a
+    /// golden-angle disc with up to `N_layer = ceil(A_eff·spacing/V_w)` particles, so the
+    /// inlet packs to rest density. Particles are written into the water pool's live range
+    /// and `water_count` grows. No-ops when not pouring and no backlog remains.
+    fn emit(&mut self, input: &EmissionInput, dt: f32) {
+        // A Reset event clears the emitter's backlog/credit (the emitter contract; a full
+        // sim restart is `reset()`). Done before the gate so a Reset with zero flow clears.
+        if input.event == crate::emission::PourEvent::Reset {
+            self.inflow.accumulator = 0.0;
+            self.inflow.axial = 0.0;
+            self.inflow.last_exit_speed = 0.0;
+        }
+        let flow = input.flow_rate.max(0.0);
+        // Gate: pour active, or a whole particle of backlog still to drain.
+        if flow <= 0.0 && self.inflow.accumulator < 1.0 {
+            return;
+        }
+        let a_eff = std::f32::consts::PI
+            * self.inflow.nozzle_radius
+            * self.inflow.nozzle_radius
+            * self.inflow.discharge_coeff;
+        let a_eff = a_eff.max(1.0e-9);
+        // Orifice relation: exit speed from flow + effective area. While draining a backlog
+        // at zero flow, keep the last cadence so the stream tail stays correctly spaced.
+        let exit_speed = if flow > 0.0 {
+            let es = flow / a_eff;
+            self.inflow.last_exit_speed = es;
+            self.inflow.accumulator += flow / self.inflow.v_w * dt;
+            es
+        } else {
+            self.inflow.last_exit_speed
+        };
+        if exit_speed <= 0.0 {
+            return;
+        }
+        // Volume-consistent layer capacity (ceil ⇒ throughput ≥ flow/V_w, no backlog).
+        let n_layer = ((a_eff * self.inflow.spacing / self.inflow.v_w).ceil() as u32).max(1);
+
+        // Pour direction (downward, tilted by pour_angle toward +x) + a disc basis.
+        let a = input.pour_angle;
+        let dir = [a.sin(), -a.cos(), 0.0];
+        let (u, w) = disc_basis(dir);
+        let r_eff = self.inflow.nozzle_radius * self.inflow.discharge_coeff.sqrt();
+        const GOLDEN: f32 = 2.399_963_2;
+
+        self.inflow.axial += exit_speed * dt;
+        let kettle = input.kettle_pos;
+        let mut want = self.inflow.accumulator.floor() as u32;
+        let mut new_pos: Vec<[f32; 4]> = Vec::new();
+        let mut new_vel: Vec<[f32; 4]> = Vec::new();
+        let mut new_chem: Vec<[f32; 4]> = Vec::new();
+        let mut clamped = false;
+        while self.inflow.axial >= self.inflow.spacing && want > 0 {
+            // Capacity check BEFORE spending arclength credit, so a full pool doesn't
+            // silently consume a layer's axial.
+            let avail = self.water_capacity - (self.water_count + new_pos.len() as u32);
+            if avail == 0 {
+                clamped = true;
+                break;
+            }
+            self.inflow.axial -= self.inflow.spacing;
+            let depth = self.inflow.axial; // residual stream travel below the nozzle
+            let this_layer = n_layer.min(want).min(avail);
+            for _ in 0..this_layer {
+                // Radial shell cycles with the cursor (mod N_layer) so partial layers still
+                // cover the whole disc over time; golden angle fills it uniformly.
+                let ri = (self.inflow.cursor % n_layer as u64) as f32;
+                let r = r_eff * ((ri + 0.5) / n_layer as f32).sqrt();
+                let theta = self.inflow.cursor as f32 * GOLDEN;
+                self.inflow.cursor += 1;
+                let (ct, st) = (theta.cos(), theta.sin());
+                let off = [
+                    u[0] * r * ct + w[0] * r * st,
+                    u[1] * r * ct + w[1] * r * st,
+                    u[2] * r * ct + w[2] * r * st,
+                ];
+                new_pos.push([
+                    kettle[0] + dir[0] * depth + off[0],
+                    kettle[1] + dir[1] * depth + off[1],
+                    kettle[2] + dir[2] * depth + off[2],
+                    1.0, // moisture lane: full water
+                ]);
+                new_vel.push([
+                    dir[0] * exit_speed,
+                    dir[1] * exit_speed,
+                    dir[2] * exit_speed,
+                    0.0,
+                ]);
+                new_chem.push([0.0, self.inflow.pour_t, 0.0, 0.0]); // c = 0, T = pour temp
+            }
+            want -= this_layer;
+        }
+        if clamped {
+            eprintln!(
+                "twofield pour: water pool {} reached; emission clamped (a recipe scene must \
+                 declare enough pour_water_ml to size the pool to its dose)",
+                self.water_capacity
+            );
+        }
+        let emit_n = new_pos.len() as u32;
+        if emit_n == 0 {
+            return;
+        }
+        // Clamp-before-decrement: subtract only what was actually emitted — unspent budget
+        // stays as backlog rather than being silently burned.
+        self.inflow.accumulator -= emit_n as f32;
+        self.inflow.emitted_mass += emit_n as f32 * self.params.particle_mass;
+        let off_v4 = (self.water_count as u64) * 16;
+        self.queue
+            .write_buffer(&self.pos, off_v4, bytemuck::cast_slice(&new_pos));
+        self.queue
+            .write_buffer(&self.vel, off_v4, bytemuck::cast_slice(&new_vel));
+        self.queue
+            .write_buffer(&self.chem, off_v4, bytemuck::cast_slice(&new_chem));
+        // Phase tags of dormant pool slots are already 0 (water) and the APIC C rows are
+        // zero (each slot is activated at most once per run; reset re-zeroes them).
+        self.water_count += emit_n;
+        self.params.water_count = self.water_count;
+    }
+
     /// Overwrite particle positions (dev/test only; the .w lane carries moisture).
     pub fn write_positions_for_test(&self, positions: &[[f32; 4]]) {
         assert_eq!(
@@ -696,9 +936,30 @@ impl Solver for TwofieldSolver {
         let device = gpu.device.clone();
         let queue = gpu.queue.clone();
 
-        let (positions, phases, water_count) = seed_ranges(scene, mats, cfg);
-        let particle_count = positions.len() as u32;
-        let solid_count = particle_count - water_count;
+        let (seed_positions, seed_phases, water_seed) = seed_ranges(scene, mats, cfg);
+        let solid_count = seed_positions.len() as u32 - water_seed;
+
+        // Water pool: seed + dose headroom for a declared pour (KEEP §2 calibration; V_w =
+        // spacing³ at this solver's rest density). Solids sit AFTER the full pool so the
+        // KTD-1 range layout survives emission; dormant slots `[water_count, water_capacity)`
+        // are never dispatched (the water kernels guard on the LIVE count) and are parked at
+        // the box corner with zero moisture until activated.
+        let v_w = mats.particle_spacing.powi(3);
+        let dose_headroom = if scene.declares_pour() {
+            (scene.pour_water_ml / ML_PER_SIM_UNIT3 / v_w).ceil() as u32
+        } else {
+            0
+        };
+        let water_capacity = water_seed + dose_headroom;
+        let particle_count = water_capacity + solid_count; // pool size (buffers + readbacks)
+        let park = [scene.box_min[0], scene.box_min[1], scene.box_min[2], 0.0];
+        let mut positions = seed_positions[..water_seed as usize].to_vec();
+        positions.resize(water_capacity as usize, park);
+        positions.extend_from_slice(&seed_positions[water_seed as usize..]);
+        let mut phases = seed_phases[..water_seed as usize].to_vec();
+        phases.resize(water_capacity as usize, 0);
+        phases.extend_from_slice(&seed_phases[water_seed as usize..]);
+        let water_count = water_seed; // live count
 
         let (origin, cell, dims) = grid_spec_for(scene, mats);
         let num_nodes = dims[0] * dims[1] * dims[2];
@@ -848,6 +1109,15 @@ impl Solver for TwofieldSolver {
             (num_ccells.max(1) as u64) * 4,
             wgpu::BufferUsages::empty(),
         );
+        // U4 bubble state: [λ_b, δλ_b].
+        let bubble = Self::storage(&device, "twofield-bubble", 8, wgpu::BufferUsages::COPY_SRC);
+        // U4 per-cell particle counts (the surface-classification particle-presence census).
+        let cell_cnt = Self::storage(
+            &device,
+            "twofield-cell-cnt",
+            (num_cells.max(1) as u64) * 4,
+            wgpu::BufferUsages::empty(),
+        );
         let solids_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("twofield-solids"),
             contents: bytemuck::cast_slice(&packed),
@@ -868,12 +1138,14 @@ impl Solver for TwofieldSolver {
 
         // WGSL has no imports: assemble the one module from the concern files. `common` declares
         // Params/bindings + shared helpers; `transfers` adds the APIC water passes; `pressure`
-        // adds the U3 incompressibility family (bindings 9–16).
+        // adds the U3 incompressibility family (bindings 9–16); `surface` adds the U4 flood
+        // fill + constraint bubble (binding 17).
         let shader_src = format!(
-            "{}\n{}\n{}",
+            "{}\n{}\n{}\n{}",
             include_str!("common.wgsl"),
             include_str!("transfers.wgsl"),
             include_str!("pressure.wgsl"),
+            include_str!("surface.wgsl"),
         );
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("twofield"),
@@ -908,7 +1180,10 @@ impl Solver for TwofieldSolver {
         };
         let pipelines = {
             let grid_clear = make("grid_clear");
-            let grid_clear_bind = bg(&grid_clear, &[(0, &params_buf), (6, &grid_fp)]);
+            let grid_clear_bind = bg(
+                &grid_clear,
+                &[(0, &params_buf), (6, &grid_fp), (18, &cell_cnt)],
+            );
             let p2g = make("p2g_water");
             let p2g_bind = bg(
                 &p2g,
@@ -918,6 +1193,7 @@ impl Solver for TwofieldSolver {
                     (2, &vel),
                     (5, &cmat),
                     (6, &grid_fp),
+                    (18, &cell_cnt),
                 ],
             );
             let grid_update = make("grid_update");
@@ -958,6 +1234,7 @@ impl Solver for TwofieldSolver {
                     (10, &cell_meta),
                     (11, &pf_a),
                     (12, &pf_b),
+                    (18, &cell_cnt),
                 ],
             );
             let coarse_node_setup = make("coarse_node_setup");
@@ -986,6 +1263,7 @@ impl Solver for TwofieldSolver {
                         (14, &cmeta),
                         (15, &pc_a),
                         (16, &pc_b),
+                        (17, &bubble),
                     ],
                 ),
                 bg(
@@ -996,6 +1274,7 @@ impl Solver for TwofieldSolver {
                         (14, &cmeta),
                         (15, &pc_b),
                         (16, &pc_a),
+                        (17, &bubble),
                     ],
                 ),
             ];
@@ -1023,6 +1302,7 @@ impl Solver for TwofieldSolver {
                         (15, pc),
                         (11, src),
                         (12, dst),
+                        (17, &bubble),
                     ],
                 )
             };
@@ -1040,6 +1320,7 @@ impl Solver for TwofieldSolver {
                         (10, &cell_meta),
                         (11, &pf_a),
                         (12, &pf_b),
+                        (17, &bubble),
                     ],
                 ),
                 bg(
@@ -1050,6 +1331,7 @@ impl Solver for TwofieldSolver {
                         (10, &cell_meta),
                         (11, &pf_b),
                         (12, &pf_a),
+                        (17, &bubble),
                     ],
                 ),
             ];
@@ -1077,6 +1359,65 @@ impl Solver for TwofieldSolver {
                     ],
                 ),
             ];
+            // --- U4 surface family --------------------------------------------------------
+            let flood_init = make("flood_init");
+            let flood_init_bind = bg(
+                &flood_init,
+                &[(0, &params_buf), (10, &cell_meta), (11, &pf_a)],
+            );
+            let flood_sweep = make("flood_sweep");
+            let flood_sweep_binds = [
+                bg(
+                    &flood_sweep,
+                    &[(0, &params_buf), (10, &cell_meta), (11, &pf_a), (12, &pf_b)],
+                ),
+                bg(
+                    &flood_sweep,
+                    &[(0, &params_buf), (10, &cell_meta), (11, &pf_b), (12, &pf_a)],
+                ),
+            ];
+            // pocket_mark reads the final labels from pf_a (FLOOD_SWEEPS is even) and
+            // re-zeroes both pressure slots for the solve.
+            let pocket_mark = make("pocket_mark");
+            let pocket_mark_bind = bg(
+                &pocket_mark,
+                &[
+                    (0, &params_buf),
+                    (7, &grid_vel),
+                    (10, &cell_meta),
+                    (11, &pf_a),
+                    (12, &pf_b),
+                    (17, &bubble),
+                ],
+            );
+            let bubble_fine = make("bubble_fine");
+            let bf = |pf: &wgpu::Buffer| {
+                bg(
+                    &bubble_fine,
+                    &[
+                        (0, &params_buf),
+                        (9, &nm),
+                        (10, &cell_meta),
+                        (11, pf),
+                        (17, &bubble),
+                    ],
+                )
+            };
+            let bubble_fine_binds = [bf(&pf_a), bf(&pf_b)];
+            let bubble_coarse = make("bubble_coarse");
+            let bc = |pc: &wgpu::Buffer| {
+                bg(
+                    &bubble_coarse,
+                    &[
+                        (0, &params_buf),
+                        (13, &nm_c),
+                        (14, &cmeta),
+                        (15, pc),
+                        (17, &bubble),
+                    ],
+                )
+            };
+            let bubble_coarse_binds = [bc(&pc_a), bc(&pc_b)];
             let dbg_div = make("dbg_div");
             let dbg_div_bind = bg(
                 &dbg_div,
@@ -1106,14 +1447,19 @@ impl Solver for TwofieldSolver {
                 prolong_add: (prolong_add, prolong_add_binds),
                 jacobi_fine: (jacobi_fine, jacobi_fine_binds),
                 project: (project, project_binds),
+                flood_init: (flood_init, flood_init_bind),
+                flood_sweep: (flood_sweep, flood_sweep_binds),
+                pocket_mark: (pocket_mark, pocket_mark_bind),
+                bubble_fine: (bubble_fine, bubble_fine_binds),
+                bubble_coarse: (bubble_coarse, bubble_coarse_binds),
                 dbg_div: (dbg_div, dbg_div_bind),
                 dbg_grad: (dbg_grad, dbg_grad_bind),
             }
         };
 
         let ts = if gpu.timestamps_supported {
-            // 26 passes per frame at the U3 defaults (2 queries each); headroom for U4+.
-            let capacity = 64u32;
+            // 69 passes per frame at the U4 defaults (2 queries each); headroom for U5+.
+            let capacity = 192u32;
             let qset = device.create_query_set(&wgpu::QuerySetDescriptor {
                 label: Some("twofield-timestamps"),
                 ty: wgpu::QueryType::Timestamp,
@@ -1149,9 +1495,22 @@ impl Solver for TwofieldSolver {
             queue,
             params,
             water_count,
+            water_capacity,
             solid_count,
             num_nodes,
             num_cells,
+            inflow: Inflow {
+                nozzle_radius: cfg.nozzle_radius,
+                discharge_coeff: cfg.discharge_coeff,
+                spacing: mats.particle_spacing,
+                v_w,
+                pour_t: mats.pour_t,
+                accumulator: 0.0,
+                axial: 0.0,
+                last_exit_speed: 0.0,
+                cursor: 0,
+                emitted_mass: 0.0,
+            },
             coarse_ratio: COARSE_RATIO_DEFAULT,
             coarse_sweeps: COARSE_SWEEPS_DEFAULT,
             fine_sweeps: FINE_SWEEPS_DEFAULT,
@@ -1167,6 +1526,7 @@ impl Solver for TwofieldSolver {
             cell_meta,
             pf_a,
             pf_b,
+            bubble,
             readback,
             pipelines,
             ts,
@@ -1174,13 +1534,15 @@ impl Solver for TwofieldSolver {
             cached_passes: Vec::new(),
             initial_positions: positions,
             initial_phases: phases,
+            initial_water: water_seed,
         }
     }
 
     fn reset(&mut self, _scene: &Scene) {
-        // Exact, deterministic re-seed: positions + phase tags back to the seed; velocities,
-        // chem lanes, and APIC C matrices re-zeroed. (The grid is cleared at the start of every
-        // frame, so it needs no reset.)
+        // Exact, deterministic re-seed: positions + phase tags back to the seed (pool-padded
+        // layout — pour-activated slots return to the parked dormant state); velocities, chem
+        // lanes, and APIC C matrices re-zeroed; the emitter restarts from t = 0. (The grid is
+        // cleared at the start of every frame, so it needs no reset.)
         if !self.initial_positions.is_empty() {
             self.queue
                 .write_buffer(&self.pos, 0, bytemuck::cast_slice(&self.initial_positions));
@@ -1195,11 +1557,21 @@ impl Solver for TwofieldSolver {
             self.queue
                 .write_buffer(&self.cmat, 0, bytemuck::cast_slice(&czeros));
         }
+        self.water_count = self.initial_water;
+        self.params.water_count = self.initial_water;
+        self.inflow.accumulator = 0.0;
+        self.inflow.axial = 0.0;
+        self.inflow.last_exit_speed = 0.0;
+        self.inflow.cursor = 0;
+        self.inflow.emitted_mass = 0.0;
         self.cached_passes.clear();
         self.dispatches = 0;
     }
 
-    fn step(&mut self, dt: f32, _input: &EmissionInput) {
+    fn step(&mut self, dt: f32, input: &EmissionInput) {
+        // Pour emission first (grows water_count for this frame); no-op when not pouring.
+        self.emit(input, dt);
+        debug_assert!(self.water_count <= self.water_capacity);
         self.params.dt = dt;
         self.queue
             .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&self.params));
@@ -1262,8 +1634,43 @@ impl Solver for TwofieldSolver {
                 cell_groups,
             ),
         ];
+        // U4 pocket detection (surface.wgsl): flood the OUTSIDE label through the air cells
+        // (labels ping-pong through the pressure slots, which cell_classify just zeroed and
+        // pocket_mark re-zeroes), then mark the enclosed remainder as the pocket. The sweep
+        // budget is fixed and even, so the final labels land back in pf_a (the pocket_mark
+        // binding).
+        const _: () = assert!(FLOOD_SWEEPS.is_multiple_of(2));
+        seq.push((
+            "flood_init",
+            &self.pipelines.flood_init.0,
+            &self.pipelines.flood_init.1,
+            cell_groups,
+        ));
+        for s in 0..FLOOD_SWEEPS {
+            seq.push((
+                "flood_sweep",
+                &self.pipelines.flood_sweep.0,
+                &self.pipelines.flood_sweep.1[(s % 2) as usize],
+                cell_groups,
+            ));
+        }
+        seq.push((
+            "pocket_mark",
+            &self.pipelines.pocket_mark.0,
+            &self.pipelines.pocket_mark.1,
+            cell_groups,
+        ));
+        // Every Jacobi sweep is preceded by the single-workgroup bubble-row solve at its own
+        // level (KTD-6 identical representation): the sweep then writes the fresh multiplier
+        // into the pocket slots while relaxing the fluid rows against the previous one.
         let push_sweeps = |seq: &mut Vec<_>, n: u32, par: &mut usize| {
             for _ in 0..n {
+                seq.push((
+                    "bubble_fine",
+                    &self.pipelines.bubble_fine.0,
+                    &self.pipelines.bubble_fine.1[*par],
+                    1,
+                ));
                 seq.push((
                     "jacobi_fine",
                     &self.pipelines.jacobi_fine.0,
@@ -1294,6 +1701,12 @@ impl Solver for TwofieldSolver {
                 ccell_groups,
             ));
             for s in 0..self.coarse_sweeps {
+                seq.push((
+                    "bubble_coarse",
+                    &self.pipelines.bubble_coarse.0,
+                    &self.pipelines.bubble_coarse.1[(s % 2) as usize],
+                    1,
+                ));
                 seq.push((
                     "jacobi_coarse",
                     &self.pipelines.jacobi_coarse.0,
@@ -1354,8 +1767,18 @@ impl Solver for TwofieldSolver {
     }
 
     fn particles(&self) -> ParticleBuffers {
+        // Exposure of the pool layout: with no solids the live water range `[0, water_count)`
+        // is a contiguous prefix, so only the live set is exposed (dormant tail hidden —
+        // the xpbd shape). With solids present the dormant gap sits between the water pool
+        // and the solid range; the full pool is exposed and dormant slots stay parked at the
+        // box corner with zero velocity (no twofield scene renders solids + pour before U5).
+        let exposed = if self.solid_count == 0 {
+            self.water_count
+        } else {
+            self.params.particle_count
+        };
         ParticleBuffers {
-            particle_count: self.params.particle_count,
+            particle_count: exposed,
             position: Some(Arc::clone(&self.pos)),
             velocity: Some(Arc::clone(&self.vel)),
             phase_tag: Some(Arc::clone(&self.phase)),
@@ -1369,7 +1792,7 @@ impl Solver for TwofieldSolver {
     fn metrics(&self) -> Metrics {
         // All values CPU-resident — never a GPU sync here (trait contract).
         Metrics {
-            particle_count: self.params.particle_count,
+            particle_count: self.water_count + self.solid_count, // live set
             ..Default::default()
         }
     }
