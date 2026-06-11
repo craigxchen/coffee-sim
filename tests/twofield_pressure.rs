@@ -37,7 +37,7 @@ use coffee_sim::solvers::base::Solver;
 use coffee_sim::solvers::twofield::{
     TwofieldSolver, COARSE_RATIO_DEFAULT, COARSE_SWEEPS_DEFAULT, DISPATCHES_PER_FRAME,
     FINE_SWEEPS_DEFAULT, JACOBI_OMEGA, MAX_STORAGE_BUFFERS_PER_ENTRY_POINT, U3_PRESSURE_DISPATCHES,
-    U4_SURFACE_DISPATCHES,
+    U4_SURFACE_DISPATCHES, U6_COUPLING_DISPATCHES,
 };
 use coffee_sim::utils::config::Config;
 use coffee_sim::utils::gpu::GpuContext;
@@ -898,8 +898,8 @@ fn independent_volume_gates_settled_tank() {
     );
 }
 
-/// Cost gate (R8): dispatches/frame equals the recorded U2 budget (4) plus the named U3 and
-/// U4 increments, and the constant matches the live profile.
+/// Cost gate (R8): dispatches/frame equals the recorded U2 budget (4) plus the named U3, U4,
+/// and U6 increments, and the constant matches the live profile.
 #[test]
 fn cost_gate_dispatch_budget() {
     let Some(gpu) = GpuContext::new_headless() else {
@@ -912,18 +912,19 @@ fn cost_gate_dispatch_budget() {
     let profile = solver.profile();
     assert_eq!(
         DISPATCHES_PER_FRAME,
-        4 + U3_PRESSURE_DISPATCHES + U4_SURFACE_DISPATCHES,
-        "budget constant must be U2's 4 + the named U3 + U4 increments"
+        4 + U3_PRESSURE_DISPATCHES + U4_SURFACE_DISPATCHES + U6_COUPLING_DISPATCHES,
+        "budget constant must be U2's 4 + the named U3 + U4 + U6 increments"
     );
     assert_eq!(
         profile.dispatches_per_frame, DISPATCHES_PER_FRAME,
         "live dispatch count drifted from the recorded budget"
     );
     println!(
-        "twofield U3+U4 budgets: dispatches/frame {} (U2 4 + U3 increment {} + U4 increment {}) | max storage buffers per entry point {}",
+        "twofield U3+U4+U6 budgets: dispatches/frame {} (U2 4 + U3 increment {} + U4 increment {} + U6 increment {}) | max storage buffers per entry point {}",
         profile.dispatches_per_frame,
         U3_PRESSURE_DISPATCHES,
         U4_SURFACE_DISPATCHES,
+        U6_COUPLING_DISPATCHES,
         MAX_STORAGE_BUFFERS_PER_ENTRY_POINT
     );
 }

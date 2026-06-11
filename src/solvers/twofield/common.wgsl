@@ -19,7 +19,7 @@
 const PHASE_WATER: u32 = 0u;
 const PHASE_SOLID: u32 = 1u;
 
-// Byte-identical to the Rust `Params` (144 bytes; vec4-aligned tail).
+// Byte-identical to the Rust `Params` (160 bytes; vec4-aligned tail).
 struct Params {
     box_min: vec4<f32>,     // simulation domain (w unused)
     box_max: vec4<f32>,     // (w unused)
@@ -37,6 +37,9 @@ struct Params {
     // U3 pressure stack (pressure.wgsl):
     coarse_dims: vec4<u32>, // coarse CELLS per axis (= ceil(fine_cells/ratio)); .w = ratio
     extra: vec4<f32>,       // (rest_density, rho_floor, mass_eps, unused)
+    // U6 coupling (coupling.wgsl): (grain_diameter d, drag_scale, grain_volume π/6·d³,
+    // open_base flag — the dev/test drained-column outflow mode).
+    coupling: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -65,6 +68,18 @@ struct Params {
 // discriminator; mass still provides the fill-fraction taper for cells that ARE fluid.
 // Cleared by grid_clear, incremented by p2g_water, read by cell_classify.
 @group(0) @binding(18) var<storage, read_write> cell_cnt: array<atomic<u32>>;
+// SOLID grid field (U6): per-node solid VOLUME, fixed-point (×FP_SCALE), one lane per node —
+// the φ_s carrier (KTD-8: a local evolving field, never a configured scalar). Cleared by
+// grid_clear, scattered by p2g_solid (grain sphere volume π/6·d³ per grain), read wherever
+// φ_s/φ_f is needed (drag_fold, node_setup, project). Headroom: |V_s| per node ≤ PHI_S-clamped
+// h³ ≈ 8 ≪ the 2^13 fixed-point ceiling.
+@group(0) @binding(19) var<storage, read_write> grid_sfp: array<atomic<i32>>;
+// U6 constraint-reaction ledger: per node, .xyz = the impulse the kinematically frozen
+// skeleton absorbs this frame (drag fold + pressure on the solid volume — NEVER silently
+// discarded; the buoyant-reaction gate sums it), .w = ς = Δt_eff/Δt, the exponential-
+// integrator mobility factor the drag fold hands to node_setup (1.0 where no solid mass).
+// Written by drag_fold every frame, accumulated by project; no clear pass needed.
+@group(0) @binding(20) var<storage, read_write> react: array<vec4<f32>>;
 
 // --- fixed-point encoding (KEEP.md §3 pattern, headroom re-validated for U2) -----------------
 //

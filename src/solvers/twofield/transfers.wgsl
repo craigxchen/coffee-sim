@@ -4,18 +4,21 @@
 //
 // Update order (the solver's OWN discrete recurrence — tests/twofield_water.rs derives its
 // free-fall reference from exactly this):
-//   P2G scatters m and m·(v + C·d) at the OLD positions; grid_update divides to velocity and
-//   applies gravity (v_i ← v_i + g·dt), then boundary conditions; G2P gathers the new particle
+//   P2G scatters m and m·(v + C·d) at the OLD positions; grid_update divides to velocity;
+//   drag_fold (coupling.wgsl, U6 — it owns the grid forces so the exponential drag fold can
+//   integrate the gravity source exactly) applies gravity (v_i ← v_i + g·dt on drag-free
+//   nodes), the drag pair update, then the boundary conditions; G2P gathers the new particle
 //   velocity and advects with it. In free air (no BC active) the per-frame closed form is
 //     v ← v + g·dt ;  x ← x + v_new·dt            (semi-implicit Euler)
 //   because the B-spline weights partition unity (velocity gather is exact for a uniform field)
 //   and Σ_k w_k·x_k = x_p (linear consistency keeps C at zero in a uniform field).
 //
-// Only the WATER range [0, water_count) is touched — the solid field generalizes these passes
-// in U5 (KTD-1 phase-range dispatches, no per-particle phase branch needed here).
+// Only the WATER range [0, water_count) is touched here — the U6 solid-mass P2G and the drag
+// fold live in coupling.wgsl (KTD-1 phase-range dispatches, no per-particle phase branch).
 
-// Zero the fixed-point water-field lanes (mass + momentum) and the per-cell particle counts
-// for this frame's scatter (cells < nodes, so the node-sized dispatch covers both).
+// Zero the fixed-point water-field lanes (mass + momentum), the solid-volume lane (U6), and
+// the per-cell particle counts for this frame's scatter (cells < nodes, so the node-sized
+// dispatch covers both).
 @compute @workgroup_size(256)
 fn grid_clear(@builtin(global_invocation_id) gid: vec3<u32>) {
     let n = gid.x;
@@ -26,6 +29,7 @@ fn grid_clear(@builtin(global_invocation_id) gid: vec3<u32>) {
     atomicStore(&grid_fp[n * 4u + 1u], 0);
     atomicStore(&grid_fp[n * 4u + 2u], 0);
     atomicStore(&grid_fp[n * 4u + 3u], 0);
+    atomicStore(&grid_sfp[n], 0);
     if (n < num_fine_cells()) {
         atomicStore(&cell_cnt[n], 0u);
     }
@@ -41,6 +45,11 @@ fn p2g_water(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     let h = params.grid_origin.w;
     let x = pos[p].xyz;
+    // Open base (U6 drained-flux mode): particles that left through the floor are ballistic
+    // and must not scatter — the index clamp would otherwise fold them onto the pad nodes.
+    if (params.coupling.w > 0.5 && x.y < params.box_min.y) {
+        return;
+    }
     let v = vel[p].xyz;
     let c0 = cmat[3u * p + 0u].xyz;
     let c1 = cmat[3u * p + 1u].xyz;
@@ -86,12 +95,10 @@ fn p2g_water(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 }
 
-// Convert fixed-point mass/momentum to velocity, apply gravity, then the grid-node boundary
-// treatment: no-penetration against the domain box faces and the scene SDF solids — the full
-// normal component is removed at wall nodes (free slip tangentially), matching the U3
-// pressure family's constrained M̃⁻¹ (see the comments at the BC sites; separation stays
-// possible at particle resolution). Writes the result for g2p_water; empty nodes get zero
-// velocity.
+// Convert fixed-point mass/momentum to velocity. Gravity, the U6 drag fold, the grid-node
+// boundary treatment, and the speed-cap backstop all live in drag_fold (coupling.wgsl) —
+// the exponential fold must integrate the gravity source itself and the BCs must follow
+// every velocity update, so this pass is decode-only. Empty nodes get zero velocity.
 @compute @workgroup_size(256)
 fn grid_update(@builtin(global_invocation_id) gid: vec3<u32>) {
     let n = gid.x;
@@ -100,7 +107,7 @@ fn grid_update(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     let mc = atomicLoad(&grid_fp[n * 4u + 0u]);
     var v = vec3<f32>(0.0);
-    // Mass gate (couples to the cap backstop below): nodes below mass_eps (params.extra.z,
+    // Mass gate (couples to drag_fold's cap backstop): nodes below mass_eps (params.extra.z,
     // ~26 fixed-point counts) decode a quantization-noise velocity AND are exactly the nodes
     // the U3 projection cannot correct (M̃⁻¹ = 0 below the same eps in node_setup) — giving
     // them gravity every frame injects uncorrectable free-fall the surface particles gather
@@ -113,52 +120,6 @@ fn grid_update(@builtin(global_invocation_id) gid: vec3<u32>) {
             f32(atomicLoad(&grid_fp[n * 4u + 2u])),
             f32(atomicLoad(&grid_fp[n * 4u + 3u]))
         ) * inv;
-        v = v + params.gravity.xyz * params.dt;
-
-        let c = node_coords(n);
-        let xp = params.grid_origin.xyz + vec3<f32>(f32(c.x), f32(c.y), f32(c.z)) * params.grid_origin.w;
-        let eps = 1.0e-4;
-
-        // Nodes strictly OUTSIDE the domain box are inside the walls: any mass there is
-        // B-spline smear of wall-clamped particles, so they take the wall's velocity (zero —
-        // mirrored by M̃⁻¹ = 0 in node_setup, so the projection family agrees). Leaving them
-        // live fed up to ~23% unprojected free-fall gather weight to particles clamped at the
-        // box EDGES (per-axis boundary weight 0.125 on the outside node, two axes at an
-        // edge), which then sank at ~quarter gravity forever (observed: the four vertical
-        // edge columns pumped the settled tank into sloshing).
-        if (any(xp < params.box_min.xyz - vec3<f32>(eps))
-            || any(xp > params.box_max.xyz + vec3<f32>(eps))) {
-            grid_vel[n] = vec4<f32>(vec3<f32>(0.0), fp_decode(mc));
-            return;
-        }
-
-        // Domain-box faces: face nodes lose the FULL normal component (free slip tangentially).
-        // This matches the U3 pressure family, whose constrained M̃⁻¹ removes the normal axis at
-        // these nodes entirely — the projection treats v_n as boundary-determined and can
-        // neither see nor correct it, so a one-sided ("separating") grid BC lets scatter noise
-        // rectify into a sustained inward v_n that the closed-wall flux gate measures as fake
-        // volume transport (observed: −5.5 units³/s on a settled tank, tolerance 2). Particle-
-        // level separation is untouched: the G2P backstop only clamps INTO-wall motion.
-        if (xp.x <= params.box_min.x + eps || xp.x >= params.box_max.x - eps) { v.x = 0.0; }
-        if (xp.y <= params.box_min.y + eps || xp.y >= params.box_max.y - eps) { v.y = 0.0; }
-        if (xp.z <= params.box_min.z + eps || xp.z >= params.box_max.z - eps) { v.z = 0.0; }
-
-        // Static SDF solids (mirrors utils/sdf.rs conventions): nodes through a wall (signed
-        // distance < 0) lose the full normal component; tangential flow is free slip — same
-        // M̃⁻¹-consistency argument as the box faces (node_setup subtracts the whole dyad).
-        if (params.num_solids > 0u) {
-            let hit = solid_union(xp, PHASE_WATER);
-            if (hit.dist < 0.0) {
-                v = v - dot(v, hit.grad) * hit.grad;
-            }
-        }
-
-        // Speed-cap backstop: a node with a tiny quantized mass (a few counts) decodes a noisy
-        // velocity; the cap bounds it like everywhere else (couples to the FP headroom math).
-        let s = length(v);
-        if (s > params.max_speed) {
-            v = v * (params.max_speed / s);
-        }
     }
     grid_vel[n] = vec4<f32>(v, fp_decode(mc));
 }
@@ -175,6 +136,20 @@ fn g2p_water(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     let h = params.grid_origin.w;
     var x = pos[p].xyz;
+
+    // Open base (U6 drained-flux mode): escaped particles fall ballistically — they no
+    // longer scatter (p2g guard), so gathering from the empty grid would freeze them.
+    let open_base = params.coupling.w > 0.5;
+    if (open_base && x.y < params.box_min.y) {
+        var v = vel[p].xyz + params.gravity.xyz * params.dt;
+        x = x + v * params.dt;
+        pos[p] = vec4<f32>(x, pos[p].w);
+        vel[p] = vec4<f32>(v, vel[p].w);
+        cmat[3u * p + 0u] = vec4<f32>(0.0);
+        cmat[3u * p + 1u] = vec4<f32>(0.0);
+        cmat[3u * p + 2u] = vec4<f32>(0.0);
+        return;
+    }
 
     let xl = (x - params.grid_origin.xyz) / h;
     var base = vec3<i32>(floor(xl - vec3<f32>(0.5)));
@@ -227,7 +202,7 @@ fn g2p_water(@builtin(global_invocation_id) gid: vec3<u32>) {
     // non-penetration gate at particle resolution; only the into-wall velocity component is
     // removed (separating, free slip).
     if (x.x < params.box_min.x) { x.x = params.box_min.x; if (v.x < 0.0) { v.x = 0.0; } }
-    if (x.y < params.box_min.y) { x.y = params.box_min.y; if (v.y < 0.0) { v.y = 0.0; } }
+    if (x.y < params.box_min.y && !open_base) { x.y = params.box_min.y; if (v.y < 0.0) { v.y = 0.0; } }
     if (x.z < params.box_min.z) { x.z = params.box_min.z; if (v.z < 0.0) { v.z = 0.0; } }
     if (x.x > params.box_max.x) { x.x = params.box_max.x; if (v.x > 0.0) { v.x = 0.0; } }
     if (x.y > params.box_max.y) { x.y = params.box_max.y; if (v.y > 0.0) { v.y = 0.0; } }
