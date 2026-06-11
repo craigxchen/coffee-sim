@@ -56,6 +56,15 @@ struct Params {
 // WATER grid velocity after grid_update (gravity + boundary conditions applied):
 // .xyz = velocity, .w = node mass (decoded float; diagnostics only).
 @group(0) @binding(7) var<storage, read_write> grid_vel: array<vec4<f32>>;
+// Per-CELL particle count (U4): the particle-presence discriminator for the free-surface
+// classification. Node mass alone cannot tell a real surface cell from a particle-free air
+// gap narrower than the B-spline smear (≈3h between two water walls): such a gap reads mean
+// corner density ≈ 0.3–0.5·ρ_rest, classifies as a constraint row, and its div = 0 row then
+// FORBIDS the refilling inflow — observed as a jet-dug chimney standing frozen forever. The
+// classical PIC/FLIP rule (a cell is fluid only if it contains particles) is the sharp
+// discriminator; mass still provides the fill-fraction taper for cells that ARE fluid.
+// Cleared by grid_clear, incremented by p2g_water, read by cell_classify.
+@group(0) @binding(18) var<storage, read_write> cell_cnt: array<atomic<u32>>;
 
 // --- fixed-point encoding (KEEP.md §3 pattern, headroom re-validated for U2) -----------------
 //

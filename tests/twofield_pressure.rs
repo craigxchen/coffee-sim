@@ -37,6 +37,7 @@ use coffee_sim::solvers::base::Solver;
 use coffee_sim::solvers::twofield::{
     TwofieldSolver, COARSE_RATIO_DEFAULT, COARSE_SWEEPS_DEFAULT, DISPATCHES_PER_FRAME,
     FINE_SWEEPS_DEFAULT, JACOBI_OMEGA, MAX_STORAGE_BUFFERS_PER_ENTRY_POINT, U3_PRESSURE_DISPATCHES,
+    U4_SURFACE_DISPATCHES,
 };
 use coffee_sim::utils::config::Config;
 use coffee_sim::utils::gpu::GpuContext;
@@ -644,9 +645,13 @@ fn restore(solver: &TwofieldSolver, s: &Snapshot) {
 }
 
 /// Post-projection RMS divergence over interior cells, via the projection's own D (the
-/// twin is pinned to the GPU D by `gpu_operators_match_twins_and_are_adjoint`).
+/// twin is pinned to the GPU D by `gpu_operators_match_twins_and_are_adjoint`). U4 pocket
+/// cells (cell_meta.w = 2: enclosed air under the AGGREGATE bubble constraint) are excluded
+/// from the census, exactly as air cells always were — only fluid rows promise per-cell
+/// divergence-freedom; this preserves, not loosens, the U3 census semantics.
 fn rms_interior_div(solver: &TwofieldSolver) -> (f64, usize) {
     let tw = twin_from_gpu(solver);
+    let pocket: Vec<bool> = solver.read_cell_meta().iter().map(|m| m[3] > 1.5).collect();
     let gv = solver.read_grid_velocities();
     let u: Vec<[f64; 3]> = gv
         .iter()
@@ -656,7 +661,7 @@ fn rms_interior_div(solver: &TwofieldSolver) -> (f64, usize) {
     let mut se = 0.0;
     let mut cnt = 0usize;
     for c in 0..tw.num_cells() {
-        if tw.active[c] && tw.cell_is_interior(c, INTERIOR_MARGIN) {
+        if tw.active[c] && !pocket[c] && tw.cell_is_interior(c, INTERIOR_MARGIN) {
             se += div[c] * div[c];
             cnt += 1;
         }
@@ -893,8 +898,8 @@ fn independent_volume_gates_settled_tank() {
     );
 }
 
-/// Cost gate (R8): dispatches/frame equals the recorded U2 budget (4) plus the named U3
-/// increment, and the constant matches the live profile.
+/// Cost gate (R8): dispatches/frame equals the recorded U2 budget (4) plus the named U3 and
+/// U4 increments, and the constant matches the live profile.
 #[test]
 fn cost_gate_dispatch_budget() {
     let Some(gpu) = GpuContext::new_headless() else {
@@ -907,16 +912,19 @@ fn cost_gate_dispatch_budget() {
     let profile = solver.profile();
     assert_eq!(
         DISPATCHES_PER_FRAME,
-        4 + U3_PRESSURE_DISPATCHES,
-        "budget constant must be U2's 4 + the named U3 increment"
+        4 + U3_PRESSURE_DISPATCHES + U4_SURFACE_DISPATCHES,
+        "budget constant must be U2's 4 + the named U3 + U4 increments"
     );
     assert_eq!(
         profile.dispatches_per_frame, DISPATCHES_PER_FRAME,
         "live dispatch count drifted from the recorded budget"
     );
     println!(
-        "twofield U3 budgets: dispatches/frame {} (U2 4 + U3 increment {}) | max storage buffers per entry point {}",
-        profile.dispatches_per_frame, U3_PRESSURE_DISPATCHES, MAX_STORAGE_BUFFERS_PER_ENTRY_POINT
+        "twofield U3+U4 budgets: dispatches/frame {} (U2 4 + U3 increment {} + U4 increment {}) | max storage buffers per entry point {}",
+        profile.dispatches_per_frame,
+        U3_PRESSURE_DISPATCHES,
+        U4_SURFACE_DISPATCHES,
+        MAX_STORAGE_BUFFERS_PER_ENTRY_POINT
     );
 }
 

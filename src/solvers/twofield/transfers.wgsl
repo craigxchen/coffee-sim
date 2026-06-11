@@ -14,7 +14,8 @@
 // Only the WATER range [0, water_count) is touched — the solid field generalizes these passes
 // in U5 (KTD-1 phase-range dispatches, no per-particle phase branch needed here).
 
-// Zero the fixed-point water-field lanes (mass + momentum) for this frame's scatter.
+// Zero the fixed-point water-field lanes (mass + momentum) and the per-cell particle counts
+// for this frame's scatter (cells < nodes, so the node-sized dispatch covers both).
 @compute @workgroup_size(256)
 fn grid_clear(@builtin(global_invocation_id) gid: vec3<u32>) {
     let n = gid.x;
@@ -25,6 +26,9 @@ fn grid_clear(@builtin(global_invocation_id) gid: vec3<u32>) {
     atomicStore(&grid_fp[n * 4u + 1u], 0);
     atomicStore(&grid_fp[n * 4u + 2u], 0);
     atomicStore(&grid_fp[n * 4u + 3u], 0);
+    if (n < num_fine_cells()) {
+        atomicStore(&cell_cnt[n], 0u);
+    }
 }
 
 // Quadratic B-spline scatter of mass + APIC momentum m·(v + C·(x_i − x_p)) via fixed-point
@@ -50,6 +54,14 @@ fn p2g_water(@builtin(global_invocation_id) gid: vec3<u32>) {
     let fx = xl - vec3<f32>(base);
     var w = bspline_w(fx);
     let m = params.particle_mass;
+
+    // Particle-presence census for the surface classification (see cell_cnt in common.wgsl).
+    let ci = clamp(
+        vec3<i32>(floor(xl)),
+        vec3<i32>(0),
+        vec3<i32>(params.grid_dims.xyz) - vec3<i32>(2),
+    );
+    atomicAdd(&cell_cnt[cell_index(ci)], 1u);
 
     for (var k = 0; k < 3; k = k + 1) {
         for (var j = 0; j < 3; j = j + 1) {

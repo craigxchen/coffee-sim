@@ -61,6 +61,11 @@
 // smear/droplet cells are ballistic (no row, implicit p = 0) — U2 behavior, confined to
 // near-massless dust. Min-corner ≥ 0.1·ρ_rest also bounds f ≥ 0.2, i.e. the surface-row
 // amplification 1/f ≤ 5.
+// U4 refinement (surface.wgsl): the implicit p = 0 holds only for air OPEN to the boundary;
+// ENCLOSED air (the pour pocket) is flood-fill detected and inserted as constraint rows with
+// fill weight 1, pressure pinned to the shared bubble multiplier λ_b — see the BUBBLE
+// REPRESENTATION header in surface.wgsl. cell_meta.w carries the cell category
+// (CELL_AIR/CELL_POCKET); the pocket pins live in the Jacobi/prolong kernels below.
 //
 // ================================ COARSE SEED ================================================
 // Coarse grid: REDISCRETIZED same family at H = ratio·h (ratio knob {4, 8}; default 4).
@@ -337,30 +342,48 @@ fn cell_classify(@builtin(global_invocation_id) gid: vec3<u32>) {
             }
         }
     }
-    // Fill fraction from the mean fluid-visible corner density; ACTIVITY from the min
-    // fluid-visible corner density (header: FREE SURFACE — the particle-presence
-    // discriminator). Sub-eps nodes were mass-gated to v = 0 by grid_update, so D reads 0
-    // from them — consistent with M̃⁻¹ = 0 there.
+    // Fill fraction from the mean fluid-visible corner density; ACTIVITY requires BOTH the
+    // min fluid-visible corner density (header: FREE SURFACE) AND particle presence in the
+    // cell (cell_cnt — the U4 sharp discriminator; see common.wgsl for the frozen-chimney
+    // failure the mass tests alone cannot resolve). Sub-eps nodes were mass-gated to v = 0
+    // by grid_update, so D reads 0 from them — consistent with M̃⁻¹ = 0 there.
     let h3 = h * h * h;
     let rho = mass / (max(cnt, 1.0) * h3);
     var f = clamp(rho / (SURF_FULL_FRAC * params.extra.x), 0.0, 1.0);
-    if (cnt == 0.0 || mmin < SURF_MIN_CORNER * params.extra.x * h3) {
+    if (cnt == 0.0 || mmin < SURF_MIN_CORNER * params.extra.x * h3
+        || atomicLoad(&cell_cnt[c]) == 0u) {
         f = 0.0;
     }
     let center = params.grid_origin.xyz + (vec3<f32>(cc) + vec3<f32>(0.5)) * h;
+    var geom_blocked = false;
     if (any(center < params.box_min.xyz) || any(center > params.box_max.xyz)) {
         f = 0.0;
+        geom_blocked = true;
     }
-    if (params.num_solids > 0u) {
+    if (!geom_blocked && params.num_solids > 0u) {
         let hit = solid_union(center, PHASE_WATER);
         if (hit.dist < 0.0) {
             f = 0.0;
+            geom_blocked = true;
         }
     }
-    // One-sided density relief (header: "Density relief"): fluid-visible corner density vs
-    // rest.
+    // U4 category lane (.w): in-box fluid-free cells are AIR — flood-fill candidates for the
+    // pocket detection (surface.wgsl); wall/out-of-box cells are never air. pocket_mark
+    // upgrades enclosed air to CELL_POCKET (fill weight 1, constraint row).
+    var cat = 0.0;
+    if (f <= 0.0 && !geom_blocked) {
+        cat = CELL_AIR;
+    }
+    // Density relief, over-density half (header: "Density relief"): fluid-visible corner
+    // density vs rest. The UNDER-density half (suction) is applied by pocket_mark in
+    // surface.wgsl — it needs the air classification of the 6-neighborhood, which does not
+    // exist yet in this pass (suction must never act on air-adjacent surface cells, or the
+    // surface band pumps itself upward; an interior rarefied region, e.g. the channel a jet
+    // tears open, MUST be re-compacted or it stands forever as a frozen void — observed).
+    // The mean corner density rides along in .z for that pass (the residual lane, free until
+    // `residual` runs).
     let s_target = max(rho / params.extra.x - 1.0, 0.0) / (DENSITY_RELAX_FRAMES * params.dt);
-    cell_meta[c] = vec4<f32>(select(0.0, f * (s_target - div) / params.dt, f > 0.0), f, 0.0, 0.0);
+    cell_meta[c] = vec4<f32>(select(0.0, f * (s_target - div) / params.dt, f > 0.0), f, rho, cat);
 }
 
 // =================================== coarse setup ==============================================
@@ -429,15 +452,32 @@ fn coarse_cell_setup(@builtin(global_invocation_id) gid: vec3<u32>) {
     let r = i32(params.coarse_dims.w);
 
     var fc = 0.0;
+    var has_fluid = false;
+    var has_pocket = false;
     for (var dz = 0; dz < r; dz = dz + 1) {
         for (var dy = 0; dy < r; dy = dy + 1) {
             for (var dx = 0; dx < r; dx = dx + 1) {
                 let f = cc * r + vec3<i32>(dx, dy, dz);
-                if (cell_in_range(f) && cell_meta[cell_index(f)].y > 0.0) {
-                    fc = 1.0;
+                if (cell_in_range(f)) {
+                    let cm = cell_meta[cell_index(f)];
+                    if (cm.y > 0.0) {
+                        fc = 1.0;
+                        if (cm.w == CELL_POCKET) {
+                            has_pocket = true;
+                        } else {
+                            has_fluid = true;
+                        }
+                    }
                 }
             }
         }
+    }
+    // U4 pocket-coarse flag: EVERY active child a pocket cell (mixed boundary cells stay
+    // fluid rows — the same rediscretization doctrine as the un-rediscretized surface taper;
+    // the restricted residual carries the boundary content and the fine sweeps smooth it).
+    var cw = 0.0;
+    if (has_pocket && !has_fluid) {
+        cw = CELL_POCKET;
     }
 
     var sum = 0.0;
@@ -461,7 +501,7 @@ fn coarse_cell_setup(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
         sum = sum / f32(r * r * r);
     }
-    cmeta[c] = vec4<f32>(sum, fc, 0.0, 0.0);
+    cmeta[c] = vec4<f32>(sum, fc, 0.0, cw);
 }
 
 // =================================== residual ==================================================
@@ -526,6 +566,13 @@ fn jacobi_fine(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
     let cm = cell_meta[c];
+    // U4 pocket pin: the pocket slot is a Dirichlet copy of the bubble multiplier λ_b — the
+    // row is relaxed as ONE aggregate by bubble_fine (surface.wgsl), never per cell, so the
+    // fine sweeps cannot relax the constraint away (the named KTD-6 failure).
+    if (cm.w == CELL_POCKET) {
+        pf_dst[c] = bubble[0];
+        return;
+    }
     if (cm.y <= 0.0) {
         pf_dst[c] = 0.0;
         return;
@@ -585,6 +632,12 @@ fn jacobi_coarse(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
     let cm = cmeta[c];
+    // U4 pocket pin at the coarse level: the identical representation (KTD-6) — pocket-coarse
+    // slots carry the shared correction δλ_b, relaxed as one aggregate by bubble_coarse.
+    if (cm.w == CELL_POCKET) {
+        pc_dst[c] = bubble[1];
+        return;
+    }
     if (cm.y <= 0.0) {
         pc_dst[c] = 0.0;
         return;
@@ -645,6 +698,13 @@ fn prolong_add(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     if (cell_meta[c].y <= 0.0) {
         pf_dst[c] = 0.0;
+        return;
+    }
+    // U4 pocket cells receive the SCALAR correction δλ_b exactly (a one-scalar prolongation
+    // is exact; hat-weighting neighboring fluid-coarse corrections onto a pinned slot would
+    // corrupt the multiplier). bubble_fine folds λ_b ← λ_b + δλ_b before the next solve.
+    if (cell_meta[c].w == CELL_POCKET) {
+        pf_dst[c] = pf_src[c] + bubble[1];
         return;
     }
     let cc = vec3<i32>(cell_coords(c));
