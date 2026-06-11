@@ -29,6 +29,20 @@
 //! bubble: a single Lagrange-multiplier scalar λ_b whose value IS the pocket pressure,
 //! represented identically in the coarse solve and the fine sweeps (see surface.wgsl's
 //! BUBBLE REPRESENTATION header). Gates: `tests/twofield_cavity.rs`.
+//!
+//! U6 (the early-L2 risk spike, run against a RIGID, kinematically frozen skeleton —
+//! KTD-3/KTD-4/KTD-8) adds `coupling.wgsl`: a thin solid-mass P2G (`p2g_solid` scatters the
+//! grain sphere volume π/6·d³ into a one-lane fixed-point field → local φ_s/φ_f per node)
+//! and the forced Laibe-Price exponential drag fold (`drag_fold`, which also owns the grid
+//! forces + BCs so the fold integrates the gravity source exactly). β(φ) mirrors
+//! `models::permeability` (Kozeny-Carman) blended toward a Wen-Yu dilute rate below
+//! φ_s ≈ 0.2 (Huilin-Gidaspow). The projection becomes the MIXTURE family ∇·(φ_f·v_f) = s
+//! (v_s = 0) with the velocity correction Δv = −(Δt_eff/ρ_w)∇p, Δt_eff = (1−e^{−βΔt})/β —
+//! the same integrator weight as the fold, carried as ς inside M̃⁻¹; φ NEVER scales the
+//! correction. Every impulse the frozen skeleton absorbs (drag pair + pressure on the solid
+//! volume) is recorded in the per-node `react` ledger — never discarded. Free water
+//! (φ_f = 1, ς = 1) is exact-zero passthrough, gated bitwise. Gates:
+//! `tests/twofield_coupling.rs`.
 
 use std::sync::Arc;
 
@@ -51,20 +65,22 @@ fn groups(n: u32) -> u32 {
     n.div_ceil(WG)
 }
 
-/// U2+U3+U4 GPU-budget bookkeeping (R8): the widest entry point's storage-buffer count,
+/// U2+U3+U4+U6 GPU-budget bookkeeping (R8): the widest entry point's storage-buffer count,
 /// derived by inspection of the bind groups in `build` (the params uniform doesn't count
-/// against the storage limit). Per pass: `grid_clear` 2 (grid_fp, cell_cnt), `p2g_water` 5
-/// (pos, vel, cmat, grid_fp, cell_cnt), `grid_update` 3 (grid_fp, grid_vel, solids),
-/// `g2p_water` 5 (pos, vel, cmat, grid_vel, solids); U3 pressure family — `node_setup` 3
-/// (grid_vel, solids, nm),
-/// `cell_classify` 6 (grid_vel, solids, cell_meta, pf_a, pf_b, cell_cnt), `coarse_node_setup` 2,
-/// `coarse_cell_setup` 4 (cell_meta, cmeta, pc_a, pc_b), `jacobi_fine`/`jacobi_coarse` 5
-/// (+bubble), `prolong_add` 6 (cell_meta, cmeta, pc, pf×2, bubble) — the widest, `project` 4,
-/// debug taps ≤ 3; U4 surface family — `flood_init` 2, `flood_sweep` 3, `pocket_mark` 5
-/// (grid_vel, cell_meta, pf×2, bubble), `bubble_fine` 4, `bubble_coarse` 4. Re-derive when
-/// passes are added. The device requests 9 storage buffers per stage
+/// against the storage limit). Per pass: `grid_clear` 3 (grid_fp, cell_cnt, grid_sfp),
+/// `p2g_water` 5 (pos, vel, cmat, grid_fp, cell_cnt), `p2g_solid` 2 (pos, grid_sfp),
+/// `grid_update` 2 (grid_fp, grid_vel), `drag_fold` 4 (grid_vel, solids, grid_sfp, react),
+/// `g2p_water` 5 (pos, vel, cmat, grid_vel, solids); U3 pressure family — `node_setup` 5
+/// (grid_vel, solids, nm, grid_sfp, react),
+/// `cell_classify` 7 (grid_vel, solids, cell_meta, pf_a, pf_b, cell_cnt, nm) — the widest,
+/// `coarse_node_setup` 2, `coarse_cell_setup` 4 (cell_meta, cmeta, pc_a, pc_b),
+/// `jacobi_fine`/`jacobi_coarse` 5 (+bubble), `prolong_add` 6 (cell_meta, cmeta, pc, pf×2,
+/// bubble), `project` 6 (grid_vel, nm, cell_meta, pf, grid_sfp, react), debug taps ≤ 4; U4
+/// surface family — `flood_init` 2, `flood_sweep` 3, `pocket_mark` 6 (grid_vel, cell_meta,
+/// pf×2, bubble, nm), `bubble_fine` 4, `bubble_coarse` 4. Re-derive when passes are added.
+/// The device requests 9 storage buffers per stage
 /// (`src/utils/gpu.rs::NEEDED_STORAGE_BUFFERS`) — still NOT raised (KTD-7).
-pub const MAX_STORAGE_BUFFERS_PER_ENTRY_POINT: u32 = 6;
+pub const MAX_STORAGE_BUFFERS_PER_ENTRY_POINT: u32 = 7;
 
 /// U3 pressure knobs — defaults of the declared knob grid (KTD-9; the grid itself is pinned
 /// in the header of `tests/twofield_pressure.rs`). The coarse ratio is fine cells per coarse
@@ -128,9 +144,34 @@ pub const FLOOD_SWEEPS: u32 = 24;
 pub const U4_SURFACE_DISPATCHES: u32 =
     2 + FLOOD_SWEEPS + FINE_SWEEPS_DEFAULT + COARSE_SWEEPS_DEFAULT;
 
+/// U6 dispatch increment: the thin solid-mass P2G (`p2g_solid`) + the drag fold
+/// (`drag_fold`, which also absorbed grid_update's force/BC work — net one new pass).
+pub const U6_COUPLING_DISPATCHES: u32 = 2;
+
 /// Compute dispatches per frame at the default knobs: the U2 transfer pipeline (grid_clear,
-/// p2g_water, grid_update, g2p_water) + the U3 pressure stack + the U4 surface stack.
-pub const DISPATCHES_PER_FRAME: u32 = 4 + U3_PRESSURE_DISPATCHES + U4_SURFACE_DISPATCHES;
+/// p2g_water, grid_update, g2p_water) + the U3 pressure stack + the U4 surface stack + the
+/// U6 coupling passes.
+pub const DISPATCHES_PER_FRAME: u32 =
+    4 + U3_PRESSURE_DISPATCHES + U4_SURFACE_DISPATCHES + U6_COUPLING_DISPATCHES;
+
+/// Per-grain solid volume (U6, KTD-8): the sphere volume π/6·d³ each frozen grain scatters
+/// into the solid grid field — a unit-pitch grain lattice therefore measures φ_s = π/6.
+pub fn grain_volume(d: f32) -> f32 {
+    std::f32::consts::PI / 6.0 * d * d * d
+}
+
+/// CPU twin of `coupling.wgsl::drag_rate_blended` (KTD-3): Kozeny-Carman packed-bed rate
+/// (mirrors `models::permeability` — β = drag_scale/k) blended toward a Wen-Yu-Stokes dilute
+/// rate (coefficient 18, voidage correction omitted) below φ_s = 0.2 via the Huilin-Gidaspow
+/// arctan transition (slope 262.5 = 150·1.75). The pair-momentum gate pins the WGSL against
+/// this twin.
+pub fn blended_drag_rate(d: f32, phi_f: f32, drag_scale: f32) -> f32 {
+    let phi_s = 1.0 - phi_f;
+    let packed = drag_scale / crate::models::permeability::kozeny_carman(d, phi_f).max(1.0e-9);
+    let dilute = drag_scale * 18.0 * phi_s / (d * d).max(1.0e-8);
+    let psi = (262.5 * (phi_s - 0.2)).atan() / std::f32::consts::PI + 0.5;
+    psi * packed + (1.0 - psi) * dilute
+}
 
 /// Reduced-units volume calibration (KEEP.md §2; mirrors the xpbd constant): mL per scene
 /// unit³ — sizes the pour pool from a scene's declared `pour_water_ml`.
@@ -166,10 +207,13 @@ struct Params {
     num_solids: u32,     // count of static SDF solids in the `solids` buffer
     coarse_dims: [u32; 4], // coarse CELLS per axis (= ceil(fine_cells/ratio)); .w = ratio
     extra: [f32; 4],     // (rest_density, rho_floor, mass_eps, unused)
+    // U6 coupling: (grain_diameter d, drag_scale, grain_volume π/6·d³, open_base flag — the
+    // dev/test drained-column outflow mode, see coupling.wgsl).
+    coupling: [f32; 4],
 }
 
 // Params is uploaded as a uniform and must stay byte-identical to the WGSL `Params`.
-const _: () = assert!(std::mem::size_of::<Params>() == 144);
+const _: () = assert!(std::mem::size_of::<Params>() == 160);
 
 /// GPU record for one static SDF solid — byte-identical to the WGSL `Primitive` (64 bytes,
 /// vec4-aligned; mirrors the xpbd packing of `utils::sdf` primitives). Cone radii in `a` are
@@ -280,6 +324,10 @@ pub struct TwofieldSolver {
     // Float grid velocity (.xyz) + node mass (.w) after grid_update; post-projection after
     // the U3 pressure stack. CPU-readable for the divergence/volume gates.
     grid_vel: wgpu::Buffer,
+    // U6 solid grid field (per-node fixed-point solid volume) + constraint-reaction ledger
+    // (per-node vec4: impulse.xyz, ς) — coupling.wgsl bindings 19/20.
+    grid_sfp: wgpu::Buffer,
+    react: wgpu::Buffer,
     // U3 pressure-family state (layouts documented in pressure.wgsl): per-node M̃⁻¹, per-cell
     // (rhs, active, dbg) meta, and the fine pressure ping-pong pair. The coarse mirrors live
     // only inside the bind groups.
@@ -350,6 +398,10 @@ fn disc_basis(dir: [f32; 3]) -> ([f32; 3], [f32; 3]) {
 struct Pipelines {
     grid_clear: (wgpu::ComputePipeline, wgpu::BindGroup),
     p2g_water: (wgpu::ComputePipeline, wgpu::BindGroup),
+    // U6 coupling family: solid-mass P2G + the exponential drag fold (which owns the grid
+    // forces + BCs — see coupling.wgsl).
+    p2g_solid: (wgpu::ComputePipeline, wgpu::BindGroup),
+    drag_fold: (wgpu::ComputePipeline, wgpu::BindGroup),
     grid_update: (wgpu::ComputePipeline, wgpu::BindGroup),
     g2p_water: (wgpu::ComputePipeline, wgpu::BindGroup),
     // U3 pressure family. The Jacobi sweeps ping-pong the pressure pair by swapping which
@@ -645,6 +697,53 @@ impl TwofieldSolver {
     pub fn read_bubble(&self) -> [f32; 2] {
         let raw: Vec<f32> = bytemuck::cast_slice(&self.read_bytes(&self.bubble, 8)).to_vec();
         [raw[0], raw[1]]
+    }
+
+    /// Read back the U6 constraint-reaction ledger, one vec4 per node: .xyz = the impulse
+    /// the frozen skeleton absorbed this frame, .w = ς (dev/test only — stalls).
+    pub fn read_reactions(&self) -> Vec<[f32; 4]> {
+        let bytes = (self.num_nodes as u64) * 16;
+        bytemuck::cast_slice(&self.read_bytes(&self.react, bytes)).to_vec()
+    }
+
+    /// Read back the decoded per-node solid volumes (the φ_s carrier; dev/test only).
+    pub fn read_solid_volumes(&self) -> Vec<f32> {
+        let bytes = (self.num_nodes as u64) * 4;
+        let raw: Vec<i32> = bytemuck::cast_slice(&self.read_bytes(&self.grid_sfp, bytes)).to_vec();
+        raw.iter().map(|&c| (c as f64 / FP_SCALE) as f32).collect()
+    }
+
+    /// Overwrite the per-node solid volumes (dev/test only; fixed-point encoded). One value
+    /// per grid node. The next `step()` re-scatters from the grains — this feeds the
+    /// standalone drag-pass gates only.
+    pub fn write_solid_volumes_for_test(&self, volumes: &[f32]) {
+        assert_eq!(
+            volumes.len(),
+            self.num_nodes as usize,
+            "one volume per node"
+        );
+        let enc: Vec<i32> = volumes
+            .iter()
+            .map(|&v| (v as f64 * FP_SCALE).round() as i32)
+            .collect();
+        self.queue
+            .write_buffer(&self.grid_sfp, 0, bytemuck::cast_slice(&enc));
+    }
+
+    /// Dispatch the U6 `drag_fold` pass standalone on the current grid state (dev/test only;
+    /// uses the last-uploaded params — dt = 1/60 from build until a `step()` ran).
+    pub fn run_drag_for_test(&self) {
+        self.run_dbg(
+            &self.pipelines.drag_fold.0,
+            &self.pipelines.drag_fold.1,
+            groups(self.num_nodes).max(1),
+        );
+    }
+
+    /// Toggle the U6 open-base drained-column mode (dev/test only; applies from the next
+    /// `step()` — U9's phase-selective filter boundary supersedes this hook).
+    pub fn set_open_base_for_test(&mut self, open: bool) {
+        self.params.coupling[3] = if open { 1.0 } else { 0.0 };
     }
 
     /// Total water mass emitted by the pour so far (conservation accounting; dev/test).
@@ -1005,6 +1104,12 @@ impl Solver for TwofieldSolver {
             num_solids: scene.solids.len() as u32,
             coarse_dims: [cdims[0], cdims[1], cdims[2], COARSE_RATIO_DEFAULT],
             extra: [rest_density, rho_floor, mass_eps, 0.0],
+            coupling: [
+                mats.grain_diameter,
+                cfg.drag_scale,
+                grain_volume(mats.grain_diameter),
+                0.0, // open_base off (dev/test hook)
+            ],
         };
         let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("twofield-params"),
@@ -1057,6 +1162,21 @@ impl Solver for TwofieldSolver {
         let grid_vel = Self::storage(
             &device,
             "twofield-grid-vel",
+            grid_bytes,
+            wgpu::BufferUsages::COPY_SRC,
+        );
+        // U6 SOLID grid field: per-node solid volume, one fixed-point lane (coupling.wgsl).
+        let grid_sfp = Self::storage(
+            &device,
+            "twofield-grid-sfp",
+            (num_nodes.max(1) as u64) * 4,
+            wgpu::BufferUsages::COPY_SRC,
+        );
+        // U6 constraint-reaction ledger: per-node vec4 (impulse.xyz, ς) — readable for the
+        // buoyant-reaction gate.
+        let react_buf = Self::storage(
+            &device,
+            "twofield-react",
             grid_bytes,
             wgpu::BufferUsages::COPY_SRC,
         );
@@ -1139,13 +1259,15 @@ impl Solver for TwofieldSolver {
         // WGSL has no imports: assemble the one module from the concern files. `common` declares
         // Params/bindings + shared helpers; `transfers` adds the APIC water passes; `pressure`
         // adds the U3 incompressibility family (bindings 9–16); `surface` adds the U4 flood
-        // fill + constraint bubble (binding 17).
+        // fill + constraint bubble (binding 17); `coupling` adds the U6 solid-mass P2G + drag
+        // fold (bindings 19–20).
         let shader_src = format!(
-            "{}\n{}\n{}\n{}",
+            "{}\n{}\n{}\n{}\n{}",
             include_str!("common.wgsl"),
             include_str!("transfers.wgsl"),
             include_str!("pressure.wgsl"),
             include_str!("surface.wgsl"),
+            include_str!("coupling.wgsl"),
         );
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("twofield"),
@@ -1182,7 +1304,12 @@ impl Solver for TwofieldSolver {
             let grid_clear = make("grid_clear");
             let grid_clear_bind = bg(
                 &grid_clear,
-                &[(0, &params_buf), (6, &grid_fp), (18, &cell_cnt)],
+                &[
+                    (0, &params_buf),
+                    (6, &grid_fp),
+                    (18, &cell_cnt),
+                    (19, &grid_sfp),
+                ],
             );
             let p2g = make("p2g_water");
             let p2g_bind = bg(
@@ -1196,15 +1323,24 @@ impl Solver for TwofieldSolver {
                     (18, &cell_cnt),
                 ],
             );
+            // U6 coupling family (coupling.wgsl).
+            let p2g_solid = make("p2g_solid");
+            let p2g_solid_bind = bg(&p2g_solid, &[(0, &params_buf), (1, &pos), (19, &grid_sfp)]);
+            let drag_fold = make("drag_fold");
+            let drag_fold_bind = bg(
+                &drag_fold,
+                &[
+                    (0, &params_buf),
+                    (7, &grid_vel),
+                    (8, &solids_buf),
+                    (19, &grid_sfp),
+                    (20, &react_buf),
+                ],
+            );
             let grid_update = make("grid_update");
             let grid_update_bind = bg(
                 &grid_update,
-                &[
-                    (0, &params_buf),
-                    (6, &grid_fp),
-                    (7, &grid_vel),
-                    (8, &solids_buf),
-                ],
+                &[(0, &params_buf), (6, &grid_fp), (7, &grid_vel)],
             );
             let g2p = make("g2p_water");
             let g2p_bind = bg(
@@ -1222,7 +1358,14 @@ impl Solver for TwofieldSolver {
             let node_setup = make("node_setup");
             let node_setup_bind = bg(
                 &node_setup,
-                &[(0, &params_buf), (7, &grid_vel), (8, &solids_buf), (9, &nm)],
+                &[
+                    (0, &params_buf),
+                    (7, &grid_vel),
+                    (8, &solids_buf),
+                    (9, &nm),
+                    (19, &grid_sfp),
+                    (20, &react_buf),
+                ],
             );
             let cell_classify = make("cell_classify");
             let cell_classify_bind = bg(
@@ -1231,6 +1374,7 @@ impl Solver for TwofieldSolver {
                     (0, &params_buf),
                     (7, &grid_vel),
                     (8, &solids_buf),
+                    (9, &nm),
                     (10, &cell_meta),
                     (11, &pf_a),
                     (12, &pf_b),
@@ -1346,6 +1490,8 @@ impl Solver for TwofieldSolver {
                         (9, &nm),
                         (10, &cell_meta),
                         (11, &pf_a),
+                        (19, &grid_sfp),
+                        (20, &react_buf),
                     ],
                 ),
                 bg(
@@ -1356,6 +1502,8 @@ impl Solver for TwofieldSolver {
                         (9, &nm),
                         (10, &cell_meta),
                         (11, &pf_b),
+                        (19, &grid_sfp),
+                        (20, &react_buf),
                     ],
                 ),
             ];
@@ -1384,6 +1532,7 @@ impl Solver for TwofieldSolver {
                 &[
                     (0, &params_buf),
                     (7, &grid_vel),
+                    (9, &nm),
                     (10, &cell_meta),
                     (11, &pf_a),
                     (12, &pf_b),
@@ -1421,7 +1570,7 @@ impl Solver for TwofieldSolver {
             let dbg_div = make("dbg_div");
             let dbg_div_bind = bg(
                 &dbg_div,
-                &[(0, &params_buf), (7, &grid_vel), (10, &cell_meta)],
+                &[(0, &params_buf), (7, &grid_vel), (9, &nm), (10, &cell_meta)],
             );
             let dbg_grad = make("dbg_grad");
             let dbg_grad_bind = bg(
@@ -1436,6 +1585,8 @@ impl Solver for TwofieldSolver {
             Pipelines {
                 grid_clear: (grid_clear, grid_clear_bind),
                 p2g_water: (p2g, p2g_bind),
+                p2g_solid: (p2g_solid, p2g_solid_bind),
+                drag_fold: (drag_fold, drag_fold_bind),
                 grid_update: (grid_update, grid_update_bind),
                 g2p_water: (g2p, g2p_bind),
                 node_setup: (node_setup, node_setup_bind),
@@ -1458,7 +1609,7 @@ impl Solver for TwofieldSolver {
         };
 
         let ts = if gpu.timestamps_supported {
-            // 69 passes per frame at the U4 defaults (2 queries each); headroom for U5+.
+            // 71 passes per frame at the U6 defaults (2 queries each); headroom for U5+.
             let capacity = 192u32;
             let qset = device.create_query_set(&wgpu::QuerySetDescriptor {
                 label: Some("twofield-timestamps"),
@@ -1522,6 +1673,8 @@ impl Solver for TwofieldSolver {
             cmat,
             grid_fp,
             grid_vel,
+            grid_sfp,
+            react: react_buf,
             nm,
             cell_meta,
             pf_a,
@@ -1591,6 +1744,7 @@ impl Solver for TwofieldSolver {
         // indirect dispatch, R8).
         let node_groups = groups(self.num_nodes).max(1);
         let water_groups = groups(self.water_count).max(1);
+        let solid_groups = groups(self.solid_count).max(1);
         let cell_groups = groups(self.num_cells).max(1);
         let cd = self.params.coarse_dims;
         let ccell_groups = groups(cd[0] * cd[1] * cd[2]).max(1);
@@ -1616,9 +1770,23 @@ impl Solver for TwofieldSolver {
                 water_groups,
             ),
             (
+                "p2g_solid",
+                &self.pipelines.p2g_solid.0,
+                &self.pipelines.p2g_solid.1,
+                solid_groups,
+            ),
+            (
                 "grid_update",
                 &self.pipelines.grid_update.0,
                 &self.pipelines.grid_update.1,
+                node_groups,
+            ),
+            // U6: grid forces + drag fold + BCs (coupling.wgsl) — the HTD order
+            // P2G(both) → grid forces → drag fold → projection → G2P.
+            (
+                "drag_fold",
+                &self.pipelines.drag_fold.0,
+                &self.pipelines.drag_fold.1,
                 node_groups,
             ),
             (

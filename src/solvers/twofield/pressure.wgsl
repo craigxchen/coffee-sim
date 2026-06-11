@@ -101,6 +101,23 @@
 // with ρ̄_c the mean corner-node density: compression is relieved over a few frames; an
 // under-dense (free-surface) cell gets NO suction — surface physics belongs to U4.
 //
+// ================================ MIXTURE FAMILY (U6, KTD-4) ==================================
+// With the U6 solid field present the constraint becomes the mixture continuity
+// ∇·(φ_f·v_f + φ_s·v_s) = s with v_s ≡ 0 (rigid skeleton): the divergence weights each
+// corner-node velocity by that node's φ_f (the nm b.w lane, from node_setup), and the same
+// φ_f scales the node mobility in the operator,
+//     A = −D·Φ·M̃⁻¹·G,   Φ = diag(φ_f per node)   (scalar per node ⇒ A stays symmetric PSD),
+// while the velocity correction applied by `project` is M̃⁻¹·(G p) WITHOUT φ — per KTD-4 the
+// intrinsic-velocity correction is Δv = −(Δt_eff/ρ_w)∇p and φ never scales it. Two more U6
+// ingredients live inside M̃⁻¹ itself (node_setup): the node density is the INTRINSIC water
+// density ρ_n/φ_f (the bulk pore-water density under-states ρ_w by φ_f), and the matrix is
+// scaled by ς = Δt_eff/Δt, the exponential-integrator weight from the drag fold (see
+// coupling.wgsl's header for why the plain-Δt split mis-partitions the hydrostatic load).
+// All three are exact-passthrough at φ_f = 1, ς = 1 (multiplication/division by exactly 1.0
+// is bitwise-identical — the free-water regression gate pins this). cell_classify's density
+// census normalizes by the corner φ_f for the same reason: a saturated pore cell at
+// ρ̄ = φ_f·ρ_rest is FULL, not a surface cell, and must get neither relief nor suction.
+//
 // Damped Jacobi: p ← p + ω·(rhs − A p)/diag(A), ω = JACOBI_OMEGA (fixed algorithmic constant,
 // mirrored in mod.rs for the CPU twins), diag(A)_c = Σ_n s(o)ᵀ·M̃⁻¹_n·s(o) / (16h²).
 //
@@ -220,6 +237,9 @@ fn hat_w(fi: i32, ci: i32, r: i32) -> f32 {
 
 // =================================== node_setup ================================================
 // Build M̃⁻¹ per fine node from this frame's node mass (grid_vel.w) and the wall geometry.
+// U6: the matrix carries the intrinsic-density inverse 1/(ρ_n/φ_f) and the ς integrator
+// weight from the drag fold (header: MIXTURE FAMILY); b.w carries φ_f for the divergence
+// weighting and the cell census (written for EVERY node, massy or not).
 @compute @workgroup_size(256)
 fn node_setup(@builtin(global_invocation_id) gid: vec3<u32>) {
     let n = gid.x;
@@ -230,14 +250,25 @@ fn node_setup(@builtin(global_invocation_id) gid: vec3<u32>) {
     var b = vec4<f32>(0.0);
     let mass = grid_vel[n].w;
     let h = params.grid_origin.w;
+    let sig = react[n].w;
     let c = node_coords(n);
     let xp = params.grid_origin.xyz + vec3<f32>(f32(c.x), f32(c.y), f32(c.z)) * h;
-    // Strictly-outside-the-box nodes are inside the walls: v = 0 in grid_update, M̃⁻¹ = 0
+    // φ_f from the solid field, wall-truncation-normalized (node_phi_f in coupling.wgsl —
+    // skips the vis loop entirely at zero-solid nodes: exact passthrough φ_f = 1.0).
+    let phi_f = node_phi_f(n, xp);
+    let open_base = params.coupling.w > 0.5;
+    // Strictly-outside-the-box nodes are inside the walls: v = 0 in drag_fold, M̃⁻¹ = 0
     // here (the projection never moves them) — one consistent treatment across the family.
-    let outside = any(xp < params.box_min.xyz - vec3<f32>(NODE_BC_EPS))
-        || any(xp > params.box_max.xyz + vec3<f32>(NODE_BC_EPS));
+    // The open base exempts the below-floor pad layer, mirroring drag_fold's BC.
+    var out_lo = xp < params.box_min.xyz - vec3<f32>(NODE_BC_EPS);
+    if (open_base) {
+        out_lo.y = false;
+    }
+    let outside = any(out_lo) || any(xp > params.box_max.xyz + vec3<f32>(NODE_BC_EPS));
     if (mass > params.extra.z && !outside) {
-        let rho = mass / (h * h * h);
+        // Intrinsic water density (KTD-4): the node measures the BULK pore-water density
+        // φ_f·ρ_w; dividing by φ_f recovers ρ_w so the correction is Δv = −(Δt_eff/ρ_w)∇p.
+        let rho = mass / (h * h * h) / phi_f;
 
         // Wall-truncated control volume: count the node's 8 adjacent cell slots whose center
         // is inside the box and not inside a solid. A wall/edge/corner node sees only
@@ -248,28 +279,15 @@ fn node_setup(@builtin(global_invocation_id) gid: vec3<u32>) {
         // 4×-truncated kick, their columns kept ~half of gravity every frame, and the tank
         // pumped itself into sloshing (observed). Surface nodes are NOT rescaled: air slots
         // are geometrically visible, so vis = 8 and the stable under-kick floor remains.
-        var vis = 0.0;
-        for (var oz = 0; oz < 2; oz = oz + 1) {
-            for (var oy = 0; oy < 2; oy = oy + 1) {
-                for (var ox = 0; ox < 2; ox = ox + 1) {
-                    let cs = corner_sign(vec3<i32>(ox, oy, oz));
-                    let cc = xp + cs * (0.5 * h);
-                    var ok = all(cc >= params.box_min.xyz) && all(cc <= params.box_max.xyz);
-                    if (ok && params.num_solids > 0u) {
-                        ok = solid_union(cc, PHASE_WATER).dist >= 0.0;
-                    }
-                    if (ok) {
-                        vis = vis + 1.0;
-                    }
-                }
-            }
-        }
+        let vis = node_vis(xp);
         let invr = 1.0 / max(rho, params.extra.y * max(vis, 1.0) / 8.0);
 
-        // Box faces: mutually orthogonal axis constraints (exact projector).
+        // Box faces: mutually orthogonal axis constraints (exact projector). The open base
+        // leaves the y-min face free (the outflow Dirichlet lives in the masked pad cells).
         var d = vec3<f32>(invr);
         if (xp.x <= params.box_min.x + NODE_BC_EPS || xp.x >= params.box_max.x - NODE_BC_EPS) { d.x = 0.0; }
-        if (xp.y <= params.box_min.y + NODE_BC_EPS || xp.y >= params.box_max.y - NODE_BC_EPS) { d.y = 0.0; }
+        if ((xp.y <= params.box_min.y + NODE_BC_EPS && !open_base)
+            || xp.y >= params.box_max.y - NODE_BC_EPS) { d.y = 0.0; }
         if (xp.z <= params.box_min.z + NODE_BC_EPS || xp.z >= params.box_max.z - NODE_BC_EPS) { d.z = 0.0; }
         a = vec4<f32>(d.x, 0.0, 0.0, d.y);
         b = vec4<f32>(0.0, d.z, 1.0, 0.0);
@@ -291,16 +309,25 @@ fn node_setup(@builtin(global_invocation_id) gid: vec3<u32>) {
                 }
             }
         }
+        // ς fold (header: MIXTURE FAMILY): the projection's effective step at a drag node is
+        // Δt_eff = ς·Δt, carried INSIDE the matrix so A and `project` stay one family. ×1.0
+        // exact at drag-free nodes.
+        a = a * sig;
+        b.x = b.x * sig;
+        b.y = b.y * sig;
     }
     nm[2u * n + 0u] = a;
-    nm[2u * n + 1u] = b;
+    nm[2u * n + 1u] = vec4<f32>(b.x, b.y, b.z, phi_f);
 }
 
 // =================================== cell_classify =============================================
 // Per fine cell: fill fraction f from grid mass (header: FREE SURFACE — f = 0 masks the cell,
-// f < 1 tapers its row through the surface band), rhs = f·(s_target − D v)/dt on fluid rows,
-// and zero both pressure ping-pong slots (the deterministic p₀ = 0 — the coarse prolongation
-// overwrites the seed when enabled).
+// f < 1 tapers its row through the surface band), rhs = f·(s_target − D(Φv))/dt on fluid rows
+// (the U6 MIXTURE divergence — v_s = 0 contributes nothing), and zero both pressure
+// ping-pong slots (the deterministic p₀ = 0 — the coarse prolongation overwrites the seed
+// when enabled). The density census divides each corner mass by its φ_f so a saturated pore
+// cell measures RELATIVE density ≈ 1 (header: MIXTURE FAMILY) — both ×/÷ by exactly 1.0 in
+// free water.
 @compute @workgroup_size(256)
 fn cell_classify(@builtin(global_invocation_id) gid: vec3<u32>) {
     let c = gid.x;
@@ -319,9 +346,11 @@ fn cell_classify(@builtin(global_invocation_id) gid: vec3<u32>) {
         for (var oy = 0; oy < 2; oy = oy + 1) {
             for (var ox = 0; ox < 2; ox = ox + 1) {
                 let node = cc + vec3<i32>(ox, oy, oz);
-                let gv = grid_vel[node_index(node)];
+                let nflat = node_index(node);
+                let gv = grid_vel[nflat];
+                let phin = nm[2u * nflat + 1u].w; // φ_f (node_setup runs first)
                 let s = corner_sign(vec3<i32>(ox, oy, oz));
-                div = div + dot(s, gv.xyz) / (4.0 * h);
+                div = div + dot(s, phin * gv.xyz) / (4.0 * h);
                 // Corner census for classification: only corners that COULD see fluid count —
                 // nodes at/behind the box faces or inside an SDF solid are geometrically
                 // truncated (a wall, not a surface) and must not deactivate wall-hugging
@@ -335,18 +364,19 @@ fn cell_classify(@builtin(global_invocation_id) gid: vec3<u32>) {
                     wallish = solid_union(xp, PHASE_WATER).dist < 0.0;
                 }
                 if (!wallish) {
-                    mass = mass + gv.w;
+                    mass = mass + gv.w / phin;
                     cnt = cnt + 1.0;
-                    mmin = min(mmin, gv.w);
+                    mmin = min(mmin, gv.w / phin);
                 }
             }
         }
     }
-    // Fill fraction from the mean fluid-visible corner density; ACTIVITY requires BOTH the
-    // min fluid-visible corner density (header: FREE SURFACE) AND particle presence in the
-    // cell (cell_cnt — the U4 sharp discriminator; see common.wgsl for the frozen-chimney
-    // failure the mass tests alone cannot resolve). Sub-eps nodes were mass-gated to v = 0
-    // by grid_update, so D reads 0 from them — consistent with M̃⁻¹ = 0 there.
+    // Fill fraction from the mean fluid-visible RELATIVE corner density (φ-normalized above,
+    // so a saturated pore cell reads ≈ ρ_rest); ACTIVITY requires BOTH the min fluid-visible
+    // corner density (header: FREE SURFACE) AND particle presence in the cell (cell_cnt —
+    // the U4 sharp discriminator; see common.wgsl for the frozen-chimney failure the mass
+    // tests alone cannot resolve). Sub-eps nodes were mass-gated to v = 0 by grid_update, so
+    // D reads 0 from them — consistent with M̃⁻¹ = 0 there.
     let h3 = h * h * h;
     let rho = mass / (max(cnt, 1.0) * h3);
     var f = clamp(rho / (SURF_FULL_FRAC * params.extra.x), 0.0, 1.0);
@@ -545,7 +575,8 @@ fn residual(@builtin(global_invocation_id) gid: vec3<u32>) {
                         }
                     }
                     let s = corner_sign(o);
-                    acc = acc + dot(s, minv_apply(m, gp)) / (4.0 * h);
+                    // φ_f node weight (header: MIXTURE FAMILY) — A = −D·Φ·M̃⁻¹·G.
+                    acc = acc + m.b.w * dot(s, minv_apply(m, gp)) / (4.0 * h);
                 }
             }
         }
@@ -609,8 +640,9 @@ fn jacobi_fine(@builtin(global_invocation_id) gid: vec3<u32>) {
                     }
                 }
                 let s = corner_sign(o);
-                acc = acc + dot(s, minv_apply(m, gp)) / (4.0 * h);
-                diag = diag + dot(s, minv_apply(m, s)) / (16.0 * h * h);
+                // φ_f node weight (header: MIXTURE FAMILY) — A = −D·Φ·M̃⁻¹·G.
+                acc = acc + m.b.w * dot(s, minv_apply(m, gp)) / (4.0 * h);
+                diag = diag + m.b.w * dot(s, minv_apply(m, s)) / (16.0 * h * h);
             }
         }
     }
@@ -625,6 +657,8 @@ fn jacobi_fine(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 // The identical sweep on the COARSE grid (same family at H = ratio·h; rediscretized, see the
 // header). Kept line-for-line parallel to jacobi_fine — both are pinned by the same CPU twin.
+// The coarse b.w is the hat-restricted fine φ_f (coarse_node_setup averages the lane
+// wholesale), so the coarse family carries the same mixture weighting.
 @compute @workgroup_size(256)
 fn jacobi_coarse(@builtin(global_invocation_id) gid: vec3<u32>) {
     let c = gid.x;
@@ -672,8 +706,8 @@ fn jacobi_coarse(@builtin(global_invocation_id) gid: vec3<u32>) {
                     }
                 }
                 let s = corner_sign(o);
-                acc = acc + dot(s, minv_apply(m, gp)) / (4.0 * hc);
-                diag = diag + dot(s, minv_apply(m, s)) / (16.0 * hc * hc);
+                acc = acc + m.b.w * dot(s, minv_apply(m, gp)) / (4.0 * hc);
+                diag = diag + m.b.w * dot(s, minv_apply(m, s)) / (16.0 * hc * hc);
             }
         }
     }
@@ -735,7 +769,13 @@ fn prolong_add(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 // =================================== project ===================================================
 // v ← v − dt·M̃⁻¹·(G p), the SAME G and M̃⁻¹ the solve used (binding 11 holds the final-parity
-// pressure). Constrained wall components receive nothing by construction of M̃⁻¹.
+// pressure; the U6 ς integrator weight is inside M̃⁻¹, so this IS Δv = −(Δt_eff/ρ_w)∇p — φ
+// never scales the correction, per KTD-4). Constrained wall components receive nothing by
+// construction of M̃⁻¹. U6 ledger: at solid-carrying nodes the pressure impulse the frozen
+// skeleton absorbs is accumulated into `react` — the direct −φ_s·∇p force on the solid
+// volume plus the (1−ς) share of the water-column pressure force that the drag fold
+// transmits to the skeleton within the step (see coupling.wgsl's header; at hydrostatic
+// equilibrium the ledger nets exactly the displaced-volume weight).
 @compute @workgroup_size(256)
 fn project(@builtin(global_invocation_id) gid: vec3<u32>) {
     let n = gid.x;
@@ -743,8 +783,9 @@ fn project(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
     let m = Minv(nm[2u * n + 0u], nm[2u * n + 1u]);
-    if (m.b.z < 0.5) {
-        return; // massless node — the projection never moves it
+    let sv = solid_volume_at(n);
+    if (m.b.z < 0.5 && sv <= 0.0) {
+        return; // massless drag-free node — nothing to move, nothing to record
     }
     let h = params.grid_origin.w;
     let node = vec3<i32>(node_coords(n));
@@ -766,14 +807,28 @@ fn project(@builtin(global_invocation_id) gid: vec3<u32>) {
             }
         }
     }
-    let dv = minv_apply(m, gp) * params.dt;
-    grid_vel[n] = vec4<f32>(grid_vel[n].xyz - dv, grid_vel[n].w);
+    let dv = minv_apply(m, gp) * params.dt; // ς·Δt·M̃⁻¹·∇p (ς folded into the matrix)
+    if (sv > 0.0) {
+        let sig = react[n].w;
+        var via = vec3<f32>(0.0);
+        if (m.b.z >= 0.5 && sig > 1.0e-6) {
+            // (1−ς)/ς · m_w·|dv|: the pressure share routed through the drag fold.
+            via = grid_vel[n].w * dv * ((1.0 - sig) / sig);
+        }
+        let direct = -sv * params.dt * gp; // −V_s·Δt·∇p: pressure on the solid volume
+        react[n] = vec4<f32>(react[n].xyz + direct - via, sig);
+    }
+    if (m.b.z >= 0.5) {
+        grid_vel[n] = vec4<f32>(grid_vel[n].xyz - dv, grid_vel[n].w);
+    }
 }
 
 // =================================== test-only debug taps ======================================
 // Never dispatched in step(); they expose the EXACT D and G kernels to the operator gates
-// (adjointness + MMS on GPU readbacks). dbg_div writes the raw masked divergence of grid_vel
-// into cell_meta.z; dbg_grad writes the raw masked gradient of pf (binding 11) into grid_vel.
+// (adjointness + MMS on GPU readbacks). dbg_div writes the masked MIXTURE divergence D(Φv)
+// of grid_vel into cell_meta.z (φ_f from the nm lane — exactly 1 in free water, so the U3
+// gates are unchanged); dbg_grad writes the raw masked gradient of pf (binding 11) into
+// grid_vel.
 @compute @workgroup_size(256)
 fn dbg_div(@builtin(global_invocation_id) gid: vec3<u32>) {
     let c = gid.x;
@@ -789,8 +844,10 @@ fn dbg_div(@builtin(global_invocation_id) gid: vec3<u32>) {
             for (var oy = 0; oy < 2; oy = oy + 1) {
                 for (var ox = 0; ox < 2; ox = ox + 1) {
                     let s = corner_sign(vec3<i32>(ox, oy, oz));
-                    let gv = grid_vel[node_index(cc + vec3<i32>(ox, oy, oz))];
-                    div = div + dot(s, gv.xyz) / (4.0 * h);
+                    let nflat = node_index(cc + vec3<i32>(ox, oy, oz));
+                    let gv = grid_vel[nflat];
+                    let phin = nm[2u * nflat + 1u].w;
+                    div = div + dot(s, phin * gv.xyz) / (4.0 * h);
                 }
             }
         }

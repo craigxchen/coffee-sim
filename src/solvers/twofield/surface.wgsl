@@ -146,15 +146,18 @@ fn pocket_mark(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (cm.w != CELL_AIR || label > 0.5) {
         return;
     }
-    // Enclosed: compute the cell divergence (same corner gather as cell_classify).
+    // Enclosed: compute the cell MIXTURE divergence (same φ-weighted corner gather as
+    // cell_classify — one family, U6).
     let h = params.grid_origin.w;
     var div = 0.0;
     for (var oz = 0; oz < 2; oz = oz + 1) {
         for (var oy = 0; oy < 2; oy = oy + 1) {
             for (var ox = 0; ox < 2; ox = ox + 1) {
                 let s = corner_sign(vec3<i32>(ox, oy, oz));
-                let gv = grid_vel[node_index(cc + vec3<i32>(ox, oy, oz))];
-                div = div + dot(s, gv.xyz) / (4.0 * h);
+                let nflat = node_index(cc + vec3<i32>(ox, oy, oz));
+                let gv = grid_vel[nflat];
+                let phin = nm[2u * nflat + 1u].w;
+                div = div + dot(s, phin * gv.xyz) / (4.0 * h);
             }
         }
     }
@@ -215,8 +218,9 @@ fn bubble_fine(@builtin(local_invocation_id) lid: vec3<u32>) {
                             }
                         }
                         let s = corner_sign(o);
-                        acc_p = acc_p + dot(s, minv_apply(m, gp)) / (4.0 * h);
-                        acc_i = acc_i + dot(s, minv_apply(m, gi)) / (4.0 * h);
+                        // φ_f node weight — same A = −D·Φ·M̃⁻¹·G family as the sweeps (U6).
+                        acc_p = acc_p + m.b.w * dot(s, minv_apply(m, gp)) / (4.0 * h);
+                        acc_i = acc_i + m.b.w * dot(s, minv_apply(m, gi)) / (4.0 * h);
                     }
                 }
             }
@@ -304,8 +308,8 @@ fn bubble_coarse(@builtin(local_invocation_id) lid: vec3<u32>) {
                             }
                         }
                         let s = corner_sign(o);
-                        acc_p = acc_p + dot(s, minv_apply(m, gp)) / (4.0 * hc);
-                        acc_i = acc_i + dot(s, minv_apply(m, gi)) / (4.0 * hc);
+                        acc_p = acc_p + m.b.w * dot(s, minv_apply(m, gp)) / (4.0 * hc);
+                        acc_i = acc_i + m.b.w * dot(s, minv_apply(m, gi)) / (4.0 * hc);
                     }
                 }
             }
