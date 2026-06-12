@@ -43,6 +43,19 @@
 //! volume) is recorded in the per-node `react` ledger — never discarded. Free water
 //! (φ_f = 1, ς = 1) is exact-zero passthrough, gated bitwise. Gates:
 //! `tests/twofield_coupling.rs`.
+//!
+//! U5 (rung L1, `plasticity.wgsl` + the CPU twin `plasticity.rs`) makes the solid phase a
+//! real elastoplastic granular material behind `Config::solid_dynamics` (default OFF — the
+//! U6 frozen-skeleton semantics are preserved bitwise; the dry-bed L1 scenes opt in): solid
+//! P2G with momentum + APIC + MLS-MPM fused stress force (`p2g_solid_dyn` replaces the
+//! frozen `p2g_solid` 1:1), grid forces + over-packing solids-pressure guard + Coulomb wall
+//! friction (`solid_update`), solid G2P with the deformation-gradient update, one 3×3 SVD
+//! per grain, and the Klar 2016 Drucker-Prager 3-branch return map + compaction-cap tamping
+//! memory (`g2p_solid`). The solid velocity does NOT yet enter the mixture divergence and
+//! the drag fold keeps its frozen-skeleton form — both are U7 scope (the L1 scenes are dry).
+//! Gates: `tests/twofield_bed.rs`.
+
+pub mod plasticity;
 
 use std::sync::Arc;
 
@@ -65,19 +78,22 @@ fn groups(n: u32) -> u32 {
     n.div_ceil(WG)
 }
 
-/// U2+U3+U4+U6 GPU-budget bookkeeping (R8): the widest entry point's storage-buffer count,
+/// U2+U3+U4+U6+U5 GPU-budget bookkeeping (R8): the widest entry point's storage-buffer count,
 /// derived by inspection of the bind groups in `build` (the params uniform doesn't count
-/// against the storage limit). Per pass: `grid_clear` 3 (grid_fp, cell_cnt, grid_sfp),
-/// `p2g_water` 5 (pos, vel, cmat, grid_fp, cell_cnt), `p2g_solid` 2 (pos, grid_sfp),
-/// `grid_update` 2 (grid_fp, grid_vel), `drag_fold` 4 (grid_vel, solids, grid_sfp, react),
-/// `g2p_water` 5 (pos, vel, cmat, grid_vel, solids); U3 pressure family — `node_setup` 5
-/// (grid_vel, solids, nm, grid_sfp, react),
+/// against the storage limit). Per pass: `grid_clear` 4 (grid_fp, cell_cnt, grid_sfp,
+/// grid_sm), `p2g_water` 5 (pos, vel, cmat, grid_fp, cell_cnt), `p2g_solid` 2 (pos,
+/// grid_sfp), `grid_update` 2 (grid_fp, grid_vel), `drag_fold` 4 (grid_vel, solids,
+/// grid_sfp, react), `g2p_water` 5 (pos, vel, cmat, grid_vel, solids); U3 pressure family —
+/// `node_setup` 5 (grid_vel, solids, nm, grid_sfp, react),
 /// `cell_classify` 7 (grid_vel, solids, cell_meta, pf_a, pf_b, cell_cnt, nm) — the widest,
 /// `coarse_node_setup` 2, `coarse_cell_setup` 4 (cell_meta, cmeta, pc_a, pc_b),
 /// `jacobi_fine`/`jacobi_coarse` 5 (+bubble), `prolong_add` 6 (cell_meta, cmeta, pc, pf×2,
 /// bubble), `project` 6 (grid_vel, nm, cell_meta, pf, grid_sfp, react), debug taps ≤ 4; U4
 /// surface family — `flood_init` 2, `flood_sweep` 3, `pocket_mark` 6 (grid_vel, cell_meta,
-/// pf×2, bubble, nm), `bubble_fine` 4, `bubble_coarse` 4. Re-derive when passes are added.
+/// pf×2, bubble, nm), `bubble_fine` 4, `bubble_coarse` 4; U5 plasticity family —
+/// `p2g_solid_dyn` 6 (pos, vel, cmat, grid_sfp, grid_sm, sstate), `solid_update` 4
+/// (grid_sm, grid_svel, grid_sfp, solids), `g2p_solid` 7 (pos, vel, cmat, solids,
+/// grid_svel, fmat, sstate) — ties cell_classify. Re-derive when passes are added.
 /// The device requests 9 storage buffers per stage
 /// (`src/utils/gpu.rs::NEEDED_STORAGE_BUFFERS`) — still NOT raised (KTD-7).
 pub const MAX_STORAGE_BUFFERS_PER_ENTRY_POINT: u32 = 7;
@@ -148,6 +164,27 @@ pub const U4_SURFACE_DISPATCHES: u32 =
 /// (`drag_fold`, which also absorbed grid_update's force/BC work — net one new pass).
 pub const U6_COUPLING_DISPATCHES: u32 = 2;
 
+/// U5 dispatch increment per SUBSTEP, applied ONLY when `Config::solid_dynamics` is on:
+/// `solid_update` + `g2p_solid` (`p2g_solid_dyn` replaces the frozen `p2g_solid`
+/// one-for-one). Dynamic mode runs the frame pipeline `plasticity::solid_substeps`
+/// times (the stiff-elasticity CFL — 7 at the default dt/h/density), so the recorded
+/// dynamic-mode frame budget is substeps × (DISPATCHES_PER_FRAME + U5_PLASTICITY_DISPATCHES)
+/// when water is present. Frozen mode keeps the U6 budget exactly.
+pub const U5_PLASTICITY_DISPATCHES: u32 = 2;
+
+/// Dry dynamic-mode budget per substep: with ZERO live water particles the entire
+/// water-side pipeline (p2g_water, grid_update decode, drag fold, the U3 pressure stack,
+/// the U4 surface stack, g2p_water) reads and writes only water state that the solid passes
+/// never touch, so the dry L1 scenes dispatch exactly grid_clear + p2g_solid_dyn +
+/// solid_update + g2p_solid per substep. This is a CPU-side pass elision keyed on the
+/// synchronously known live water count — NOT indirect dispatch (R8) — and it is scoped to
+/// DYNAMIC mode only: frozen-mode scenes keep the full pipeline bitwise, so every U2–U6
+/// suite's pinned budget is untouched. Solid trajectories are bitwise identical with and
+/// without the elision (verified by the suite re-runs at the switch); without it the dry
+/// macro gates spend 18× their dispatch budget ringing an empty pressure solve (measured:
+/// the resolved runout scene fell from ~70 min to minutes).
+pub const U5_DRY_DISPATCHES: u32 = 4;
+
 /// Compute dispatches per frame at the default knobs: the U2 transfer pipeline (grid_clear,
 /// p2g_water, grid_update, g2p_water) + the U3 pressure stack + the U4 surface stack + the
 /// U6 coupling passes.
@@ -158,6 +195,27 @@ pub const DISPATCHES_PER_FRAME: u32 =
 /// into the solid grid field — a unit-pitch grain lattice therefore measures φ_s = π/6.
 pub fn grain_volume(d: f32) -> f32 {
     std::f32::consts::PI / 6.0 * d * d * d
+}
+
+/// U5 seed state: per-solid identity deformation gradients (3 vec4 rows each).
+fn identity_rows(solid_count: u32) -> Vec<[f32; 4]> {
+    let mut rows = Vec::with_capacity(3 * solid_count as usize);
+    for _ in 0..solid_count {
+        rows.push([1.0, 0.0, 0.0, 0.0]);
+        rows.push([0.0, 1.0, 0.0, 0.0]);
+        rows.push([0.0, 0.0, 1.0, 0.0]);
+    }
+    rows
+}
+
+/// U5 seed state: per-solid (τ = 0, p_c = PC0, compaction = 0), 2 vec4 each.
+fn fresh_sstate(solid_count: u32) -> Vec<[f32; 4]> {
+    let mut rows = Vec::with_capacity(2 * solid_count as usize);
+    for _ in 0..solid_count {
+        rows.push([0.0; 4]);
+        rows.push([0.0, 0.0, plasticity::PC0, 0.0]);
+    }
+    rows
 }
 
 /// CPU twin of `coupling.wgsl::drag_rate_blended` (KTD-3): Kozeny-Carman packed-bed rate
@@ -210,10 +268,14 @@ struct Params {
     // U6 coupling: (grain_diameter d, drag_scale, grain_volume π/6·d³, open_base flag — the
     // dev/test drained-column outflow mode, see coupling.wgsl).
     coupling: [f32; 4],
+    // U5 plasticity (plasticity.wgsl; values from `plasticity` consts + Materials/Config):
+    splas0: [f32; 4], // (solid_dynamics flag, Lamé μ, Lamé λ, DP α)
+    splas1: [f32; 4], // (cap hardening ξ, φ_max = packing limit, grain mass, cohesion y_c)
+    splas2: [f32; 4], // (floor/wall Coulomb μ_b, guard K_sp, guard onset φ_on, unused)
 }
 
 // Params is uploaded as a uniform and must stay byte-identical to the WGSL `Params`.
-const _: () = assert!(std::mem::size_of::<Params>() == 160);
+const _: () = assert!(std::mem::size_of::<Params>() == 208);
 
 /// GPU record for one static SDF solid — byte-identical to the WGSL `Primitive` (64 bytes,
 /// vec4-aligned; mirrors the xpbd packing of `utils::sdf` primitives). Cone radii in `a` are
@@ -328,6 +390,14 @@ pub struct TwofieldSolver {
     // (per-node vec4: impulse.xyz, ς) — coupling.wgsl bindings 19/20.
     grid_sfp: wgpu::Buffer,
     react: wgpu::Buffer,
+    // U5 dynamic-solid per-particle state (plasticity.wgsl bindings 23/24): deformation
+    // gradient (3 vec4 rows) and (τ, p_c, compaction). The grid_sm/grid_svel node fields
+    // (bindings 21/22) live only inside the bind groups, like the coarse pressure mirrors.
+    fmat: wgpu::Buffer,
+    sstate: wgpu::Buffer,
+    /// `Config::solid_dynamics`: dispatch the U5 dynamic-solid passes instead of the frozen
+    /// U6 skeleton.
+    solid_dynamic: bool,
     // U3 pressure-family state (layouts documented in pressure.wgsl): per-node M̃⁻¹, per-cell
     // (rhs, active, dbg) meta, and the fine pressure ping-pong pair. The coarse mirrors live
     // only inside the bind groups.
@@ -402,6 +472,11 @@ struct Pipelines {
     // forces + BCs — see coupling.wgsl).
     p2g_solid: (wgpu::ComputePipeline, wgpu::BindGroup),
     drag_fold: (wgpu::ComputePipeline, wgpu::BindGroup),
+    // U5 plasticity family (dispatched only in dynamic mode; p2g_solid_dyn replaces
+    // p2g_solid 1:1 there).
+    p2g_solid_dyn: (wgpu::ComputePipeline, wgpu::BindGroup),
+    solid_update: (wgpu::ComputePipeline, wgpu::BindGroup),
+    g2p_solid: (wgpu::ComputePipeline, wgpu::BindGroup),
     grid_update: (wgpu::ComputePipeline, wgpu::BindGroup),
     g2p_water: (wgpu::ComputePipeline, wgpu::BindGroup),
     // U3 pressure family. The Jacobi sweeps ping-pong the pressure pair by swapping which
@@ -749,6 +824,49 @@ impl TwofieldSolver {
     /// Total water mass emitted by the pour so far (conservation accounting; dev/test).
     pub fn total_emitted_water_mass(&self) -> f32 {
         self.inflow.emitted_mass
+    }
+
+    /// Read back the per-solid deformation gradients, 3 vec4 rows per solid (row-major,
+    /// solid-local indexing; dev/test only — stalls).
+    pub fn read_deformation(&self) -> Vec<[f32; 4]> {
+        let bytes = (self.solid_count.max(1) as u64) * 48;
+        bytemuck::cast_slice(&self.read_bytes(&self.fmat, bytes)).to_vec()
+    }
+
+    /// Overwrite the per-solid deformation gradients (dev/test only; 3 rows per solid).
+    pub fn write_deformation_for_test(&self, rows: &[[f32; 4]]) {
+        assert_eq!(
+            rows.len(),
+            3 * self.solid_count as usize,
+            "deformation seed must be 3 rows per solid"
+        );
+        self.queue
+            .write_buffer(&self.fmat, 0, bytemuck::cast_slice(rows));
+    }
+
+    /// Read back the per-solid constitutive state, 2 vec4 per solid:
+    /// (τxx, τxy, τxz, τyy), (τyz, τzz, p_c, compaction) (dev/test only — stalls).
+    pub fn read_solid_state(&self) -> Vec<[f32; 4]> {
+        let bytes = (self.solid_count.max(1) as u64) * 32;
+        bytemuck::cast_slice(&self.read_bytes(&self.sstate, bytes)).to_vec()
+    }
+
+    /// Overwrite the per-solid constitutive state (dev/test only; 2 vec4 per solid — the
+    /// over-packing gate softens p_c with this).
+    pub fn write_solid_state_for_test(&self, rows: &[[f32; 4]]) {
+        assert_eq!(
+            rows.len(),
+            2 * self.solid_count as usize,
+            "solid state must be 2 vec4 per solid"
+        );
+        self.queue
+            .write_buffer(&self.sstate, 0, bytemuck::cast_slice(rows));
+    }
+
+    /// Override gravity from the next `step()` on (dev/test only — the documented U5 tamp
+    /// probe applies body-force pulses by pulsing gravity on a grain-only scene).
+    pub fn set_gravity_for_test(&mut self, g: [f32; 3]) {
+        self.params.gravity = [g[0], g[1], g[2], 0.0];
     }
 
     /// Activate pour-emitted water particles for this frame from `EmissionInput` — the
@@ -1110,6 +1228,26 @@ impl Solver for TwofieldSolver {
                 grain_volume(mats.grain_diameter),
                 0.0, // open_base off (dev/test hook)
             ],
+            // U5 constitutive lanes (plasticity.rs consts; friction angle from Materials,
+            // dry cohesion from models::cohesion — the Bishop saturation mapping is U7).
+            splas0: [
+                f32::from(cfg.solid_dynamics),
+                plasticity::lame_mu(plasticity::YOUNG_E, plasticity::POISSON_NU),
+                plasticity::lame_lambda(plasticity::YOUNG_E, plasticity::POISSON_NU),
+                plasticity::dp_alpha(mats.friction_mu),
+            ],
+            splas1: [
+                plasticity::HARDEN_XI,
+                cfg.packing_limit,
+                mats.grain_mass,
+                crate::models::cohesion::dry(),
+            ],
+            splas2: [
+                mats.floor_mu,
+                plasticity::SP_STIFF,
+                plasticity::SP_ONSET,
+                0.0,
+            ],
         };
         let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("twofield-params"),
@@ -1180,6 +1318,37 @@ impl Solver for TwofieldSolver {
             grid_bytes,
             wgpu::BufferUsages::COPY_SRC,
         );
+        // U5 dynamic-solid buffers (allocated regardless of mode — bind groups need them;
+        // dormant in frozen mode). Per-solid state is solid-local indexed.
+        let grid_sm = Self::storage(
+            &device,
+            "twofield-grid-sm",
+            grid_bytes,
+            wgpu::BufferUsages::empty(),
+        );
+        let grid_svel = Self::storage(
+            &device,
+            "twofield-grid-svel",
+            grid_bytes,
+            wgpu::BufferUsages::empty(),
+        );
+        let ns = solid_count.max(1) as u64;
+        let fmat = Self::storage(
+            &device,
+            "twofield-fmat",
+            ns * 48,
+            wgpu::BufferUsages::COPY_SRC,
+        );
+        let sstate = Self::storage(
+            &device,
+            "twofield-sstate",
+            ns * 32,
+            wgpu::BufferUsages::COPY_SRC,
+        );
+        if solid_count > 0 {
+            queue.write_buffer(&fmat, 0, bytemuck::cast_slice(&identity_rows(solid_count)));
+            queue.write_buffer(&sstate, 0, bytemuck::cast_slice(&fresh_sstate(solid_count)));
+        }
         // U3 pressure-family buffers (layouts in pressure.wgsl).
         let nm = Self::storage(
             &device,
@@ -1260,14 +1429,16 @@ impl Solver for TwofieldSolver {
         // Params/bindings + shared helpers; `transfers` adds the APIC water passes; `pressure`
         // adds the U3 incompressibility family (bindings 9–16); `surface` adds the U4 flood
         // fill + constraint bubble (binding 17); `coupling` adds the U6 solid-mass P2G + drag
-        // fold (bindings 19–20).
+        // fold (bindings 19–20); `plasticity` adds the U5 dynamic-solid family (bindings
+        // 22–24; grid_sm at 21 lives in common so grid_clear can zero it).
         let shader_src = format!(
-            "{}\n{}\n{}\n{}\n{}",
+            "{}\n{}\n{}\n{}\n{}\n{}",
             include_str!("common.wgsl"),
             include_str!("transfers.wgsl"),
             include_str!("pressure.wgsl"),
             include_str!("surface.wgsl"),
             include_str!("coupling.wgsl"),
+            include_str!("plasticity.wgsl"),
         );
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("twofield"),
@@ -1309,6 +1480,7 @@ impl Solver for TwofieldSolver {
                     (6, &grid_fp),
                     (18, &cell_cnt),
                     (19, &grid_sfp),
+                    (21, &grid_sm),
                 ],
             );
             let p2g = make("p2g_water");
@@ -1326,6 +1498,45 @@ impl Solver for TwofieldSolver {
             // U6 coupling family (coupling.wgsl).
             let p2g_solid = make("p2g_solid");
             let p2g_solid_bind = bg(&p2g_solid, &[(0, &params_buf), (1, &pos), (19, &grid_sfp)]);
+            // U5 plasticity family (plasticity.wgsl).
+            let p2g_solid_dyn = make("p2g_solid_dyn");
+            let p2g_solid_dyn_bind = bg(
+                &p2g_solid_dyn,
+                &[
+                    (0, &params_buf),
+                    (1, &pos),
+                    (2, &vel),
+                    (5, &cmat),
+                    (19, &grid_sfp),
+                    (21, &grid_sm),
+                    (24, &sstate),
+                ],
+            );
+            let solid_update = make("solid_update");
+            let solid_update_bind = bg(
+                &solid_update,
+                &[
+                    (0, &params_buf),
+                    (8, &solids_buf),
+                    (19, &grid_sfp),
+                    (21, &grid_sm),
+                    (22, &grid_svel),
+                ],
+            );
+            let g2p_solid = make("g2p_solid");
+            let g2p_solid_bind = bg(
+                &g2p_solid,
+                &[
+                    (0, &params_buf),
+                    (1, &pos),
+                    (2, &vel),
+                    (5, &cmat),
+                    (8, &solids_buf),
+                    (22, &grid_svel),
+                    (23, &fmat),
+                    (24, &sstate),
+                ],
+            );
             let drag_fold = make("drag_fold");
             let drag_fold_bind = bg(
                 &drag_fold,
@@ -1587,6 +1798,9 @@ impl Solver for TwofieldSolver {
                 p2g_water: (p2g, p2g_bind),
                 p2g_solid: (p2g_solid, p2g_solid_bind),
                 drag_fold: (drag_fold, drag_fold_bind),
+                p2g_solid_dyn: (p2g_solid_dyn, p2g_solid_dyn_bind),
+                solid_update: (solid_update, solid_update_bind),
+                g2p_solid: (g2p_solid, g2p_solid_bind),
                 grid_update: (grid_update, grid_update_bind),
                 g2p_water: (g2p, g2p_bind),
                 node_setup: (node_setup, node_setup_bind),
@@ -1675,6 +1889,9 @@ impl Solver for TwofieldSolver {
             grid_vel,
             grid_sfp,
             react: react_buf,
+            fmat,
+            sstate,
+            solid_dynamic: cfg.solid_dynamics,
             nm,
             cell_meta,
             pf_a,
@@ -1710,6 +1927,19 @@ impl Solver for TwofieldSolver {
             self.queue
                 .write_buffer(&self.cmat, 0, bytemuck::cast_slice(&czeros));
         }
+        if self.solid_count > 0 {
+            // U5 constitutive state back to the seed: F = I, τ = 0, p_c = PC0, compaction 0.
+            self.queue.write_buffer(
+                &self.fmat,
+                0,
+                bytemuck::cast_slice(&identity_rows(self.solid_count)),
+            );
+            self.queue.write_buffer(
+                &self.sstate,
+                0,
+                bytemuck::cast_slice(&fresh_sstate(self.solid_count)),
+            );
+        }
         self.water_count = self.initial_water;
         self.params.water_count = self.initial_water;
         self.inflow.accumulator = 0.0;
@@ -1725,7 +1955,22 @@ impl Solver for TwofieldSolver {
         // Pour emission first (grows water_count for this frame); no-op when not pouring.
         self.emit(input, dt);
         debug_assert!(self.water_count <= self.water_capacity);
-        self.params.dt = dt;
+        // U5 dynamic mode substeps the frame pipeline at dt/n: the explicit elastic
+        // solid needs the sound-speed CFL (plasticity::solid_substeps), and params.dt is one
+        // uniform shared by every pass in the frame, so the substep applies uniformly (a
+        // split water/solid cadence is a U7 decision). With ZERO live water the substepped
+        // pipeline is just the four solid passes (U5_DRY_DISPATCHES below). Frozen mode
+        // stays at exactly one substep — all U6-mode suites are untouched. The budget gate
+        // in tests/twofield_bed.rs pins the recorded dispatch growth.
+        let substeps = if self.solid_dynamic {
+            let h = self.params.grid_origin[3];
+            let d = self.params.coupling[0];
+            let rho_p = self.params.splas1[2] / (d * d * d).max(1.0e-9);
+            plasticity::solid_substeps(dt, h, rho_p)
+        } else {
+            1
+        };
+        self.params.dt = dt / substeps as f32;
         self.queue
             .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&self.params));
 
@@ -1750,6 +1995,66 @@ impl Solver for TwofieldSolver {
         let ccell_groups = groups(cd[0] * cd[1] * cd[2]).max(1);
         let cnode_groups = groups((cd[0] + 1) * (cd[1] + 1) * (cd[2] + 1)).max(1);
 
+        // Dry dynamic mode (U5_DRY_DISPATCHES): no live water → only the solid passes run.
+        let dry_dynamic = self.solid_dynamic && self.water_count == 0;
+        if dry_dynamic {
+            let seq: [(&str, &wgpu::ComputePipeline, &wgpu::BindGroup, u32); 4] = [
+                (
+                    "grid_clear",
+                    &self.pipelines.grid_clear.0,
+                    &self.pipelines.grid_clear.1,
+                    node_groups,
+                ),
+                (
+                    "p2g_solid_dyn",
+                    &self.pipelines.p2g_solid_dyn.0,
+                    &self.pipelines.p2g_solid_dyn.1,
+                    solid_groups,
+                ),
+                (
+                    "solid_update",
+                    &self.pipelines.solid_update.0,
+                    &self.pipelines.solid_update.1,
+                    node_groups,
+                ),
+                (
+                    "g2p_solid",
+                    &self.pipelines.g2p_solid.0,
+                    &self.pipelines.g2p_solid.1,
+                    solid_groups,
+                ),
+            ];
+            for ss in 0..substeps {
+                let ts = if ss == 0 { self.ts.as_ref() } else { None };
+                for &(label, pipe, bind, g) in &seq {
+                    dispatch_pass(
+                        &mut enc,
+                        pipe,
+                        bind,
+                        ts,
+                        &mut cursor,
+                        &mut labels,
+                        label,
+                        g,
+                        &mut dispatches,
+                    );
+                }
+            }
+            if let Some(ts) = &self.ts {
+                if cursor >= 2 {
+                    enc.resolve_query_set(&ts.qset, 0..cursor, &ts.resolve, 0);
+                    enc.copy_buffer_to_buffer(&ts.resolve, 0, &ts.readback, 0, (cursor as u64) * 8);
+                }
+            }
+            self.queue.submit(Some(enc.finish()));
+            self.dispatches = dispatches;
+            if let Some(ts) = self.ts.as_mut() {
+                ts.labels = labels;
+                ts.count = cursor;
+            }
+            return;
+        }
+
         // (label, pipeline, bind group, workgroups) — pressure order per pressure.wgsl header:
         // node_setup → cell_classify → pre-smooth → residual → coarse correction →
         // prolong_add → post-smooth → project. `par` tracks which ping-pong buffer holds the
@@ -1769,10 +2074,24 @@ impl Solver for TwofieldSolver {
                 &self.pipelines.p2g_water.1,
                 water_groups,
             ),
+            // U5: in dynamic mode `p2g_solid_dyn` (momentum + APIC + fused stress force)
+            // replaces the frozen thin volume scatter one-for-one.
             (
-                "p2g_solid",
-                &self.pipelines.p2g_solid.0,
-                &self.pipelines.p2g_solid.1,
+                if self.solid_dynamic {
+                    "p2g_solid_dyn"
+                } else {
+                    "p2g_solid"
+                },
+                if self.solid_dynamic {
+                    &self.pipelines.p2g_solid_dyn.0
+                } else {
+                    &self.pipelines.p2g_solid.0
+                },
+                if self.solid_dynamic {
+                    &self.pipelines.p2g_solid_dyn.1
+                } else {
+                    &self.pipelines.p2g_solid.1
+                },
                 solid_groups,
             ),
             (
@@ -1802,6 +2121,19 @@ impl Solver for TwofieldSolver {
                 cell_groups,
             ),
         ];
+        // U5 dynamic skeleton: decode + gravity + over-packing guard + solid BCs, right after
+        // grid_update (its water twin) and before the drag fold.
+        if self.solid_dynamic {
+            seq.insert(
+                4,
+                (
+                    "solid_update",
+                    &self.pipelines.solid_update.0,
+                    &self.pipelines.solid_update.1,
+                    node_groups,
+                ),
+            );
+        }
         // U4 pocket detection (surface.wgsl): flood the OUTSIDE label through the air cells
         // (labels ping-pong through the pressure slots, which cell_classify just zeroed and
         // pocket_mark re-zeroes), then mark the enclosed remainder as the pocket. The sweep
@@ -1905,18 +2237,32 @@ impl Solver for TwofieldSolver {
             &self.pipelines.g2p_water.1,
             water_groups,
         ));
-        for (label, pipe, bind, g) in seq {
-            dispatch_pass(
-                &mut enc,
-                pipe,
-                bind,
-                self.ts.as_ref(),
-                &mut cursor,
-                &mut labels,
-                label,
-                g,
-                &mut dispatches,
-            );
+        // U5: solid gather + advection + deformation update + return map (plasticity.wgsl).
+        if self.solid_dynamic {
+            seq.push((
+                "g2p_solid",
+                &self.pipelines.g2p_solid.0,
+                &self.pipelines.g2p_solid.1,
+                solid_groups,
+            ));
+        }
+        for ss in 0..substeps {
+            // Timestamp queries only on the first substep (fixed query-set capacity); the
+            // dispatch counter still counts every substep — the budget is the honest total.
+            let ts = if ss == 0 { self.ts.as_ref() } else { None };
+            for &(label, pipe, bind, g) in &seq {
+                dispatch_pass(
+                    &mut enc,
+                    pipe,
+                    bind,
+                    ts,
+                    &mut cursor,
+                    &mut labels,
+                    label,
+                    g,
+                    &mut dispatches,
+                );
+            }
         }
 
         if let Some(ts) = &self.ts {
