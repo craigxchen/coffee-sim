@@ -30,6 +30,11 @@ fn grid_clear(@builtin(global_invocation_id) gid: vec3<u32>) {
     atomicStore(&grid_fp[n * 4u + 2u], 0);
     atomicStore(&grid_fp[n * 4u + 3u], 0);
     atomicStore(&grid_sfp[n], 0);
+    // U5 solid momentum lanes (read only in dynamic mode; clearing is mode-independent).
+    atomicStore(&grid_sm[n * 4u + 0u], 0);
+    atomicStore(&grid_sm[n * 4u + 1u], 0);
+    atomicStore(&grid_sm[n * 4u + 2u], 0);
+    atomicStore(&grid_sm[n * 4u + 3u], 0);
     if (n < num_fine_cells()) {
         atomicStore(&cell_cnt[n], 0u);
     }

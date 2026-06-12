@@ -84,6 +84,11 @@ pub struct Config {
     /// grains down/out (crater) via a force ∝ (normal approach velocity)². Momentum-conserving,
     /// approach-gated. `0` disables the pass (existing scenes byte-unchanged); a brew scene opts in.
     pub impact_scale: f32,
+    /// Twofield U5 gate: the solid phase is a DYNAMIC elastoplastic granular material (Klar
+    /// Drucker-Prager + compaction cap; `solvers/twofield/plasticity.wgsl`). `false` (default)
+    /// keeps the U6 kinematically frozen skeleton — existing scenes byte-unchanged; the dry-bed
+    /// L1 scenes opt in. (U7 releases the saturated bed and this becomes the production path.)
+    pub solid_dynamics: bool,
 
     // --- wetting / cohesion (Phase 1.4) ---
     /// Absorption rate constant `k_abs` (1/s) in the bounded uptake `(1−e^{−k·dt})`. Higher = a
@@ -171,6 +176,7 @@ impl Default for Config {
             buoyancy_scale: 1.0,
             wake_threshold: 0.3, // local water flow speed (units/s) above grain_sleep_speed (KTD-9)
             impact_scale: 0.0, // dynamic-pressure crater coupling OFF by default (opt-in per scene)
+            solid_dynamics: false, // U6 frozen skeleton by default; the U5 bed scenes opt in
             // Wetting OFF by default (like drag_subiters=0): scenes opt in with absorb_rate>0 until
             // the feature is calibrated. ~2 s saturation time constant when enabled; deactivate
             // water only at a tiny remaining fraction (exact conservation), skip from PBF above that.

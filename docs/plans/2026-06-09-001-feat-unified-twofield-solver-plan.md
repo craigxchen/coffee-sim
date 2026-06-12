@@ -239,7 +239,8 @@ U-IDs are stable identifiers, not an ordering: U9 was split out of U6 during rev
 - Web frontend generalization (`src/web.rs` currently hard-codes the XPBD solver; exposing the new solver in the browser UI is its own small plan after L3).
 - Multi-pocket constraint-bubble generalization (R0 ships the single-pocket pour case).
 - Patch of main's divergence-penalty Darcy (explicitly declined — main is superseded by this program).
-- Espresso high-pressure regime; neural correctors; CK-MPM compact-kernel and other perf levers beyond the linearity gate (listed in PERF_NOTES as backlog).
+- Espresso high-pressure regime (including the U5 tamp gate's per-cycle 0.002 precision floor and vibratory-consolidation mechanism, re-scoped here by owner ruling 2026-06-12); neural correctors; CK-MPM compact-kernel and other perf levers beyond the linearity gate (listed in PERF_NOTES as backlog).
+- Lode-angle-dependent yield surface (e.g. Matsuoka–Nakai) to remove the grid-strength component of measured repose — the U5 grid-resolution confound documented in `tests/twofield_bed.rs` (h = 1.5 arm 29.9° vs h = 2 base 44.3°).
 
 **Outside this project's identity:** replacing or deleting the XPBD solver or main branch (both remain as baselines and referees); LBM or height-field reformulations.
 

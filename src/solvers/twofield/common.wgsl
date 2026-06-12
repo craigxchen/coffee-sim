@@ -40,6 +40,10 @@ struct Params {
     // U6 coupling (coupling.wgsl): (grain_diameter d, drag_scale, grain_volume π/6·d³,
     // open_base flag — the dev/test drained-column outflow mode).
     coupling: vec4<f32>,
+    // U5 plasticity (plasticity.wgsl; mirrors twofield::plasticity constants):
+    splas0: vec4<f32>, // (solid_dynamics flag, Lamé μ, Lamé λ, DP α)
+    splas1: vec4<f32>, // (cap hardening ξ, φ_max = packing limit, grain mass m_s, cohesion y_c)
+    splas2: vec4<f32>, // (floor/wall Coulomb μ_b, guard K_sp, guard onset φ_on, unused)
 };
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -80,6 +84,11 @@ struct Params {
 // integrator mobility factor the drag fold hands to node_setup (1.0 where no solid mass).
 // Written by drag_fold every frame, accumulated by project; no clear pass needed.
 @group(0) @binding(20) var<storage, read_write> react: array<vec4<f32>>;
+// U5 SOLID momentum grid field (dynamic skeleton, plasticity.wgsl): fixed-point, 4 lanes per
+// node [mass, mom.xyz] — the solid mirror of grid_fp. Cleared by grid_clear, scattered by
+// p2g_solid_dyn, decoded by solid_update. Only dispatched-to when Config::solid_dynamics is
+// on (params.splas0.x > 0.5); cleared unconditionally (never read in frozen mode).
+@group(0) @binding(21) var<storage, read_write> grid_sm: array<atomic<i32>>;
 
 // --- fixed-point encoding (KEEP.md §3 pattern, headroom re-validated for U2) -----------------
 //
