@@ -287,7 +287,11 @@ impl CoffeeSimApp {
 
     #[wasm_bindgen(js_name = particleCount)]
     pub fn particle_count(&self) -> u32 {
-        self.solver.particles().particle_count
+        // Live set, not the render buffer length. For the two-field solver `particles()` exposes
+        // the full water pool + solids (dormant pool slots are render-culled), so its count is the
+        // fixed pool size; `metrics()` carries the live count (water_count + solid_count) that
+        // grows as the pour activates slots. Equal to `particles().particle_count` for XPBD.
+        self.solver.metrics().particle_count
     }
 
     // --- scorecard metrics (cached; refreshed by the async sample path, U4) ---

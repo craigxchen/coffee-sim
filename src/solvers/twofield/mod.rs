@@ -74,6 +74,11 @@ use crate::utils::gpu::GpuContext;
 
 const WG: u32 = 256;
 
+/// Y-coordinate at which un-emitted (dormant) water-pool slots are parked: far below any scene so
+/// the renderer culls them (particles.wgsl matches this with `p.y <= -1.0e8`). Activated slots get
+/// a real position from `emit()`. Kept finite (not NaN) so any accidental read stays well-defined.
+const DORMANT_PARK_Y: f32 = -1.0e9;
+
 fn groups(n: u32) -> u32 {
     n.div_ceil(WG)
 }
@@ -1307,7 +1312,9 @@ impl Solver for TwofieldSolver {
         // spacing³ at this solver's rest density). Solids sit AFTER the full pool so the
         // KTD-1 range layout survives emission; dormant slots `[water_count, water_capacity)`
         // are never dispatched (the water kernels guard on the LIVE count) and are parked at
-        // the box corner with zero moisture until activated.
+        // a far below-domain sentinel (y = DORMANT_PARK_Y) so the renderer can cull them when the
+        // full pool is exposed (solids-present scenes) — otherwise the unused tail would draw as a
+        // clump at one point. emit() overwrites the slot's position when it activates it.
         let v_w = mats.particle_spacing.powi(3);
         let dose_headroom = if scene.declares_pour() {
             (scene.pour_water_ml / ML_PER_SIM_UNIT3 / v_w).ceil() as u32
@@ -1316,7 +1323,8 @@ impl Solver for TwofieldSolver {
         };
         let water_capacity = water_seed + dose_headroom;
         let particle_count = water_capacity + solid_count; // pool size (buffers + readbacks)
-        let park = [scene.box_min[0], scene.box_min[1], scene.box_min[2], 0.0];
+                                                           // Sentinel far below the domain (matched by DORMANT_PARK_Y in particles.wgsl's cull).
+        let park = [scene.box_min[0], DORMANT_PARK_Y, scene.box_min[2], 0.0];
         let mut positions = seed_positions[..water_seed as usize].to_vec();
         positions.resize(water_capacity as usize, park);
         positions.extend_from_slice(&seed_positions[water_seed as usize..]);

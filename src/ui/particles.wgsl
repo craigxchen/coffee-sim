@@ -32,6 +32,14 @@ fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VsOut
     );
     let c = corners[vi];
     let p = positions[ii].xyz;
+    // Dormant-pool cull: the two-field solver parks un-emitted water-pool slots far below the
+    // domain (y = -1e9, see DORMANT_PARK_Y) so the exposed-but-inactive tail doesn't render as a
+    // clump at one point. No other solver parks there, so this is a no-op for them.
+    if (p.y <= -1.0e8) {
+        var dormant: VsOut;
+        dormant.clip = vec4<f32>(2.0, 2.0, 2.0, 1.0); // outside NDC → impostor quad discarded
+        return dormant;
+    }
     // Cross-section slab cull: when enabled (clip.z>0.5), drop instances outside the center z-slab
     // so the inset shows a thin 2D slice. Off (clip.z==0) for the main pass → no effect.
     if (cam.clip.z > 0.5 && abs(p.z - cam.clip.x) > cam.clip.y) {
