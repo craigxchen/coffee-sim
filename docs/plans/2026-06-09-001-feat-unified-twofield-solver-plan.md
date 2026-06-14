@@ -1,6 +1,6 @@
 ---
 title: "feat: Unified two-field multiphase solver (incompressible water + elastoplastic porous bed)"
-status: active
+status: completed
 date: 2026-06-09
 type: feat
 plan_id: 2026-06-09-001

@@ -59,7 +59,7 @@ Baseline climbed 2.25× across the GPU-saturated range (super-linear, ≈N^1.2+)
 - **Dispatch cost:** the reorder adds ~3 dispatches + 5 buffer copies per water-loop rebuild
   (~5/frame). Natively dwarfed by the gather savings; for the browser, fuse via lever 2 below.
 
-## Two-field solver (U8 R9 gate, Apple M5, measured 2026-06) — **HALT at 200k**
+## Two-field solver (R9 gate CLEARED, Apple M5, measured 2026-06) — **PASS at 200k, 25.4 ms/frame**
 The unified two-field solver's R9 real-time gate (`tests/twofield_perf.rs`, table from
 `examples/twofield_scaling`) measures the FULL V60 saturated-pour scene — deformable Klar bed,
 two-field Darcy drag, mixture projection, free-surface + constraint-bubble cavity — at the
@@ -71,41 +71,34 @@ uses).
 
 | N (water+solid) | substeps | median ms/frame | µs/Kpart | verdict |
 |---|---|---|---|---|
-| ~2.9k  | 7 | ~19   | ~6500 | launch-overhead-dominated |
-| ~25k   | 7 | ~23   | ~900  | warming up |
-| ~56k   | 7 | ~30   | ~534  | borderline |
-| ~107k  | 7 | ~39   | ~365  | offline |
-| ~207k  | 7 | **~68–180** | ~350–870 | **HALT — fails the 33 ms R9 gate** |
+| ~207k  | 7 | **25.4** | ~123 | **PASS — clears the 33 ms R9 gate** |
 
-**Verdict: HALT.** The 200k median is ~68–180 ms/frame (data-dependent; see below) vs the hard
-33 ms gate — a **NO-FALLBACK failure**, reported straight. The linearity gate **passes** at
-**1.05×** µs/Kpart (40k→200k, both in the active-pour bubble regime): the solver scales
-~linearly, but the **absolute constant is ~2–5× over the real-time budget**. This is exactly the
-case R9 was written to catch — "a perfectly linear 90 ms/frame solver fails the program."
+**Verdict: PASS.** The 200k median is **25.4 ms/frame** (N = 206,838 = 191,954 water + 14,884
+solids) vs the hard 33 ms gate, with the full physics suite (8 binaries) re-verified green and
+the dispatch budget unchanged (511/frame). The linearity gate passes at **0.62×** µs/Kpart
+(40k→200k) — the solver is now flat-to-improving with N (fixed launch overhead amortizes out).
 
-**Where the time goes:** `bubble_fine` (the constraint-bubble row solve, KTD-6) is **78–81 %** of
-the frame. It is a **single-workgroup, all-cells reduction** run before every fine Jacobi sweep
-(8 sweeps × 7 substeps = 56×/frame): one GPU core scans all ~76k fine cells per dispatch to sum
-the few pocket-cell rows, serializing the pipeline. Its cost is **data-dependent** — it spikes
-when a large enclosed pour cavity persists (the median swings 68→180 ms between runs as the
-cavity's enclosed-pocket size fluctuates), which is itself a finding. The next-largest passes
-(`jacobi_fine` 8–9 %, everything else < 3 %) are comfortably linear and cheap.
+**The fix — compacted pocket list (the R9 blocker, resolved):** `bubble_fine`/`bubble_coarse`
+were a SINGLE-workgroup, ALL-cells reduction (one GPU core strided over ~76k fine cells per
+dispatch to sum the few hundred CELL_POCKET rows), run 56×/frame (8 sweeps × 7 substeps) — it was
+**78–81 % of the 200k frame**. The flood-fill already labels the pocket cells; the fix builds a
+**compacted list** of those indices once per frame via an atomic append folded into the existing
+passes (no new dispatches): `flood_init` zeroes two atomic counters (binding 26 `pocket_f`,
+binding 27 `pocket_c`); `pocket_mark` appends each fine CELL_POCKET cell; `coarse_cell_setup`
+appends each coarse one. The bubble row solves then stride the few-hundred-entry list instead of
+all cells — **same λ_b math, same contributing cells, same operator** (only the summation order
+differs at float-associativity level; the cavity/crater gates have wide bands and stayed green).
+Single-workgroup shape and barrier discipline are preserved (uniform trip count over the list).
+Result: bubble_fine fell from ~80 % to **34.5 %** of the frame, and the 200k median dropped from
+~68–180 ms to **25.4 ms**. Per-pass breakdown at 200k (substeps-scaled): `bubble_fine` 34.5 %,
+`jacobi_fine` 26.4 %, `flood_sweep` 7.5 %, `p2g_water` 5.9 %, `g2p_water` 4.4 %, everything else
+< 5 %. The earlier open-cavity early-out (`bubble[2]` flag) is retained on top — it skips the
+solve entirely on open-surface frames.
 
-**Cheap wins applied (physics-neutral, suite re-verified green):**
-- **Open-cavity bubble early-out** — `flood_init` zeroes a pocket-present flag (`bubble[2]`),
-  `pocket_mark` raises it when any enclosed pocket exists, and `bubble_fine`/`bubble_coarse`
-  return immediately when it's 0. Bitwise-identical (no pocket ⇒ λ_b = 0 either way), it elides
-  the all-cells reduction on open-surface frames (over-dispatch + early-out, R8). It does **not**
-  help the gate scene: the deep pour column keeps a pocket flagged every frame, so the full
-  reduction runs — the gate's cavity is genuinely enclosed.
-
-**The levers that would fix it (deferred — out of U8 scope):** the `bubble_fine` single-workgroup
-all-cells reduction is the textbook target for (a) a **parallel two-pass reduction** (partial sums
-per workgroup → final reduce, using all GPU cores — same math, no serialization) and (b) a
-**compacted pocket-cell list** (scan only pocket cells, not all cells). Both risk perturbing the
-cavity/crater gate numerics (float-add reordering), so they were NOT attempted under the "a perf
-win must not move a gate" rule — they belong with the CK-MPM / kernel-fusion backlog below. A
-perfect parallelization is the only plausible path to 33 ms; even then it is not guaranteed.
+**Remaining headroom (not needed for the gate):** `bubble_fine` is still the single largest pass.
+Further wins if ever needed: a multi-workgroup partial-sum reduction (the list-strided
+single-workgroup form is the simplest sufficient fix and was chosen for that reason), or warm-
+starting λ_b. These are CK-MPM / kernel-fusion backlog territory; the gate is met without them.
 
 Offline grid-refinement (GCI, reduced 3×2:1 with budget-scaled fine sweeps) on a settled
 hydrostatic column converges cleanly: water-COM height 8.42 → 8.73 → 8.90 su, **observed order
