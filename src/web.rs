@@ -380,6 +380,15 @@ fn setup_for(kind: WebScene, solver_id: SolverId) -> (Scene, Materials, Config) 
                 cfg.tf_absorb_rate = 0.15;
                 cfg.tf_wet_cohesion = 4.0;
                 cfg.tf_filter_floor = true;
+                // Stream coherence on a grid solver: the jet must span several cells or the
+                // P2G/G2P + pressure solve on a sub-2-cell column reconstructs noisy, asymmetric
+                // velocities and the thin stream whips/scatters (the dual of XPBD's Lagrangian
+                // strength). At h = 2·spacing = 0.32 a radius-0.25 jet is ~1.5 cells wide; widen
+                // to ~0.55 (diameter ~3.4 cells) so it's grid-resolvable, and lower the velocity
+                // cap so a stray projection correction can't fling it sideways. Twofield-only;
+                // the XPBD path keeps the thin realistic stream it handles fine.
+                cfg.nozzle_radius = 0.55;
+                cfg.max_speed = 12.0;
             }
             (scene, mats, cfg)
         }
