@@ -68,6 +68,7 @@ use crate::engine::{Metrics, Scene};
 use crate::models::Materials;
 use crate::profiling::Profile;
 use crate::solvers::base::Solver;
+use crate::solvers::pass_recorder::{PassRecorder, TimestampSink};
 use crate::utils::buffers::ParticleBuffers;
 use crate::utils::config::Config;
 use crate::utils::gpu::GpuContext;
@@ -887,6 +888,14 @@ impl TwofieldSolver {
     /// Total water mass emitted by the pour so far (conservation accounting; dev/test).
     pub fn total_emitted_water_mass(&self) -> f32 {
         self.inflow.emitted_mass
+    }
+
+    /// Drop per-pass timestamp profiling so `step()` records every frame in the BATCHED
+    /// single-compute-pass mode — exactly the web/no-TIMESTAMP_QUERY path. Used by the
+    /// equivalence gate (`tests/batch_pass_equivalence.rs`) to compare batched vs per-pass
+    /// recording natively; not used in production.
+    pub fn force_batched_passes_for_test(&mut self) {
+        self.ts = None;
     }
 
     /// Read back the per-solid deformation gradients, 3 vec4 rows per solid (row-major,
@@ -2235,14 +2244,22 @@ impl Solver for TwofieldSolver {
         self.queue
             .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&self.params));
 
-        let mut cursor = 0u32;
-        let mut labels: Vec<String> = Vec::new();
-        let mut dispatches = 0u32;
         let mut enc = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("twofield-frame"),
             });
+        // One recorder for the whole frame. With timestamps (native profiling) it records
+        // per-pass timestamped passes for substep 0, then batches the rest; without timestamps
+        // (web / no TIMESTAMP_QUERY) the whole frame collapses into ONE compute pass — Dawn
+        // inserts the storage-buffer barriers between dependent dispatches automatically, so the
+        // result is identical (proven by tests/batch_pass_equivalence.rs). Only the per-pass
+        // begin/end CPU overhead is dropped.
+        let sink = self.ts.as_ref().map(|t| TimestampSink {
+            qset: &t.qset,
+            capacity: t.capacity,
+        });
+        let mut rec = PassRecorder::new(sink);
 
         // The U2 transfer pipeline + U3 pressure stack, one substep per frame. Passes dispatch
         // at least one workgroup so the dispatch/profiling path is real even on an empty scene
@@ -2289,21 +2306,16 @@ impl Solver for TwofieldSolver {
                 ),
             ];
             for ss in 0..substeps {
-                let ts = if ss == 0 { self.ts.as_ref() } else { None };
+                // Timestamp substep 0 only (fixed query-set capacity; the perf test reads ONE
+                // substep's sum). Remaining substeps batch into one pass.
+                if ss == 1 {
+                    rec.disable_timestamps();
+                }
                 for &(label, pipe, bind, g) in &seq {
-                    dispatch_pass(
-                        &mut enc,
-                        pipe,
-                        bind,
-                        ts,
-                        &mut cursor,
-                        &mut labels,
-                        label,
-                        g,
-                        &mut dispatches,
-                    );
+                    rec.dispatch(&mut enc, pipe, bind, label, g);
                 }
             }
+            let (dispatches, cursor, labels) = rec.finish();
             if let Some(ts) = &self.ts {
                 if cursor >= 2 {
                     enc.resolve_query_set(&ts.qset, 0..cursor, &ts.resolve, 0);
@@ -2536,21 +2548,15 @@ impl Solver for TwofieldSolver {
         for ss in 0..substeps {
             // Timestamp queries only on the first substep (fixed query-set capacity); the
             // dispatch counter still counts every substep — the budget is the honest total.
-            let ts = if ss == 0 { self.ts.as_ref() } else { None };
+            // After substep 0 the recorder batches the remaining dispatches into one pass.
+            if ss == 1 {
+                rec.disable_timestamps();
+            }
             for &(label, pipe, bind, g) in &seq {
-                dispatch_pass(
-                    &mut enc,
-                    pipe,
-                    bind,
-                    ts,
-                    &mut cursor,
-                    &mut labels,
-                    label,
-                    g,
-                    &mut dispatches,
-                );
+                rec.dispatch(&mut enc, pipe, bind, label, g);
             }
         }
+        let (dispatches, cursor, labels) = rec.finish();
 
         if let Some(ts) = &self.ts {
             if cursor >= 2 {
@@ -2610,42 +2616,6 @@ impl Solver for TwofieldSolver {
             dispatches_per_frame: self.dispatches,
         }
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn dispatch_pass(
-    enc: &mut wgpu::CommandEncoder,
-    pipeline: &wgpu::ComputePipeline,
-    bind_group: &wgpu::BindGroup,
-    ts: Option<&Timestamps>,
-    cursor: &mut u32,
-    labels: &mut Vec<String>,
-    label: &str,
-    groups: u32,
-    dispatches: &mut u32,
-) {
-    let tw = match ts {
-        Some(t) if *cursor + 1 < t.capacity => {
-            let b = *cursor;
-            let e = *cursor + 1;
-            *cursor += 2;
-            labels.push(label.to_string());
-            Some(wgpu::ComputePassTimestampWrites {
-                query_set: &t.qset,
-                beginning_of_pass_write_index: Some(b),
-                end_of_pass_write_index: Some(e),
-            })
-        }
-        _ => None,
-    };
-    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-        label: Some(label),
-        timestamp_writes: tw,
-    });
-    pass.set_pipeline(pipeline);
-    pass.set_bind_group(0, Some(bind_group), &[]);
-    pass.dispatch_workgroups(groups, 1, 1);
-    *dispatches += 1;
 }
 
 #[cfg(test)]
