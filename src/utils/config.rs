@@ -117,6 +117,27 @@ pub struct Config {
     pub nozzle_radius: f32,
     /// Orifice discharge coefficient `∈ (0,1]` (vena-contracta loss). Folded into `A_eff`.
     pub discharge_coeff: f32,
+
+    // --- twofield U9 infiltration interface (opt-in; all default 0 / OFF so existing scenes
+    // and the U2–U6 twofield suites are byte-unchanged) ---
+    /// Twofield moisture phase-change absorption gate + rate `k_abs` (1/s, reduced sim units).
+    /// Zero skips the grid-projected absorption passes entirely (no φ_s/swelling change); a
+    /// positive value enables GIC-style absorption into grain moisture via `models::wetting`.
+    /// Calibrated: 60–80% swelling complete ≤ 30 s physical (≈ 8.14 s sim) gives k_abs ≈
+    /// 0.11–0.20 (see `tests/twofield_infiltration.rs` UNIT MAPPING).
+    pub tf_absorb_rate: f32,
+    /// Twofield wetting-front capillary suction body force (Green–Ampt magnitude, reduced
+    /// units): the extra downward acceleration on water at the unsaturated front, derived from
+    /// the suction head ψ_f ≈ 50–110 mm (≈ 1.39–3.05 su) — see the test's UNIT MAPPING. 0 =
+    /// no suction (the bare-Darcy arm).
+    pub tf_suction_accel: f32,
+    /// Twofield bloom delay (reduced sim seconds): a dry hydrophobic grain ramps from no
+    /// absorption/suction to full over this contact time. 0 = no bloom gate (grains wet on
+    /// contact). Calibrated seconds-scale: ≈ 2–6 s physical ⇒ ≈ 0.54–1.63 s sim.
+    pub tf_bloom_delay: f32,
+    /// Twofield phase-selective filter floor: water drains through the y-min face (porous-jump
+    /// outflow), the frozen solid skeleton is retained. 0 = sealed floor (the U6 default).
+    pub tf_filter_floor: bool,
 }
 
 impl Default for Config {
@@ -190,6 +211,13 @@ impl Default for Config {
             // Pour spout: a thin stream by default; a pour scene tunes these to its grind/flow.
             nozzle_radius: 0.5,
             discharge_coeff: 1.0,
+            // Twofield U9 infiltration interface: OFF by default — the absorption/suction/bloom
+            // passes are CPU-elided (absorb_rate gate) and the filter floor is sealed, so the
+            // U2–U6 twofield suites and every existing scene are byte-unchanged.
+            tf_absorb_rate: 0.0,
+            tf_suction_accel: 0.0,
+            tf_bloom_delay: 0.0,
+            tf_filter_floor: false,
         }
     }
 }
