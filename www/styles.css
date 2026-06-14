@@ -514,6 +514,25 @@ button:hover {
   background: rgba(217, 179, 106, 0.08);
 }
 
+select {
+  flex: 1;
+  min-width: 0;
+  padding: 8px 6px;
+  border-radius: 12px;
+  border: 1px solid var(--panel-border);
+  background: rgba(9, 16, 19, 0.56);
+  color: var(--ink);
+  font: inherit;
+  font-size: 0.85rem;
+  cursor: pointer;
+  transition: border-color 160ms ease, background 160ms ease;
+}
+
+select:hover {
+  border-color: rgba(217, 179, 106, 0.45);
+  background: rgba(217, 179, 106, 0.08);
+}
+
 .stats {
   margin: 0;
   display: grid;
