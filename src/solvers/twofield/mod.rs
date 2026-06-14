@@ -91,7 +91,8 @@ fn groups(n: u32) -> u32 {
 /// bubble), `project` 7 (grid_vel, nm, cell_meta, pf, grid_sfp, react, grid_svel — U7 adds
 /// grid_svel for the pore-pressure buoyancy on the solid field; ties cell_classify), debug
 /// taps ≤ 4; U4
-/// surface family — `flood_init` 2, `flood_sweep` 3, `pocket_mark` 6 (grid_vel, cell_meta,
+/// surface family — `flood_init` 3 (cell_meta, pf_a, bubble — U8 early-out flag reset),
+/// `flood_sweep` 3, `pocket_mark` 6 (grid_vel, cell_meta,
 /// pf×2, bubble, nm), `bubble_fine` 4, `bubble_coarse` 4; U5 plasticity family —
 /// `p2g_solid_dyn` 6 (pos, vel, cmat, grid_sfp, grid_sm, sstate), `solid_update` 4
 /// (grid_sm, grid_svel, grid_sfp, solids), `g2p_solid` 7 (pos, vel, cmat, solids,
@@ -365,6 +366,25 @@ struct Timestamps {
     count: u32,
 }
 
+/// Brew diagnostics sampled from the GPU (dev/test only — the read-back stalls). Mirrors the
+/// xpbd `XpbdDiagnostics` precedent so future suites can port: the values are CPU-resident
+/// after `sample_diagnostics()` and the getters never sync. `drawdown_time` latches the sim
+/// time when the free water ABOVE the bed surface (the pond) first drains away — the
+/// pour-over drawdown event (U8 metric). `evenness`/`extraction_yield`/`tds` are placeholders
+/// (1.0 / 0.0) until the extraction port lands (deferred to follow-up — see the plan's Scope
+/// Boundaries); the slots exist so the seam matches xpbd and the metric surface is wired now.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TwofieldDiagnostics {
+    /// Live free-water particles above the bed surface (the pond), latest sample.
+    pub free_water_above_bed: u32,
+    /// Sim time (s) when the pond first drained below the drawdown threshold; 0 = not latched.
+    pub drawdown_time: f32,
+    /// Flow-evenness placeholder (1.0 = even) — extraction-gated, deferred.
+    pub evenness: f32,
+    /// Peak per-node grid occupancy proxy (max decoded node mass / rest density), latest sample.
+    pub max_occupancy: f32,
+}
+
 pub struct TwofieldSolver {
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -434,6 +454,13 @@ pub struct TwofieldSolver {
     // Cached per-frame results returned by the getters (never a GPU sync there).
     dispatches: u32,
     cached_passes: Vec<(String, f32)>,
+
+    // U8 metrics/diagnostics surface (CPU-resident; refreshed by `sample_diagnostics`, returned
+    // by `metrics()`/`diagnostics()` without a GPU sync). `sim_time` advances every `step`.
+    sim_time: f32,
+    bed_top_seed: f32,
+    pond_peak: u32,
+    cached_diag: TwofieldDiagnostics,
 
     // Retained for reset (exact, deterministic re-seed; pool-padded layout).
     initial_positions: Vec<[f32; 4]>,
@@ -794,6 +821,13 @@ impl TwofieldSolver {
     pub fn read_bubble(&self) -> [f32; 2] {
         let raw: Vec<f32> = bytemuck::cast_slice(&self.read_bytes(&self.bubble, 8)).to_vec();
         [raw[0], raw[1]]
+    }
+
+    /// Whether an enclosed air pocket was detected this frame (the U8 bubble early-out flag,
+    /// `bubble[2]`; dev/test only — stalls). When false the bubble-row solves were elided.
+    pub fn pocket_present(&self) -> bool {
+        let raw: Vec<f32> = bytemuck::cast_slice(&self.read_bytes(&self.bubble, 12)).to_vec();
+        raw[2] >= 0.5
     }
 
     /// Read back the U6 constraint-reaction ledger, one vec4 per node: .xyz = the impulse
@@ -1167,6 +1201,95 @@ impl TwofieldSolver {
                 self.cached_passes = passes;
             }
         }
+        self.sample_brew_diagnostics();
+    }
+
+    /// Refresh the brew metrics (free-water-above-bed → drawdown latch, occupancy proxy) from a
+    /// position/phase snapshot (blocking reads — folded into `sample_diagnostics`). The
+    /// drawdown event latches `sim_time` when the pond above the seeded bed surface first
+    /// drains below a small fraction of its peak; water-only / bed-less scenes never pond, so
+    /// drawdown stays 0. Evenness/yield/TDS remain placeholders (extraction deferred).
+    fn sample_brew_diagnostics(&mut self) {
+        // Read the live particle prefix only (the dormant tail is parked, phase noise-free).
+        let live = (self.water_count + self.solid_count) as usize;
+        if live == 0 {
+            return;
+        }
+        let pos = self.read_positions();
+        let phase = self.read_phases();
+        let n = live.min(pos.len()).min(phase.len());
+        let bed_top = self.bed_top_seed;
+        let mut above = 0u32;
+        let mut max_y_grain = f32::NEG_INFINITY;
+        for i in 0..n {
+            let p = pos[i];
+            if phase[i] == 0 {
+                // Live water carries pos.w (moisture lane) > 0; parked slots are at the corner.
+                if p[3] > 0.0 && p[1] > bed_top {
+                    above += 1;
+                }
+            } else {
+                max_y_grain = max_y_grain.max(p[1]);
+            }
+        }
+        // Occupancy proxy: peak node mass / rest density (the dense-region indicator; cheap,
+        // no extra GPU pass — read from the float grid the last project wrote).
+        let max_occ = self
+            .read_grid_velocities()
+            .iter()
+            .map(|v| v[3])
+            .fold(0.0f32, f32::max)
+            / self.params.extra[0].max(1.0e-6);
+
+        let mut diag = self.cached_diag;
+        diag.free_water_above_bed = above;
+        diag.evenness = 1.0; // placeholder until extraction lands
+        diag.max_occupancy = max_occ;
+        // Drawdown latch: only meaningful on a bedded scene (a real surface above the floor).
+        // Track the peak pond, latch when it first falls below 10% of that peak with grains
+        // present (the pond has drained through/around the bed).
+        if self.solid_count > 0 && max_y_grain.is_finite() {
+            self.pond_peak = self.pond_peak.max(above);
+            if diag.drawdown_time == 0.0
+                && self.pond_peak >= 4
+                && (above as f32) < 0.10 * self.pond_peak as f32
+            {
+                diag.drawdown_time = self.sim_time;
+            }
+        }
+        self.cached_diag = diag;
+    }
+
+    /// Latest sampled brew diagnostics (CPU-resident; the getters never sync). Mirrors
+    /// `XpbdSolver::diagnostics` so future suites can port.
+    pub fn diagnostics(&self) -> TwofieldDiagnostics {
+        self.cached_diag
+    }
+
+    /// Live particle count currently simulated (water prefix + solids). Mirrors
+    /// `XpbdSolver::active_count` — the scaling-probe / perf-test particle-count read.
+    pub fn active_count(&self) -> u32 {
+        self.water_count + self.solid_count
+    }
+
+    /// Allocated water-pool capacity (`seed + dose headroom`; dev/test). The upper bound the
+    /// scaling-probe / perf-test bed-saturation may raise the live water count to.
+    pub fn water_pool_capacity(&self) -> u32 {
+        self.water_capacity
+    }
+
+    /// CFL substep count this frame would run at `dt` (the per-frame timing multiplier: the
+    /// per-pass timestamps capture substep 0 only, so the honest per-frame GPU cost is
+    /// `substeps × profile().total_micros()`). Frozen-skeleton scenes run exactly one substep.
+    pub fn substeps_for_dt(&self, dt: f32) -> u32 {
+        if self.solid_dynamic {
+            let h = self.params.grid_origin[3];
+            let d = self.params.coupling[0];
+            let rho_p = self.params.splas1[2] / (d * d * d).max(1.0e-9);
+            plasticity::solid_substeps(dt, h, rho_p)
+        } else {
+            1
+        }
     }
 }
 
@@ -1454,8 +1577,13 @@ impl Solver for TwofieldSolver {
             (num_ccells.max(1) as u64) * 4,
             wgpu::BufferUsages::empty(),
         );
-        // U4 bubble state: [λ_b, δλ_b].
-        let bubble = Self::storage(&device, "twofield-bubble", 8, wgpu::BufferUsages::COPY_SRC);
+        // U4 bubble state: [λ_b, δλ_b, pocket_present]. The 3rd slot is the open-cavity
+        // early-out flag (U8 cheap win): flood_init zeroes it, pocket_mark raises it to 1.0 if
+        // ANY enclosed pocket exists this frame, and bubble_fine/bubble_coarse return immediately
+        // when it is 0 — bitwise-identical to the full pass (no pocket ⇒ λ_b = 0 either way),
+        // it just skips the all-cells single-workgroup reduction on open-surface frames (over-
+        // dispatch + early-out, R8). The dispatch is still counted; only the work is elided.
+        let bubble = Self::storage(&device, "twofield-bubble", 12, wgpu::BufferUsages::COPY_SRC);
         // U4 per-cell particle counts (the surface-classification particle-presence census).
         let cell_cnt = Self::storage(
             &device,
@@ -1795,9 +1923,16 @@ impl Solver for TwofieldSolver {
             ];
             // --- U4 surface family --------------------------------------------------------
             let flood_init = make("flood_init");
+            // binding 17 (bubble): flood_init now zeroes the U8 pocket-present early-out flag
+            // (bubble[2]) at c == 0, so the surface family's first pass owns the reset.
             let flood_init_bind = bg(
                 &flood_init,
-                &[(0, &params_buf), (10, &cell_meta), (11, &pf_a)],
+                &[
+                    (0, &params_buf),
+                    (10, &cell_meta),
+                    (11, &pf_a),
+                    (17, &bubble),
+                ],
             );
             let flood_sweep = make("flood_sweep");
             let flood_sweep_binds = [
@@ -1980,6 +2115,18 @@ impl Solver for TwofieldSolver {
             ts,
             dispatches: 0,
             cached_passes: Vec::new(),
+            sim_time: 0.0,
+            // Bed surface = top of the seeded grain regions (the pond/free-water boundary the
+            // drawdown metric keys on). No grain region ⇒ box floor (water-only: never ponds
+            // on a bed, so drawdown stays 0).
+            bed_top_seed: scene
+                .regions
+                .iter()
+                .filter(|r| matches!(r.species, Species::Grain))
+                .map(|r| r.max[1])
+                .fold(scene.box_min[1], f32::max),
+            pond_peak: 0,
+            cached_diag: TwofieldDiagnostics::default(),
             initial_positions: positions,
             initial_phases: phases,
             initial_water: water_seed,
@@ -2027,11 +2174,15 @@ impl Solver for TwofieldSolver {
         self.inflow.emitted_mass = 0.0;
         self.cached_passes.clear();
         self.dispatches = 0;
+        self.sim_time = 0.0;
+        self.pond_peak = 0;
+        self.cached_diag = TwofieldDiagnostics::default();
     }
 
     fn step(&mut self, dt: f32, input: &EmissionInput) {
         // Pour emission first (grows water_count for this frame); no-op when not pouring.
         self.emit(input, dt);
+        self.sim_time += dt;
         debug_assert!(self.water_count <= self.water_capacity);
         // U5 dynamic mode substeps the frame pipeline at dt/n: the explicit elastic
         // solid needs the sound-speed CFL (plasticity::solid_substeps), and params.dt is one
@@ -2408,9 +2559,15 @@ impl Solver for TwofieldSolver {
     }
 
     fn metrics(&self) -> Metrics {
-        // All values CPU-resident — never a GPU sync here (trait contract).
+        // All values CPU-resident — never a GPU sync here (trait contract). Drawdown/evenness
+        // come from the last `sample_diagnostics`; extraction_yield/tds are 0 placeholders
+        // (the extraction port is deferred — see the plan Scope Boundaries). iteration_count
+        // carries the pressure fine-sweep budget (the per-frame solver work indicator).
         Metrics {
             particle_count: self.water_count + self.solid_count, // live set
+            drawdown_time: self.cached_diag.drawdown_time,
+            evenness: self.cached_diag.evenness,
+            iteration_count: self.fine_sweeps + self.coarse_sweeps,
             ..Default::default()
         }
     }

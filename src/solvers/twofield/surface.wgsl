@@ -54,6 +54,9 @@ const FLOOD_OUTSIDE: f32 = 1.0;
 @compute @workgroup_size(256)
 fn flood_init(@builtin(global_invocation_id) gid: vec3<u32>) {
     let c = gid.x;
+    if (c == 0u) {
+        bubble[2] = 0.0; // pocket-present flag, raised by pocket_mark this frame
+    }
     if (c >= num_fine_cells()) {
         return;
     }
@@ -162,6 +165,7 @@ fn pocket_mark(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
     cell_meta[c] = vec4<f32>((0.0 - div) / params.dt, 1.0, 0.0, CELL_POCKET);
+    bubble[2] = 1.0; // an enclosed pocket exists: arm the bubble-row solves this frame
 }
 
 // =================================== bubble row relaxation =====================================
@@ -176,6 +180,12 @@ var<workgroup> red_diag: array<f32, 256>;
 @compute @workgroup_size(256)
 fn bubble_fine(@builtin(local_invocation_id) lid: vec3<u32>) {
     let t = lid.x;
+    // Open-cavity early-out (U8): no enclosed pocket this frame ⇒ λ_b is 0 (pocket_mark already
+    // pinned bubble[0]=bubble[1]=0), so the all-cells reduction is pure waste. bubble[2] is
+    // uniform across the workgroup, so this return precedes every barrier in uniform control flow.
+    if (bubble[2] < 0.5) {
+        return;
+    }
     let n = num_fine_cells();
     let h = params.grid_origin.w;
     var s_rhs = 0.0;
@@ -266,6 +276,10 @@ fn bubble_fine(@builtin(local_invocation_id) lid: vec3<u32>) {
 @compute @workgroup_size(256)
 fn bubble_coarse(@builtin(local_invocation_id) lid: vec3<u32>) {
     let t = lid.x;
+    // Open-cavity early-out (U8), identical to bubble_fine: no enclosed pocket ⇒ δλ_b stays 0.
+    if (bubble[2] < 0.5) {
+        return;
+    }
     let n = num_coarse_cells();
     let hc = params.grid_origin.w * f32(params.coarse_dims.w);
     var s_rhs = 0.0;
