@@ -36,14 +36,14 @@ struct Params {
     num_solids: u32,     // count of static SDF solids in the `solids` buffer (0 = none)
     // U3 pressure stack (pressure.wgsl):
     coarse_dims: vec4<u32>, // coarse CELLS per axis (= ceil(fine_cells/ratio)); .w = ratio
-    extra: vec4<f32>,       // (rest_density, rho_floor, mass_eps, unused)
+    extra: vec4<f32>,       // (rest_density, rho_floor, mass_eps, U7 wet-cohesion s_peak)
     // U6 coupling (coupling.wgsl): (grain_diameter d, drag_scale, grain_volume π/6·d³,
     // open_base flag — the dev/test drained-column outflow mode).
     coupling: vec4<f32>,
     // U5 plasticity (plasticity.wgsl; mirrors twofield::plasticity constants):
     splas0: vec4<f32>, // (solid_dynamics flag, Lamé μ, Lamé λ, DP α)
     splas1: vec4<f32>, // (cap hardening ξ, φ_max = packing limit, grain mass m_s, cohesion y_c)
-    splas2: vec4<f32>, // (floor/wall Coulomb μ_b, guard K_sp, guard onset φ_on, unused)
+    splas2: vec4<f32>, // (floor/wall Coulomb μ_b, guard K_sp, guard onset φ_on, U7 wet c_max)
     // U9 infiltration interface (coupling.wgsl; mirrors models::wetting + the test UNIT MAPPING):
     wet0: vec4<f32>, // (tf_absorb_rate k_abs, V_cap = r_max·ρ_ratio·V_dry, V_w = water vol,
                      //  absorb_roundoff — the f_w/V_abs saturation floor)

@@ -418,6 +418,20 @@ pub fn solid_step(f: Mat3, c_grad: Mat3, dt: f32, p_c: f32, vc: f32, m: &SolidCo
     }
 }
 
+/// U7 Bishop saturation-weighted wet cohesion fed into the DP yield (CPU twin of
+/// `cohesion_for_saturation` in plasticity.wgsl): `y_c(s) = dry + χ·c_max·bump(s)` with the
+/// Bishop factor χ = s (degree of saturation) and `bump(s) = models::cohesion::for_saturation`.
+/// `c_max = 0` returns `dry` exactly (the dry-rung passthrough). This is where saturation enters
+/// the U5 return map's cohesion argument (the effective-stress coupling KTD-4/KTD-5).
+pub fn cohesion_for_saturation(sat: f32, dry: f32, c_max: f32, s_peak: f32) -> f32 {
+    if c_max <= 0.0 {
+        return dry;
+    }
+    let s = sat.clamp(0.0, 1.0);
+    let bump = crate::models::cohesion::for_saturation(s, s_peak, c_max);
+    dry + s * bump
+}
+
 /// Over-packing solids pressure P_sp(φ_s) (module constants; mirrors `solids_pressure` in
 /// plasticity.wgsl): zero below the onset, diverging as φ_s → φ_max.
 pub fn solids_pressure(phi_s: f32, phi_max: f32) -> f32 {

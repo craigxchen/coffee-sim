@@ -817,6 +817,29 @@ fn project(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
         let direct = -sv * params.dt * gp; // −V_s·Δt·∇p: pressure on the solid volume
         react[n] = vec4<f32>(react[n].xyz + direct - via, sig);
+        // U7 (KTD-4): release the solid field — submerged grains feel buoyancy through the
+        // momentum equation. The pore pressure IS the projection pressure, so the solid
+        // velocity correction is Δv_s = −(Δt/ρ_s)·∇p (the SAME ∇p the water sees; φ_s is in
+        // the operator/mass, NOT the velocity correction, exactly as for water). ρ_s = solid
+        // node mass / h³ (grid_svel.w, set by solid_update). Wall-constrained axes are zeroed
+        // by reusing the water node's d-axis flags (massless box-face/SDF projector in nm.a),
+        // so buoyancy never drives a grain through a wall — and frozen mode (solid_dynamics
+        // off) skips this entirely (grid_svel is dormant), keeping U6 bitwise.
+        if (params.splas0.x > 0.5) {
+            let sm = grid_svel[n].w;
+            if (sm > params.extra.z) {
+                let h3 = h * h * h;
+                let rho_s = sm / h3;
+                var dvs = gp * (params.dt / max(rho_s, 0.1));
+                // Reuse the water projector's free-axis mask (nm.a.x/.w/.b.y are the box-face
+                // /SDF-constrained inverse-mass diagonal — 0 on a constrained axis): a zero
+                // there means the node cannot move on that axis, for either phase.
+                if (m.a.x == 0.0) { dvs.x = 0.0; }
+                if (m.a.w == 0.0) { dvs.y = 0.0; }
+                if (m.b.y == 0.0) { dvs.z = 0.0; }
+                grid_svel[n] = vec4<f32>(grid_svel[n].xyz - dvs, sm);
+            }
+        }
     }
     if (m.b.z >= 0.5) {
         grid_vel[n] = vec4<f32>(grid_vel[n].xyz - dv, grid_vel[n].w);

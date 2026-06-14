@@ -175,11 +175,13 @@ fn svd3(f: mat3x3<f32>) -> Svd3 {
 
 struct RmOut { eps: vec3<f32>, p_c: f32, d_comp: f32 };
 
-fn return_map(eps_trial: vec3<f32>, p_c: f32) -> RmOut {
+// U7: the cohesion `y_coh` is passed in (per-grain, saturation-dependent via Bishop weighting
+// — see g2p_solid and cohesion_for_saturation) instead of read from params; the dry rung
+// passes params.splas1.w = cohesion::dry() = 0, so the U5 behavior is bitwise unchanged.
+fn return_map(eps_trial: vec3<f32>, p_c: f32, y_coh: f32) -> RmOut {
     let mu = params.splas0.y;
     let lam = params.splas0.z;
     let alpha = params.splas0.w;
-    let y_coh = params.splas1.w;
     let xi = params.splas1.x;
     let k3 = 2.0 * mu + 3.0 * lam;
     let kb = lam + 2.0 * mu / 3.0;
@@ -208,6 +210,30 @@ fn return_map(eps_trial: vec3<f32>, p_c: f32) -> RmOut {
         return RmOut(vec3<f32>(tr_apex / 3.0), p_c_new, d_comp);
     }
     return RmOut(eps - (dg / max(dn, 1.0e-12)) * dev, p_c_new, d_comp);
+}
+
+// U7 wet cohesion (Bishop saturation weighting, KTD-4/KTD-5): the saturation-dependent
+// capillary cohesion fed into the DP yield apex. y_c(s) = dry + χ·c_max·bump(s), with the
+// Bishop factor χ = s (degree of saturation: a fully-saturated grain carries the full
+// capillary bump, a dry one none — the same χ that weights the effective stress σ' = σ + χ·p·I)
+// and bump(s) the models::cohesion::for_saturation piecewise tent (peaks at s_peak = extra.w,
+// scaled to c_max = splas2.w). c_max = 0 (default) ⇒ y_c = dry exactly. Mirrors
+// models::cohesion::for_saturation, then weighted by χ.
+fn cohesion_for_saturation(s_arg: f32) -> f32 {
+    let dry = params.splas1.w;
+    let c_max = params.splas2.w;
+    if (c_max <= 0.0) {
+        return dry; // OFF: byte-identical to the dry rung
+    }
+    let s = clamp(s_arg, 0.0, 1.0);
+    let s_peak = clamp(params.extra.w, 1.0e-6, 1.0 - 1.0e-6);
+    var bump = 0.0;
+    if (s <= s_peak) {
+        bump = c_max * s / s_peak;
+    } else {
+        bump = c_max * (1.0 - s) / (1.0 - s_peak);
+    }
+    return dry + s * bump; // Bishop χ = s
 }
 
 // Over-packing solids pressure (module header; mirrors plasticity.rs::solids_pressure).
@@ -490,7 +516,16 @@ fn g2p_solid(@builtin(global_invocation_id) gid: vec3<u32>) {
     // debt into the rebuilt F.
     let vc = fmat[3u * i + 0u].w;
     let eps_eff = eps_tr + vec3<f32>(vc / 3.0);
-    let rm = return_map(eps_eff, sb_old.z);
+    // U7 Bishop effective-stress cohesion: local grain saturation s = V_abs/V_cap (V_abs rides
+    // pos.w on grains, V_cap = wet_v_cap()) maps to the saturation-dependent wet cohesion fed
+    // into the DP yield. Dry grains (V_abs = 0) and c_max = 0 both give y_c = cohesion::dry().
+    let v_cap = wet_v_cap();
+    var sat = 0.0;
+    if (v_cap > 0.0) {
+        sat = clamp(pos[p].w / v_cap, 0.0, 1.0);
+    }
+    let y_coh = cohesion_for_saturation(sat);
+    let rm = return_map(eps_eff, sb_old.z, y_coh);
     let tr_eff = eps_eff.x + eps_eff.y + eps_eff.z;
     let vc_new = max(tr_eff + rm.d_comp - (rm.eps.x + rm.eps.y + rm.eps.z), 0.0);
     let sig_new = vec3<f32>(exp(rm.eps.x), exp(rm.eps.y), exp(rm.eps.z));

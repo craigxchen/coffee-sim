@@ -88,7 +88,9 @@ fn groups(n: u32) -> u32 {
 /// `cell_classify` 7 (grid_vel, solids, cell_meta, pf_a, pf_b, cell_cnt, nm) — the widest,
 /// `coarse_node_setup` 2, `coarse_cell_setup` 4 (cell_meta, cmeta, pc_a, pc_b),
 /// `jacobi_fine`/`jacobi_coarse` 5 (+bubble), `prolong_add` 6 (cell_meta, cmeta, pc, pf×2,
-/// bubble), `project` 6 (grid_vel, nm, cell_meta, pf, grid_sfp, react), debug taps ≤ 4; U4
+/// bubble), `project` 7 (grid_vel, nm, cell_meta, pf, grid_sfp, react, grid_svel — U7 adds
+/// grid_svel for the pore-pressure buoyancy on the solid field; ties cell_classify), debug
+/// taps ≤ 4; U4
 /// surface family — `flood_init` 2, `flood_sweep` 3, `pocket_mark` 6 (grid_vel, cell_meta,
 /// pf×2, bubble, nm), `bubble_fine` 4, `bubble_coarse` 4; U5 plasticity family —
 /// `p2g_solid_dyn` 6 (pos, vel, cmat, grid_sfp, grid_sm, sstate), `solid_update` 4
@@ -274,14 +276,14 @@ struct Params {
     particle_count: u32, // = water_count + solid_count (kernel live-set guard)
     num_solids: u32,     // count of static SDF solids in the `solids` buffer
     coarse_dims: [u32; 4], // coarse CELLS per axis (= ceil(fine_cells/ratio)); .w = ratio
-    extra: [f32; 4],     // (rest_density, rho_floor, mass_eps, unused)
+    extra: [f32; 4],     // (rest_density, rho_floor, mass_eps, U7 wet-cohesion s_peak)
     // U6 coupling: (grain_diameter d, drag_scale, grain_volume π/6·d³, open_base flag — the
     // dev/test drained-column outflow mode, see coupling.wgsl).
     coupling: [f32; 4],
     // U5 plasticity (plasticity.wgsl; values from `plasticity` consts + Materials/Config):
     splas0: [f32; 4], // (solid_dynamics flag, Lamé μ, Lamé λ, DP α)
     splas1: [f32; 4], // (cap hardening ξ, φ_max = packing limit, grain mass, cohesion y_c)
-    splas2: [f32; 4], // (floor/wall Coulomb μ_b, guard K_sp, guard onset φ_on, unused)
+    splas2: [f32; 4], // (floor/wall Coulomb μ_b, guard K_sp, guard onset φ_on, U7 wet c_max)
     // U9 infiltration interface (coupling.wgsl; mirrors models::wetting + the test UNIT MAPPING):
     wet0: [f32; 4], // (k_abs, V_cap = r_max·ρ_ratio·V_dry, V_w water vol, absorb_roundoff)
     wet1: [f32; 4], // (a_suction, bloom_delay, filter_floor flag, V_dry = π/6·d³)
@@ -1241,7 +1243,10 @@ impl Solver for TwofieldSolver {
             particle_count,
             num_solids: scene.solids.len() as u32,
             coarse_dims: [cdims[0], cdims[1], cdims[2], COARSE_RATIO_DEFAULT],
-            extra: [rest_density, rho_floor, mass_eps, 0.0],
+            // extra.w (U7): wet-cohesion peak saturation s_peak (the cohesion::for_saturation
+            // curve argument; paired with c_max in splas2.w). 0.4 is the coffee-plausible
+            // capillary-bridge peak — inert while c_max = 0.
+            extra: [rest_density, rho_floor, mass_eps, cfg.tf_cohesion_speak],
             coupling: [
                 mats.grain_diameter,
                 cfg.drag_scale,
@@ -1269,7 +1274,10 @@ impl Solver for TwofieldSolver {
                 mats.floor_mu,
                 plasticity::SP_STIFF,
                 plasticity::SP_ONSET,
-                0.0,
+                // U7 wet-cohesion peak c_max (Bishop saturation-weighted cohesion into the DP
+                // yield; models::cohesion::for_saturation). 0 ⇒ the yield uses cohesion::dry()
+                // exactly, so the dry U5 bed is byte-unchanged.
+                cfg.tf_wet_cohesion,
             ],
             // U9: V_cap = r_max·ρ_ratio·V_dry (models::wetting::capacity); V_w = spacing³;
             // V_dry = grain sphere volume. a_suction/bloom/filter are opt-in Config gates.
@@ -1765,6 +1773,10 @@ impl Solver for TwofieldSolver {
                         (11, &pf_a),
                         (19, &grid_sfp),
                         (20, &react_buf),
+                        // U7: the solid velocity field — project applies the pore-pressure
+                        // buoyancy Δv_s = −(Δt/ρ_s)∇p to it (dynamic mode only; auto-layout
+                        // drops it in frozen mode where the branch is never taken).
+                        (22, &grid_svel),
                     ],
                 ),
                 bg(
@@ -1777,6 +1789,7 @@ impl Solver for TwofieldSolver {
                         (11, &pf_b),
                         (19, &grid_sfp),
                         (20, &react_buf),
+                        (22, &grid_svel),
                     ],
                 ),
             ];

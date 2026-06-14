@@ -138,6 +138,19 @@ pub struct Config {
     /// Twofield phase-selective filter floor: water drains through the y-min face (porous-jump
     /// outflow), the frozen solid skeleton is retained. 0 = sealed floor (the U6 default).
     pub tf_filter_floor: bool,
+
+    // --- twofield U7 effective-stress coupling (opt-in; default 0 / OFF so the U2–U6 suites and
+    // the dry U5 bed are byte-unchanged: c_max = 0 ⇒ `cohesion::for_saturation` ≡ 0 ⇒ the DP
+    // yield uses `cohesion::dry()` exactly) ---
+    /// Twofield wet-cohesion peak `c_max` (stress units): the saturation-dependent capillary
+    /// cohesion bump (`models::cohesion::for_saturation`) fed into the U5 Drucker-Prager yield
+    /// apex as a function of local grain saturation s = V_abs/V_cap. 0 = no wet cohesion (dry
+    /// `cohesion::dry()`), so the dry bed and the U5 gates are bitwise unchanged.
+    pub tf_wet_cohesion: f32,
+    /// Saturation at which the wet-cohesion bump peaks (`models::cohesion::for_saturation`
+    /// `s_peak`): capillary bridges strengthen to `tf_wet_cohesion` here, then collapse toward
+    /// full saturation. Coffee-plausible ≈ 0.4. Unused when `tf_wet_cohesion = 0`.
+    pub tf_cohesion_speak: f32,
 }
 
 impl Default for Config {
@@ -218,6 +231,11 @@ impl Default for Config {
             tf_suction_accel: 0.0,
             tf_bloom_delay: 0.0,
             tf_filter_floor: false,
+            // U7 effective-stress coupling: OFF by default — c_max = 0 makes the wet-cohesion
+            // curve identically zero, so the DP yield falls back to cohesion::dry() and the dry
+            // U5 bed + the U2–U6 suites are byte-unchanged. A saturated brew bed opts in.
+            tf_wet_cohesion: 0.0,
+            tf_cohesion_speak: 0.4,
         }
     }
 }
