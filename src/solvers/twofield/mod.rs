@@ -93,8 +93,11 @@ fn groups(n: u32) -> u32 {
 /// pf×2, bubble, nm), `bubble_fine` 4, `bubble_coarse` 4; U5 plasticity family —
 /// `p2g_solid_dyn` 6 (pos, vel, cmat, grid_sfp, grid_sm, sstate), `solid_update` 4
 /// (grid_sm, grid_svel, grid_sfp, solids), `g2p_solid` 7 (pos, vel, cmat, solids,
-/// grid_svel, fmat, sstate) — ties cell_classify. Re-derive when passes are added.
-/// The device requests 9 storage buffers per stage
+/// grid_svel, fmat, sstate) — ties cell_classify; U9 absorption family — `grid_clear` now 5
+/// (grid_fp, cell_cnt, grid_sfp, grid_sm, grid_moist), `p2g_moisture` 3 (pos, chem,
+/// grid_moist), `g2p_absorb` 3 (pos, chem, grid_moist) — all well under the cap; suction/filter
+/// add NO bindings (branches in drag_fold/node_setup/g2p_water). Re-derive when passes are
+/// added. The device requests 9 storage buffers per stage
 /// (`src/utils/gpu.rs::NEEDED_STORAGE_BUFFERS`) — still NOT raised (KTD-7).
 pub const MAX_STORAGE_BUFFERS_PER_ENTRY_POINT: u32 = 7;
 
@@ -163,6 +166,13 @@ pub const U4_SURFACE_DISPATCHES: u32 =
 /// U6 dispatch increment: the thin solid-mass P2G (`p2g_solid`) + the drag fold
 /// (`drag_fold`, which also absorbed grid_update's force/BC work — net one new pass).
 pub const U6_COUPLING_DISPATCHES: u32 = 2;
+
+/// U9 dispatch increment, applied ONLY when `Config::tf_absorb_rate > 0` (opt-in; default-knob
+/// frozen-water scenes keep the U6 budget bitwise, so `DISPATCHES_PER_FRAME` and every U2–U6
+/// suite's pinned budget are untouched): `p2g_moisture` + `g2p_absorb`. Suction and the filter
+/// floor add ZERO passes — suction folds into `drag_fold`'s existing force step, the filter
+/// floor is a branch in `drag_fold`/`node_setup`/`g2p_water`'s existing BC code.
+pub const U9_INFILTRATION_DISPATCHES: u32 = 2;
 
 /// U5 dispatch increment per SUBSTEP, applied ONLY when `Config::solid_dynamics` is on:
 /// `solid_update` + `g2p_solid` (`p2g_solid_dyn` replaces the frozen `p2g_solid`
@@ -272,10 +282,13 @@ struct Params {
     splas0: [f32; 4], // (solid_dynamics flag, Lamé μ, Lamé λ, DP α)
     splas1: [f32; 4], // (cap hardening ξ, φ_max = packing limit, grain mass, cohesion y_c)
     splas2: [f32; 4], // (floor/wall Coulomb μ_b, guard K_sp, guard onset φ_on, unused)
+    // U9 infiltration interface (coupling.wgsl; mirrors models::wetting + the test UNIT MAPPING):
+    wet0: [f32; 4], // (k_abs, V_cap = r_max·ρ_ratio·V_dry, V_w water vol, absorb_roundoff)
+    wet1: [f32; 4], // (a_suction, bloom_delay, filter_floor flag, V_dry = π/6·d³)
 }
 
 // Params is uploaded as a uniform and must stay byte-identical to the WGSL `Params`.
-const _: () = assert!(std::mem::size_of::<Params>() == 208);
+const _: () = assert!(std::mem::size_of::<Params>() == 240);
 
 /// GPU record for one static SDF solid — byte-identical to the WGSL `Primitive` (64 bytes,
 /// vec4-aligned; mirrors the xpbd packing of `utils::sdf` primitives). Cone radii in `a` are
@@ -398,6 +411,10 @@ pub struct TwofieldSolver {
     /// `Config::solid_dynamics`: dispatch the U5 dynamic-solid passes instead of the frozen
     /// U6 skeleton.
     solid_dynamic: bool,
+    /// `Config::tf_absorb_rate > 0`: dispatch the U9 moisture phase-change absorption passes
+    /// (`p2g_moisture` + `g2p_absorb`). Off (default) ⇒ the passes are CPU-elided, so the
+    /// U2–U6 suites and existing scenes are byte-unchanged.
+    absorb_on: bool,
     // U3 pressure-family state (layouts documented in pressure.wgsl): per-node M̃⁻¹, per-cell
     // (rhs, active, dbg) meta, and the fine pressure ping-pong pair. The coarse mirrors live
     // only inside the bind groups.
@@ -472,6 +489,9 @@ struct Pipelines {
     // forces + BCs — see coupling.wgsl).
     p2g_solid: (wgpu::ComputePipeline, wgpu::BindGroup),
     drag_fold: (wgpu::ComputePipeline, wgpu::BindGroup),
+    // U9 moisture phase-change absorption (dispatched only when Config::tf_absorb_rate > 0).
+    p2g_moisture: (wgpu::ComputePipeline, wgpu::BindGroup),
+    g2p_absorb: (wgpu::ComputePipeline, wgpu::BindGroup),
     // U5 plasticity family (dispatched only in dynamic mode; p2g_solid_dyn replaces
     // p2g_solid 1:1 there).
     p2g_solid_dyn: (wgpu::ComputePipeline, wgpu::BindGroup),
@@ -1226,7 +1246,10 @@ impl Solver for TwofieldSolver {
                 mats.grain_diameter,
                 cfg.drag_scale,
                 grain_volume(mats.grain_diameter),
-                0.0, // open_base off (dev/test hook)
+                // Floor-outflow flag: the U6 dev/test open_base hook OR the U9 phase-selective
+                // filter floor (water drains, frozen grains retained). set_open_base_for_test
+                // still toggles it at runtime.
+                if cfg.tf_filter_floor { 1.0 } else { 0.0 },
             ],
             // U5 constitutive lanes (plasticity.rs consts; friction angle from Materials,
             // dry cohesion from models::cohesion — the Bishop saturation mapping is U7).
@@ -1247,6 +1270,24 @@ impl Solver for TwofieldSolver {
                 plasticity::SP_STIFF,
                 plasticity::SP_ONSET,
                 0.0,
+            ],
+            // U9: V_cap = r_max·ρ_ratio·V_dry (models::wetting::capacity); V_w = spacing³;
+            // V_dry = grain sphere volume. a_suction/bloom/filter are opt-in Config gates.
+            wet0: [
+                cfg.tf_absorb_rate,
+                crate::models::wetting::capacity(
+                    grain_volume(mats.grain_diameter),
+                    mats.r_max,
+                    mats.rho_ratio,
+                ),
+                v_w,
+                cfg.absorb_roundoff,
+            ],
+            wet1: [
+                cfg.tf_suction_accel,
+                cfg.tf_bloom_delay,
+                if cfg.tf_filter_floor { 1.0 } else { 0.0 },
+                grain_volume(mats.grain_diameter),
             ],
         };
         let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -1330,6 +1371,13 @@ impl Solver for TwofieldSolver {
             &device,
             "twofield-grid-svel",
             grid_bytes,
+            wgpu::BufferUsages::empty(),
+        );
+        // U9 moisture grid field: 2 fixed-point lanes per node (water supply S, grain demand D).
+        let grid_moist = Self::storage(
+            &device,
+            "twofield-grid-moist",
+            (num_nodes.max(1) as u64) * 8,
             wgpu::BufferUsages::empty(),
         );
         let ns = solid_count.max(1) as u64;
@@ -1481,6 +1529,7 @@ impl Solver for TwofieldSolver {
                     (18, &cell_cnt),
                     (19, &grid_sfp),
                     (21, &grid_sm),
+                    (25, &grid_moist),
                 ],
             );
             let p2g = make("p2g_water");
@@ -1547,6 +1596,19 @@ impl Solver for TwofieldSolver {
                     (19, &grid_sfp),
                     (20, &react_buf),
                 ],
+            );
+            // U9 absorption family (coupling.wgsl). p2g_moisture scatters S/D; g2p_absorb gathers
+            // the drain/fill fractions and updates pos.w (water f_w / grain V_abs) + chem.x (the
+            // bloom clock).
+            let p2g_moisture = make("p2g_moisture");
+            let p2g_moisture_bind = bg(
+                &p2g_moisture,
+                &[(0, &params_buf), (1, &pos), (4, &chem), (25, &grid_moist)],
+            );
+            let g2p_absorb = make("g2p_absorb");
+            let g2p_absorb_bind = bg(
+                &g2p_absorb,
+                &[(0, &params_buf), (1, &pos), (4, &chem), (25, &grid_moist)],
             );
             let grid_update = make("grid_update");
             let grid_update_bind = bg(
@@ -1798,6 +1860,8 @@ impl Solver for TwofieldSolver {
                 p2g_water: (p2g, p2g_bind),
                 p2g_solid: (p2g_solid, p2g_solid_bind),
                 drag_fold: (drag_fold, drag_fold_bind),
+                p2g_moisture: (p2g_moisture, p2g_moisture_bind),
+                g2p_absorb: (g2p_absorb, g2p_absorb_bind),
                 p2g_solid_dyn: (p2g_solid_dyn, p2g_solid_dyn_bind),
                 solid_update: (solid_update, solid_update_bind),
                 g2p_solid: (g2p_solid, g2p_solid_bind),
@@ -1892,6 +1956,7 @@ impl Solver for TwofieldSolver {
             fmat,
             sstate,
             solid_dynamic: cfg.solid_dynamics,
+            absorb_on: cfg.tf_absorb_rate > 0.0,
             nm,
             cell_meta,
             pf_a,
@@ -1990,6 +2055,9 @@ impl Solver for TwofieldSolver {
         let node_groups = groups(self.num_nodes).max(1);
         let water_groups = groups(self.water_count).max(1);
         let solid_groups = groups(self.solid_count).max(1);
+        // U9 absorption passes cover the full particle layout (water prefix + solid suffix);
+        // dormant pool slots early-out on the range guards.
+        let part_groups = groups(self.params.particle_count).max(1);
         let cell_groups = groups(self.num_cells).max(1);
         let cd = self.params.coarse_dims;
         let ccell_groups = groups(cd[0] * cd[1] * cd[2]).max(1);
@@ -2061,13 +2129,32 @@ impl Solver for TwofieldSolver {
         // current pressure (0 = pf_a); sweeps and prolong_add flip it.
         let (pre, post) = self.smooth_split();
         let mut par = 0usize;
-        let mut seq: Vec<(&str, &wgpu::ComputePipeline, &wgpu::BindGroup, u32)> = vec![
-            (
-                "grid_clear",
-                &self.pipelines.grid_clear.0,
-                &self.pipelines.grid_clear.1,
-                node_groups,
-            ),
+        let mut seq: Vec<(&str, &wgpu::ComputePipeline, &wgpu::BindGroup, u32)> = vec![(
+            "grid_clear",
+            &self.pipelines.grid_clear.0,
+            &self.pipelines.grid_clear.1,
+            node_groups,
+        )];
+        // U9 moisture phase-change absorption (KTD-4c), only when on. Runs BEFORE the field
+        // P2Gs so they scatter the updated f_w mass / swollen V_abs: p2g_moisture scatters the
+        // node supply/demand (S/D) at the start-of-frame positions, g2p_absorb gathers the
+        // drain/fill fractions at the SAME positions (the transfer is a position-static phase
+        // change — water-loss == grain-gain exactly per node).
+        if self.absorb_on {
+            seq.push((
+                "p2g_moisture",
+                &self.pipelines.p2g_moisture.0,
+                &self.pipelines.p2g_moisture.1,
+                part_groups,
+            ));
+            seq.push((
+                "g2p_absorb",
+                &self.pipelines.g2p_absorb.0,
+                &self.pipelines.g2p_absorb.1,
+                part_groups,
+            ));
+        }
+        seq.extend([
             (
                 "p2g_water",
                 &self.pipelines.p2g_water.0,
@@ -2120,12 +2207,16 @@ impl Solver for TwofieldSolver {
                 &self.pipelines.cell_classify.1,
                 cell_groups,
             ),
-        ];
+        ]);
         // U5 dynamic skeleton: decode + gravity + over-packing guard + solid BCs, right after
-        // grid_update (its water twin) and before the drag fold.
+        // grid_update (its water twin) and before the drag fold. The base offset is 4
+        // (grid_clear, p2g_water, p2g_solid, grid_update) plus the 2 U9 absorption passes when
+        // they precede the field P2Gs (U5 + U9 are independent — frozen vs dynamic skeleton —
+        // but the offset stays correct if a future scene enables both).
         if self.solid_dynamic {
+            let after_grid_update = 4 + if self.absorb_on { 2 } else { 0 };
             seq.insert(
-                4,
+                after_grid_update,
                 (
                     "solid_update",
                     &self.pipelines.solid_update.0,

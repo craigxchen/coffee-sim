@@ -44,6 +44,11 @@ struct Params {
     splas0: vec4<f32>, // (solid_dynamics flag, Lamé μ, Lamé λ, DP α)
     splas1: vec4<f32>, // (cap hardening ξ, φ_max = packing limit, grain mass m_s, cohesion y_c)
     splas2: vec4<f32>, // (floor/wall Coulomb μ_b, guard K_sp, guard onset φ_on, unused)
+    // U9 infiltration interface (coupling.wgsl; mirrors models::wetting + the test UNIT MAPPING):
+    wet0: vec4<f32>, // (tf_absorb_rate k_abs, V_cap = r_max·ρ_ratio·V_dry, V_w = water vol,
+                     //  absorb_roundoff — the f_w/V_abs saturation floor)
+    wet1: vec4<f32>, // (suction body-force accel a_suction, bloom_delay seconds, filter_floor
+                     //  flag, V_dry = grain sphere volume π/6·d³)
 };
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -89,6 +94,15 @@ struct Params {
 // p2g_solid_dyn, decoded by solid_update. Only dispatched-to when Config::solid_dynamics is
 // on (params.splas0.x > 0.5); cleared unconditionally (never read in frozen mode).
 @group(0) @binding(21) var<storage, read_write> grid_sm: array<atomic<i32>>;
+// U9 MOISTURE grid field (coupling.wgsl, GIC-style absorption): per node, 2 fixed-point lanes —
+// [0] = water SUPPLY S_n = Σ_w w·f_w·V_w, [1] = grain DEMAND D_n = Σ_g w·demand_g (the
+// models::wetting per-step demand). The actual node transfer is T_n = min(S_n, D_n); g2p_absorb
+// gathers the node drain/fill fractions T_n/S_n and T_n/D_n so water-loss == grain-gain EXACTLY
+// per node (header in coupling.wgsl). Cleared by grid_clear, scattered by p2g_moisture, read by
+// g2p_absorb. Only dispatched-to when Config::tf_absorb_rate > 0 (params.wet0.x); the clear runs
+// unconditionally (one node-sized dispatch). Headroom: |S_n|,|D_n| per node ≤ a few V_w ≈ a few
+// ≪ the 2^13 fixed-point ceiling.
+@group(0) @binding(25) var<storage, read_write> grid_moist: array<atomic<i32>>;
 
 // --- fixed-point encoding (KEEP.md §3 pattern, headroom re-validated for U2) -----------------
 //

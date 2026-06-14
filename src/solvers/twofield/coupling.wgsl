@@ -155,7 +155,11 @@ fn p2g_solid(@builtin(global_invocation_id) gid: vec3<u32>) {
     base = clamp(base, vec3<i32>(0), vec3<i32>(params.grid_dims.xyz) - vec3<i32>(3));
     let fx = xl - vec3<f32>(base);
     var w = bspline_w(fx);
-    let vg = params.coupling.z; // grain sphere volume π/6·d³
+    // U9 swelling (KTD-8): the EFFECTIVE grain volume is the dry sphere volume π/6·d³ plus the
+    // absorbed water volume V_abs (pos.w on grains — models::wetting effective_volume), so a
+    // saturating grain raises the local φ_s and lowers K(φ) as it swells. With absorption off
+    // V_abs ≡ 0 and this is bit-identical to the U6 constant params.coupling.z.
+    let vg = params.coupling.z + max(pos[p].w, 0.0);
     for (var k = 0; k < 3; k = k + 1) {
         for (var j = 0; j < 3; j = j + 1) {
             for (var i2 = 0; i2 < 3; i2 = i2 + 1) {
@@ -183,10 +187,29 @@ fn drag_fold(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
     var v = gv.xyz;
-    let g = params.gravity.xyz;
+    var g = params.gravity.xyz;
     let c = node_coords(n);
     let xp = params.grid_origin.xyz + vec3<f32>(f32(c.x), f32(c.y), f32(c.z)) * params.grid_origin.w;
     let sv = solid_volume_at(n);
+    // U9 wetting-front capillary suction (KTD-4b, Green-Ampt body force): on water nodes INSIDE
+    // the bed (sv > 0) that sit at the unsaturated front — water present here but the node one
+    // cell BELOW carries less water mass (the dry advancing front) — add a downward acceleration
+    // a_suction (mapped from ψ_f; see tests/twofield_infiltration.rs UNIT MAPPING). Folded into
+    // the gravity source g so the exponential drag integrator carries it exactly (same as
+    // gravity). a_suction = 0 (Config default) is exact passthrough (no front detection cost).
+    let a_suction = params.wet1.x;
+    if (a_suction > 0.0 && sv > 0.0 && mass > params.extra.z) {
+        let h = params.grid_origin.w;
+        let below = vec3<i32>(c) - vec3<i32>(0, 1, 0);
+        var drier_below = true; // domain edge counts as "open below" (front at the base)
+        if (below.y >= 0) {
+            let mb = grid_vel[node_index(below)].w;
+            drier_below = mb < mass * 0.5; // the cell below carries < half this node's water
+        }
+        if (drier_below) {
+            g = g - vec3<f32>(0.0, a_suction, 0.0); // pull water down into the dry front
+        }
+    }
     var sig = 1.0;
     var imp = vec3<f32>(0.0);
     if (sv > 0.0) {
@@ -245,4 +268,164 @@ fn drag_fold(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     grid_vel[n] = vec4<f32>(v, mass);
     react[n] = vec4<f32>(imp, sig);
+}
+
+// ============================ U9 MOISTURE PHASE-CHANGE ABSORPTION (KTD-4c) =====================
+// GIC-style: water leaving the fluid phase becomes grain volume, conserved 1:1. Grid-projected,
+// atomic-free in the gather pass, deterministic and EXACTLY conserving by construction.
+//
+// p2g_moisture scatters two fixed-point grid lanes with the SAME quadratic B-spline weights as
+// the field transfers: the water SUPPLY S_n = Σ_w w·f_w·V_w and the grain DEMAND
+// D_n = Σ_g w·demand_g, demand_g = (V_cap − V_abs)·(1 − e^{−k_abs·dt}) (mirrors
+// models::wetting::absorb_demand, capped two-sidedly). The transfer at a node is the two-sided
+// cap T_n = min(S_n, D_n). g2p_absorb makes:
+//   * each WATER lose its weighted share  Σ_n w·(f_w·V_w)·(T_n/S_n),
+//   * each GRAIN gain its weighted share  Σ_n w·(demand_g)·(T_n/D_n).
+// Σ over particles at node n: water loses Σ_w w·f_w·V_w·(T_n/S_n) = S_n·(T_n/S_n) = T_n, and
+// grains gain D_n·(T_n/D_n) = T_n — EXACTLY equal, per node and globally (the conservation
+// gate). f_w / V_abs ride pos.w (U1 lane convention). Bloom (KTD-4b): a dry grain's demand is
+// scaled by a contact-time ramp (chem.x accumulates wet contact; ramps 0→1 over bloom_delay) so
+// the hydrophobic entry delay falls out. Off by default (k_abs = 0 ⇒ CPU-elided in mod.rs).
+
+fn wet_v_cap() -> f32 { return params.wet0.y; }
+fn wet_v_water() -> f32 { return params.wet0.z; }
+fn wet_roundoff() -> f32 { return params.wet0.w; }
+fn wet_sat_cutoff() -> f32 { let c = wet_v_cap(); return c - c * wet_roundoff(); }
+fn wet_demand(v_abs: f32) -> f32 {
+    if (v_abs >= wet_sat_cutoff()) { return 0.0; }
+    return (wet_v_cap() - v_abs) * (1.0 - exp(-params.wet0.x * params.dt));
+}
+// Bloom factor for a grain (KTD-4b): a smooth ramp of its accumulated wet-contact time
+// (chem.x, sim seconds) over bloom_delay. No delay ⇒ factor 1 immediately.
+fn bloom_factor(contact_t: f32) -> f32 {
+    let bd = params.wet1.y;
+    if (bd <= 0.0) { return 1.0; }
+    let t = clamp(contact_t / bd, 0.0, 1.0);
+    return t * t * (3.0 - 2.0 * t); // smoothstep
+}
+
+// =================================== p2g_moisture =============================================
+@compute @workgroup_size(256)
+fn p2g_moisture(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let p = gid.x;
+    if (p >= params.particle_count) {
+        return;
+    }
+    // Water range [0, water_count); solid range [particle_count − solid_count, particle_count).
+    let is_water = p < params.water_count;
+    let is_solid = p >= (params.particle_count - params.solid_count);
+    if (!is_water && !is_solid) {
+        return; // dormant pool slot — never scatters
+    }
+    let h = params.grid_origin.w;
+    let x = pos[p].xyz;
+    // Ballistic escaped particles (open base): don't scatter (mirror the field-transfer guard).
+    if (params.coupling.w > 0.5 && x.y < params.box_min.y) {
+        return;
+    }
+    var quantity = 0.0;
+    var lane = 0u;
+    if (is_water) {
+        let f_w = pos[p].w;
+        if (f_w <= wet_roundoff()) { return; } // drained water: nothing to supply
+        quantity = f_w * wet_v_water();
+        lane = 0u; // SUPPLY
+    } else {
+        let v_abs = pos[p].w;
+        let demand = wet_demand(v_abs) * bloom_factor(chem[p].x);
+        if (demand <= 0.0) { return; } // saturated / unbloomed grain: no demand
+        quantity = demand;
+        lane = 1u; // DEMAND
+    }
+    let xl = (x - params.grid_origin.xyz) / h;
+    var base = vec3<i32>(floor(xl - vec3<f32>(0.5)));
+    base = clamp(base, vec3<i32>(0), vec3<i32>(params.grid_dims.xyz) - vec3<i32>(3));
+    let fx = xl - vec3<f32>(base);
+    var w = bspline_w(fx);
+    for (var k = 0; k < 3; k = k + 1) {
+        for (var j = 0; j < 3; j = j + 1) {
+            for (var i = 0; i < 3; i = i + 1) {
+                let wijk = w[i].x * w[j].y * w[k].z;
+                let node = base + vec3<i32>(i, j, k);
+                atomicAdd(&grid_moist[node_index(node) * 2u + lane], fp_encode(quantity * wijk));
+            }
+        }
+    }
+}
+
+// =================================== g2p_absorb ===============================================
+// Gather the node drain/fill fractions and apply the conserved transfer (atomic-free: each
+// particle writes only its own pos.w / chem.x). Water shrinks f_w; grain grows V_abs and ticks
+// its wet-contact timer (the bloom clock).
+@compute @workgroup_size(256)
+fn g2p_absorb(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let p = gid.x;
+    if (p >= params.particle_count) {
+        return;
+    }
+    let is_water = p < params.water_count;
+    let is_solid = p >= (params.particle_count - params.solid_count);
+    if (!is_water && !is_solid) {
+        return;
+    }
+    let h = params.grid_origin.w;
+    let x = pos[p].xyz;
+    if (params.coupling.w > 0.5 && x.y < params.box_min.y) {
+        return; // ballistic escaped water: no transfer
+    }
+    let xl = (x - params.grid_origin.xyz) / h;
+    var base = vec3<i32>(floor(xl - vec3<f32>(0.5)));
+    base = clamp(base, vec3<i32>(0), vec3<i32>(params.grid_dims.xyz) - vec3<i32>(3));
+    let fx = xl - vec3<f32>(base);
+    var w = bspline_w(fx);
+
+    if (is_water) {
+        let f_w = pos[p].w;
+        if (f_w <= wet_roundoff()) { return; }
+        let my_supply = f_w * wet_v_water();
+        var loss = 0.0;
+        for (var k = 0; k < 3; k = k + 1) {
+            for (var j = 0; j < 3; j = j + 1) {
+                for (var i = 0; i < 3; i = i + 1) {
+                    let wijk = w[i].x * w[j].y * w[k].z;
+                    let n = node_index(base + vec3<i32>(i, j, k));
+                    let s_n = fp_decode(atomicLoad(&grid_moist[n * 2u + 0u]));
+                    let d_n = fp_decode(atomicLoad(&grid_moist[n * 2u + 1u]));
+                    if (s_n > 0.0) {
+                        let t_n = min(s_n, d_n);   // node transfer (two-sided cap)
+                        loss += (wijk * my_supply) * (t_n / s_n); // my weighted drain share
+                    }
+                }
+            }
+        }
+        // Volume only leaves via the capped share (loss ≤ my_supply by construction).
+        let new_f = max(f_w - loss / wet_v_water(), 0.0);
+        pos[p] = vec4<f32>(x, new_f);
+    } else {
+        let v_abs = pos[p].w;
+        let demand = wet_demand(v_abs) * bloom_factor(chem[p].x);
+        // Wet-contact clock for the bloom gate: a grain touching water (any local supply) ticks
+        // its timer regardless of whether it absorbed this step (it can be saturated yet wet).
+        var touching = false;
+        var gain = 0.0;
+        for (var k = 0; k < 3; k = k + 1) {
+            for (var j = 0; j < 3; j = j + 1) {
+                for (var i = 0; i < 3; i = i + 1) {
+                    let wijk = w[i].x * w[j].y * w[k].z;
+                    let n = node_index(base + vec3<i32>(i, j, k));
+                    let s_n = fp_decode(atomicLoad(&grid_moist[n * 2u + 0u]));
+                    let d_n = fp_decode(atomicLoad(&grid_moist[n * 2u + 1u]));
+                    if (s_n > 0.0) { touching = true; }
+                    if (demand > 0.0 && d_n > 0.0) {
+                        let t_n = min(s_n, d_n);
+                        gain += (wijk * demand) * (t_n / d_n); // my weighted fill share
+                    }
+                }
+            }
+        }
+        pos[p] = vec4<f32>(x, v_abs + gain);
+        if (touching) {
+            chem[p] = vec4<f32>(chem[p].x + params.dt, chem[p].y, chem[p].z, chem[p].w);
+        }
+    }
 }

@@ -35,6 +35,9 @@ fn grid_clear(@builtin(global_invocation_id) gid: vec3<u32>) {
     atomicStore(&grid_sm[n * 4u + 1u], 0);
     atomicStore(&grid_sm[n * 4u + 2u], 0);
     atomicStore(&grid_sm[n * 4u + 3u], 0);
+    // U9 moisture lanes (read only when absorption is on; cleared unconditionally).
+    atomicStore(&grid_moist[n * 2u + 0u], 0);
+    atomicStore(&grid_moist[n * 2u + 1u], 0);
     if (n < num_fine_cells()) {
         atomicStore(&cell_cnt[n], 0u);
     }
@@ -67,7 +70,11 @@ fn p2g_water(@builtin(global_invocation_id) gid: vec3<u32>) {
     base = clamp(base, vec3<i32>(0), vec3<i32>(params.grid_dims.xyz) - vec3<i32>(3));
     let fx = xl - vec3<f32>(base);
     var w = bspline_w(fx);
-    let m = params.particle_mass;
+    // U9 effective water mass: a partially-absorbed particle (remaining fraction f_w = pos.w)
+    // scatters proportionally less mass/volume (models::wetting::water_eff_mass), so the bed
+    // pore volume falls exactly as water is absorbed — the projection sees the real remaining
+    // fluid. With absorption off f_w ≡ 1 and this is bit-identical to the U2 constant mass.
+    let m = params.particle_mass * clamp(pos[p].w, 0.0, 1.0);
 
     // Particle-presence census for the surface classification (see cell_cnt in common.wgsl).
     let ci = clamp(
