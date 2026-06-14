@@ -195,16 +195,16 @@ var<workgroup> red_diag: array<f32, 256>;
 @compute @workgroup_size(256)
 fn bubble_fine(@builtin(local_invocation_id) lid: vec3<u32>) {
     let t = lid.x;
-    // Open-cavity early-out (U8): no enclosed pocket this frame ⇒ λ_b is 0 (pocket_mark already
-    // pinned bubble[0]=bubble[1]=0), so the reduction is pure waste. bubble[2] is uniform across
-    // the workgroup, so this return precedes every barrier in uniform control flow.
-    if (bubble[2] < 0.5) {
-        return;
-    }
-    // U8 R9 fix: stride the COMPACTED pocket list (a few hundred entries) instead of all ~76k
-    // fine cells. `count` is uniform across the workgroup (single atomic load, no in-flight
-    // append — pocket_mark finished last frame-pass), so the trip count stays uniform and every
-    // workgroupBarrier() below remains in uniform control flow.
+    // No open-cavity early-out here: a storage-buffer-gated `return` BEFORE a workgroupBarrier()
+    // is a Tint uniformity violation (Tint treats every read_write storage load as non-uniform,
+    // regardless of the value being equal across threads — native naga tolerates it, the browser
+    // rejects it and fails the whole module). The no-pocket case is already handled for free:
+    // when no pocket exists `pocket_f[0]` is 0, so `trips` is 0, the reduction sums zeros, and the
+    // thread-0 solve's `red_diag > 1e-12` guard yields λ_b = 0 — identical to the old early-out.
+    // U8 R9: stride the COMPACTED pocket list (a few hundred entries) not all ~76k fine cells.
+    // `count` is uniform across the workgroup (single atomic load, no in-flight append —
+    // pocket_mark finished last frame-pass), so the trip count stays uniform and every
+    // workgroupBarrier() below is reached from uniform control flow.
     let count = atomicLoad(&pocket_f[0]);
     let h = params.grid_origin.w;
     var s_rhs = 0.0;
@@ -296,11 +296,9 @@ fn bubble_fine(@builtin(local_invocation_id) lid: vec3<u32>) {
 @compute @workgroup_size(256)
 fn bubble_coarse(@builtin(local_invocation_id) lid: vec3<u32>) {
     let t = lid.x;
-    // Open-cavity early-out (U8), identical to bubble_fine: no enclosed pocket ⇒ δλ_b stays 0.
-    if (bubble[2] < 0.5) {
-        return;
-    }
-    // U8 R9 fix: stride the COMPACTED coarse pocket list (see bubble_fine). `count` is uniform.
+    // No storage-gated early return before the barriers (Tint uniformity — see bubble_fine). The
+    // no-pocket case falls out for free: count 0 ⇒ trips 0 ⇒ zero reduction ⇒ δλ_b = 0.
+    // U8 R9: stride the COMPACTED coarse pocket list (see bubble_fine). `count` is uniform.
     let count = atomicLoad(&pocket_c[0]);
     let hc = params.grid_origin.w * f32(params.coarse_dims.w);
     var s_rhs = 0.0;
