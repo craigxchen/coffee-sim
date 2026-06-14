@@ -16,6 +16,7 @@ use crate::engine::{Metrics, Scene};
 use crate::models::Materials;
 use crate::profiling::Profile;
 use crate::solvers::base::Solver;
+use crate::solvers::pass_recorder::{PassRecorder, TimestampSink};
 use crate::utils::buffers::ParticleBuffers;
 use crate::utils::config::Config;
 use crate::utils::gpu::GpuContext;
@@ -705,6 +706,14 @@ impl XpbdSolver {
         );
         self.queue
             .write_buffer(&self.vel, 0, bytemuck::cast_slice(velocities));
+    }
+
+    /// Drop per-pass timestamp profiling so `step()` records in the BATCHED single-pass-per-run
+    /// mode — exactly the web/no-TIMESTAMP_QUERY path (consecutive dispatches collapse into one
+    /// compute pass; the cell-reorder / freeze copies still split passes). Used by the
+    /// equivalence gate to compare batched vs per-pass recording natively; not used in production.
+    pub fn force_batched_passes_for_test(&mut self) {
+        self.ts = None;
     }
 
     /// Overwrite the per-particle chem/thermal lanes (dev/test only): grain = (s_f, s_s, T_g, _),
@@ -2191,15 +2200,26 @@ impl Solver for XpbdSolver {
 
         let np = groups(self.active_count);
         let nc = groups(self.num_cells);
-        let mut cursor = 0u32;
-        let mut labels: Vec<String> = Vec::new();
-        let mut dispatches = 0u32;
 
         let mut enc = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("xpbd-frame"),
             });
+
+        // One recorder for the whole frame. With timestamps (native profiling) it records a
+        // per-pass timestamped pass for every dispatch (legacy behavior — the profiler/perf
+        // probes read every substep's passes). Without timestamps (web / no TIMESTAMP_QUERY) it
+        // batches *consecutive* dispatches into one compute pass; Dawn inserts the storage-buffer
+        // barriers between dependent dispatches automatically, so the result is identical. The
+        // recorder MUST be flushed before any direct encoder op (`copy_buffer_to_buffer`,
+        // `resolve_query_set`) — the cell-order reorder and the freeze/snapshot copies below each
+        // call `rec.flush()` first, which is also the natural pass boundary they need.
+        let sink = self.ts.as_ref().map(|t| TimestampSink {
+            qset: &t.qset,
+            capacity: t.capacity,
+        });
+        let mut rec = PassRecorder::new(sink);
 
         // Pass sequence is chosen from which species are present. Water runs the density solve;
         // grain runs the contact subcycle; mixed runs both, with the bed contact AFTER the
@@ -2208,36 +2228,26 @@ impl Solver for XpbdSolver {
         let mixed = self.has_water && self.has_grain;
         let p = &self.pipelines;
         let b = &self.bind_groups;
-        let ts_ref = self.ts.as_ref();
         {
-            let mut pass = |enc: &mut wgpu::CommandEncoder,
-                            pipe: &wgpu::ComputePipeline,
-                            bg: &wgpu::BindGroup,
-                            label: &str,
-                            groups: u32| {
-                dispatch_pass(
-                    enc,
-                    pipe,
-                    bg,
-                    ts_ref,
-                    &mut cursor,
-                    &mut labels,
-                    label,
-                    groups,
-                    &mut dispatches,
-                );
-            };
+            // `pass!(enc, pipe, bind, "label", groups)` records one dispatch via the recorder.
+            // A macro (not a closure) so `rec.flush()` can be interleaved before the direct
+            // `enc.copy_buffer_to_buffer` ops without a long-lived borrow of `rec`.
+            macro_rules! pass {
+                ($enc:expr, $pipe:expr, $bg:expr, $label:expr, $groups:expr $(,)?) => {
+                    rec.dispatch($enc, $pipe, $bg, $label, $groups)
+                };
+            }
             for _ in 0..self.substeps {
-                pass(&mut enc, &p.predict, &b.predict, "predict", np);
+                pass!(&mut enc, &p.predict, &b.predict, "predict", np);
 
                 if self.has_water {
                     for it in 0..self.water_iters {
                         if it % self.water_regrid == 0 {
-                            pass(&mut enc, &p.grid_clear, &b.grid_clear, "grid_clear", nc);
-                            pass(&mut enc, &p.grid_count, &b.grid_count, "grid_count", np);
-                            pass(&mut enc, &p.grid_scan, &b.grid_scan, "grid_scan", 1);
-                            pass(&mut enc, &p.grid_clear, &b.grid_clear, "grid_clear", nc);
-                            pass(
+                            pass!(&mut enc, &p.grid_clear, &b.grid_clear, "grid_clear", nc);
+                            pass!(&mut enc, &p.grid_count, &b.grid_count, "grid_count", np);
+                            pass!(&mut enc, &p.grid_scan, &b.grid_scan, "grid_scan", 1);
+                            pass!(&mut enc, &p.grid_clear, &b.grid_clear, "grid_clear", nc);
+                            pass!(
                                 &mut enc,
                                 &p.grid_scatter,
                                 &b.grid_scatter,
@@ -2252,13 +2262,14 @@ impl Solver for XpbdSolver {
                             // (sorted_indices read-only until the identity write) → no chunk hazard.
                             let nbytes_v4 = (self.active_count as u64) * 16;
                             let nbytes_u32 = (self.active_count as u64) * 4;
-                            pass(
+                            pass!(
                                 &mut enc,
                                 &p.grid_reorder_a,
                                 &b.grid_reorder_a,
                                 "grid_reorder_a",
                                 np,
                             );
+                            rec.flush();
                             enc.copy_buffer_to_buffer(
                                 &self.pos_scratch,
                                 0,
@@ -2266,6 +2277,7 @@ impl Solver for XpbdSolver {
                                 0,
                                 nbytes_v4,
                             );
+                            rec.flush();
                             enc.copy_buffer_to_buffer(
                                 &self.pred_scratch,
                                 0,
@@ -2273,6 +2285,7 @@ impl Solver for XpbdSolver {
                                 0,
                                 nbytes_v4,
                             );
+                            rec.flush();
                             enc.copy_buffer_to_buffer(
                                 &self.vel_scratch,
                                 0,
@@ -2280,13 +2293,14 @@ impl Solver for XpbdSolver {
                                 0,
                                 nbytes_v4,
                             );
-                            pass(
+                            pass!(
                                 &mut enc,
                                 &p.grid_reorder_b,
                                 &b.grid_reorder_b,
                                 "grid_reorder_b",
                                 np,
                             );
+                            rec.flush();
                             enc.copy_buffer_to_buffer(
                                 &self.chem_scratch,
                                 0,
@@ -2294,6 +2308,7 @@ impl Solver for XpbdSolver {
                                 0,
                                 nbytes_v4,
                             );
+                            rec.flush();
                             enc.copy_buffer_to_buffer(
                                 &self.phase_scratch,
                                 0,
@@ -2301,7 +2316,7 @@ impl Solver for XpbdSolver {
                                 0,
                                 nbytes_u32,
                             );
-                            pass(
+                            pass!(
                                 &mut enc,
                                 &p.grid_reorder_identity,
                                 &b.grid_reorder_identity,
@@ -2311,7 +2326,7 @@ impl Solver for XpbdSolver {
                         }
                         if mixed {
                             // Solid fraction (live from current pred) → pore-modulated water target.
-                            pass(
+                            pass!(
                                 &mut enc,
                                 &p.compute_fractions,
                                 &b.compute_fractions,
@@ -2322,7 +2337,7 @@ impl Solver for XpbdSolver {
                         if self.has_solids {
                             // Wall density compensation into c_residual (consumed by compute_lambda,
                             // then overwritten with the convergence residual). Solid scenes only.
-                            pass(
+                            pass!(
                                 &mut enc,
                                 &p.compute_boundary,
                                 &b.compute_boundary,
@@ -2330,18 +2345,18 @@ impl Solver for XpbdSolver {
                                 np,
                             );
                         }
-                        pass(
+                        pass!(
                             &mut enc,
                             &p.compute_lambda,
                             &b.compute_lambda,
                             "compute_lambda",
                             np,
                         );
-                        pass(&mut enc, &p.compute_dp, &b.compute_dp, "compute_dp", np);
-                        pass(&mut enc, &p.apply_dp, &b.apply_dp, "apply_dp", np);
+                        pass!(&mut enc, &p.compute_dp, &b.compute_dp, "compute_dp", np);
+                        pass!(&mut enc, &p.apply_dp, &b.apply_dp, "apply_dp", np);
                         // Adaptive early-exit only for single-species water (mixed runs fixed iters).
                         if !mixed {
-                            pass(
+                            pass!(
                                 &mut enc,
                                 &p.residual_reduce,
                                 &b.residual_reduce,
@@ -2353,18 +2368,18 @@ impl Solver for XpbdSolver {
                 }
 
                 if mixed && self.drag_subiters > 0 {
-                    pass(&mut enc, &p.grid_clear, &b.grid_clear, "grid_clear", nc);
-                    pass(&mut enc, &p.grid_count, &b.grid_count, "grid_count", np);
-                    pass(&mut enc, &p.grid_scan, &b.grid_scan, "grid_scan", 1);
-                    pass(&mut enc, &p.grid_clear, &b.grid_clear, "grid_clear", nc);
-                    pass(
+                    pass!(&mut enc, &p.grid_clear, &b.grid_clear, "grid_clear", nc);
+                    pass!(&mut enc, &p.grid_count, &b.grid_count, "grid_count", np);
+                    pass!(&mut enc, &p.grid_scan, &b.grid_scan, "grid_scan", 1);
+                    pass!(&mut enc, &p.grid_clear, &b.grid_clear, "grid_clear", nc);
+                    pass!(
                         &mut enc,
                         &p.grid_scatter,
                         &b.grid_scatter,
                         "grid_scatter",
                         np,
                     );
-                    pass(
+                    pass!(
                         &mut enc,
                         &p.compute_coupling_scale,
                         &b.compute_coupling_scale,
@@ -2372,6 +2387,7 @@ impl Solver for XpbdSolver {
                         np,
                     );
                     for _ in 0..self.drag_subiters {
+                        rec.flush();
                         enc.copy_buffer_to_buffer(
                             self.vel.as_ref(),
                             0,
@@ -2379,9 +2395,9 @@ impl Solver for XpbdSolver {
                             0,
                             (self.active_count as u64) * 16,
                         );
-                        pass(&mut enc, &p.drag_water, &b.drag_water, "drag_water", np);
-                        pass(&mut enc, &p.drag_grain, &b.drag_grain, "drag_grain", np);
-                        pass(
+                        pass!(&mut enc, &p.drag_water, &b.drag_water, "drag_water", np);
+                        pass!(&mut enc, &p.drag_grain, &b.drag_grain, "drag_grain", np);
+                        pass!(
                             &mut enc,
                             &p.apply_drag_pred,
                             &b.apply_drag_pred,
@@ -2392,17 +2408,18 @@ impl Solver for XpbdSolver {
                 }
 
                 if mixed && self.params.buoyancy_scale > 0.0 {
-                    pass(&mut enc, &p.grid_clear, &b.grid_clear, "grid_clear", nc);
-                    pass(&mut enc, &p.grid_count, &b.grid_count, "grid_count", np);
-                    pass(&mut enc, &p.grid_scan, &b.grid_scan, "grid_scan", 1);
-                    pass(&mut enc, &p.grid_clear, &b.grid_clear, "grid_clear", nc);
-                    pass(
+                    pass!(&mut enc, &p.grid_clear, &b.grid_clear, "grid_clear", nc);
+                    pass!(&mut enc, &p.grid_count, &b.grid_count, "grid_count", np);
+                    pass!(&mut enc, &p.grid_scan, &b.grid_scan, "grid_scan", 1);
+                    pass!(&mut enc, &p.grid_clear, &b.grid_clear, "grid_clear", nc);
+                    pass!(
                         &mut enc,
                         &p.grid_scatter,
                         &b.grid_scatter,
                         "grid_scatter",
                         np,
                     );
+                    rec.flush();
                     enc.copy_buffer_to_buffer(
                         self.vel.as_ref(),
                         0,
@@ -2410,21 +2427,21 @@ impl Solver for XpbdSolver {
                         0,
                         (self.active_count as u64) * 16,
                     );
-                    pass(
+                    pass!(
                         &mut enc,
                         &p.buoyancy_grain,
                         &b.buoyancy_grain,
                         "buoyancy_grain",
                         np,
                     );
-                    pass(
+                    pass!(
                         &mut enc,
                         &p.buoyancy_water,
                         &b.buoyancy_water,
                         "buoyancy_water",
                         np,
                     );
-                    pass(
+                    pass!(
                         &mut enc,
                         &p.apply_drag_pred,
                         &b.apply_drag_pred,
@@ -2438,17 +2455,18 @@ impl Solver for XpbdSolver {
                 // their velocity deltas (every pass writes vel = vel_frozen + dv). Reads the stored
                 // pre-finalize velocity (still the jet). No-op unless impact_scale > 0.
                 if mixed && self.params.impact_scale > 0.0 {
-                    pass(&mut enc, &p.grid_clear, &b.grid_clear, "grid_clear", nc);
-                    pass(&mut enc, &p.grid_count, &b.grid_count, "grid_count", np);
-                    pass(&mut enc, &p.grid_scan, &b.grid_scan, "grid_scan", 1);
-                    pass(&mut enc, &p.grid_clear, &b.grid_clear, "grid_clear", nc);
-                    pass(
+                    pass!(&mut enc, &p.grid_clear, &b.grid_clear, "grid_clear", nc);
+                    pass!(&mut enc, &p.grid_count, &b.grid_count, "grid_count", np);
+                    pass!(&mut enc, &p.grid_scan, &b.grid_scan, "grid_scan", 1);
+                    pass!(&mut enc, &p.grid_clear, &b.grid_clear, "grid_clear", nc);
+                    pass!(
                         &mut enc,
                         &p.grid_scatter,
                         &b.grid_scatter,
                         "grid_scatter",
                         np,
                     );
+                    rec.flush();
                     enc.copy_buffer_to_buffer(
                         self.vel.as_ref(),
                         0,
@@ -2456,21 +2474,21 @@ impl Solver for XpbdSolver {
                         0,
                         (self.active_count as u64) * 16,
                     );
-                    pass(
+                    pass!(
                         &mut enc,
                         &p.impact_grain,
                         &b.impact_grain,
                         "impact_grain",
                         np,
                     );
-                    pass(
+                    pass!(
                         &mut enc,
                         &p.impact_water,
                         &b.impact_water,
                         "impact_water",
                         np,
                     );
-                    pass(
+                    pass!(
                         &mut enc,
                         &p.apply_drag_pred,
                         &b.apply_drag_pred,
@@ -2482,11 +2500,11 @@ impl Solver for XpbdSolver {
                 if self.has_grain {
                     for it in 0..self.bed_iters {
                         if it % self.bed_regrid == 0 {
-                            pass(&mut enc, &p.grid_clear, &b.grid_clear, "grid_clear", nc);
-                            pass(&mut enc, &p.grid_count, &b.grid_count, "grid_count", np);
-                            pass(&mut enc, &p.grid_scan, &b.grid_scan, "grid_scan", 1);
-                            pass(&mut enc, &p.grid_clear, &b.grid_clear, "grid_clear", nc);
-                            pass(
+                            pass!(&mut enc, &p.grid_clear, &b.grid_clear, "grid_clear", nc);
+                            pass!(&mut enc, &p.grid_count, &b.grid_count, "grid_count", np);
+                            pass!(&mut enc, &p.grid_scan, &b.grid_scan, "grid_scan", 1);
+                            pass!(&mut enc, &p.grid_clear, &b.grid_clear, "grid_clear", nc);
+                            pass!(
                                 &mut enc,
                                 &p.grid_scatter,
                                 &b.grid_scatter,
@@ -2494,10 +2512,10 @@ impl Solver for XpbdSolver {
                                 np,
                             );
                         }
-                        pass(&mut enc, &p.bed_project, &b.bed_project, "bed_project", np);
-                        pass(&mut enc, &p.apply_dp, &b.apply_dp, "apply_dp", np);
+                        pass!(&mut enc, &p.bed_project, &b.bed_project, "bed_project", np);
+                        pass!(&mut enc, &p.apply_dp, &b.apply_dp, "apply_dp", np);
                         if !mixed {
-                            pass(
+                            pass!(
                                 &mut enc,
                                 &p.residual_reduce,
                                 &b.residual_reduce,
@@ -2508,11 +2526,12 @@ impl Solver for XpbdSolver {
                     }
                 }
 
-                pass(&mut enc, &p.finalize, &b.finalize, "finalize", np);
+                pass!(&mut enc, &p.finalize, &b.finalize, "finalize", np);
 
                 // XSPH viscosity is a fluid term; runs only when water is present.
                 if self.has_water {
-                    pass(&mut enc, &p.xsph, &b.xsph, "xsph", np);
+                    pass!(&mut enc, &p.xsph, &b.xsph, "xsph", np);
+                    rec.flush();
                     enc.copy_buffer_to_buffer(
                         &self.vel_smoothed,
                         0,
@@ -2527,20 +2546,20 @@ impl Solver for XpbdSolver {
                 // momentum merge isn't clobbered by the xsph velocity copy. Reads the frozen pred.w
                 // snapshot, writes the new moisture to pos.w; the next predict mirrors it.
                 if mixed && self.params.k_abs > 0.0 {
-                    pass(&mut enc, &p.grid_clear, &b.grid_clear, "grid_clear", nc);
-                    pass(&mut enc, &p.grid_count, &b.grid_count, "grid_count", np);
-                    pass(&mut enc, &p.grid_scan, &b.grid_scan, "grid_scan", 1);
-                    pass(&mut enc, &p.grid_clear, &b.grid_clear, "grid_clear", nc);
-                    pass(
+                    pass!(&mut enc, &p.grid_clear, &b.grid_clear, "grid_clear", nc);
+                    pass!(&mut enc, &p.grid_count, &b.grid_count, "grid_count", np);
+                    pass!(&mut enc, &p.grid_scan, &b.grid_scan, "grid_scan", 1);
+                    pass!(&mut enc, &p.grid_clear, &b.grid_clear, "grid_clear", nc);
+                    pass!(
                         &mut enc,
                         &p.grid_scatter,
                         &b.grid_scatter,
                         "grid_scatter",
                         np,
                     );
-                    pass(&mut enc, &p.wet_count, &b.wet_count, "wet_count", np);
-                    pass(&mut enc, &p.wet_water, &b.wet_water, "wet_water", np);
-                    pass(&mut enc, &p.wet_grain, &b.wet_grain, "wet_grain", np);
+                    pass!(&mut enc, &p.wet_count, &b.wet_count, "wet_count", np);
+                    pass!(&mut enc, &p.wet_water, &b.wet_water, "wet_water", np);
+                    pass!(&mut enc, &p.wet_grain, &b.wet_grain, "wet_grain", np);
                 }
 
                 // Extraction / dissolution (mixed scenes; opt-in via extract_rate>0). Wet grains
@@ -2549,11 +2568,11 @@ impl Solver for XpbdSolver {
                 // used) + a frozen chem copy; writes only the live chem buffer. Rebuilds the grid
                 // itself so it's independent of the wetting block's gate.
                 if mixed && self.params.extract_rate > 0.0 {
-                    pass(&mut enc, &p.grid_clear, &b.grid_clear, "grid_clear", nc);
-                    pass(&mut enc, &p.grid_count, &b.grid_count, "grid_count", np);
-                    pass(&mut enc, &p.grid_scan, &b.grid_scan, "grid_scan", 1);
-                    pass(&mut enc, &p.grid_clear, &b.grid_clear, "grid_clear", nc);
-                    pass(
+                    pass!(&mut enc, &p.grid_clear, &b.grid_clear, "grid_clear", nc);
+                    pass!(&mut enc, &p.grid_count, &b.grid_count, "grid_count", np);
+                    pass!(&mut enc, &p.grid_scan, &b.grid_scan, "grid_scan", 1);
+                    pass!(&mut enc, &p.grid_clear, &b.grid_clear, "grid_clear", nc);
+                    pass!(
                         &mut enc,
                         &p.grid_scatter,
                         &b.grid_scatter,
@@ -2562,6 +2581,7 @@ impl Solver for XpbdSolver {
                     );
                     // Snapshot the live chem so both transfer passes read a frozen state while
                     // writing disjoint slots of the live buffer (race-free conservation).
+                    rec.flush();
                     enc.copy_buffer_to_buffer(
                         self.chem.as_ref(),
                         0,
@@ -2569,15 +2589,15 @@ impl Solver for XpbdSolver {
                         0,
                         (self.active_count as u64) * 16,
                     );
-                    pass(&mut enc, &p.diss_count, &b.diss_count, "diss_count", np);
-                    pass(
+                    pass!(&mut enc, &p.diss_count, &b.diss_count, "diss_count", np);
+                    pass!(
                         &mut enc,
                         &p.dissolve_grain,
                         &b.dissolve_grain,
                         "dissolve_grain",
                         np,
                     );
-                    pass(
+                    pass!(
                         &mut enc,
                         &p.dissolve_water,
                         &b.dissolve_water,
@@ -2587,6 +2607,7 @@ impl Solver for XpbdSolver {
                     // Thermal exchange + ambient loss (U6). Re-snapshot the post-dissolution chem so
                     // the pass preserves the updated c/pools (it writes only the T lane), then run on
                     // the still-valid grid. T evolved here feeds the NEXT substep's k_T (one-step lag).
+                    rec.flush();
                     enc.copy_buffer_to_buffer(
                         self.chem.as_ref(),
                         0,
@@ -2594,7 +2615,7 @@ impl Solver for XpbdSolver {
                         0,
                         (self.active_count as u64) * 16,
                     );
-                    pass(
+                    pass!(
                         &mut enc,
                         &p.thermal_exchange,
                         &b.thermal_exchange,
@@ -2609,11 +2630,11 @@ impl Solver for XpbdSolver {
                 // momentum is untouched). Reads live post-wetting pos/pos.w + a frozen chem copy;
                 // rebuilds the grid itself so it's independent of the wetting/extraction gates.
                 if mixed && self.params.fines[0] > 0.0 {
-                    pass(&mut enc, &p.grid_clear, &b.grid_clear, "grid_clear", nc);
-                    pass(&mut enc, &p.grid_count, &b.grid_count, "grid_count", np);
-                    pass(&mut enc, &p.grid_scan, &b.grid_scan, "grid_scan", 1);
-                    pass(&mut enc, &p.grid_clear, &b.grid_clear, "grid_clear", nc);
-                    pass(
+                    pass!(&mut enc, &p.grid_clear, &b.grid_clear, "grid_clear", nc);
+                    pass!(&mut enc, &p.grid_count, &b.grid_count, "grid_count", np);
+                    pass!(&mut enc, &p.grid_scan, &b.grid_scan, "grid_scan", 1);
+                    pass!(&mut enc, &p.grid_clear, &b.grid_clear, "grid_clear", nc);
+                    pass!(
                         &mut enc,
                         &p.grid_scatter,
                         &b.grid_scatter,
@@ -2622,6 +2643,7 @@ impl Solver for XpbdSolver {
                     );
                     // Snapshot live chem so both transfer passes read a frozen state while writing
                     // disjoint chem.w slots (race-free, conservation-safe).
+                    rec.flush();
                     enc.copy_buffer_to_buffer(
                         self.chem.as_ref(),
                         0,
@@ -2629,12 +2651,15 @@ impl Solver for XpbdSolver {
                         0,
                         (self.active_count as u64) * 16,
                     );
-                    pass(&mut enc, &p.fines_count, &b.fines_count, "fines_count", np);
-                    pass(&mut enc, &p.fines_grain, &b.fines_grain, "fines_grain", np);
-                    pass(&mut enc, &p.fines_water, &b.fines_water, "fines_water", np);
+                    pass!(&mut enc, &p.fines_count, &b.fines_count, "fines_count", np);
+                    pass!(&mut enc, &p.fines_grain, &b.fines_grain, "fines_grain", np);
+                    pass!(&mut enc, &p.fines_water, &b.fines_water, "fines_water", np);
                 }
             }
         }
+        // Close any open batched pass and harvest the bookkeeping (dispatch count always; the
+        // timestamp cursor/labels are populated only in timestamp mode).
+        let (dispatches, cursor, labels) = rec.finish();
 
         if let Some(ts) = &self.ts {
             if cursor >= 2 {
@@ -2683,42 +2708,6 @@ impl Solver for XpbdSolver {
             dispatches_per_frame: self.dispatches,
         }
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn dispatch_pass(
-    enc: &mut wgpu::CommandEncoder,
-    pipeline: &wgpu::ComputePipeline,
-    bind_group: &wgpu::BindGroup,
-    ts: Option<&Timestamps>,
-    cursor: &mut u32,
-    labels: &mut Vec<String>,
-    label: &str,
-    groups: u32,
-    dispatches: &mut u32,
-) {
-    let tw = match ts {
-        Some(t) if *cursor + 1 < t.capacity => {
-            let b = *cursor;
-            let e = *cursor + 1;
-            *cursor += 2;
-            labels.push(label.to_string());
-            Some(wgpu::ComputePassTimestampWrites {
-                query_set: &t.qset,
-                beginning_of_pass_write_index: Some(b),
-                end_of_pass_write_index: Some(e),
-            })
-        }
-        _ => None,
-    };
-    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-        label: Some(label),
-        timestamp_writes: tw,
-    });
-    pass.set_pipeline(pipeline);
-    pass.set_bind_group(0, Some(bind_group), &[]);
-    pass.dispatch_workgroups(groups, 1, 1);
-    *dispatches += 1;
 }
 
 #[cfg(test)]
