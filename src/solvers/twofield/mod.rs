@@ -86,14 +86,16 @@ fn groups(n: u32) -> u32 {
 /// grid_sfp, react), `g2p_water` 5 (pos, vel, cmat, grid_vel, solids); U3 pressure family —
 /// `node_setup` 5 (grid_vel, solids, nm, grid_sfp, react),
 /// `cell_classify` 7 (grid_vel, solids, cell_meta, pf_a, pf_b, cell_cnt, nm) — the widest,
-/// `coarse_node_setup` 2, `coarse_cell_setup` 4 (cell_meta, cmeta, pc_a, pc_b),
+/// `coarse_node_setup` 2, `coarse_cell_setup` 5 (cell_meta, cmeta, pc_a, pc_b, pocket_c — U8
+/// compacted coarse-pocket append),
 /// `jacobi_fine`/`jacobi_coarse` 5 (+bubble), `prolong_add` 6 (cell_meta, cmeta, pc, pf×2,
 /// bubble), `project` 7 (grid_vel, nm, cell_meta, pf, grid_sfp, react, grid_svel — U7 adds
 /// grid_svel for the pore-pressure buoyancy on the solid field; ties cell_classify), debug
 /// taps ≤ 4; U4
-/// surface family — `flood_init` 3 (cell_meta, pf_a, bubble — U8 early-out flag reset),
-/// `flood_sweep` 3, `pocket_mark` 6 (grid_vel, cell_meta,
-/// pf×2, bubble, nm), `bubble_fine` 4, `bubble_coarse` 4; U5 plasticity family —
+/// surface family — `flood_init` 5 (cell_meta, pf_a, bubble — U8 early-out flag reset — plus
+/// pocket_f/pocket_c counter resets), `flood_sweep` 3, `pocket_mark` 7 (grid_vel, cell_meta,
+/// pf×2, bubble, nm, pocket_f — U8 compacted-list append), `bubble_fine` 5 (nm, cell_meta, pf,
+/// bubble, pocket_f), `bubble_coarse` 5 (nm_c, cmeta, pc, bubble, pocket_c); U5 plasticity family —
 /// `p2g_solid_dyn` 6 (pos, vel, cmat, grid_sfp, grid_sm, sstate), `solid_update` 4
 /// (grid_sm, grid_svel, grid_sfp, solids), `g2p_solid` 7 (pos, vel, cmat, solids,
 /// grid_svel, fmat, sstate) — ties cell_classify; U9 absorption family — `grid_clear` now 5
@@ -1591,6 +1593,22 @@ impl Solver for TwofieldSolver {
             (num_cells.max(1) as u64) * 4,
             wgpu::BufferUsages::empty(),
         );
+        // U8 R9 fix: compacted pocket-cell lists (slot 0 = atomic append count, rest = flat
+        // indices). flood_init resets the counters; pocket_mark / coarse_cell_setup append; the
+        // bubble row solves stride these few-hundred-entry lists instead of all cells. Sized for
+        // the worst case (every cell a pocket) + the count slot.
+        let pocket_f = Self::storage(
+            &device,
+            "twofield-pocket-f",
+            ((num_cells as u64) + 1) * 4,
+            wgpu::BufferUsages::empty(),
+        );
+        let pocket_c = Self::storage(
+            &device,
+            "twofield-pocket-c",
+            ((num_ccells as u64) + 1) * 4,
+            wgpu::BufferUsages::empty(),
+        );
         let solids_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("twofield-solids"),
             contents: bytemuck::cast_slice(&packed),
@@ -1804,6 +1822,7 @@ impl Solver for TwofieldSolver {
                     (14, &cmeta),
                     (15, &pc_a),
                     (16, &pc_b),
+                    (27, &pocket_c),
                 ],
             );
             let jacobi_coarse = make("jacobi_coarse");
@@ -1932,6 +1951,8 @@ impl Solver for TwofieldSolver {
                     (10, &cell_meta),
                     (11, &pf_a),
                     (17, &bubble),
+                    (26, &pocket_f),
+                    (27, &pocket_c),
                 ],
             );
             let flood_sweep = make("flood_sweep");
@@ -1958,6 +1979,7 @@ impl Solver for TwofieldSolver {
                     (11, &pf_a),
                     (12, &pf_b),
                     (17, &bubble),
+                    (26, &pocket_f),
                 ],
             );
             let bubble_fine = make("bubble_fine");
@@ -1970,6 +1992,7 @@ impl Solver for TwofieldSolver {
                         (10, &cell_meta),
                         (11, pf),
                         (17, &bubble),
+                        (26, &pocket_f),
                     ],
                 )
             };
@@ -1984,6 +2007,7 @@ impl Solver for TwofieldSolver {
                         (14, &cmeta),
                         (15, pc),
                         (17, &bubble),
+                        (27, &pocket_c),
                     ],
                 )
             };

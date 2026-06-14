@@ -508,6 +508,10 @@ fn coarse_cell_setup(@builtin(global_invocation_id) gid: vec3<u32>) {
     var cw = 0.0;
     if (has_pocket && !has_fluid) {
         cw = CELL_POCKET;
+        // U8 R9 fix: append to the compacted coarse pocket list (slot 0 = count); bubble_coarse
+        // strides this list instead of all coarse cells. flood_init reset the counter this frame.
+        let slot = atomicAdd(&pocket_c[0], 1u);
+        atomicStore(&pocket_c[slot + 1u], c);
     }
 
     var sum = 0.0;

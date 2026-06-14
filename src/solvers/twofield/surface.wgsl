@@ -34,14 +34,24 @@
 // (pre-enclosure — e.g. the jet annulus connects the cavity to outside air) there are no
 // pocket cells, the aggregated diagonal is 0, and λ_b is pinned inactive (p = 0 air).
 //
-// Tint discipline: bubble_fine/bubble_coarse run as ONE workgroup with a uniform grid-stride
-// trip count and predicated bodies, so every workgroupBarrier() is in uniform control flow.
-// All other passes use guard returns with no barriers. Over-dispatch + early-out only (R8).
-// Storage buffers per entry point ≤ 6 (see MAX_STORAGE_BUFFERS_PER_ENTRY_POINT in mod.rs).
+// Tint discipline: bubble_fine/bubble_coarse run as ONE workgroup with a uniform trip count
+// (now over the COMPACTED pocket list, not all cells — U8 R9 fix) and predicated bodies, so
+// every workgroupBarrier() is in uniform control flow. All other passes use guard returns with
+// no barriers. Over-dispatch + early-out only (R8). Storage buffers per entry point ≤ 7 (see
+// MAX_STORAGE_BUFFERS_PER_ENTRY_POINT in mod.rs).
 
 // --- bindings (continue the global table; 17 is the bubble state) -----------------------------
 // bubble[0] = λ_b (fine-level pocket pressure), bubble[1] = δλ_b (coarse correction).
 @group(0) @binding(17) var<storage, read_write> bubble: array<f32>;
+
+// U8 R9 fix: COMPACTED pocket-cell lists (the parallel-reduction approach). Element 0 is an
+// atomic append counter, elements [1, 1+count) are the flat cell indices labelled CELL_POCKET
+// this frame. flood_init resets both counters; pocket_mark appends the fine pockets and
+// coarse_cell_setup appends the coarse pockets. The bubble row solves then iterate the few
+// hundred listed cells instead of strided-scanning all ~76k cells per dispatch (the same sums
+// over the SAME cells — only the iteration set is compacted, λ_b is unchanged).
+@group(0) @binding(26) var<storage, read_write> pocket_f: array<atomic<u32>>;
+@group(0) @binding(27) var<storage, read_write> pocket_c: array<atomic<u32>>;
 
 // cell_meta.w / cmeta.w categories (CELL_AIR is only ever set on fine cells).
 const CELL_AIR: f32 = 1.0;
@@ -56,6 +66,8 @@ fn flood_init(@builtin(global_invocation_id) gid: vec3<u32>) {
     let c = gid.x;
     if (c == 0u) {
         bubble[2] = 0.0; // pocket-present flag, raised by pocket_mark this frame
+        atomicStore(&pocket_f[0], 0u); // reset the compacted pocket-list counters this frame
+        atomicStore(&pocket_c[0], 0u);
     }
     if (c >= num_fine_cells()) {
         return;
@@ -166,6 +178,9 @@ fn pocket_mark(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     cell_meta[c] = vec4<f32>((0.0 - div) / params.dt, 1.0, 0.0, CELL_POCKET);
     bubble[2] = 1.0; // an enclosed pocket exists: arm the bubble-row solves this frame
+    // Append this fine pocket cell to the compacted list (slot 0 is the count).
+    let slot = atomicAdd(&pocket_f[0], 1u);
+    atomicStore(&pocket_f[slot + 1u], c);
 }
 
 // =================================== bubble row relaxation =====================================
@@ -181,20 +196,25 @@ var<workgroup> red_diag: array<f32, 256>;
 fn bubble_fine(@builtin(local_invocation_id) lid: vec3<u32>) {
     let t = lid.x;
     // Open-cavity early-out (U8): no enclosed pocket this frame ⇒ λ_b is 0 (pocket_mark already
-    // pinned bubble[0]=bubble[1]=0), so the all-cells reduction is pure waste. bubble[2] is
-    // uniform across the workgroup, so this return precedes every barrier in uniform control flow.
+    // pinned bubble[0]=bubble[1]=0), so the reduction is pure waste. bubble[2] is uniform across
+    // the workgroup, so this return precedes every barrier in uniform control flow.
     if (bubble[2] < 0.5) {
         return;
     }
-    let n = num_fine_cells();
+    // U8 R9 fix: stride the COMPACTED pocket list (a few hundred entries) instead of all ~76k
+    // fine cells. `count` is uniform across the workgroup (single atomic load, no in-flight
+    // append — pocket_mark finished last frame-pass), so the trip count stays uniform and every
+    // workgroupBarrier() below remains in uniform control flow.
+    let count = atomicLoad(&pocket_f[0]);
     let h = params.grid_origin.w;
     var s_rhs = 0.0;
     var s_ap = 0.0;
     var s_diag = 0.0;
-    let trips = (n + 255u) / 256u; // uniform trip count (barrier discipline)
+    let trips = (count + 255u) / 256u; // uniform trip count (barrier discipline)
     for (var it = 0u; it < trips; it = it + 1u) {
-        let c = it * 256u + t;
-        if (c < n && cell_meta[c].w == CELL_POCKET) {
+        let li = it * 256u + t;
+        if (li < count) {
+            let c = atomicLoad(&pocket_f[li + 1u]);
             let cc = vec3<i32>(cell_coords(c));
             var acc_p = 0.0; // (D M̃⁻¹ G p̃)_c
             var acc_i = 0.0; // (D M̃⁻¹ G 1_pocket)_c — aggregated diagonal incl. cross terms
@@ -280,15 +300,17 @@ fn bubble_coarse(@builtin(local_invocation_id) lid: vec3<u32>) {
     if (bubble[2] < 0.5) {
         return;
     }
-    let n = num_coarse_cells();
+    // U8 R9 fix: stride the COMPACTED coarse pocket list (see bubble_fine). `count` is uniform.
+    let count = atomicLoad(&pocket_c[0]);
     let hc = params.grid_origin.w * f32(params.coarse_dims.w);
     var s_rhs = 0.0;
     var s_ap = 0.0;
     var s_diag = 0.0;
-    let trips = (n + 255u) / 256u;
+    let trips = (count + 255u) / 256u;
     for (var it = 0u; it < trips; it = it + 1u) {
-        let c = it * 256u + t;
-        if (c < n && cmeta[c].w == CELL_POCKET) {
+        let li = it * 256u + t;
+        if (li < count) {
+            let c = atomicLoad(&pocket_c[li + 1u]);
             let cc = vec3<i32>(ccell_coords(c));
             var acc_p = 0.0;
             var acc_i = 0.0;
