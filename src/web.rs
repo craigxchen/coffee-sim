@@ -1,18 +1,20 @@
 //! Browser (wasm + WebGPU) entry point. A `#[wasm_bindgen]` handle (`CoffeeSimApp`) the JS frontend
-//! drives via `requestAnimationFrame`: it owns a `GpuContext` + `XpbdSolver` + `ui::Renderer` +
+//! drives via `requestAnimationFrame`: it owns a `GpuContext` + a `Box<dyn Solver>` + `ui::Renderer` +
 //! `OrbitCamera` directly (mirroring `examples/water_app.rs`; not `engine::Simulator`, which doesn't
-//! expose reset/scene-rebuild/device access). One-way data flow: JS setters only feed `EmissionInput`
-//! / rebuild the scene; they never write solver state. The renderer is reused unchanged (its corner
-//! GPU gizmo is disabled — the frontend draws a CSS view-cube from the camera yaw/pitch).
+//! expose reset/scene-rebuild/device access). The solver is selectable at runtime via the registry
+//! (`set_solver`); all frame calls go through the `Solver` trait object. One-way data flow: JS setters
+//! only feed `EmissionInput` / rebuild the scene; they never write solver state. The renderer is
+//! reused unchanged (its corner GPU gizmo is disabled — the frontend draws a CSS view-cube from the
+//! camera yaw/pitch).
 #![cfg(target_arch = "wasm32")]
 
 use glam::Vec3;
 use wasm_bindgen::prelude::*;
 
+use crate::engine::registry::{build_solver, info_for, SolverId};
 use crate::engine::Scene;
 use crate::models::Materials;
 use crate::solvers::base::Solver;
-use crate::solvers::xpbd::XpbdSolver;
 use crate::ui::{OrbitCamera, Renderer};
 use crate::utils::config::Config;
 use crate::utils::gpu::GpuContext;
@@ -35,7 +37,8 @@ pub struct CoffeeSimApp {
     surface: wgpu::Surface<'static>,
     config: wgpu::SurfaceConfiguration,
     renderer: Renderer,
-    solver: XpbdSolver,
+    solver: Box<dyn Solver>,
+    solver_id: SolverId,
     camera: OrbitCamera,
     scene_kind: WebScene,
     scene: Scene,
@@ -77,8 +80,9 @@ impl CoffeeSimApp {
         surface.configure(&gpu.device, &config);
 
         let scene_kind = WebScene::CenterPour;
-        let (scene, mats, cfg) = setup_for(scene_kind);
-        let solver = XpbdSolver::build(&scene, &mats, &cfg, &gpu);
+        let solver_id = SolverId::Xpbd; // preserve current default behavior
+        let (scene, mats, cfg) = setup_for(scene_kind, solver_id);
+        let solver = build_solver(solver_id, &scene, &mats, &cfg, &gpu);
         let mut renderer =
             Renderer::new(&gpu, format, (width, height), 0.5 * mats.particle_spacing);
         configure_renderer(&mut renderer, &mats);
@@ -93,6 +97,7 @@ impl CoffeeSimApp {
             config,
             renderer,
             solver,
+            solver_id,
             camera,
             scene_kind,
             scene,
@@ -177,6 +182,37 @@ impl CoffeeSimApp {
     #[wasm_bindgen(js_name = loadWaterOnly)]
     pub fn load_water_only(&mut self) {
         self.rebuild(WebScene::WaterOnly);
+    }
+
+    // --- solver selection ---
+
+    /// Registry solvers as `id|display-name` pairs, newline-separated, for the UI dropdown. The
+    /// display name is read from the embedded `engine/solvers.json` catalog (`SolverInfo::name`).
+    #[wasm_bindgen(js_name = availableSolvers)]
+    pub fn available_solvers(&self) -> String {
+        SolverId::all()
+            .iter()
+            .map(|&id| format!("{}|{}", id.id(), info_for(id).name))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The active solver's registry id (e.g. `"xpbd"`), so the UI can sync the dropdown selection.
+    #[wasm_bindgen(js_name = activeSolver)]
+    pub fn active_solver(&self) -> String {
+        self.solver_id.id().to_string()
+    }
+
+    /// Switch the active solver by registry id (`SolverId::id()`). Unknown ids are ignored. Rebuilds
+    /// the solver on the CURRENT scene via the shared drop-and-rebuild path, so the canvas restarts
+    /// with the new solver's physics applied (twofield gets its coupling gates — see `setup_for`).
+    #[wasm_bindgen(js_name = setSolver)]
+    pub fn set_solver(&mut self, id: &str) {
+        let Some(&new_id) = SolverId::all().iter().find(|s| s.id() == id) else {
+            return;
+        };
+        self.solver_id = new_id;
+        self.rebuild(self.scene_kind);
     }
 
     // --- camera ---
@@ -279,9 +315,11 @@ impl CoffeeSimApp {
 
 impl CoffeeSimApp {
     /// Rebuild the solver + camera for a new scene (drop-and-rebuild — GPU resources are RAII).
+    /// Used both by the scene-change path and `set_solver` (same drop-and-rebuild on the current
+    /// scene/mats/cfg for the active `solver_id`).
     fn rebuild(&mut self, kind: WebScene) {
-        let (scene, mats, cfg) = setup_for(kind);
-        self.solver = XpbdSolver::build(&scene, &mats, &cfg, &self.gpu);
+        let (scene, mats, cfg) = setup_for(kind, self.solver_id);
+        self.solver = build_solver(self.solver_id, &scene, &mats, &cfg, &self.gpu);
         configure_renderer(&mut self.renderer, &mats);
         self.renderer.set_solids(&scene.solids); // refresh the cone / cup wireframe for the new scene
         self.camera = OrbitCamera::framing(Vec3::from(scene.box_min), Vec3::from(scene.box_max));
@@ -294,7 +332,12 @@ impl CoffeeSimApp {
 
 /// Scene + calibrated materials/config for each web scene. Center Pour mirrors the native viewer's
 /// `v60pour` setup at a browser-friendly resolution; Water Only is the default dam.
-fn setup_for(kind: WebScene) -> (Scene, Materials, Config) {
+///
+/// `solver_id` lets the coffee scene turn on the two-field coupling gates when the two-field solver
+/// is active. Those `tf_*`/`solid_dynamics` flags are opt-in (default OFF) and the XPBD solver
+/// ignores them, so they are applied only for `SolverId::Twofield` — keeping the XPBD path's config
+/// byte-identical to before.
+fn setup_for(kind: WebScene, solver_id: SolverId) -> (Scene, Materials, Config) {
     let scene = kind.build();
     match kind {
         WebScene::CenterPour => {
@@ -307,7 +350,7 @@ fn setup_for(kind: WebScene) -> (Scene, Materials, Config) {
                 grain_mass: 10.0,
                 ..Materials::default()
             };
-            let cfg = Config {
+            let mut cfg = Config {
                 absorb_rate: 0.5,
                 extract_rate: 1.0,
                 nozzle_radius: 0.25,
@@ -322,6 +365,18 @@ fn setup_for(kind: WebScene) -> (Scene, Materials, Config) {
                 drag_subiters: 6,
                 ..Config::default()
             };
+            if solver_id == SolverId::Twofield {
+                // Turn ON the two-field coupling so selecting it on the V60 pour visibly runs the
+                // percolation/absorption/cohesion physics (an inert frozen bed otherwise). These are
+                // the canonical "full coffee" gates from `tests/twofield_full.rs`: a deformable bed
+                // (solid_dynamics) that absorbs water (tf_absorb_rate, feeding swelling + K(φ)),
+                // drains through the filter (tf_filter_floor), and gains wet cohesion for steeper
+                // walls (tf_wet_cohesion). The XPBD path never sees these.
+                cfg.solid_dynamics = true;
+                cfg.tf_absorb_rate = 0.15;
+                cfg.tf_wet_cohesion = 4.0;
+                cfg.tf_filter_floor = true;
+            }
             (scene, mats, cfg)
         }
         WebScene::WaterOnly => {

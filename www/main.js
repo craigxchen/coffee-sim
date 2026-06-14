@@ -10,6 +10,7 @@ const toggleButton = document.getElementById("toggle");
 const resetButton = document.getElementById("reset");
 const sceneCenterPourButton = document.getElementById("scene-center-pour");
 const sceneFreeStreamButton = document.getElementById("scene-free-stream");
+const solverSelect = document.getElementById("solver-select");
 const waterVelocityInput = document.getElementById("water-velocity");
 const waterVelocityValue = document.getElementById("water-velocity-value");
 const spoutPlane = document.getElementById("spout-plane");
@@ -64,6 +65,7 @@ async function bootstrap() {
     await init();
     app = await CoffeeSimApp.create(canvas);
     app.loadCenterPour();
+    populateSolverSelect();
     syncControlDefaultsFromSim();
     applyWaterVelocityControl();
     applySpoutControls();
@@ -97,6 +99,14 @@ function installListeners() {
   });
   sceneFreeStreamButton.addEventListener("click", () => {
     app.loadWaterOnly();
+    syncControlDefaultsFromSim();
+    syncUi();
+  });
+
+  solverSelect.addEventListener("change", () => {
+    // setSolver rebuilds the solver on the current scene (drop-and-rebuild), so the canvas
+    // restarts with the selected solver's physics. Re-sync controls/UI as the scene buttons do.
+    app.setSolver(solverSelect.value);
     syncControlDefaultsFromSim();
     syncUi();
   });
@@ -315,6 +325,21 @@ function syncControlDefaultsFromSim() {
   spoutX = clamp(snap(app.spoutX()), SPOUT_X_MIN, SPOUT_X_MAX);
   spoutZ = clamp(snap(app.spoutZ()), SPOUT_Z_MIN, SPOUT_Z_MAX);
   spoutHeightInput.value = app.spoutY().toFixed(1);
+}
+
+// Fill the solver dropdown from the registry catalog ("id|name" rows) and select the active one.
+function populateSolverSelect() {
+  const rows = app.availableSolvers().split("\n").filter(Boolean);
+  solverSelect.replaceChildren(
+    ...rows.map((row) => {
+      const [id, name] = row.split("|");
+      const option = document.createElement("option");
+      option.value = id;
+      option.textContent = name;
+      return option;
+    }),
+  );
+  solverSelect.value = app.activeSolver();
 }
 
 function updateSpoutPlaneFromPointer(e) {

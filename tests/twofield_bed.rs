@@ -47,13 +47,12 @@
 //!     0.0058/0.0012 @ 6×, 0.0067/0.0019 @ 8×, 0.0059/0.0020 @ 10× — the cap acts on mean
 //!     pressure (~0.62·σ_v in K₀), so a 4× pulse barely clears p_c0 and the per-cycle
 //!     quantum scales with amplitude, not press duration (hold 60→180 changed gains < 1%).
-//!     The original per-cycle 0.002 floor exhausted its knob grid (cycle-2 gain plateaus at
-//!     ~0.0019 across amplitude 8–14×, hold 60–180, rest 90–210, ξ 1.5/5, wall friction
-//!     0.05–0.8, measurement window y ≤ 6..9, solid CFL 0.25/0.4) and was RE-SCOPED by owner
-//!     ruling 2026-06-12 as DEFERRED ESPRESSO SCOPE — tamping is an espresso operation and
-//!     the espresso regime is deferred in the plan's Scope Boundaries; the floor was never
-//!     loosened. The gate now asserts the demonstrated plastic-compaction-memory mechanism
-//!     (see the test doc), with the measured table kept there as the evidence record.
+//!     The original per-cycle 0.002 precision floor exhausted its knob grid (cycle-2 gain
+//!     plateaus at ~0.0019 across amplitude 8–14×, hold 60–180, rest 90–210, ξ 1.5/5, wall
+//!     friction 0.05–0.8, measurement window y ≤ 6..9, solid CFL 0.25/0.4) and was DROPPED by
+//!     owner ruling 2026-06-12; the floor was never loosened. The gate now asserts the
+//!     demonstrated plastic-compaction-memory mechanism (see the test doc), with the measured
+//!     table kept there as the evidence record.
 //!   * Grid resolution arm: `Materials::particle_spacing` ∈ {1.0, 0.75} (h = 2·spacing —
 //!     grain pitch unchanged); the runout gate scene fixes spacing 0.6 (h = 1.2) per its
 //!     resolution re-registration; wall-friction arm: `Materials::floor_mu` ∈ {0.4, 0.8}.
@@ -99,7 +98,7 @@
 //!   STATIC     settled heap over 1200 frames: sampled max |v| ≤ 0.5, top-decile surface
 //!              drift ≤ 0.5 spacing, finite.
 //!   TAMP       (re-registered 2026-06-12 per the owner ruling — the original per-cycle
-//!              0.002 floor + diminishing-returns clause is deferred espresso scope, never
+//!              0.002 precision floor + diminishing-returns clause was dropped, never
 //!              loosened) every press cycle's φ̄_s gain > 0 and persists across unload;
 //!              cumulative gain ≥ 0.008 over 3 cycles; p_c strictly ratchets.
 //!   OVERPACK   (probe redesigned 2026-06-12 — the original press scene never reached the
@@ -1127,19 +1126,23 @@ fn bed_phi_stats(solver: &TwofieldSolver, y_max: f64) -> (f64, f64) {
     (sum / cnt as f64, peak)
 }
 
-/// TAMP MEMORY gate (RE-SCOPED 2026-06-12, owner ruling): tamping is an ESPRESSO operation,
-/// and the espresso high-pressure regime is explicitly deferred in the plan's Scope
-/// Boundaries; what R2/L3 need from this gate is PLASTIC COMPACTION MEMORY — compaction that
-/// persists across unload and feeds K(φ) — which IS demonstrated at current physics. The
-/// gate therefore asserts exactly the demonstrated mechanism:
+/// PLASTIC COMPACTION-MEMORY gate (RE-SCOPED 2026-06-12, owner ruling). This is a pour-over
+/// property, not a niche operation: the bed densifies under sustained load — the standing
+/// water column plus grain swelling — and that densification PERSISTS after the load relaxes,
+/// feeding K(φ) per KTD-8. L2/L3 drawdown depends directly on this memory (a bed that fluffed
+/// back after every load would never build the lower permeability the late-brew flow needs).
+/// The gravity-pulse presses here are simply the body-force-pulse PROBE for that mechanism;
+/// what the gate asserts is PLASTIC COMPACTION MEMORY — compaction that persists across unload
+/// and feeds K(φ) — which IS demonstrated at current physics. The gate therefore asserts
+/// exactly the demonstrated mechanism:
 ///   (i)   every press cycle's packing gain > 0 and persists across unload,
 ///   (ii)  cumulative gain ≥ 0.008 (`TAMP_CUMULATIVE_MIN`) over 3 cycles,
 ///   (iii) p_c strictly ratchets.
 /// EVIDENCE RECORD (release, Apple M-series, gravity-pulse presses — the documented
 /// body-force-pulse probe): per-cycle unload gains 0.0056 / 0.0019 / 0.0028, mean p_c
-/// 250 → 697. The vibratory-consolidation mechanism and the original per-cycle 0.002
-/// precision floor (cycle-2 gain plateaus at ~0.0019 across the exhausted knob grid — see
-/// the header tamp bullet) are DEFERRED WITH ESPRESSO.
+/// 250 → 697. The original per-cycle 0.002 precision floor (cycle-2 gain plateaus at ~0.0019
+/// across the exhausted knob grid — see the header tamp bullet) was DROPPED by the owner
+/// ruling; only the persistent-memory mechanism above is gated.
 #[test]
 fn tamp_memory_raises_packing_persistently() {
     let Some(gpu) = GpuContext::new_headless() else {
