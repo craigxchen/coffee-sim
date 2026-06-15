@@ -98,10 +98,12 @@ fn groups(n: u32) -> u32 {
 /// bubble), `project` 7 (grid_vel, nm, cell_meta, pf, grid_sfp, react, grid_svel — U7 adds
 /// grid_svel for the pore-pressure buoyancy on the solid field; ties cell_classify), debug
 /// taps ≤ 4; U4
-/// surface family — `flood_init` 5 (cell_meta, pf_a, bubble — U8 early-out flag reset — plus
-/// pocket_f/pocket_c counter resets), `flood_sweep` 3, `pocket_mark` 7 (grid_vel, cell_meta,
+/// surface family — `flood_init` 6 (solids, cell_meta, pf_a, bubble — U8 early-out flag reset —
+/// plus pocket_f/pocket_c counter resets; `solids` for the wall-adjacent OUTSIDE seed),
+/// `flood_sweep` 3, `pocket_mark` 7 (grid_vel, cell_meta,
 /// pf×2, bubble, nm, pocket_f — U8 compacted-list append), `bubble_fine` 5 (nm, cell_meta, pf,
-/// bubble, pocket_f), `bubble_coarse` 5 (nm_c, cmeta, pc, bubble, pocket_c); U5 plasticity family —
+/// bubble, pocket_f), `bubble_coarse` 6 (nm_c, cmeta, pc, bubble, pocket_f, pocket_c — pocket_f
+/// for the shared sub-resolution release size gate); U5 plasticity family —
 /// `p2g_solid_dyn` 6 (pos, vel, cmat, grid_sfp, grid_sm, sstate), `solid_update` 4
 /// (grid_sm, grid_svel, grid_sfp, solids), `g2p_solid` 7 (pos, vel, cmat, solids,
 /// grid_svel, fmat, sstate) — ties cell_classify; U9 absorption family — `grid_clear` now 5
@@ -159,20 +161,33 @@ pub const SURF_MIN_CORNER: f32 = 0.1;
 /// above the plan's rough +6–12 guess — recorded honestly per R8.
 pub const U3_PRESSURE_DISPATCHES: u32 = 7 + COARSE_SWEEPS_DEFAULT + FINE_SWEEPS_DEFAULT;
 
-/// U4 flood-fill sweep budget (fixed structural constant, like JACOBI_OMEGA — NOT a gate
-/// knob): each sweep propagates the OUTSIDE label one 6-neighbor cell, so the budget bounds
-/// the reachable open-air path length in cells. 24 covers every current scene with margin
-/// (tallest air column: the 32-unit tank → 16 cells; the V60 cone detour ≈ 20); cells beyond
-/// the budget would degrade conservatively (extra pocket members with massless nodes — zero
-/// row coupling). Kept EVEN so the final labels land back in the pf_a slot (parity).
-pub const FLOOD_SWEEPS: u32 = 24;
+/// U4 flood-fill sweep budget: each sweep propagates the OUTSIDE label ONE 6-neighbor cell, so
+/// the budget must bound the longest open-air PATH (in cells) from any in-box air cell to the
+/// open top face. The earlier fixed 24 was a miscalculation: it covered the box gate scenes
+/// (tank air column ≈ 16 cells) but NOT the V60 cup, whose air path runs from the cup floor
+/// (y = -8) up through the cone apex and out the box top (y = +10) — ≈ 88 cells at the web
+/// spacing, plus the cup-radius lateral detour. With too few sweeps the cup/cone air never gets
+/// the OUTSIDE label, is misclassified as one enclosed POCKET, and the bubble constraint
+/// (λ ≈ −3000) crushes the standing water into the floor corner (the reported WaterOnly
+/// collapse). The budget is therefore the grid's MANHATTAN DIAMETER — (nx−1)+(ny−1)+(nz−1)
+/// cells — which upper-bounds any monotone 6-neighbor path on the grid regardless of geometry,
+/// rounded UP to even so the final labels land back in the pf_a slot (parity). It is scene-
+/// derived (a per-solver field), not a global constant, because the path length scales with the
+/// grid; cells beyond the budget still degrade conservatively (extra pocket members with
+/// massless nodes — zero row coupling).
+pub fn flood_sweeps_for(dims: [u32; 3]) -> u32 {
+    let diameter = (dims[0] - 1) + (dims[1] - 1) + (dims[2] - 1);
+    diameter + (diameter & 1) // round up to even
+}
 
-/// U4 dispatch increment at the default knobs: flood_init + FLOOD_SWEEPS + pocket_mark, plus
+/// U4 dispatch increment for a grid of `dims`: flood_init + flood sweeps + pocket_mark, plus
 /// one single-workgroup bubble-row solve preceding EVERY fine and coarse Jacobi sweep (the
 /// KTD-6 identical-representation requirement — the multiplier relaxes WITH the smoother at
-/// both levels, so neither level can erode the constraint).
-pub const U4_SURFACE_DISPATCHES: u32 =
-    2 + FLOOD_SWEEPS + FINE_SWEEPS_DEFAULT + COARSE_SWEEPS_DEFAULT;
+/// both levels, so neither level can erode the constraint). Scene-derived through the flood
+/// budget (see `flood_sweeps_for`).
+pub fn u4_surface_dispatches_for(dims: [u32; 3]) -> u32 {
+    2 + flood_sweeps_for(dims) + FINE_SWEEPS_DEFAULT + COARSE_SWEEPS_DEFAULT
+}
 
 /// U6 dispatch increment: the thin solid-mass P2G (`p2g_solid`) + the drag fold
 /// (`drag_fold`, which also absorbed grid_update's force/BC work — net one new pass).
@@ -206,11 +221,12 @@ pub const U5_PLASTICITY_DISPATCHES: u32 = 2;
 /// the resolved runout scene fell from ~70 min to minutes).
 pub const U5_DRY_DISPATCHES: u32 = 4;
 
-/// Compute dispatches per frame at the default knobs: the U2 transfer pipeline (grid_clear,
-/// p2g_water, grid_update, g2p_water) + the U3 pressure stack + the U4 surface stack + the
-/// U6 coupling passes.
-pub const DISPATCHES_PER_FRAME: u32 =
-    4 + U3_PRESSURE_DISPATCHES + U4_SURFACE_DISPATCHES + U6_COUPLING_DISPATCHES;
+/// Compute dispatches per frame for a grid of `dims` at the default knobs: the U2 transfer
+/// pipeline (grid_clear, p2g_water, grid_update, g2p_water) + the U3 pressure stack + the U4
+/// surface stack (scene-derived through the flood budget) + the U6 coupling passes.
+pub fn dispatches_per_frame_for(dims: [u32; 3]) -> u32 {
+    4 + U3_PRESSURE_DISPATCHES + u4_surface_dispatches_for(dims) + U6_COUPLING_DISPATCHES
+}
 
 /// Per-grain solid volume (U6, KTD-8): the sphere volume π/6·d³ each frozen grain scatters
 /// into the solid grid field — a unit-pitch grain lattice therefore measures φ_s = π/6.
@@ -414,6 +430,8 @@ pub struct TwofieldSolver {
     coarse_ratio: u32,
     coarse_sweeps: u32,
     fine_sweeps: u32,
+    // U4 flood-fill budget = grid Manhattan diameter (scene-derived; see `flood_sweeps_for`).
+    flood_sweeps: u32,
 
     params_buf: wgpu::Buffer,
     // Canonical particle state, exposed through `ParticleBuffers`: pos.w carries the moisture
@@ -626,7 +644,7 @@ fn seed_ranges(scene: &Scene, mats: &Materials, cfg: &Config) -> (Vec<[f32; 4]>,
 /// full 3-node B-spline support in range: `xl = (x − origin)/h ∈ [1, 1 + extent/h]`, so
 /// `base = floor(xl − 0.5) ∈ [0, dims − 3]`. The node layer at exactly `box_min` always exists
 /// (origin + h = box_min), which is what the grid box-face BC keys on.
-fn grid_spec_for(scene: &Scene, mats: &Materials) -> ([f32; 3], f32, [u32; 3]) {
+pub fn grid_spec_for(scene: &Scene, mats: &Materials) -> ([f32; 3], f32, [u32; 3]) {
     let h = CELL_SIZE_FACTOR * mats.particle_spacing;
     let origin = [
         scene.box_min[0] - h,
@@ -1965,6 +1983,7 @@ impl Solver for TwofieldSolver {
                 &flood_init,
                 &[
                     (0, &params_buf),
+                    (8, &solids_buf),
                     (10, &cell_meta),
                     (11, &pf_a),
                     (17, &bubble),
@@ -1983,7 +2002,7 @@ impl Solver for TwofieldSolver {
                     &[(0, &params_buf), (10, &cell_meta), (11, &pf_b), (12, &pf_a)],
                 ),
             ];
-            // pocket_mark reads the final labels from pf_a (FLOOD_SWEEPS is even) and
+            // pocket_mark reads the final labels from pf_a (the flood sweep count is even) and
             // re-zeroes both pressure slots for the solve.
             let pocket_mark = make("pocket_mark");
             let pocket_mark_bind = bg(
@@ -2024,6 +2043,7 @@ impl Solver for TwofieldSolver {
                         (14, &cmeta),
                         (15, pc),
                         (17, &bubble),
+                        (26, &pocket_f),
                         (27, &pocket_c),
                     ],
                 )
@@ -2132,6 +2152,7 @@ impl Solver for TwofieldSolver {
             coarse_ratio: COARSE_RATIO_DEFAULT,
             coarse_sweeps: COARSE_SWEEPS_DEFAULT,
             fine_sweeps: FINE_SWEEPS_DEFAULT,
+            flood_sweeps: flood_sweeps_for(dims),
             params_buf,
             pos,
             vel,
@@ -2436,16 +2457,16 @@ impl Solver for TwofieldSolver {
         // U4 pocket detection (surface.wgsl): flood the OUTSIDE label through the air cells
         // (labels ping-pong through the pressure slots, which cell_classify just zeroed and
         // pocket_mark re-zeroes), then mark the enclosed remainder as the pocket. The sweep
-        // budget is fixed and even, so the final labels land back in pf_a (the pocket_mark
-        // binding).
-        const _: () = assert!(FLOOD_SWEEPS.is_multiple_of(2));
+        // budget is scene-derived (grid Manhattan diameter, `flood_sweeps_for`) and even, so the
+        // final labels land back in pf_a (the pocket_mark binding).
+        debug_assert!(self.flood_sweeps.is_multiple_of(2));
         seq.push((
             "flood_init",
             &self.pipelines.flood_init.0,
             &self.pipelines.flood_init.1,
             cell_groups,
         ));
-        for s in 0..FLOOD_SWEEPS {
+        for s in 0..self.flood_sweeps {
             seq.push((
                 "flood_sweep",
                 &self.pipelines.flood_sweep.0,

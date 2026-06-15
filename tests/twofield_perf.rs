@@ -25,7 +25,7 @@
 use coffee_sim::engine::scene::{Scene, SeedRegion, Species};
 use coffee_sim::models::Materials;
 use coffee_sim::solvers::base::Solver;
-use coffee_sim::solvers::twofield::{TwofieldSolver, DISPATCHES_PER_FRAME};
+use coffee_sim::solvers::twofield::{dispatches_per_frame_for, TwofieldSolver};
 use coffee_sim::utils::config::Config;
 use coffee_sim::utils::gpu::GpuContext;
 use coffee_sim::EmissionInput;
@@ -330,10 +330,12 @@ fn dispatch_budget_within_recorded_formula() {
         solver.step(DT, &pour);
     }
     let substeps = solver.substeps_for_dt(DT);
-    // Water-present dynamic budget per the U5 doc: substeps × (DISPATCHES_PER_FRAME + the U5
+    let (_, _, dims) = solver.grid_spec();
+    // Water-present dynamic budget per the U5 doc: substeps × (dispatches_per_frame + the U5
     // plasticity increment of 2: solid_update + g2p_solid each substep; p2g_solid_dyn replaces
-    // p2g_solid 1:1). U9 absorption is OFF on this scene (tf_absorb_rate default 0).
-    let expected = substeps * (DISPATCHES_PER_FRAME + 2);
+    // p2g_solid 1:1). The frame budget is scene-derived through the U4 flood stack. U9 absorption
+    // is OFF on this scene (tf_absorb_rate default 0).
+    let expected = substeps * (dispatches_per_frame_for(dims) + 2);
     println!(
         "twofield U8 dispatch budget: substeps {substeps}, dispatches/frame {} (expected {expected})",
         solver.profile().dispatches_per_frame
@@ -341,7 +343,7 @@ fn dispatch_budget_within_recorded_formula() {
     assert_eq!(
         solver.profile().dispatches_per_frame,
         expected,
-        "dynamic deformable-bed dispatch count drifted from substeps × (DISPATCHES_PER_FRAME + 2)"
+        "dynamic deformable-bed dispatch count drifted from substeps × (dispatches_per_frame + 2)"
     );
 }
 

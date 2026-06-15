@@ -254,11 +254,24 @@ fn drag_fold(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (xp.x <= params.box_min.x + eps || xp.x >= params.box_max.x - eps) { v.x = 0.0; }
     if ((xp.y <= params.box_min.y + eps && !open_base) || xp.y >= params.box_max.y - eps) { v.y = 0.0; }
     if (xp.z <= params.box_min.z + eps || xp.z >= params.box_max.z - eps) { v.z = 0.0; }
-    // Static SDF solids: remove the full normal component (mirrors utils/sdf.rs).
+    // Static SDF solids: remove the full normal component (mirrors utils/sdf.rs). Band the test
+    // by one cell (WALL_BAND·h) on the FLUID side so the supporting layer of a non-grid-aligned
+    // wall (e.g. the cup floor) is held — the SAME band node_setup uses to build the M̃⁻¹ wall
+    // projector, so the pre-projection velocity field and the operator constrain the same axes
+    // (operator consistency). The normal is orthogonalized against the already-zeroed box-face
+    // axes and renormalized, exactly as in node_setup.
     if (params.num_solids > 0u) {
         let hit = solid_union(xp, PHASE_WATER);
-        if (hit.dist < 0.0) {
-            v = v - dot(v, hit.grad) * hit.grad;
+        if (hit.dist < WALL_BAND * params.grid_origin.w) {
+            var nrm = hit.grad;
+            if (xp.x <= params.box_min.x + eps || xp.x >= params.box_max.x - eps) { nrm.x = 0.0; }
+            if ((xp.y <= params.box_min.y + eps && !open_base) || xp.y >= params.box_max.y - eps) { nrm.y = 0.0; }
+            if (xp.z <= params.box_min.z + eps || xp.z >= params.box_max.z - eps) { nrm.z = 0.0; }
+            let len = length(nrm);
+            if (len > SDF_NORMAL_MIN) {
+                nrm = nrm / len;
+                v = v - dot(v, nrm) * nrm;
+            }
         }
     }
     // Speed-cap backstop (couples to the FP headroom math in common.wgsl).

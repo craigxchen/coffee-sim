@@ -157,6 +157,16 @@ const SURF_FULL_FRAC: f32 = 0.5;
 const SURF_MIN_CORNER: f32 = 0.1;
 const NODE_BC_EPS: f32 = 1.0e-4;     // box-face epsilon (matches grid_update)
 const SDF_NORMAL_MIN: f32 = 1.0e-3;  // degenerate orthogonalized-normal guard
+// SDF no-penetration band in cell sizes: a node within WALL_BAND·h on the FLUID side of a wall
+// gets the wall-normal projector (the supporting fluid layer of a non-grid-aligned wall). Mirror
+// of `drag_fold`'s velocity BC band in coupling.wgsl — they MUST match for operator consistency.
+const WALL_BAND: f32 = 1.0;
+// Flood-fill OUTSIDE seed band in cell sizes (surface.wgsl flood_init): an air cell within
+// FLOOD_WALL_BAND·h of an SDF wall is seeded OPEN. Wider than WALL_BAND so the seed reaches the
+// CENTER of a ~1-cell-wide SDF channel (the V60 cone apex hole, radius 0.42 ≈ 1.3 cells) and
+// keeps it conductive — connecting the cup/cone air to the open top. Purely a pocket-detection
+// aid (no operator/BC effect), so it carries no operator-consistency constraint.
+const FLOOD_WALL_BAND: f32 = 2.0;
 
 // --- fine-grid cell helpers --------------------------------------------------------------------
 fn fine_cells() -> vec3<u32> {
@@ -293,9 +303,19 @@ fn node_setup(@builtin(global_invocation_id) gid: vec3<u32>) {
         b = vec4<f32>(0.0, d.z, 1.0, 0.0);
 
         // SDF wall: subtract the dyad of the (box-orthogonalized) unit normal — symmetric PSD.
+        // The constraint must engage on the FLUID node layer adjacent to the wall, not only on
+        // nodes strictly inside the wall material (hit.dist < 0): an SDF surface (e.g. the cup
+        // floor at y = -8) almost never coincides with a node, so the node that actually carries
+        // the supporting fluid column sits up to one cell OUTSIDE the wall (hit.dist ∈ [0, h)).
+        // With the old `< 0` test that node was left y-FREE, gravity drove the column into the
+        // floor unchecked, and it pancaked to 10–20× rest (the V60-cup collapse the box-face
+        // floor never showed, because there nodes land exactly on the face). The band is the
+        // cell size h — the standard staircase reach of a collocated no-penetration BC. The
+        // SAME band is mirrored in drag_fold's velocity BC so the pre-projection field D sees and
+        // M̃⁻¹ constrains the SAME axes (operator consistency A = D·M̃⁻¹·G).
         if (params.num_solids > 0u) {
             let hit = solid_union(xp, PHASE_WATER);
-            if (hit.dist < 0.0) {
+            if (hit.dist < WALL_BAND * h) {
                 var nrm = hit.grad;
                 if (d.x == 0.0) { nrm.x = 0.0; }
                 if (d.y == 0.0) { nrm.y = 0.0; }
@@ -399,7 +419,14 @@ fn cell_classify(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     // U4 category lane (.w): in-box fluid-free cells are AIR — flood-fill candidates for the
     // pocket detection (surface.wgsl); wall/out-of-box cells are never air. pocket_mark
-    // upgrades enclosed air to CELL_POCKET (fill weight 1, constraint row).
+    // upgrades enclosed air to CELL_POCKET (fill weight 1, constraint row). flood_init seeds the
+    // OUTSIDE label not only from the open top face but also from every WALL-ADJACENT air cell
+    // (see its header): a sub-resolution void at an SDF wall — the gap that opens at the very
+    // bottom of a fluid column resting on the non-grid-aligned cup floor, OR a cell at the cone
+    // apex pinch — is OPEN (fluid settles into it / it vents through the wall gap), never trapped
+    // gas at this resolution. Keeping such cells CELL_AIR (not masked) is what lets the flood
+    // CONDUCT through the ~1-cell cone apex hole and reach the cup air below; seeding them OUTSIDE
+    // is what stops the bottom-of-column gap from becoming a crushing pocket.
     var cat = 0.0;
     if (f <= 0.0 && !geom_blocked) {
         cat = CELL_AIR;

@@ -11,7 +11,7 @@ use coffee_sim::engine::Scene;
 use coffee_sim::models::Materials;
 use coffee_sim::solvers::base::Solver;
 use coffee_sim::solvers::twofield::{
-    TwofieldSolver, DISPATCHES_PER_FRAME, MAX_STORAGE_BUFFERS_PER_ENTRY_POINT,
+    dispatches_per_frame_for, grid_spec_for, TwofieldSolver, MAX_STORAGE_BUFFERS_PER_ENTRY_POINT,
 };
 use coffee_sim::utils::config::Config;
 use coffee_sim::utils::gpu::GpuContext;
@@ -61,9 +61,11 @@ fn builds_via_registry_and_steps_an_empty_scene() {
         profile.dispatches_per_frame > 0,
         "the transfer pipeline dispatches even on an empty scene"
     );
-    // Budget gate (R8): dispatches/frame stays pinned to the recorded constant — a new pass
-    // must update the budget, not drift past it silently.
-    assert_eq!(profile.dispatches_per_frame, DISPATCHES_PER_FRAME);
+    // Budget gate (R8): dispatches/frame stays pinned to the recorded budget — a new pass must
+    // update the budget, not drift past it silently. The U4 flood budget is scene-derived (grid
+    // Manhattan diameter), so the expected count is computed from this scene's grid.
+    let (_, _, dims) = grid_spec_for(&scene, &Materials::default());
+    assert_eq!(profile.dispatches_per_frame, dispatches_per_frame_for(dims));
     println!(
         "twofield budgets (empty scene): dispatches/frame {} | max storage buffers per entry point {}",
         profile.dispatches_per_frame, MAX_STORAGE_BUFFERS_PER_ENTRY_POINT
@@ -126,7 +128,8 @@ fn water_only_scene_has_canonical_layout_and_finite_state() {
     assert_eq!(twin.read_positions(), solver.read_positions());
 
     let profile = solver.profile();
-    assert_eq!(profile.dispatches_per_frame, DISPATCHES_PER_FRAME);
+    let (_, _, dims) = solver.grid_spec();
+    assert_eq!(profile.dispatches_per_frame, dispatches_per_frame_for(dims));
     println!(
         "twofield budgets (water-only, {} particles): dispatches/frame {} | max storage buffers per entry point {} | device request 9/stage",
         particles.particle_count, profile.dispatches_per_frame, MAX_STORAGE_BUFFERS_PER_ENTRY_POINT

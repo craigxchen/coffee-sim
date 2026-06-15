@@ -401,7 +401,7 @@ fn setup_for(kind: WebScene, solver_id: SolverId) -> (Scene, Materials, Config) 
                 support_radius: 2.0 * r,
                 ..Materials::default()
             };
-            let cfg = Config {
+            let mut cfg = Config {
                 nozzle_radius: 0.25,
                 max_speed: 25.0,
                 // Less velocity-smoothing at the surface so the pour's impact reads as a
@@ -409,6 +409,17 @@ fn setup_for(kind: WebScene, solver_id: SolverId) -> (Scene, Materials, Config) 
                 xsph_viscosity_c: 0.02,
                 ..Config::default()
             };
+            if solver_id == SolverId::Twofield {
+                // The two-field solver is a GRID solver: a sub-2-cell-wide jet (the thin XPBD
+                // nozzle, ~1.5 cells at h = 2·spacing = 0.32) plunging into the cup reconstructs
+                // noisy, asymmetric velocities, whips/scatters, and PLUNGES — trapping a column of
+                // air that the pocket machinery then carries as a crushing bubble that collapses
+                // the pool. Widen the jet to ~3.4 cells (grid-resolvable) and lower the speed cap,
+                // exactly as the CenterPour twofield branch does for the same reason. The XPBD path
+                // keeps the thin realistic stream it handles fine (these are Twofield-only).
+                cfg.nozzle_radius = 0.55;
+                cfg.max_speed = 12.0;
+            }
             (scene, mats, cfg)
         }
     }
