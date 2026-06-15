@@ -1360,9 +1360,10 @@ fn frozen_mode_grains_stay_pinned() {
             assert_eq!(a[c].to_bits(), b[c].to_bits(), "frozen grain moved");
         }
     }
+    let (_, _, frozen_dims) = solver.grid_spec();
     assert_eq!(
         solver.profile().dispatches_per_frame,
-        coffee_sim::solvers::twofield::DISPATCHES_PER_FRAME,
+        coffee_sim::solvers::twofield::dispatches_per_frame_for(frozen_dims),
         "frozen mode must keep the U6 dispatch budget"
     );
     // Dynamic mode on the same scene runs the full pipeline + the named U5 increment once

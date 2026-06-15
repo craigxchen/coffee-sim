@@ -67,9 +67,9 @@ use coffee_sim::engine::Scene;
 use coffee_sim::models::{permeability, Materials};
 use coffee_sim::solvers::base::Solver;
 use coffee_sim::solvers::twofield::{
-    blended_drag_rate, grain_volume, TwofieldSolver, COARSE_RATIO_DEFAULT, COARSE_SWEEPS_DEFAULT,
-    DENSITY_RELAX_FRAMES, DISPATCHES_PER_FRAME, U3_PRESSURE_DISPATCHES, U4_SURFACE_DISPATCHES,
-    U6_COUPLING_DISPATCHES,
+    blended_drag_rate, dispatches_per_frame_for, grain_volume, u4_surface_dispatches_for,
+    TwofieldSolver, COARSE_RATIO_DEFAULT, COARSE_SWEEPS_DEFAULT, DENSITY_RELAX_FRAMES,
+    U3_PRESSURE_DISPATCHES, U6_COUPLING_DISPATCHES,
 };
 use coffee_sim::utils::config::Config;
 use coffee_sim::utils::gpu::GpuContext;
@@ -603,10 +603,13 @@ fn linfit(pts: &[(f64, f64)]) -> (f64, f64) {
 /// the packed regime, scales as d⁻², and vanishes toward φ_s = 0.
 #[test]
 fn budget_constant_and_blend_twin() {
+    // The scene-derived budget is U2's 4 + U3 + the (scene-derived) U4 surface stack + U6, by
+    // construction for any grid — checked here at a representative grid size.
+    let dims = [40u32, 60, 40];
     assert_eq!(
-        DISPATCHES_PER_FRAME,
-        4 + U3_PRESSURE_DISPATCHES + U4_SURFACE_DISPATCHES + U6_COUPLING_DISPATCHES,
-        "budget constant must carry the named U6 increment"
+        dispatches_per_frame_for(dims),
+        4 + U3_PRESSURE_DISPATCHES + u4_surface_dispatches_for(dims) + U6_COUPLING_DISPATCHES,
+        "budget must carry the named U6 increment"
     );
     assert_eq!(U6_COUPLING_DISPATCHES, 2, "p2g_solid + drag_fold");
 

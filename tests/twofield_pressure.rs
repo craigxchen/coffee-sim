@@ -35,9 +35,9 @@ use coffee_sim::engine::Scene;
 use coffee_sim::models::Materials;
 use coffee_sim::solvers::base::Solver;
 use coffee_sim::solvers::twofield::{
-    TwofieldSolver, COARSE_RATIO_DEFAULT, COARSE_SWEEPS_DEFAULT, DISPATCHES_PER_FRAME,
-    FINE_SWEEPS_DEFAULT, JACOBI_OMEGA, MAX_STORAGE_BUFFERS_PER_ENTRY_POINT, U3_PRESSURE_DISPATCHES,
-    U4_SURFACE_DISPATCHES, U6_COUPLING_DISPATCHES,
+    dispatches_per_frame_for, u4_surface_dispatches_for, TwofieldSolver, COARSE_RATIO_DEFAULT,
+    COARSE_SWEEPS_DEFAULT, FINE_SWEEPS_DEFAULT, JACOBI_OMEGA, MAX_STORAGE_BUFFERS_PER_ENTRY_POINT,
+    U3_PRESSURE_DISPATCHES, U6_COUPLING_DISPATCHES,
 };
 use coffee_sim::utils::config::Config;
 use coffee_sim::utils::gpu::GpuContext;
@@ -910,20 +910,22 @@ fn cost_gate_dispatch_budget() {
     let mut solver = TwofieldSolver::build(&scene, &Materials::default(), &Config::default(), &gpu);
     solver.step(DT, &EmissionInput::default());
     let profile = solver.profile();
+    let (_, _, dims) = solver.grid_spec();
     assert_eq!(
-        DISPATCHES_PER_FRAME,
-        4 + U3_PRESSURE_DISPATCHES + U4_SURFACE_DISPATCHES + U6_COUPLING_DISPATCHES,
-        "budget constant must be U2's 4 + the named U3 + U4 + U6 increments"
+        dispatches_per_frame_for(dims),
+        4 + U3_PRESSURE_DISPATCHES + u4_surface_dispatches_for(dims) + U6_COUPLING_DISPATCHES,
+        "budget must be U2's 4 + the named U3 + (scene-derived) U4 + U6 increments"
     );
     assert_eq!(
-        profile.dispatches_per_frame, DISPATCHES_PER_FRAME,
+        profile.dispatches_per_frame,
+        dispatches_per_frame_for(dims),
         "live dispatch count drifted from the recorded budget"
     );
     println!(
         "twofield U3+U4+U6 budgets: dispatches/frame {} (U2 4 + U3 increment {} + U4 increment {} + U6 increment {}) | max storage buffers per entry point {}",
         profile.dispatches_per_frame,
         U3_PRESSURE_DISPATCHES,
-        U4_SURFACE_DISPATCHES,
+        u4_surface_dispatches_for(dims),
         U6_COUPLING_DISPATCHES,
         MAX_STORAGE_BUFFERS_PER_ENTRY_POINT
     );

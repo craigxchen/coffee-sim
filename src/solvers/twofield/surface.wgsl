@@ -4,10 +4,13 @@
 // Air cells (cell_meta.w = CELL_AIR after cell_classify: no fluid, center in-box, not inside a
 // solid) are flood-filled from the OPEN boundary: the topmost in-box cell layer is the
 // atmosphere (the box's side/bottom faces are sealed walls — air sealed against them is still
-// enclosed). FLOOD_SWEEPS fixed ping-pong relaxation sweeps (labels in the pressure ping-pong
-// buffers, which cell_classify zeroed and pocket_mark re-zeroes) propagate the OUTSIDE label
-// one 6-neighbor step per sweep — fixed budget, uniform control flow, deterministic (read old
-// / write new, never racy in-place). Air cells still unlabeled afterwards are ENCLOSED: the
+// enclosed). The flood runs a scene-derived number of ping-pong relaxation sweeps (the grid
+// Manhattan diameter — `flood_sweeps_for` in mod.rs; labels in the pressure ping-pong buffers,
+// which cell_classify zeroed and pocket_mark re-zeroes) propagating the OUTSIDE label one
+// 6-neighbor step per sweep — uniform control flow, deterministic (read old / write new, never
+// racy in-place). The budget MUST cover the longest open-air path or genuinely-open air (e.g.
+// the deep V60 cup under its cone) is misread as one enclosed pocket and the bubble crushes the
+// standing water. Air cells still unlabeled afterwards are ENCLOSED: the
 // pocket. Single-pocket case (the pour cavity) per the plan: ALL enclosed air shares ONE
 // bubble — multi-pocket generalization is deferred scope.
 //
@@ -59,8 +62,34 @@ const CELL_POCKET: f32 = 2.0;
 // Label values in the flood ping-pong (pressure slots reused before the solve zeroes them).
 const FLOOD_OUTSIDE: f32 = 1.0;
 
+// Minimum resolved-bubble size, in FINE cells. The constant-volume bubble constraint models a
+// RESOLVED incompressible air cavity (the pour crater). A pocket of only a handful of cells is
+// sub-resolution air: a 3-node (2-cell) B-spline support cannot represent a bubble narrower than
+// ~2 cells per axis, so its "incompressibility" is a discretization artifact, not physics — real
+// entrained microbubbles are compressible and vent/dissolve. Such a pocket must be RELEASED to
+// p = 0 (open air), not pinned to a huge λ. Without this, the V60 cone's draining film
+// geometrically isolates 1–7 air cells the 6-neighbor flood cannot reach; the single global
+// bubble then assigns them λ ≈ 1e3–1e4, ejecting the standing cup water at the speed cap for
+// 100+ frames (the residual WaterOnly artifact after the flood-budget / wall-band fixes). One
+// 2×2×2 cell block (8) is the threshold: the legitimate pour cavity is hundreds of cells (the
+// cavity gate's enclosed slab is 288), so the band is enormous — this can never gate a real
+// cavity. Both levels gate on this one authoritative FINE count (bubble_coarse reads pocket_f[0]
+// too), so the coarse correction releases on exactly the same criterion as the fine solve.
+const MIN_POCKET_FINE_CELLS: u32 = 8u;
+
 // =================================== flood_init ================================================
-// Seed the OUTSIDE label: air cells in the topmost in-box layer (the open atmosphere face).
+// Seed the OUTSIDE label: air cells in the topmost in-box layer (the open atmosphere face), AND
+// every air cell WITHIN ONE CELL OF AN SDF WALL. The wall-adjacent seed is what makes the pocket
+// machinery correct in deep SDF geometry like the V60 cup: a 6-neighbor flood cannot squeeze the
+// OUTSIDE label down through the ~1-cell-wide cone apex hole (radius 0.42 ≈ 1.3 cells at the web
+// h = 0.32) to reach the cup air below, so the whole cup/cone air column was misread as one
+// enclosed POCKET and the bubble constraint (λ ≈ −3000) crushed the standing water into the
+// floor corner — the reported WaterOnly collapse. A sub-resolution void touching an SDF wall is
+// never genuinely trapped gas at this resolution: it is open (fluid settles into the bottom-of-
+// column gap; air vents through the apex/wall gap), pressure p = 0. This narrows the bubble to
+// air actually sealed away from any wall — the transient pour cavity the machinery exists for
+// (the cavity gate scene is a plain box, no SDF walls, so it is byte-unchanged: the extra seed
+// only fires when num_solids > 0 AND a wall is within a cell).
 @compute @workgroup_size(256)
 fn flood_init(@builtin(global_invocation_id) gid: vec3<u32>) {
     let c = gid.x;
@@ -76,9 +105,20 @@ fn flood_init(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (cell_meta[c].w == CELL_AIR) {
         let h = params.grid_origin.w;
         let cc = vec3<f32>(cell_coords(c));
-        let cy = params.grid_origin.y + (cc.y + 0.5) * h;
-        if (cy + h > params.box_max.y) {
+        let center = params.grid_origin.xyz + (cc + vec3<f32>(0.5)) * h;
+        if (center.y + h > params.box_max.y) {
             label = FLOOD_OUTSIDE; // the cell above is out of the box: open face
+        } else if (params.num_solids > 0u
+            && solid_union(center, PHASE_WATER).dist < FLOOD_WALL_BAND * h) {
+            // Any air cell within FLOOD_WALL_BAND cells of an SDF wall is OPEN, not trapped gas:
+            // a sub-resolution void at a wall (the bottom-of-column floor gap), OR an air cell in
+            // a narrow SDF channel the 6-neighbor flood cannot squeeze the label through (the V60
+            // cone apex hole, radius 0.42 ≈ 1.3 cells — a center-of-apex air cell sits ~0.42 from
+            // the wall, just OUTSIDE the projector's 1-cell band, so the flood seed uses a wider
+            // 2-cell band to keep the apex conductive and connect the cup/cone air to the open
+            // top). Without this the filled cup seals the cone air into one enclosed pocket and
+            // the bubble crushes the pool.
+            label = FLOOD_OUTSIDE;
         }
     }
     pf_src[c] = label;
@@ -277,6 +317,16 @@ fn bubble_fine(@builtin(local_invocation_id) lid: vec3<u32>) {
         off = off / 2u;
     }
     if (t == 0u) {
+        // Sub-resolution release (header: MIN_POCKET_FINE_CELLS): a pocket too small to be a
+        // resolved incompressible bubble is open air — λ = 0, present-flag cleared (so the next
+        // frame's bubble solves early-out and pocket_present() reads false). Guards the residual
+        // V60-cone draining-film entrainment without touching the large pour cavity.
+        if (count < MIN_POCKET_FINE_CELLS) {
+            bubble[0] = 0.0;
+            bubble[1] = 0.0;
+            bubble[2] = 0.0;
+            return;
+        }
         // Fold the prolongated coarse correction into the scalar (exact for one scalar), then
         // solve the aggregated row exactly given the current fluid pressure.
         var lam = bubble[0] + bubble[1];
@@ -370,6 +420,12 @@ fn bubble_coarse(@builtin(local_invocation_id) lid: vec3<u32>) {
         off = off / 2u;
     }
     if (t == 0u) {
+        // Sub-resolution release on the SAME authoritative fine count as bubble_fine: a pocket
+        // too small to be a resolved bubble injects no coarse correction (it is open air).
+        if (atomicLoad(&pocket_f[0]) < MIN_POCKET_FINE_CELLS) {
+            bubble[1] = 0.0;
+            return;
+        }
         if (red_diag[0] > 1.0e-12) {
             bubble[1] = bubble[1] + (red_rhs[0] - red_ap[0]) / red_diag[0];
         } else {
