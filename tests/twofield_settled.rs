@@ -18,19 +18,18 @@
 //! it (the C is the lossless CARRIER); relief OFF collapses it (relief is the SOURCE); more sweeps
 //! cut it (convergence is the cure the budget can't afford).
 //!
-//! FIX STATUS: DEFERRED to the saturated-bed-creep redesign. Every damping knob was measured and
-//! rejected because the settled-pool stirring is the SAME open-water agitation that drives the
-//! deformable-bed crater slump: a global PIC blend quiets the pool but FREEZES the crater
-//! (twofield_full.rs); a φ_f-gated open-water-only blend froze it too (the slump is pond-driven);
-//! more fine sweeps INFLATE the pool ~5× (twofield_cavity.rs — they realize the relief's expansion
-//! target). No knob separates "quiet the cup" from "let the crater slump". The proper fix is to
-//! make the wet bed slump via genuine pore-pressure creep / saturation-softened yield (so the slump
-//! no longer needs numerical agitation), after which a global blend can quiet the pool safely.
+//! FIX STATUS: SHIPPED — a small global G2P PIC blend (`PIC_BLEND_DEFAULT`). The blend was held at
+//! 0 during the investigation because the stirring is the SAME open-water agitation that drove the
+//! OLD deformable-bed crater slump, so any blend that quiets the pool also "freezes" that slump.
+//! The resolution was NOT a damping knob but correcting the crater gate: a real wet bed HOLDS the
+//! poured crater (wet-sand plasticity — pour-over research), so a held crater is the CORRECT
+//! outcome. With the crater gate asserting persistence (`twofield_full.rs`, docs/plans/2026-06-15-001),
+//! the global blend is safe: it quiets the pool AND the crater correctly persists. Volume
+//! conservation was verified to hold at the shipped blend.
 //!
-//! This file therefore (1) GATES the bounded settled-pool KE that holds at the pure-APIC baseline
-//! (the regression floor: KE stays bounded, no spontaneous spikes — the churn is bounded, not
-//! divergent), and (2) CHARACTERIZES the mechanism for the redesign (`isolate_…`). It asserts no
-//! shipped damping fix.
+//! This file (1) GATES the bounded settled-pool KE (the regression floor: KE stays bounded, no
+//! spontaneous spikes), now quieter under the shipped blend, and (2) CHARACTERIZES the mechanism
+//! (`isolate_…`: pure-PIC kills the carrier, relief-off cuts the source, the shipped blend quiets).
 
 #![allow(clippy::needless_range_loop)]
 

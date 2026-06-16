@@ -136,19 +136,19 @@ pub const JACOBI_OMEGA: f32 = 2.0 / 3.0;
 /// is the standard MPM damping that bleeds off the affine field's spurious rotational energy each
 /// transfer. DEFAULT 0 = pure APIC.
 ///
-/// This is NOT the settled-pool stirring fix. The stirring (a settled tank holds ~32× the pure-PIC
-/// tail KE under pure APIC; `tests/twofield_settled.rs` isolates it) was investigated exhaustively
-/// and the fix DEFERRED to the saturated-bed-creep redesign, because it is the SAME open-water
-/// agitation that drives the deformable-bed crater slump. Measured (`tests/twofield_settled.rs`,
-/// `twofield_full.rs`, `twofield_cavity.rs`): a global blend quiets the pool but FREEZES the crater
-/// slump; a φ_f-gated open-water-only blend ALSO froze it (the slump is pond-driven, not grain-
-/// driven); more pressure fine-sweeps INFLATE the pool ~5× (they realize the density relief's
-/// expansion target, which the under-converged baseline never reaches). No damping knob separates
-/// "quiet the cup" from "let the crater slump" — they are one agitation. The redesign makes the
-/// bed slump via genuine pore-pressure creep / saturation-softened yield, after which a global
-/// blend can quiet the pool safely. This knob stays for the APIC-vs-PIC gate (blend 1 ⇒ pure PIC)
-/// and for that future re-enable.
-pub const PIC_BLEND_DEFAULT: f32 = 0.0;
+/// This IS the settled-pool stirring fix (the user-reported open-water churn): a settled tank held
+/// ~32× the pure-PIC tail KE under pure APIC; a small blend bleeds that off (settled tail KE 67→21,
+/// max|v| 0.95→0.52). It was held at 0 during the investigation because the stirring is the SAME
+/// open-water agitation that drove the OLD deformable-bed crater slump, so any blend that quieted
+/// the pool also "froze" that slump. The fix was to correct the crater gate: a real wet bed HOLDS
+/// the poured crater (wet-sand plasticity — pour-over research), so a held crater is the CORRECT
+/// outcome, not a regression. With the gate asserting persistence (see `twofield_full.rs` and
+/// docs/plans/2026-06-15-001), the blend is safe to re-enable: it quiets the pool AND the crater
+/// correctly persists. Volume conservation was verified to hold at this blend (the
+/// `combined_conservation_v60_pour_deformable` + saturated-tail gates). blend 1 ⇒ pure PIC (the
+/// APIC-vs-PIC gate). The global blend is chosen over a φ_f-gated one because the held crater is
+/// now correct, so no gating is needed.
+pub const PIC_BLEND_DEFAULT: f32 = 0.05;
 
 /// Density-relief time constant in frames (mirrors `DENSITY_RELAX_FRAMES` in pressure.wgsl).
 /// A fixed structural constant like `JACOBI_OMEGA`: it closes the volume-conservation loop

@@ -189,15 +189,12 @@ fn g2p_water(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     let dinv = 4.0 / (h * h);
     // APIC↔PIC blend knob: scale the affine C by (1 − pic_blend) each transfer (the gathered
-    // velocity stays full APIC; the FLIP/PIC distinction lives entirely in C). DEFAULT 0 = pure
-    // APIC. This is NOT the settled-pool stirring fix — that was investigated and DEFERRED to the
-    // saturated-bed-creep redesign: the stirring is the same open-water agitation that drives the
-    // crater slump, so any blend that quiets the pool also freezes the crater (measured: a global
-    // blend froze it; a φ_f-gated open-water-only blend froze it too — the slump is pond-driven;
-    // and more pressure sweeps inflate the pool by realizing the relief's expansion target). The
-    // knob remains for the APIC-vs-PIC discrimination gate (pic_blend = 1 ⇒ pure PIC) and for the
-    // redesign, which can re-enable a global blend once the bed slumps via real pore-pressure creep
-    // rather than numerical agitation.
+    // velocity stays full APIC; the FLIP/PIC distinction lives entirely in C). A small blend (the
+    // production default) is the SHIPPED settled-pool stirring fix — it bleeds off the spurious
+    // affine ringing that re-energizes a settled pool. It is safe to apply globally because the
+    // crater gate now asserts the wet bed HOLDS its poured crater (wet-sand plasticity), so the
+    // blend "freezing" the crater is the correct outcome, not a regression (see PIC_BLEND_DEFAULT /
+    // twofield_full.rs). pic_blend = 1 ⇒ pure PIC (the APIC-vs-PIC discrimination gate).
     let apic_keep = 1.0 - params.pic_blend;
     var c0 = b0 * (dinv * apic_keep);
     var c1 = b1 * (dinv * apic_keep);

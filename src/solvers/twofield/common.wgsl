@@ -51,9 +51,8 @@ struct Params {
                      //  flag, V_dry = grain sphere volume π/6·d³)
     dbg: vec4<f32>,  // diagnostic toggles (test-only): .x = density-relief enable (1 = on);
                      //  .y carried a prototyped relief dead-band that was DROPPED — now unread
-                     //  (the settled-pool stirring fix is deferred to the bed-creep redesign; no
-                     //  damping knob fixes it without freezing the crater — see pressure.wgsl);
-                     //  .zw reserved
+                     //  (the settled-pool stirring fix is the G2P PIC blend, PIC_BLEND_DEFAULT —
+                     //  see transfers.wgsl / mod.rs); .zw reserved
 };
 
 @group(0) @binding(0) var<uniform> params: Params;
