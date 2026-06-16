@@ -152,6 +152,18 @@ const JACOBI_OMEGA: f32 = 0.6666667;
 // ≈ residual·N·dt ≈ 1% — inside the ±5% band — while keeping the relief of a seeded
 // over-density gentle, v ~ Δx/τ, instead of detonating it into slosh).
 const DENSITY_RELAX_FRAMES: f32 = 30.0;
+// SETTLED-POOL STIRRING — diagnosis (no in-solver fix yet; see twofield_settled.rs).
+// A settled pool slowly churns. Isolation (water tank, settled-tail KE): baseline ~67; relief OFF
+// ~7.6; 32 fine sweeps (vs 8) ~17; pure PIC (kill the affine C) ~1.3. So the mechanism is a limit
+// cycle: the local-Jacobi pressure solve is intentionally UNDER-converged (8+8 sweeps, no global
+// Poisson — the real-time design), leaving a standing density error; the density relief faithfully
+// converts that error into a velocity each frame; the lossless APIC affine field accumulates it (no
+// numerical dissipation); the pool sloshes and re-creates the error. Two clamps were MEASURED and
+// rejected: a global G2P APIC→PIC blend quiets the pool but freezes the deformable-bed crater slump
+// (which rides on the same agitation — even blend 0.02 froze it); a φ_f-gated relief dead-band does
+// not reach the churn (the standing error exceeds a tolerable band). The honest cures all trade a
+// pre-registered gate — more fine sweeps (R9 perf), carrier dissipation (the crater) — so the lever
+// is a product decision, deferred. The relief below stays the original un-banded feedback.
 // Free-surface fill-fraction constants (header: FREE SURFACE; mirrored in twofield/mod.rs).
 const SURF_FULL_FRAC: f32 = 0.5;
 const SURF_MIN_CORNER: f32 = 0.1;
@@ -439,7 +451,15 @@ fn cell_classify(@builtin(global_invocation_id) gid: vec3<u32>) {
     // tears open, MUST be re-compacted or it stands forever as a frozen void — observed).
     // The mean corner density rides along in .z for that pass (the residual lane, free until
     // `residual` runs).
-    let s_target = max(rho / params.extra.x - 1.0, 0.0) / (DENSITY_RELAX_FRAMES * params.dt);
+    // dbg.x gates the relief on/off (1 in production; 0 only in the stirring isolation arm). The
+    // relief is the original un-banded volume-conservation feedback. (A φ_f-gated dead-band — clamp
+    // the relief in open water to break the settled-pool limit cycle — was MEASURED and rejected:
+    // the settled density error the relief tracks exceeds the band, so a 1–2% dead-band does not
+    // reach the churn and a band large enough would tolerate that much permanent compression. The
+    // churn is pressure under-convergence, not a noise ripple a clamp can cut; see the
+    // DENSITY_RELAX_FRAMES header.)
+    let s_target =
+        params.dbg.x * max(rho / params.extra.x - 1.0, 0.0) / (DENSITY_RELAX_FRAMES * params.dt);
     cell_meta[c] = vec4<f32>(select(0.0, f * (s_target - div) / params.dt, f > 0.0), f, rho, cat);
 }
 

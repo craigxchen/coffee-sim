@@ -188,15 +188,20 @@ fn g2p_water(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
     let dinv = 4.0 / (h * h);
-    var c0 = b0 * dinv;
-    var c1 = b1 * dinv;
-    var c2 = b2 * dinv;
-    if (params.pic_mode != 0u) {
-        // Test-only PIC variant (the APIC-vs-PIC discrimination gate): drop the affine state.
-        c0 = vec3<f32>(0.0);
-        c1 = vec3<f32>(0.0);
-        c2 = vec3<f32>(0.0);
-    }
+    // APIC↔PIC blend knob: scale the affine C by (1 − pic_blend) each transfer (the gathered
+    // velocity stays full APIC; the FLIP/PIC distinction lives entirely in C). DEFAULT 0 = pure
+    // APIC. This is NOT the settled-pool stirring fix — that was investigated and DEFERRED to the
+    // saturated-bed-creep redesign: the stirring is the same open-water agitation that drives the
+    // crater slump, so any blend that quiets the pool also freezes the crater (measured: a global
+    // blend froze it; a φ_f-gated open-water-only blend froze it too — the slump is pond-driven;
+    // and more pressure sweeps inflate the pool by realizing the relief's expansion target). The
+    // knob remains for the APIC-vs-PIC discrimination gate (pic_blend = 1 ⇒ pure PIC) and for the
+    // redesign, which can re-enable a global blend once the bed slumps via real pore-pressure creep
+    // rather than numerical agitation.
+    let apic_keep = 1.0 - params.pic_blend;
+    var c0 = b0 * (dinv * apic_keep);
+    var c1 = b1 * (dinv * apic_keep);
+    var c2 = b2 * (dinv * apic_keep);
 
     // Velocity cap backstop (anti-blow-up; the other half of the FP headroom contract).
     let s = length(v);

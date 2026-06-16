@@ -29,7 +29,7 @@ struct Params {
     dt: f32,
     particle_mass: f32,  // per water particle (Materials::particle_mass)
     max_speed: f32,      // velocity cap — COUPLED to FP_SCALE (see headroom math below)
-    pic_mode: u32,       // test-only: 1 = zero the affine C in G2P (PIC variant for the APIC gate)
+    pic_blend: f32,      // APIC↔PIC blend = PIC fraction ∈ [0,1] (G2P scales the affine C by 1−blend)
     water_count: u32,    // particles [0, water_count) are water (KTD-1 range layout)
     solid_count: u32,    // particles [water_count, water_count + solid_count) are solid grains
     particle_count: u32, // = water_count + solid_count (kernel live-set guard)
@@ -49,6 +49,11 @@ struct Params {
                      //  absorb_roundoff — the f_w/V_abs saturation floor)
     wet1: vec4<f32>, // (suction body-force accel a_suction, bloom_delay seconds, filter_floor
                      //  flag, V_dry = grain sphere volume π/6·d³)
+    dbg: vec4<f32>,  // diagnostic toggles (test-only): .x = density-relief enable (1 = on);
+                     //  .y carried a prototyped relief dead-band that was DROPPED — now unread
+                     //  (the settled-pool stirring fix is deferred to the bed-creep redesign; no
+                     //  damping knob fixes it without freezing the crater — see pressure.wgsl);
+                     //  .zw reserved
 };
 
 @group(0) @binding(0) var<uniform> params: Params;

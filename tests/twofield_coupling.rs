@@ -1200,9 +1200,12 @@ fn face_velocity_consistency_rhs_carries_drag_and_phi() {
         let rho_rel = meta[c][2] as f64;
         let dtf = DT as f64;
         let relax = DENSITY_RELAX_FRAMES as f64 * dtf;
+        // Original deficit-driven relief, NO dead-band — mirrors the solver: cell_classify's
+        // over-density `max(rho/rest-1,0)` and pocket_mark's under-density `min(rho/rest-1,0)`.
+        // (A relief dead-band was prototyped and dropped; the stirring fix is the G2P PIC blend.)
         let mut rhs = f * ((rho_rel / REST - 1.0).max(0.0) / relax - div) / dtf;
         // pocket_mark's under-density half (interior cells away from air).
-        if meta[c][3] < 0.5 && rho_rel / REST < 1.0 {
+        if meta[c][3] < 0.5 && rho_rel / REST - 1.0 < 0.0 {
             let mut near_air = false;
             for a in 0..3usize {
                 for s in [-1i64, 1] {

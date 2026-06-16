@@ -382,6 +382,47 @@ fn solver_ref(s: &TwofieldSolver) -> &TwofieldSolver {
     s
 }
 
+/// DIAGNOSTIC sweep (ignored by default — run with `--ignored`): crater depth + persistence vs
+/// the APIC↔PIC blend, to choose the production `PIC_BLEND_DEFAULT` (the settle-vs-crater
+/// tradeoff). Prints the curve; asserts only that pure APIC (blend 0) clears the persistence
+/// floor (the crater baseline) so the tradeoff is real.
+#[test]
+#[ignore = "diagnostic sweep; run explicitly to retune PIC_BLEND_DEFAULT"]
+fn blend_sweep_crater_depth_and_persistence() {
+    let Some(gpu) = GpuContext::new_headless() else {
+        eprintln!("twofield_cavity: no GPU adapter; skipping.");
+        return;
+    };
+    let scene = jet_scene();
+    let quiet = EmissionInput::default();
+    let pour = jet_input();
+    println!("twofield crater blend sweep (depth floor {CAVITY_DEPTH_FLOOR}, persistence floor {PERSIST_FRAMES}):");
+    let mut blend0_run = 0usize;
+    for &blend in &[0.0f32, 0.03, 0.05, 0.08, 0.1, 0.15] {
+        let mut solver = TwofieldSolver::build(&scene, &Materials::default(), &jet_cfg(), &gpu);
+        solver.set_pic_blend_for_test(blend);
+        for _ in 0..SETTLE_FRAMES {
+            solver.step(DT, &quiet);
+        }
+        let h0 = surface_map(&solver).annulus();
+        let mut depths = Vec::with_capacity(JET_FRAMES);
+        for _ in 0..JET_FRAMES {
+            solver.step(DT, &pour);
+            depths.push(h0 - surface_map(&solver).annulus());
+        }
+        let max_depth = depths.iter().cloned().fold(f64::MIN, f64::max);
+        let run = longest_run_at_floor(&depths);
+        if blend == 0.0 {
+            blend0_run = run;
+        }
+        println!("  blend {blend:.2}: max depth {max_depth:.2} | persistence {run} frames");
+    }
+    assert!(
+        blend0_run >= PERSIST_FRAMES,
+        "pure-APIC crater baseline below the persistence floor ({blend0_run} < {PERSIST_FRAMES})"
+    );
+}
+
 // ==============================================================================================
 // Gate 2: BUBBLE SENSITIVITY — fine sweeps 8 vs 16 (constraint-erosion check)
 // ==============================================================================================

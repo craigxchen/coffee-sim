@@ -131,6 +131,25 @@ pub const FINE_SWEEPS_DEFAULT: u32 = 8;
 /// keeps ω·λ_max = 16/9 < 2 with healthy high-frequency smoothing.
 pub const JACOBI_OMEGA: f32 = 2.0 / 3.0;
 
+/// Default APIC↔PIC blend = the PIC fraction folded into the G2P affine reconstruction
+/// (`v_new` keeps full APIC velocity; the C matrix is scaled by `1 − PIC_BLEND`). A PIC fraction
+/// is the standard MPM damping that bleeds off the affine field's spurious rotational energy each
+/// transfer. DEFAULT 0 = pure APIC.
+///
+/// This is NOT the settled-pool stirring fix. The stirring (a settled tank holds ~32× the pure-PIC
+/// tail KE under pure APIC; `tests/twofield_settled.rs` isolates it) was investigated exhaustively
+/// and the fix DEFERRED to the saturated-bed-creep redesign, because it is the SAME open-water
+/// agitation that drives the deformable-bed crater slump. Measured (`tests/twofield_settled.rs`,
+/// `twofield_full.rs`, `twofield_cavity.rs`): a global blend quiets the pool but FREEZES the crater
+/// slump; a φ_f-gated open-water-only blend ALSO froze it (the slump is pond-driven, not grain-
+/// driven); more pressure fine-sweeps INFLATE the pool ~5× (they realize the density relief's
+/// expansion target, which the under-converged baseline never reaches). No damping knob separates
+/// "quiet the cup" from "let the crater slump" — they are one agitation. The redesign makes the
+/// bed slump via genuine pore-pressure creep / saturation-softened yield, after which a global
+/// blend can quiet the pool safely. This knob stays for the APIC-vs-PIC gate (blend 1 ⇒ pure PIC)
+/// and for that future re-enable.
+pub const PIC_BLEND_DEFAULT: f32 = 0.0;
+
 /// Density-relief time constant in frames (mirrors `DENSITY_RELAX_FRAMES` in pressure.wgsl).
 /// A fixed structural constant like `JACOBI_OMEGA`: it closes the volume-conservation loop
 /// (velocity-only projection cannot see accumulated positional compression), it is not a
@@ -139,6 +158,18 @@ pub const JACOBI_OMEGA: f32 = 2.0 / 3.0;
 /// seeded over-density (the lattice double-counts the wall layers by ~30%) injects v ~
 /// Δx/τ ≈ 0.6 instead of ~4.5 of slosh — the relief must correct volume, not detonate it.
 pub const DENSITY_RELAX_FRAMES: f32 = 30.0;
+
+/// Density-relief dead-band that was PROTOTYPED AND DROPPED. The idea: a settled pool leaves a
+/// small standing density ripple that, relieved every frame, feeds the stirring churn, so relieve
+/// only sustained compression. Measured: the standing density error the relief tracks EXCEEDS any
+/// safe band (a 1.5% band did not reach the churn; a band large enough would tolerate that much
+/// permanent compression), because the error is pressure under-convergence, not a noise ripple a
+/// clamp can cut. So the band is unused — the WGSL relief is the original un-banded feedback and
+/// `dbg.y` is unread (see pressure.wgsl / common.wgsl). The settled-pool stirring fix is deferred
+/// to the bed-creep redesign (see `PIC_BLEND_DEFAULT`). Retained only as the value the
+/// `set_relief_deadband_for_test` diagnostic seeds into `dbg.y` for the stirring-isolation arm in
+/// tests/twofield_settled.rs (a documented no-op since the kernels ignore it).
+pub const RELIEF_DEADBAND: f32 = 0.015;
 
 /// Free-surface fill-fraction constants (mirror `SURF_FULL_FRAC`/`SURF_MIN_CORNER` in
 /// pressure.wgsl — the ghost-fluid-style fraction weighting documented in its FREE SURFACE
@@ -295,7 +326,10 @@ struct Params {
     dt: f32,
     particle_mass: f32,
     max_speed: f32,
-    pic_mode: u32,       // test-only PIC variant flag (APIC-vs-PIC discrimination gate)
+    // APIC↔PIC blend = PIC fraction ∈ [0,1] applied to the G2P affine state (0 = pure APIC,
+    // 1 = pure PIC). A small default (PIC_BLEND_DEFAULT) damps the APIC rotational ringing that
+    // re-energizes a settled pool; the APIC-vs-PIC gate forces 1.0 via `set_pic_for_test`.
+    pic_blend: f32,
     water_count: u32,    // particles [0, water_count) are water (KTD-1 range layout)
     solid_count: u32,    // particles [water_count, water_count + solid_count) are solid grains
     particle_count: u32, // = water_count + solid_count (kernel live-set guard)
@@ -312,10 +346,14 @@ struct Params {
     // U9 infiltration interface (coupling.wgsl; mirrors models::wetting + the test UNIT MAPPING):
     wet0: [f32; 4], // (k_abs, V_cap = r_max·ρ_ratio·V_dry, V_w water vol, absorb_roundoff)
     wet1: [f32; 4], // (a_suction, bloom_delay, filter_floor flag, V_dry = π/6·d³)
+    // Diagnostic toggles (test-only; production keeps the defaults). .x = density-relief enable
+    // (1.0 on by default; 0.0 disables BOTH the cell_classify over-density relief and the
+    // pocket_mark under-density suction for the stirring-isolation gate). .yzw reserved (0).
+    dbg: [f32; 4],
 }
 
 // Params is uploaded as a uniform and must stay byte-identical to the WGSL `Params`.
-const _: () = assert!(std::mem::size_of::<Params>() == 240);
+const _: () = assert!(std::mem::size_of::<Params>() == 256);
 
 /// GPU record for one static SDF solid — byte-identical to the WGSL `Primitive` (64 bytes,
 /// vec4-aligned; mirrors the xpbd packing of `utils::sdf` primitives). Cone radii in `a` are
@@ -803,10 +841,28 @@ impl TwofieldSolver {
             .write_buffer(&self.cmat, 0, bytemuck::cast_slice(rows));
     }
 
-    /// Switch G2P to the PIC variant (C zeroed each step) — ONLY for the APIC-vs-PIC
+    /// Switch G2P to the pure-PIC variant (C fully zeroed each step) — ONLY for the APIC-vs-PIC
     /// discrimination gate; never set in production paths.
     pub fn set_pic_for_test(&mut self, pic: bool) {
-        self.params.pic_mode = u32::from(pic);
+        self.params.pic_blend = if pic { 1.0 } else { 0.0 };
+    }
+
+    /// Set the APIC↔PIC blend (PIC fraction ∈ [0,1]) directly — dev/test only (the
+    /// stirring-vs-crater tradeoff sweep). Production keeps `PIC_BLEND_DEFAULT`.
+    pub fn set_pic_blend_for_test(&mut self, blend: f32) {
+        self.params.pic_blend = blend.clamp(0.0, 1.0);
+    }
+
+    /// Toggle the density relief (over-density relief + under-density suction) — dev/test only,
+    /// for the spontaneous-stirring isolation gate. Production keeps relief ON.
+    pub fn set_relief_for_test(&mut self, on: bool) {
+        self.params.dbg[0] = if on { 1.0 } else { 0.0 };
+    }
+
+    /// Set the density-relief dead-band (fractional) — dev/test only. Production keeps
+    /// `RELIEF_DEADBAND`; the isolation gate sets 0 to reproduce the un-banded bug.
+    pub fn set_relief_deadband_for_test(&mut self, band: f32) {
+        self.params.dbg[1] = band.max(0.0);
     }
 
     /// Set the U3 pressure-budget knobs (KTD-9 grid points; dev/test only). `coarse_sweeps =
@@ -1397,7 +1453,7 @@ impl Solver for TwofieldSolver {
             dt: 1.0 / 60.0,
             particle_mass: mats.particle_mass,
             max_speed: cfg.max_speed,
-            pic_mode: 0,
+            pic_blend: PIC_BLEND_DEFAULT,
             water_count,
             solid_count,
             particle_count,
@@ -1457,6 +1513,9 @@ impl Solver for TwofieldSolver {
                 if cfg.tf_filter_floor { 1.0 } else { 0.0 },
                 grain_volume(mats.grain_diameter),
             ],
+            // Density relief ON (dbg.x) by default; relief dead-band (dbg.y) at RELIEF_DEADBAND.
+            // The isolation gate overrides these (relief off / dead-band 0).
+            dbg: [1.0, RELIEF_DEADBAND, 0.0, 0.0],
         };
         let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("twofield-params"),

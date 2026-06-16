@@ -313,6 +313,7 @@ fn apic_retains_angular_momentum_better_than_pic() {
         angular_momentum_y(&solver.read_positions(), &solver.read_velocities()) / l0
     };
 
+    solver.set_pic_for_test(false); // pure APIC arm (override the small production PIC blend)
     let apic_retention = run(&mut solver);
     solver.reset(&scene);
     solver.set_pic_for_test(true);
