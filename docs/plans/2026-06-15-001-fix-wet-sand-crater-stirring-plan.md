@@ -1,7 +1,7 @@
 ---
 date: 2026-06-15
 type: fix
-status: active
+status: completed
 origin: docs/brainstorms/2026-06-15-saturated-bed-effective-stress-requirements.md
 ---
 
