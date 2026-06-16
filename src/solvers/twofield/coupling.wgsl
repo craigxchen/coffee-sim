@@ -258,8 +258,11 @@ fn drag_fold(@builtin(global_invocation_id) gid: vec3<u32>) {
     // by one cell (WALL_BAND·h) on the FLUID side so the supporting layer of a non-grid-aligned
     // wall (e.g. the cup floor) is held — the SAME band node_setup uses to build the M̃⁻¹ wall
     // projector, so the pre-projection velocity field and the operator constrain the same axes
-    // (operator consistency). The normal is orthogonalized against the already-zeroed box-face
-    // axes and renormalized, exactly as in node_setup.
+    // (operator consistency — a one-sided BC here keeps the supporting layer's inward velocity
+    // that the symmetric M̃⁻¹ projector cannot correct, which both breaks A = D·M̃⁻¹·G AND, in the
+    // V60 cup, changed the filling dynamics enough to trap a spurious crushing pocket; reverted).
+    // The normal is orthogonalized against the already-zeroed box-face axes and renormalized,
+    // exactly as in node_setup.
     if (params.num_solids > 0u) {
         let hit = solid_union(xp, PHASE_WATER);
         if (hit.dist < WALL_BAND * params.grid_origin.w) {

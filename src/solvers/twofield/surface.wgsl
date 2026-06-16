@@ -191,8 +191,12 @@ fn pocket_mark(@builtin(global_invocation_id) gid: vec3<u32>) {
                 }
             }
         }
+        // params.dbg.x gates the suction on/off (production = on; the stirring isolation gate
+        // disables it). The deficit-driven suction is the original un-banded feedback — the
+        // settled-pool stirring fix is DEFERRED to the bed-creep redesign (see pressure.wgsl /
+        // PIC_BLEND_DEFAULT: no damping knob fixes it without freezing the crater).
         let deficit = min(cm.z / params.extra.x - 1.0, 0.0);
-        if (!near_air && deficit < 0.0) {
+        if (params.dbg.x > 0.5 && !near_air && deficit < 0.0) {
             let s_under = deficit / (DENSITY_RELAX_FRAMES * params.dt);
             cell_meta[c].x = cm.x + cm.y * s_under / params.dt;
         }
