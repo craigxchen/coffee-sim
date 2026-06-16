@@ -784,6 +784,22 @@ fn center_pour_crater_slumps_without_blend() {
 // capillary-cohesion contribution shows up at PARTIAL saturation, exercised by the U3 contrast probe.
 
 // ==============================================================================================
+// EFFECTIVE-STRESS DEPENDENCE (R1/R2) — coverage note
+// ==============================================================================================
+// R1/R2 (the bed's yield is governed by effective stress = total − pore pressure; the bed is weaker
+// when flooded) are validated by the effective-stress gates already in this file plus the crater,
+// NOT by a standalone "flooded deforms more" deformation probe. A surcharge-deformation probe was
+// prototyped and DROPPED: under a 2× gravity surcharge the stiff, already-consolidated bed shows no
+// measurable grain settlement in EITHER saturation state (the load transfers to pore pressure à la
+// Skempton then dissipates, but the grain positions barely move) — the volumetric deformation is
+// sub-measurable, and a shear/crater contrast is confounded by pour-wetting. What IS measurable and
+// IS asserted: `static_saturated_column_stress_partition_audit` (σ_total = σ' + u — the skeleton's
+// yield operates on the effective stress), the Skempton-B + load-sharing arm and `terzaghi_…`
+// consolidation (the pore-pressure ↔ effective-stress dynamics), and `center_pour_…_and_holds` (the
+// crater is a large SHEAR deformation that only forms because the flooded bed yields). Together
+// these pin the effective-stress dependence directly.
+
+// ==============================================================================================
 // NO FLUIDIZATION
 // ==============================================================================================
 
