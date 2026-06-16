@@ -653,7 +653,10 @@ fn run_center_pour_crater(gpu: &GpuContext, blend: f32, wet_cohesion: f32) -> Cr
     for _ in 0..200 {
         bed.solver.step(DT, &quiet);
     }
-    assert!(all_finite(&bed.solver.read_positions()), "settle non-finite");
+    assert!(
+        all_finite(&bed.solver.read_positions()),
+        "settle non-finite"
+    );
     let base_cols = bed_surface_map(&bed.solver);
     let base_center = surface_band(&base_cols, axis, 0.0, 2.0);
     let base_rim = surface_band(&base_cols, axis, 6.0, 9.0);
