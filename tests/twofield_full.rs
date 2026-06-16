@@ -49,7 +49,7 @@ use coffee_sim::engine::scene::{SeedRegion, Species};
 use coffee_sim::engine::Scene;
 use coffee_sim::models::{cohesion, Materials};
 use coffee_sim::solvers::base::Solver;
-use coffee_sim::solvers::twofield::{plasticity, TwofieldSolver};
+use coffee_sim::solvers::twofield::{plasticity, TwofieldSolver, PIC_BLEND_DEFAULT};
 use coffee_sim::utils::config::Config;
 use coffee_sim::utils::gpu::GpuContext;
 use coffee_sim::EmissionInput;
@@ -74,11 +74,13 @@ const JET_FLOW: f32 = 70.0; // units³/s — a vigorous pour-strength jet (under
                             // is measured AGAINST the swelling lift (the swollen baseline), so a positive value is a true
                             // depression below the raised surface, not a swelling artifact.
 const CRATER_DEPTH_FLOOR: f64 = 0.5 * JET_RADIUS; // 0.75 su
-                                                  // CRATER COLLAPSE: when the jet stops, the walls slump — the crater relaxes toward the
-                                                  // swollen-flat profile; residual depth must fall to ≤ this fraction of the peak crater depth
-                                                  // (tensile-apex behavior, no frozen spikes). NOT all the way to zero (a deformable bed keeps a
-                                                  // shallow dimple, unlike free water) — the gate is the RELAXATION, not full re-leveling.
-const COLLAPSE_RESIDUAL_FRAC: f64 = 0.6;
+                                                  // CRATER PERSISTENCE: when the jet stops the wet bed HOLDS the poured crater (wet-sand
+                                                  // plasticity — a real pour-over bed retains the pour topography; the Rao Spin exists precisely
+                                                  // because an un-agitated bed does NOT self-level). The crater must persist to ≥ this fraction
+                                                  // of its peak depth after a long drain — the OPPOSITE of the old collapse target, which rewarded
+                                                  // the numerical-agitation slump. Measured on the absolute pit displacement (rim-swell-corrected)
+                                                  // AND the rim−center differential; U4 calibrates the final value from the measured held depth.
+const PERSIST_RESIDUAL_FRAC: f64 = 0.8; // "holds almost fully"; measured hold 97–100%, slump (blend 0) 14%
 
 // --- NO FLUIDIZATION ---
 // Saturated bed under sustained pour does not fluidize: the skeleton holds — the xpbd-style
@@ -607,16 +609,23 @@ fn wet_cohesion_bishop_wiring_is_consistent() {
 // CRATER (the L3 physics gate)
 // ==============================================================================================
 
-/// A center pour craters the saturated DEFORMABLE bed: a signed center-vs-rim depression below
-/// the swollen-flat surface that exceeds the pre-committed floor (vs main/xpbd ≈ 0). The pour
-/// reuses the U4 emission path; impact momentum arrives through the shared-grid drag/contact
-/// path (no pairwise bolt-ons). Then COLLAPSE: when the jet stops the walls slump toward flat.
-#[test]
-fn center_pour_craters_saturated_deformable_bed_then_collapses() {
-    let Some(gpu) = GpuContext::new_headless() else {
-        eprintln!("twofield_full: no GPU adapter; skipping.");
-        return;
-    };
+/// Persistence metrics from the center-pour crater scenario. The pit is measured two ways: the
+/// rim−center DIFFERENTIAL (the original metric — but inversion turns a swelling rim from a
+/// conservative friend into a passing accomplice), and the ABSOLUTE pit displacement below the
+/// pre-pour baseline (`base_center − center`), which subtracts the rim-swell confound (F1).
+struct CraterMetrics {
+    peak_diff: f64,     // max (rim − center) during the pour
+    residual_diff: f64, // (rim − center) after the long drain, clamped ≥ 0
+    pit_peak: f64,      // base_center − center_min (deepest carve below the pre-pour bed top)
+    pit_residual: f64,  // base_center − center_final (how far the center is STILL below pre-pour)
+    rim_swell: f64,     // rim_final − base_rim (reported so the hold is not a rim artifact)
+}
+
+/// Run the center-pour crater scenario at a given PIC blend and wet cohesion, returning the
+/// persistence metrics. Settle → pour (carve) → long drain. The wet-sand target is that the pit
+/// HOLDS after the drain; the negative controls vary blend (agitation) and cohesion to prove the
+/// hold is effective-stress cohesion, not numerical agitation.
+fn run_center_pour_crater(gpu: &GpuContext, blend: f32, wet_cohesion: f32) -> CraterMetrics {
     let bx = [24.0f32, 30.0, 24.0];
     let bed_top = 8.0f32;
     let axis = (bx[0] as f64 / 2.0, bx[2] as f64 / 2.0);
@@ -631,29 +640,23 @@ fn center_pour_craters_saturated_deformable_bed_then_collapses() {
         cfg: Config {
             solid_dynamics: true,
             nozzle_radius: JET_RADIUS as f32,
-            tf_wet_cohesion: 4.0, // wet bed → steeper walls (effective-stress cohesion)
+            tf_wet_cohesion: wet_cohesion, // wet bed → steeper walls (effective-stress cohesion)
             tf_cohesion_speak: 0.4,
             tf_filter_floor: true, // let pour-water drain so the bed doesn't just flood
             ..Config::default()
         },
     };
-    let mut bed = build_bed(&gpu, &spec);
+    let mut bed = build_bed(gpu, &spec);
+    bed.solver.set_pic_blend_for_test(blend);
     let quiet = EmissionInput::default();
     // Settle the saturated deformable bed (no pour): establishes the swollen-flat baseline.
     for _ in 0..200 {
         bed.solver.step(DT, &quiet);
     }
-    assert!(
-        all_finite(&bed.solver.read_positions()),
-        "settle non-finite"
-    );
+    assert!(all_finite(&bed.solver.read_positions()), "settle non-finite");
     let base_cols = bed_surface_map(&bed.solver);
     let base_center = surface_band(&base_cols, axis, 0.0, 2.0);
     let base_rim = surface_band(&base_cols, axis, 6.0, 9.0);
-    let base_flat = surface_band(&base_cols, axis, 0.0, 9.0);
-    println!(
-        "twofield U7 crater baseline (swollen-flat): center {base_center:.2}, rim {base_rim:.2}, flat {base_flat:.2}"
-    );
 
     // Pour ON: a center jet from above the bed.
     let pour = EmissionInput {
@@ -662,52 +665,123 @@ fn center_pour_craters_saturated_deformable_bed_then_collapses() {
         pour_angle: 0.0,
         ..EmissionInput::default()
     };
-    let mut peak_depth = 0.0f64;
+    let mut peak_diff = 0.0f64;
+    let mut center_min = base_center;
     for f in 0..240 {
         bed.solver.step(DT, &pour);
         if f % 10 == 0 {
             let cols = bed_surface_map(&bed.solver);
             let center = surface_band(&cols, axis, 0.0, 2.0);
             let rim = surface_band(&cols, axis, 6.0, 9.0);
-            // Signed depression below the SWOLLEN surface: rim is the lifted reference, center
-            // is the dug pit. Measured against the swelling baseline (rim ≥ base_rim under
-            // ongoing swelling), so a positive depth is a true crater, not a swelling artifact.
-            let depth = rim - center;
-            peak_depth = peak_depth.max(depth);
-            if f % 40 == 0 {
-                println!(
-                    "  crater probe frame {f}: center {center:.2}, rim {rim:.2}, depth {depth:.2}"
-                );
-            }
+            peak_diff = peak_diff.max(rim - center);
+            center_min = center_min.min(center);
         }
     }
     assert!(all_finite(&bed.solver.read_positions()), "pour non-finite");
-    println!(
-        "twofield U7 CRATER: peak signed depth {peak_depth:.3} su (floor {CRATER_DEPTH_FLOOR}, vs main/xpbd ≈ 0)"
-    );
-    assert!(
-        peak_depth >= CRATER_DEPTH_FLOOR,
-        "crater depth {peak_depth:.3} below the pre-committed floor {CRATER_DEPTH_FLOOR} \
-         — HALT: the L3 crater floor is not met (center pour, drag_scale 0.30, wet cohesion 4.0)"
-    );
 
-    // COLLAPSE: stop the jet; the walls slump toward the swollen-flat profile.
+    // DRAIN: stop the jet; a wet-sand bed HOLDS the crater, free water would slump.
     for _ in 0..400 {
         bed.solver.step(DT, &quiet);
     }
+    assert!(all_finite(&bed.solver.read_positions()), "drain non-finite");
     let cols = bed_surface_map(&bed.solver);
-    let center = surface_band(&cols, axis, 0.0, 2.0);
-    let rim = surface_band(&cols, axis, 6.0, 9.0);
-    let residual = (rim - center).max(0.0);
+    let center_final = surface_band(&cols, axis, 0.0, 2.0);
+    let rim_final = surface_band(&cols, axis, 6.0, 9.0);
+    CraterMetrics {
+        peak_diff,
+        residual_diff: (rim_final - center_final).max(0.0),
+        pit_peak: (base_center - center_min).max(0.0),
+        pit_residual: (base_center - center_final).max(0.0),
+        rim_swell: rim_final - base_rim,
+    }
+}
+
+/// A center pour craters the saturated DEFORMABLE bed, and the crater PERSISTS after drawdown —
+/// wet-sand plasticity (the wet bed holds the pour topography; a real pour-over bed does not
+/// self-level). Runs at the PRODUCTION blend (open-water agitation damped), so a persisting crater
+/// here is the held wet-sand crater, not numerical agitation. Persistence is asserted on BOTH the
+/// rim−center differential AND the absolute pit displacement (rim-swell-corrected, F1). The hold is
+/// effective-stress FRICTION (the DP cone), not capillary cohesion (which is ~0 at full saturation);
+/// it is proven physics-not-agitation by control A below (blend 0 slumps) + the soil-mechanics gates
+/// (Terzaghi/Skempton/stress-partition validate the yield). See docs/plans/2026-06-15-001.
+#[test]
+fn center_pour_craters_saturated_deformable_bed_and_holds() {
+    let Some(gpu) = GpuContext::new_headless() else {
+        eprintln!("twofield_full: no GPU adapter; skipping.");
+        return;
+    };
+    let m = run_center_pour_crater(&gpu, PIC_BLEND_DEFAULT, 4.0);
     println!(
-        "twofield U7 CRATER COLLAPSE: residual depth {residual:.3} su vs peak {peak_depth:.3} (≤ {COLLAPSE_RESIDUAL_FRAC} of peak)"
+        "twofield U7 CRATER HOLDS (blend {PIC_BLEND_DEFAULT}): peak_diff {:.3}, residual_diff {:.3} ({:.0}% of peak) | abs pit_peak {:.3}, pit_residual {:.3} ({:.0}% of peak) | rim_swell {:.3} | persist gate ≥ {PERSIST_RESIDUAL_FRAC}",
+        m.peak_diff, m.residual_diff, 100.0 * m.residual_diff / m.peak_diff.max(1e-9),
+        m.pit_peak, m.pit_residual, 100.0 * m.pit_residual / m.pit_peak.max(1e-9), m.rim_swell
     );
+    // Forms: the jet carves a crater above the floor while pouring.
     assert!(
-        residual <= COLLAPSE_RESIDUAL_FRAC * peak_depth,
-        "crater did not slump: residual {residual:.3} > {COLLAPSE_RESIDUAL_FRAC} × peak {peak_depth:.3} \
-         (frozen spike — tensile-apex relaxation absent)"
+        m.peak_diff >= CRATER_DEPTH_FLOOR,
+        "crater did not form: peak {:.3} < floor {CRATER_DEPTH_FLOOR}",
+        m.peak_diff
+    );
+    // Persists (differential): the rim−center depression holds a large fraction of peak.
+    assert!(
+        m.residual_diff >= PERSIST_RESIDUAL_FRAC * m.peak_diff,
+        "crater differential did not persist: residual {:.3} < {PERSIST_RESIDUAL_FRAC} × peak {:.3} \
+         (the crater slumped — wet-sand plasticity should HOLD it)",
+        m.residual_diff,
+        m.peak_diff
+    );
+    // Persists (absolute, rim-swell-corrected): the center stayed depressed below the pre-pour
+    // level — NOT a differential artifact carried by an over-swelling rim (F1).
+    assert!(
+        m.pit_residual >= PERSIST_RESIDUAL_FRAC * m.pit_peak,
+        "crater pit relaxed in absolute terms: pit_residual {:.3} < {PERSIST_RESIDUAL_FRAC} × pit_peak {:.3} \
+         — the center rose back toward flat (the differential hold would be a rim-swelling artifact)",
+        m.pit_residual,
+        m.pit_peak
     );
 }
+
+/// Negative control A — agitation isolation (the decouple proof). The SAME scene at blend 0
+/// (open-water agitation present) must SLUMP: the numerical agitation shakes the bed loose. This is
+/// the behavior the OLD collapse gate rewarded. Together with the soil-mechanics gates (which prove
+/// the DP yield holding the crater is real effective stress, not numerical), this establishes the
+/// persistence is physics, not agitation. NOTE the absolute pit metric is essential here: at blend 0
+/// the rim−center differential still reads ~2 (rim swelling), but the absolute pit drops to ~14% —
+/// only the absolute metric reveals the slump.
+#[test]
+fn center_pour_crater_slumps_without_blend() {
+    let Some(gpu) = GpuContext::new_headless() else {
+        eprintln!("twofield_full: no GPU adapter; skipping.");
+        return;
+    };
+    let m = run_center_pour_crater(&gpu, 0.0, 4.0);
+    println!(
+        "twofield U7 CONTROL A (blend 0, agitation): pit_peak {:.3}, pit_residual {:.3} ({:.0}% of peak) | residual_diff {:.3}",
+        m.pit_peak,
+        m.pit_residual,
+        100.0 * m.pit_residual / m.pit_peak.max(1e-9),
+        m.residual_diff
+    );
+    assert!(
+        m.pit_residual < PERSIST_RESIDUAL_FRAC * m.pit_peak,
+        "control A did NOT slump: at blend 0 the agitation should slump the crater, but the pit held \
+         (pit_residual {:.3} ≥ {PERSIST_RESIDUAL_FRAC} × pit_peak {:.3}) — the gate cannot distinguish \
+         agitation-slumped from physics-held",
+        m.pit_residual,
+        m.pit_peak
+    );
+}
+
+// Note: a cohesion-isolation control (cohesion off → must slump) was prototyped and DROPPED. At the
+// fully-saturated crater (sat_frac 1.0) the Bishop capillary-cohesion tent is ~0 BY DESIGN (capillary
+// cohesion peaks at PARTIAL saturation and vanishes when submerged — pour-over / wet-granular
+// physics), so disabling `tf_wet_cohesion` changes the saturated crater nothing: it holds on the
+// effective-stress FRICTION (the Drucker-Prager cone), not capillary cohesion. Measured: cohesion 4
+// and cohesion 0 both held the pit at 100%. The "hold is physics, not numerical agitation" proof is
+// therefore control A above (agitation slumps it — the absolute pit drops to 14%) PLUS the soil-
+// mechanics gates that validate the DP yield is real effective stress: `terzaghi_consolidation_…`,
+// the Skempton-B arm, and `static_saturated_column_stress_partition_audit` (σ_total = σ' + u). The
+// capillary-cohesion contribution shows up at PARTIAL saturation, exercised by the U3 contrast probe.
 
 // ==============================================================================================
 // NO FLUIDIZATION
