@@ -246,6 +246,79 @@ fn probe(
     }
 }
 
+/// VALIDATION (high-level, #[ignore] diagnostic): do the three water-side symptoms — corner/wall
+/// over-pack, settled stirring, and not-reaching-hydrostatic-rest (floor over-compression) — share
+/// the SAME root: the ∇·v-only under-converged pressure with no density constraint? Decisive test:
+/// if the root is UNDER-CONVERGENCE, cranking the fine-sweep budget fixes them; if the root is the
+/// MODEL (a compacted static pool has ∇·v=0, so converging ∇·v→0 leaves the wrong density), more
+/// sweeps change nothing (or detonate via the one-sided relief). Measures all three on the real
+/// v60_cup_static_full in SINGLE mode (the base model, no corner-BC patch) across sweep/relief
+/// interventions. `cargo test ... validate_pressure_model_root -- --ignored --nocapture`.
+#[test]
+#[ignore = "on-demand high-level diagnostic (slow); validates the shared pressure-model root"]
+fn validate_pressure_model_root() {
+    let Some(gpu) = GpuContext::new_headless() else {
+        return;
+    };
+    let quiet = EmissionInput::default();
+    // ρ_rest calibration: a flat box interior at rest (same spacing).
+    let rest = {
+        let mut s = TwofieldSolver::build(&box_scene(), &web_mats(), &web_cfg(), &gpu);
+        for _ in 0..SETTLE {
+            s.step(DT, &quiet);
+        }
+        let pos = s.read_positions();
+        let n = s.phase_counts().0 as usize;
+        mean_nb(&pos[..n], (-0.6, 0.6), (-4.0, -3.0), 0.6)
+            .0
+            .max(1.0)
+    };
+    let measure = |label: &str, fine_sweeps: u32, relief: bool| {
+        let mut s =
+            TwofieldSolver::build(&Scene::v60_cup_static_full(), &web_mats(), &web_cfg(), &gpu);
+        s.set_pressure_budget_for_test(4, 8, fine_sweeps);
+        s.set_relief_for_test(relief);
+        for _ in 0..400 {
+            s.step(DT, &quiet);
+        }
+        let pos = s.read_positions();
+        let nlive = s.phase_counts().0 as usize;
+        let cup: Vec<[f32; 4]> = pos[..nlive]
+            .iter()
+            .copied()
+            .filter(|p| p[1] <= -3.5 && p[1] >= -8.5)
+            .collect();
+        let ymin = cup.iter().map(|p| p[1]).fold(f32::INFINITY, f32::min);
+        let band = (ymin + 0.05, ymin + 0.05 + 2.0 * SPACING);
+        // (1) over-pack: wall shell + interior. (3) hydrostatic-rest proxy: floor-shell over-pack.
+        let wall = mean_nb_radial(&cup, 3.0 - 2.0 * SPACING, 3.0, band).0 / rest;
+        let interior = mean_nb_radial(&cup, 0.0, 1.0, band).0 / rest;
+        // (2) stirring: mean speed over massy cup nodes (the post-project settled field).
+        let gv = s.read_grid_velocities();
+        let (mut ssum, mut sn) = (0.0f64, 0u64);
+        for v in &gv {
+            if v[3] > 1.0e-6 {
+                ssum += (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt() as f64;
+                sn += 1;
+            }
+        }
+        let mean_speed = ssum / sn.max(1) as f64;
+        println!(
+            "[{label:<22}] wall ρ/ρ_rest={wall:.2}  interior ρ/ρ_rest={interior:.2}  settled mean|v|={mean_speed:.3}"
+        );
+    };
+    println!(
+        "\n==== PRESSURE-MODEL ROOT VALIDATION (v60_cup_static_full, SINGLE, 400 frames) ===="
+    );
+    println!("  ρ_rest (box interior) = {rest:.2}\n");
+    measure("baseline fine=8", 8, true);
+    measure("cranked fine=32", 32, true);
+    measure("cranked fine=64", 64, true);
+    measure("relief OFF fine=8", 8, false);
+    println!("  → if cranking does NOT reduce over-pack, the root is the MODEL (∇·v≠density), not convergence.");
+    println!("================================================================================\n");
+}
+
 /// Radial-shell neighbor mean for the real cylindrical V60 cup. (mean, n).
 fn mean_nb_radial(pos: &[[f32; 4]], rlo: f32, rhi: f32, yr: (f32, f32)) -> (f64, usize) {
     let r2 = (2.0 * SPACING) * (2.0 * SPACING);
