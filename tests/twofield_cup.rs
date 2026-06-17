@@ -28,7 +28,7 @@ use coffee_sim::engine::scene::{SeedRegion, Species};
 use coffee_sim::engine::Scene;
 use coffee_sim::models::Materials;
 use coffee_sim::solvers::base::Solver;
-use coffee_sim::solvers::twofield::TwofieldSolver;
+use coffee_sim::solvers::twofield::{TwofieldSolver, WALL_BC_MULTI, WALL_BC_SINGLE};
 use coffee_sim::utils::config::Config;
 use coffee_sim::utils::gpu::GpuContext;
 use coffee_sim::EmissionInput;
@@ -226,6 +226,91 @@ fn poured_cup_water_fills_not_corner() {
         settled_pocket_lambda < 100.0,
         "the standing cup pool grew a spurious crushing pocket: settled |λ|_max {settled_pocket_lambda:.1}"
     );
+}
+
+/// INVESTIGATION (CornerU4, on-demand diagnostic, NOT a gate): locate the air pocket multi mode
+/// traps during the pour. Pours then settles like `poured_cup_water_fills_not_corner`, dumping
+/// CELL_POCKET cells' (r,y) extent + bubble λ for SINGLE vs MULTI at two flow rates. Finding: the
+/// pocket is a VIOLENT-POUR (flow 8) plunge-trapped sub-floor air disc (r≈0.8–2.35, y≈−7.1) that
+/// MULTI's rigid corner ring seals (SINGLE leaves the corner radially free → air escapes); at
+/// gentle flow 3 MULTI traps nothing. So it's a dynamic fill-transient × corner-rigidity conflict,
+/// not a static-fix flaw. `cargo test ... investigate_pour_pocket -- --ignored --nocapture`.
+#[test]
+#[ignore = "on-demand diagnostic (slow: 3× pour runs); documents the multi-mode pour pocket"]
+fn investigate_pour_pocket() {
+    const CELL_POCKET: f32 = 2.0;
+    let Some(gpu) = GpuContext::new_headless() else {
+        return;
+    };
+    let run = |mode: f32, flow_rate: f32| {
+        let mut s =
+            TwofieldSolver::build(&Scene::v60_pour_water_only(), &web_mats(), &web_cfg(), &gpu);
+        s.set_wall_bc_mode_for_test(mode);
+        let pour = EmissionInput {
+            kettle_pos: [0.0, 5.0, 0.0],
+            flow_rate,
+            pour_angle: 0.0,
+            ..EmissionInput::default()
+        };
+        let quiet = EmissionInput::default();
+        let mut pour_lambda = 0.0f32;
+        for _ in 0..400 {
+            s.step(DT, &pour);
+            pour_lambda = pour_lambda.max(s.read_bubble()[0].abs());
+        }
+        let mut settle_lambda = 0.0f32;
+        for _ in 0..200 {
+            s.step(DT, &quiet);
+            settle_lambda = settle_lambda.max(s.read_bubble()[0].abs());
+        }
+        // Locate CELL_POCKET cells.
+        let (origin, h, dims) = s.grid_spec();
+        let nc = [
+            dims[0] as usize - 1,
+            dims[1] as usize - 1,
+            dims[2] as usize - 1,
+        ];
+        let meta = s.read_cell_meta();
+        let (mut n, mut rlo, mut rhi, mut ylo, mut yhi) = (
+            0usize,
+            f32::INFINITY,
+            0.0f32,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+        );
+        for (c, m) in meta.iter().enumerate() {
+            if (m[3] - CELL_POCKET).abs() < 0.5 {
+                let (i, j, k) = (c % nc[0], (c / nc[0]) % nc[1], c / (nc[0] * nc[1]));
+                let cx = origin[0] + (i as f32 + 0.5) * h;
+                let cy = origin[1] + (j as f32 + 0.5) * h;
+                let cz = origin[2] + (k as f32 + 0.5) * h;
+                let rr = (cx * cx + cz * cz).sqrt();
+                n += 1;
+                rlo = rlo.min(rr);
+                rhi = rhi.max(rr);
+                ylo = ylo.min(cy);
+                yhi = yhi.max(cy);
+            }
+        }
+        let mode_s = if mode > 0.5 { "MULTI " } else { "SINGLE" };
+        if n == 0 {
+            println!(
+                "[{mode_s}] pocket_cells=0  λ pour={pour_lambda:.1} settle={settle_lambda:.1}"
+            );
+        } else {
+            println!(
+                "[{mode_s}] pocket_cells={n}  r∈[{rlo:.2},{rhi:.2}] y∈[{ylo:.2},{yhi:.2}]  λ pour={pour_lambda:.1} settle={settle_lambda:.1}  (cup floor {CUP_FLOOR}, rim {CUP_RIM})"
+            );
+        }
+    };
+    println!("\n==== POUR-POCKET LOCALIZATION (v60 pour, 400 pour + 200 settle) ====");
+    print!("flow 8.0  ");
+    run(WALL_BC_SINGLE, 8.0);
+    print!("flow 8.0  ");
+    run(WALL_BC_MULTI, 8.0);
+    print!("flow 3.0  ");
+    run(WALL_BC_MULTI, 3.0); // gentler pour: dynamic-plunge mechanism if the pocket shrinks
+    println!("====================================================================\n");
 }
 
 // ---------------------------------------------------------------------------------------------
