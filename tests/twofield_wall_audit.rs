@@ -14,7 +14,7 @@ use coffee_sim::engine::scene::{SeedRegion, Species};
 use coffee_sim::engine::Scene;
 use coffee_sim::models::Materials;
 use coffee_sim::solvers::base::Solver;
-use coffee_sim::solvers::twofield::TwofieldSolver;
+use coffee_sim::solvers::twofield::{TwofieldSolver, WALL_BC_MULTI};
 use coffee_sim::utils::config::Config;
 use coffee_sim::utils::gpu::GpuContext;
 use coffee_sim::utils::sdf::{SdfPrimitive, SolidKind, MASK_WATER};
@@ -112,7 +112,7 @@ fn mean_nb(pos: &[[f32; 4]], xr: (f32, f32), yr: (f32, f32), zband: f32) -> (f64
         .iter()
         .copied()
         .filter(|p| {
-            p[0] >= xr.0 && p[0] <= xr.1 && p[1] >= yr.0 && p[1] <= yr.1 && p[2].abs() < zband
+            (xr.0..=xr.1).contains(&p[0]) && (yr.0..=yr.1).contains(&p[1]) && p[2].abs() < zband
         })
         .collect();
     if sel.is_empty() {
@@ -369,7 +369,8 @@ fn probe_v60_cup(gpu: &GpuContext, rest: f64) -> (f64, f64, f64, usize) {
         .copied()
         .filter(|p| {
             let rr = (p[0] * p[0] + p[2] * p[2]).sqrt();
-            rr >= 3.0 - 2.0 * SPACING && rr <= 3.0 && p[1] >= -8.0 && p[1] <= -8.0 + 2.0 * SPACING
+            (3.0 - 2.0 * SPACING..=3.0).contains(&rr)
+                && (-8.0..=-8.0 + 2.0 * SPACING).contains(&p[1])
         })
         .collect();
     let (corner_coarse, ncorner) =
@@ -560,5 +561,102 @@ fn aligned_square_localize_overpack() {
     assert!(
         a.interior_nb > 0.0 && b.side_nb > 0.0 && c.floor_nb > 0.0,
         "no particles measured in a shell"
+    );
+}
+
+// ---- U2: multi-normal operator-consistency gate -------------------------------------------------
+
+/// Octagon SDF cup: its vertical edges meet adjacent side faces at 45° → NON-orthogonal binding
+/// normals (dot ≈ 0.707). A raw Σ n̂n̂ᵀ projector would be non-PSD there; the orthonormal-basis
+/// P = I − QQᵀ must stay PSD.
+fn octagon_cup_scene() -> Scene {
+    Scene {
+        dose_g: 0.0,
+        water_ml: 100.0,
+        pour_water_ml: 0.0,
+        gravity: [0.0, -20.0, 0.0],
+        box_min: [-4.0, -8.0, -4.0],
+        box_max: [4.0, TOP_Y, 4.0],
+        regions: vec![slab(-4.8)],
+        solids: vec![SdfPrimitive {
+            kind: SolidKind::PolyCup {
+                center: Vec3::ZERO,
+                floor_y: -4.8,
+                rim_y: TOP_Y,
+                apothem: APOTHEM,
+                sides: 8,
+            },
+            species_mask: MASK_WATER,
+            friction: 0.0,
+        }],
+    }
+}
+
+/// Smallest eigenvalue of a symmetric 3×3 packed as (xx, xy, xz, yy, yz, zz) — Smith's closed form.
+fn min_eig_sym3(m: [f32; 6]) -> f64 {
+    let (xx, xy, xz, yy, yz, zz) = (
+        m[0] as f64,
+        m[1] as f64,
+        m[2] as f64,
+        m[3] as f64,
+        m[4] as f64,
+        m[5] as f64,
+    );
+    let p1 = xy * xy + xz * xz + yz * yz;
+    if p1 == 0.0 {
+        return xx.min(yy).min(zz);
+    }
+    let q = (xx + yy + zz) / 3.0;
+    let p2 = (xx - q).powi(2) + (yy - q).powi(2) + (zz - q).powi(2) + 2.0 * p1;
+    let p = (p2 / 6.0).sqrt();
+    let (bxx, byy, bzz) = ((xx - q) / p, (yy - q) / p, (zz - q) / p);
+    let (bxy, bxz, byz) = (xy / p, xz / p, yz / p);
+    let detb = bxx * (byy * bzz - byz * byz) - bxy * (bxy * bzz - byz * bxz)
+        + bxz * (bxy * byz - byy * bxz);
+    let r = (detb / 2.0).clamp(-1.0, 1.0);
+    let phi = r.acos() / 3.0;
+    let e1 = q + 2.0 * p * phi.cos();
+    let e3 = q + 2.0 * p * (phi + 2.0 * std::f64::consts::PI / 3.0).cos();
+    let e2 = 3.0 * q - e1 - e3;
+    e1.min(e2).min(e3)
+}
+
+/// CornerU2 operator-consistency gate: in WALL_BC_MULTI mode every per-node M̃⁻¹ stays symmetric
+/// POSITIVE-SEMIDEFINITE — even at the octagon's non-orthogonal vertical edges. This is the guard
+/// that the orthonormal basis (not a raw dyad sum) is used; a `Σ n̂n̂ᵀ` projector fails here
+/// (relative min eigenvalue ≈ −0.7). PSD M̃⁻¹ ⇒ A = D·M̃⁻¹·Dᵀ stays SPD (operator consistency).
+#[test]
+fn multi_normal_nm_is_psd_on_octagon_cup() {
+    let Some(gpu) = GpuContext::new_headless() else {
+        eprintln!("twofield_wall_audit: no GPU adapter; skipping.");
+        return;
+    };
+    let mut s = TwofieldSolver::build(&octagon_cup_scene(), &web_mats(), &web_cfg(), &gpu);
+    s.set_wall_bc_mode_for_test(WALL_BC_MULTI);
+    let quiet = EmissionInput::default();
+    for _ in 0..60 {
+        s.step(DT, &quiet);
+    }
+    let nm = s.read_node_matrices();
+    // Global matrix scale (≈ sig·invr ~ 1e-2). Fully-constrained nodes (P=0 ⇒ M̃⁻¹=0, e.g. floor +
+    // two octagon side faces spanning R³, like a box bottom-corner) are legitimately ~0; judge PSD
+    // by an ABSOLUTE eigenvalue floor scaled by this global scale, NOT a per-node relative ratio
+    // (which would amplify float noise at the zero nodes).
+    let mut global_scale = 0.0f64;
+    for m in &nm {
+        global_scale = global_scale.max(m[0].abs().max(m[3].abs()).max(m[5].abs()) as f64);
+    }
+    let mut min_eig = f64::INFINITY;
+    for m in &nm {
+        min_eig = min_eig.min(min_eig_sym3([m[0], m[1], m[2], m[3], m[4], m[5]]));
+    }
+    let floor = -1.0e-3 * global_scale;
+    println!(
+        "octagon WALL_BC_MULTI: min eigenvalue of M̃⁻¹ = {min_eig:.3e} (global scale {global_scale:.3e}, PSD floor {floor:.3e})"
+    );
+    assert!(
+        min_eig > floor,
+        "M̃⁻¹ went non-PSD under non-orthogonal octagon-edge normals (min eig {min_eig:.3e} < {floor:.3e}) \
+         — the projector must be orthonormal I−QQᵀ, not a raw Σ n̂n̂ᵀ"
     );
 }
