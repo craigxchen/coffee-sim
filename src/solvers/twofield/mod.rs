@@ -159,13 +159,15 @@ pub const PIC_BLEND_DEFAULT: f32 = 0.05;
 /// Δx/τ ≈ 0.6 instead of ~4.5 of slosh — the relief must correct volume, not detonate it.
 pub const DENSITY_RELAX_FRAMES: f32 = 30.0;
 
-/// SDF wall-BC mode selector, written to `dbg.y` and read by `wall_coverage` (pressure.wgsl).
-/// `BINARY` is the pre-coverage no-penetration band (byte-identical default); `COVERAGE` enables
-/// the graded embedded-boundary coverage weight (plan 2026-06-17-001 — the L1 soft-penalty path,
-/// flipped on in U3 after calibration). `dbg.y` previously carried a prototyped relief dead-band
-/// that was dropped (the settled-pool stirring fix is the G2P PIC blend, `PIC_BLEND_DEFAULT`).
-pub const WALL_BC_BINARY: f32 = 0.0;
-pub const WALL_BC_COVERAGE: f32 = 1.0;
+/// SDF wall-BC mode selector, written to `dbg.y` and read in pressure.wgsl/coupling.wgsl
+/// (`wall_bc_multi`). `SINGLE` is the original single-most-penetrated-normal banded BC
+/// (byte-identical default); `MULTI` is the orthonormal-basis projector P = I − Q·Qᵀ over ALL
+/// in-band faces (plan 2026-06-17-002 — constrains BOTH surfaces at a concave floor∩wall seam),
+/// flipped on in U3 after the corner-audit confirms box parity. `dbg.y` previously carried a
+/// prototyped relief dead-band that was dropped (the settled-pool stirring fix is the G2P PIC
+/// blend, `PIC_BLEND_DEFAULT`).
+pub const WALL_BC_SINGLE: f32 = 0.0;
+pub const WALL_BC_MULTI: f32 = 1.0;
 
 /// Free-surface fill-fraction constants (mirror `SURF_FULL_FRAC`/`SURF_MIN_CORNER` in
 /// pressure.wgsl — the ghost-fluid-style fraction weighting documented in its FREE SURFACE
@@ -870,9 +872,9 @@ impl TwofieldSolver {
         self.params.dbg[0] = if on { 1.0 } else { 0.0 };
     }
 
-    /// Select the SDF wall-BC mode (`dbg.y`) — dev/test only. `WALL_BC_BINARY` (≤ 0.5) is the
-    /// no-penetration band; `WALL_BC_COVERAGE` (> 0.5) is the graded embedded-boundary weight.
-    /// Production default is `WALL_BC_BINARY` until U3 flips it post-calibration.
+    /// Select the SDF wall-BC mode (`dbg.y`) — dev/test only. `WALL_BC_SINGLE` (≤ 0.5) is the
+    /// single-normal banded BC; `WALL_BC_MULTI` (> 0.5) is the orthonormal-basis multi-normal
+    /// projector. Production default is `WALL_BC_SINGLE` until U3 flips it post-calibration.
     pub fn set_wall_bc_mode_for_test(&mut self, mode: f32) {
         self.params.dbg[1] = mode;
     }
@@ -1527,7 +1529,7 @@ impl Solver for TwofieldSolver {
             ],
             // Density relief ON (dbg.x) by default; SDF wall BC in BINARY mode (dbg.y) until U3
             // flips it. Tests override via set_relief_for_test / set_wall_bc_mode_for_test.
-            dbg: [1.0, WALL_BC_BINARY, 0.0, 0.0],
+            dbg: [1.0, WALL_BC_SINGLE, 0.0, 0.0],
         };
         let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("twofield-params"),

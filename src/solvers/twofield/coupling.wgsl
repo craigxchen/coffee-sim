@@ -249,36 +249,45 @@ fn drag_fold(@builtin(global_invocation_id) gid: vec3<u32>) {
         react[n] = vec4<f32>(imp, sig);
         return;
     }
-    // Domain-box faces: full normal component removed (free slip tangentially), matching the
-    // constrained M̃⁻¹. The open base keeps the y-min face open for the water field.
-    if (xp.x <= params.box_min.x + eps || xp.x >= params.box_max.x - eps) { v.x = 0.0; }
-    if ((xp.y <= params.box_min.y + eps && !open_base) || xp.y >= params.box_max.y - eps) { v.y = 0.0; }
-    if (xp.z <= params.box_min.z + eps || xp.z >= params.box_max.z - eps) { v.z = 0.0; }
-    // Static SDF solids: remove the full normal component (mirrors utils/sdf.rs). Band the test
-    // by one cell (WALL_BAND·h) on the FLUID side so the supporting layer of a non-grid-aligned
-    // wall (e.g. the cup floor) is held — the SAME band node_setup uses to build the M̃⁻¹ wall
-    // projector, so the pre-projection velocity field and the operator constrain the same axes
-    // (operator consistency — a one-sided BC here keeps the supporting layer's inward velocity
-    // that the symmetric M̃⁻¹ projector cannot correct, which both breaks A = D·M̃⁻¹·G AND, in the
-    // V60 cup, changed the filling dynamics enough to trap a spurious crushing pocket; reverted).
-    // The normal is orthogonalized against the already-zeroed box-face axes and renormalized,
-    // exactly as in node_setup.
-    if (params.num_solids > 0u) {
-        let hit = solid_union(xp, PHASE_WATER);
-        // SAME coverage weight as node_setup's M̃⁻¹ dyad (operator consistency). Binary mode
-        // (default) returns 1.0 in-band → `v - 1.0·(v·n̂)n̂` is byte-identical to the old BC.
-        let wc = wall_coverage(hit.dist, params.grid_origin.w);
-        if (wc > 0.0) {
-            var nrm = hit.grad;
-            if (xp.x <= params.box_min.x + eps || xp.x >= params.box_max.x - eps) { nrm.x = 0.0; }
-            if ((xp.y <= params.box_min.y + eps && !open_base) || xp.y >= params.box_max.y - eps) { nrm.y = 0.0; }
-            if (xp.z <= params.box_min.z + eps || xp.z >= params.box_max.z - eps) { nrm.z = 0.0; }
-            let len = length(nrm);
-            if (len > SDF_NORMAL_MIN) {
-                nrm = nrm / len;
-                v = v - wc * dot(v, nrm) * nrm;
+    // Wall BC. The box-face normal components are removed (free slip tangentially), matching the
+    // constrained M̃⁻¹; the SDF wall adds its in-band normal(s). Both modes share the SAME basis
+    // node_setup builds (operator consistency A = D·M̃⁻¹·G; a one-sided BC here was tried and
+    // reverted). The open base keeps the y-min face open for the water field.
+    if (!wall_bc_multi()) {
+        // SINGLE-NORMAL (default): box-face axis zeroing + the most-penetrated SDF normal, banded,
+        // box-orthogonalized — byte-identical to the original BC.
+        if (xp.x <= params.box_min.x + eps || xp.x >= params.box_max.x - eps) { v.x = 0.0; }
+        if ((xp.y <= params.box_min.y + eps && !open_base) || xp.y >= params.box_max.y - eps) { v.y = 0.0; }
+        if (xp.z <= params.box_min.z + eps || xp.z >= params.box_max.z - eps) { v.z = 0.0; }
+        if (params.num_solids > 0u) {
+            let hit = solid_union(xp, PHASE_WATER);
+            if (hit.dist < WALL_BAND * params.grid_origin.w) {
+                var nrm = hit.grad;
+                if (xp.x <= params.box_min.x + eps || xp.x >= params.box_max.x - eps) { nrm.x = 0.0; }
+                if ((xp.y <= params.box_min.y + eps && !open_base) || xp.y >= params.box_max.y - eps) { nrm.y = 0.0; }
+                if (xp.z <= params.box_min.z + eps || xp.z >= params.box_max.z - eps) { nrm.z = 0.0; }
+                let len = length(nrm);
+                if (len > SDF_NORMAL_MIN) {
+                    nrm = nrm / len;
+                    v = v - dot(v, nrm) * nrm;
+                }
             }
         }
+    } else {
+        // MULTI-NORMAL: v ← P·v with P = I − Q·Qᵀ over the active box axes + ALL in-band wall faces
+        // — the IDENTICAL basis node_setup builds for M̃⁻¹ = invr·P (exact lockstep). box_mask
+        // matches the single path's box-face conditions; faces empty when no solids.
+        var box_mask = 0u;
+        if (xp.x <= params.box_min.x + eps || xp.x >= params.box_max.x - eps) { box_mask = box_mask | 1u; }
+        if ((xp.y <= params.box_min.y + eps && !open_base) || xp.y >= params.box_max.y - eps) { box_mask = box_mask | 2u; }
+        if (xp.z <= params.box_min.z + eps || xp.z >= params.box_max.z - eps) { box_mask = box_mask | 4u; }
+        var faces: WallFaces;
+        faces.count = 0u;
+        if (params.num_solids > 0u) {
+            faces = wall_binding_faces(xp, PHASE_WATER, WALL_BAND * params.grid_origin.w);
+        }
+        let cb = build_constraint_basis(box_mask, faces);
+        v = cbasis_project_vec(cb, v);
     }
     // Speed-cap backstop (couples to the FP headroom math in common.wgsl).
     let s = length(v);

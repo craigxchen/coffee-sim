@@ -326,6 +326,52 @@ fn wf_push(wf: ptr<function, WallFaces>, nrm: vec3<f32>) {
     }
 }
 
+// Orthonormal constraint basis Q (≤3 columns) for the MULTI-NORMAL wall BC: the active box-face
+// axes plus the in-band SDF wall normals, orthonormalized by modified Gram-Schmidt. The projector
+// is P = I − Q·Qᵀ — a TRUE orthogonal projector (PSD for ANY normals, even a non-orthogonal poly
+// vertical edge, where a raw Σ n̂n̂ᵀ would be non-PSD and break A = D·M̃⁻¹·G). `node_setup` builds
+// M̃⁻¹ = invr·P and `drag_fold` applies v ← P·v from the SAME basis (lockstep). box_mask bits:
+// 1 = x axis constrained, 2 = y, 4 = z (the axes node_setup/drag_fold zero on box faces). Rank-aware:
+// box axes first, then wall faces residualized + dropped if near-dependent, stop at rank 3 — so a
+// floor normal is never crowded out (the floor face is pushed first by wall_binding_faces).
+const CB_RESIDUAL_MIN: f32 = 1.0e-3;
+struct CBasis { q: array<vec3<f32>, 3>, count: u32 };
+
+fn cb_push_ortho(cb: ptr<function, CBasis>, v: vec3<f32>) {
+    if ((*cb).count >= 3u) { return; }
+    var r = v;
+    for (var j = 0u; j < (*cb).count; j = j + 1u) {
+        r = r - (*cb).q[j] * dot((*cb).q[j], r);
+    }
+    let len = length(r);
+    if (len > CB_RESIDUAL_MIN) {
+        (*cb).q[(*cb).count] = r / len;
+        (*cb).count = (*cb).count + 1u;
+    }
+}
+
+fn build_constraint_basis(box_mask: u32, faces: WallFaces) -> CBasis {
+    var cb: CBasis;
+    cb.count = 0u;
+    if ((box_mask & 1u) != 0u) { cb_push_ortho(&cb, vec3<f32>(1.0, 0.0, 0.0)); }
+    if ((box_mask & 2u) != 0u) { cb_push_ortho(&cb, vec3<f32>(0.0, 1.0, 0.0)); }
+    if ((box_mask & 4u) != 0u) { cb_push_ortho(&cb, vec3<f32>(0.0, 0.0, 1.0)); }
+    for (var i = 0u; i < faces.count; i = i + 1u) {
+        cb_push_ortho(&cb, faces.n[i]);
+    }
+    return cb;
+}
+
+// Apply P = I − Q·Qᵀ to a vector (Q orthonormal ⇒ subtract each column's projection of the
+// ORIGINAL v). Used by drag_fold for the velocity BC; node_setup builds the matrix form inline.
+fn cbasis_project_vec(cb: CBasis, v: vec3<f32>) -> vec3<f32> {
+    var out = v;
+    for (var i = 0u; i < cb.count; i = i + 1u) {
+        out = out - cb.q[i] * dot(cb.q[i], v);
+    }
+    return out;
+}
+
 fn wall_binding_faces(p: vec3<f32>, ph: u32, band: f32) -> WallFaces {
     var wf: WallFaces;
     wf.count = 0u;

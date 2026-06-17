@@ -180,21 +180,14 @@ const WALL_BAND: f32 = 1.0;
 // aid (no operator/BC effect), so it carries no operator-consistency constraint.
 const FLOOD_WALL_BAND: f32 = 2.0;
 
-// SDF wall no-penetration COVERAGE WEIGHT w ∈ [0,1], applied to BOTH the M̃⁻¹ wall dyad
-// (node_setup) and the velocity BC (drag_fold) in lockstep — they MUST share this weight or
-// A = D·M̃⁻¹·G breaks (the embedded-boundary coefficient, plan 2026-06-17-001 D1/D2). `dist` is
-// the signed SDF distance (fluid side ≥ 0); `h` the cell size.
-//   params.dbg.y ≤ 0.5  → BINARY band (default): w = 1 for dist < WALL_BAND·h, else 0 — bitwise
-//                          identical to the pre-coverage no-penetration band.
-//   params.dbg.y  > 0.5 → graded coverage (L1 soft penalty): w → 1 at the wall, → 0 one cell out.
-// The graded branch is a PLACEHOLDER (linear ramp) — U3 replaces it with the calibrated
-// near-wall-plateau form; U1 only stands up the selector and proves the binary path is inert.
-fn wall_coverage(dist: f32, h: f32) -> f32 {
-    if (params.dbg.y <= 0.5) {
-        return select(0.0, 1.0, dist < WALL_BAND * h);
-    }
-    return clamp(1.0 - dist / (WALL_BAND * h), 0.0, 1.0);
-}
+// SDF wall BC mode (params.dbg.y, plan 2026-06-17-002):
+//   ≤ 0.5  → WALL_BC_SINGLE (default): the single most-penetrated normal (solid_union) banded over
+//            WALL_BAND·h — the original behavior, kept byte-identical here.
+//   > 0.5  → WALL_BC_MULTI: the orthonormal-basis projector P = I − Q·Qᵀ over ALL in-band faces
+//            (build_constraint_basis in common.wgsl), constraining BOTH surfaces at a concave seam
+//            (the cup floor∩wall corner). node_setup builds M̃⁻¹ = invr·P; drag_fold applies
+//            v ← P·v from the SAME basis (lockstep — A = D·M̃⁻¹·G holds).
+fn wall_bc_multi() -> bool { return params.dbg.y > 0.5; }
 
 // --- fine-grid cell helpers --------------------------------------------------------------------
 fn fine_cells() -> vec3<u32> {
@@ -342,23 +335,42 @@ fn node_setup(@builtin(global_invocation_id) gid: vec3<u32>) {
         // SAME band is mirrored in drag_fold's velocity BC so the pre-projection field D sees and
         // M̃⁻¹ constrains the SAME axes (operator consistency A = D·M̃⁻¹·G).
         if (params.num_solids > 0u) {
-            let hit = solid_union(xp, PHASE_WATER);
-            // Coverage weight (lockstep with drag_fold's velocity BC). Binary mode (default,
-            // dbg.y ≤ 0.5) returns exactly 1.0 in-band / 0.0 out → `wc * invc == invc` bitwise,
-            // so this path is byte-identical to the pre-coverage band.
-            let wc = wall_coverage(hit.dist, h);
-            if (wc > 0.0) {
-                var nrm = hit.grad;
-                if (d.x == 0.0) { nrm.x = 0.0; }
-                if (d.y == 0.0) { nrm.y = 0.0; }
-                if (d.z == 0.0) { nrm.z = 0.0; }
-                let len = length(nrm);
-                if (len > SDF_NORMAL_MIN) {
-                    nrm = nrm / len;
-                    let invc = wc * max(max(d.x, d.y), d.z);
-                    a -= invc * vec4<f32>(nrm.x * nrm.x, nrm.x * nrm.y, nrm.x * nrm.z, nrm.y * nrm.y);
-                    b -= invc * vec4<f32>(nrm.y * nrm.z, nrm.z * nrm.z, 0.0, 0.0);
+            if (!wall_bc_multi()) {
+                // SINGLE-NORMAL (default): the most-penetrated normal, box-orthogonalized, banded.
+                let hit = solid_union(xp, PHASE_WATER);
+                if (hit.dist < WALL_BAND * h) {
+                    var nrm = hit.grad;
+                    if (d.x == 0.0) { nrm.x = 0.0; }
+                    if (d.y == 0.0) { nrm.y = 0.0; }
+                    if (d.z == 0.0) { nrm.z = 0.0; }
+                    let len = length(nrm);
+                    if (len > SDF_NORMAL_MIN) {
+                        nrm = nrm / len;
+                        let invc = max(max(d.x, d.y), d.z);
+                        a -= invc * vec4<f32>(nrm.x * nrm.x, nrm.x * nrm.y, nrm.x * nrm.z, nrm.y * nrm.y);
+                        b -= invc * vec4<f32>(nrm.y * nrm.z, nrm.z * nrm.z, 0.0, 0.0);
+                    }
                 }
+            } else {
+                // MULTI-NORMAL: rebuild M̃⁻¹ = invr·(I − Q·Qᵀ) over the active box axes + ALL in-band
+                // wall faces (orthonormal basis). Reduces to the single/box paths in their limits;
+                // PSD for any normals (even a non-orthogonal poly edge). drag_fold mirrors the SAME
+                // basis (lockstep). box_mask matches the box-face axes zeroed in `d` above.
+                var box_mask = 0u;
+                if (d.x == 0.0) { box_mask = box_mask | 1u; }
+                if (d.y == 0.0) { box_mask = box_mask | 2u; }
+                if (d.z == 0.0) { box_mask = box_mask | 4u; }
+                let faces = wall_binding_faces(xp, PHASE_WATER, WALL_BAND * h);
+                let cb = build_constraint_basis(box_mask, faces);
+                var pxx = 1.0; var pyy = 1.0; var pzz = 1.0;
+                var pxy = 0.0; var pxz = 0.0; var pyz = 0.0;
+                for (var i = 0u; i < cb.count; i = i + 1u) {
+                    let q = cb.q[i];
+                    pxx = pxx - q.x * q.x; pyy = pyy - q.y * q.y; pzz = pzz - q.z * q.z;
+                    pxy = pxy - q.x * q.y; pxz = pxz - q.x * q.z; pyz = pyz - q.y * q.z;
+                }
+                a = invr * vec4<f32>(pxx, pxy, pxz, pyy);
+                b = vec4<f32>(invr * pyz, invr * pzz, 1.0, 0.0);
             }
         }
         // ς fold (header: MIXTURE FAMILY): the projection's effective step at a drag node is
