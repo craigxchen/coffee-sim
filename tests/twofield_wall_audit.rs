@@ -14,7 +14,7 @@ use coffee_sim::engine::scene::{SeedRegion, Species};
 use coffee_sim::engine::Scene;
 use coffee_sim::models::Materials;
 use coffee_sim::solvers::base::Solver;
-use coffee_sim::solvers::twofield::{TwofieldSolver, WALL_BC_MULTI};
+use coffee_sim::solvers::twofield::{TwofieldSolver, WALL_BC_MULTI, WALL_BC_SINGLE};
 use coffee_sim::utils::config::Config;
 use coffee_sim::utils::gpu::GpuContext;
 use coffee_sim::utils::sdf::{SdfPrimitive, SolidKind, MASK_WATER};
@@ -565,6 +565,101 @@ fn aligned_square_localize_overpack() {
 }
 
 // ---- U2: multi-normal operator-consistency gate -------------------------------------------------
+
+/// CornerU3 corner-parity measurement: the SDF square cup floor∩wall corner ρ/ρ_rest in SINGLE
+/// (bug, ~2.4×) vs MULTI (fix → should reach box parity ~1.4×), with the flat box as the live
+/// reference. Print-first (calibrate-then-pin) + a two-sided parity assertion.
+#[test]
+fn corner_parity_multi_drops_to_box() {
+    let Some(gpu) = GpuContext::new_headless() else {
+        eprintln!("twofield_wall_audit: no GPU adapter; skipping.");
+        return;
+    };
+    let quiet = EmissionInput::default();
+    let corner_and_interior = |scene: &Scene, floor: f32, mode: f32| -> (f64, f64) {
+        let mut s = TwofieldSolver::build(scene, &web_mats(), &web_cfg(), &gpu);
+        s.set_wall_bc_mode_for_test(mode);
+        for _ in 0..SETTLE {
+            s.step(DT, &quiet);
+        }
+        let pos = s.read_positions();
+        let nlive = s.phase_counts().0 as usize;
+        let live = &pos[..nlive];
+        let corner = mean_nb(
+            live,
+            (APOTHEM - 2.0 * SPACING, APOTHEM),
+            (floor, floor + 2.0 * SPACING),
+            0.6,
+        )
+        .0;
+        let interior = mean_nb(live, (-0.6, 0.6), (floor + 0.8, floor + 1.8), 0.6).0;
+        (corner, interior)
+    };
+
+    // Flat box reference (no solids → box-face BC; the mode is irrelevant there).
+    let (box_corner, box_interior) = corner_and_interior(&box_scene(), -5.0, WALL_BC_SINGLE);
+    let rest = box_interior.max(1.0);
+    let box_c = box_corner / rest;
+    // SDF SQUARE cup: single (the bug) vs multi (the fix).
+    let sq_single = corner_and_interior(&sdf_floor_scene(), -4.8, WALL_BC_SINGLE).0 / rest;
+    let sq_multi = corner_and_interior(&sdf_floor_scene(), -4.8, WALL_BC_MULTI).0 / rest;
+    // ROUND (cylinder) cup: same orthogonal floor+radial seam.
+    let rd_single = corner_and_interior(&cyl_cup_scene(), -4.8, WALL_BC_SINGLE).0 / rest;
+    let rd_multi = corner_and_interior(&cyl_cup_scene(), -4.8, WALL_BC_MULTI).0 / rest;
+
+    println!("CORNER ρ/ρ_rest:  box(ref)={box_c:.3}");
+    println!("  square: SINGLE(bug)={sq_single:.3}  MULTI(fix)={sq_multi:.3}");
+    println!("  round:  SINGLE(bug)={rd_single:.3}  MULTI(fix)={rd_multi:.3}");
+
+    // Two-sided acceptance band for the MULTI corner: no over-pack (≤ box + margin) AND no
+    // depletion/void (≥ void_floor, well below rest). The band is NOT centered on the box —
+    // the box's own corner is mildly hydrostatically elevated (1.4×); a curved cup legitimately
+    // settles to rest (~1.0) there, which is correct, not a void.
+    let over_pack_cap = box_c + 0.35;
+    let void_floor = 0.65;
+    for (name, single, multi) in [
+        ("square", sq_single, sq_multi),
+        ("round", rd_single, rd_multi),
+    ] {
+        // The bug must be present in SINGLE mode (corner notably over the box).
+        assert!(
+            single > box_c + 0.3,
+            "{name}: expected corner over-pack in SINGLE mode: {single:.3} vs box {box_c:.3}"
+        );
+        // MULTI removes the over-pack without carving a void, and improves on SINGLE.
+        assert!(
+            multi <= over_pack_cap && multi >= void_floor,
+            "{name}: MULTI corner must land in [{void_floor:.2}, {over_pack_cap:.3}] (no over-pack, \
+             no void): got {multi:.3}"
+        );
+        assert!(
+            multi < single - 0.3,
+            "{name}: MULTI must reduce the corner vs SINGLE: {multi:.3} vs {single:.3}"
+        );
+    }
+}
+
+fn cyl_cup_scene() -> Scene {
+    Scene {
+        dose_g: 0.0,
+        water_ml: 100.0,
+        pour_water_ml: 0.0,
+        gravity: [0.0, -20.0, 0.0],
+        box_min: [-4.0, -8.0, -4.0],
+        box_max: [4.0, TOP_Y, 4.0],
+        regions: vec![slab(-4.8)],
+        solids: vec![SdfPrimitive {
+            kind: SolidKind::Cylinder {
+                center: Vec3::ZERO,
+                floor_y: -4.8,
+                rim_y: TOP_Y,
+                radius: APOTHEM,
+            },
+            species_mask: MASK_WATER,
+            friction: 0.0,
+        }],
+    }
+}
 
 /// Octagon SDF cup: its vertical edges meet adjacent side faces at 45° → NON-orthogonal binding
 /// normals (dot ≈ 0.707). A raw Σ n̂n̂ᵀ projector would be non-PSD there; the orthonormal-basis

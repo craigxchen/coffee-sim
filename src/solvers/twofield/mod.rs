@@ -1528,7 +1528,11 @@ impl Solver for TwofieldSolver {
                 grain_volume(mats.grain_diameter),
             ],
             // Density relief ON (dbg.x) by default; SDF wall BC in BINARY mode (dbg.y) until U3
-            // flips it. Tests override via set_relief_for_test / set_wall_bc_mode_for_test.
+            // Default stays SINGLE: the multi-normal corner fix is proven (corner_parity gate)
+            // but flipping the default trips poured_cup_water_fills_not_corner — the dynamic pour
+            // traps a spurious crushing pocket under multi (same failure mode a prior one-sided
+            // wall BC hit). Resolve that before defaulting MULTI / retiring the selector.
+            // Tests override via set_relief_for_test / set_wall_bc_mode_for_test.
             dbg: [1.0, WALL_BC_SINGLE, 0.0, 0.0],
         };
         let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
