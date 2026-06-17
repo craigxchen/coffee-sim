@@ -58,6 +58,15 @@ pub fn solid_wireframe(solids: &[SdfPrimitive]) -> Vec<LineVertex> {
                 rim_y,
                 radius,
             } => cylinder_lines(&mut out, center, floor_y, rim_y, radius, color),
+            // DIAGNOSTIC poly-cup: approximate with the bounding cylinder outline (the experiment
+            // reads density numerically, not the wireframe; a faithful N-gon outline isn't needed).
+            SolidKind::PolyCup {
+                center,
+                floor_y,
+                rim_y,
+                apothem,
+                ..
+            } => cylinder_lines(&mut out, center, floor_y, rim_y, apothem, color),
         }
     }
     out

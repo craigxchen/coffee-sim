@@ -411,6 +411,21 @@ fn pack_solids(solids: &[crate::utils::sdf::SdfPrimitive]) -> Vec<Primitive> {
                 b: [center.x, center.z, 0.0, 0.0],
                 c: [0.0; 4],
             },
+            SolidKind::PolyCup {
+                center,
+                floor_y,
+                rim_y,
+                apothem,
+                sides,
+            } => Primitive {
+                kind: 2,
+                species_mask: s.species_mask,
+                friction: s.friction,
+                flags: 0,
+                a: [floor_y, rim_y, apothem, sides as f32],
+                b: [center.x, center.z, 0.0, 0.0],
+                c: [0.0; 4],
+            },
         })
         .collect()
 }

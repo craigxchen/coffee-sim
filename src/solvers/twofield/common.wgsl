@@ -159,12 +159,12 @@ fn node_coords(flat: u32) -> vec3<u32> {
 // --- SDF cavity geometry (mirrors utils/sdf.rs; interior positive, gradient toward the cavity) --
 // Byte-identical to the Rust `Primitive` (64 bytes). Cone radii in `a` are OUTER wall radii.
 struct Primitive {
-    kind: u32,          // 0 = cone, 1 = cylinder
+    kind: u32,          // 0 = cone, 1 = cylinder, 2 = poly-cup
     species_mask: u32,
     friction: f32,
     flags: u32,         // bit0 = apex_open
-    a: vec4<f32>,       // cone:(apex_y, apex_r, top_y, top_r)  cyl:(floor_y, rim_y, radius, _)
-    b: vec4<f32>,       // cone:(thickness, hole_radius, center_x, center_z)  cyl:(center_x, center_z, _, _)
+    a: vec4<f32>,       // cone:(apex_y, apex_r, top_y, top_r)  cyl:(floor_y, rim_y, radius, _)  poly:(floor_y, rim_y, apothem, sides)
+    b: vec4<f32>,       // cone:(thickness, hole_radius, center_x, center_z)  cyl/poly:(center_x, center_z, _, _)
     c: vec4<f32>,       // reserved
 };
 @group(0) @binding(8) var<storage, read> solids: array<Primitive>;
@@ -259,8 +259,37 @@ fn cyl_cavity(prim: Primitive, p: vec3<f32>) -> SolidHit {
     return SolidHit(d_floor, vec3<f32>(0.0, 1.0, 0.0), prim.friction);
 }
 
+// DIAGNOSTIC: regular N-gon prism cup (mirror of sdf.rs::poly_cavity). Face normals at 2πk/N
+// (k=0 → +x), so sides=4 is an axis-aligned square. Inner side dist = apothem − max_k(rel·n_k).
+fn poly_cavity(prim: Primitive, p: vec3<f32>) -> SolidHit {
+    let floor_y = prim.a.x;
+    let rim_y = prim.a.y;
+    let apothem = prim.a.z;
+    let sides = max(u32(prim.a.w), 3u);
+    let center = vec2<f32>(prim.b.x, prim.b.y);
+    let rel = vec2<f32>(p.x - center.x, p.z - center.y);
+    let y = p.y;
+    if (y > rim_y) { return SolidHit(SDF_FREE, vec3<f32>(0.0, 1.0, 0.0), prim.friction); }
+    var maxproj = -1.0e30;
+    var bestn = vec2<f32>(1.0, 0.0);
+    let tau = 6.28318530718;
+    for (var k = 0u; k < sides; k = k + 1u) {
+        let ang = tau * f32(k) / f32(sides);
+        let nk = vec2<f32>(cos(ang), sin(ang));
+        let proj = dot(rel, nk);
+        if (proj > maxproj) { maxproj = proj; bestn = nk; }
+    }
+    let d_side = apothem - maxproj;
+    let d_floor = y - floor_y;
+    if (d_side <= d_floor) {
+        return SolidHit(d_side, sdf_normalize3(vec3<f32>(-bestn.x, 0.0, -bestn.y)), prim.friction);
+    }
+    return SolidHit(d_floor, vec3<f32>(0.0, 1.0, 0.0), prim.friction);
+}
+
 fn solid_cavity(prim: Primitive, p: vec3<f32>) -> SolidHit {
     if (prim.kind == 0u) { return cone_cavity(prim, p); }
+    if (prim.kind == 2u) { return poly_cavity(prim, p); }
     return cyl_cavity(prim, p);
 }
 
