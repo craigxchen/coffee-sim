@@ -50,9 +50,11 @@ struct Params {
     wet1: vec4<f32>, // (suction body-force accel a_suction, bloom_delay seconds, filter_floor
                      //  flag, V_dry = grain sphere volume π/6·d³)
     dbg: vec4<f32>,  // diagnostic toggles (test-only): .x = density-relief enable (1 = on);
-                     //  .y carried a prototyped relief dead-band that was DROPPED — now unread
-                     //  (the settled-pool stirring fix is the G2P PIC blend, PIC_BLEND_DEFAULT —
-                     //  see transfers.wgsl / mod.rs); .zw reserved
+                     //  .y = SDF wall-BC mode selector: ≤ 0.5 → binary no-penetration band
+                     //  (default, byte-identical to pre-coverage); > 0.5 → graded coverage weight
+                     //  (wall_coverage in pressure.wgsl — the embedded-boundary L1 path). (Formerly
+                     //  a dropped relief dead-band; the settled-pool stirring fix is the G2P PIC
+                     //  blend PIC_BLEND_DEFAULT.) .zw reserved
 };
 
 @group(0) @binding(0) var<uniform> params: Params;

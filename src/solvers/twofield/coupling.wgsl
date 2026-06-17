@@ -265,7 +265,10 @@ fn drag_fold(@builtin(global_invocation_id) gid: vec3<u32>) {
     // exactly as in node_setup.
     if (params.num_solids > 0u) {
         let hit = solid_union(xp, PHASE_WATER);
-        if (hit.dist < WALL_BAND * params.grid_origin.w) {
+        // SAME coverage weight as node_setup's M̃⁻¹ dyad (operator consistency). Binary mode
+        // (default) returns 1.0 in-band → `v - 1.0·(v·n̂)n̂` is byte-identical to the old BC.
+        let wc = wall_coverage(hit.dist, params.grid_origin.w);
+        if (wc > 0.0) {
             var nrm = hit.grad;
             if (xp.x <= params.box_min.x + eps || xp.x >= params.box_max.x - eps) { nrm.x = 0.0; }
             if ((xp.y <= params.box_min.y + eps && !open_base) || xp.y >= params.box_max.y - eps) { nrm.y = 0.0; }
@@ -273,7 +276,7 @@ fn drag_fold(@builtin(global_invocation_id) gid: vec3<u32>) {
             let len = length(nrm);
             if (len > SDF_NORMAL_MIN) {
                 nrm = nrm / len;
-                v = v - dot(v, nrm) * nrm;
+                v = v - wc * dot(v, nrm) * nrm;
             }
         }
     }

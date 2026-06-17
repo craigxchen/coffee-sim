@@ -159,17 +159,13 @@ pub const PIC_BLEND_DEFAULT: f32 = 0.05;
 /// Δx/τ ≈ 0.6 instead of ~4.5 of slosh — the relief must correct volume, not detonate it.
 pub const DENSITY_RELAX_FRAMES: f32 = 30.0;
 
-/// Density-relief dead-band that was PROTOTYPED AND DROPPED. The idea: a settled pool leaves a
-/// small standing density ripple that, relieved every frame, feeds the stirring churn, so relieve
-/// only sustained compression. Measured: the standing density error the relief tracks EXCEEDS any
-/// safe band (a 1.5% band did not reach the churn; a band large enough would tolerate that much
-/// permanent compression), because the error is pressure under-convergence, not a noise ripple a
-/// clamp can cut. So the band is unused — the WGSL relief is the original un-banded feedback and
-/// `dbg.y` is unread (see pressure.wgsl / common.wgsl). The settled-pool stirring fix is deferred
-/// to the bed-creep redesign (see `PIC_BLEND_DEFAULT`). Retained only as the value the
-/// `set_relief_deadband_for_test` diagnostic seeds into `dbg.y` for the stirring-isolation arm in
-/// tests/twofield_settled.rs (a documented no-op since the kernels ignore it).
-pub const RELIEF_DEADBAND: f32 = 0.015;
+/// SDF wall-BC mode selector, written to `dbg.y` and read by `wall_coverage` (pressure.wgsl).
+/// `BINARY` is the pre-coverage no-penetration band (byte-identical default); `COVERAGE` enables
+/// the graded embedded-boundary coverage weight (plan 2026-06-17-001 — the L1 soft-penalty path,
+/// flipped on in U3 after calibration). `dbg.y` previously carried a prototyped relief dead-band
+/// that was dropped (the settled-pool stirring fix is the G2P PIC blend, `PIC_BLEND_DEFAULT`).
+pub const WALL_BC_BINARY: f32 = 0.0;
+pub const WALL_BC_COVERAGE: f32 = 1.0;
 
 /// Free-surface fill-fraction constants (mirror `SURF_FULL_FRAC`/`SURF_MIN_CORNER` in
 /// pressure.wgsl — the ghost-fluid-style fraction weighting documented in its FREE SURFACE
@@ -874,10 +870,11 @@ impl TwofieldSolver {
         self.params.dbg[0] = if on { 1.0 } else { 0.0 };
     }
 
-    /// Set the density-relief dead-band (fractional) — dev/test only. Production keeps
-    /// `RELIEF_DEADBAND`; the isolation gate sets 0 to reproduce the un-banded bug.
-    pub fn set_relief_deadband_for_test(&mut self, band: f32) {
-        self.params.dbg[1] = band.max(0.0);
+    /// Select the SDF wall-BC mode (`dbg.y`) — dev/test only. `WALL_BC_BINARY` (≤ 0.5) is the
+    /// no-penetration band; `WALL_BC_COVERAGE` (> 0.5) is the graded embedded-boundary weight.
+    /// Production default is `WALL_BC_BINARY` until U3 flips it post-calibration.
+    pub fn set_wall_bc_mode_for_test(&mut self, mode: f32) {
+        self.params.dbg[1] = mode;
     }
 
     /// Set the U3 pressure-budget knobs (KTD-9 grid points; dev/test only). `coarse_sweeps =
@@ -1528,9 +1525,9 @@ impl Solver for TwofieldSolver {
                 if cfg.tf_filter_floor { 1.0 } else { 0.0 },
                 grain_volume(mats.grain_diameter),
             ],
-            // Density relief ON (dbg.x) by default; relief dead-band (dbg.y) at RELIEF_DEADBAND.
-            // The isolation gate overrides these (relief off / dead-band 0).
-            dbg: [1.0, RELIEF_DEADBAND, 0.0, 0.0],
+            // Density relief ON (dbg.x) by default; SDF wall BC in BINARY mode (dbg.y) until U3
+            // flips it. Tests override via set_relief_for_test / set_wall_bc_mode_for_test.
+            dbg: [1.0, WALL_BC_BINARY, 0.0, 0.0],
         };
         let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("twofield-params"),
