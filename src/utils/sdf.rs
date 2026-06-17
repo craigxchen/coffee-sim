@@ -170,6 +170,80 @@ pub fn nearest(solids: &[SdfPrimitive], p: Vec3, phase: u32) -> Contact {
     best
 }
 
+/// Max binding faces returned by [`wall_binding_faces`] (mirrors `WF_MAX` in common.wgsl).
+pub const WF_MAX: usize = 4;
+
+#[inline]
+fn wf_push(faces: &mut Vec<Vec3>, nrm: Vec3) {
+    if faces.len() < WF_MAX && nrm.length() > EPS {
+        faces.push(nrm.normalize());
+    }
+}
+
+/// Multi-normal wall BC (plan 2026-06-17-002): every cavity FACE within `band` of `p` for `phase`,
+/// as unit inward normals — generalizing [`nearest`]'s single most-penetrated pick. At a concave
+/// seam (cup floor∩wall) two faces are in-band and BOTH must be constrained; `nearest` returns only
+/// one. The floor face is pushed FIRST per primitive so the rank-aware basis build never drops it.
+/// The cone stays single-normal (one smooth converging surface, not discrete faces). CPU twin of
+/// `wall_binding_faces` in common.wgsl; capped at `WF_MAX`.
+pub fn wall_binding_faces(solids: &[SdfPrimitive], p: Vec3, phase: u32, band: f32) -> Vec<Vec3> {
+    let mut faces: Vec<Vec3> = Vec::new();
+    for s in solids {
+        if !s.applies_to(phase) {
+            continue;
+        }
+        match s.kind {
+            SolidKind::Cone { .. } => {
+                let (dist, grad) = s.cavity(p);
+                if dist < band {
+                    wf_push(&mut faces, grad);
+                }
+            }
+            SolidKind::Cylinder {
+                center,
+                floor_y,
+                rim_y,
+                radius,
+            } => {
+                if p.y <= rim_y {
+                    let rel = Vec2::new(p.x - center.x, p.z - center.z);
+                    let r = rel.length();
+                    if (p.y - floor_y) < band {
+                        wf_push(&mut faces, Vec3::Y);
+                    }
+                    if (radius - r) < band && r >= EPS {
+                        let rh = rel / r;
+                        wf_push(&mut faces, Vec3::new(-rh.x, 0.0, -rh.y));
+                    }
+                }
+            }
+            SolidKind::PolyCup {
+                center,
+                floor_y,
+                rim_y,
+                apothem,
+                sides,
+            } => {
+                if p.y <= rim_y {
+                    let rel = Vec2::new(p.x - center.x, p.z - center.z);
+                    if (p.y - floor_y) < band {
+                        wf_push(&mut faces, Vec3::Y);
+                    }
+                    let n = sides.max(3);
+                    for k in 0..n {
+                        let ang = std::f32::consts::TAU * (k as f32) / (n as f32);
+                        let nk = Vec2::new(ang.cos(), ang.sin());
+                        if (apothem - rel.dot(nk)) < band {
+                            wf_push(&mut faces, Vec3::new(-nk.x, 0.0, -nk.y));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    faces
+}
+
 // --- internals ------------------------------------------------------------------------------------
 
 #[inline]
@@ -576,5 +650,106 @@ mod tests {
             (c.friction - 0.9).abs() < TOL,
             "friction from the binding (tighter) solid"
         );
+    }
+
+    // --- U1: wall_binding_faces (multi-normal seam query) -------------------------------------
+
+    fn poly_cup(sides: u32, apothem: f32) -> SdfPrimitive {
+        SdfPrimitive {
+            kind: SolidKind::PolyCup {
+                center: Vec3::ZERO,
+                floor_y: -8.0,
+                rim_y: -3.5,
+                apothem,
+                sides,
+            },
+            species_mask: MASK_ALL,
+            friction: 0.2,
+        }
+    }
+
+    const BAND: f32 = 0.5;
+
+    #[test]
+    fn binding_faces_cylinder_corner_floor_and_wall_orthogonal() {
+        let solids = [cup()]; // cylinder: floor -8, radius 3
+                              // floor∩wall corner: just inside both surfaces.
+        let f = wall_binding_faces(&solids, Vec3::new(2.95, -7.95, 0.0), 0, BAND);
+        assert_eq!(f.len(), 2, "corner binds floor + wall: {f:?}");
+        // floor pushed first.
+        assert!(
+            (f[0] - Vec3::Y).length() < TOL,
+            "floor normal first: {:?}",
+            f[0]
+        );
+        assert!(
+            f[1].x < -0.9 && f[1].y.abs() < TOL,
+            "wall normal radial (−x here): {:?}",
+            f[1]
+        );
+        assert!(f[0].dot(f[1]).abs() < TOL, "floor ⟂ wall");
+    }
+
+    #[test]
+    fn binding_faces_single_away_from_seam_matches_nearest() {
+        let solids = [cup()];
+        // mid-wall (far above floor): one radial face, equal to nearest()'s normal.
+        let mid_wall = Vec3::new(2.95, -5.5, 0.0);
+        let fw = wall_binding_faces(&solids, mid_wall, 0, BAND);
+        assert_eq!(fw.len(), 1, "mid-wall → 1 face");
+        assert!(
+            (fw[0] - nearest(&solids, mid_wall, 0).grad).length() < TOL,
+            "matches nearest()"
+        );
+        // mid-floor (near axis): one up face.
+        let fm = wall_binding_faces(&solids, Vec3::new(0.0, -7.95, 0.0), 0, BAND);
+        assert_eq!(fm.len(), 1, "mid-floor → 1 face");
+        assert!((fm[0] - Vec3::Y).length() < TOL);
+        // deep interior: no binding face.
+        assert_eq!(
+            wall_binding_faces(&solids, Vec3::new(0.0, -5.5, 0.0), 0, BAND).len(),
+            0
+        );
+    }
+
+    #[test]
+    fn binding_faces_square_edge_orthogonal_octagon_edge_nonorthogonal() {
+        // Square (sides=4) vertical edge along the +x/+z diagonal: two orthogonal side normals.
+        let sq = [poly_cup(4, 2.0)];
+        let fe = wall_binding_faces(&sq, Vec3::new(1.95, -5.5, 1.95), 0, BAND);
+        assert_eq!(fe.len(), 2, "square edge → 2 side faces: {fe:?}");
+        assert!(
+            fe[0].dot(fe[1]).abs() < TOL,
+            "square edge normals orthogonal"
+        );
+
+        // Octagon (sides=8) vertical edge between the 0° and 45° faces: NON-orthogonal (dot≈0.707).
+        let oct = [poly_cup(8, 2.0)];
+        let r = 1.9 / (22.5_f32.to_radians().cos());
+        let p = Vec3::new(
+            r * 22.5_f32.to_radians().cos(),
+            -5.5,
+            r * 22.5_f32.to_radians().sin(),
+        );
+        let fo = wall_binding_faces(&oct, p, 0, BAND);
+        assert_eq!(fo.len(), 2, "octagon edge → 2 side faces: {fo:?}");
+        let d = fo[0].dot(fo[1]).abs();
+        assert!(
+            (d - 0.707).abs() < 0.05,
+            "octagon edge normals non-orthogonal (dot≈0.707): {d}"
+        );
+    }
+
+    #[test]
+    fn binding_faces_floor_retained_at_high_sided_corner() {
+        // A high-sided poly near the floor at a vertex: floor must be among the faces (pushed
+        // first), never crowded out by side faces — the rank-aware floor-retention guarantee.
+        let solids = [poly_cup(12, 2.0)];
+        let f = wall_binding_faces(&solids, Vec3::new(1.93, -7.95, 0.0), 0, BAND);
+        assert!(
+            f.iter().any(|n| (*n - Vec3::Y).length() < TOL),
+            "floor normal retained at high-sided corner: {f:?}"
+        );
+        assert!((f[0] - Vec3::Y).length() < TOL, "floor pushed first");
     }
 }

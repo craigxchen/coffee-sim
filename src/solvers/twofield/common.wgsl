@@ -307,3 +307,67 @@ fn solid_union(p: vec3<f32>, ph: u32) -> SolidHit {
     }
     return best;
 }
+
+// MULTI-NORMAL wall BC (plan 2026-06-17-002): all cavity FACES within `band` of p, generalizing
+// solid_union's single most-penetrated pick. At a concave seam (cup floor∩wall) two faces are
+// in-band and BOTH must be constrained — solid_union would return only one, leaving the other
+// direction free (the corner over-pack). `band` is passed in (= WALL_BAND·h; WALL_BAND lives in
+// pressure.wgsl, concatenated after this file). Floor face is pushed FIRST per primitive so the
+// rank-aware basis build (build_constraint_basis) never drops it. cone stays single-normal (it is
+// one smooth converging surface, not discrete faces). Cap WF_MAX candidates.
+const WF_MAX: u32 = 4u;
+struct WallFaces { n: array<vec3<f32>, 4>, count: u32 };
+
+fn wf_push(wf: ptr<function, WallFaces>, nrm: vec3<f32>) {
+    let c = (*wf).count;
+    if (c < WF_MAX && length(nrm) > SDF_EPS) {
+        (*wf).n[c] = sdf_normalize3(nrm);
+        (*wf).count = c + 1u;
+    }
+}
+
+fn wall_binding_faces(p: vec3<f32>, ph: u32, band: f32) -> WallFaces {
+    var wf: WallFaces;
+    wf.count = 0u;
+    let ns = params.num_solids;
+    for (var i = 0u; i < ns; i = i + 1u) {
+        let prim = solids[i];
+        if ((prim.species_mask & (1u << ph)) == 0u) { continue; }
+        if (prim.kind == 0u) {
+            // cone: single smooth surface — one nearest normal, in-band only.
+            let hit = cone_cavity(prim, p);
+            if (hit.dist < band) { wf_push(&wf, hit.grad); }
+        } else if (prim.kind == 2u) {
+            // poly cup: floor + every in-band side face (vertical edges yield 2 sides).
+            let floor_y = prim.a.x; let rim_y = prim.a.y; let apothem = prim.a.z;
+            let sides = max(u32(prim.a.w), 3u);
+            let center = vec2<f32>(prim.b.x, prim.b.y);
+            let rel = vec2<f32>(p.x - center.x, p.z - center.y);
+            if (p.y <= rim_y) {
+                if ((p.y - floor_y) < band) { wf_push(&wf, vec3<f32>(0.0, 1.0, 0.0)); }
+                let tau = 6.28318530718;
+                for (var k = 0u; k < sides; k = k + 1u) {
+                    let ang = tau * f32(k) / f32(sides);
+                    let nk = vec2<f32>(cos(ang), sin(ang));
+                    if ((apothem - dot(rel, nk)) < band) {
+                        wf_push(&wf, vec3<f32>(-nk.x, 0.0, -nk.y));
+                    }
+                }
+            }
+        } else {
+            // cylinder cup: floor + radial side face when in-band.
+            let floor_y = prim.a.x; let rim_y = prim.a.y; let radius = prim.a.z;
+            let center = vec2<f32>(prim.b.x, prim.b.y);
+            let rel = vec2<f32>(p.x - center.x, p.z - center.y);
+            let r = length(rel);
+            if (p.y <= rim_y) {
+                if ((p.y - floor_y) < band) { wf_push(&wf, vec3<f32>(0.0, 1.0, 0.0)); }
+                if ((radius - r) < band && r >= SDF_EPS) {
+                    let rh = rel / r;
+                    wf_push(&wf, vec3<f32>(-rh.x, 0.0, -rh.y));
+                }
+            }
+        }
+    }
+    return wf;
+}
