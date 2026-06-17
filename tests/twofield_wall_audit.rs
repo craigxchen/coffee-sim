@@ -154,6 +154,7 @@ struct Probe {
     interior_nb: f64,
     side_nb: f64,
     floor_nb: f64,
+    corner_nb: f64,
     interior_dnn: f32,
     nm_floor: [f32; 8],
     floor_dist: f32,
@@ -195,6 +196,14 @@ fn probe(
         0.6,
     )
     .0;
+    // CORNER = floor∩wall seam (+x bottom edge): the multi-face-incidence locus.
+    let corner_nb = mean_nb(
+        live,
+        (APOTHEM - 2.0 * SPACING, APOTHEM),
+        (rest_floor, rest_floor + 2.0 * SPACING),
+        0.6,
+    )
+    .0;
     let interior_sel: Vec<[f32; 4]> = live
         .iter()
         .copied()
@@ -229,6 +238,7 @@ fn probe(
         interior_nb,
         side_nb,
         floor_nb,
+        corner_nb,
         interior_dnn,
         nm_floor,
         floor_dist,
@@ -350,6 +360,30 @@ fn probe_v60_cup(gpu: &GpuContext, rest: f64) -> (f64, f64, f64, usize) {
     println!(
         "  [RECONCILE] per-particle ρ=(s/d_nn)³ MEAN (the likely original metric):  WALL={:.1}×  INTERIOR={:.1}×",
         wrho, irho
+    );
+
+    // CORNER = floor∩wall seam (low-y ∩ high-r): the visible "corner packing" locus, where the
+    // floor band + wall band compound and the single SDF normal is ambiguous (multi-face seam).
+    let corner: Vec<[f32; 4]> = cup
+        .iter()
+        .copied()
+        .filter(|p| {
+            let rr = (p[0] * p[0] + p[2] * p[2]).sqrt();
+            rr >= 3.0 - 2.0 * SPACING && rr <= 3.0 && p[1] >= -8.0 && p[1] <= -8.0 + 2.0 * SPACING
+        })
+        .collect();
+    let (corner_coarse, ncorner) =
+        mean_nb_radial(&cup, 3.0 - 2.0 * SPACING, 3.0, (-8.0, -8.0 + 2.0 * SPACING));
+    let (cm, cp05, cmin, crho) = dnn_stats(&corner);
+    println!(
+        "  [CORNER seam] n={} coarse ρ/ρ_rest={:.2}  d_nn mean={:.4} p05={:.4} min={:.4} ({:.2}× rest)  (s/d_nn)³_mean={:.1}×",
+        ncorner,
+        corner_coarse / rest,
+        cm,
+        cp05,
+        cmin,
+        cm / SPACING,
+        crho
     );
 
     (interior / rest, wall / rest, floor / rest, nwall)
@@ -483,6 +517,12 @@ fn aligned_square_localize_overpack() {
     println!(
         "  INTERIOR d_nn (rest spacing {:.3}) A/B/C = {:.4} / {:.4} / {:.4}  [control: is 0.068 normal?]",
         SPACING, a.interior_dnn, b.interior_dnn, c.interior_dnn
+    );
+    println!(
+        "  CORNER ρ/ρ_rest   A/B/C = {:.3} / {:.3} / {:.3}  [box multi-axis vs SDF single-normal seam]",
+        r(a.corner_nb),
+        r(b.corner_nb),
+        r(c.corner_nb)
     );
     println!(
         "  FLOOR ρ/ρ_rest    A/B/C = {:.3} / {:.3} / {:.3}",
