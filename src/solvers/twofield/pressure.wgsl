@@ -180,6 +180,22 @@ const WALL_BAND: f32 = 1.0;
 // aid (no operator/BC effect), so it carries no operator-consistency constraint.
 const FLOOD_WALL_BAND: f32 = 2.0;
 
+// SDF wall no-penetration COVERAGE WEIGHT w ∈ [0,1], applied to BOTH the M̃⁻¹ wall dyad
+// (node_setup) and the velocity BC (drag_fold) in lockstep — they MUST share this weight or
+// A = D·M̃⁻¹·G breaks (the embedded-boundary coefficient, plan 2026-06-17-001 D1/D2). `dist` is
+// the signed SDF distance (fluid side ≥ 0); `h` the cell size.
+//   params.dbg.y ≤ 0.5  → BINARY band (default): w = 1 for dist < WALL_BAND·h, else 0 — bitwise
+//                          identical to the pre-coverage no-penetration band.
+//   params.dbg.y  > 0.5 → graded coverage (L1 soft penalty): w → 1 at the wall, → 0 one cell out.
+// The graded branch is a PLACEHOLDER (linear ramp) — U3 replaces it with the calibrated
+// near-wall-plateau form; U1 only stands up the selector and proves the binary path is inert.
+fn wall_coverage(dist: f32, h: f32) -> f32 {
+    if (params.dbg.y <= 0.5) {
+        return select(0.0, 1.0, dist < WALL_BAND * h);
+    }
+    return clamp(1.0 - dist / (WALL_BAND * h), 0.0, 1.0);
+}
+
 // --- fine-grid cell helpers --------------------------------------------------------------------
 fn fine_cells() -> vec3<u32> {
     return params.grid_dims.xyz - vec3<u32>(1u);
@@ -327,7 +343,11 @@ fn node_setup(@builtin(global_invocation_id) gid: vec3<u32>) {
         // M̃⁻¹ constrains the SAME axes (operator consistency A = D·M̃⁻¹·G).
         if (params.num_solids > 0u) {
             let hit = solid_union(xp, PHASE_WATER);
-            if (hit.dist < WALL_BAND * h) {
+            // Coverage weight (lockstep with drag_fold's velocity BC). Binary mode (default,
+            // dbg.y ≤ 0.5) returns exactly 1.0 in-band / 0.0 out → `wc * invc == invc` bitwise,
+            // so this path is byte-identical to the pre-coverage band.
+            let wc = wall_coverage(hit.dist, h);
+            if (wc > 0.0) {
                 var nrm = hit.grad;
                 if (d.x == 0.0) { nrm.x = 0.0; }
                 if (d.y == 0.0) { nrm.y = 0.0; }
@@ -335,7 +355,7 @@ fn node_setup(@builtin(global_invocation_id) gid: vec3<u32>) {
                 let len = length(nrm);
                 if (len > SDF_NORMAL_MIN) {
                     nrm = nrm / len;
-                    let invc = max(max(d.x, d.y), d.z);
+                    let invc = wc * max(max(d.x, d.y), d.z);
                     a -= invc * vec4<f32>(nrm.x * nrm.x, nrm.x * nrm.y, nrm.x * nrm.z, nrm.y * nrm.y);
                     b -= invc * vec4<f32>(nrm.y * nrm.z, nrm.z * nrm.z, 0.0, 0.0);
                 }

@@ -234,14 +234,12 @@ fn isolate_settled_stirring_mechanisms() {
         "twofield SETTLED stirring isolation (water-only tank, depth 12, {RUN} settled frames):"
     );
     // BASELINE: the reported BUG state — pure APIC, relief + the dead-band off.
-    let (_, mean_apic, peak_apic, _) = arm("APIC blend=0, no deadband (BUG)", &|s| {
+    let (_, mean_apic, peak_apic, _) = arm("APIC blend=0 (BUG)", &|s| {
         s.set_pic_blend_for_test(0.0);
-        s.set_relief_deadband_for_test(0.0);
     });
     // ISOLATE (a) APIC ringing: pure PIC zeros the affine state.
     let (_, mean_pic, _, _) = arm("pure PIC (no affine)", &|s| {
         s.set_pic_blend_for_test(1.0);
-        s.set_relief_deadband_for_test(0.0);
     });
     // ISOLATE (b) relief: turn relief OFF entirely.
     let (_, mean_norelief, _, _) = arm("APIC blend=0, relief OFF", &|s| {
@@ -252,7 +250,6 @@ fn isolate_settled_stirring_mechanisms() {
     let (_, mean_sweeps, _, _) = arm("APIC blend=0, fine sweeps 32", &|s| {
         s.set_pic_blend_for_test(0.0);
         s.set_pressure_budget_for_test(4, 8, 32);
-        s.set_relief_deadband_for_test(0.0);
     });
     // CANDIDATE that quiets the pool but is deferred: a global PIC blend (shown here for the
     // redesign's record — it freezes the crater slump in twofield_full.rs, hence not shipped).
