@@ -1,10 +1,19 @@
 ---
 type: fix
-status: active
+status: superseded
 date: 2026-06-17
 depth: deep
 origin: docs/brainstorms/2026-06-17-twofield-sdf-wall-embedded-boundary-requirements.md
 review: codex-r4-approved
+superseded_by: docs/brainstorms/2026-06-17-twofield-cup-corner-seam-bc-requirements.md
+superseded_reason: >
+  U2a audit (tests/twofield_wall_audit.rs) overturned this plan's premise: the over-pack is
+  not a ~25× mid-wall phenomenon fixed by a cut-cell coverage coefficient. The aligned-square
+  side-wall M̃⁻¹ exactly matches the box (Δ=0); the "25×" was a tail-sensitive nearest-neighbor
+  metric artifact (robust over-pack ~1.8×). The real, visible defect is corner packing at the
+  concave floor∩wall SEAM (2.4× vs box 1.4×) — a single-normal multi-face-incidence BC bug.
+  Re-brainstormed → the corner-seam requirements doc above. U1 (the dbg.y selector, commit
+  3980eb5) stays valid.
 ---
 
 # Two-field SDF wall: embedded-boundary pressure BC — plan
