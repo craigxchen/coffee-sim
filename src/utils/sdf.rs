@@ -52,6 +52,17 @@ pub enum SolidKind {
         rim_y: f32,
         radius: f32,
     },
+    /// DIAGNOSTIC: regular N-gon prism cup (flat side faces, vertical axis). `apothem` is the
+    /// inradius (face distance from the axis); `sides` = N (4 = axis-aligned square, 8 = octagon).
+    /// Isolates whether the curved-cylinder wall over-pack is curvature, off-grid-normal, or the
+    /// SDF-wall path itself. Same open-top + floor as `Cylinder`.
+    PolyCup {
+        center: Vec3,
+        floor_y: f32,
+        rim_y: f32,
+        apothem: f32,
+        sides: u32,
+    },
 }
 
 /// A solid plus its collision properties: which species it blocks and its boundary friction.
@@ -110,6 +121,13 @@ impl SdfPrimitive {
                 rim_y,
                 radius,
             } => cyl_cavity(center, floor_y, rim_y, radius, p),
+            SolidKind::PolyCup {
+                center,
+                floor_y,
+                rim_y,
+                apothem,
+                sides,
+            } => poly_cavity(center, floor_y, rim_y, apothem, sides, p),
         }
     }
 
@@ -275,6 +293,44 @@ fn cyl_cavity(center: Vec3, floor_y: f32, rim_y: f32, radius: f32, p: Vec3) -> (
         (d_side, grad)
     } else {
         (d_floor, Vec3::Y) // floor nearest: push up
+    }
+}
+
+/// Regular N-gon prism cup cavity (DIAGNOSTIC; mirror of common.wgsl::poly_cavity). The N face
+/// outward normals are at angles 2πk/N (k=0 → +x), so `sides=4` is an axis-aligned square. Inner
+/// side distance = apothem − max_k(rel·n_k); the gradient is the inward normal of the nearest face.
+fn poly_cavity(
+    center: Vec3,
+    floor_y: f32,
+    rim_y: f32,
+    apothem: f32,
+    sides: u32,
+    p: Vec3,
+) -> (f32, Vec3) {
+    let rel = Vec2::new(p.x - center.x, p.z - center.z);
+    let y = p.y;
+    if y > rim_y {
+        return (FREE, Vec3::Y); // open rim → enter from the top
+    }
+    let n = sides.max(3);
+    let mut maxproj = f32::NEG_INFINITY;
+    let mut bestn = Vec2::new(1.0, 0.0);
+    for k in 0..n {
+        let ang = std::f32::consts::TAU * (k as f32) / (n as f32);
+        let nk = Vec2::new(ang.cos(), ang.sin());
+        let proj = rel.dot(nk);
+        if proj > maxproj {
+            maxproj = proj;
+            bestn = nk;
+        }
+    }
+    let d_side = apothem - maxproj; // + inside the nearest face
+    let d_floor = y - floor_y;
+    if d_side <= d_floor {
+        let grad = safe_normalize3(Vec3::new(-bestn.x, 0.0, -bestn.y));
+        (d_side, grad)
+    } else {
+        (d_floor, Vec3::Y)
     }
 }
 

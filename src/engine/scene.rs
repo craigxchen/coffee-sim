@@ -143,6 +143,32 @@ impl Scene {
         }
     }
 
+    /// DEBUG SCENE (ported from v1's `cup-volume` / `hydrostatic-column` debug scenes): the V60
+    /// cup pre-filled STATICALLY with water at rest, **no pour** — water is seeded directly in the
+    /// cup cavity (rejection trims the slab to the cup) and just settles under gravity. The
+    /// static-fill counterpart to `v60_pour_water_only`: same geometry and (web) resolution, so it
+    /// isolates whether cup over-compression is pour-jet-driven (this scene stays at rest density)
+    /// or confinement/fill-driven (this scene over-compresses too). The slab fills the cup
+    /// cross-section ~1.6 units deep, sized to land near the poured cup's settled particle count.
+    pub fn v60_cup_static_full() -> Self {
+        Self {
+            dose_g: 0.0,
+            water_ml: 250.0,
+            pour_water_ml: 0.0, // STATIC: no pour, water is seeded directly in the cup
+            gravity: [0.0, -20.0, 0.0],
+            box_min: [-7.0, -10.0, -7.0],
+            box_max: [7.0, 10.0, 7.0],
+            solids: crate::utils::geometry::v60_dripper(),
+            // Full-cross-section water slab inside the cup (floor -8, rim -3.5, radius 3); rejection
+            // trims it to the cup cavity. Depth chosen so the settled count ≈ the poured cup's.
+            regions: vec![SeedRegion {
+                min: [-2.85, -7.85, -2.85],
+                max: [2.85, -6.2, 2.85],
+                species: Species::Water,
+            }],
+        }
+    }
+
     /// A dam-break: a tall water column released in a box. The water-core gate scene.
     pub fn dam_break() -> Self {
         Self::default()
