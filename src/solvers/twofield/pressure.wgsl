@@ -152,6 +152,10 @@ const JACOBI_OMEGA: f32 = 0.6666667;
 // ≈ residual·N·dt ≈ 1% — inside the ±5% band — while keeping the relief of a seeded
 // over-density gentle, v ~ Δx/τ, instead of detonating it into slosh).
 const DENSITY_RELAX_FRAMES: f32 = 30.0;
+// Compliant-density target dead-band (compliant path, dbg.w on): density error |e| below this
+// is treated as zero (no chatter on near-rest cells). Default 0 (no dead-band) until the U4
+// calibration finds a value; like DENSITY_RELAX_FRAMES it is a structural const, not a Params slot.
+const DENSITY_TARGET_DEADBAND: f32 = 0.0;
 // SETTLED-POOL STIRRING — diagnosis (no in-solver fix yet; see twofield_settled.rs).
 // A settled pool slowly churns. Isolation (water tank, settled-tail KE): baseline ~67; relief OFF
 // ~7.6; 32 fine sweeps (vs 8) ~17; pure PIC (kill the affine C) ~1.3. So the mechanism is a limit
@@ -490,8 +494,19 @@ fn cell_classify(@builtin(global_invocation_id) gid: vec3<u32>) {
     // reach the churn and a band large enough would tolerate that much permanent compression. The
     // churn is pressure under-convergence, not a noise ripple a clamp can cut; see the
     // DENSITY_RELAX_FRAMES header.)
-    let s_target =
-        params.dbg.x * max(rho / params.extra.x - 1.0, 0.0) / (DENSITY_RELAX_FRAMES * params.dt);
+    // Over-density (+) half of the density source. Legacy (dbg.w ≤ 0.5): one-sided, rate-limited
+    // by DENSITY_RELAX_FRAMES. Compliant path (dbg.w > 0.5, U2): the full predicted error e at
+    // density-error dimension (rate e/dt ⇒ rhs e/dt², the DFSPH/compliant form), dead-banded by
+    // DENSITY_TARGET_DEADBAND; stiffness is set by the U3 compliance α, not a rate cap. Both paths
+    // multiply by dbg.x so the stirring-isolation gate (dbg.x = 0) still zeros the source. The
+    // under-density (−) half stays the interior-gated surface.wgsl pass (KTD5).
+    let e_over = rho / params.extra.x - 1.0;
+    var s_target: f32;
+    if (params.dbg.w > 0.5) {
+        s_target = params.dbg.x * max(e_over - DENSITY_TARGET_DEADBAND, 0.0) / params.dt;
+    } else {
+        s_target = params.dbg.x * max(e_over, 0.0) / (DENSITY_RELAX_FRAMES * params.dt);
+    }
     cell_meta[c] = vec4<f32>(select(0.0, f * (s_target - div) / params.dt, f > 0.0), f, rho, cat);
 }
 
@@ -663,7 +678,13 @@ fn residual(@builtin(global_invocation_id) gid: vec3<u32>) {
                 }
             }
         }
-        r = cm.x - (-acc * cm.y);
+        // U3 compliance diagonal: the solved system is (A + αI)·p = b on the compliant path
+        // (dbg.w on; α = dbg.z). α = 0 on the legacy path ⇒ bare A, byte-identical. CELL_POCKET
+        // rows are EXCLUDED — they are the incompressible-bubble Dirichlet constraint relaxed by
+        // bubble_fine/coarse, not density-compliance rows (their bare-A residual is unchanged).
+        let alpha = select(0.0, params.dbg.z, params.dbg.w > 0.5);
+        let comp = select(alpha * pf_src[c], 0.0, cm.w == CELL_POCKET);
+        r = cm.x - (-acc * cm.y + comp);
     }
     cm.z = r;
     cell_meta[c] = cm;
@@ -729,8 +750,11 @@ fn jacobi_fine(@builtin(global_invocation_id) gid: vec3<u32>) {
             }
         }
     }
-    let ap = -acc * cm.y;
-    diag = diag * cm.y * cm.y;
+    // U3 compliance diagonal (A + αI). α = dbg.z on the compliant path (dbg.w on), 0 otherwise
+    // ⇒ byte-identical legacy. CELL_POCKET rows already returned above, so they never get +α.
+    let alpha = select(0.0, params.dbg.z, params.dbg.w > 0.5);
+    let ap = -acc * cm.y + alpha * pf_src[c];
+    diag = diag * cm.y * cm.y + alpha;
     if (diag > 1.0e-20) {
         pf_dst[c] = pf_src[c] + JACOBI_OMEGA * (cm.x - ap) / diag;
     } else {
@@ -794,8 +818,12 @@ fn jacobi_coarse(@builtin(global_invocation_id) gid: vec3<u32>) {
             }
         }
     }
-    let ap = -acc * cm.y;
-    diag = diag * cm.y * cm.y;
+    // U3 compliance diagonal (A + αI), same zeroth-order α as the fine sweep (a grid-independent
+    // reaction term — the rediscretized coarse operator carries the identical α). α = dbg.z on the
+    // compliant path (dbg.w on), 0 otherwise ⇒ byte-identical legacy. CELL_POCKET returned above.
+    let alpha = select(0.0, params.dbg.z, params.dbg.w > 0.5);
+    let ap = -acc * cm.y + alpha * pc_src[c];
+    diag = diag * cm.y * cm.y + alpha;
     if (diag > 1.0e-20) {
         pc_dst[c] = pc_src[c] + JACOBI_OMEGA * (cm.x - ap) / diag;
     } else {
