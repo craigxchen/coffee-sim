@@ -228,6 +228,82 @@ fn poured_cup_water_fills_not_corner() {
     );
 }
 
+/// DensU4 violent-pour stability probe (plan 2026-06-17-003): the calibration showed the uncapped
+/// two-sided density target fixes the STATIC cup over-pack and stays stable even converged. The
+/// violent pour (flow 8) is the regime that historically detonated / trapped crushing pockets;
+/// this confirms the uncapped target survives it (no detonation, no sustained crushing bubble — the
+/// pour-transient λ drains to ~0 at settle, like legacy SINGLE). WALL_BC_SINGLE for both (isolates
+/// the density path from the corner BC). On-demand, logging only.
+/// `cargo test --release --test twofield_cup pour_uncapped_density_stability -- --ignored --nocapture`
+#[test]
+#[ignore = "on-demand: violent-pour stability of the uncapped density target (slow: 2× pour runs)"]
+fn pour_uncapped_density_stability() {
+    const CELL_POCKET: f32 = 2.0;
+    let Some(gpu) = GpuContext::new_headless() else {
+        return;
+    };
+    let run = |label: &str, uncapped: bool| {
+        let mut s =
+            TwofieldSolver::build(&Scene::v60_pour_water_only(), &web_mats(), &web_cfg(), &gpu);
+        if uncapped {
+            s.set_density_target_mode_for_test(true);
+        }
+        let pour = EmissionInput {
+            kettle_pos: [0.0, 5.0, 0.0],
+            flow_rate: 8.0,
+            pour_angle: 0.0,
+            ..EmissionInput::default()
+        };
+        let quiet = EmissionInput::default();
+        let mut pour_lambda = 0.0f32;
+        for _ in 0..400 {
+            s.step(DT, &pour);
+            pour_lambda = pour_lambda.max(s.read_bubble()[0].abs());
+        }
+        let mut settle_lambda = 0.0f32;
+        for _ in 0..200 {
+            s.step(DT, &quiet);
+            settle_lambda = settle_lambda.max(s.read_bubble()[0].abs());
+        }
+        let pos = s.read_positions();
+        let nlive = s.phase_counts().0 as usize;
+        let live = &pos[..nlive];
+        let blown = live
+            .iter()
+            .any(|p| !p[0].is_finite() || !p[1].is_finite() || p[1].abs() > 100.0);
+        let pockets = s
+            .read_cell_meta()
+            .iter()
+            .filter(|m| (m[3] - CELL_POCKET).abs() < 0.5)
+            .count();
+        // cup fill: interior-core fraction (r < 1.5) of the settled cup pool.
+        let cup: Vec<[f32; 4]> = live
+            .iter()
+            .copied()
+            .filter(|p| p[1] <= -3.5 && p[1] >= -8.5)
+            .collect();
+        let core = cup
+            .iter()
+            .filter(|p| (p[0] * p[0] + p[2] * p[2]).sqrt() < 1.5)
+            .count();
+        let core_frac = core as f64 / cup.len().max(1) as f64;
+        if blown {
+            println!("[{label:<16}] DETONATED  λ pour={pour_lambda:.0} settle={settle_lambda:.0}");
+        } else {
+            println!(
+                "[{label:<16}] OK  pocket_cells={pockets}  λ pour={pour_lambda:.0} settle={settle_lambda:.0}  cup_n={} core_frac={core_frac:.2}",
+                cup.len()
+            );
+        }
+    };
+    println!("\n==== VIOLENT-POUR STABILITY (flow 8.0, WALL_BC_SINGLE, 400 pour + 200 settle) ====");
+    run("legacy", false);
+    run("uncapped target", true);
+    println!("  → the uncapped target must NOT detonate AND NOT sustain a crushing pocket (settle λ");
+    println!("     small, like legacy SINGLE — a transient pour cavity that drains is fine).");
+    println!("====================================================================\n");
+}
+
 /// INVESTIGATION (CornerU4, on-demand diagnostic, NOT a gate): locate the air pocket multi mode
 /// traps during the pour. Pours then settles like `poured_cup_water_fills_not_corner`, dumping
 /// CELL_POCKET cells' (r,y) extent + bubble λ for SINGLE vs MULTI at two flow rates. Finding: the
