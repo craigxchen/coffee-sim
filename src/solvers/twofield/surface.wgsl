@@ -195,9 +195,20 @@ fn pocket_mark(@builtin(global_invocation_id) gid: vec3<u32>) {
         // disables it). The deficit-driven suction is the original un-banded feedback — the
         // settled-pool stirring fix is the G2P global PIC blend (PIC_BLEND_DEFAULT), shipped now
         // that the crater gate asserts persistence (a held crater is correct, so the blend is safe).
-        let deficit = min(cm.z / params.extra.x - 1.0, 0.0);
+        // Under-density (−) suction half. Legacy (dbg.w ≤ 0.5): rate-limited by
+        // DENSITY_RELAX_FRAMES. Compliant path (dbg.w > 0.5, U2): the full predicted deficit at
+        // density-error dimension (rate e/dt), dead-banded by DENSITY_TARGET_DEADBAND — together
+        // with the cell_classify over-density half this forms one signed two-sided target, applied
+        // ONLY to interior fluid rows (the !near_air gate, KTD5). dbg.x = 0 still disables it.
+        let db = select(0.0, DENSITY_TARGET_DEADBAND, params.dbg.w > 0.5);
+        let deficit = min(cm.z / params.extra.x - 1.0 + db, 0.0);
         if (params.dbg.x > 0.5 && !near_air && deficit < 0.0) {
-            let s_under = deficit / (DENSITY_RELAX_FRAMES * params.dt);
+            var s_under: f32;
+            if (params.dbg.w > 0.5) {
+                s_under = deficit / params.dt;
+            } else {
+                s_under = deficit / (DENSITY_RELAX_FRAMES * params.dt);
+            }
             cell_meta[c].x = cm.x + cm.y * s_under / params.dt;
         }
         return;
