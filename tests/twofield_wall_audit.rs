@@ -901,3 +901,60 @@ fn uncapped_density_reduces_overpack() {
          not the model — do NOT tighten to ≲1.2)"
     );
 }
+
+/// DensU5 TEMPER-K sweep — cup over-pack (crispness) vs the uncapped rate-cap K, the partner to
+/// `twofield_settled::temper_k_sweep_settled_agitation`. The over-pack should improve as K→1
+/// (stiffer); the settled sweep showed K≥3 stays quiet while K=1 agitates. This finds the LARGEST
+/// K (gentlest/quietest) that still de-mushes the cup (interior near rest) — the temper candidate
+/// to eyeball in the webapp. ρ_rest = flat box-interior at rest (box-interior = 1.0).
+/// `cargo test --release --test twofield_wall_audit temper_k_sweep_overpack -- --ignored --nocapture`
+#[test]
+#[ignore = "on-demand temper-K cup over-pack (crispness) sweep"]
+fn temper_k_sweep_overpack() {
+    let Some(gpu) = GpuContext::new_headless() else {
+        return;
+    };
+    let quiet = EmissionInput::default();
+    let rest = {
+        let mut s = TwofieldSolver::build(&box_scene(), &web_mats(), &web_cfg(), &gpu);
+        for _ in 0..SETTLE {
+            s.step(DT, &quiet);
+        }
+        let pos = s.read_positions();
+        let n = s.phase_counts().0 as usize;
+        mean_nb(&pos[..n], (-0.6, 0.6), (-4.0, -3.0), 0.6).0.max(1.0)
+    };
+    let measure = |label: &str, uncapped: bool, k: f32| {
+        let mut s =
+            TwofieldSolver::build(&Scene::v60_cup_static_full(), &web_mats(), &web_cfg(), &gpu);
+        if uncapped {
+            s.set_density_target_mode_for_test(true);
+            s.set_density_rate_k_for_test(k);
+        }
+        for _ in 0..400 {
+            s.step(DT, &quiet);
+        }
+        let pos = s.read_positions();
+        let nlive = s.phase_counts().0 as usize;
+        let cup: Vec<[f32; 4]> = pos[..nlive]
+            .iter()
+            .copied()
+            .filter(|p| p[1] <= -3.5 && p[1] >= -8.5)
+            .collect();
+        let ymin = cup.iter().map(|p| p[1]).fold(f32::INFINITY, f32::min);
+        let band = (ymin + 0.05, ymin + 0.05 + 2.0 * SPACING);
+        let wall = mean_nb_radial(&cup, 3.0 - 2.0 * SPACING, 3.0, band).0 / rest;
+        let interior = mean_nb_radial(&cup, 0.0, 1.0, band).0 / rest;
+        println!("  [{label:<18}] interior ρ/ρ_rest {interior:.2}  wall {wall:.2}  (rest 1.0; mushy = high interior)");
+    };
+    println!("\n==== TEMPER-K vs CUP OVER-PACK / CRISPNESS (v60_cup_static_full, 400f, ρ_rest={rest:.2}) ====");
+    println!("  smaller K = stiffer/crisper (interior → rest); legacy is mushy (interior ~1.3)");
+    measure("legacy (capped)", false, 0.0);
+    measure("uncapped K=1", true, 1.0);
+    measure("uncapped K=3", true, 3.0);
+    measure("uncapped K=5", true, 5.0);
+    measure("uncapped K=10", true, 10.0);
+    measure("uncapped K=30", true, 30.0); // sanity: ≈ legacy
+    println!("  → cross with the settled sweep: K≥3 is QUIET; pick the smallest-still-quiet K that");
+    println!("    de-mushes most (interior nearest rest). Candidate ≈ K=3. Eyeball it in the webapp.");
+}

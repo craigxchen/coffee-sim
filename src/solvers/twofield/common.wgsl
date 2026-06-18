@@ -54,7 +54,8 @@ struct Params {
                      //  (default, byte-identical to pre-coverage); > 0.5 → graded coverage weight
                      //  (wall_coverage in pressure.wgsl — the embedded-boundary L1 path). (Formerly
                      //  a dropped relief dead-band; the settled-pool stirring fix is the G2P PIC
-                     //  blend PIC_BLEND_DEFAULT.) .z reserved. .w = uncapped two-sided
+                     //  blend PIC_BLEND_DEFAULT.) .z = temper-K rate divisor for the uncapped path
+                     //  (0 ⇒ K=1 full uncap; legacy cap 30; sweet spot K∈(1,30)). .w = uncapped two-sided
                      //  density-target mode (≤ 0.5 → legacy rate-limited two-sided relief, default
                      //  & byte-identical; > 0.5 → relief uncapped to full strength, driving ρ→ρ₀
                      //  — the over-pack fix; see cell_classify in pressure.wgsl / surface.wgsl).

@@ -502,10 +502,14 @@ fn cell_classify(@builtin(global_invocation_id) gid: vec3<u32>) {
     // dropped — it only re-softened the response). Both paths multiply by dbg.x so the
     // stirring-isolation gate (dbg.x = 0) still zeros the source. The under-density (−) half is
     // the interior-gated surface.wgsl pass (KTD5).
+    // Temper-K rate divisor for the uncapped path (dbg.z): legacy uses DENSITY_RELAX_FRAMES (=30,
+    // slow → mushy); full uncap = K=1 (crisp but pumps energy on coupled scenes); the calibrated
+    // sweet spot is K∈(1,30). dbg.z default 0 ⇒ K=1 (full uncap). Smaller K = stiffer/crisper.
+    let kfac = max(params.dbg.z, 1.0);
     let e_over = rho / params.extra.x - 1.0;
     var s_target: f32;
     if (params.dbg.w > 0.5) {
-        s_target = params.dbg.x * max(e_over - DENSITY_TARGET_DEADBAND, 0.0) / params.dt;
+        s_target = params.dbg.x * max(e_over - DENSITY_TARGET_DEADBAND, 0.0) / (kfac * params.dt);
     } else {
         s_target = params.dbg.x * max(e_over, 0.0) / (DENSITY_RELAX_FRAMES * params.dt);
     }

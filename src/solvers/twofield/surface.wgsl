@@ -205,9 +205,12 @@ fn pocket_mark(@builtin(global_invocation_id) gid: vec3<u32>) {
         let db = select(0.0, DENSITY_TARGET_DEADBAND, params.dbg.w > 0.5);
         let deficit = min(cm.z / params.extra.x - 1.0 + db, 0.0);
         if (params.dbg.x > 0.5 && !near_air && deficit < 0.0) {
+            // Temper-K rate divisor (dbg.z, default 0 ⇒ K=1 full uncap) — matches the cell_classify
+            // over-density half so the two-sided target shares one rate.
+            let kfac = max(params.dbg.z, 1.0);
             var s_under: f32;
             if (params.dbg.w > 0.5) {
-                s_under = deficit / params.dt;
+                s_under = deficit / (kfac * params.dt);
             } else {
                 s_under = deficit / (DENSITY_RELAX_FRAMES * params.dt);
             }

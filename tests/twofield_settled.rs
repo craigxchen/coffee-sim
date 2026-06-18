@@ -540,3 +540,55 @@ fn pic_blend_default_in_documented_band() {
         )
     };
 }
+
+/// DensU5 TEMPER-K sweep — settled-tank agitation (tail KE + max|v|) vs the uncapped rate-cap K.
+/// The U5 recon found the full uncap (K=1) pumps energy into deep/coupled scenes (this tank's KE
+/// blew up); legacy (rate-capped, K=30-equiv) is the quiet reference. Finds the SMALLEST K
+/// (= stiffest/crispest density) that keeps the tank quiet. Pair with the cup over-pack sweep
+/// (`twofield_wall_audit::temper_k_sweep_overpack`): a K that is BOTH crisp (low cup over-pack)
+/// AND quiet (tank KE ≈ legacy) is the temper candidate — then eyeball it in the webapp.
+/// `cargo test --release --test twofield_settled temper_k_sweep_settled_agitation -- --ignored --nocapture`
+#[test]
+#[ignore = "on-demand temper-K agitation sweep (slow: ~6 long tank runs)"]
+fn temper_k_sweep_settled_agitation() {
+    let Some(gpu) = GpuContext::new_headless() else {
+        return;
+    };
+    const RUN: usize = 1500; // MUST match the gate — the agitation builds up slowly; 800 frames
+                             // gives false "QUIET" verdicts (K=1: 0.0115@800 but 0.6151@1500).
+    let tail_start = RUN * 6 / 10;
+    let scene = tank_scene(12.0);
+    // Match the `settled_water_tank_ke_decays_and_stays_bounded` gate EXACTLY: default mats/cfg,
+    // 200-frame warmup (seed-relax), then the trace. Bound: per-particle tail-mean KE < 0.05,
+    // max|v| < 5.0. The triage showed full uncap blows it (per-particle 0.6151, max|v| 26).
+    let measure = |label: &str, uncapped: bool, k: f32| {
+        let mut s = TwofieldSolver::build(&scene, &Materials::default(), &Config::default(), &gpu);
+        if uncapped {
+            s.set_density_target_mode_for_test(true);
+            s.set_density_rate_k_for_test(k);
+        }
+        let quiet = EmissionInput::default();
+        for _ in 0..200 {
+            s.step(DT, &quiet);
+        }
+        let nw = s.phase_counts().0 as f64;
+        let (ke, mv) = settle_trace(&mut s, RUN);
+        let (mean, peak) = tail_stats(&ke, tail_start);
+        let maxv = mv.iter().cloned().fold(0.0, f64::max);
+        let pp = mean / nw;
+        let verdict = if pp < 0.05 && maxv < 5.0 { "QUIET ✓" } else { "agitated" };
+        println!(
+            "  [{label:<18}] per-particle KE {pp:7.4}  max|v| {maxv:6.2}  (peak/mean {:.1}x)  {verdict}",
+            peak / mean.max(1e-9)
+        );
+    };
+    println!("\n==== TEMPER-K vs SETTLED-TANK AGITATION (gate config: default mats, 200 warmup + {RUN}) ====");
+    println!("  bound: per-particle tail-mean KE < 0.05 AND max|v| < 5.0; smaller K = crisper but more agitation");
+    measure("legacy (capped)", false, 0.0);
+    measure("uncapped K=1", true, 1.0);
+    measure("uncapped K=3", true, 3.0);
+    measure("uncapped K=5", true, 5.0);
+    measure("uncapped K=10", true, 10.0);
+    measure("uncapped K=30", true, 30.0); // sanity: ≈ legacy (same rate, two-sided path)
+    println!("  → smallest K whose tail KE / max|v| ≈ legacy is the temper candidate (quiet + crispest).");
+}
