@@ -828,3 +828,76 @@ fn multi_normal_nm_is_psd_on_octagon_cup() {
          — the projector must be orthonormal I−QQᵀ, not a raw Σ n̂n̂ᵀ"
     );
 }
+
+/// DensU4 R9 — the durable over-pack regression gate for the uncapped two-sided density relief
+/// (plan 2026-06-17-003). Two bars, kept SEPARATE (do NOT collapse / over-tighten the wall):
+///   (a) clean-model bar: cup INTERIOR ρ/ρ_rest ≲ 1.2 (the strong incompressibility claim);
+///   (b) V60 WALL-shell regression bar: the fix must materially beat legacy (wall < legacy − 0.3),
+///       but is NOT held to ≲1.2 — the residual wall over-pack is partly the deferred corner-seam
+///       BC (this runs WALL_BC_SINGLE), not the model (see R11 / the corner follow-up).
+/// Sanity: the clean-model bar genuinely separates fix from legacy (legacy interior > 1.2).
+/// ρ_rest = a flat box interior at rest (box-interior = 1.0 calibration).
+#[test]
+fn uncapped_density_reduces_overpack() {
+    let Some(gpu) = GpuContext::new_headless() else {
+        eprintln!("twofield_wall_audit: no GPU adapter; skipping.");
+        return;
+    };
+    let quiet = EmissionInput::default();
+    let rest = {
+        let mut s = TwofieldSolver::build(&box_scene(), &web_mats(), &web_cfg(), &gpu);
+        for _ in 0..SETTLE {
+            s.step(DT, &quiet);
+        }
+        let pos = s.read_positions();
+        let n = s.phase_counts().0 as usize;
+        mean_nb(&pos[..n], (-0.6, 0.6), (-4.0, -3.0), 0.6).0.max(1.0)
+    };
+    let measure = |uncapped: bool| -> (f64, f64) {
+        let mut s =
+            TwofieldSolver::build(&Scene::v60_cup_static_full(), &web_mats(), &web_cfg(), &gpu);
+        if uncapped {
+            s.set_density_target_mode_for_test(true);
+        }
+        for _ in 0..400 {
+            s.step(DT, &quiet);
+        }
+        let pos = s.read_positions();
+        let nlive = s.phase_counts().0 as usize;
+        let cup: Vec<[f32; 4]> = pos[..nlive]
+            .iter()
+            .copied()
+            .filter(|p| p[1] <= -3.5 && p[1] >= -8.5)
+            .collect();
+        let ymin = cup.iter().map(|p| p[1]).fold(f32::INFINITY, f32::min);
+        let band = (ymin + 0.05, ymin + 0.05 + 2.0 * SPACING);
+        let wall = mean_nb_radial(&cup, 3.0 - 2.0 * SPACING, 3.0, band).0 / rest;
+        let interior = mean_nb_radial(&cup, 0.0, 1.0, band).0 / rest;
+        (wall, interior)
+    };
+    let (lw, li) = measure(false);
+    let (uw, ui) = measure(true);
+    println!(
+        "DensU4 R9 over-pack (ρ_rest={rest:.2}): legacy wall {lw:.2}/interior {li:.2}  →  \
+         uncapped wall {uw:.2}/interior {ui:.2}"
+    );
+    // (a) clean-model bar: interior near rest, and it genuinely separates fix from legacy.
+    assert!(
+        ui <= 1.20,
+        "clean-model bar: uncapped interior ρ/ρ_rest {ui:.2} must be ≲ 1.20 (near rest)"
+    );
+    assert!(
+        li > 1.20,
+        "sanity: legacy interior {li:.2} should exceed the 1.20 bar (else the bar is vacuous)"
+    );
+    // (b) V60 wall-shell regression bar: fix materially beats legacy; NOT held to ≲1.2 (corner BC).
+    assert!(
+        uw < li.max(lw) && uw < lw - 0.3,
+        "wall-shell regression: uncapped wall {uw:.2} must materially beat legacy wall {lw:.2} (by ≥ 0.3)"
+    );
+    assert!(
+        uw <= 1.55,
+        "wall-shell bar: uncapped wall {uw:.2} ≤ 1.55 (residual over 1.0 is the deferred corner BC, \
+         not the model — do NOT tighten to ≲1.2)"
+    );
+}
