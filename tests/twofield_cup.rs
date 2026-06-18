@@ -235,14 +235,18 @@ fn poured_cup_water_fills_not_corner() {
 /// pour-transient λ drains to ~0 at settle, like legacy SINGLE). WALL_BC_SINGLE for both (isolates
 /// the density path from the corner BC). On-demand, logging only.
 /// `cargo test --release --test twofield_cup pour_uncapped_density_stability -- --ignored --nocapture`
+/// DensU4 R10 — the uncapped two-sided density target must NOT leak suction into the pour cavity:
+/// on the violent pour (flow 8) it must not detonate and not sustain a crushing bubble (settle λ
+/// small — a transient pour cavity that drains is fine, exactly how legacy SINGLE behaves). Asserts
+/// on the uncapped run; legacy is the comparison baseline. (Slow: 2× pour runs.)
 #[test]
-#[ignore = "on-demand: violent-pour stability of the uncapped density target (slow: 2× pour runs)"]
 fn pour_uncapped_density_stability() {
     const CELL_POCKET: f32 = 2.0;
     let Some(gpu) = GpuContext::new_headless() else {
+        eprintln!("twofield_cup: no GPU adapter; skipping.");
         return;
     };
-    let run = |label: &str, uncapped: bool| {
+    let run = |label: &str, uncapped: bool| -> (bool, usize, f32) {
         let mut s =
             TwofieldSolver::build(&Scene::v60_pour_water_only(), &web_mats(), &web_cfg(), &gpu);
         if uncapped {
@@ -295,12 +299,23 @@ fn pour_uncapped_density_stability() {
                 cup.len()
             );
         }
+        (blown, pockets, settle_lambda)
     };
     println!("\n==== VIOLENT-POUR STABILITY (flow 8.0, WALL_BC_SINGLE, 400 pour + 200 settle) ====");
-    run("legacy", false);
-    run("uncapped target", true);
-    println!("  → the uncapped target must NOT detonate AND NOT sustain a crushing pocket (settle λ");
-    println!("     small, like legacy SINGLE — a transient pour cavity that drains is fine).");
+    let _ = run("legacy", false); // baseline comparison (printed)
+    let (blown, pockets, settle) = run("uncapped target", true);
+    // R10: the uncapped target must not detonate and must not sustain a crushing bubble. The
+    // pour-transient λ is allowed (a real transient cavity); the SETTLED λ must drain small —
+    // the <100 bar mirrors `poured_cup_water_fills_not_corner`.
+    assert!(!blown, "uncapped target detonated on the violent pour (flow 8)");
+    assert!(
+        pockets == 0,
+        "uncapped target left {pockets} CELL_POCKET cells after settle (a sustained crushing pocket)"
+    );
+    assert!(
+        settle < 100.0,
+        "uncapped target sustained a crushing bubble after settle: |λ|={settle:.0} (bar <100)"
+    );
     println!("====================================================================\n");
 }
 
