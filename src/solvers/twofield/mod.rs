@@ -347,9 +347,9 @@ struct Params {
     // Diagnostic toggles (test-only; production keeps the defaults). .x = density-relief enable
     // (1.0 on by default; 0.0 disables BOTH the cell_classify over-density relief and the
     // pocket_mark under-density suction for the stirring-isolation gate). .y = SDF wall-BC mode
-    // (WALL_BC_SINGLE/MULTI). .z = compliance α (compliant-density path; 0 = off). .w =
-    // compliant-density mode (≤ 0.5 → legacy ∇·v + rate-relief, default & byte-identical;
-    // > 0.5 → two-sided predicted-density-error target + compliance diagonal).
+    // (WALL_BC_SINGLE/MULTI). .z reserved. .w = uncapped two-sided density-target mode
+    // (≤ 0.5 → legacy rate-limited (DENSITY_RELAX) two-sided relief, default & byte-identical;
+    // > 0.5 → relief uncapped to full strength, driving ρ→ρ₀ — the over-pack fix).
     dbg: [f32; 4],
 }
 
@@ -882,18 +882,12 @@ impl TwofieldSolver {
         self.params.dbg[1] = mode;
     }
 
-    /// Set the compliance magnitude α (dbg.z) for the compliant-density pressure path — dev/test
-    /// only (the U4 calibration sweep). α = 0 (default) ⇒ the bare operator A, byte-identical to
-    /// the legacy path. α > 0 adds the +αI diagonal in residual/jacobi_fine/jacobi_coarse (U3).
-    /// Only takes effect when the compliant-density mode (dbg.w) is on.
-    pub fn set_compliance_for_test(&mut self, alpha: f32) {
-        self.params.dbg[2] = alpha.max(0.0);
-    }
-
-    /// Select the compliant-density target mode (dbg.w) — dev/test only. `false` (default) keeps
-    /// the legacy ∇·v projection + one-sided rate-relief (byte-identical to pre-compliance);
-    /// `true` switches the rhs to the two-sided predicted-density-error target (U2) and engages
-    /// the compliance diagonal (U3). Production default flips to `true` in U5 post-calibration.
+    /// Select the uncapped two-sided density-target mode (dbg.w) — dev/test only. `false`
+    /// (default) keeps the legacy ∇·v projection + rate-limited (DENSITY_RELAX) two-sided relief,
+    /// byte-identical to pre-fix; `true` drops the rate cap so the density relief drives ρ→ρ₀ at
+    /// full strength (the calibration showed this is the over-pack fix; it is stable because it is
+    /// a bounded restoring target, not the one-sided expansion source that historically detonated).
+    /// Production default flips to `true` in U5.
     pub fn set_density_target_mode_for_test(&mut self, on: bool) {
         self.params.dbg[3] = if on { 1.0 } else { 0.0 };
     }
