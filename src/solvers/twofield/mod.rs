@@ -347,7 +347,8 @@ struct Params {
     // Diagnostic toggles (test-only; production keeps the defaults). .x = density-relief enable
     // (1.0 on by default; 0.0 disables BOTH the cell_classify over-density relief and the
     // pocket_mark under-density suction for the stirring-isolation gate). .y = SDF wall-BC mode
-    // (WALL_BC_SINGLE/MULTI). .z reserved. .w = uncapped two-sided density-target mode
+    // (WALL_BC_SINGLE/MULTI). .z = temper-K rate divisor for the uncapped path (0 ⇒ K=1 full
+    // uncap; legacy cap is 30; sweet spot K∈(1,30)). .w = uncapped two-sided density-target mode
     // (≤ 0.5 → legacy rate-limited (DENSITY_RELAX) two-sided relief, default & byte-identical;
     // > 0.5 → relief uncapped to full strength, driving ρ→ρ₀ — the over-pack fix).
     dbg: [f32; 4],
@@ -890,6 +891,15 @@ impl TwofieldSolver {
     /// Production default flips to `true` in U5.
     pub fn set_density_target_mode_for_test(&mut self, on: bool) {
         self.params.dbg[3] = if on { 1.0 } else { 0.0 };
+    }
+
+    /// Set the temper-K rate divisor (dbg.z) for the uncapped density path — dev/test only (the
+    /// temper calibration). The uncapped relief rate is `e/(K·dt)`: K=1 (default, dbg.z=0) is the
+    /// full uncap (crisp but pumps energy on coupled scenes); the legacy cap is K=30 (slow, mushy);
+    /// the calibrated sweet spot is K∈(1,30). Smaller K = stiffer/crisper. Only takes effect on the
+    /// uncapped path (dbg.w on).
+    pub fn set_density_rate_k_for_test(&mut self, k: f32) {
+        self.params.dbg[2] = k.max(0.0);
     }
 
     /// Set the U3 pressure-budget knobs (KTD-9 grid points; dev/test only). `coarse_sweeps =
