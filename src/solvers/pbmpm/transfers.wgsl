@@ -1,6 +1,8 @@
-// PB-MPM APIC fixed-point transfers (U3): p2g → grid_update → g2p, one APIC transfer cycle per
-// substep (the iteration_count loop + the compliant density constraint are U4 — NOT here). The
-// grid_clear pass lives in common.wgsl. Concatenated after common.wgsl into one shader module.
+// PB-MPM APIC fixed-point transfers (U3): p2g → grid_update → g2p, one APIC transfer cycle. U4
+// wraps `particle_update → grid_clear → p2g → grid_update → g2p` into an iteration_count loop per
+// substep (step() in mod.rs) and runs `particle_integrate` once after it; the compliant density
+// constraint + advection live in constraint.wgsl. The grid_clear pass lives in common.wgsl.
+// Concatenated after common.wgsl into one shader module.
 //
 // Per-substep recurrence (the solver's OWN discrete form — tests/pbmpm_transfers.rs derives its
 // round-trip reference from exactly this):
@@ -9,9 +11,10 @@
 //   grid_update divides momentum/mass → velocity, applies gravity (v ← v + g·dt), and a simple
 //     domain BC (zero the into-wall normal so water stays in the box — collider BC/restitution is
 //     U5);
-//   g2p gathers the new particle velocity, reconstructs the APIC affine matrix into the per-
-//     particle D (KTD8: D = B·D⁻¹, the velocity-gradient state U4's tr(D) reads), and advects
-//     x ← x + v_new·dt.
+//   g2p gathers the new particle velocity and reconstructs the APIC affine matrix into the per-
+//     particle D (KTD8: D = B·D⁻¹, the velocity-gradient state U4's tr(D) reads). Advection was
+//     MOVED OUT of g2p into `particle_integrate` (constraint.wgsl) in U4: it runs ONCE per substep
+//     after the iteration_count loop, on the converged velocity.
 // In free air (no BC) the per-substep closed form is v ← v + g·dt ; x ← x + v_new·dt
 // (semi-implicit Euler), because the B-spline weights partition unity (the gather is exact for a
 // uniform field) and D stays ~0 in a uniform field (linear consistency).
@@ -73,6 +76,12 @@ fn p2g(@builtin(global_invocation_id) gid: vec3<u32>) {
 // decoded velocity is written to the FLOAT grid_vel scratch (KTD8 — not a fixed-point lane).
 // Empty nodes get zero velocity. Collider SDF BC + restitution is U5; here a node sitting on a
 // domain face just has its into-wall normal component zeroed so water stays in the box.
+//
+// grid_update runs once per ITERATION (the U4 iteration_count loop), but the substep's body force
+// is g·dt TOTAL — so gravity is amortized as g·dt/iteration_count per iteration. The gathered
+// particle velocity carries across the iterations (it is re-scattered each iteration), so over the
+// iteration_count grid_update calls the velocity accumulates exactly g·dt of gravity, regardless of
+// the iteration count (the constraint loop does not over-inject the body force).
 @compute @workgroup_size(WG)
 fn grid_update(@builtin(global_invocation_id) gid: vec3<u32>) {
     let n = gid.x;
@@ -91,8 +100,9 @@ fn grid_update(@builtin(global_invocation_id) gid: vec3<u32>) {
             f32(atomicLoad(&grid_fp[n * 4u + 2u])),
             f32(atomicLoad(&grid_fp[n * 4u + 3u]))
         ) * inv;
-        // Gravity on every mass-carrying node (the substep's body force; G2P advects with v_new).
-        v = v + params.gravity.xyz * params.dt;
+        // Gravity on every mass-carrying node, amortized over the iteration loop (g·dt total).
+        let iters = f32(max(params.iter_pad.x, 1u));
+        v = v + params.gravity.xyz * (params.dt / iters);
     }
 
     // Simple domain BC (U3 placeholder; collider SDF + restitution is U5): a node within one cell
@@ -115,7 +125,9 @@ fn grid_update(@builtin(global_invocation_id) gid: vec3<u32>) {
 // APIC gather: new particle velocity v = Σ w·v_i and the affine matrix B = Σ w·v_i·dᵀ, then
 // D = B·D⁻¹ with D⁻¹ = (4/h²)·I for the quadratic B-spline (Jiang et al. APIC). D is written back
 // to the per-particle deform_disp (KTD8: the velocity-gradient state U4's constraint reads via
-// tr(D)). Then advect x ← x + v·dt and apply a particle-resolution box clamp.
+// tr(D)). Velocity is written but NOT advected here — U4 moved advection into `particle_integrate`
+// (constraint.wgsl), which runs ONCE per substep after the iteration loop, so the position only
+// moves on the converged velocity. g2p now only gathers velocity + writes D.
 @compute @workgroup_size(WG)
 fn g2p(@builtin(global_invocation_id) gid: vec3<u32>) {
     let p = gid.x;
@@ -161,18 +173,8 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>) {
         v = v * (params.max_speed / s);
     }
 
-    x = x + v * params.dt;
-
-    // Particle-resolution box clamp (the grid BC bounds penetration only at node resolution).
-    // Only the into-wall component is removed (separating, free slip). Collider SDF push-out is U5.
-    if (x.x < params.box_min.x) { x.x = params.box_min.x; if (v.x < 0.0) { v.x = 0.0; } }
-    if (x.y < params.box_min.y) { x.y = params.box_min.y; if (v.y < 0.0) { v.y = 0.0; } }
-    if (x.z < params.box_min.z) { x.z = params.box_min.z; if (v.z < 0.0) { v.z = 0.0; } }
-    if (x.x > params.box_max.x) { x.x = params.box_max.x; if (v.x > 0.0) { v.x = 0.0; } }
-    if (x.y > params.box_max.y) { x.y = params.box_max.y; if (v.y > 0.0) { v.y = 0.0; } }
-    if (x.z > params.box_max.z) { x.z = params.box_max.z; if (v.z > 0.0) { v.z = 0.0; } }
-
-    pos[p] = vec4<f32>(x, pos[p].w);
+    // No advection here — `particle_integrate` (constraint.wgsl) advects once per substep after the
+    // iteration loop. Only the gathered velocity + the reconstructed affine D are written back.
     vel[p] = vec4<f32>(v, vel[p].w);
     deform_disp[3u * p + 0u] = vec4<f32>(nd0, 0.0);
     deform_disp[3u * p + 1u] = vec4<f32>(nd1, 0.0);

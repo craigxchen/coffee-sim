@@ -6,13 +6,16 @@
 //! constraint scalars — all in the PARTICLE buffer; the GRID carries ONLY [mass, mom.xyz] as
 //! fixed-point `atomic<i32>`), the `Params` Rust↔WGSL ABI lock, the `FP_SCALE` fixed-point
 //! encoding, the WGSL-concatenation module assembly, and the registry seam. It mirrors
-//! `src/solvers/twofield/` structurally (KTD2). U3 (this revision) replaces the U1 gravity
-//! `advect` placeholder with a single APIC fixed-point transfer cycle per substep:
-//! `grid_clear -> p2g -> grid_update -> g2p` (`transfers.wgsl`). Water now scatters mass + APIC
-//! momentum to the 3x3x3 fixed-point grid, gains gravity on the grid, and gathers velocity +
-//! reconstructs the per-particle affine matrix D, so it falls and accumulates (compressibly; the
-//! compliant density constraint that gives incompressibility/bounce is U4). Collider BC/restitution
-//! is U5.
+//! `src/solvers/twofield/` structurally (KTD2). U3 added the APIC fixed-point transfer cycle
+//! (`grid_clear -> p2g -> grid_update -> g2p`, `transfers.wgsl`). U4 (this revision) adds the
+//! compliant density constraint that makes the water STIFF so it bounces (`constraint.wgsl`): per
+//! substep the bundle `particle_update -> grid_clear -> p2g -> grid_update -> g2p` repeats
+//! `iteration_count` times (the grid rebuilds each iteration so the per-particle correction
+//! propagates spatially), then `particle_integrate` advects ONCE on the converged velocity (the
+//! advection was moved out of g2p). D is zeroed per substep (`deform_clear`) and accumulated across
+//! the iterations; F carries across substeps. The four knobs (iteration_count, liquid_density,
+//! liquid_relaxation, liquid_viscosity) are plumbed from `Config` and have `set_*_for_test`
+//! setters. Collider BC/restitution is U5.
 
 use std::sync::Arc;
 
@@ -45,15 +48,17 @@ fn groups(n: u32) -> u32 {
     n.div_ceil(WG)
 }
 
-/// Storage-buffer budget (KTD5): per U3 entry point (the params uniform does NOT count against
-/// the storage limit) —
-///   `grid_clear`  1 (grid_fp);
-///   `p2g`         4 (pos, vel, deform_disp, grid_fp) — reads pos/vel/deform_disp, scatters grid_fp;
-///   `grid_update` 2 (grid_fp, grid_vel);
-///   `g2p`         4 (pos, vel, deform_disp, grid_vel) — the OTHER widest entry point.
-/// Widest = `p2g`/`g2p` at 4 storage buffers. Well within the 9 grant
-/// the device requests (`src/utils/gpu.rs::NEEDED_STORAGE_BUFFERS`). Re-derive when U4's constraint
-/// pass lands (it adds deform_grad reads). The compliant-density constraint + iteration loop is U4.
+/// Storage-buffer budget (KTD5): per entry point (the params uniform does NOT count against the
+/// storage limit) —
+///   `grid_clear`         1 (grid_fp);
+///   `particle_update`    1 (deform_disp) — U4 constraint, reads+writes D only;
+///   `p2g`                4 (pos, vel, deform_disp, grid_fp) — reads pos/vel/deform_disp, scatters;
+///   `grid_update`        2 (grid_fp, grid_vel);
+///   `g2p`                4 (pos, vel, deform_disp, grid_vel) — the OTHER widest entry point;
+///   `particle_integrate` 2 (pos, vel) — advect once per substep.
+/// Widest = `p2g`/`g2p` at 4 storage buffers. Well within the 9 grant the device requests
+/// (`src/utils/gpu.rs::NEEDED_STORAGE_BUFFERS`). The U4 constraint pass adds only `deform_disp`
+/// reads (1 buffer) so the widest count is unchanged.
 pub const MAX_STORAGE_BUFFERS_PER_ENTRY_POINT: u32 = 4;
 
 /// Fixed-point scale for the grid atomics — mirrors `FP_SCALE` in `common.wgsl` (2^18,
@@ -62,11 +67,13 @@ pub const MAX_STORAGE_BUFFERS_PER_ENTRY_POINT: u32 = 4;
 /// perf/range gate is U6).
 pub const FP_SCALE: f64 = 262144.0;
 
-/// Default PB-MPM liquid-constraint knobs (KTD1). Inert in U1 — the compliant density
-/// constraint that reads them lands in U4; carried in `Params` now so the ABI is fixed up front.
+/// Default PB-MPM liquid-constraint knobs (KTD1). These mirror the `Config` defaults
+/// (`pbmpm_*`) and are the fallback if a caller hands a `Config` that left them at zero; the
+/// live values come from `Config` in `build()`. The compliant density constraint that reads them
+/// is the U4 `particle_update` pass.
 pub const LIQUID_DENSITY_DEFAULT: f32 = 1.0;
-pub const LIQUID_RELAXATION_DEFAULT: f32 = 1.0;
-pub const LIQUID_VISCOSITY_DEFAULT: f32 = 0.0;
+pub const LIQUID_RELAXATION_DEFAULT: f32 = 0.5;
+pub const LIQUID_VISCOSITY_DEFAULT: f32 = 0.01;
 pub const ITERATION_COUNT_DEFAULT: u32 = 2;
 
 /// Fine-grid cell size as a multiple of the particle spacing — ~2× spacing gives the quadratic
@@ -74,9 +81,11 @@ pub const ITERATION_COUNT_DEFAULT: u32 = 2;
 /// CELL_SIZE_FACTOR; the transfers in U3 pick the final resolution).
 pub const CELL_SIZE_FACTOR: f32 = 2.0;
 
-/// Dispatches per substep at the U3 knobs: `grid_clear → p2g → grid_update → g2p`. One substep per
-/// frame for now (U4 adds the iteration_count loop; a CFL substep policy is a later decision).
-pub const DISPATCHES_PER_FRAME: u32 = 4;
+/// Dispatches per substep (U4 structure): the iteration loop runs `iteration_count` × the 5-pass
+/// bundle `particle_update → grid_clear → p2g → grid_update → g2p`, then `particle_integrate` once,
+/// i.e. `5·iteration_count + 1` per substep. One substep per frame for now (a CFL substep policy is
+/// a later decision). The profiler reports the real per-frame dispatch count.
+pub const DISPATCHES_PER_SUBSTEP_BUNDLE: u32 = 5;
 
 /// Uniform parameters, byte-mirrored by the WGSL `Params` in `common.wgsl`.
 #[repr(C)]
@@ -265,10 +274,13 @@ pub struct PbmpmSolver {
 }
 
 struct Pipelines {
+    deform_clear: (wgpu::ComputePipeline, wgpu::BindGroup),
+    particle_update: (wgpu::ComputePipeline, wgpu::BindGroup),
     grid_clear: (wgpu::ComputePipeline, wgpu::BindGroup),
     p2g: (wgpu::ComputePipeline, wgpu::BindGroup),
     grid_update: (wgpu::ComputePipeline, wgpu::BindGroup),
     g2p: (wgpu::ComputePipeline, wgpu::BindGroup),
+    particle_integrate: (wgpu::ComputePipeline, wgpu::BindGroup),
 }
 
 impl PbmpmSolver {
@@ -391,6 +403,31 @@ impl PbmpmSolver {
         let o = self.params.grid_origin;
         let d = self.params.grid_dims;
         ([o[0], o[1], o[2]], o[3], [d[0], d[1], d[2]])
+    }
+
+    /// Set the PB-MPM iteration count (the `particle_update → grid_zero → p2g → grid_update → g2p`
+    /// bundle repeats this many times per substep) — dev/test only (the bounce/stability sweep and
+    /// the pure-transfer round-trip arm, which sets it to 1). Clamped to ≥ 1.
+    pub fn set_iteration_count_for_test(&mut self, count: u32) {
+        self.params.iter_pad[0] = count.max(1);
+    }
+
+    /// Set the rest liquid density target (`1/liquid_density` in the `alpha` term) — dev/test only.
+    pub fn set_liquid_density_for_test(&mut self, density: f32) {
+        self.params.liquid_density = density;
+    }
+
+    /// Set the compliant volume-correction relaxation `∈ [0,1]` — dev/test only (the stiffness ⇒
+    /// bounce sweep, and the `0.0` disabled arm that makes the iteration loop a pure transfer
+    /// check: alpha is still computed but the correction is scaled to zero).
+    pub fn set_liquid_relaxation_for_test(&mut self, relaxation: f32) {
+        self.params.liquid_relaxation = relaxation;
+    }
+
+    /// Set the viscous (deviatoric/shear) correction weight — dev/test only. `0.0` disables the
+    /// shear term.
+    pub fn set_liquid_viscosity_for_test(&mut self, viscosity: f32) {
+        self.params.liquid_viscosity = viscosity;
     }
 
     /// Live water count currently simulated.
@@ -572,10 +609,11 @@ impl Solver for PbmpmSolver {
             max_speed: cfg.max_speed,
             water_count,
             particle_count,
-            liquid_density: LIQUID_DENSITY_DEFAULT,
-            liquid_relaxation: LIQUID_RELAXATION_DEFAULT,
-            liquid_viscosity: LIQUID_VISCOSITY_DEFAULT,
-            iter_pad: [ITERATION_COUNT_DEFAULT, 0, 0, 0],
+            // PB-MPM liquid constraint knobs from Config (U4); tunable live via the setters below.
+            liquid_density: cfg.pbmpm_liquid_density,
+            liquid_relaxation: cfg.pbmpm_liquid_relaxation,
+            liquid_viscosity: cfg.pbmpm_liquid_viscosity,
+            iter_pad: [cfg.pbmpm_iteration_count.max(1), 0, 0, 0],
         };
         let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("pbmpm-params"),
@@ -657,12 +695,14 @@ impl Solver for PbmpmSolver {
         }
 
         // One shader module from the concatenated WGSL (WGSL has no imports): common.wgsl declares
-        // the shared bindings/helpers, transfers.wgsl adds the U3 p2g/grid_update/g2p passes. The
-        // U4 constraint file concatenates after these.
+        // the shared bindings/helpers, transfers.wgsl adds the U3 p2g/grid_update/g2p passes, and
+        // constraint.wgsl adds the U4 particle_update (compliant density constraint) + the moved-out
+        // particle_integrate (advect).
         let shader_src = format!(
-            "{}\n{}",
+            "{}\n{}\n{}",
             include_str!("common.wgsl"),
             include_str!("transfers.wgsl"),
+            include_str!("constraint.wgsl"),
         );
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("pbmpm"),
@@ -696,6 +736,13 @@ impl Solver for PbmpmSolver {
             })
         };
         let pipelines = {
+            // deform_clear: deform_disp (write). 1 storage buffer. Zeroes D once per substep.
+            let deform_clear = make("deform_clear");
+            let deform_clear_bind = bg(&deform_clear, &[(0, &params_buf), (5, &deform_disp)]);
+            // particle_update: deform_disp (read+write D). 1 storage buffer. Runs BEFORE p2g each
+            // iteration so the corrected D propagates through the scatter.
+            let particle_update = make("particle_update");
+            let particle_update_bind = bg(&particle_update, &[(0, &params_buf), (5, &deform_disp)]);
             let grid_clear = make("grid_clear");
             let grid_clear_bind = bg(&grid_clear, &[(0, &params_buf), (7, &grid_fp)]);
             // p2g: pos, vel, deform_disp (read affine D), grid_fp (scatter). 4 storage buffers.
@@ -716,7 +763,8 @@ impl Solver for PbmpmSolver {
                 &grid_update,
                 &[(0, &params_buf), (7, &grid_fp), (8, &grid_vel)],
             );
-            // g2p: pos, vel, deform_disp (write D), grid_vel (gather). 4 storage buffers.
+            // g2p: pos (read), vel (write), deform_disp (write D), grid_vel (gather). 4 storage
+            // buffers. No longer writes pos — advection moved to particle_integrate (U4).
             let g2p = make("g2p");
             let g2p_bind = bg(
                 &g2p,
@@ -728,11 +776,21 @@ impl Solver for PbmpmSolver {
                     (8, &grid_vel),
                 ],
             );
+            // particle_integrate: pos (write), vel (read+wall clamp). 2 storage buffers. Runs ONCE
+            // per substep after the iteration loop.
+            let particle_integrate = make("particle_integrate");
+            let particle_integrate_bind = bg(
+                &particle_integrate,
+                &[(0, &params_buf), (1, &pos), (2, &vel)],
+            );
             Pipelines {
+                deform_clear: (deform_clear, deform_clear_bind),
+                particle_update: (particle_update, particle_update_bind),
                 grid_clear: (grid_clear, grid_clear_bind),
                 p2g: (p2g, p2g_bind),
                 grid_update: (grid_update, grid_update_bind),
                 g2p: (g2p, g2p_bind),
+                particle_integrate: (particle_integrate, particle_integrate_bind),
             }
         };
 
@@ -812,8 +870,8 @@ impl Solver for PbmpmSolver {
         debug_assert!(self.water_count <= self.water_capacity);
 
         self.profiler.begin_frame();
-        // One substep per frame for now (U4 adds the iteration_count loop; a CFL substep policy is
-        // a later decision — twofield also runs one substep in its U2 transfer revision).
+        // One substep per frame for now; the iteration_count loop runs WITHIN the substep (below).
+        // A CFL substep policy is a later decision (twofield also runs one substep in its U2 form).
         self.params.dt = dt;
         self.queue
             .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&self.params));
@@ -823,31 +881,58 @@ impl Solver for PbmpmSolver {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("pbmpm-frame"),
             });
-        // The single APIC transfer cycle: grid_clear -> p2g -> grid_update -> g2p. Each pass
+        // PB-MPM iteration structure (U4; one substep per frame for now):
+        //   deform_clear                          // zero D once at the substep's iteration loop start
+        //   repeat iteration_count {
+        //     particle_update                     // compliant density constraint (writes D)
+        //     grid_clear                          // clear the fixed-point grid lanes
+        //     p2g                                 // scatter m, m·(v + D·d) (fixed-point atomicAdd)
+        //     grid_update                         // decode, gravity, domain BC → grid_vel
+        //     g2p                                 // gather velocity + reconstruct D (NO advect)
+        //   }
+        //   particle_integrate                    // advect ONCE on the converged velocity
+        // D is zeroed per substep and accumulated across the iterations (the constraint correction
+        // propagates through the rebuilt grid each iteration); F carries across substeps. Each pass
         // dispatches at least one workgroup so the dispatch/profiling path is real even on an empty
-        // scene (threads early-out on the live-set guards — over-dispatch + early-out, never
-        // indirect dispatch). Fixed-point P2G is order-independent, so the cycle is deterministic.
+        // scene (threads early-out on the live-set guards — over-dispatch + early-out, never indirect
+        // dispatch). Fixed-point P2G is order-independent and the host-side loop count is uniform, so
+        // the structure is deterministic (Tint-safe: no in-shader barriers/loops over the iterations).
         let node_groups = groups(self.num_nodes).max(1);
         let water_groups = groups(self.water_count).max(1);
+        let iterations = self.params.iter_pad[0].max(1);
         {
             let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("pbmpm-frame"),
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&self.pipelines.grid_clear.0);
-            pass.set_bind_group(0, Some(&self.pipelines.grid_clear.1), &[]);
-            pass.dispatch_workgroups(node_groups, 1, 1);
-            self.profiler.record_dispatch();
-            pass.set_pipeline(&self.pipelines.p2g.0);
-            pass.set_bind_group(0, Some(&self.pipelines.p2g.1), &[]);
+            pass.set_pipeline(&self.pipelines.deform_clear.0);
+            pass.set_bind_group(0, Some(&self.pipelines.deform_clear.1), &[]);
             pass.dispatch_workgroups(water_groups, 1, 1);
             self.profiler.record_dispatch();
-            pass.set_pipeline(&self.pipelines.grid_update.0);
-            pass.set_bind_group(0, Some(&self.pipelines.grid_update.1), &[]);
-            pass.dispatch_workgroups(node_groups, 1, 1);
-            self.profiler.record_dispatch();
-            pass.set_pipeline(&self.pipelines.g2p.0);
-            pass.set_bind_group(0, Some(&self.pipelines.g2p.1), &[]);
+            for _ in 0..iterations {
+                pass.set_pipeline(&self.pipelines.particle_update.0);
+                pass.set_bind_group(0, Some(&self.pipelines.particle_update.1), &[]);
+                pass.dispatch_workgroups(water_groups, 1, 1);
+                self.profiler.record_dispatch();
+                pass.set_pipeline(&self.pipelines.grid_clear.0);
+                pass.set_bind_group(0, Some(&self.pipelines.grid_clear.1), &[]);
+                pass.dispatch_workgroups(node_groups, 1, 1);
+                self.profiler.record_dispatch();
+                pass.set_pipeline(&self.pipelines.p2g.0);
+                pass.set_bind_group(0, Some(&self.pipelines.p2g.1), &[]);
+                pass.dispatch_workgroups(water_groups, 1, 1);
+                self.profiler.record_dispatch();
+                pass.set_pipeline(&self.pipelines.grid_update.0);
+                pass.set_bind_group(0, Some(&self.pipelines.grid_update.1), &[]);
+                pass.dispatch_workgroups(node_groups, 1, 1);
+                self.profiler.record_dispatch();
+                pass.set_pipeline(&self.pipelines.g2p.0);
+                pass.set_bind_group(0, Some(&self.pipelines.g2p.1), &[]);
+                pass.dispatch_workgroups(water_groups, 1, 1);
+                self.profiler.record_dispatch();
+            }
+            pass.set_pipeline(&self.pipelines.particle_integrate.0);
+            pass.set_bind_group(0, Some(&self.pipelines.particle_integrate.1), &[]);
             pass.dispatch_workgroups(water_groups, 1, 1);
             self.profiler.record_dispatch();
         }
