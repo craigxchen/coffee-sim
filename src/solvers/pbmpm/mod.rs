@@ -1,0 +1,532 @@
+//! Position-Based MPM (PB-MPM) solver under `SolverId::Pbmpm` — the U1 scaffold of
+//! `docs/plans/2026-06-20-001-feat-pbmpm-prototype-plan.md`.
+//!
+//! U1 pins the seam contract (the six `Solver` methods), the per-particle PB-MPM state layout
+//! (KTD8: `deformation_displacement` D + `deformation_gradient` F as mat3x3 floats, the liquid
+//! constraint scalars — all in the PARTICLE buffer; the GRID carries ONLY [mass, mom.xyz] as
+//! fixed-point `atomic<i32>`), the `Params` Rust↔WGSL ABI lock, the `FP_SCALE` fixed-point
+//! encoding, the WGSL-concatenation module assembly, and the registry seam. It mirrors
+//! `src/solvers/twofield/` structurally (KTD2) but is MINIMAL: the only physics is a `grid_clear`
+//! pass plus a gravity `advect` of particle positions — enough that the dropdown renders moving
+//! particles. The real PB-MPM pipeline (emission, APIC transfers, the compliant density
+//! constraint, collider BCs) lands in U2–U5.
+
+use std::sync::Arc;
+
+use bytemuck::{Pod, Zeroable};
+use wgpu::util::DeviceExt;
+
+use crate::emission::EmissionInput;
+use crate::engine::scene::Species;
+use crate::engine::{Metrics, Scene};
+use crate::models::Materials;
+use crate::profiling::{Profile, Profiler};
+use crate::solvers::base::Solver;
+use crate::utils::buffers::ParticleBuffers;
+use crate::utils::config::Config;
+use crate::utils::gpu::GpuContext;
+
+const WG: u32 = 256;
+
+fn groups(n: u32) -> u32 {
+    n.div_ceil(WG)
+}
+
+/// Storage-buffer budget (KTD5): the widest U1 entry point binds 2 storage buffers (`advect`:
+/// pos, vel; the params uniform doesn't count against the storage limit). `grid_clear` binds 1
+/// (grid_fp). Re-derive when passes are added (U3 adds the P2G/G2P transfers — pos, vel,
+/// deform_disp, deform_grad, grid_fp = 5 at most, still ≤ 9). The device requests 9 storage
+/// buffers per stage (`src/utils/gpu.rs::NEEDED_STORAGE_BUFFERS`).
+pub const MAX_STORAGE_BUFFERS_PER_ENTRY_POINT: u32 = 2;
+
+/// Fixed-point scale for the grid atomics — mirrors `FP_SCALE` in `common.wgsl` (2^18,
+/// KEEP.md §3). Coupled to `Config::max_speed` (the overflow-headroom derivation lives next to
+/// the WGSL constant); the overflow probe is a U6 deliverable.
+pub const FP_SCALE: f64 = 262144.0;
+
+/// Default PB-MPM liquid-constraint knobs (KTD1). Inert in U1 — the compliant density
+/// constraint that reads them lands in U4; carried in `Params` now so the ABI is fixed up front.
+pub const LIQUID_DENSITY_DEFAULT: f32 = 1.0;
+pub const LIQUID_RELAXATION_DEFAULT: f32 = 1.0;
+pub const LIQUID_VISCOSITY_DEFAULT: f32 = 0.0;
+pub const ITERATION_COUNT_DEFAULT: u32 = 2;
+
+/// Fine-grid cell size as a multiple of the particle spacing — ~2× spacing gives the quadratic
+/// B-spline support a ≈3-spacing reach with ≈8 particles per cell at rest (mirrors twofield's
+/// CELL_SIZE_FACTOR; the transfers in U3 pick the final resolution).
+pub const CELL_SIZE_FACTOR: f32 = 2.0;
+
+/// Dispatches per frame at the U1 knobs: `grid_clear` + `advect`. Grows as the U3/U4 passes land.
+pub const DISPATCHES_PER_FRAME: u32 = 2;
+
+/// Uniform parameters, byte-mirrored by the WGSL `Params` in `common.wgsl`.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct Params {
+    box_min: [f32; 4],
+    box_max: [f32; 4],
+    gravity: [f32; 4],
+    grid_origin: [f32; 4], // .xyz = node (0,0,0) world position; .w = cell size h
+    grid_dims: [u32; 4],   // nx, ny, nz, num_nodes
+    dt: f32,
+    particle_mass: f32,
+    max_speed: f32,
+    water_count: u32,    // particles [0, water_count) are live water
+    particle_count: u32, // allocated pool size (kernel live-set guard)
+    // PB-MPM liquid constraint knobs (KTD1; inert in U1, read by the U4 constraint).
+    liquid_density: f32,
+    liquid_relaxation: f32,
+    liquid_viscosity: f32,
+    // .x = iteration_count (PB-MPM constraint→grid rebuild loop); .yzw = tail pad. Packed as one
+    // vec4 so the WGSL vec4<u32> alignment matches Rust's `[u32; 4]` exactly (a bare u32 followed
+    // by a vec3 pad disagrees: WGSL aligns the vec3 to 16, Rust does not).
+    iter_pad: [u32; 4],
+}
+
+// Params is uploaded as a uniform and must stay byte-identical to the WGSL `Params`.
+const _: () = assert!(std::mem::size_of::<Params>() == 128);
+
+/// Compute grid dimensions for a scene: cell size `h = CELL_SIZE_FACTOR · particle_spacing`,
+/// node 0 one cell OUTSIDE `box_min` (a pad layer), `ceil(extent/h) + 3` nodes per axis (mirrors
+/// twofield's `grid_spec_for`, so the B-spline support of any in-box particle stays in range).
+pub fn grid_spec_for(scene: &Scene, mats: &Materials) -> ([f32; 3], f32, [u32; 3]) {
+    let h = CELL_SIZE_FACTOR * mats.particle_spacing;
+    let origin = [
+        scene.box_min[0] - h,
+        scene.box_min[1] - h,
+        scene.box_min[2] - h,
+    ];
+    let mut dims = [0u32; 3];
+    for (a, d) in dims.iter_mut().enumerate() {
+        let extent = (scene.box_max[a] - scene.box_min[a]).max(0.0);
+        *d = (extent / h).ceil() as u32 + 3;
+    }
+    (origin, h, dims)
+}
+
+/// Seed the scene's water regions as a lattice with seeded jitter (mirrors twofield's
+/// `seed_ranges`, water-only for the single-phase prototype). RNG draws happen per lattice point
+/// regardless of rejection, so the layout is deterministic for a given `cfg.seed`. The 4th
+/// position lane carries the moisture fraction (1 = full). Returns `(positions, phases)`.
+fn seed_water(scene: &Scene, mats: &Materials, cfg: &Config) -> (Vec<[f32; 4]>, Vec<u32>) {
+    const SEED_CLEARANCE: f32 = 0.4;
+    let mut rng = crate::utils::rng::Rng::new(cfg.seed);
+    let mut pos: Vec<[f32; 4]> = Vec::new();
+    for region in &scene.regions {
+        // Single-phase water prototype: only water regions seed particles.
+        if region.species != Species::Water {
+            continue;
+        }
+        let (lo, hi) = (region.min, region.max);
+        let s = mats.particle_spacing;
+        let jitter = cfg.seed_jitter * s;
+        let nx = (((hi[0] - lo[0]) / s).floor() as i32).max(0);
+        let ny = (((hi[1] - lo[1]) / s).floor() as i32).max(0);
+        let nz = (((hi[2] - lo[2]) / s).floor() as i32).max(0);
+        for k in 0..=nz {
+            for j in 0..=ny {
+                for i in 0..=nx {
+                    let jx = (rng.next_f32() * 2.0 - 1.0) * jitter;
+                    let jy = (rng.next_f32() * 2.0 - 1.0) * jitter;
+                    let jz = (rng.next_f32() * 2.0 - 1.0) * jitter;
+                    let px = lo[0] + i as f32 * s + jx;
+                    let py = lo[1] + j as f32 * s + jy;
+                    let pz = lo[2] + k as f32 * s + jz;
+                    if !scene.solids.is_empty() {
+                        let c = crate::utils::sdf::nearest(
+                            &scene.solids,
+                            glam::Vec3::new(px, py, pz),
+                            0,
+                        );
+                        if c.signed < SEED_CLEARANCE {
+                            continue;
+                        }
+                    }
+                    pos.push([px, py, pz, 1.0]);
+                }
+            }
+        }
+    }
+    let phases = vec![0u32; pos.len()];
+    (pos, phases)
+}
+
+/// Per-particle identity deformation gradients (F = I), 3 vec4 rows each — the U1 seed for the
+/// KTD8 state (D is left zero-initialized by wgpu).
+fn identity_rows(count: u32) -> Vec<[f32; 4]> {
+    let mut rows = Vec::with_capacity(3 * count as usize);
+    for _ in 0..count {
+        rows.push([1.0, 0.0, 0.0, 0.0]);
+        rows.push([0.0, 1.0, 0.0, 0.0]);
+        rows.push([0.0, 0.0, 1.0, 0.0]);
+    }
+    rows
+}
+
+pub struct PbmpmSolver {
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    params: Params,
+    water_count: u32,
+    num_nodes: u32,
+
+    params_buf: wgpu::Buffer,
+    // Canonical particle state, exposed through `ParticleBuffers`.
+    pos: Arc<wgpu::Buffer>,
+    vel: Arc<wgpu::Buffer>,
+    phase: Arc<wgpu::Buffer>,
+    chem: Arc<wgpu::Buffer>,
+    // Per-particle PB-MPM state (KTD8): deformation displacement D and gradient F, 3 vec4 rows
+    // each. Floats in the particle buffer — never on the grid.
+    deform_disp: wgpu::Buffer,
+    deform_grad: wgpu::Buffer,
+    // LIQUID grid field: fixed-point atomic<i32>, 4 lanes per node [mass, mom.xyz] (KTD8).
+    grid_fp: wgpu::Buffer,
+    readback: wgpu::Buffer,
+
+    pipelines: Pipelines,
+    profiler: Profiler,
+
+    // Retained for reset (exact, deterministic re-seed).
+    initial_positions: Vec<[f32; 4]>,
+    initial_phases: Vec<u32>,
+}
+
+struct Pipelines {
+    grid_clear: (wgpu::ComputePipeline, wgpu::BindGroup),
+    advect: (wgpu::ComputePipeline, wgpu::BindGroup),
+}
+
+impl PbmpmSolver {
+    fn storage(
+        device: &wgpu::Device,
+        label: &str,
+        bytes: u64,
+        extra: wgpu::BufferUsages,
+    ) -> wgpu::Buffer {
+        device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: bytes.max(4),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | extra,
+            mapped_at_creation: false,
+        })
+    }
+
+    /// Blocking GPU→CPU read-back of the first `bytes` of `src` (dev/test only — stalls).
+    fn read_bytes(&self, src: &wgpu::Buffer, bytes: u64) -> Vec<u8> {
+        if bytes == 0 {
+            return Vec::new();
+        }
+        let mut enc = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("pbmpm-readback"),
+            });
+        enc.copy_buffer_to_buffer(src, 0, &self.readback, 0, bytes);
+        self.queue.submit(Some(enc.finish()));
+        let slice = self.readback.slice(0..bytes);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        let _ = self.device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        });
+        rx.recv().unwrap().unwrap();
+        let data = slice.get_mapped_range().to_vec();
+        self.readback.unmap();
+        data
+    }
+
+    /// Read back current particle positions (dev/test only — stalls the GPU).
+    pub fn read_positions(&self) -> Vec<[f32; 4]> {
+        let bytes = (self.params.particle_count as u64) * 16;
+        bytemuck::cast_slice(&self.read_bytes(&self.pos, bytes)).to_vec()
+    }
+
+    /// Read back the per-particle phase tags (dev/test only — stalls the GPU).
+    pub fn read_phases(&self) -> Vec<u32> {
+        let bytes = (self.params.particle_count as u64) * 4;
+        bytemuck::cast_slice(&self.read_bytes(&self.phase, bytes)).to_vec()
+    }
+
+    /// Raw fixed-point grid totals `(mass_counts, momentum_counts)` summed in i64 — exact
+    /// integer sums, so two scatters of the same state are bit-identical (dev/test only). U1
+    /// only clears the grid (no P2G yet), so these read zero until the U3 transfers land; the
+    /// surface is wired now for the U6 overflow probe.
+    pub fn read_grid_counts(&self) -> (i64, [i64; 3]) {
+        let bytes = (self.num_nodes as u64) * 16;
+        let raw: Vec<i32> = bytemuck::cast_slice(&self.read_bytes(&self.grid_fp, bytes)).to_vec();
+        let mut mass = 0i64;
+        let mut mom = [0i64; 3];
+        for node in raw.chunks_exact(4) {
+            mass += node[0] as i64;
+            mom[0] += node[1] as i64;
+            mom[1] += node[2] as i64;
+            mom[2] += node[3] as i64;
+        }
+        (mass, mom)
+    }
+
+    /// Grid layout `(origin, cell_size, dims)` for CPU twins (dev/test only).
+    pub fn grid_spec(&self) -> ([f32; 3], f32, [u32; 3]) {
+        let o = self.params.grid_origin;
+        let d = self.params.grid_dims;
+        ([o[0], o[1], o[2]], o[3], [d[0], d[1], d[2]])
+    }
+
+    /// Live water count currently simulated.
+    pub fn active_count(&self) -> u32 {
+        self.water_count
+    }
+}
+
+impl Solver for PbmpmSolver {
+    fn build(scene: &Scene, mats: &Materials, cfg: &Config, gpu: &GpuContext) -> Self {
+        let device = gpu.device.clone();
+        let queue = gpu.queue.clone();
+
+        let (positions, phases) = seed_water(scene, mats, cfg);
+        let water_count = positions.len() as u32;
+        // Single-phase prototype: the pool is exactly the seed (no pour headroom — emission is
+        // U2). particle_count == water_count keeps the layout fixed for the later units.
+        let particle_count = water_count;
+
+        let (origin, cell, dims) = grid_spec_for(scene, mats);
+        let num_nodes = dims[0] * dims[1] * dims[2];
+
+        let params = Params {
+            box_min: [scene.box_min[0], scene.box_min[1], scene.box_min[2], 0.0],
+            box_max: [scene.box_max[0], scene.box_max[1], scene.box_max[2], 0.0],
+            gravity: [scene.gravity[0], scene.gravity[1], scene.gravity[2], 0.0],
+            grid_origin: [origin[0], origin[1], origin[2], cell],
+            grid_dims: [dims[0], dims[1], dims[2], num_nodes],
+            dt: 1.0 / 60.0,
+            particle_mass: mats.particle_mass,
+            max_speed: cfg.max_speed,
+            water_count,
+            particle_count,
+            liquid_density: LIQUID_DENSITY_DEFAULT,
+            liquid_relaxation: LIQUID_RELAXATION_DEFAULT,
+            liquid_viscosity: LIQUID_VISCOSITY_DEFAULT,
+            iter_pad: [ITERATION_COUNT_DEFAULT, 0, 0, 0],
+        };
+        let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("pbmpm-params"),
+            contents: bytemuck::bytes_of(&params),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let n = particle_count.max(1) as u64;
+        let vec4 = n * 16;
+        let pos = Arc::new(Self::storage(
+            &device,
+            "pbmpm-pos",
+            vec4,
+            wgpu::BufferUsages::COPY_SRC,
+        ));
+        let vel = Arc::new(Self::storage(
+            &device,
+            "pbmpm-vel",
+            vec4,
+            wgpu::BufferUsages::COPY_SRC,
+        ));
+        let phase = Arc::new(Self::storage(
+            &device,
+            "pbmpm-phase",
+            n * 4,
+            wgpu::BufferUsages::COPY_SRC,
+        ));
+        let chem = Arc::new(Self::storage(
+            &device,
+            "pbmpm-chem",
+            vec4,
+            wgpu::BufferUsages::COPY_SRC,
+        ));
+        // KTD8 per-particle state: D (zero) + F (identity), 3 vec4 rows per particle.
+        let deform_disp = Self::storage(
+            &device,
+            "pbmpm-deform-disp",
+            n * 48,
+            wgpu::BufferUsages::COPY_SRC,
+        );
+        let deform_grad = Self::storage(
+            &device,
+            "pbmpm-deform-grad",
+            n * 48,
+            wgpu::BufferUsages::COPY_SRC,
+        );
+        // KTD8 grid field: 4 fixed-point lanes per node [mass, mom.xyz].
+        let grid_fp = Self::storage(
+            &device,
+            "pbmpm-grid-fp",
+            (num_nodes.max(1) as u64) * 16,
+            wgpu::BufferUsages::COPY_SRC,
+        );
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("pbmpm-readback"),
+            size: vec4.max(grid_fp.size()),
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // Seed the particle buffers (positions + phases + identity F). D/vel/chem stay zero.
+        if water_count > 0 {
+            queue.write_buffer(&pos, 0, bytemuck::cast_slice(&positions));
+            queue.write_buffer(&phase, 0, bytemuck::cast_slice(&phases));
+            queue.write_buffer(
+                &deform_grad,
+                0,
+                bytemuck::cast_slice(&identity_rows(water_count)),
+            );
+        }
+
+        // One shader module from the concatenated WGSL (WGSL has no imports). U1 has only
+        // common.wgsl; the U3/U4 transfers/constraint files concatenate after it.
+        let shader_src = include_str!("common.wgsl").to_string();
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("pbmpm"),
+            source: wgpu::ShaderSource::Wgsl(shader_src.into()),
+        });
+        let make = |entry: &str| {
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(entry),
+                layout: None,
+                module: &shader,
+                entry_point: Some(entry),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            })
+        };
+        // Per-pipeline bind groups providing exactly the bindings each entry point uses (auto
+        // layout drops declared-but-unused globals; binding indices stay global).
+        let bg = |pipe: &wgpu::ComputePipeline, entries: &[(u32, &wgpu::Buffer)]| {
+            let layout = pipe.get_bind_group_layout(0);
+            let e: Vec<wgpu::BindGroupEntry> = entries
+                .iter()
+                .map(|(b, buf)| wgpu::BindGroupEntry {
+                    binding: *b,
+                    resource: buf.as_entire_binding(),
+                })
+                .collect();
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &layout,
+                entries: &e,
+            })
+        };
+        let pipelines = {
+            let grid_clear = make("grid_clear");
+            let grid_clear_bind = bg(&grid_clear, &[(0, &params_buf), (7, &grid_fp)]);
+            let advect = make("advect");
+            let advect_bind = bg(&advect, &[(0, &params_buf), (1, &pos), (2, &vel)]);
+            Pipelines {
+                grid_clear: (grid_clear, grid_clear_bind),
+                advect: (advect, advect_bind),
+            }
+        };
+
+        Self {
+            device,
+            queue,
+            params,
+            water_count,
+            num_nodes,
+            params_buf,
+            pos,
+            vel,
+            phase,
+            chem,
+            deform_disp,
+            deform_grad,
+            grid_fp,
+            readback,
+            pipelines,
+            profiler: Profiler::new(gpu.timestamps_supported),
+            initial_positions: positions,
+            initial_phases: phases,
+        }
+    }
+
+    fn reset(&mut self, _scene: &Scene) {
+        // Exact, deterministic re-seed: positions + phase tags + identity F back to the seed;
+        // velocities, chem lanes, and D re-zeroed. (The grid is cleared at the start of every
+        // frame, so it needs no reset.)
+        if !self.initial_positions.is_empty() {
+            self.queue
+                .write_buffer(&self.pos, 0, bytemuck::cast_slice(&self.initial_positions));
+            self.queue
+                .write_buffer(&self.phase, 0, bytemuck::cast_slice(&self.initial_phases));
+            let zeros = vec![[0.0f32; 4]; self.initial_positions.len()];
+            self.queue
+                .write_buffer(&self.vel, 0, bytemuck::cast_slice(&zeros));
+            self.queue
+                .write_buffer(&self.chem, 0, bytemuck::cast_slice(&zeros));
+            let dzeros = vec![[0.0f32; 4]; 3 * self.initial_positions.len()];
+            self.queue
+                .write_buffer(&self.deform_disp, 0, bytemuck::cast_slice(&dzeros));
+            self.queue.write_buffer(
+                &self.deform_grad,
+                0,
+                bytemuck::cast_slice(&identity_rows(self.water_count)),
+            );
+        }
+    }
+
+    fn step(&mut self, dt: f32, _input: &EmissionInput) {
+        self.profiler.begin_frame();
+        self.params.dt = dt;
+        self.queue
+            .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&self.params));
+
+        let mut enc = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("pbmpm-frame"),
+            });
+        // grid_clear → advect. Both dispatch at least one workgroup so the dispatch/profiling
+        // path is real even on an empty scene (threads early-out on the live-set guards —
+        // over-dispatch + early-out, never indirect dispatch).
+        let node_groups = groups(self.num_nodes).max(1);
+        let water_groups = groups(self.water_count).max(1);
+        {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("pbmpm-frame"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pipelines.grid_clear.0);
+            pass.set_bind_group(0, Some(&self.pipelines.grid_clear.1), &[]);
+            pass.dispatch_workgroups(node_groups, 1, 1);
+            self.profiler.record_dispatch();
+            pass.set_pipeline(&self.pipelines.advect.0);
+            pass.set_bind_group(0, Some(&self.pipelines.advect.1), &[]);
+            pass.dispatch_workgroups(water_groups, 1, 1);
+            self.profiler.record_dispatch();
+        }
+        self.queue.submit(Some(enc.finish()));
+    }
+
+    fn particles(&self) -> ParticleBuffers {
+        ParticleBuffers {
+            particle_count: self.water_count,
+            position: Some(Arc::clone(&self.pos)),
+            velocity: Some(Arc::clone(&self.vel)),
+            phase_tag: Some(Arc::clone(&self.phase)),
+            concentration: Some(Arc::clone(&self.chem)),
+            temperature: Some(Arc::clone(&self.chem)),
+            ..Default::default()
+        }
+    }
+
+    fn metrics(&self) -> Metrics {
+        Metrics {
+            particle_count: self.water_count,
+            ..Default::default()
+        }
+    }
+
+    fn profile(&self) -> Profile {
+        self.profiler.snapshot()
+    }
+}

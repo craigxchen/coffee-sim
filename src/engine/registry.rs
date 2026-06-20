@@ -10,6 +10,7 @@ use crate::engine::scene::Scene;
 use crate::models::Materials;
 use crate::solvers::base::{Solver, SolverInfo};
 use crate::solvers::noop::{NoopSolverA, NoopSolverB};
+use crate::solvers::pbmpm::PbmpmSolver;
 use crate::solvers::twofield::TwofieldSolver;
 use crate::solvers::xpbd::XpbdSolver;
 use crate::utils::config::Config;
@@ -25,6 +26,7 @@ pub enum SolverId {
     NoopB,
     Xpbd,
     Twofield,
+    Pbmpm,
 }
 
 impl SolverId {
@@ -34,6 +36,7 @@ impl SolverId {
             SolverId::NoopB => "noop_b",
             SolverId::Xpbd => "xpbd",
             SolverId::Twofield => "twofield",
+            SolverId::Pbmpm => "pbmpm",
         }
     }
 
@@ -44,6 +47,7 @@ impl SolverId {
             SolverId::NoopB,
             SolverId::Xpbd,
             SolverId::Twofield,
+            SolverId::Pbmpm,
         ]
     }
 }
@@ -89,6 +93,7 @@ pub fn build_solver(
         SolverId::NoopB => Box::new(NoopSolverB::build(scene, mats, cfg, gpu)),
         SolverId::Xpbd => Box::new(XpbdSolver::build(scene, mats, cfg, gpu)),
         SolverId::Twofield => Box::new(TwofieldSolver::build(scene, mats, cfg, gpu)),
+        SolverId::Pbmpm => Box::new(PbmpmSolver::build(scene, mats, cfg, gpu)),
     }
 }
 
