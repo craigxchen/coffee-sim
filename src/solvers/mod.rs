@@ -5,5 +5,6 @@
 pub mod base;
 pub mod noop;
 pub mod pass_recorder;
+pub mod pbmpm;
 pub mod twofield;
 pub mod xpbd;

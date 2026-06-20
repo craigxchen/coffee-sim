@@ -22,5 +22,11 @@
     "paradigm": "Hybrid",
     "owns_grid": true,
     "stability": { "CflLimited": { "c": 0.5 } }
+  },
+  "pbmpm": {
+    "name": "PB-MPM (position-based)",
+    "paradigm": "Hybrid",
+    "owns_grid": true,
+    "stability": { "CflLimited": { "c": 0.5 } }
   }
 }
