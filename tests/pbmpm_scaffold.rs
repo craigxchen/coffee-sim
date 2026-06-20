@@ -127,3 +127,68 @@ fn water_only_layout_round_trips_and_steps_deterministically() {
         particles.particle_count, profile.dispatches_per_frame, MAX_STORAGE_BUFFERS_PER_ENTRY_POINT
     );
 }
+
+/// U2 (light, per visual-first KTD3): a pour activates dormant water-pool slots — `water_count`
+/// grows while the pour is on, never exceeds the pre-allocated capacity, and a quiet input
+/// (`flow_rate = 0`) emits nothing. No per-particle behavioral assertion (the bounce/conservation
+/// gates are Phase B). Uses the `high-velocity-jet-impact` scene, which declares a pour.
+#[test]
+fn pour_grows_water_count_within_capacity() {
+    let Some(gpu) = GpuContext::new_headless() else {
+        eprintln!("pbmpm_scaffold: no GPU adapter; skipping.");
+        return;
+    };
+    let scene = Scene::debug_high_velocity_jet_impact();
+    let mats = Materials::default();
+    let cfg = Config::default();
+    let mut solver = PbmpmSolver::build(&scene, &mats, &cfg, &gpu);
+
+    // The declared pour sizes a pool with dormant headroom above the seed.
+    let seed = solver.active_count();
+    let capacity = solver.capacity();
+    assert!(
+        capacity > seed,
+        "a declared pour reserves headroom (capacity {capacity} should exceed seed {seed})"
+    );
+
+    // A quiet step emits nothing: the live count holds at the seed.
+    solver.step(1.0 / 60.0, &EmissionInput::default());
+    assert_eq!(
+        solver.active_count(),
+        seed,
+        "no pour ⇒ no emission (live count holds at the seed)"
+    );
+
+    // An active pour above the cup grows the live count over several frames, never past capacity.
+    let pour = EmissionInput {
+        kettle_pos: [0.0, scene.box_max[1] - 1.0, 0.0],
+        flow_rate: 60.0,
+        pour_angle: 0.0,
+        ..EmissionInput::default()
+    };
+    for _ in 0..30 {
+        solver.step(1.0 / 60.0, &pour);
+        assert!(
+            solver.active_count() <= capacity,
+            "live count {} exceeded capacity {capacity}",
+            solver.active_count()
+        );
+    }
+    let after_pour = solver.active_count();
+    assert!(
+        after_pour > seed,
+        "an active pour activates dormant slots (live count {after_pour} should exceed seed {seed})"
+    );
+
+    // Reset returns the live count to the seed (pour-activated slots re-park).
+    solver.reset(&scene);
+    assert_eq!(
+        solver.active_count(),
+        seed,
+        "reset returns the live count to the seed"
+    );
+
+    println!(
+        "pbmpm pour activation: seed {seed} → after 30 pour frames {after_pour} (capacity {capacity})"
+    );
+}
