@@ -57,8 +57,13 @@ struct Params {
 @group(0) @binding(6) var<storage, read_write> deform_grad: array<vec4<f32>>;
 // LIQUID grid field, fixed-point: 4 atomic<i32> lanes per node, stride 4 — [mass, mom.x, mom.y,
 // mom.z], each value × FP_SCALE. The grid carries ONLY these (KTD8); per-particle state stays on
-// the particle buffer. Cleared by grid_clear; scattered/gathered by the U3 transfers.
+// the particle buffer. Cleared by grid_clear; scattered by p2g; decoded by grid_update.
 @group(0) @binding(7) var<storage, read_write> grid_fp: array<atomic<i32>>;
+// Grid velocity after grid_update (decode + gravity + domain BC): .xyz = velocity, .w = node mass
+// (decoded float, diagnostics only). NOT a fixed-point lane (KTD8 — the grid carries only the
+// atomic mass/momentum; this float scratch is the decoded transient the g2p gather reads). Mirrors
+// twofield's `grid_vel`.
+@group(0) @binding(8) var<storage, read_write> grid_vel: array<vec4<f32>>;
 
 // --- fixed-point encoding (KEEP.md §3 pattern; mirrors twofield's FP_SCALE) ------------------
 //
@@ -81,6 +86,19 @@ fn fp_decode(c: i32) -> f32 {
     return f32(c) / FP_SCALE;
 }
 
+// --- quadratic B-spline weights (mirrors twofield/common.wgsl; KEEP.md §3) --------------------
+// Per axis, around base = floor(x/h − 0.5) with fx = x/h − base ∈ [0.5, 1.5]; node offset
+// k ∈ {0,1,2} gets w[k]. Weights sum to 1 and Σ_k w[k]·(base+k) = x/h (linear consistency —
+// what makes the free-fall recurrence exact and keeps the APIC affine reconstruction zero in a
+// uniform field). The 3×3×3 (27-node) stencil per KTD6 — no cubic 4³.
+fn bspline_w(fx: vec3<f32>) -> array<vec3<f32>, 3> {
+    var w: array<vec3<f32>, 3>;
+    w[0] = 0.5 * (1.5 - fx) * (1.5 - fx);
+    w[1] = 0.75 - (fx - 1.0) * (fx - 1.0);
+    w[2] = 0.5 * (fx - 0.5) * (fx - 0.5);
+    return w;
+}
+
 // --- grid indexing -----------------------------------------------------------------------------
 // Flat node index, x-fastest. Node world position = grid_origin + (i,j,k)·h.
 fn node_index(n: vec3<i32>) -> u32 {
@@ -89,10 +107,10 @@ fn node_index(n: vec3<i32>) -> u32 {
 
 const WG: u32 = 256u;
 
-// --- U1 passes -------------------------------------------------------------------------------
-// Minimal scaffold physics (KTD2): clear the fixed-point grid lanes, then gravity-advect the
-// live water positions so the dropdown shows moving particles. The P2G/G2P transfers and the
-// compliant density constraint (U3/U4) replace `advect` with the real PB-MPM iteration loop.
+// --- grid_clear ------------------------------------------------------------------------------
+// Clear all 4 fixed-point lanes of every node (mass + mom.xyz) before this iteration's scatter.
+// The P2G/G2P transfers (transfers.wgsl) replace the U1 `advect` placeholder with the real
+// PB-MPM transfer cycle (U3).
 
 // Clear all 4 fixed-point lanes of every node (mass + mom.xyz).
 @compute @workgroup_size(WG)
@@ -104,19 +122,4 @@ fn grid_clear(@builtin(global_invocation_id) gid: vec3<u32>) {
     atomicStore(&grid_fp[base + 1u], 0);
     atomicStore(&grid_fp[base + 2u], 0);
     atomicStore(&grid_fp[base + 3u], 0);
-}
-
-// Gravity advect of live water particles (placeholder integration until the transfers land):
-// v += g·dt (capped), x += v·dt, clamped to the domain box so particles settle on the floor.
-@compute @workgroup_size(WG)
-fn advect(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let p = gid.x;
-    if (p >= params.water_count) { return; }
-    var v = vel[p].xyz + params.gravity.xyz * params.dt;
-    let speed = length(v);
-    if (speed > params.max_speed) { v = v * (params.max_speed / speed); }
-    var x = pos[p].xyz + v * params.dt;
-    x = clamp(x, params.box_min.xyz, params.box_max.xyz);
-    vel[p] = vec4<f32>(v, vel[p].w);
-    pos[p] = vec4<f32>(x, pos[p].w);
 }
