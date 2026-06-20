@@ -28,6 +28,16 @@ use crate::utils::gpu::GpuContext;
 
 const WG: u32 = 256;
 
+/// Y-coordinate at which un-emitted (dormant) water-pool slots are parked: far below any scene so
+/// the renderer culls them (`ui/particles.wgsl` matches this with `p.y <= -1.0e8`). Activated slots
+/// get a real position from `emit()`. Kept finite (not NaN) so any accidental read stays defined.
+/// (Mirrors twofield's `DORMANT_PARK_Y`.)
+const DORMANT_PARK_Y: f32 = -1.0e9;
+
+/// Reduced-units volume calibration (KEEP.md §2; mirrors twofield's constant): mL per scene unit³ —
+/// sizes the pour pool from a scene's declared `pour_water_ml`.
+const ML_PER_SIM_UNIT3: f32 = 5.20;
+
 fn groups(n: u32) -> u32 {
     n.div_ceil(WG)
 }
@@ -151,6 +161,48 @@ fn seed_water(scene: &Scene, mats: &Materials, cfg: &Config) -> (Vec<[f32; 4]>, 
     (pos, phases)
 }
 
+/// Pour-emission state + spout parameters (host-side; ported verbatim from twofield's `Inflow`).
+/// Turns `EmissionInput` into activated water-pool particles via the volume-consistent
+/// arclength-credit emitter: the volume accumulator (flow/V_w·dt) is the master count budget;
+/// layers release one `particle_spacing` of stream travel apart, each filling a golden-angle disc,
+/// so the inlet packs to the fluid's rest density.
+struct Inflow {
+    // Static (from Config/Materials at build).
+    nozzle_radius: f32,
+    discharge_coeff: f32,
+    spacing: f32,
+    v_w: f32,
+    pour_t: f32,
+    // State.
+    accumulator: f32, // volume budget in particles (carries the sub-particle fraction)
+    axial: f32,       // arclength credit (scene units) toward the next layer
+    last_exit_speed: f32, // drains backlog at the last cadence when flow drops to 0
+    cursor: u64,      // golden-angle determinism across all emitted particles
+}
+
+/// Orthonormal disc basis perpendicular to a (unit) pour direction `dir` (mirrors twofield).
+fn disc_basis(dir: [f32; 3]) -> ([f32; 3], [f32; 3]) {
+    let cross = |a: [f32; 3], b: [f32; 3]| {
+        [
+            a[1] * b[2] - a[2] * b[1],
+            a[2] * b[0] - a[0] * b[2],
+            a[0] * b[1] - a[1] * b[0],
+        ]
+    };
+    let norm = |v: [f32; 3]| {
+        let l = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt().max(1.0e-9);
+        [v[0] / l, v[1] / l, v[2] / l]
+    };
+    let refv = if dir[1].abs() < 0.9 {
+        [0.0, 1.0, 0.0]
+    } else {
+        [1.0, 0.0, 0.0]
+    };
+    let u = norm(cross(dir, refv));
+    let w = cross(dir, u);
+    (u, w)
+}
+
 /// Per-particle identity deformation gradients (F = I), 3 vec4 rows each — the U1 seed for the
 /// KTD8 state (D is left zero-initialized by wgpu).
 fn identity_rows(count: u32) -> Vec<[f32; 4]> {
@@ -168,6 +220,12 @@ pub struct PbmpmSolver {
     queue: wgpu::Queue,
     params: Params,
     water_count: u32,
+    // Pre-allocated water pool: buffers + readbacks span `[0, water_capacity)`; the live water
+    // range is `[0, water_count)` and grows toward `water_capacity` as `emit()` activates dormant
+    // slots. Dormant slots `[water_count, water_capacity)` are parked off-scene and never dispatched
+    // (the kernels guard on `water_count`).
+    water_capacity: u32,
+    inflow: Inflow,
     num_nodes: u32,
 
     params_buf: wgpu::Buffer,
@@ -190,6 +248,8 @@ pub struct PbmpmSolver {
     // Retained for reset (exact, deterministic re-seed).
     initial_positions: Vec<[f32; 4]>,
     initial_phases: Vec<u32>,
+    // Live water count at the seed (the count `reset()` returns to before any pour activates slots).
+    initial_water: u32,
 }
 
 struct Pipelines {
@@ -280,6 +340,135 @@ impl PbmpmSolver {
     pub fn active_count(&self) -> u32 {
         self.water_count
     }
+
+    /// Pre-allocated water-pool capacity (the live count never exceeds this).
+    pub fn capacity(&self) -> u32 {
+        self.water_capacity
+    }
+
+    /// Activate pour-emitted water particles for this frame from `EmissionInput` — the
+    /// volume-consistent arclength-credit emitter, ported verbatim from twofield's `emit`: the
+    /// volume accumulator (flow/V_w·dt) is the master count budget; layers release one
+    /// `particle_spacing` of stream travel apart, each filling a golden-angle disc with up to
+    /// `N_layer = ceil(A_eff·spacing/V_w)` particles, so the inlet packs to rest density. Activated
+    /// slots are written into the water pool's live range (real position/velocity, identity F via
+    /// the dormant-slot seed, zero D) and `water_count` grows. No-ops when not pouring and no
+    /// backlog remains. (Newly activated slots inherit the seed's identity F + zero D; the
+    /// dormant-slot writes only overwrite pos/vel/chem.)
+    fn emit(&mut self, input: &EmissionInput, dt: f32) {
+        // A Reset event clears the emitter's backlog/credit (the emitter contract; a full sim
+        // restart is `reset()`). Done before the gate so a Reset with zero flow clears.
+        if input.event == crate::emission::PourEvent::Reset {
+            self.inflow.accumulator = 0.0;
+            self.inflow.axial = 0.0;
+            self.inflow.last_exit_speed = 0.0;
+        }
+        let flow = input.flow_rate.max(0.0);
+        // Gate: pour active, or a whole particle of backlog still to drain.
+        if flow <= 0.0 && self.inflow.accumulator < 1.0 {
+            return;
+        }
+        let a_eff = std::f32::consts::PI
+            * self.inflow.nozzle_radius
+            * self.inflow.nozzle_radius
+            * self.inflow.discharge_coeff;
+        let a_eff = a_eff.max(1.0e-9);
+        // Orifice relation: exit speed from flow + effective area. While draining a backlog at zero
+        // flow, keep the last cadence so the stream tail stays correctly spaced.
+        let exit_speed = if flow > 0.0 {
+            let es = flow / a_eff;
+            self.inflow.last_exit_speed = es;
+            self.inflow.accumulator += flow / self.inflow.v_w * dt;
+            es
+        } else {
+            self.inflow.last_exit_speed
+        };
+        if exit_speed <= 0.0 {
+            return;
+        }
+        // Volume-consistent layer capacity (ceil ⇒ throughput ≥ flow/V_w, no backlog).
+        let n_layer = ((a_eff * self.inflow.spacing / self.inflow.v_w).ceil() as u32).max(1);
+
+        // Pour direction (downward, tilted by pour_angle toward +x) + a disc basis.
+        let a = input.pour_angle;
+        let dir = [a.sin(), -a.cos(), 0.0];
+        let (u, w) = disc_basis(dir);
+        let r_eff = self.inflow.nozzle_radius * self.inflow.discharge_coeff.sqrt();
+        const GOLDEN: f32 = 2.399_963_2;
+
+        self.inflow.axial += exit_speed * dt;
+        let kettle = input.kettle_pos;
+        let mut want = self.inflow.accumulator.floor() as u32;
+        let mut new_pos: Vec<[f32; 4]> = Vec::new();
+        let mut new_vel: Vec<[f32; 4]> = Vec::new();
+        let mut new_chem: Vec<[f32; 4]> = Vec::new();
+        let mut clamped = false;
+        while self.inflow.axial >= self.inflow.spacing && want > 0 {
+            // Capacity check BEFORE spending arclength credit, so a full pool doesn't silently
+            // consume a layer's axial.
+            let avail = self.water_capacity - (self.water_count + new_pos.len() as u32);
+            if avail == 0 {
+                clamped = true;
+                break;
+            }
+            self.inflow.axial -= self.inflow.spacing;
+            let depth = self.inflow.axial; // residual stream travel below the nozzle
+            let this_layer = n_layer.min(want).min(avail);
+            for _ in 0..this_layer {
+                // Radial shell cycles with the cursor (mod N_layer) so partial layers still cover
+                // the whole disc over time; golden angle fills it uniformly.
+                let ri = (self.inflow.cursor % n_layer as u64) as f32;
+                let r = r_eff * ((ri + 0.5) / n_layer as f32).sqrt();
+                let theta = self.inflow.cursor as f32 * GOLDEN;
+                self.inflow.cursor += 1;
+                let (ct, st) = (theta.cos(), theta.sin());
+                let off = [
+                    u[0] * r * ct + w[0] * r * st,
+                    u[1] * r * ct + w[1] * r * st,
+                    u[2] * r * ct + w[2] * r * st,
+                ];
+                new_pos.push([
+                    kettle[0] + dir[0] * depth + off[0],
+                    kettle[1] + dir[1] * depth + off[1],
+                    kettle[2] + dir[2] * depth + off[2],
+                    1.0, // moisture lane: full water
+                ]);
+                new_vel.push([
+                    dir[0] * exit_speed,
+                    dir[1] * exit_speed,
+                    dir[2] * exit_speed,
+                    0.0,
+                ]);
+                new_chem.push([0.0, self.inflow.pour_t, 0.0, 0.0]); // c = 0, T = pour temp
+            }
+            want -= this_layer;
+        }
+        if clamped {
+            eprintln!(
+                "pbmpm pour: water pool {} reached; emission clamped (a recipe scene must declare \
+                 enough pour_water_ml to size the pool to its dose)",
+                self.water_capacity
+            );
+        }
+        let emit_n = new_pos.len() as u32;
+        if emit_n == 0 {
+            return;
+        }
+        // Clamp-before-decrement: subtract only what was actually emitted — unspent budget stays as
+        // backlog rather than being silently burned.
+        self.inflow.accumulator -= emit_n as f32;
+        let off_v4 = (self.water_count as u64) * 16;
+        self.queue
+            .write_buffer(&self.pos, off_v4, bytemuck::cast_slice(&new_pos));
+        self.queue
+            .write_buffer(&self.vel, off_v4, bytemuck::cast_slice(&new_vel));
+        self.queue
+            .write_buffer(&self.chem, off_v4, bytemuck::cast_slice(&new_chem));
+        // Dormant pool slots already carry phase 0 (water), identity F, and zero D (the build seed);
+        // activation only overwrites pos/vel/chem, so the KTD8 per-particle state stays consistent.
+        self.water_count += emit_n;
+        self.params.water_count = self.water_count;
+    }
 }
 
 impl Solver for PbmpmSolver {
@@ -287,11 +476,30 @@ impl Solver for PbmpmSolver {
         let device = gpu.device.clone();
         let queue = gpu.queue.clone();
 
-        let (positions, phases) = seed_water(scene, mats, cfg);
-        let water_count = positions.len() as u32;
-        // Single-phase prototype: the pool is exactly the seed (no pour headroom — emission is
-        // U2). particle_count == water_count keeps the layout fixed for the later units.
-        let particle_count = water_count;
+        let (seed_positions, seed_phases) = seed_water(scene, mats, cfg);
+        let water_seed = seed_positions.len() as u32;
+
+        // Pre-allocated water pool (KTD2, mirroring twofield): seed + dose headroom for a declared
+        // pour (KEEP §2 calibration; V_w = spacing³ at this solver's rest density). The live water
+        // range `[0, water_count)` grows toward `water_capacity` as `emit()` activates dormant slots
+        // each frame; dormant slots `[water_count, water_capacity)` are never dispatched (the kernels
+        // guard on the LIVE count) and are parked at a far below-domain sentinel (y = DORMANT_PARK_Y)
+        // so the renderer culls them. `emit()` overwrites a slot's pos/vel/chem when it activates it.
+        let v_w = mats.particle_spacing.powi(3);
+        let dose_headroom = if scene.declares_pour() {
+            (scene.pour_water_ml / ML_PER_SIM_UNIT3 / v_w).ceil() as u32
+        } else {
+            0
+        };
+        let water_capacity = water_seed + dose_headroom;
+        let particle_count = water_capacity; // pool size (buffers + readbacks)
+        let water_count = water_seed; // live count
+                                      // Park the dormant tail far below the domain (matched by the cull in ui/particles.wgsl).
+        let park = [scene.box_min[0], DORMANT_PARK_Y, scene.box_min[2], 0.0];
+        let mut positions = seed_positions;
+        positions.resize(water_capacity as usize, park);
+        let mut phases = seed_phases;
+        phases.resize(water_capacity as usize, 0);
 
         let (origin, cell, dims) = grid_spec_for(scene, mats);
         let num_nodes = dims[0] * dims[1] * dims[2];
@@ -371,14 +579,16 @@ impl Solver for PbmpmSolver {
             mapped_at_creation: false,
         });
 
-        // Seed the particle buffers (positions + phases + identity F). D/vel/chem stay zero.
-        if water_count > 0 {
+        // Seed the FULL pool: live water positions + parked dormant tail, all phase 0, identity F
+        // across the whole capacity so a slot `emit()` later activates is already F = I (activation
+        // only overwrites pos/vel/chem). D/vel/chem stay zero.
+        if water_capacity > 0 {
             queue.write_buffer(&pos, 0, bytemuck::cast_slice(&positions));
             queue.write_buffer(&phase, 0, bytemuck::cast_slice(&phases));
             queue.write_buffer(
                 &deform_grad,
                 0,
-                bytemuck::cast_slice(&identity_rows(water_count)),
+                bytemuck::cast_slice(&identity_rows(water_capacity)),
             );
         }
 
@@ -432,6 +642,18 @@ impl Solver for PbmpmSolver {
             queue,
             params,
             water_count,
+            water_capacity,
+            inflow: Inflow {
+                nozzle_radius: cfg.nozzle_radius,
+                discharge_coeff: cfg.discharge_coeff,
+                spacing: mats.particle_spacing,
+                v_w,
+                pour_t: mats.pour_t,
+                accumulator: 0.0,
+                axial: 0.0,
+                last_exit_speed: 0.0,
+                cursor: 0,
+            },
             num_nodes,
             params_buf,
             pos,
@@ -446,13 +668,15 @@ impl Solver for PbmpmSolver {
             profiler: Profiler::new(gpu.timestamps_supported),
             initial_positions: positions,
             initial_phases: phases,
+            initial_water: water_seed,
         }
     }
 
     fn reset(&mut self, _scene: &Scene) {
-        // Exact, deterministic re-seed: positions + phase tags + identity F back to the seed;
-        // velocities, chem lanes, and D re-zeroed. (The grid is cleared at the start of every
-        // frame, so it needs no reset.)
+        // Exact, deterministic re-seed of the FULL pool: positions + phase tags + identity F back to
+        // the seed (pour-activated slots return to the parked dormant state); velocities, chem lanes,
+        // and D re-zeroed; the live count drops back to the seed; the emitter restarts. (The grid is
+        // cleared at the start of every frame, so it needs no reset.)
         if !self.initial_positions.is_empty() {
             self.queue
                 .write_buffer(&self.pos, 0, bytemuck::cast_slice(&self.initial_positions));
@@ -469,12 +693,25 @@ impl Solver for PbmpmSolver {
             self.queue.write_buffer(
                 &self.deform_grad,
                 0,
-                bytemuck::cast_slice(&identity_rows(self.water_count)),
+                bytemuck::cast_slice(&identity_rows(self.water_capacity)),
             );
         }
+        self.water_count = self.initial_water;
+        self.params.water_count = self.initial_water;
+        self.inflow.accumulator = 0.0;
+        self.inflow.axial = 0.0;
+        self.inflow.last_exit_speed = 0.0;
+        self.inflow.cursor = 0;
     }
 
-    fn step(&mut self, dt: f32, _input: &EmissionInput) {
+    fn step(&mut self, dt: f32, input: &EmissionInput) {
+        // Pour emission first (grows water_count for this frame); no-op when not pouring. Newly
+        // activated slots are written into the live range so the grid_clear/advect dispatches below
+        // (guarded on water_count) pick them up. With only gravity advect here (the U3 transfers
+        // come next), emitted water just falls — expected at this stage.
+        self.emit(input, dt);
+        debug_assert!(self.water_count <= self.water_capacity);
+
         self.profiler.begin_frame();
         self.params.dt = dt;
         self.queue
