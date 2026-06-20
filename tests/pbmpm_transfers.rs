@@ -62,6 +62,14 @@ fn p2g_g2p_round_trip_conserves_mass_and_momentum() {
     let cfg = Config::default();
     let mats = Materials::default();
     let mut solver = PbmpmSolver::build(&scene, &mats, &cfg, &gpu);
+    // Keep this a PURE transfer check (U4): one iteration + the compliant constraint OFF
+    // (relaxation 0 ⇒ no volume correction; viscosity 0 ⇒ no shear), so `step()` is exactly one
+    // grid_clear → p2g → grid_update → g2p cycle and the grid totals are the particle totals to the
+    // single-scatter rounding bound. The iteration loop + constraint physics are gated visually/in
+    // the shared harness (U6/U7), not here.
+    solver.set_iteration_count_for_test(1);
+    solver.set_liquid_relaxation_for_test(0.0);
+    solver.set_liquid_viscosity_for_test(0.0);
     let n = solver.read_positions().len();
     assert_eq!(n, 216, "6³ interior water block seeds 216 particles");
 
