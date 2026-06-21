@@ -53,12 +53,13 @@ fn groups(n: u32) -> u32 {
 ///   `grid_clear`         1 (grid_fp);
 ///   `particle_update`    1 (deform_disp) — U4 constraint, reads+writes D only;
 ///   `p2g`                4 (pos, vel, deform_disp, grid_fp) — reads pos/vel/deform_disp, scatters;
-///   `grid_update`        2 (grid_fp, grid_vel);
+///   `grid_update`        3 (grid_fp, grid_vel, solids) — U5 adds the collider node BC;
 ///   `g2p`                4 (pos, vel, deform_disp, grid_vel) — the OTHER widest entry point;
-///   `particle_integrate` 2 (pos, vel) — advect once per substep.
-/// Widest = `p2g`/`g2p` at 4 storage buffers. Well within the 9 grant the device requests
-/// (`src/utils/gpu.rs::NEEDED_STORAGE_BUFFERS`). The U4 constraint pass adds only `deform_disp`
-/// reads (1 buffer) so the widest count is unchanged.
+///   `particle_integrate` 3 (pos, vel, solids) — advect once + the U5 SDF push-out/restitution.
+/// Widest = `p2g`/`g2p` at 4 storage buffers (unchanged by U5 — neither gained `solids`). Well
+/// within the 9 grant the device requests (`src/utils/gpu.rs::NEEDED_STORAGE_BUFFERS`). The U5
+/// collider BC adds `solids` (1 buffer) only to `grid_update` (→3) and `particle_integrate` (→3),
+/// both below the widest.
 pub const MAX_STORAGE_BUFFERS_PER_ENTRY_POINT: u32 = 4;
 
 /// Fixed-point scale for the grid atomics — mirrors `FP_SCALE` in `common.wgsl` (2^18,
@@ -105,14 +106,95 @@ struct Params {
     liquid_density: f32,
     liquid_relaxation: f32,
     liquid_viscosity: f32,
-    // .x = iteration_count (PB-MPM constraint→grid rebuild loop); .yzw = tail pad. Packed as one
-    // vec4 so the WGSL vec4<u32> alignment matches Rust's `[u32; 4]` exactly (a bare u32 followed
-    // by a vec3 pad disagrees: WGSL aligns the vec3 to 16, Rust does not).
+    // .x = iteration_count (PB-MPM constraint→grid rebuild loop); .y = num_solids (count of static
+    // SDF solids in the `solids` buffer, 0 = none → BC skipped); .z = restitution as f32 bits
+    // (U5 collider normal-velocity reflection coefficient, read via `bitcast<f32>`); .w = pad.
+    // Packed as one vec4 so the WGSL vec4<u32> alignment matches Rust's `[u32; 4]` exactly (a bare
+    // u32 followed by a vec3 pad disagrees: WGSL aligns the vec3 to 16, Rust does not).
     iter_pad: [u32; 4],
 }
 
 // Params is uploaded as a uniform and must stay byte-identical to the WGSL `Params`.
 const _: () = assert!(std::mem::size_of::<Params>() == 128);
+
+/// GPU record for one static SDF solid — byte-identical to the WGSL `Primitive` (64 bytes,
+/// vec4-aligned; mirrors twofield's `Primitive` packing of `utils::sdf` primitives, U5). Cone
+/// radii in `a` are OUTER wall radii; the cavity surface is `outer − thickness`. Each solid is a
+/// CAVITY (interior allowed): `sample > 0` inside the free space, `< 0` through the wall material,
+/// and the gradient points INTO the cavity — so the collider BC contains water inside the cup.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct Primitive {
+    kind: u32,         // 0 = cone, 1 = cylinder, 2 = poly-cup
+    species_mask: u32, // MASK_* bits
+    friction: f32,
+    flags: u32,  // bit0 = apex_open
+    a: [f32; 4], // cone:(apex_y, apex_r, top_y, top_r)  cyl:(floor_y, rim_y, radius, _)  poly:(floor_y, rim_y, apothem, sides)
+    b: [f32; 4], // cone:(thickness, hole_radius, center_x, center_z)  cyl/poly:(center_x, center_z, _, _)
+    c: [f32; 4], // reserved
+}
+
+// Primitive is a storage-buffer element and must stay byte-identical to the WGSL `Primitive`.
+const _: () = assert!(std::mem::size_of::<Primitive>() == 64);
+
+/// Pack a scene's analytic solids into the GPU `Primitive` layout (mirrors twofield's `pack_solids`
+/// and `utils/sdf.rs`). U5: the single-phase prototype only collides WATER, but the packed
+/// `species_mask` is preserved so the WGSL union filters by species exactly as twofield does.
+fn pack_solids(solids: &[crate::utils::sdf::SdfPrimitive]) -> Vec<Primitive> {
+    use crate::utils::sdf::SolidKind;
+    solids
+        .iter()
+        .map(|s| match s.kind {
+            SolidKind::Cone {
+                center,
+                apex_y,
+                top_y,
+                apex_r,
+                top_r,
+                thickness,
+                hole_radius,
+                apex_open,
+            } => Primitive {
+                kind: 0,
+                species_mask: s.species_mask,
+                friction: s.friction,
+                flags: u32::from(apex_open),
+                a: [apex_y, apex_r, top_y, top_r],
+                b: [thickness, hole_radius, center.x, center.z],
+                c: [0.0; 4],
+            },
+            SolidKind::Cylinder {
+                center,
+                floor_y,
+                rim_y,
+                radius,
+            } => Primitive {
+                kind: 1,
+                species_mask: s.species_mask,
+                friction: s.friction,
+                flags: 0,
+                a: [floor_y, rim_y, radius, 0.0],
+                b: [center.x, center.z, 0.0, 0.0],
+                c: [0.0; 4],
+            },
+            SolidKind::PolyCup {
+                center,
+                floor_y,
+                rim_y,
+                apothem,
+                sides,
+            } => Primitive {
+                kind: 2,
+                species_mask: s.species_mask,
+                friction: s.friction,
+                flags: 0,
+                a: [floor_y, rim_y, apothem, sides as f32],
+                b: [center.x, center.z, 0.0, 0.0],
+                c: [0.0; 4],
+            },
+        })
+        .collect()
+}
 
 /// Compute grid dimensions for a scene: cell size `h = CELL_SIZE_FACTOR · particle_spacing`,
 /// node 0 one cell OUTSIDE `box_min` (a pad layer), `ceil(extent/h) + 3` nodes per axis (mirrors
@@ -261,6 +343,8 @@ pub struct PbmpmSolver {
     // Decoded grid velocity (.xyz) + node mass (.w) after grid_update — a FLOAT transient (KTD8:
     // the grid carries only the atomic mass/momentum; this is the decode scratch g2p gathers from).
     grid_vel: wgpu::Buffer,
+    // (Static SDF solids the water collides with (U5) are created in build() and retained by the
+    // collider-pass bind groups — like twofield's `solids_buf`, not stored on the struct.)
     readback: wgpu::Buffer,
 
     pipelines: Pipelines,
@@ -428,6 +512,14 @@ impl PbmpmSolver {
     /// shear term.
     pub fn set_liquid_viscosity_for_test(&mut self, viscosity: f32) {
         self.params.liquid_viscosity = viscosity;
+    }
+
+    /// Set the collider normal-velocity restitution (U5) — dev/test only. `0.0` = free-slip stop
+    /// (the plan's constraint-only arm: the into-solid normal velocity is killed, no rebound);
+    /// `>0` reflects `v_n_out = −restitution·v_n_in` on penetration (a bouncier floor/wall).
+    /// Clamped to `[0, 1]`. Stored as f32 bits in `iter_pad.z` to keep the 128-byte Params ABI.
+    pub fn set_restitution_for_test(&mut self, restitution: f32) {
+        self.params.iter_pad[2] = restitution.clamp(0.0, 1.0).to_bits();
     }
 
     /// Live water count currently simulated.
@@ -613,7 +705,12 @@ impl Solver for PbmpmSolver {
             liquid_density: cfg.pbmpm_liquid_density,
             liquid_relaxation: cfg.pbmpm_liquid_relaxation,
             liquid_viscosity: cfg.pbmpm_liquid_viscosity,
-            iter_pad: [cfg.pbmpm_iteration_count.max(1), 0, 0, 0],
+            iter_pad: [
+                cfg.pbmpm_iteration_count.max(1),
+                scene.solids.len() as u32,
+                cfg.pbmpm_restitution.to_bits(),
+                0,
+            ],
         };
         let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("pbmpm-params"),
@@ -674,6 +771,21 @@ impl Solver for PbmpmSolver {
             (num_nodes.max(1) as u64) * 16,
             wgpu::BufferUsages::COPY_SRC,
         );
+        // Static SDF solids the water collides with (U5). An empty scene still needs a non-empty
+        // binding, so push one zeroed primitive; `num_solids = 0` (in Params) makes every BC loop
+        // skip it. The packed `Primitive`s mirror twofield/utils::sdf (interior-positive cavities).
+        let packed = {
+            let mut packed = pack_solids(&scene.solids);
+            if packed.is_empty() {
+                packed.push(Primitive::zeroed());
+            }
+            packed
+        };
+        let solids = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("pbmpm-solids"),
+            contents: bytemuck::cast_slice(&packed),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
         let readback = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("pbmpm-readback"),
             size: vec4.max(grid_fp.size()),
@@ -757,11 +869,17 @@ impl Solver for PbmpmSolver {
                     (7, &grid_fp),
                 ],
             );
-            // grid_update: grid_fp (decode), grid_vel (write). 2 storage buffers.
+            // grid_update: grid_fp (decode), grid_vel (write), solids (read SDF BC). 3 storage
+            // buffers (U5 adds the collider node BC).
             let grid_update = make("grid_update");
             let grid_update_bind = bg(
                 &grid_update,
-                &[(0, &params_buf), (7, &grid_fp), (8, &grid_vel)],
+                &[
+                    (0, &params_buf),
+                    (7, &grid_fp),
+                    (8, &grid_vel),
+                    (9, &solids),
+                ],
             );
             // g2p: pos (read), vel (write), deform_disp (write D), grid_vel (gather). 4 storage
             // buffers. No longer writes pos — advection moved to particle_integrate (U4).
@@ -776,12 +894,13 @@ impl Solver for PbmpmSolver {
                     (8, &grid_vel),
                 ],
             );
-            // particle_integrate: pos (write), vel (read+wall clamp). 2 storage buffers. Runs ONCE
-            // per substep after the iteration loop.
+            // particle_integrate: pos (write), vel (read+wall clamp), solids (SDF push-out +
+            // restitution). 3 storage buffers (U5 adds the particle-resolution collider BC). Runs
+            // ONCE per substep after the iteration loop.
             let particle_integrate = make("particle_integrate");
             let particle_integrate_bind = bg(
                 &particle_integrate,
-                &[(0, &params_buf), (1, &pos), (2, &vel)],
+                &[(0, &params_buf), (1, &pos), (2, &vel), (9, &solids)],
             );
             Pipelines {
                 deform_clear: (deform_clear, deform_clear_bind),

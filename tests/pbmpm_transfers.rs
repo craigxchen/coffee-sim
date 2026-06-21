@@ -14,6 +14,7 @@ use coffee_sim::solvers::pbmpm::{PbmpmSolver, FP_SCALE};
 use coffee_sim::utils::config::Config;
 use coffee_sim::utils::gpu::GpuContext;
 use coffee_sim::utils::rng::Rng;
+use coffee_sim::utils::sdf::{SdfPrimitive, SolidKind, MASK_ALL};
 use coffee_sim::EmissionInput;
 
 const DT: f32 = 1.0 / 60.0;
@@ -185,5 +186,146 @@ fn fixed_point_overflow_probe_at_velocity_cap() {
     assert!(
         headroom >= 2.0,
         "fixed-point headroom collapsed: {headroom:.2}×"
+    );
+}
+
+/// A cup (cylinder cavity) inside a box, with a SINGLE water particle seeded high in the cavity,
+/// well clear of the floor. The cup floor at `floor_y` is the known surface the collider BC acts
+/// on. `interior_y` is the seed height; the region is a point (hi == lo) so seed_water emits exactly
+/// one particle. The box is generous so the box-clamp backstop never engages on the test motion.
+fn cup_with_one_particle(floor_y: f32, interior_y: f32) -> (Scene, [f32; 3]) {
+    let center = [16.0_f32, 0.0, 16.0];
+    let seed = [center[0], interior_y, center[2]];
+    let scene = Scene {
+        gravity: [0.0; 3], // gravity OFF: the test drives velocity explicitly
+        box_min: [0.0; 3],
+        box_max: [32.0; 3],
+        regions: vec![SeedRegion {
+            min: seed,
+            max: seed, // point region → exactly one seeded particle
+            species: Species::Water,
+        }],
+        solids: vec![SdfPrimitive {
+            kind: SolidKind::Cylinder {
+                center: glam::Vec3::new(center[0], 0.0, center[2]),
+                floor_y,
+                rim_y: 30.0,
+                radius: 8.0,
+            },
+            species_mask: MASK_ALL,
+            friction: 0.0,
+        }],
+        ..Scene::default()
+    };
+    (scene, seed)
+}
+
+/// Collider BC smoke test (U5; light, per KTD3): a particle driven INTO the cup floor in one step
+/// is pushed back to the floor surface, its into-floor (normal) velocity is reflected by the
+/// restitution coefficient, and its tangential velocity is preserved. The SDF sign convention is
+/// interior-POSITIVE, so the push-out keeps the particle in the cup CAVITY (above the floor), never
+/// expelling it. Catches SDF/sign and reflection-math bugs before the U7 bounce measurement.
+///
+/// To isolate `particle_integrate`'s particle-resolution push-out from the grid node BC, the
+/// particle starts well ABOVE the floor (> one cell h = 2·spacing) so no node is within the band
+/// during grid_update; its large downward velocity then carries `x + v·dt` BELOW the floor in the
+/// single advect, where the push-out + restitution fire. The compliant constraint is OFF
+/// (relaxation/viscosity 0, one iteration) so the gathered velocity round-trips unchanged.
+#[test]
+fn collider_bc_pushes_out_and_reflects_by_restitution() {
+    let Some(gpu) = GpuContext::new_headless() else {
+        eprintln!("pbmpm_transfers: no GPU adapter; skipping.");
+        return;
+    };
+    let floor_y = 8.0_f32;
+    let start_y = 16.0_f32; // 8 above the floor = 4 cells (h = 2): clear of the node band
+    let (scene, seed) = cup_with_one_particle(floor_y, start_y);
+    // Raise the velocity cap well above the test velocity so the scatter/gather clamp never scales
+    // the seeded velocity down (which would corrupt the tangential-preservation check). The point
+    // here is the collider BC, not the cap (its own probe is above).
+    let cfg = Config {
+        max_speed: 5000.0,
+        ..Config::default()
+    };
+    let mats = Materials::default();
+
+    // Drive the particle straight down fast enough to cross the floor in one dt, plus a tangential
+    // (x) component that must survive (free slip). vy is chosen so `start_y + vy·dt` lands 4 below
+    // the floor in the single advect; the particle starts > one cell (h = 2) above the floor so the
+    // grid node BC never engages on its stencil — only particle_integrate's push-out fires.
+    let vy = -((start_y - floor_y) + 4.0) / DT; // lands 4 below the floor in one advect
+    let vx = 3.0_f32;
+    let restitution = 0.5_f32; // an exaggerated value so the reflection is unambiguous in the test
+
+    let run = |rest: f32| -> ([f32; 4], [f32; 4]) {
+        let mut solver = PbmpmSolver::build(&scene, &mats, &cfg, &gpu);
+        // Pure transfer + collider BC: no constraint correction, one iteration.
+        solver.set_iteration_count_for_test(1);
+        solver.set_liquid_relaxation_for_test(0.0);
+        solver.set_liquid_viscosity_for_test(0.0);
+        solver.set_restitution_for_test(rest);
+        let n = solver.read_positions().len();
+        assert_eq!(n, 1, "point region seeds exactly one particle");
+        // Seed position is preserved; overwrite the velocity (length = particle_count = 1).
+        solver.write_velocities_for_test(&[[vx, vy, 0.0, 0.0]]);
+        solver.step(DT, &EmissionInput::default());
+        (solver.read_positions()[0], solver.read_velocities()[0])
+    };
+
+    // restitution > 0: rebound (normal velocity flips, damped by the coefficient).
+    let (pos, vel) = run(restitution);
+    assert!(
+        all_finite(&[pos]) && all_finite(&[vel]),
+        "non-finite state after BC"
+    );
+    // Pushed OUT of the wall material to (or above) the cup floor surface — stays in the cavity.
+    assert!(
+        pos[1] >= floor_y - 1e-3,
+        "particle pushed back to/above the floor (cavity side): y={} floor={}",
+        pos[1],
+        floor_y
+    );
+    // The seed x/z are unchanged by the advect on a pure-vertical-then-tangential motion only by vx;
+    // tangential velocity preserved (free slip — restitution acts on the NORMAL only).
+    assert!(
+        (vel[0] - vx).abs() < 1e-3,
+        "tangential (x) velocity preserved: {} vs {vx}",
+        vel[0]
+    );
+    assert!(vel[2].abs() < 1e-3, "no spurious z velocity: {}", vel[2]);
+    // Normal (y) velocity reflected: v_n_out = −restitution·v_n_in (the floor normal is +y, v_n_in
+    // = vy < 0, so v_n_out = −0.5·vy > 0, an upward rebound).
+    let expect_vy = -restitution * vy;
+    assert!(
+        (vel[1] - expect_vy).abs() < 1e-2 * expect_vy.abs().max(1.0),
+        "normal velocity reflected by restitution: {} vs −{}·{} = {}",
+        vel[1],
+        restitution,
+        vy,
+        expect_vy
+    );
+    let _ = seed;
+
+    // restitution = 0: free-slip stop (the constraint-only arm). Normal velocity killed, no rebound.
+    let (pos0, vel0) = run(0.0);
+    assert!(
+        pos0[1] >= floor_y - 1e-3,
+        "restitution=0 still pushes out: y={}",
+        pos0[1]
+    );
+    assert!(
+        vel0[1].abs() < 1e-3,
+        "restitution=0 kills the into-floor normal velocity (no rebound): {}",
+        vel0[1]
+    );
+    assert!(
+        (vel0[0] - vx).abs() < 1e-3,
+        "restitution=0 still preserves tangential velocity: {}",
+        vel0[0]
+    );
+    println!(
+        "pbmpm U5 collider BC: push-out to floor OK; restitution 0.5 → v_y {:.3} (expect {:.3}); \
+         restitution 0 → v_y {:.3} (stop)",
+        vel[1], expect_vy, vel0[1]
     );
 }

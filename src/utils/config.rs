@@ -186,6 +186,12 @@ pub struct Config {
     /// PB-MPM viscous (deviatoric/shear) correction weight. Small (~0.01) damps shear without
     /// over-thickening the pool; `0` disables the shear term.
     pub pbmpm_liquid_viscosity: f32,
+    /// PB-MPM collider normal-velocity restitution (U5; net-new knob twofield never had). On a
+    /// particle penetrating a solid (cup floor/wall) the into-solid normal velocity reflects as
+    /// `v_n_out = −restitution·v_n_in`. `0.0` = free-slip stop (the constraint-only / no-rebound
+    /// arm, R8); larger reflects more (a bouncier floor). Water is barely elastic, so the default
+    /// is LOW (~0.1) — not bouncy-rubber. Clamped to `[0, 1]`.
+    pub pbmpm_restitution: f32,
 }
 
 impl Default for Config {
@@ -287,6 +293,9 @@ impl Default for Config {
             pbmpm_liquid_density: 1.0,
             pbmpm_liquid_relaxation: 0.5,
             pbmpm_liquid_viscosity: 0.01,
+            // Water is barely elastic: a LOW restitution so the floor bounce is a thin rebound, not
+            // bouncy-rubber. 0 = free-slip stop (the constraint-only arm). Tuned live in U5/U6.
+            pbmpm_restitution: 0.1,
         }
     }
 }

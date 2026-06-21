@@ -36,7 +36,8 @@ struct Params {
     liquid_density: f32,    // rest liquid density target (1/liquid_density in the alpha term)
     liquid_relaxation: f32, // compliant volume-correction relaxation
     liquid_viscosity: f32,  // deviatoric shear-correction weight
-    iter_pad: vec4<u32>,    // .x = iteration_count (constraint→grid rebuild loop); .yzw = pad
+    iter_pad: vec4<u32>,    // .x = iteration_count; .y = num_solids (SDF BC count, 0 = none);
+                            // .z = restitution f32 bits (U5, bitcast<f32>); .w = pad
 };
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -64,6 +65,24 @@ struct Params {
 // atomic mass/momentum; this float scratch is the decoded transient the g2p gather reads). Mirrors
 // twofield's `grid_vel`.
 @group(0) @binding(8) var<storage, read_write> grid_vel: array<vec4<f32>>;
+// SDF cavity geometry (U5; byte-identical to the Rust `Primitive`, 64 bytes — mirrors twofield's
+// `Primitive` + utils/sdf.rs). Cone radii in `a` are OUTER wall radii. Each solid is a CAVITY:
+// interior positive, gradient toward the cavity interior.
+struct Primitive {
+    kind: u32,          // 0 = cone, 1 = cylinder, 2 = poly-cup
+    species_mask: u32,
+    friction: f32,
+    flags: u32,         // bit0 = apex_open
+    a: vec4<f32>,       // cone:(apex_y, apex_r, top_y, top_r)  cyl:(floor_y, rim_y, radius, _)  poly:(floor_y, rim_y, apothem, sides)
+    b: vec4<f32>,       // cone:(thickness, hole_radius, center_x, center_z)  cyl/poly:(center_x, center_z, _, _)
+    c: vec4<f32>,       // reserved
+};
+// Static SDF solids (U5 collider BC; read-only). Each `Primitive` is a CAVITY — `dist > 0` inside
+// the free space, `< 0` through the wall material, gradient toward the cavity interior — so the BC
+// CONTAINS water inside the cup. Bound only by `grid_update` (node-resolution momentum BC) and
+// `particle_integrate` (particle-resolution push-out + restitution). `params.iter_pad.y =
+// num_solids`; the union loops `[0, num_solids)` (uniform — Tint-safe, no early return).
+@group(0) @binding(9) var<storage, read> solids: array<Primitive>;
 
 // --- fixed-point encoding (KEEP.md §3 pattern; mirrors twofield's FP_SCALE) ------------------
 //
@@ -123,3 +142,151 @@ fn grid_clear(@builtin(global_invocation_id) gid: vec3<u32>) {
     atomicStore(&grid_fp[base + 2u], 0);
     atomicStore(&grid_fp[base + 3u], 0);
 }
+
+// --- SDF cavity query (U5; mirrors twofield/common.wgsl + utils/sdf.rs) ------------------------
+// Signed distance (interior POSITIVE) + unit gradient (toward the cavity interior) of the nearest
+// blocking solid. The union over all primitives is the intersection of cavities (a particle must be
+// inside ALL applicable cavities), so the binding constraint is the MIN signed distance. The loop
+// runs `[0, num_solids)` (uniform bound, num_solids = 0 → returns FREE) — Tint-safe.
+const SDF_EPS: f32 = 1.0e-6;
+const SDF_FREE: f32 = 1.0e30;
+
+struct SolidHit { dist: f32, grad: vec3<f32>, friction: f32 };
+struct SegCP { p: vec2<f32>, interior: bool };
+
+fn sdf_normalize2(v: vec2<f32>) -> vec2<f32> {
+    let len = length(v);
+    if (len > SDF_EPS) { return v / len; }
+    return vec2<f32>(0.0, 0.0);
+}
+fn sdf_normalize3(v: vec3<f32>) -> vec3<f32> {
+    let len = length(v);
+    if (len > SDF_EPS) { return v / len; }
+    return vec3<f32>(0.0, 0.0, 0.0);
+}
+fn sdf_closest_on_segment(p: vec2<f32>, a: vec2<f32>, b: vec2<f32>) -> SegCP {
+    let ab = b - a;
+    let len2 = dot(ab, ab);
+    if (len2 < SDF_EPS) { return SegCP(a, false); }
+    let t = dot(p - a, ab) / len2;
+    let tc = clamp(t, 0.0, 1.0);
+    return SegCP(a + ab * tc, t > SDF_EPS && t < 1.0 - SDF_EPS);
+}
+
+fn cone_cavity(prim: Primitive, p: vec3<f32>) -> SolidHit {
+    let apex_y = prim.a.x;
+    let apex_r = prim.a.y;
+    let top_y = prim.a.z;
+    let top_r = prim.a.w;
+    let thickness = prim.b.x;
+    let hole_radius = prim.b.y;
+    let center = vec2<f32>(prim.b.z, prim.b.w);
+    let apex_open = (prim.flags & 1u) != 0u;
+
+    let rel = vec2<f32>(p.x - center.x, p.z - center.y);
+    let r = length(rel);
+    let y = p.y;
+    var rhat = vec2<f32>(0.0, 0.0);
+    if (r >= SDF_EPS) { rhat = rel / r; } // axis guard before building the 3D gradient
+
+    if (y > top_y) { return SolidHit(SDF_FREE, vec3<f32>(0.0, 1.0, 0.0), prim.friction); }
+    if (apex_open && y < apex_y) { return SolidHit(SDF_FREE, vec3<f32>(0.0, -1.0, 0.0), prim.friction); }
+
+    let inner_apex = max(apex_r - thickness, hole_radius);
+    let inner_top = max(top_r - thickness, hole_radius);
+    let a2 = vec2<f32>(inner_apex, apex_y);
+    let b2 = vec2<f32>(inner_top, top_y);
+    let cp = sdf_closest_on_segment(vec2<f32>(r, y), a2, b2);
+    let d2d = length(vec2<f32>(r, y) - cp.p);
+
+    let height = top_y - apex_y;
+    var t = 0.0;
+    if (height > SDF_EPS) { t = (y - apex_y) / height; }
+    let inner = max(mix(apex_r, top_r, t) - thickness, hole_radius);
+    let inside = (y >= apex_y) && (r <= inner);
+    var dist = -d2d;
+    if (inside) { dist = d2d; }
+
+    let dir = vec2<f32>(r, y) - cp.p;
+    var n2d = vec2<f32>(0.0, 0.0);
+    if (length(dir) > SDF_EPS) {
+        if (inside) { n2d = sdf_normalize2(dir); } else { n2d = sdf_normalize2(-dir); }
+    } else if (cp.interior) {
+        let ab = b2 - a2;
+        n2d = sdf_normalize2(vec2<f32>(-ab.y, ab.x)); // smooth-wall analytic normal (never zero here)
+    }
+    let grad = sdf_normalize3(vec3<f32>(n2d.x * rhat.x, n2d.y, n2d.x * rhat.y));
+    return SolidHit(dist, grad, prim.friction);
+}
+
+fn cyl_cavity(prim: Primitive, p: vec3<f32>) -> SolidHit {
+    let floor_y = prim.a.x;
+    let rim_y = prim.a.y;
+    let radius = prim.a.z;
+    let center = vec2<f32>(prim.b.x, prim.b.y);
+    let rel = vec2<f32>(p.x - center.x, p.z - center.y);
+    let r = length(rel);
+    let y = p.y;
+    if (y > rim_y) { return SolidHit(SDF_FREE, vec3<f32>(0.0, 1.0, 0.0), prim.friction); }
+    let d_side = radius - r;
+    let d_floor = y - floor_y;
+    if (d_side <= d_floor) {
+        var rhat = vec2<f32>(0.0, 0.0);
+        if (r >= SDF_EPS) { rhat = rel / r; }
+        return SolidHit(d_side, sdf_normalize3(vec3<f32>(-rhat.x, 0.0, -rhat.y)), prim.friction);
+    }
+    return SolidHit(d_floor, vec3<f32>(0.0, 1.0, 0.0), prim.friction);
+}
+
+// DIAGNOSTIC: regular N-gon prism cup (mirror of sdf.rs::poly_cavity). Face normals at 2πk/N
+// (k=0 → +x), so sides=4 is an axis-aligned square. Inner side dist = apothem − max_k(rel·n_k).
+fn poly_cavity(prim: Primitive, p: vec3<f32>) -> SolidHit {
+    let floor_y = prim.a.x;
+    let rim_y = prim.a.y;
+    let apothem = prim.a.z;
+    let sides = max(u32(prim.a.w), 3u);
+    let center = vec2<f32>(prim.b.x, prim.b.y);
+    let rel = vec2<f32>(p.x - center.x, p.z - center.y);
+    let y = p.y;
+    if (y > rim_y) { return SolidHit(SDF_FREE, vec3<f32>(0.0, 1.0, 0.0), prim.friction); }
+    var maxproj = -1.0e30;
+    var bestn = vec2<f32>(1.0, 0.0);
+    let tau = 6.28318530718;
+    for (var k = 0u; k < sides; k = k + 1u) {
+        let ang = tau * f32(k) / f32(sides);
+        let nk = vec2<f32>(cos(ang), sin(ang));
+        let proj = dot(rel, nk);
+        if (proj > maxproj) { maxproj = proj; bestn = nk; }
+    }
+    let d_side = apothem - maxproj;
+    let d_floor = y - floor_y;
+    if (d_side <= d_floor) {
+        return SolidHit(d_side, sdf_normalize3(vec3<f32>(-bestn.x, 0.0, -bestn.y)), prim.friction);
+    }
+    return SolidHit(d_floor, vec3<f32>(0.0, 1.0, 0.0), prim.friction);
+}
+
+fn solid_cavity(prim: Primitive, p: vec3<f32>) -> SolidHit {
+    if (prim.kind == 0u) { return cone_cavity(prim, p); }
+    if (prim.kind == 2u) { return poly_cavity(prim, p); }
+    return cyl_cavity(prim, p);
+}
+
+// Species-filtered union: the most-penetrated (min signed-distance) solid that blocks `ph`. The
+// single-phase prototype only collides WATER (ph = 0), but the mask filter is kept so a future
+// grain phase reuses this verbatim. num_solids = 0 → FREE (no constraint), so an empty scene falls
+// through to the box clamp untouched.
+fn solid_union(p: vec3<f32>, ph: u32) -> SolidHit {
+    var best = SolidHit(SDF_FREE, vec3<f32>(0.0, 0.0, 0.0), 0.0);
+    let n = params.iter_pad.y;
+    for (var i = 0u; i < n; i = i + 1u) {
+        let prim = solids[i];
+        if ((prim.species_mask & (1u << ph)) == 0u) { continue; }
+        let hit = solid_cavity(prim, p);
+        if (hit.dist < best.dist) { best = hit; }
+    }
+    return best;
+}
+
+// Water is phase 0 in this single-phase prototype.
+const PHASE_WATER: u32 = 0u;
