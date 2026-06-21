@@ -54,14 +54,16 @@ fn groups(n: u32) -> u32 {
 ///   `particle_update`    2 (deform_disp, deform_grad) — U4 constraint, reads+writes D, reads the
 ///                          U6 per-particle liquidDensity lane (deform_grad[3p+0].x);
 ///   `p2g`                4 (pos, vel, deform_disp, grid_fp) — reads pos/vel/deform_disp, scatters;
+///   `grid_decode_old`    2 (grid_fp, grid_vel_old) — SPLASH FLIP snapshot decode (no gravity/BC);
 ///   `grid_update`        3 (grid_fp, grid_vel, solids) — U5 adds the collider node BC;
 ///   `g2p`                4 (pos, vel, deform_disp, grid_vel);
-///   `particle_integrate` 5 (pos, vel, deform_disp, deform_grad, solids) — advect once + the U5 SDF
-///                          push-out/restitution + the U6 per-particle liquidDensity accumulation
-///                          (reads the converged D, read-writes the deform_grad lane).
-/// Widest = `particle_integrate` at 5 storage buffers (U6 added `deform_disp` + `deform_grad` to it).
+///   `particle_integrate` 7 (pos, vel, deform_disp, deform_grad, solids, grid_vel_old, vel_prev) —
+///                          the SPLASH FLIP blend (gather grid_vel_old + read vel_prev) + advect once
+///                          + the U5 SDF push-out/restitution + the U6 per-particle liquidDensity
+///                          accumulation (reads the converged D, read-writes the deform_grad lane).
+/// Widest = `particle_integrate` at 7 storage buffers (SPLASH added `grid_vel_old` + `vel_prev`).
 /// Well within the 9 grant the device requests (`src/utils/gpu.rs::NEEDED_STORAGE_BUFFERS`).
-pub const MAX_STORAGE_BUFFERS_PER_ENTRY_POINT: u32 = 5;
+pub const MAX_STORAGE_BUFFERS_PER_ENTRY_POINT: u32 = 7;
 
 /// Fixed-point scale for the grid atomics — mirrors `FP_SCALE` in `common.wgsl` (2^18,
 /// KEEP.md §3). Coupled to `Config::max_speed` (the overflow-headroom derivation lives next to
@@ -83,10 +85,12 @@ pub const ITERATION_COUNT_DEFAULT: u32 = 2;
 /// CELL_SIZE_FACTOR; the transfers in U3 pick the final resolution).
 pub const CELL_SIZE_FACTOR: f32 = 2.0;
 
-/// Dispatches per substep (U4 structure): the iteration loop runs `iteration_count` × the 5-pass
-/// bundle `particle_update → grid_clear → p2g → grid_update → g2p`, then `particle_integrate` once,
-/// i.e. `5·iteration_count + 1` per substep. One substep per frame for now (a CFL substep policy is
-/// a later decision). The profiler reports the real per-frame dispatch count.
+/// Dispatches per substep (U4 structure + SPLASH snapshot): `deform_clear` once, then the SPLASH
+/// FLIP snapshot `grid_clear → p2g → grid_decode_old` (3 passes), then the iteration loop runs
+/// `iteration_count` × the 5-pass bundle `particle_update → grid_clear → p2g → grid_update → g2p`,
+/// then `particle_integrate` once, i.e. `4 + 1 + 5·iteration_count + 1` = `6 + 5·iteration_count` per
+/// substep. One substep per frame for now (a CFL substep policy is a later decision). The profiler
+/// reports the real per-frame dispatch count.
 pub const DISPATCHES_PER_SUBSTEP_BUNDLE: u32 = 5;
 
 /// Uniform parameters, byte-mirrored by the WGSL `Params` in `common.wgsl`.
@@ -109,7 +113,8 @@ struct Params {
     liquid_viscosity: f32,
     // .x = iteration_count (PB-MPM constraint→grid rebuild loop); .y = num_solids (count of static
     // SDF solids in the `solids` buffer, 0 = none → BC skipped); .z = restitution as f32 bits
-    // (U5 collider normal-velocity reflection coefficient, read via `bitcast<f32>`); .w = pad.
+    // (U5 collider normal-velocity reflection coefficient, read via `bitcast<f32>`); .w =
+    // flip_fraction as f32 bits (SPLASH FLIP blend weight, read via `bitcast<f32>`).
     // Packed as one vec4 so the WGSL vec4<u32> alignment matches Rust's `[u32; 4]` exactly (a bare
     // u32 followed by a vec3 pad disagrees: WGSL aligns the vec3 to 16, Rust does not).
     iter_pad: [u32; 4],
@@ -344,6 +349,11 @@ pub struct PbmpmSolver {
     // Decoded grid velocity (.xyz) + node mass (.w) after grid_update — a FLOAT transient (KTD8:
     // the grid carries only the atomic mass/momentum; this is the decode scratch g2p gathers from).
     grid_vel: wgpu::Buffer,
+    // SPLASH (FLIP) snapshot: each particle's substep-start velocity, copied from `vel` via
+    // copy_buffer_to_buffer before the iteration loop. particle_integrate reads it to form the FLIP
+    // blend. (The companion PRE-FORCE grid snapshot `grid_vel_old` is not stored on the struct — like
+    // `solids`, the snapshot/integrate bind groups retain it; it is a per-substep transient.)
+    vel_prev: wgpu::Buffer,
     // (Static SDF solids the water collides with (U5) are created in build() and retained by the
     // collider-pass bind groups — like twofield's `solids_buf`, not stored on the struct.)
     readback: wgpu::Buffer,
@@ -363,6 +373,7 @@ struct Pipelines {
     particle_update: (wgpu::ComputePipeline, wgpu::BindGroup),
     grid_clear: (wgpu::ComputePipeline, wgpu::BindGroup),
     p2g: (wgpu::ComputePipeline, wgpu::BindGroup),
+    grid_decode_old: (wgpu::ComputePipeline, wgpu::BindGroup),
     grid_update: (wgpu::ComputePipeline, wgpu::BindGroup),
     g2p: (wgpu::ComputePipeline, wgpu::BindGroup),
     particle_integrate: (wgpu::ComputePipeline, wgpu::BindGroup),
@@ -524,6 +535,14 @@ impl PbmpmSolver {
     /// Clamped to `[0, 1]`. Stored as f32 bits in `iter_pad.z` to keep the 128-byte Params ABI.
     pub fn set_restitution_for_test(&mut self, restitution: f32) {
         self.params.iter_pad[2] = restitution.clamp(0.0, 1.0).to_bits();
+    }
+
+    /// Set the SPLASH FLIP fraction (the per-substep output-velocity blend `v = mix(v_pic, v_flip,
+    /// flip_fraction)`) — dev/test only. `0.0` = pure APIC/PIC (the byte-identical off-switch the
+    /// round-trip transfer check uses); `1.0` = full FLIP (maximally preserves the impact-generated
+    /// grid-velocity change). Clamped to `[0, 1]`. Stored as f32 bits in `iter_pad.w`.
+    pub fn set_flip_fraction_for_test(&mut self, flip_fraction: f32) {
+        self.params.iter_pad[3] = flip_fraction.clamp(0.0, 1.0).to_bits();
     }
 
     /// Live water count currently simulated.
@@ -722,7 +741,7 @@ impl Solver for PbmpmSolver {
                 cfg.pbmpm_iteration_count.max(1),
                 scene.solids.len() as u32,
                 cfg.pbmpm_restitution.to_bits(),
-                0,
+                cfg.pbmpm_flip_fraction.clamp(0.0, 1.0).to_bits(),
             ],
         };
         let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -782,6 +801,21 @@ impl Solver for PbmpmSolver {
             &device,
             "pbmpm-grid-vel",
             (num_nodes.max(1) as u64) * 16,
+            wgpu::BufferUsages::COPY_SRC,
+        );
+        // SPLASH (FLIP) snapshots: the PRE-FORCE pure-transfer grid velocity (one vec4 per node) and
+        // each particle's substep-start velocity (one vec4 per particle). vel_prev is a
+        // copy_buffer_to_buffer destination each substep (the `storage()` helper grants COPY_DST).
+        let grid_vel_old = Self::storage(
+            &device,
+            "pbmpm-grid-vel-old",
+            (num_nodes.max(1) as u64) * 16,
+            wgpu::BufferUsages::COPY_SRC,
+        );
+        let vel_prev = Self::storage(
+            &device,
+            "pbmpm-vel-prev",
+            vec4,
             wgpu::BufferUsages::COPY_SRC,
         );
         // Static SDF solids the water collides with (U5). An empty scene still needs a non-empty
@@ -886,6 +920,14 @@ impl Solver for PbmpmSolver {
                     (7, &grid_fp),
                 ],
             );
+            // grid_decode_old: grid_fp (decode), grid_vel_old (write). 2 storage buffers. Runs ONCE
+            // per substep before the iteration loop to snapshot the PRE-FORCE pure-transfer velocity
+            // (no gravity/BC) for the FLIP blend.
+            let grid_decode_old = make("grid_decode_old");
+            let grid_decode_old_bind = bg(
+                &grid_decode_old,
+                &[(0, &params_buf), (7, &grid_fp), (10, &grid_vel_old)],
+            );
             // grid_update: grid_fp (decode), grid_vel (write), solids (read SDF BC). 3 storage
             // buffers (U5 adds the collider node BC).
             let grid_update = make("grid_update");
@@ -913,8 +955,9 @@ impl Solver for PbmpmSolver {
             );
             // particle_integrate: pos (write), vel (read+wall clamp), deform_disp (READ the converged
             // D for the liquidDensity accumulation), deform_grad (READ-WRITE the per-particle
-            // liquidDensity lane), solids (SDF push-out + restitution). 5 storage buffers. Runs ONCE
-            // per substep after the iteration loop.
+            // liquidDensity lane), grid_vel_old (gather the PRE-FORCE velocity for the FLIP blend),
+            // vel_prev (the substep-start velocity), solids (SDF push-out + restitution). 7 storage
+            // buffers. Runs ONCE per substep after the iteration loop.
             let particle_integrate = make("particle_integrate");
             let particle_integrate_bind = bg(
                 &particle_integrate,
@@ -925,6 +968,8 @@ impl Solver for PbmpmSolver {
                     (5, &deform_disp),
                     (6, &deform_grad),
                     (9, &solids),
+                    (10, &grid_vel_old),
+                    (11, &vel_prev),
                 ],
             );
             Pipelines {
@@ -932,6 +977,7 @@ impl Solver for PbmpmSolver {
                 particle_update: (particle_update, particle_update_bind),
                 grid_clear: (grid_clear, grid_clear_bind),
                 p2g: (p2g, p2g_bind),
+                grid_decode_old: (grid_decode_old, grid_decode_old_bind),
                 grid_update: (grid_update, grid_update_bind),
                 g2p: (g2p, g2p_bind),
                 particle_integrate: (particle_integrate, particle_integrate_bind),
@@ -965,6 +1011,7 @@ impl Solver for PbmpmSolver {
             deform_grad,
             grid_fp,
             grid_vel,
+            vel_prev,
             readback,
             pipelines,
             profiler: Profiler::new(gpu.timestamps_supported),
@@ -1025,8 +1072,18 @@ impl Solver for PbmpmSolver {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("pbmpm-frame"),
             });
-        // PB-MPM iteration structure (U4; one substep per frame for now):
+        // SPLASH (FLIP) snapshot (a): copy the substep-start particle velocity into vel_prev BEFORE
+        // the iteration loop overwrites `vel`. An encoder copy (no shader — cheapest, deterministic);
+        // must sit OUTSIDE the compute pass.
+        if self.water_count > 0 {
+            let bytes = (self.water_count as u64) * 16;
+            enc.copy_buffer_to_buffer(&self.vel, 0, &self.vel_prev, 0, bytes);
+        }
+        // PB-MPM iteration structure (U4 + SPLASH snapshot; one substep per frame for now):
+        //   copy vel → vel_prev                    // (encoder copy above) substep-start velocity
         //   deform_clear                          // zero D once at the substep's iteration loop start
+        //   grid_clear ; p2g ; grid_decode_old     // FLIP snapshot (b): PRE-FORCE pure-transfer grid
+        //                                          //   velocity (no gravity/BC) → grid_vel_old
         //   repeat iteration_count {
         //     particle_update                     // compliant density constraint (writes D)
         //     grid_clear                          // clear the fixed-point grid lanes
@@ -1034,13 +1091,18 @@ impl Solver for PbmpmSolver {
         //     grid_update                         // decode, gravity, domain BC → grid_vel
         //     g2p                                 // gather velocity + reconstruct D (NO advect)
         //   }
-        //   particle_integrate                    // advect ONCE on the converged velocity
-        // D is zeroed per substep and accumulated across the iterations (the constraint correction
-        // propagates through the rebuilt grid each iteration); F carries across substeps. Each pass
-        // dispatches at least one workgroup so the dispatch/profiling path is real even on an empty
-        // scene (threads early-out on the live-set guards — over-dispatch + early-out, never indirect
-        // dispatch). Fixed-point P2G is order-independent and the host-side loop count is uniform, so
-        // the structure is deterministic (Tint-safe: no in-shader barriers/loops over the iterations).
+        //   particle_integrate                    // FLIP blend + advect ONCE on the converged velocity
+        // deform_clear runs BEFORE the snapshot p2g so D = 0 there: the snapshot scatters PURE `vel`
+        // (no affine/constraint term), making grid_vel_old the pure-transfer velocity exactly. The
+        // snapshot perturbs nothing else — its grid_fp is overwritten by the loop's first grid_clear,
+        // and D is already zero for the loop's first particle_update. FLIP is applied ONCE in
+        // particle_integrate so the loop's g2p stays pure-PIC and the incompressibility solve is
+        // unaffected. D is zeroed per substep and accumulated across the iterations; F carries across
+        // substeps. Each pass dispatches at least one workgroup so the dispatch/profiling path is real
+        // even on an empty scene (threads early-out on the live-set guards — over-dispatch +
+        // early-out, never indirect dispatch). Fixed-point P2G is order-independent and the host-side
+        // loop count is uniform, so the structure is deterministic (Tint-safe: no in-shader
+        // barriers/loops over the iterations).
         let node_groups = groups(self.num_nodes).max(1);
         let water_groups = groups(self.water_count).max(1);
         let iterations = self.params.iter_pad[0].max(1);
@@ -1052,6 +1114,20 @@ impl Solver for PbmpmSolver {
             pass.set_pipeline(&self.pipelines.deform_clear.0);
             pass.set_bind_group(0, Some(&self.pipelines.deform_clear.1), &[]);
             pass.dispatch_workgroups(water_groups, 1, 1);
+            self.profiler.record_dispatch();
+            // FLIP snapshot (b): clear the grid, scatter the substep-start velocity (D = 0 now), decode
+            // it to the PRE-FORCE pure-transfer velocity (no gravity/BC) into grid_vel_old.
+            pass.set_pipeline(&self.pipelines.grid_clear.0);
+            pass.set_bind_group(0, Some(&self.pipelines.grid_clear.1), &[]);
+            pass.dispatch_workgroups(node_groups, 1, 1);
+            self.profiler.record_dispatch();
+            pass.set_pipeline(&self.pipelines.p2g.0);
+            pass.set_bind_group(0, Some(&self.pipelines.p2g.1), &[]);
+            pass.dispatch_workgroups(water_groups, 1, 1);
+            self.profiler.record_dispatch();
+            pass.set_pipeline(&self.pipelines.grid_decode_old.0);
+            pass.set_bind_group(0, Some(&self.pipelines.grid_decode_old.1), &[]);
+            pass.dispatch_workgroups(node_groups, 1, 1);
             self.profiler.record_dispatch();
             for _ in 0..iterations {
                 pass.set_pipeline(&self.pipelines.particle_update.0);

@@ -140,6 +140,32 @@ fn grid_update(@builtin(global_invocation_id) gid: vec3<u32>) {
     grid_vel[n] = vec4<f32>(v, mass);
 }
 
+// SPLASH (FLIP) snapshot decode: the PRE-FORCE pure-transfer grid velocity. Run ONCE per substep
+// BEFORE the iteration loop, after a grid_clear + p2g that scattered the substep-start velocity.
+// Mirrors grid_update's momentum/mass → velocity decode but writes `grid_vel_old` and applies NO
+// gravity, NO domain BC, and NO collider BC — so `v_pic − gathered(grid_vel_old)` in
+// particle_integrate is exactly the velocity CHANGE due to gravity + the pressure/constraint over
+// the substep, which is what FLIP preserves.
+@compute @workgroup_size(WG)
+fn grid_decode_old(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let n = gid.x;
+    if (n >= params.grid_dims.w) {
+        return;
+    }
+    let mc = atomicLoad(&grid_fp[n * 4u + 0u]);
+    var v = vec3<f32>(0.0);
+    let mass = fp_decode(mc);
+    if (mass > 0.0) {
+        let inv = 1.0 / f32(mc);
+        v = vec3<f32>(
+            f32(atomicLoad(&grid_fp[n * 4u + 1u])),
+            f32(atomicLoad(&grid_fp[n * 4u + 2u])),
+            f32(atomicLoad(&grid_fp[n * 4u + 3u]))
+        ) * inv;
+    }
+    grid_vel_old[n] = vec4<f32>(v, mass);
+}
+
 // APIC gather: new particle velocity v = Σ w·v_i and the affine matrix B = Σ w·v_i·dᵀ, then
 // D = B·D⁻¹ with D⁻¹ = (4/h²)·I for the quadratic B-spline (Jiang et al. APIC). D is written back
 // to the per-particle deform_disp (KTD8: the velocity-gradient state U4's constraint reads via

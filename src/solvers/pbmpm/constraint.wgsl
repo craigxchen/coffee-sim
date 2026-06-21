@@ -113,7 +113,40 @@ fn particle_integrate(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
     var x = pos[p].xyz;
-    var v = vel[p].xyz;
+
+    // SPLASH (FLIP) blend, applied ONCE per substep on the converged output velocity. `vel[p]` is
+    // the pure-PIC result of the constraint iteration loop (g2p stays pure-PIC so the
+    // incompressibility solve is clean). Gather the PRE-FORCE pure-transfer grid velocity over the
+    // particle's 3×3×3 stencil → `gathered_old`; then v_flip = vel_prev + (v_pic − gathered_old)
+    // adds the substep's grid-velocity CHANGE (gravity + pressure/constraint) onto the substep-start
+    // velocity, preserving the impact-generated crown velocity APIC would smooth away. flip_fraction
+    // = 0 ⇒ v = v_pic (the byte-identical pure-APIC off-switch).
+    let v_pic = vel[p].xyz;
+    let h = params.grid_origin.w;
+    let xl = (x - params.grid_origin.xyz) / h;
+    var base = vec3<i32>(floor(xl - vec3<f32>(0.5)));
+    base = clamp(base, vec3<i32>(0), vec3<i32>(params.grid_dims.xyz) - vec3<i32>(3));
+    let fx = xl - vec3<f32>(base);
+    let w = bspline_w(fx);
+    var gathered_old = vec3<f32>(0.0);
+    for (var k = 0; k < 3; k = k + 1) {
+        for (var j = 0; j < 3; j = j + 1) {
+            for (var i = 0; i < 3; i = i + 1) {
+                let wijk = w[i].x * w[j].y * w[k].z;
+                let node = base + vec3<i32>(i, j, k);
+                gathered_old = gathered_old + wijk * grid_vel_old[node_index(node)].xyz;
+            }
+        }
+    }
+    let flip_fraction = bitcast<f32>(params.iter_pad.w);
+    let v_flip = vel_prev[p].xyz + (v_pic - gathered_old);
+    var v = mix(v_pic, v_flip, flip_fraction);
+    // Velocity cap (anti-blow-up): FLIP can amplify the kept change, so clamp the blended result.
+    let s = length(v);
+    if (s > params.max_speed) {
+        v = v * (params.max_speed / s);
+    }
+
     x = x + v * params.dt;
 
     // Box clamp (outer backstop): only the into-wall component is removed (separating, free slip).

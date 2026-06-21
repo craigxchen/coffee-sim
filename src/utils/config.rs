@@ -192,6 +192,14 @@ pub struct Config {
     /// arm, R8); larger reflects more (a bouncier floor). Water is barely elastic, so the default
     /// is LOW (~0.1) — not bouncy-rubber. Clamped to `[0, 1]`.
     pub pbmpm_restitution: f32,
+    /// PB-MPM substep FLIP fraction (SPLASH knob): blends the final per-substep output velocity
+    /// between pure-APIC/PIC (`v_pic`, the smoothed grid mean) and FLIP (`v_prev + Δv_grid`, which
+    /// adds only the substep's grid-velocity CHANGE to the prior velocity). `v = mix(v_pic, v_flip,
+    /// flip_fraction)`. FLIP preserves the impact-generated upward crown velocity that pure-APIC
+    /// smooths away, so the pour CROWNS/SPLASHES on impact. `0.0` = pure APIC (the byte-identical
+    /// off-switch); `0.95` (default) = splashy but still damped. The constraint iteration loop stays
+    /// pure-PIC regardless — this blends ONLY the final output velocity in `particle_integrate`.
+    pub pbmpm_flip_fraction: f32,
 }
 
 impl Default for Config {
@@ -289,13 +297,16 @@ impl Default for Config {
             // 2 iterations (cheap, enough to bounce), relaxation 0.5 (a half-step compliant push —
             // does not detonate at the default cap on a fast pour), density 1.0 (rest at zero
             // divergence), and a small 0.01 viscous shear damp. Tuned live in the webapp (U4/U6).
-            pbmpm_iteration_count: 2,
+            pbmpm_iteration_count: 16,
             pbmpm_liquid_density: 1.0,
-            pbmpm_liquid_relaxation: 0.5,
+            pbmpm_liquid_relaxation: 0.7,
             pbmpm_liquid_viscosity: 0.01,
             // Water is barely elastic: a LOW restitution so the floor bounce is a thin rebound, not
             // bouncy-rubber. 0 = free-slip stop (the constraint-only arm). Tuned live in U5/U6.
-            pbmpm_restitution: 0.1,
+            pbmpm_restitution: 0.4,
+            // SPLASH knob: a high FLIP fraction so the impact-generated crown velocity survives the
+            // g2p transfer (pure APIC smooths it away). 0.0 = pure APIC (the clean off-switch).
+            pbmpm_flip_fraction: 0.95,
         }
     }
 }
