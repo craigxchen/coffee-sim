@@ -44,6 +44,11 @@ use std::time::Instant;
 use bytemuck::cast_slice;
 use serde::Serialize;
 
+use crate::profiling::{
+    env_flag, parse_solver_specs, solver_list_summary, solver_run_metadata, SolverRunMetadata,
+    SolverSpec,
+};
+
 use super::inflow::{EmissionResult, MASS_UNITS_PER_ML, PARTICLES_PER_ML};
 use super::state::{sparse_tile_slot_count, tile_count, METRICS_SLOT_COUNT, NUM_THREADS};
 use super::{dispatch_size, required_limits, MpmSettings, MpmSim3D};
@@ -57,12 +62,99 @@ const DEFAULT_MEASURED_FRAMES: u32 = 120;
 const DEFAULT_CALIBRATION_FRAMES: u32 = 30;
 const FRAME_DT: f32 = 1.0 / 60.0;
 
+#[derive(Clone, Debug)]
+struct ProfilerRunOptions {
+    scene: String,
+    warmup: u32,
+    measured: u32,
+    calibration: u32,
+    require_gpu: bool,
+}
+
+impl ProfilerRunOptions {
+    fn from_legacy_env() -> Self {
+        Self {
+            scene: std::env::var("COFFEE_SIM_PROFILE_SCENE")
+                .unwrap_or_else(|_| "center_pour".into()),
+            warmup: env_u32_or("COFFEE_SIM_PROFILE_WARMUP", DEFAULT_WARMUP_FRAMES),
+            measured: env_u32_or("COFFEE_SIM_PROFILE_FRAMES", DEFAULT_MEASURED_FRAMES),
+            calibration: env_u32_or("COFFEE_SIM_PROFILE_CAL", DEFAULT_CALIBRATION_FRAMES),
+            require_gpu: env_flag("COFFEE_SIM_PROFILE_REQUIRE_GPU"),
+        }
+    }
+
+    fn from_profile_args() -> Self {
+        Self {
+            scene: profile_arg_value("scene")
+                .or_else(|| std::env::var("COFFEE_SIM_PROFILE_SCENE").ok())
+                .unwrap_or_else(|| "center_pour".into()),
+            warmup: profile_arg_value("warmup")
+                .and_then(|value| value.parse().ok())
+                .unwrap_or_else(|| env_u32_or("COFFEE_SIM_PROFILE_WARMUP", DEFAULT_WARMUP_FRAMES)),
+            measured: profile_arg_value("frames")
+                .or_else(|| profile_arg_value("measured"))
+                .and_then(|value| value.parse().ok())
+                .unwrap_or_else(|| {
+                    env_u32_or("COFFEE_SIM_PROFILE_FRAMES", DEFAULT_MEASURED_FRAMES)
+                }),
+            calibration: profile_arg_value("cal")
+                .or_else(|| profile_arg_value("calibration"))
+                .and_then(|value| value.parse().ok())
+                .unwrap_or_else(|| {
+                    env_u32_or("COFFEE_SIM_PROFILE_CAL", DEFAULT_CALIBRATION_FRAMES)
+                }),
+            require_gpu: profile_arg_flag("require-gpu")
+                || profile_arg_flag("require_gpu")
+                || env_flag("COFFEE_SIM_PROFILE_REQUIRE_GPU"),
+        }
+    }
+}
+
 fn env_u32_or(name: &str, default: u32) -> u32 {
     std::env::var(name)
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
         .filter(|v| *v > 0)
         .unwrap_or(default)
+}
+
+fn profile_args() -> Vec<String> {
+    std::env::var("COFFEE_SIM_PROFILE_ARGS")
+        .unwrap_or_default()
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect()
+}
+
+fn profile_arg_value(name: &str) -> Option<String> {
+    let long = format!("--{name}");
+    let key = name.replace('-', "_");
+    let args = profile_args();
+    let mut iter = args.iter().peekable();
+    while let Some(arg) = iter.next() {
+        if arg == &long {
+            return iter.peek().map(|value| (*value).clone().to_string());
+        }
+        if let Some(value) = arg.strip_prefix(&(long.clone() + "=")) {
+            return Some(value.to_string());
+        }
+        if let Some(value) = arg.strip_prefix(&(key.clone() + "=")) {
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
+fn profile_arg_flag(name: &str) -> bool {
+    let long = format!("--{name}");
+    let key = name.replace('-', "_");
+    profile_args().iter().any(|arg| {
+        arg == &long
+            || arg == &(key.clone() + "=true")
+            || arg == &(key.clone() + "=1")
+            || arg == &(long.clone() + "=true")
+            || arg == &(long.clone() + "=1")
+    })
 }
 
 // ── GPU timestamp ring ──
@@ -576,6 +668,7 @@ struct PassStat {
 
 #[derive(Serialize)]
 struct Metadata {
+    solver_run: SolverRunMetadata,
     scene: String,
     adapter: String,
     backend: String,
@@ -663,8 +756,135 @@ fn output_path() -> PathBuf {
 #[test]
 #[ignore = "profiling harness; run explicitly with --ignored --release"]
 fn profile_mpm_pipeline() {
+    run_profile_mpm_pipeline(
+        "profile_mpm_pipeline",
+        ProfilerRunOptions::from_legacy_env(),
+        solver_run_metadata(&[SolverSpec::Mpm], SolverSpec::Mpm),
+    );
+}
+
+#[test]
+#[ignore = "solver-neutral profiling harness; run explicitly with --ignored --release"]
+fn profile_solvers() {
+    run_profile_solvers_from_env();
+}
+
+fn run_profile_solvers_from_env() {
+    if profile_arg_flag("list-solvers") || env_flag("COFFEE_SIM_PROFILE_LIST_SOLVERS") {
+        print!("{}", solver_list_summary());
+        return;
+    }
+
+    let solvers = selected_solver_specs_from_env();
+    let options = ProfilerRunOptions::from_profile_args();
+    if profile_arg_flag("dry-run-json") || env_flag("COFFEE_SIM_PROFILE_DRY_RUN_JSON") {
+        print_dry_run_plan(&solvers, &options, true);
+        return;
+    }
+    if profile_arg_flag("dry-run") || env_flag("COFFEE_SIM_PROFILE_DRY_RUN") {
+        print_dry_run_plan(&solvers, &options, false);
+        return;
+    }
+
+    for &solver in &solvers {
+        match solver {
+            SolverSpec::Mpm => run_profile_mpm_pipeline(
+                "profile_solvers",
+                options.clone(),
+                solver_run_metadata(&solvers, solver),
+            ),
+        }
+    }
+}
+
+fn selected_solver_specs_from_env() -> Vec<SolverSpec> {
+    let value = profile_arg_value("solvers")
+        .or_else(|| profile_arg_value("solver"))
+        .or_else(|| std::env::var("COFFEE_SIM_PROFILE_SOLVERS").ok())
+        .or_else(|| std::env::var("COFFEE_SIM_PROFILE_SOLVER").ok())
+        .unwrap_or_else(|| "mpm".into());
+    parse_solver_specs(&value).unwrap_or_else(|err| panic!("{err}"))
+}
+
+#[derive(Serialize)]
+struct DryRunPlan {
+    version: u32,
+    solvers: Vec<String>,
+    scene: String,
+    warmup_frames: u32,
+    measured_frames: u32,
+    calibration_frames: u32,
+    require_gpu: bool,
+    solver_runs: Vec<SolverRunMetadata>,
+}
+
+fn dry_run_plan(solvers: &[SolverSpec], options: &ProfilerRunOptions) -> DryRunPlan {
+    DryRunPlan {
+        version: 1,
+        solvers: solvers
+            .iter()
+            .map(|solver| solver.id().to_string())
+            .collect(),
+        scene: options.scene.clone(),
+        warmup_frames: options.warmup,
+        measured_frames: options.measured,
+        calibration_frames: options.calibration,
+        require_gpu: options.require_gpu,
+        solver_runs: solvers
+            .iter()
+            .map(|&solver| solver_run_metadata(solvers, solver))
+            .collect(),
+    }
+}
+
+fn print_dry_run_plan(solvers: &[SolverSpec], options: &ProfilerRunOptions, json: bool) {
+    let plan = dry_run_plan(solvers, options);
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&plan).expect("dry-run json")
+        );
+        return;
+    }
+    println!(
+        "profile_solvers dry run: scene={} solvers={} warmup={} frames={} cal={} require_gpu={}",
+        plan.scene,
+        plan.solvers.join(","),
+        plan.warmup_frames,
+        plan.measured_frames,
+        plan.calibration_frames,
+        plan.require_gpu
+    );
+}
+
+#[test]
+fn profile_solvers_dry_run_plan_records_mpm_metadata() {
+    let options = ProfilerRunOptions {
+        scene: "center_pour".into(),
+        warmup: 1,
+        measured: 2,
+        calibration: 3,
+        require_gpu: false,
+    };
+    let solvers = parse_solver_specs("all").expect("all resolves");
+    let plan = dry_run_plan(&solvers, &options);
+    assert_eq!(plan.version, 1);
+    assert_eq!(plan.solvers, vec!["mpm"]);
+    assert_eq!(plan.scene, "center_pour");
+    assert_eq!(plan.solver_runs.len(), 1);
+    assert_eq!(plan.solver_runs[0].current, "mpm");
+}
+
+fn run_profile_mpm_pipeline(
+    entrypoint: &str,
+    options: ProfilerRunOptions,
+    solver_run: SolverRunMetadata,
+) {
     let Some(adapter) = request_adapter() else {
-        eprintln!("profile_mpm_pipeline: no GPU adapter available; skipping.");
+        if options.require_gpu {
+            panic!("{entrypoint}: no GPU adapter available and require_gpu=true");
+        }
+        eprintln!("{entrypoint}: no GPU adapter available; skipping.");
         return;
     };
 
@@ -687,10 +907,10 @@ fn profile_mpm_pipeline() {
     .expect("request profiler device");
 
     let info = adapter.get_info();
-    let scene = std::env::var("COFFEE_SIM_PROFILE_SCENE").unwrap_or_else(|_| "center_pour".into());
-    let warmup = env_u32_or("COFFEE_SIM_PROFILE_WARMUP", DEFAULT_WARMUP_FRAMES);
-    let measured = env_u32_or("COFFEE_SIM_PROFILE_FRAMES", DEFAULT_MEASURED_FRAMES);
-    let calibration = env_u32_or("COFFEE_SIM_PROFILE_CAL", DEFAULT_CALIBRATION_FRAMES);
+    let scene = options.scene;
+    let warmup = options.warmup;
+    let measured = options.measured;
+    let calibration = options.calibration;
 
     let mut settings = scene_settings(&scene);
     settings.sparse_pressure = std::env::var("COFFEE_SIM_PROFILE_SPARSE_PRESSURE")
@@ -833,6 +1053,7 @@ fn profile_mpm_pipeline() {
 
     let report = ProfileReport {
         metadata: Metadata {
+            solver_run,
             scene: scene.clone(),
             adapter: info.name.clone(),
             backend: format!("{:?}", info.backend),

@@ -358,6 +358,30 @@ h1 {
   white-space: nowrap;
 }
 
+.solver-field {
+  align-items: center;
+}
+
+select {
+  min-width: 96px;
+  height: 32px;
+  padding: 4px 28px 4px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--panel-border);
+  background: rgba(9, 16, 19, 0.56);
+  color: var(--ink);
+  font: inherit;
+  font-size: 0.82rem;
+  letter-spacing: 0;
+  text-transform: none;
+  accent-color: var(--accent);
+}
+
+select:focus-visible {
+  outline: 2px solid rgba(217, 179, 106, 0.72);
+  outline-offset: 2px;
+}
+
 input[type="range"] {
   width: 100%;
   margin: 0;
@@ -563,7 +587,8 @@ body.sim-startup-failed canvas {
 }
 
 body.sim-startup-failed button,
-body.sim-startup-failed input {
+body.sim-startup-failed input,
+body.sim-startup-failed select {
   cursor: not-allowed;
   opacity: 0.55;
 }

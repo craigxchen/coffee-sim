@@ -230,6 +230,7 @@ pub(crate) fn init_bed_particles(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_cell_lookup(
     config: &BedConfig,
     spacing: f32,

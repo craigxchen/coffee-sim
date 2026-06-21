@@ -4,6 +4,7 @@ const canvas = document.getElementById("sim-canvas");
 const viewCubeStage = document.getElementById("view-cube-stage");
 const toggleButton = document.getElementById("toggle");
 const resetButton = document.getElementById("reset");
+const solverSelect = document.getElementById("solver-select");
 const sceneMainTab = document.getElementById("scene-tab-main");
 const sceneDebugTab = document.getElementById("scene-tab-debug");
 const sceneMainPanel = document.getElementById("scene-panel-main");
@@ -66,6 +67,7 @@ const TIMESERIES_SAMPLE_INTERVAL = 6;
 const TIMESERIES_MAX_SAMPLES = 720;
 const HUD_REFRESH_INTERVAL = 6;
 const MAX_RENDER_DPR = 1.5;
+const ACTIVE_SOLVER_ID = "mpm";
 let metricsSamplesPending = 0;
 let latestExactMetrics = null;
 const AUTO_PAUSE_DELAY_MS = 30_000;
@@ -259,6 +261,7 @@ async function bootstrap() {
     resetTimeseries();
     requestAnimationFrame(animate);
     scheduleAutoPauseIfInactive();
+    syncSolverSelect();
     publishDebugHooks();
   } catch (error) {
     showStartupError({
@@ -285,6 +288,10 @@ async function bootstrap() {
 
   resetButton.addEventListener("click", () => {
     reloadCurrentScene();
+  });
+
+  solverSelect.addEventListener("change", () => {
+    syncSolverSelect();
   });
 
   toggleTimeseriesButton.addEventListener("click", () => {
@@ -994,6 +1001,10 @@ function applySpoutControls() {
 }
 
 function applySceneControls() {
+}
+
+function syncSolverSelect() {
+  solverSelect.value = ACTIVE_SOLVER_ID;
 }
 
 function setSceneTab(tabName) {

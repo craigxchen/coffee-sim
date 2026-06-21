@@ -82,7 +82,7 @@ jobs:
             gpu-smoke-${{ runner.os }}-
 
       - name: Shader parser smoke
-        run: cargo test -p coffee-sim-wasm mpm_3d::shader::tests::shader_parses_with_naga --lib
+        run: cargo test -p coffee-sim-wasm shader_parses_with_naga --lib
 
       - name: Pool mass smoke
         run: >

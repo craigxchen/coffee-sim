@@ -8,10 +8,11 @@ use web_sys::HtmlCanvasElement;
 
 use coffee_sim_core::Vec3;
 
-use crate::mpm_3d::{
-    MpmSettings, MpmSim3D, Obstacle, CONTACT_OFFSET, MAX_FILL_VERTEX_COUNT,
-    MAX_RENDER_VERTEX_COUNT, OBSTACLE_WALL_THICKNESS,
+use crate::solvers::mpm::{
+    MpmSettings, Obstacle, CONTACT_OFFSET, MAX_FILL_VERTEX_COUNT, MAX_RENDER_VERTEX_COUNT,
+    OBSTACLE_WALL_THICKNESS,
 };
+use crate::ui::RenderView;
 
 const EPSILON: f32 = 1e-6;
 const CROSS_SECTION_ASPECT: f32 = 1.38;
@@ -444,7 +445,7 @@ impl Renderer {
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("coffee-sim device"),
                 required_features: wgpu::Features::empty(),
-                required_limits: crate::mpm_3d::required_limits(),
+                required_limits: crate::solvers::mpm::required_limits(),
                 memory_hints: wgpu::MemoryHints::Performance,
                 trace: wgpu::Trace::default(),
                 experimental_features: wgpu::ExperimentalFeatures::disabled(),
@@ -1038,7 +1039,7 @@ impl Renderer {
         Some((x, y, width, height, width / height.max(EPSILON)))
     }
 
-    fn sync_filter_mesh_vertices(&mut self, simulation: &MpmSim3D) {
+    fn sync_filter_mesh_vertices(&mut self, simulation: &RenderView<'_>) {
         let mesh_key = simulation.static_filter_mesh_key();
         if self.uploaded_filter_mesh_key == mesh_key {
             return;
@@ -1076,7 +1077,7 @@ impl Renderer {
 
     pub(crate) fn render_3d(
         &mut self,
-        simulation: &MpmSim3D,
+        simulation: &RenderView<'_>,
         camera: OrbitCamera,
     ) -> Result<(), JsValue> {
         if self.config.width == 0 || self.config.height == 0 {

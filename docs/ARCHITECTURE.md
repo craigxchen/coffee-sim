@@ -3,14 +3,19 @@
 ## Overview
 
 The active simulator is the WebGPU MPM stack in
-[`crates/sim-wasm/src/mpm_3d`](../crates/sim-wasm/src/mpm_3d).
-The browser app is a WASM wrapper around that stack.
+[`crates/sim-wasm/src/solvers/mpm`](../crates/sim-wasm/src/solvers/mpm).
+The browser app is a WASM wrapper around `engine::Simulator`, which currently
+selects the MPM solver by default.
 
 High-level ownership:
 - `sim-core`: shared math/types used by the browser simulation
 - `sim-wasm/src/lib.rs`: WASM-facing API and scene loaders
+- `sim-wasm/src/engine`: active solver orchestration
+- `sim-wasm/src/solvers`: solver trait, registry, and solver implementations
+- `sim-wasm/src/ui`: shared render-facing view types
+- `sim-wasm/src/profiling`: solver-neutral profiler selection helpers
 - `sim-wasm/src/renderer.rs`: render pipeline and camera controls
-- `sim-wasm/src/mpm_3d/*`: simulation state, passes, scene setup, tests
+- `sim-wasm/src/solvers/mpm/*`: MPM simulation state, passes, scene setup, tests
 - `sim-wasm/www-3d/*`: browser UI and scene controls
 - `sim-wasm/www-3d/demo/*`: small baseline demo shell kept beside the primary app
 - `sim-wasm/www-3d/pkg/*`: generated `wasm-pack` browser package
@@ -31,7 +36,8 @@ Rendering is downstream of that state via `render_data`.
 
 ## Pass Order
 
-Each frame is orchestrated by [`MpmSim3D::step_frame`](../crates/sim-wasm/src/mpm_3d/mod.rs).
+Each frame is orchestrated by [`MpmSim3D::step_frame`](../crates/sim-wasm/src/solvers/mpm/mod.rs),
+driven through `engine::Simulator`.
 
 Current pass shape:
 1. update uniforms and scene-dependent state
@@ -88,6 +94,18 @@ Important invariant:
   - static filter support mesh and upload-ready vertex state
 - `physics_tests.rs`
   - headless GPU regression tests against the MPM stack
+
+## Solver Boundary
+
+`solvers::base::Solver` is the internal seam for complete simulation methods.
+The registry currently exposes one production solver:
+- `SolverId::Mpm`
+
+The renderer consumes a shared `ui::RenderView` instead of `MpmSim3D` directly.
+The MPM solver still owns the physical state and provides the same render
+buffer, filter mesh vertices, settings, and particle counts as before. Future
+solvers should implement `Solver`, add one registry entry, and provide a render
+view without changing the browser API.
 
 ## Buffer Ownership
 

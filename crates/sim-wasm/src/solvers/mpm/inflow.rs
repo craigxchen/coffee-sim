@@ -92,6 +92,7 @@ impl InflowState {
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn emit_particles(
         &mut self,
         queue: &wgpu::Queue,

@@ -117,6 +117,7 @@ pub(crate) const fn kozeny_carman_permeability_m2(grind_diameter_um: f32, porosi
 }
 
 #[cfg(test)]
+#[allow(clippy::assertions_on_constants)]
 mod tests {
     use super::*;
 

@@ -44,6 +44,7 @@ pub(crate) fn sim_speed_from_meters_per_second(speed: f32) -> f32 {
 }
 
 #[cfg(test)]
+#[allow(clippy::assertions_on_constants)]
 mod tests {
     use super::*;
 

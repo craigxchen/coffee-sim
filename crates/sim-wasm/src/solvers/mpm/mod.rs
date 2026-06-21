@@ -1064,6 +1064,7 @@ impl MpmSim3D {
         self.write_seeded_water(queue, particle_data, particle_mass, 0.0);
     }
 
+    #[allow(clippy::manual_clamp)]
     pub fn seed_filter_apex_drain(&mut self, queue: &wgpu::Queue) {
         let Some(filter) = self.settings.filter.clone() else {
             return;
@@ -1838,6 +1839,17 @@ impl MpmSim3D {
         &self.settings
     }
 
+    pub(crate) fn render_view(&self) -> crate::ui::RenderView<'_> {
+        crate::ui::RenderView::new(
+            self.settings(),
+            self.particle_count(),
+            self.render_buffer(),
+            self.filter_render_vertices(),
+            self.filter_fill_vertices(),
+            self.static_filter_mesh_key(),
+        )
+    }
+
     pub fn set_pressure_residual_adaptation(&mut self, target: f32, max_pairs: u32) {
         self.settings.pressure_residual_target = target.max(0.0);
         self.settings.pressure_rbgs_max_pairs = max_pairs.max(self.settings.pressure_rbgs_pairs);
@@ -2225,6 +2237,36 @@ impl MpmSim3D {
     }
 }
 
+impl crate::solvers::base::Solver for MpmSim3D {
+    fn id(&self) -> crate::solvers::base::SolverId {
+        crate::solvers::base::SolverId::Mpm
+    }
+
+    fn info(&self) -> crate::solvers::base::SolverInfo {
+        crate::solvers::registry::info_for(self.id())
+    }
+
+    fn reset(&mut self, queue: &wgpu::Queue, device: &wgpu::Device) {
+        MpmSim3D::reset(self, queue, device);
+    }
+
+    fn step_frame(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, dt: f32) {
+        MpmSim3D::step_frame(self, device, queue, dt);
+    }
+
+    fn render_view(&self) -> crate::ui::RenderView<'_> {
+        MpmSim3D::render_view(self)
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+}
+
 fn dispatch_size(count: u32, threads: u32) -> u32 {
     count.div_ceil(threads)
 }
@@ -2353,8 +2395,8 @@ mod tests {
 
     #[test]
     fn debug_scene_catalog_stays_in_sync_with_browser_ui() {
-        let html = include_str!("../../www-3d/index.html");
-        let js = include_str!("../../www-3d/main.js");
+        let html = include_str!("../../../www-3d/index.html");
+        let js = include_str!("../../../www-3d/main.js");
 
         for scene in DebugScene::ALL {
             let id = scene.id();
