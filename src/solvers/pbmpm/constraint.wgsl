@@ -11,21 +11,27 @@
 //     Advection was MOVED OUT of g2p into here so it happens ONCE per substep after the iteration
 //     loop converges (g2p now only gathers velocity + writes D, no advect).
 //
-// EA SEED liquid constraint (KTD1; Lewin, "A Position Based Material Point Method", SIGGRAPH 2024):
-//   alpha = 0.5 * (1/liquid_density − tr(D) − 1)          // signed volume error vs rest
-//   D    += liquid_relaxation * alpha * Identity          // compliant VOLUME correction
-//   D    += liquid_viscosity  * 0.5 * deviatoric(D)       // viscous SHEAR term
-// where deviatoric(D) = D − (tr(D)/3)·I. `liquid_relaxation ∈ (0,1]` controls compliance: 1 is the
-// stiffest single-iteration push toward rest, smaller is softer/more damped. Under compression
-// (tr(D) < 0, density too high) alpha > 0 ⇒ a positive (expanding) volume correction restores the
-// pool toward rest — that restoring push, rebuilt and re-gathered across the iteration loop, is the
-// stiff incompressibility that makes the water BOUNCE. The grid rebuilds each iteration, so the
-// per-particle correction propagates spatially through the scatter → grid → gather cycle.
+// EA SEED liquid constraint (KTD1; Lewin, "A Position Based Material Point Method", SIGGRAPH 2024;
+// verified against electronicarts/pbmpm siggraph2024). Applied in EA SEED's EXACT order:
+//   1. Viscosity FIRST: deviatoric = −(D + Dᵀ); D += liquid_viscosity·0.5·deviatoric  (the NEGATIVE
+//      SYMMETRIC part — NOT the trace-removed deviatoric).
+//   2. Volume SECOND:  alpha = 0.5·(1/liquidDensity − tr(D) − 1); D += liquid_relaxation·alpha·I
+//      where liquidDensity is the PER-PARTICLE accumulated value (not a constant params lane).
+// `liquid_relaxation ∈ (0,1]` controls compliance: 1 is the stiffest single-iteration push toward
+// rest, smaller is softer/more damped. The per-particle liquidDensity (EA SEED's running product of
+// det(F), updated each substep in particle_integrate) is the VOLUME MEMORY: a static over-dense blob
+// has tr(D) ≈ 0 but liquidDensity > 1, so alpha < 0 ⇒ an expanding correction recovers it toward rest
+// (a CONSTANT density=1 gave alpha ≈ 0 here — the collapse bug). That restoring push, rebuilt and
+// re-gathered across the iteration loop, is the stiff incompressibility that makes the water BOUNCE.
+// The grid rebuilds each iteration, so the per-particle correction propagates spatially through the
+// scatter → grid → gather cycle.
 //
 // D is the per-particle velocity-gradient matrix (deform_disp rows; p2g scatters `vaff = v + D·d`).
-// For the default liquid_density = 1.0 the rest target is tr(D) = 1/liquid_density − 1 = 0 (zero
-// divergence), so a settled uniform pool reads alpha ≈ 0 and the correction vanishes (a bounded
-// fixed point); an impact spikes a converging flow (tr(D) < 0) and the constraint pushes back.
+// At rest with liquidDensity = 1.0 the target is tr(D) = 1/liquidDensity − 1 = 0 (zero divergence),
+// so a settled uniform pool reads alpha ≈ 0 and the correction vanishes (a bounded fixed point); an
+// impact spikes a converging flow (tr(D) < 0) and the constraint pushes back. Sustained compression
+// (tr(D) < 0 over several substeps) drives liquidDensity above 1 in particle_integrate, so even after
+// the flow stalls the volume term keeps expanding the over-dense pool back toward rest.
 
 // Zero the per-particle deformation displacement D for the live water range. Run ONCE at the start
 // of each substep's iteration loop (KTD8: D is zeroed per substep and accumulated across the
@@ -53,30 +59,43 @@ fn particle_update(@builtin(global_invocation_id) gid: vec3<u32>) {
     var d1 = deform_disp[3u * p + 1u].xyz;
     var d2 = deform_disp[3u * p + 2u].xyz;
 
-    let tr = d0.x + d1.y + d2.z;
+    // Per-particle accumulated liquid density (EA SEED `particle.liquidDensity` = the running
+    // product of det(F) ≈ the volume Jacobian; updated each substep in particle_integrate). Stored
+    // in the repurposed deform_grad lane [3p+0].x (see common.wgsl). A value > 1 means the particle
+    // has accumulated COMPRESSION (it is over-dense); the volume term must then expand it back toward
+    // rest even when the INSTANTANEOUS flow is divergence-free (tr(D) ≈ 0) — without this memory a
+    // static over-dense blob reads alpha ≈ 0 and never recovers (the collapse bug U6 fixes).
+    let liquid_density = deform_grad[3u * p + 0u].x;
 
-    // Compliant VOLUME correction: a relaxation-scaled isotropic push toward the rest volume.
-    let alpha = 0.5 * (1.0 / params.liquid_density - tr - 1.0);
+    // EA SEED order: VISCOSITY FIRST, then VOLUME.
+    // 1. Viscosity: nudge D by the NEGATIVE symmetric part. deviatoric = −(D + Dᵀ);
+    //    D += liquid_viscosity·0.5·deviatoric. (This is EA SEED's exact form — the symmetric part,
+    //    not the trace-removed deviatoric.)
+    let visc = params.liquid_viscosity * 0.5;
+    let s00 = -2.0 * d0.x;
+    let s11 = -2.0 * d1.y;
+    let s22 = -2.0 * d2.z;
+    let s01 = -(d0.y + d1.x);
+    let s02 = -(d0.z + d2.x);
+    let s12 = -(d1.z + d2.y);
+    d0.x = d0.x + visc * s00;
+    d0.y = d0.y + visc * s01;
+    d0.z = d0.z + visc * s02;
+    d1.x = d1.x + visc * s01;
+    d1.y = d1.y + visc * s11;
+    d1.z = d1.z + visc * s12;
+    d2.x = d2.x + visc * s02;
+    d2.y = d2.y + visc * s12;
+    d2.z = d2.z + visc * s22;
+
+    // 2. Volume: compliant isotropic push toward the rest volume, using the PER-PARTICLE accumulated
+    //    density. alpha = 0.5·(1/liquid_density − tr(D) − 1); D += liquid_relaxation·alpha·I.
+    let tr = d0.x + d1.y + d2.z;
+    let alpha = 0.5 * (1.0 / liquid_density - tr - 1.0);
     let vol = params.liquid_relaxation * alpha;
     d0.x = d0.x + vol;
     d1.y = d1.y + vol;
     d2.z = d2.z + vol;
-
-    // Viscous SHEAR correction: nudge D toward its deviatoric part (removes shear off-diagonals /
-    // the anisotropic trace split). deviatoric(D) = D − (tr(D)/3)·I; uses the post-volume trace.
-    let tr2 = d0.x + d1.y + d2.z;
-    let third = tr2 / 3.0;
-    let shear = params.liquid_viscosity * 0.5;
-    // dev(D) diagonal = d_ii − tr/3 ; off-diagonal = d_ij unchanged.
-    d0.x = d0.x + shear * (d0.x - third);
-    d0.y = d0.y + shear * d0.y;
-    d0.z = d0.z + shear * d0.z;
-    d1.x = d1.x + shear * d1.x;
-    d1.y = d1.y + shear * (d1.y - third);
-    d1.z = d1.z + shear * d1.z;
-    d2.x = d2.x + shear * d2.x;
-    d2.y = d2.y + shear * d2.y;
-    d2.z = d2.z + shear * (d2.z - third);
 
     deform_disp[3u * p + 0u] = vec4<f32>(d0, 0.0);
     deform_disp[3u * p + 1u] = vec4<f32>(d1, 0.0);
@@ -128,4 +147,16 @@ fn particle_integrate(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     pos[p] = vec4<f32>(x, pos[p].w);
     vel[p] = vec4<f32>(v, vel[p].w);
+
+    // EA SEED `particleIntegrate` liquid accumulation (runs ONCE per substep, on the converged D):
+    // liquidDensity *= (tr(D) + 1.0); clamped to ≥ 0.1. tr(D)+1 is the per-substep volume Jacobian
+    // (a converging/compressing flow has tr(D) < 0 ⇒ factor < 1 ⇒ density rises toward over-dense;
+    // an expanding flow relaxes it back). The running product is the volume memory the constraint's
+    // alpha term reads next substep — the fix for the density-blind collapse. Read the FINAL
+    // deform_disp (the converged D from the last iteration of this substep).
+    let tr_final = deform_disp[3u * p + 0u].x + deform_disp[3u * p + 1u].y + deform_disp[3u * p + 2u].z;
+    var liquid_density = deform_grad[3u * p + 0u].x;
+    liquid_density = liquid_density * (tr_final + 1.0);
+    liquid_density = max(liquid_density, 0.1);
+    deform_grad[3u * p + 0u].x = liquid_density;
 }

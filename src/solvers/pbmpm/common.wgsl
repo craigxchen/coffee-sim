@@ -33,9 +33,11 @@ struct Params {
     water_count: u32,     // particles [0, water_count) are live water (range layout)
     particle_count: u32,  // allocated pool size (kernel live-set guard)
     // PB-MPM liquid constraint knobs (KTD1; inert in U1 — the constraint lands in U4):
-    liquid_density: f32,    // rest liquid density target (1/liquid_density in the alpha term)
+    liquid_density: f32,    // INIT-only rest density (U6: the constraint reads the PER-PARTICLE
+                            // accumulated density from deform_grad[3p+0].x, not this lane; the
+                            // identity seed inits each particle's lane to 1.0 = this default)
     liquid_relaxation: f32, // compliant volume-correction relaxation
-    liquid_viscosity: f32,  // deviatoric shear-correction weight
+    liquid_viscosity: f32,  // negative-symmetric viscosity weight (EA SEED)
     iter_pad: vec4<u32>,    // .x = iteration_count; .y = num_solids (SDF BC count, 0 = none);
                             // .z = restitution f32 bits (U5, bitcast<f32>); .w = pad
 };
@@ -54,6 +56,15 @@ struct Params {
 // 3 vec4 rows per particle each; .xyz = the matrix row, .w = 0 (constraint scalars reuse .w in U4).
 // Allocated + identity-seeded (F = I, D = 0) in U1 so the ABI is fixed; the transfers/constraint
 // passes that write them land in U3/U4.
+//
+// REPURPOSED LANE (U6, EA SEED per-particle liquidDensity): `deform_grad[3p + 0].x` (the F[0][0]
+// slot) holds the per-particle accumulated liquid density (EA SEED `particle.liquidDensity` = the
+// running product of the per-substep volume Jacobian tr(D)+1). The identity seed already writes
+// F[0][0] = 1.0, so the build/reset seed gives the correct initial density = 1 for free; emit also
+// sets it to 1.0 for activated slots (defensive). The rest of F (deform_grad) is otherwise unused by
+// the single-phase liquid prototype, so this borrows one float lane rather than adding a buffer.
+// READ by particle_update (the volume term's 1/liquidDensity); READ-WRITTEN by particle_integrate
+// (the per-substep accumulation). Do NOT clobber pos.w (moisture) / vel.w (carried) for this.
 @group(0) @binding(5) var<storage, read_write> deform_disp: array<vec4<f32>>;
 @group(0) @binding(6) var<storage, read_write> deform_grad: array<vec4<f32>>;
 // LIQUID grid field, fixed-point: 4 atomic<i32> lanes per node, stride 4 — [mass, mom.x, mom.y,

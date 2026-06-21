@@ -51,16 +51,17 @@ fn groups(n: u32) -> u32 {
 /// Storage-buffer budget (KTD5): per entry point (the params uniform does NOT count against the
 /// storage limit) —
 ///   `grid_clear`         1 (grid_fp);
-///   `particle_update`    1 (deform_disp) — U4 constraint, reads+writes D only;
+///   `particle_update`    2 (deform_disp, deform_grad) — U4 constraint, reads+writes D, reads the
+///                          U6 per-particle liquidDensity lane (deform_grad[3p+0].x);
 ///   `p2g`                4 (pos, vel, deform_disp, grid_fp) — reads pos/vel/deform_disp, scatters;
 ///   `grid_update`        3 (grid_fp, grid_vel, solids) — U5 adds the collider node BC;
-///   `g2p`                4 (pos, vel, deform_disp, grid_vel) — the OTHER widest entry point;
-///   `particle_integrate` 3 (pos, vel, solids) — advect once + the U5 SDF push-out/restitution.
-/// Widest = `p2g`/`g2p` at 4 storage buffers (unchanged by U5 — neither gained `solids`). Well
-/// within the 9 grant the device requests (`src/utils/gpu.rs::NEEDED_STORAGE_BUFFERS`). The U5
-/// collider BC adds `solids` (1 buffer) only to `grid_update` (→3) and `particle_integrate` (→3),
-/// both below the widest.
-pub const MAX_STORAGE_BUFFERS_PER_ENTRY_POINT: u32 = 4;
+///   `g2p`                4 (pos, vel, deform_disp, grid_vel);
+///   `particle_integrate` 5 (pos, vel, deform_disp, deform_grad, solids) — advect once + the U5 SDF
+///                          push-out/restitution + the U6 per-particle liquidDensity accumulation
+///                          (reads the converged D, read-writes the deform_grad lane).
+/// Widest = `particle_integrate` at 5 storage buffers (U6 added `deform_disp` + `deform_grad` to it).
+/// Well within the 9 grant the device requests (`src/utils/gpu.rs::NEEDED_STORAGE_BUFFERS`).
+pub const MAX_STORAGE_BUFFERS_PER_ENTRY_POINT: u32 = 5;
 
 /// Fixed-point scale for the grid atomics — mirrors `FP_SCALE` in `common.wgsl` (2^18,
 /// KEEP.md §3). Coupled to `Config::max_speed` (the overflow-headroom derivation lives next to
@@ -496,7 +497,10 @@ impl PbmpmSolver {
         self.params.iter_pad[0] = count.max(1);
     }
 
-    /// Set the rest liquid density target (`1/liquid_density` in the `alpha` term) — dev/test only.
+    /// Set the INIT rest liquid density (U6: the constraint reads the PER-PARTICLE accumulated
+    /// density from the `deform_grad[3p+0].x` lane, not this Params lane — the lane is seeded to 1.0
+    /// by the identity F seed at build/reset/emit). Kept for the Params ABI + future re-seed hooks;
+    /// changing it alone no longer changes the running constraint. Dev/test only.
     pub fn set_liquid_density_for_test(&mut self, density: f32) {
         self.params.liquid_density = density;
     }
@@ -651,7 +655,16 @@ impl PbmpmSolver {
         self.queue
             .write_buffer(&self.chem, off_v4, bytemuck::cast_slice(&new_chem));
         // Dormant pool slots already carry phase 0 (water), identity F, and zero D (the build seed);
-        // activation only overwrites pos/vel/chem, so the KTD8 per-particle state stays consistent.
+        // activation only overwrites pos/vel/chem. Re-seed identity F for the activated slots so the
+        // U6 per-particle liquidDensity lane (deform_grad[3p+0].x) is exactly 1.0 at activation (the
+        // identity seed already puts 1.0 there, but re-writing it is defensive against a reused slot
+        // carrying stale accumulation; 3 contiguous vec4 rows per particle = one strided write).
+        let off_f = (self.water_count as u64) * 48;
+        self.queue.write_buffer(
+            &self.deform_grad,
+            off_f,
+            bytemuck::cast_slice(&identity_rows(emit_n)),
+        );
         self.water_count += emit_n;
         self.params.water_count = self.water_count;
     }
@@ -851,10 +864,14 @@ impl Solver for PbmpmSolver {
             // deform_clear: deform_disp (write). 1 storage buffer. Zeroes D once per substep.
             let deform_clear = make("deform_clear");
             let deform_clear_bind = bg(&deform_clear, &[(0, &params_buf), (5, &deform_disp)]);
-            // particle_update: deform_disp (read+write D). 1 storage buffer. Runs BEFORE p2g each
-            // iteration so the corrected D propagates through the scatter.
+            // particle_update: deform_disp (read+write D), deform_grad (READ the per-particle
+            // liquidDensity lane [3p+0].x). 2 storage buffers. Runs BEFORE p2g each iteration so the
+            // corrected D propagates through the scatter.
             let particle_update = make("particle_update");
-            let particle_update_bind = bg(&particle_update, &[(0, &params_buf), (5, &deform_disp)]);
+            let particle_update_bind = bg(
+                &particle_update,
+                &[(0, &params_buf), (5, &deform_disp), (6, &deform_grad)],
+            );
             let grid_clear = make("grid_clear");
             let grid_clear_bind = bg(&grid_clear, &[(0, &params_buf), (7, &grid_fp)]);
             // p2g: pos, vel, deform_disp (read affine D), grid_fp (scatter). 4 storage buffers.
@@ -894,13 +911,21 @@ impl Solver for PbmpmSolver {
                     (8, &grid_vel),
                 ],
             );
-            // particle_integrate: pos (write), vel (read+wall clamp), solids (SDF push-out +
-            // restitution). 3 storage buffers (U5 adds the particle-resolution collider BC). Runs
-            // ONCE per substep after the iteration loop.
+            // particle_integrate: pos (write), vel (read+wall clamp), deform_disp (READ the converged
+            // D for the liquidDensity accumulation), deform_grad (READ-WRITE the per-particle
+            // liquidDensity lane), solids (SDF push-out + restitution). 5 storage buffers. Runs ONCE
+            // per substep after the iteration loop.
             let particle_integrate = make("particle_integrate");
             let particle_integrate_bind = bg(
                 &particle_integrate,
-                &[(0, &params_buf), (1, &pos), (2, &vel), (9, &solids)],
+                &[
+                    (0, &params_buf),
+                    (1, &pos),
+                    (2, &vel),
+                    (5, &deform_disp),
+                    (6, &deform_grad),
+                    (9, &solids),
+                ],
             );
             Pipelines {
                 deform_clear: (deform_clear, deform_clear_bind),
