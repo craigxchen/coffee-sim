@@ -1722,6 +1722,7 @@ fn sparse_pressure_tracks_dense_within_nondeterminism() {
 /// regress after over-dispatch overhead. Diagnostic — not a hard perf gate
 /// (run with --nocapture to read the fractions).
 #[test]
+#[allow(clippy::type_complexity)]
 fn sparse_active_tile_fraction_by_scene() {
     let Some((device, queue)) = create_test_device() else {
         eprintln!("skipping: no GPU adapter");

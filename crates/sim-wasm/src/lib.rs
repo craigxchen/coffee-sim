@@ -1,14 +1,27 @@
 #![cfg_attr(test, allow(dead_code))]
 
 #[cfg(any(target_arch = "wasm32", test))]
-pub(crate) mod mpm_3d;
+pub(crate) mod engine;
+#[cfg(test)]
+pub(crate) mod profiling;
+#[cfg(any(target_arch = "wasm32", test))]
+pub(crate) mod solvers;
+#[cfg(any(target_arch = "wasm32", test))]
+pub(crate) mod ui;
+#[cfg(any(target_arch = "wasm32", test))]
+pub(crate) mod mpm_3d {
+    #[allow(unused_imports)]
+    pub(crate) use crate::solvers::mpm::*;
+}
 #[cfg(target_arch = "wasm32")]
 mod renderer;
 
 #[cfg(target_arch = "wasm32")]
-use mpm_3d::{DebugScene, MpmSettings, MpmSim3D};
+use engine::Simulator;
 #[cfg(target_arch = "wasm32")]
 use renderer::{OrbitCamera, Renderer};
+#[cfg(target_arch = "wasm32")]
+use solvers::mpm::{DebugScene, MpmSettings};
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
 #[cfg(target_arch = "wasm32")]
@@ -250,7 +263,7 @@ fn metrics_snapshot_object(snapshot: mpm_3d::MetricsSnapshot) -> Result<js_sys::
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
 pub struct WasmSim3D {
-    sim: MpmSim3D,
+    sim: Simulator,
     renderer: Renderer,
     camera: OrbitCamera,
 }
@@ -264,7 +277,7 @@ impl WasmSim3D {
 
         let settings = MpmSettings::default_v60();
         let renderer = Renderer::new(canvas, &settings).await?;
-        let sim = MpmSim3D::new(renderer.device(), renderer.queue(), settings);
+        let sim = Simulator::new_mpm(renderer.device(), renderer.queue(), settings);
         let camera = OrbitCamera::new(sim.settings().bounds_size);
         Ok(Self {
             sim,
@@ -305,7 +318,7 @@ impl WasmSim3D {
         let scene = DebugScene::from_id(scene_id)
             .ok_or_else(|| JsValue::from_str(&format!("unknown debug scene: {scene_id}")))?;
         self.rebuild_with_settings(scene.settings());
-        scene.seed(&mut self.sim, self.renderer.queue());
+        self.sim.seed_debug_scene(scene, self.renderer.queue());
         Ok(())
     }
 
@@ -361,7 +374,8 @@ impl WasmSim3D {
     }
 
     pub fn render(&mut self) -> Result<(), JsValue> {
-        self.renderer.render_3d(&self.sim, self.camera)
+        self.renderer
+            .render_3d(&self.sim.render_view(), self.camera)
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
@@ -484,9 +498,14 @@ impl WasmSim3D {
         let metrics = self.sim.metrics_buffer();
         let has_bed = self.sim.settings().bed.is_some();
         wasm_bindgen_futures::future_to_promise(async move {
-            let snapshot =
-                MpmSim3D::sample_metrics_after_delay(device, queue, metrics, has_bed, delay_frames)
-                    .await?;
+            let snapshot = Simulator::sample_metrics_after_delay(
+                device,
+                queue,
+                metrics,
+                has_bed,
+                delay_frames,
+            )
+            .await?;
             Ok(metrics_snapshot_object(snapshot)?.into())
         })
     }
@@ -578,7 +597,8 @@ impl WasmSim3D {
 #[cfg(target_arch = "wasm32")]
 impl WasmSim3D {
     fn rebuild_with_settings(&mut self, settings: MpmSettings) {
-        self.sim = MpmSim3D::new(self.renderer.device(), self.renderer.queue(), settings);
+        self.sim
+            .rebuild_mpm(self.renderer.device(), self.renderer.queue(), settings);
         self.camera = OrbitCamera::new(self.sim.settings().bounds_size);
     }
 }
