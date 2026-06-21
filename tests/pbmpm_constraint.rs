@@ -1,11 +1,14 @@
-//! PB-MPM U4 compliant density constraint — pure-Rust formula mirror (no GPU), in the spirit of
+//! PB-MPM U4/U6 compliant density constraint — pure-Rust formula mirror (no GPU), in the spirit of
 //! `tests/twofield_dissipation.rs`. It re-derives the `particle_update` correction on the CPU and
-//! pins the three load-bearing properties (KTD3 — the real bounce verification is the webapp):
+//! pins the load-bearing properties (KTD3 — the real bounce verification is the webapp):
 //!   (a) under COMPRESSION (tr(D) < 0, density too high) alpha > 0 ⇒ a positive (expanding) volume
 //!       correction that restores the trace toward rest (the restoring push that bounces);
-//!   (b) at REST (tr(D) = 0, density = 1) the correction is ~0 (a neutral fixed point);
+//!   (b) at REST (tr(D) = 0, liquidDensity = 1) the correction is ~0 (a neutral fixed point);
 //!   (c) the iterate is STABLE — repeatedly applying the correction to a compressed state converges
-//!       to a bounded fixed point (no blow-up) for a representative liquid_relaxation.
+//!       to a bounded fixed point (no blow-up) for a representative liquid_relaxation;
+//!   (d) U6 REGRESSION — a STATIC over-dense particle (liquidDensity > 1, D = 0) yields alpha < 0
+//!       (an EXPANSION signal). The pre-U6 density-blind code (constant density = 1) gave alpha = 0
+//!       for this case — the collapse bug. This is the key fix gate.
 //!
 //! IMPORTANT — this Rust mirror MUST stay byte-for-byte equivalent to the WGSL `particle_update` in
 //! `src/solvers/pbmpm/constraint.wgsl`. If the shader formula changes, change this mirror too.
@@ -17,9 +20,17 @@ fn trace(d: &Mat3) -> f32 {
     d[0][0] + d[1][1] + d[2][2]
 }
 
-/// The exact `particle_update` correction from `constraint.wgsl`: the compliant VOLUME term
-/// (`liquid_relaxation · alpha · I`, `alpha = 0.5·(1/liquid_density − tr(D) − 1)`) followed by the
-/// viscous SHEAR term (`liquid_viscosity · 0.5 · deviatoric(D)`, using the post-volume trace).
+/// The signed volume error EA SEED's volume term reads: `alpha = 0.5·(1/liquidDensity − tr(D) − 1)`.
+/// `liquid_density` is the PER-PARTICLE accumulated density (U6), not a constant.
+fn alpha(d: &Mat3, liquid_density: f32) -> f32 {
+    0.5 * (1.0 / liquid_density - trace(d) - 1.0)
+}
+
+/// The exact `particle_update` correction from `constraint.wgsl`, in EA SEED's ORDER:
+///   1. VISCOSITY FIRST: `deviatoric = −(D + Dᵀ)`; `D += liquid_viscosity·0.5·deviatoric` (the
+///      negative SYMMETRIC part — NOT the trace-removed deviatoric).
+///   2. VOLUME SECOND: `alpha = 0.5·(1/liquidDensity − tr(D) − 1)`; `D += liquid_relaxation·alpha·I`,
+///      using the PER-PARTICLE accumulated `liquid_density` and the post-viscosity trace.
 fn particle_update(
     d: &Mat3,
     liquid_density: f32,
@@ -28,28 +39,43 @@ fn particle_update(
 ) -> Mat3 {
     let mut o = *d;
 
-    let tr = trace(&o);
-    let alpha = 0.5 * (1.0 / liquid_density - tr - 1.0);
-    let vol = liquid_relaxation * alpha;
+    // 1. Viscosity: negative symmetric part −(D + Dᵀ), scaled by viscosity·0.5.
+    let visc = liquid_viscosity * 0.5;
+    let sym: Mat3 = [
+        [
+            -(o[0][0] + o[0][0]),
+            -(o[0][1] + o[1][0]),
+            -(o[0][2] + o[2][0]),
+        ],
+        [
+            -(o[1][0] + o[0][1]),
+            -(o[1][1] + o[1][1]),
+            -(o[1][2] + o[2][1]),
+        ],
+        [
+            -(o[2][0] + o[0][2]),
+            -(o[2][1] + o[1][2]),
+            -(o[2][2] + o[2][2]),
+        ],
+    ];
+    for (r, row) in o.iter_mut().enumerate() {
+        for (c, x) in row.iter_mut().enumerate() {
+            *x += visc * sym[r][c];
+        }
+    }
+
+    // 2. Volume: per-particle compliant isotropic push toward rest (post-viscosity trace).
+    let vol = liquid_relaxation * alpha(&o, liquid_density);
     o[0][0] += vol;
     o[1][1] += vol;
     o[2][2] += vol;
 
-    let tr2 = trace(&o);
-    let third = tr2 / 3.0;
-    let shear = liquid_viscosity * 0.5;
-    for (r, row) in o.iter_mut().enumerate() {
-        for (c, x) in row.iter_mut().enumerate() {
-            let dev = if r == c { *x - third } else { *x };
-            *x += shear * dev;
-        }
-    }
     o
 }
 
 const DENSITY: f32 = 1.0; // rest target tr(D) = 1/density − 1 = 0
 const RELAX: f32 = 0.5; // representative compliant relaxation
-const VISC: f32 = 0.01; // small viscous shear damp (the default)
+const VISC: f32 = 0.01; // small viscous damp (the default)
 
 /// (a) Under compression (a converging flow, tr(D) < 0) the volume correction pushes the trace
 /// back UP toward rest — alpha > 0 and the corrected trace is strictly closer to 0.
@@ -60,10 +86,10 @@ fn compression_pushes_back_toward_rest() {
     let tr0 = trace(&d);
     assert!(tr0 < 0.0, "test setup is a compressive state");
 
-    let alpha = 0.5 * (1.0 / DENSITY - tr0 - 1.0);
+    let a = alpha(&d, DENSITY);
     assert!(
-        alpha > 0.0,
-        "compression ⇒ alpha > 0 (expanding correction), got {alpha}"
+        a > 0.0,
+        "compression ⇒ alpha > 0 (expanding correction), got {a}"
     );
 
     let o = particle_update(&d, DENSITY, RELAX, VISC);
@@ -77,8 +103,8 @@ fn compression_pushes_back_toward_rest() {
     assert!(tr1 >= tr0, "no backward step");
 }
 
-/// (b) At rest (tr(D) = 0, density = 1) the correction is ~0 — a neutral fixed point (no spontaneous
-/// expansion or compression of a settled uniform pool).
+/// (b) At rest (tr(D) = 0, liquidDensity = 1) the correction is ~0 — a neutral fixed point (no
+/// spontaneous expansion or compression of a settled uniform pool at rest density).
 #[test]
 fn rest_state_is_a_neutral_fixed_point() {
     let d: Mat3 = [[0.0; 3]; 3];
@@ -88,6 +114,40 @@ fn rest_state_is_a_neutral_fixed_point() {
         "rest state must stay ~0, got {o:?}"
     );
     assert!(trace(&o).abs() < 1e-6, "rest trace stays ~0");
+}
+
+/// (d) U6 KEY REGRESSION — a STATIC over-dense particle (liquidDensity > 1, D = 0) must yield
+/// alpha < 0 (an EXPANSION signal) and a NEGATIVE diagonal volume correction that drives the trace
+/// below zero (a diverging/expanding flow). The pre-U6 density-blind code used a CONSTANT density = 1
+/// here, so alpha = 0.5·(1 − 0 − 1) = 0 — no correction, the over-dense blob stays collapsed forever.
+/// With the per-particle accumulated density the constraint finally pushes it back out.
+#[test]
+fn static_over_dense_particle_expands() {
+    // A blob that accumulated 30% compression (liquidDensity = 1.3) but is now STATIC: D = 0,
+    // tr(D) = 0. The instantaneous flow is divergence-free, so a density-blind alpha is 0.
+    let over_dense = 1.3_f32;
+    let d: Mat3 = [[0.0; 3]; 3];
+
+    // Density-blind (the BUG): constant density = 1 with tr(D) = 0 gives no expansion signal.
+    assert!(
+        alpha(&d, 1.0).abs() < 1e-6,
+        "the old density-blind constraint gives alpha ≈ 0 for a static over-dense blob (the bug)"
+    );
+
+    // U6 fix: the per-particle accumulated density makes alpha strictly NEGATIVE (expand).
+    let a = alpha(&d, over_dense);
+    assert!(
+        a < 0.0,
+        "static over-dense (liquidDensity {over_dense} > 1, D = 0) ⇒ alpha < 0 (expansion), got {a}"
+    );
+
+    // The correction is a negative diagonal push ⇒ tr(D) goes below 0 (an expanding flow next p2g).
+    let o = particle_update(&d, over_dense, RELAX, VISC);
+    assert!(
+        trace(&o) < 0.0,
+        "the expansion correction drives tr(D) below rest (a diverging flow): {}",
+        trace(&o)
+    );
 }
 
 /// (c) The iterate is a STABLE, BOUNDED fixed point: repeatedly applying the correction to a
