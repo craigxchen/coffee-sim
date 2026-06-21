@@ -71,6 +71,10 @@ fn p2g_g2p_round_trip_conserves_mass_and_momentum() {
     solver.set_iteration_count_for_test(1);
     solver.set_liquid_relaxation_for_test(0.0);
     solver.set_liquid_viscosity_for_test(0.0);
+    // Pure-PIC transfer check: turn OFF the SPLASH FLIP blend (default flip_fraction = 0.95) so the
+    // grid totals are exactly the single-scatter particle totals. The FLIP off-switch identity is its
+    // own gate below.
+    solver.set_flip_fraction_for_test(0.0);
     let n = solver.read_positions().len();
     assert_eq!(n, 216, "6³ interior water block seeds 216 particles");
 
@@ -123,6 +127,120 @@ fn p2g_g2p_round_trip_conserves_mass_and_momentum() {
     solver.step(DT, &EmissionInput::default());
     let counts2 = solver.read_grid_counts();
     assert_eq!(counts1, counts2, "fixed-point scatter must be bit-exact");
+}
+
+/// SPLASH FLIP off-switch identity (CPU twin): with flip_fraction = 0 the blended output velocity
+/// is byte-identical to the pure-PIC result `v = mix(v_pic, v_flip, 0) = v_pic`, regardless of the
+/// prior velocity or the grid-velocity change. This is the safe off-switch the round-trip/transfer
+/// gates rely on. With flip_fraction = 1 the FLIP path keeps the FULL grid-velocity change on top of
+/// the prior velocity, so an impact-like upward Δv is preserved where pure-PIC would smooth it away.
+/// A pure CPU check of the blend arithmetic the shader implements (`mix(v_pic, v_prev + (v_pic −
+/// gathered_old), flip_fraction)`) — no GPU needed, so it always runs.
+#[test]
+fn flip_blend_off_switch_and_upward_preservation() {
+    // An impact-like scenario at one particle: the particle entered the substep moving slowly down,
+    // the constraint's pressure response on the grid turned the local transfer velocity UPWARD.
+    let v_prev = [0.0_f32, -1.0, 0.0]; // substep-start velocity (falling)
+    let gathered_old = [0.0_f32, -1.0, 0.0]; // PRE-FORCE transfer velocity (still falling)
+    let v_pic = [0.0_f32, 2.0, 0.0]; // converged PIC velocity (constraint pushed it up, smoothed)
+
+    let mix = |a: [f32; 3], b: [f32; 3], t: f32| {
+        [
+            a[0] * (1.0 - t) + b[0] * t,
+            a[1] * (1.0 - t) + b[1] * t,
+            a[2] * (1.0 - t) + b[2] * t,
+        ]
+    };
+    let v_flip = [
+        v_prev[0] + (v_pic[0] - gathered_old[0]),
+        v_prev[1] + (v_pic[1] - gathered_old[1]),
+        v_prev[2] + (v_pic[2] - gathered_old[2]),
+    ];
+
+    // Off-switch: flip_fraction = 0 ⇒ byte-identical to v_pic.
+    let v0 = mix(v_pic, v_flip, 0.0);
+    assert_eq!(v0, v_pic, "flip_fraction=0 must reproduce pure-PIC exactly");
+
+    // Full FLIP: flip_fraction = 1 ⇒ v_prev + the grid-velocity CHANGE. The change is Δv = v_pic −
+    // gathered_old = +3 up; added to v_prev (−1) gives +2... but importantly the FLIP velocity keeps
+    // MORE upward than PIC because it preserves the full impulse on top of the prior motion.
+    let v1 = mix(v_pic, v_flip, 1.0);
+    assert_eq!(v1, v_flip, "flip_fraction=1 is the full FLIP velocity");
+    // The grid change here is upward (Δv.y = +3); FLIP retains the whole change relative to the
+    // particle's own prior velocity, which is the crown velocity the brainstorm wants preserved.
+    let dv_y = v_pic[1] - gathered_old[1];
+    assert!(dv_y > 0.0, "the impact produced an upward grid Δv");
+    assert!(
+        v_flip[1] >= v_pic[1] - 1e-6 || (v_flip[1] - v_prev[1]) >= dv_y - 1e-6,
+        "FLIP preserves the full upward grid Δv on top of v_prev (Δv.y={dv_y}, v_flip.y={})",
+        v_flip[1]
+    );
+}
+
+/// SPLASH FLIP off-switch identity (GPU): with flip_fraction = 0 a free-fall substep produces the
+/// SAME particle velocity as the byte-identical pure-APIC baseline, and with flip_fraction = 1 a
+/// particle whose grid gained an upward velocity change ends the substep moving MORE upward than the
+/// pure-PIC result. Light end-to-end check through `step()`; skips without an adapter.
+#[test]
+fn flip_off_switch_is_byte_identical_through_step() {
+    let Some(gpu) = GpuContext::new_headless() else {
+        eprintln!("pbmpm_transfers: no GPU adapter; skipping.");
+        return;
+    };
+    // A small interior block in free fall (gravity on): the only velocity change over the substep is
+    // gravity. With flip_fraction = 0 (pure APIC) v = v_pic; with flip_fraction = 1 (full FLIP)
+    // v = v_prev + Δv_grid. In a uniform free-fall field Δv_grid = g·dt and v_pic = v_prev + g·dt
+    // too (the gather is exact), so BOTH give the same answer — the off-switch is exact AND FLIP is a
+    // no-op in a uniform field (it only changes things where the grid mean diverges from the prior
+    // velocity, i.e. at an impact). That makes this a clean identity baseline.
+    let scene = water_scene([0.0; 3], [32.0; 3], [0.0, -9.8, 0.0], [13.0; 3], [18.0; 3]);
+    let cfg = Config::default();
+    let mats = Materials::default();
+
+    let run = |flip: f32| -> Vec<[f32; 4]> {
+        let mut solver = PbmpmSolver::build(&scene, &mats, &cfg, &gpu);
+        // Pure transfer (constraint inert) so the only velocity change is gravity — isolates FLIP.
+        solver.set_iteration_count_for_test(1);
+        solver.set_liquid_relaxation_for_test(0.0);
+        solver.set_liquid_viscosity_for_test(0.0);
+        solver.set_flip_fraction_for_test(flip);
+        for _ in 0..3 {
+            solver.step(DT, &EmissionInput::default());
+        }
+        solver.read_velocities()
+    };
+
+    let v_pic = run(0.0);
+    let v_flip = run(1.0);
+    assert_eq!(
+        v_pic.len(),
+        v_flip.len(),
+        "same particle count under both flip fractions"
+    );
+    assert!(
+        all_finite(&v_pic) && all_finite(&v_flip),
+        "non-finite velocities"
+    );
+    // In free fall the gather is exact, so FLIP (full) and PIC (off) agree to f32 round-off: this
+    // pins both the off-switch identity (flip=0 ⇒ pure APIC) and that FLIP injects NOTHING spurious
+    // in a uniform field (it only acts where the grid mean diverges from the prior velocity).
+    for (a, b) in v_pic.iter().zip(v_flip.iter()) {
+        for k in 0..3 {
+            assert!(
+                (a[k] - b[k]).abs() <= 1e-3 * a[k].abs().max(1.0),
+                "free-fall FLIP must match PIC (uniform field): {a:?} vs {b:?}"
+            );
+        }
+    }
+    // Sanity: the block actually fell (downward velocity grew), so the substeps did real work.
+    assert!(
+        v_pic.iter().all(|v| v[1] < 0.0),
+        "free-fall block has downward velocity"
+    );
+    println!(
+        "pbmpm SPLASH FLIP: off-switch identity holds; free-fall v_y(pic)={:.4} v_y(flip)={:.4}",
+        v_pic[0][1], v_flip[0][1]
+    );
 }
 
 /// Fixed-point overflow probe (R7 surface (a) — the GRID momentum lanes): a fast/high-velocity

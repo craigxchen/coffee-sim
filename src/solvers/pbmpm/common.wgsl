@@ -39,7 +39,8 @@ struct Params {
     liquid_relaxation: f32, // compliant volume-correction relaxation
     liquid_viscosity: f32,  // negative-symmetric viscosity weight (EA SEED)
     iter_pad: vec4<u32>,    // .x = iteration_count; .y = num_solids (SDF BC count, 0 = none);
-                            // .z = restitution f32 bits (U5, bitcast<f32>); .w = pad
+                            // .z = restitution f32 bits (U5, bitcast<f32>); .w = flip_fraction f32
+                            // bits (SPLASH knob, bitcast<f32>)
 };
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -94,6 +95,15 @@ struct Primitive {
 // `particle_integrate` (particle-resolution push-out + restitution). `params.iter_pad.y =
 // num_solids`; the union loops `[0, num_solids)` (uniform — Tint-safe, no early return).
 @group(0) @binding(9) var<storage, read> solids: array<Primitive>;
+// SPLASH (FLIP) snapshot buffers. `grid_vel_old` is the PRE-FORCE pure-transfer grid velocity
+// (decode of the substep-start P2G with NO gravity, NO BC, NO constraint), written by
+// grid_decode_old once per substep before the iteration loop; `vel_prev` is each particle's
+// substep-start velocity, copied host-side via copy_buffer_to_buffer. particle_integrate gathers
+// grid_vel_old over the 3×3×3 stencil and forms the FLIP velocity `v_prev + (v_pic − gathered_old)`,
+// then blends `v = mix(v_pic, v_flip, flip_fraction)`. The constraint loop never reads these — FLIP
+// is applied ONCE per substep so the incompressibility solve stays pure-PIC.
+@group(0) @binding(10) var<storage, read_write> grid_vel_old: array<vec4<f32>>;
+@group(0) @binding(11) var<storage, read> vel_prev: array<vec4<f32>>;
 
 // --- fixed-point encoding (KEEP.md §3 pattern; mirrors twofield's FP_SCALE) ------------------
 //
