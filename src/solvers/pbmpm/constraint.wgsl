@@ -84,8 +84,9 @@ fn particle_update(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 
 // Advect each live particle by its final gathered velocity (semi-implicit Euler), then apply the
-// particle-resolution box clamp (the grid BC bounds penetration only at node resolution). Runs
-// ONCE per substep after the iteration loop. Collider SDF push-out is U5.
+// particle-resolution boundary backstops: the box clamp AND the U5 collider SDF push-out +
+// restitution (the grid node BC bounds penetration only at node resolution h, so a particle between
+// a constrained node and a live one creeps through). Runs ONCE per substep after the iteration loop.
 @compute @workgroup_size(WG)
 fn particle_integrate(@builtin(global_invocation_id) gid: vec3<u32>) {
     let p = gid.x;
@@ -96,13 +97,34 @@ fn particle_integrate(@builtin(global_invocation_id) gid: vec3<u32>) {
     var v = vel[p].xyz;
     x = x + v * params.dt;
 
-    // Only the into-wall component is removed (separating, free slip).
+    // Box clamp (outer backstop): only the into-wall component is removed (separating, free slip).
     if (x.x < params.box_min.x) { x.x = params.box_min.x; if (v.x < 0.0) { v.x = 0.0; } }
     if (x.y < params.box_min.y) { x.y = params.box_min.y; if (v.y < 0.0) { v.y = 0.0; } }
     if (x.z < params.box_min.z) { x.z = params.box_min.z; if (v.z < 0.0) { v.z = 0.0; } }
     if (x.x > params.box_max.x) { x.x = params.box_max.x; if (v.x > 0.0) { v.x = 0.0; } }
     if (x.y > params.box_max.y) { x.y = params.box_max.y; if (v.y > 0.0) { v.y = 0.0; } }
     if (x.z > params.box_max.z) { x.z = params.box_max.z; if (v.z > 0.0) { v.z = 0.0; } }
+
+    // Collider SDF push-out + restitution (U5; mirrors twofield's particle BC). The cavity sign
+    // convention is interior-POSITIVE: `hit.dist < 0` means the particle is INSIDE the wall material
+    // (it penetrated the cup wall/floor). Push it back ALONG the gradient (which points into the
+    // cavity) to the surface — `x += (−dist)·grad`, where −dist > 0 — so water ends up in the cup
+    // CAVITY, never expelled from it. Then reflect the into-solid normal velocity by the restitution:
+    // `v_n_out = −restitution·v_n_in` (restitution 0 → free-slip stop, the constraint-only arm; >0 →
+    // a rebound). The tangential velocity is untouched (free slip).
+    if (params.iter_pad.y > 0u) {
+        let hit = solid_union(x, PHASE_WATER);
+        if (hit.dist < 0.0) {
+            x = x + (-hit.dist) * hit.grad; // project back to the cavity surface
+            let vn = dot(v, hit.grad);      // < 0 when moving INTO the solid (against the inward grad)
+            if (vn < 0.0) {
+                let restitution = bitcast<f32>(params.iter_pad.z);
+                // Remove the into-solid normal (−vn·grad), then add the reflected rebound
+                // (−restitution·vn·grad): net `v − (1 + restitution)·vn·grad`.
+                v = v - (1.0 + restitution) * vn * hit.grad;
+            }
+        }
+    }
 
     pos[p] = vec4<f32>(x, pos[p].w);
     vel[p] = vec4<f32>(v, vel[p].w);

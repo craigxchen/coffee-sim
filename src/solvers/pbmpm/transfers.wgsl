@@ -105,8 +105,8 @@ fn grid_update(@builtin(global_invocation_id) gid: vec3<u32>) {
         v = v + params.gravity.xyz * (params.dt / iters);
     }
 
-    // Simple domain BC (U3 placeholder; collider SDF + restitution is U5): a node within one cell
-    // of a domain face zeroes the into-wall normal component so the pool cannot leak out the box.
+    // Domain BC: a node within one cell of a domain face zeroes the into-wall normal component so
+    // the pool cannot leak out the box (the outer backstop the collider BC sits in front of).
     let h = params.grid_origin.w;
     let nx = n % params.grid_dims.x;
     let ny = (n / params.grid_dims.x) % params.grid_dims.y;
@@ -118,6 +118,24 @@ fn grid_update(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (wp.x >= params.box_max.x && v.x > 0.0) { v.x = 0.0; }
     if (wp.y >= params.box_max.y && v.y > 0.0) { v.y = 0.0; }
     if (wp.z >= params.box_max.z && v.z > 0.0) { v.z = 0.0; }
+
+    // Collider node BC (U5; mirrors twofield's coupling wall BC). A mass-carrying node within one
+    // cell (`dist < h`) of a solid surface — inside the wall material (dist < 0) OR on the adjacent
+    // fluid layer (0 ≤ dist < h, which is where the supporting column actually sits, since an SDF
+    // surface like the cup floor rarely coincides with a node) — has its INTO-solid normal velocity
+    // removed: `v -= min(0, dot(v, n))·n`. This is the node-resolution momentum BC that makes the
+    // water collide with the cup walls/floor; the gradient points INTO the cavity so removing the
+    // into-solid (negative dot) component keeps water in the cavity (it never expels it). Restitution
+    // is applied at particle resolution in `particle_integrate` (the node BC is the free-slip stop).
+    if (params.iter_pad.y > 0u && mass > 0.0) {
+        let hit = solid_union(wp, PHASE_WATER);
+        if (hit.dist < h) {
+            let vn = dot(v, hit.grad);
+            if (vn < 0.0) {
+                v = v - vn * hit.grad;
+            }
+        }
+    }
 
     grid_vel[n] = vec4<f32>(v, mass);
 }
