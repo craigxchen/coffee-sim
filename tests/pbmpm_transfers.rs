@@ -341,13 +341,15 @@ fn cup_with_one_particle(floor_y: f32, interior_y: f32) -> (Scene, [f32; 3]) {
 /// Collider BC smoke test (U5; light, per KTD3): a particle driven INTO the cup floor in one step
 /// is pushed back to the floor surface, its into-floor (normal) velocity is reflected by the
 /// restitution coefficient, and its tangential velocity is preserved. The SDF sign convention is
-/// interior-POSITIVE, so the push-out keeps the particle in the cup CAVITY (above the floor), never
-/// expelling it. Catches SDF/sign and reflection-math bugs before the U7 bounce measurement.
+/// thin-wall FREE-POSITIVE: the wall material is the shell `[floor_y − WALL_T, floor_y]`, so a
+/// particle landing INSIDE the shell is pushed back up to the floor (the cup-interior free side).
+/// Catches SDF/sign and reflection-math bugs before the U7 bounce measurement.
 ///
 /// To isolate `particle_integrate`'s particle-resolution push-out from the grid node BC, the
 /// particle starts well ABOVE the floor (> one cell h = 2·spacing) so no node is within the band
-/// during grid_update; its large downward velocity then carries `x + v·dt` BELOW the floor in the
-/// single advect, where the push-out + restitution fire. The compliant constraint is OFF
+/// during grid_update; its large downward velocity then carries `x + v·dt` just BELOW the floor —
+/// INSIDE the wall shell (not past it: a thin wall can be tunneled, which is why the landing depth
+/// is < WALL_T) — where the push-out + restitution fire. The compliant constraint is OFF
 /// (relaxation/viscosity 0, one iteration) so the gathered velocity round-trips unchanged.
 #[test]
 fn collider_bc_pushes_out_and_reflects_by_restitution() {
@@ -367,11 +369,14 @@ fn collider_bc_pushes_out_and_reflects_by_restitution() {
     };
     let mats = Materials::default();
 
-    // Drive the particle straight down fast enough to cross the floor in one dt, plus a tangential
-    // (x) component that must survive (free slip). vy is chosen so `start_y + vy·dt` lands 4 below
-    // the floor in the single advect; the particle starts > one cell (h = 2) above the floor so the
-    // grid node BC never engages on its stencil — only particle_integrate's push-out fires.
-    let vy = -((start_y - floor_y) + 4.0) / DT; // lands 4 below the floor in one advect
+    // Drive the particle straight down so `start_y + vy·dt` lands 0.3 below the floor in the single
+    // advect — INSIDE the wall shell `[floor_y − WALL_T, floor_y]` (WALL_T = 1.0) and nearer the
+    // INNER (cup-interior) free face than the outer one, so the push-out fires UPWARD back into the
+    // cup (landing deeper than WALL_T would tunnel clean through the thin wall; landing past the shell
+    // midline would push out the OUTER side). Plus a tangential (x) component that must survive (free
+    // slip). The particle starts > one cell (h = 2) above the floor so the grid node BC never engages
+    // on its stencil — only particle_integrate's push-out fires.
+    let vy = -((start_y - floor_y) + 0.3) / DT; // lands 0.3 below the floor (in-shell) in one advect
     let vx = 3.0_f32;
     let restitution = 0.5_f32; // an exaggerated value so the reflection is unambiguous in the test
 

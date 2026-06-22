@@ -120,13 +120,13 @@ fn grid_update(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (wp.z >= params.box_max.z && v.z > 0.0) { v.z = 0.0; }
 
     // Collider node BC (U5; mirrors twofield's coupling wall BC). A mass-carrying node within one
-    // cell (`dist < h`) of a solid surface — inside the wall material (dist < 0) OR on the adjacent
-    // fluid layer (0 ≤ dist < h, which is where the supporting column actually sits, since an SDF
-    // surface like the cup floor rarely coincides with a node) — has its INTO-solid normal velocity
+    // cell (`dist < h`) of a wall surface — inside the wall material (dist < 0) OR on the adjacent
+    // free layer (0 ≤ dist < h, which is where the supporting column actually sits, since an SDF
+    // surface like the cup floor rarely coincides with a node) — has its INTO-wall normal velocity
     // removed: `v -= min(0, dot(v, n))·n`. This is the node-resolution momentum BC that makes the
-    // water collide with the cup walls/floor; the gradient points INTO the cavity so removing the
-    // into-solid (negative dot) component keeps water in the cavity (it never expels it). Restitution
-    // is applied at particle resolution in `particle_integrate` (the node BC is the free-slip stop).
+    // water collide with the vessel walls/floor; the gradient points OUT of the wall, so removing the
+    // into-wall (negative dot) component keeps water off the wall on the free side. Restitution is
+    // applied at particle resolution in `particle_integrate` (the node BC is the free-slip stop).
     if (params.iter_pad.y > 0u && mass > 0.0) {
         let hit = solid_union(wp, PHASE_WATER);
         if (hit.dist < h) {
