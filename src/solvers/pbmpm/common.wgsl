@@ -77,9 +77,11 @@ struct Params {
 // atomic mass/momentum; this float scratch is the decoded transient the g2p gather reads). Mirrors
 // twofield's `grid_vel`.
 @group(0) @binding(8) var<storage, read_write> grid_vel: array<vec4<f32>>;
-// SDF cavity geometry (U5; byte-identical to the Rust `Primitive`, 64 bytes — mirrors twofield's
-// `Primitive` + utils/sdf.rs). Cone radii in `a` are OUTER wall radii. Each solid is a CAVITY:
-// interior positive, gradient toward the cavity interior.
+// SDF thin-wall geometry (byte-identical to the Rust `Primitive`, 64 bytes — mirrors utils/sdf.rs
+// packing). Cone radii in `a` are OUTER wall radii. Each solid is a THIN WALL (the vessel material
+// only): `dist > 0` everywhere FREE (BOTH the vessel's open interior AND everything OUTSIDE the
+// vessel), `dist < 0` only INSIDE the thin wall material, gradient = ∇dist points OUT of the wall
+// toward the nearest free space.
 struct Primitive {
     kind: u32,          // 0 = cone, 1 = cylinder, 2 = poly-cup
     species_mask: u32,
@@ -89,10 +91,13 @@ struct Primitive {
     b: vec4<f32>,       // cone:(thickness, hole_radius, center_x, center_z)  cyl/poly:(center_x, center_z, _, _)
     c: vec4<f32>,       // reserved
 };
-// Static SDF solids (U5 collider BC; read-only). Each `Primitive` is a CAVITY — `dist > 0` inside
-// the free space, `< 0` through the wall material, gradient toward the cavity interior — so the BC
-// CONTAINS water inside the cup. Bound only by `grid_update` (node-resolution momentum BC) and
-// `particle_integrate` (particle-resolution push-out + restitution). `params.iter_pad.y =
+// Static SDF solids (collider BC; read-only). Each `Primitive` is a THIN WALL — `dist > 0` in free
+// space (the open vessel interior AND outside the vessel), `< 0` inside the wall material, gradient
+// pointing OUT of the wall toward the nearest free side. Water spilling over a rim therefore falls
+// FREELY beside the vessel (the OLD cavity model treated everything-outside as solid and shoved it
+// back in — water could never overflow). The box BC (particle_integrate / grid_update) is the real
+// container that catches escaped water. Bound only by `grid_update` (node-resolution momentum BC)
+// and `particle_integrate` (particle-resolution push-out + restitution). `params.iter_pad.y =
 // num_solids`; the union loops `[0, num_solids)` (uniform — Tint-safe, no early return).
 @group(0) @binding(9) var<storage, read> solids: array<Primitive>;
 // SPLASH (FLIP) snapshot buffers. `grid_vel_old` is the PRE-FORCE pure-transfer grid velocity
@@ -164,11 +169,25 @@ fn grid_clear(@builtin(global_invocation_id) gid: vec3<u32>) {
     atomicStore(&grid_fp[base + 3u], 0);
 }
 
-// --- SDF cavity query (U5; mirrors twofield/common.wgsl + utils/sdf.rs) ------------------------
-// Signed distance (interior POSITIVE) + unit gradient (toward the cavity interior) of the nearest
-// blocking solid. The union over all primitives is the intersection of cavities (a particle must be
-// inside ALL applicable cavities), so the binding constraint is the MIN signed distance. The loop
-// runs `[0, num_solids)` (uniform bound, num_solids = 0 → returns FREE) — Tint-safe.
+// --- SDF thin-wall query (mirrors utils/sdf.rs) ------------------------------------------------
+// Signed distance (FREE space POSITIVE — both vessel interior and outside the vessel) + unit
+// gradient (∇dist, pointing OUT of the wall toward the nearest free space) of the nearest blocking
+// solid. Each vessel is built as a CSG SUBTRACTION: wall material = (outer solid) MINUS (inner
+// cavity), so `wall_dist = max(SDF_O, -SDF_C)` is negative ONLY in the thin shell between them. The
+// union over all primitives takes the MIN signed distance (the most-penetrated wall). The loop runs
+// `[0, num_solids)` (uniform bound, num_solids = 0 → returns FREE) — Tint-safe.
+//
+// WALL_T — collision wall thickness (anti-tunneling). A thin shell can be crossed in one substep by
+// a fast particle (the node BC bounds penetration only at node resolution h; the particle push-out
+// fires only when the particle lands INSIDE the shell). The max per-substep displacement is
+// max_speed·dt; at the default cap max_speed = 50 and dt = 1/60 that is ≈ 0.83 world units, and the
+// web cap (12) gives ≈ 0.2. WALL_T = 1.0 sits above the default-cap bound with margin, so a particle
+// at the cap cannot step clean through the shell. The wall is INVISIBLE (only a wireframe is
+// rendered) so a collision shell thicker than the geometry's visual thickness is fine — water fills
+// to the INNER radius and looks correct. The effective shell thickness is max(geometry_thickness,
+// WALL_T): the cup has no geometry thickness (→ WALL_T) and the support cone's 0.05 visual thickness
+// is far below the tunneling bound (→ WALL_T).
+const WALL_T: f32 = 1.0;
 const SDF_EPS: f32 = 1.0e-6;
 const SDF_FREE: f32 = 1.0e30;
 
@@ -194,12 +213,21 @@ fn sdf_closest_on_segment(p: vec2<f32>, a: vec2<f32>, b: vec2<f32>) -> SegCP {
     return SegCP(a + ab * tc, t > SDF_EPS && t < 1.0 - SDF_EPS);
 }
 
-fn cone_cavity(prim: Primitive, p: vec3<f32>) -> SolidHit {
+// CONE thin wall = (outer cone) MINUS (inner cone). The outer profile is the OUTER radius
+// (lerp(apex_r, top_r)); the inner profile is the cavity surface (outer − T, clamped to
+// hole_radius). The wall material is the shell between them over y ∈ [apex_y, top_y]. The drain
+// (r < hole_radius) and (apex_open ⇒ below apex_y) stay FREE — the funnel passes water through.
+// `free_in` = signed distance to the INNER wall, positive on the cavity (small-r) side; `free_out` =
+// signed distance to the OUTER wall, positive OUTSIDE the vessel (large-r) side. Free space is
+// `free_in > 0 OR free_out > 0`, so `wall_dist = max(free_in, free_out)` is negative only in the
+// shell and equals the nearest free face's (negative) distance; the gradient is that face's, pointing
+// toward its free side (∇dist out of the wall).
+fn cone_wall(prim: Primitive, p: vec3<f32>) -> SolidHit {
     let apex_y = prim.a.x;
     let apex_r = prim.a.y;
     let top_y = prim.a.z;
     let top_r = prim.a.w;
-    let thickness = prim.b.x;
+    let thickness = max(prim.b.x, WALL_T); // collision shell ≥ tunneling bound (visual is wireframe)
     let hole_radius = prim.b.y;
     let center = vec2<f32>(prim.b.z, prim.b.w);
     let apex_open = (prim.flags & 1u) != 0u;
@@ -210,37 +238,69 @@ fn cone_cavity(prim: Primitive, p: vec3<f32>) -> SolidHit {
     var rhat = vec2<f32>(0.0, 0.0);
     if (r >= SDF_EPS) { rhat = rel / r; } // axis guard before building the 3D gradient
 
+    // Free passages: above the open top, below the open apex outlet, and inside the drain hole.
     if (y > top_y) { return SolidHit(SDF_FREE, vec3<f32>(0.0, 1.0, 0.0), prim.friction); }
     if (apex_open && y < apex_y) { return SolidHit(SDF_FREE, vec3<f32>(0.0, -1.0, 0.0), prim.friction); }
 
-    let inner_apex = max(apex_r - thickness, hole_radius);
-    let inner_top = max(top_r - thickness, hole_radius);
-    let a2 = vec2<f32>(inner_apex, apex_y);
-    let b2 = vec2<f32>(inner_top, top_y);
-    let cp = sdf_closest_on_segment(vec2<f32>(r, y), a2, b2);
-    let d2d = length(vec2<f32>(r, y) - cp.p);
-
+    let p2d = vec2<f32>(r, y);
     let height = top_y - apex_y;
     var t = 0.0;
     if (height > SDF_EPS) { t = (y - apex_y) / height; }
-    let inner = max(mix(apex_r, top_r, t) - thickness, hole_radius);
-    let inside = (y >= apex_y) && (r <= inner);
-    var dist = -d2d;
-    if (inside) { dist = d2d; }
+    let outer_r = mix(apex_r, top_r, t);
+    let inner_r = max(outer_r - thickness, hole_radius);
 
-    let dir = vec2<f32>(r, y) - cp.p;
-    var n2d = vec2<f32>(0.0, 0.0);
-    if (length(dir) > SDF_EPS) {
-        if (inside) { n2d = sdf_normalize2(dir); } else { n2d = sdf_normalize2(-dir); }
-    } else if (cp.interior) {
-        let ab = b2 - a2;
-        n2d = sdf_normalize2(vec2<f32>(-ab.y, ab.x)); // smooth-wall analytic normal (never zero here)
+    // free_in: distance to the inner wall, positive inside the cavity (r ≤ inner_r). Gradient points
+    // toward the cavity interior (smaller r). Mirrors the old cavity surface query exactly.
+    let ai = vec2<f32>(max(apex_r - thickness, hole_radius), apex_y);
+    let bi = vec2<f32>(max(top_r - thickness, hole_radius), top_y);
+    let cpi = sdf_closest_on_segment(p2d, ai, bi);
+    let di = length(p2d - cpi.p);
+    let inside_cav = (y >= apex_y) && (r <= inner_r);
+    var free_in = -di;
+    if (inside_cav) { free_in = di; }
+    let dir_in = p2d - cpi.p;
+    var n_in = vec2<f32>(0.0, 0.0);
+    if (length(dir_in) > SDF_EPS) {
+        if (inside_cav) { n_in = sdf_normalize2(dir_in); } else { n_in = sdf_normalize2(-dir_in); }
+    } else if (cpi.interior) {
+        let ab = bi - ai;
+        n_in = sdf_normalize2(vec2<f32>(-ab.y, ab.x)); // smooth-wall analytic normal (toward cavity)
     }
+
+    // free_out: distance to the outer wall, positive OUTSIDE the vessel (r ≥ outer_r). Gradient
+    // points outward (larger r) — the mirror of free_in with the free side flipped.
+    let ao = vec2<f32>(apex_r, apex_y);
+    let bo = vec2<f32>(top_r, top_y);
+    let cpo = sdf_closest_on_segment(p2d, ao, bo);
+    let do2 = length(p2d - cpo.p);
+    let inside_outer = (y >= apex_y) && (r <= outer_r);
+    var free_out = do2;
+    if (inside_outer) { free_out = -do2; }
+    let dir_out = p2d - cpo.p;
+    var n_out = vec2<f32>(0.0, 0.0);
+    if (length(dir_out) > SDF_EPS) {
+        if (inside_outer) { n_out = sdf_normalize2(-dir_out); } else { n_out = sdf_normalize2(dir_out); }
+    } else if (cpo.interior) {
+        let ab = bo - ao;
+        n_out = sdf_normalize2(vec2<f32>(ab.y, -ab.x)); // smooth-wall analytic normal (outward)
+    }
+
+    // CSG: wall = NOT-in-cavity AND NOT-outside-vessel ⇒ wall_dist = max(free_in, free_out), the
+    // nearest free face. The active term's normal is the push-out direction.
+    var dist = free_in;
+    var n2d = n_in;
+    if (free_out > free_in) { dist = free_out; n2d = n_out; }
     let grad = sdf_normalize3(vec3<f32>(n2d.x * rhat.x, n2d.y, n2d.x * rhat.y));
     return SolidHit(dist, grad, prim.friction);
 }
 
-fn cyl_cavity(prim: Primitive, p: vec3<f32>) -> SolidHit {
+// CYLINDER cup thin wall = (outer box) MINUS (inner open-top can), in the (r, y) plane. Outer box:
+// r ≤ radius+T, y ∈ [floor_y−T, rim_y] (finite — capped at the rim so water spills OVER the top).
+// Inner can: r ≤ radius, y ≥ floor_y (OPEN top, no upper cap). The wall is the side tube
+// [radius, radius+T] + the floor disk [floor_y−T, floor_y]. Inside the cup, above the rim, and
+// OUTSIDE the cup (r > radius+T) are all FREE. SDFs use the intersection-of-half-spaces form (exact
+// sign + face gradients; corner distances are conservative, fine for push-out).
+fn cyl_wall(prim: Primitive, p: vec3<f32>) -> SolidHit {
     let floor_y = prim.a.x;
     let rim_y = prim.a.y;
     let radius = prim.a.z;
@@ -248,20 +308,38 @@ fn cyl_cavity(prim: Primitive, p: vec3<f32>) -> SolidHit {
     let rel = vec2<f32>(p.x - center.x, p.z - center.y);
     let r = length(rel);
     let y = p.y;
-    if (y > rim_y) { return SolidHit(SDF_FREE, vec3<f32>(0.0, 1.0, 0.0), prim.friction); }
-    let d_side = radius - r;
-    let d_floor = y - floor_y;
-    if (d_side <= d_floor) {
-        var rhat = vec2<f32>(0.0, 0.0);
-        if (r >= SDF_EPS) { rhat = rel / r; }
-        return SolidHit(d_side, sdf_normalize3(vec3<f32>(-rhat.x, 0.0, -rhat.y)), prim.friction);
-    }
-    return SolidHit(d_floor, vec3<f32>(0.0, 1.0, 0.0), prim.friction);
+    var rhat = vec2<f32>(0.0, 0.0);
+    if (r >= SDF_EPS) { rhat = rel / r; }
+
+    // sdf_O (neg inside the finite outer box): max of the three bounding half-spaces.
+    let o_side = r - (radius + WALL_T);     // grad (+rhat): radial out
+    let o_floor = (floor_y - WALL_T) - y;   // grad (−y): down
+    let o_rim = y - rim_y;                   // grad (+y): up
+    var sdf_o = o_side;
+    var n_o = vec3<f32>(rhat.x, 0.0, rhat.y);
+    if (o_floor > sdf_o) { sdf_o = o_floor; n_o = vec3<f32>(0.0, -1.0, 0.0); }
+    if (o_rim > sdf_o) { sdf_o = o_rim; n_o = vec3<f32>(0.0, 1.0, 0.0); }
+
+    // sdf_C (neg inside the open-top can): max(r − radius, floor_y − y). −sdf_C is positive in the
+    // cavity; its gradient points into the cavity (toward smaller r / upward off the floor).
+    let c_side = r - radius;     // active ⇒ ∇(−sdf_C) = (−rhat): radial in
+    let c_floor = floor_y - y;   // active ⇒ ∇(−sdf_C) = (+y): up
+    var sdf_c = c_side;
+    var n_c = vec3<f32>(-rhat.x, 0.0, -rhat.y);
+    if (c_floor > sdf_c) { sdf_c = c_floor; n_c = vec3<f32>(0.0, 1.0, 0.0); }
+
+    // wall = O ∩ (¬C) ⇒ dist = max(sdf_O, −sdf_C); the active term's normal is ∇dist.
+    var dist = sdf_o;
+    var grad = n_o;
+    if (-sdf_c > sdf_o) { dist = -sdf_c; grad = n_c; }
+    return SolidHit(dist, sdf_normalize3(grad), prim.friction);
 }
 
-// DIAGNOSTIC: regular N-gon prism cup (mirror of sdf.rs::poly_cavity). Face normals at 2πk/N
-// (k=0 → +x), so sides=4 is an axis-aligned square. Inner side dist = apothem − max_k(rel·n_k).
-fn poly_cavity(prim: Primitive, p: vec3<f32>) -> SolidHit {
+// DIAGNOSTIC: regular N-gon prism cup thin wall (mirror of cyl_wall with the polygon apothem in
+// place of the radius). Face normals at 2πk/N (k=0 → +x); sides=4 is an axis-aligned square. The
+// radial coordinate is replaced by the apothem projection `proj = max_k(rel·n_k)` and its face
+// normal `bestn`.
+fn poly_wall(prim: Primitive, p: vec3<f32>) -> SolidHit {
     let floor_y = prim.a.x;
     let rim_y = prim.a.y;
     let apothem = prim.a.z;
@@ -269,7 +347,6 @@ fn poly_cavity(prim: Primitive, p: vec3<f32>) -> SolidHit {
     let center = vec2<f32>(prim.b.x, prim.b.y);
     let rel = vec2<f32>(p.x - center.x, p.z - center.y);
     let y = p.y;
-    if (y > rim_y) { return SolidHit(SDF_FREE, vec3<f32>(0.0, 1.0, 0.0), prim.friction); }
     var maxproj = -1.0e30;
     var bestn = vec2<f32>(1.0, 0.0);
     let tau = 6.28318530718;
@@ -279,21 +356,34 @@ fn poly_cavity(prim: Primitive, p: vec3<f32>) -> SolidHit {
         let proj = dot(rel, nk);
         if (proj > maxproj) { maxproj = proj; bestn = nk; }
     }
-    let d_side = apothem - maxproj;
-    let d_floor = y - floor_y;
-    if (d_side <= d_floor) {
-        return SolidHit(d_side, sdf_normalize3(vec3<f32>(-bestn.x, 0.0, -bestn.y)), prim.friction);
-    }
-    return SolidHit(d_floor, vec3<f32>(0.0, 1.0, 0.0), prim.friction);
+
+    let o_side = maxproj - (apothem + WALL_T);   // grad (+bestn): outward face normal
+    let o_floor = (floor_y - WALL_T) - y;
+    let o_rim = y - rim_y;
+    var sdf_o = o_side;
+    var n_o = vec3<f32>(bestn.x, 0.0, bestn.y);
+    if (o_floor > sdf_o) { sdf_o = o_floor; n_o = vec3<f32>(0.0, -1.0, 0.0); }
+    if (o_rim > sdf_o) { sdf_o = o_rim; n_o = vec3<f32>(0.0, 1.0, 0.0); }
+
+    let c_side = maxproj - apothem;
+    let c_floor = floor_y - y;
+    var sdf_c = c_side;
+    var n_c = vec3<f32>(-bestn.x, 0.0, -bestn.y);
+    if (c_floor > sdf_c) { sdf_c = c_floor; n_c = vec3<f32>(0.0, 1.0, 0.0); }
+
+    var dist = sdf_o;
+    var grad = n_o;
+    if (-sdf_c > sdf_o) { dist = -sdf_c; grad = n_c; }
+    return SolidHit(dist, sdf_normalize3(grad), prim.friction);
 }
 
 fn solid_cavity(prim: Primitive, p: vec3<f32>) -> SolidHit {
-    if (prim.kind == 0u) { return cone_cavity(prim, p); }
-    if (prim.kind == 2u) { return poly_cavity(prim, p); }
-    return cyl_cavity(prim, p);
+    if (prim.kind == 0u) { return cone_wall(prim, p); }
+    if (prim.kind == 2u) { return poly_wall(prim, p); }
+    return cyl_wall(prim, p);
 }
 
-// Species-filtered union: the most-penetrated (min signed-distance) solid that blocks `ph`. The
+// Species-filtered union: the most-penetrated (min signed-distance) wall that blocks `ph`. The
 // single-phase prototype only collides WATER (ph = 0), but the mask filter is kept so a future
 // grain phase reuses this verbatim. num_solids = 0 → FREE (no constraint), so an empty scene falls
 // through to the box clamp untouched.

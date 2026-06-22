@@ -157,11 +157,12 @@ fn particle_integrate(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (x.y > params.box_max.y) { x.y = params.box_max.y; if (v.y > 0.0) { v.y = 0.0; } }
     if (x.z > params.box_max.z) { x.z = params.box_max.z; if (v.z > 0.0) { v.z = 0.0; } }
 
-    // Collider SDF push-out + restitution (U5; mirrors twofield's particle BC). The cavity sign
-    // convention is interior-POSITIVE: `hit.dist < 0` means the particle is INSIDE the wall material
-    // (it penetrated the cup wall/floor). Push it back ALONG the gradient (which points into the
-    // cavity) to the surface — `x += (−dist)·grad`, where −dist > 0 — so water ends up in the cup
-    // CAVITY, never expelled from it. Then reflect the into-solid normal velocity by the restitution:
+    // Collider SDF push-out + restitution (U5; mirrors twofield's particle BC). The thin-wall sign
+    // convention is FREE-POSITIVE: `hit.dist < 0` means the particle is INSIDE the wall material (it
+    // penetrated the vessel wall/floor). Push it back ALONG the gradient (which points OUT of the
+    // wall toward the nearest free side) to the surface — `x += (−dist)·grad`, where −dist > 0 — so
+    // the particle lands on whichever free side is closest (the cup interior, or beside the vessel if
+    // it spilled out). Then reflect the into-solid normal velocity by the restitution:
     // `v_n_out = −restitution·v_n_in` (restitution 0 → free-slip stop, the constraint-only arm; >0 →
     // a rebound). The tangential velocity is untouched (free slip).
     if (params.iter_pad.y > 0u) {
