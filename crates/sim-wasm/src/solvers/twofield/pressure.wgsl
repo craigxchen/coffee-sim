@@ -152,6 +152,10 @@ const JACOBI_OMEGA: f32 = 0.6666667;
 // ≈ residual·N·dt ≈ 1% — inside the ±5% band — while keeping the relief of a seeded
 // over-density gentle, v ~ Δx/τ, instead of detonating it into slosh).
 const DENSITY_RELAX_FRAMES: f32 = 30.0;
+// Uncapped density-target dead-band (dbg.w on): density error |e| below this is treated as zero
+// (no chatter on near-rest cells). Default 0 (no dead-band) until calibration finds a value; like
+// DENSITY_RELAX_FRAMES it is a structural const, not a Params slot.
+const DENSITY_TARGET_DEADBAND: f32 = 0.0;
 // SETTLED-POOL STIRRING — diagnosis (no in-solver fix yet; see twofield_settled.rs).
 // A settled pool slowly churns. Isolation (water tank, settled-tail KE): baseline ~67; relief OFF
 // ~7.6; 32 fine sweeps (vs 8) ~17; pure PIC (kill the affine C) ~1.3. So the mechanism is a limit
@@ -179,6 +183,15 @@ const WALL_BAND: f32 = 1.0;
 // keeps it conductive — connecting the cup/cone air to the open top. Purely a pocket-detection
 // aid (no operator/BC effect), so it carries no operator-consistency constraint.
 const FLOOD_WALL_BAND: f32 = 2.0;
+
+// SDF wall BC mode (params.dbg.y, plan 2026-06-17-002):
+//   ≤ 0.5  → WALL_BC_SINGLE (default): the single most-penetrated normal (solid_union) banded over
+//            WALL_BAND·h — the original behavior, kept byte-identical here.
+//   > 0.5  → WALL_BC_MULTI: the orthonormal-basis projector P = I − Q·Qᵀ over ALL in-band faces
+//            (build_constraint_basis in common.wgsl), constraining BOTH surfaces at a concave seam
+//            (the cup floor∩wall corner). node_setup builds M̃⁻¹ = invr·P; drag_fold applies
+//            v ← P·v from the SAME basis (lockstep — A = D·M̃⁻¹·G holds).
+fn wall_bc_multi() -> bool { return params.dbg.y > 0.5; }
 
 // --- fine-grid cell helpers --------------------------------------------------------------------
 fn fine_cells() -> vec3<u32> {
@@ -326,19 +339,42 @@ fn node_setup(@builtin(global_invocation_id) gid: vec3<u32>) {
         // SAME band is mirrored in drag_fold's velocity BC so the pre-projection field D sees and
         // M̃⁻¹ constrains the SAME axes (operator consistency A = D·M̃⁻¹·G).
         if (params.num_solids > 0u) {
-            let hit = solid_union(xp, PHASE_WATER);
-            if (hit.dist < WALL_BAND * h) {
-                var nrm = hit.grad;
-                if (d.x == 0.0) { nrm.x = 0.0; }
-                if (d.y == 0.0) { nrm.y = 0.0; }
-                if (d.z == 0.0) { nrm.z = 0.0; }
-                let len = length(nrm);
-                if (len > SDF_NORMAL_MIN) {
-                    nrm = nrm / len;
-                    let invc = max(max(d.x, d.y), d.z);
-                    a -= invc * vec4<f32>(nrm.x * nrm.x, nrm.x * nrm.y, nrm.x * nrm.z, nrm.y * nrm.y);
-                    b -= invc * vec4<f32>(nrm.y * nrm.z, nrm.z * nrm.z, 0.0, 0.0);
+            if (!wall_bc_multi()) {
+                // SINGLE-NORMAL (default): the most-penetrated normal, box-orthogonalized, banded.
+                let hit = solid_union(xp, PHASE_WATER);
+                if (hit.dist < WALL_BAND * h) {
+                    var nrm = hit.grad;
+                    if (d.x == 0.0) { nrm.x = 0.0; }
+                    if (d.y == 0.0) { nrm.y = 0.0; }
+                    if (d.z == 0.0) { nrm.z = 0.0; }
+                    let len = length(nrm);
+                    if (len > SDF_NORMAL_MIN) {
+                        nrm = nrm / len;
+                        let invc = max(max(d.x, d.y), d.z);
+                        a -= invc * vec4<f32>(nrm.x * nrm.x, nrm.x * nrm.y, nrm.x * nrm.z, nrm.y * nrm.y);
+                        b -= invc * vec4<f32>(nrm.y * nrm.z, nrm.z * nrm.z, 0.0, 0.0);
+                    }
                 }
+            } else {
+                // MULTI-NORMAL: rebuild M̃⁻¹ = invr·(I − Q·Qᵀ) over the active box axes + ALL in-band
+                // wall faces (orthonormal basis). Reduces to the single/box paths in their limits;
+                // PSD for any normals (even a non-orthogonal poly edge). drag_fold mirrors the SAME
+                // basis (lockstep). box_mask matches the box-face axes zeroed in `d` above.
+                var box_mask = 0u;
+                if (d.x == 0.0) { box_mask = box_mask | 1u; }
+                if (d.y == 0.0) { box_mask = box_mask | 2u; }
+                if (d.z == 0.0) { box_mask = box_mask | 4u; }
+                let faces = wall_binding_faces(xp, PHASE_WATER, WALL_BAND * h);
+                let cb = build_constraint_basis(box_mask, faces);
+                var pxx = 1.0; var pyy = 1.0; var pzz = 1.0;
+                var pxy = 0.0; var pxz = 0.0; var pyz = 0.0;
+                for (var i = 0u; i < cb.count; i = i + 1u) {
+                    let q = cb.q[i];
+                    pxx = pxx - q.x * q.x; pyy = pyy - q.y * q.y; pzz = pzz - q.z * q.z;
+                    pxy = pxy - q.x * q.y; pxz = pxz - q.x * q.z; pyz = pyz - q.y * q.z;
+                }
+                a = invr * vec4<f32>(pxx, pxy, pxz, pyy);
+                b = vec4<f32>(invr * pyz, invr * pzz, 1.0, 0.0);
             }
         }
         // ς fold (header: MIXTURE FAMILY): the projection's effective step at a drag node is
@@ -458,8 +494,25 @@ fn cell_classify(@builtin(global_invocation_id) gid: vec3<u32>) {
     // reach the churn and a band large enough would tolerate that much permanent compression. The
     // churn is pressure under-convergence, not a noise ripple a clamp can cut; see the
     // DENSITY_RELAX_FRAMES header.)
-    let s_target =
-        params.dbg.x * max(rho / params.extra.x - 1.0, 0.0) / (DENSITY_RELAX_FRAMES * params.dt);
+    // Over-density (+) half of the density source. Legacy (dbg.w ≤ 0.5): rate-limited by
+    // DENSITY_RELAX_FRAMES. Uncapped path (dbg.w > 0.5): the full predicted error e at
+    // density-error dimension (rate e/dt ⇒ rhs e/dt²), dead-banded by DENSITY_TARGET_DEADBAND —
+    // full-strength relief driving ρ→ρ₀. Calibration found this is THE over-pack lever, stable
+    // because it is a bounded restoring target (a compliance/αI regularization was tried and
+    // dropped — it only re-softened the response). Both paths multiply by dbg.x so the
+    // stirring-isolation gate (dbg.x = 0) still zeros the source. The under-density (−) half is
+    // the interior-gated surface.wgsl pass (KTD5).
+    // Temper-K rate divisor for the uncapped path (dbg.z): legacy uses DENSITY_RELAX_FRAMES (=30,
+    // slow → mushy); full uncap = K=1 (crisp but pumps energy on coupled scenes); the calibrated
+    // sweet spot is K∈(1,30). dbg.z default 0 ⇒ K=1 (full uncap). Smaller K = stiffer/crisper.
+    let kfac = max(params.dbg.z, 1.0);
+    let e_over = rho / params.extra.x - 1.0;
+    var s_target: f32;
+    if (params.dbg.w > 0.5) {
+        s_target = params.dbg.x * max(e_over - DENSITY_TARGET_DEADBAND, 0.0) / (kfac * params.dt);
+    } else {
+        s_target = params.dbg.x * max(e_over, 0.0) / (DENSITY_RELAX_FRAMES * params.dt);
+    }
     cell_meta[c] = vec4<f32>(select(0.0, f * (s_target - div) / params.dt, f > 0.0), f, rho, cat);
 }
 
