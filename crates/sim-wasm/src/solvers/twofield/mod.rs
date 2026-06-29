@@ -159,17 +159,15 @@ pub const PIC_BLEND_DEFAULT: f32 = 0.05;
 /// Δx/τ ≈ 0.6 instead of ~4.5 of slosh — the relief must correct volume, not detonate it.
 pub const DENSITY_RELAX_FRAMES: f32 = 30.0;
 
-/// Density-relief dead-band that was PROTOTYPED AND DROPPED. The idea: a settled pool leaves a
-/// small standing density ripple that, relieved every frame, feeds the stirring churn, so relieve
-/// only sustained compression. Measured: the standing density error the relief tracks EXCEEDS any
-/// safe band (a 1.5% band did not reach the churn; a band large enough would tolerate that much
-/// permanent compression), because the error is pressure under-convergence, not a noise ripple a
-/// clamp can cut. So the band is unused — the WGSL relief is the original un-banded feedback and
-/// `dbg.y` is unread (see pressure.wgsl / common.wgsl). The settled-pool stirring fix is deferred
-/// to the bed-creep redesign (see `PIC_BLEND_DEFAULT`). Retained only as the value the
-/// `set_relief_deadband_for_test` diagnostic seeds into `dbg.y` for the stirring-isolation arm in
-/// tests/twofield_settled.rs (a documented no-op since the kernels ignore it).
-pub const RELIEF_DEADBAND: f32 = 0.015;
+/// SDF wall-BC mode selector, written to `dbg.y` and read in pressure.wgsl/coupling.wgsl
+/// (`wall_bc_multi`). `SINGLE` is the original single-most-penetrated-normal banded BC
+/// (byte-identical default); `MULTI` is the orthonormal-basis projector P = I − Q·Qᵀ over ALL
+/// in-band faces (plan 2026-06-17-002 — constrains BOTH surfaces at a concave floor∩wall seam),
+/// flipped on in U3 after the corner-audit confirms box parity. `dbg.y` previously carried a
+/// prototyped relief dead-band that was dropped (the settled-pool stirring fix is the G2P PIC
+/// blend, `PIC_BLEND_DEFAULT`).
+pub const WALL_BC_SINGLE: f32 = 0.0;
+pub const WALL_BC_MULTI: f32 = 1.0;
 
 /// Free-surface fill-fraction constants (mirror `SURF_FULL_FRAC`/`SURF_MIN_CORNER` in
 /// pressure.wgsl — the ghost-fluid-style fraction weighting documented in its FREE SURFACE
@@ -348,12 +346,21 @@ struct Params {
     wet1: [f32; 4], // (a_suction, bloom_delay, filter_floor flag, V_dry = π/6·d³)
     // Diagnostic toggles (test-only; production keeps the defaults). .x = density-relief enable
     // (1.0 on by default; 0.0 disables BOTH the cell_classify over-density relief and the
-    // pocket_mark under-density suction for the stirring-isolation gate). .yzw reserved (0).
+    // pocket_mark under-density suction for the stirring-isolation gate). .y = SDF wall-BC mode
+    // (WALL_BC_SINGLE/MULTI). .z = temper-K rate divisor for the uncapped path (0 ⇒ K=1 full
+    // uncap; legacy cap is 30; sweet spot K∈(1,30)). .w = uncapped two-sided density-target mode
+    // (≤ 0.5 → legacy rate-limited (DENSITY_RELAX) two-sided relief, default & byte-identical;
+    // > 0.5 → relief uncapped to full strength, driving ρ→ρ₀ — the over-pack fix).
     dbg: [f32; 4],
+    // U1 surface-weighted dissipation knob (transfers.wgsl g2p_water). Lanes =
+    // (c_surface, density_gate, div_scale, water_splash_cap). DISABLED by default
+    // (c_surface = 1.0 ⇒ v = v_grid = pure-PIC; div_scale = 0 ⇒ merge discriminator off;
+    // water_splash_cap = 0 ⇒ fall back to the global max_speed). The U2 curve reads these.
+    flip: [f32; 4],
 }
 
 // Params is uploaded as a uniform and must stay byte-identical to the WGSL `Params`.
-const _: () = assert!(std::mem::size_of::<Params>() == 256);
+const _: () = assert!(std::mem::size_of::<Params>() == 272);
 
 /// GPU record for one static SDF solid — byte-identical to the WGSL `Primitive` (64 bytes,
 /// vec4-aligned; mirrors the xpbd packing of `utils::sdf` primitives). Cone radii in `a` are
@@ -408,6 +415,21 @@ fn pack_solids(solids: &[crate::utils::sdf::SdfPrimitive]) -> Vec<Primitive> {
                 friction: s.friction,
                 flags: 0,
                 a: [floor_y, rim_y, radius, 0.0],
+                b: [center.x, center.z, 0.0, 0.0],
+                c: [0.0; 4],
+            },
+            SolidKind::PolyCup {
+                center,
+                floor_y,
+                rim_y,
+                apothem,
+                sides,
+            } => Primitive {
+                kind: 2,
+                species_mask: s.species_mask,
+                friction: s.friction,
+                flags: 0,
+                a: [floor_y, rim_y, apothem, sides as f32],
                 b: [center.x, center.z, 0.0, 0.0],
                 c: [0.0; 4],
             },
@@ -853,16 +875,43 @@ impl TwofieldSolver {
         self.params.pic_blend = blend.clamp(0.0, 1.0);
     }
 
+    /// Set the U3 separate water-splash velocity cap (`flip.w`) directly — dev/test only (the
+    /// FP-overflow headroom probe at a raised water cap). `0.0` is the disabled sentinel
+    /// (water path falls back to the global `max_speed`, byte-identical).
+    pub fn set_water_splash_cap_for_test(&mut self, cap: f32) {
+        self.params.flip[3] = cap;
+    }
+
     /// Toggle the density relief (over-density relief + under-density suction) — dev/test only,
     /// for the spontaneous-stirring isolation gate. Production keeps relief ON.
     pub fn set_relief_for_test(&mut self, on: bool) {
         self.params.dbg[0] = if on { 1.0 } else { 0.0 };
     }
 
-    /// Set the density-relief dead-band (fractional) — dev/test only. Production keeps
-    /// `RELIEF_DEADBAND`; the isolation gate sets 0 to reproduce the un-banded bug.
-    pub fn set_relief_deadband_for_test(&mut self, band: f32) {
-        self.params.dbg[1] = band.max(0.0);
+    /// Select the SDF wall-BC mode (`dbg.y`) — dev/test only. `WALL_BC_SINGLE` (≤ 0.5) is the
+    /// single-normal banded BC; `WALL_BC_MULTI` (> 0.5) is the orthonormal-basis multi-normal
+    /// projector. Production default is `WALL_BC_SINGLE` until U3 flips it post-calibration.
+    pub fn set_wall_bc_mode_for_test(&mut self, mode: f32) {
+        self.params.dbg[1] = mode;
+    }
+
+    /// Select the uncapped two-sided density-target mode (dbg.w) — dev/test only. `false`
+    /// (default) keeps the legacy ∇·v projection + rate-limited (DENSITY_RELAX) two-sided relief,
+    /// byte-identical to pre-fix; `true` drops the rate cap so the density relief drives ρ→ρ₀ at
+    /// full strength (the calibration showed this is the over-pack fix; it is stable because it is
+    /// a bounded restoring target, not the one-sided expansion source that historically detonated).
+    /// Production default flips to `true` in U5.
+    pub fn set_density_target_mode_for_test(&mut self, on: bool) {
+        self.params.dbg[3] = if on { 1.0 } else { 0.0 };
+    }
+
+    /// Set the temper-K rate divisor (dbg.z) for the uncapped density path — dev/test only (the
+    /// temper calibration). The uncapped relief rate is `e/(K·dt)`: K=1 (default, dbg.z=0) is the
+    /// full uncap (crisp but pumps energy on coupled scenes); the legacy cap is K=30 (slow, mushy);
+    /// the calibrated sweet spot is K∈(1,30). Smaller K = stiffer/crisper. Only takes effect on the
+    /// uncapped path (dbg.w on).
+    pub fn set_density_rate_k_for_test(&mut self, k: f32) {
+        self.params.dbg[2] = k.max(0.0);
     }
 
     /// Set the U3 pressure-budget knobs (KTD-9 grid points; dev/test only). `coarse_sweeps =
@@ -1513,9 +1562,23 @@ impl Solver for TwofieldSolver {
                 if cfg.tf_filter_floor { 1.0 } else { 0.0 },
                 grain_volume(mats.grain_diameter),
             ],
-            // Density relief ON (dbg.x) by default; relief dead-band (dbg.y) at RELIEF_DEADBAND.
-            // The isolation gate overrides these (relief off / dead-band 0).
-            dbg: [1.0, RELIEF_DEADBAND, 0.0, 0.0],
+            // Density relief ON (dbg.x) by default; SDF wall BC in BINARY mode (dbg.y) until U3
+            // Default stays SINGLE: the multi-normal corner fix is proven (corner_parity gate)
+            // but flipping the default trips poured_cup_water_fills_not_corner — the dynamic pour
+            // traps a spurious crushing pocket under multi (same failure mode a prior one-sided
+            // wall BC hit). Resolve that before defaulting MULTI / retiring the selector.
+            // Tests override via set_relief_for_test / set_wall_bc_mode_for_test.
+            dbg: [1.0, WALL_BC_SINGLE, 0.0, 0.0],
+            // U1 surface-weighted dissipation knob: (c_surface, density_gate, div_scale,
+            // water_splash_cap). Default DISABLED (c_surface = 1.0 ⇒ pure-PIC; div_scale = 0 ⇒
+            // merge off; water_splash_cap = 0 ⇒ global max_speed), so g2p_water is byte-identical
+            // to the pure-PIC baseline. The U2 curve reads these lanes.
+            flip: [
+                cfg.tf_flip_c_surface,
+                cfg.tf_flip_density_gate,
+                cfg.tf_flip_div_scale,
+                cfg.tf_flip_water_splash_cap,
+            ],
         };
         let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("twofield-params"),
