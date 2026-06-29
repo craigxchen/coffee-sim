@@ -9,10 +9,9 @@ use web_sys::HtmlCanvasElement;
 use coffee_sim_core::Vec3;
 
 use crate::solvers::mpm::{
-    MpmSettings, Obstacle, CONTACT_OFFSET, MAX_FILL_VERTEX_COUNT, MAX_RENDER_VERTEX_COUNT,
-    OBSTACLE_WALL_THICKNESS,
+    CONTACT_OFFSET, MAX_FILL_VERTEX_COUNT, MAX_RENDER_VERTEX_COUNT, OBSTACLE_WALL_THICKNESS,
 };
-use crate::ui::RenderView;
+use crate::ui::{ParticleRenderSource, RenderObstacle, RenderSceneGeometry, RenderView};
 
 const EPSILON: f32 = 1e-6;
 const CROSS_SECTION_ASPECT: f32 = 1.38;
@@ -24,6 +23,7 @@ const WORLD_AXIS_LENGTH: f32 = 1.45;
 const WORLD_AXIS_NEGATIVE_STUB: f32 = 0.22;
 const WORLD_AXIS_ARROW_LENGTH: f32 = 0.24;
 const WORLD_AXIS_ARROW_WIDTH: f32 = 0.12;
+const CANONICAL_COLOR_MAX_SPEED: f32 = 25.0;
 
 const PARTICLE_3D_SHADER: &str = r#"
 struct Particle3DUniforms {
@@ -277,6 +277,219 @@ fn fs_main(input: ParticleVertexOutput) -> @location(0) vec4<f32> {
 }
 "#;
 
+const CANONICAL_PARTICLE_3D_SHADER: &str = r#"
+struct Particle3DUniforms {
+    view_proj: mat4x4<f32>,
+    camera_right: vec4<f32>,
+    camera_up: vec4<f32>,
+    camera_forward: vec4<f32>,
+    light_dir: vec4<f32>,
+    params: vec4<f32>,
+};
+
+@group(0) @binding(0)
+var<uniform> uniforms: Particle3DUniforms;
+@group(0) @binding(1)
+var<storage, read> positions: array<vec4<f32>>;
+@group(0) @binding(2)
+var<storage, read> velocities: array<vec4<f32>>;
+@group(0) @binding(3)
+var<storage, read> phases: array<u32>;
+
+struct ParticleVertexOutput {
+    @builtin(position) clip_position: vec4<f32>,
+    @location(0) local: vec2<f32>,
+    @location(1) speed_t: f32,
+    @location(2) @interpolate(flat) phase: u32,
+    @location(3) saturation: f32,
+};
+
+fn corner(index: u32) -> vec2<f32> {
+    var corners = array<vec2<f32>, 6>(
+        vec2<f32>(-1.0, -1.0),
+        vec2<f32>(1.0, -1.0),
+        vec2<f32>(1.0, 1.0),
+        vec2<f32>(-1.0, -1.0),
+        vec2<f32>(1.0, 1.0),
+        vec2<f32>(-1.0, 1.0),
+    );
+    return corners[index];
+}
+
+@vertex
+fn vs_main(@builtin(vertex_index) vertex_index: u32, @builtin(instance_index) instance_index: u32) -> ParticleVertexOutput {
+    let local = corner(vertex_index);
+    let position = positions[instance_index];
+    if (position.y <= -1.0e8) {
+        var dormant: ParticleVertexOutput;
+        dormant.clip_position = vec4<f32>(2.0, 2.0, 2.0, 1.0);
+        return dormant;
+    }
+    let phase = phases[instance_index];
+    let grain_scale = select(1.0, uniforms.params.z, phase == 1u);
+    let speed_t = clamp(length(velocities[instance_index].xyz) * uniforms.params.y, 0.0, 1.0);
+    let water_radius = uniforms.params.x * mix(1.0, 0.72, clamp(speed_t * 0.7, 0.0, 1.0));
+    let radius = select(water_radius, uniforms.params.x * grain_scale, phase == 1u);
+    let world = position.xyz
+        + uniforms.camera_right.xyz * local.x * radius
+        + uniforms.camera_up.xyz * local.y * radius;
+
+    var output: ParticleVertexOutput;
+    output.clip_position = uniforms.view_proj * vec4<f32>(world, 1.0);
+    output.local = local;
+    output.speed_t = speed_t;
+    output.phase = phase;
+    output.saturation = clamp(position.w * uniforms.params.w, 0.0, 1.0);
+    return output;
+}
+
+fn phase_color(phase: u32, speed_t: f32, saturation: f32) -> vec3<f32> {
+    if (phase == 1u) {
+        let dry = vec3<f32>(0.30, 0.18, 0.10);
+        let wet = vec3<f32>(0.13, 0.07, 0.03);
+        let disturbed = vec3<f32>(0.60, 0.42, 0.26);
+        return mix(mix(dry, wet, saturation), disturbed, speed_t);
+    }
+    let calm = vec3<f32>(0.10, 0.32, 0.85);
+    let fast = vec3<f32>(0.75, 0.92, 1.0);
+    return mix(calm, fast, speed_t);
+}
+
+@fragment
+fn fs_main(input: ParticleVertexOutput) -> @location(0) vec4<f32> {
+    let radial = dot(input.local, input.local);
+    if (radial > 1.0) {
+        discard;
+    }
+
+    let sphere_z = sqrt(max(1.0 - radial, 0.0));
+    let normal = normalize(
+        uniforms.camera_right.xyz * input.local.x
+            + uniforms.camera_up.xyz * input.local.y
+            - uniforms.camera_forward.xyz * sphere_z
+    );
+    let light = normalize(-uniforms.light_dir.xyz);
+    let diffuse = max(dot(normal, light), 0.0);
+    let rim = pow(1.0 - sphere_z, 2.5);
+    let color = phase_color(input.phase, input.speed_t, input.saturation) * (0.34 + diffuse * 0.9)
+        + vec3<f32>(rim * 0.12);
+    let alpha = smoothstep(1.0, 0.82, radial);
+    return vec4<f32>(color, alpha);
+}
+"#;
+
+const CANONICAL_CROSS_SECTION_SHADER: &str = r#"
+struct CrossSectionUniforms {
+    bounds: vec4<f32>,
+    params: vec4<f32>,
+    material: vec4<f32>,
+};
+
+@group(0) @binding(0)
+var<uniform> uniforms: CrossSectionUniforms;
+@group(0) @binding(1)
+var<storage, read> positions: array<vec4<f32>>;
+@group(0) @binding(2)
+var<storage, read> velocities: array<vec4<f32>>;
+@group(0) @binding(3)
+var<storage, read> phases: array<u32>;
+
+struct ParticleVertexOutput {
+    @builtin(position) clip_position: vec4<f32>,
+    @location(0) local: vec2<f32>,
+    @location(1) speed_t: f32,
+    @location(2) @interpolate(flat) phase: u32,
+    @location(3) saturation: f32,
+    @location(4) visible: f32,
+};
+
+fn corner(index: u32) -> vec2<f32> {
+    var corners = array<vec2<f32>, 6>(
+        vec2<f32>(-1.0, -1.0),
+        vec2<f32>(1.0, -1.0),
+        vec2<f32>(1.0, 1.0),
+        vec2<f32>(-1.0, -1.0),
+        vec2<f32>(1.0, 1.0),
+        vec2<f32>(-1.0, 1.0),
+    );
+    return corners[index];
+}
+
+@vertex
+fn vs_main(@builtin(vertex_index) vertex_index: u32, @builtin(instance_index) instance_index: u32) -> ParticleVertexOutput {
+    let local = corner(vertex_index);
+    let position = positions[instance_index];
+    let phase = phases[instance_index];
+    let x_min = uniforms.bounds.x;
+    let x_max = uniforms.bounds.y;
+    let y_min = uniforms.bounds.z;
+    let y_max = uniforms.bounds.w;
+    let z_center = uniforms.params.x;
+    let slice_half_width = uniforms.params.y;
+
+    let x_range = max(x_max - x_min, 1e-5);
+    let y_range = max(y_max - y_min, 1e-5);
+    let dormant = position.y <= -1.0e8;
+    let in_slice = abs(position.z - z_center) <= slice_half_width;
+    let in_bounds = position.x >= x_min
+        && position.x <= x_max
+        && position.y >= y_min
+        && position.y <= y_max
+        && position.y > -1e5;
+    let visible = select(0.0, 1.0, in_slice && in_bounds && !dormant);
+    let grain_scale = select(1.0, uniforms.params.z, phase == 1u);
+    let speed_t = clamp(length(velocities[instance_index].xyz) * uniforms.material.y, 0.0, 1.0);
+    let water_radius = uniforms.params.w * mix(1.0, 0.72, clamp(speed_t * 0.7, 0.0, 1.0));
+    let particle_radius = select(water_radius, uniforms.params.w * grain_scale, phase == 1u);
+    let radius_ndc = vec2<f32>(
+        max(particle_radius * 2.0 / x_range, 0.0025),
+        max(particle_radius * 2.0 / y_range, 0.0025),
+    );
+    let center = vec2<f32>(
+        ((position.x - x_min) / x_range) * 2.0 - 1.0,
+        ((position.y - y_min) / y_range) * 2.0 - 1.0,
+    );
+
+    var output: ParticleVertexOutput;
+    output.clip_position = select(
+        vec4<f32>(2.4, 2.4, 0.0, 1.0),
+        vec4<f32>(center + local * radius_ndc, 0.0, 1.0),
+        visible > 0.5,
+    );
+    output.local = local;
+    output.speed_t = speed_t;
+    output.phase = phase;
+    output.saturation = clamp(position.w * uniforms.material.x, 0.0, 1.0);
+    output.visible = visible;
+    return output;
+}
+
+fn phase_color(phase: u32, speed_t: f32, saturation: f32) -> vec3<f32> {
+    if (phase == 1u) {
+        let dry = vec3<f32>(0.42, 0.28, 0.12);
+        let wet = vec3<f32>(0.16, 0.10, 0.05);
+        let disturbed = vec3<f32>(0.62, 0.44, 0.26);
+        return mix(mix(dry, wet, saturation), disturbed, speed_t);
+    }
+    let water = vec3<f32>(0.08, 0.34, 0.86);
+    let fast = vec3<f32>(0.74, 0.92, 1.0);
+    return mix(water, fast, speed_t);
+}
+
+@fragment
+fn fs_main(input: ParticleVertexOutput) -> @location(0) vec4<f32> {
+    if (input.visible < 0.5) {
+        discard;
+    }
+    let radial = dot(input.local, input.local);
+    if (radial > 1.0) {
+        discard;
+    }
+    let alpha = smoothstep(1.0, 0.72, radial);
+    return vec4<f32>(phase_color(input.phase, input.speed_t, input.saturation), alpha * 0.92);
+}
+"#;
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct QuadVertex {
@@ -319,6 +532,7 @@ struct AxisVertex {
 struct CrossSectionUniforms {
     bounds: [f32; 4],
     params: [f32; 4],
+    material: [f32; 4],
 }
 
 #[derive(Clone, Copy)]
@@ -393,6 +607,9 @@ pub(crate) struct Renderer {
     css_height: f32,
     particle_3d_pipeline: wgpu::RenderPipeline,
     cross_section_pipeline: wgpu::RenderPipeline,
+    canonical_particle_3d_pipeline: wgpu::RenderPipeline,
+    canonical_cross_section_pipeline: wgpu::RenderPipeline,
+    canonical_particle_bind_group_layout: wgpu::BindGroupLayout,
     filter_fill_pipeline: wgpu::RenderPipeline,
     cone_pipeline: wgpu::RenderPipeline,
     axis_pipeline: wgpu::RenderPipeline,
@@ -423,7 +640,7 @@ pub(crate) struct Renderer {
 impl Renderer {
     pub(crate) async fn new(
         canvas: HtmlCanvasElement,
-        settings: &MpmSettings,
+        geometry: &RenderSceneGeometry,
     ) -> Result<Self, JsValue> {
         let width = canvas.width().max(1);
         let height = canvas.height().max(1);
@@ -564,6 +781,16 @@ impl Renderer {
             label: Some("cross section shader"),
             source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(CROSS_SECTION_SHADER)),
         });
+        let canonical_particle_3d_shader =
+            device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("canonical particle 3d shader"),
+                source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(CANONICAL_PARTICLE_3D_SHADER)),
+            });
+        let canonical_cross_section_shader =
+            device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("canonical cross section shader"),
+                source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(CANONICAL_CROSS_SECTION_SHADER)),
+            });
         let cone_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("cone shader"),
             source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(CONE_SHADER)),
@@ -578,6 +805,60 @@ impl Renderer {
             bind_group_layouts: &[Some(&bind_group_layout)],
             immediate_size: 0,
         });
+
+        let canonical_particle_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("canonical particle bind group layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::VERTEX,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::VERTEX,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::VERTEX,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+
+        let canonical_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("canonical particle pipeline layout"),
+                bind_group_layouts: &[Some(&canonical_particle_bind_group_layout)],
+                immediate_size: 0,
+            });
 
         // Particle 3D render pipeline
         let particle_3d_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -704,6 +985,88 @@ impl Renderer {
                 },
                 fragment: Some(wgpu::FragmentState {
                     module: &cross_section_shader,
+                    entry_point: Some("fs_main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: config.format,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: None,
+                    unclipped_depth: false,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    conservative: false,
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: wgpu::TextureFormat::Depth24Plus,
+                    depth_write_enabled: Some(false),
+                    depth_compare: Some(wgpu::CompareFunction::Always),
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            });
+
+        let canonical_particle_3d_pipeline =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("canonical particle 3d pipeline"),
+                layout: Some(&canonical_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &canonical_particle_3d_shader,
+                    entry_point: Some("vs_main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    buffers: &[],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &canonical_particle_3d_shader,
+                    entry_point: Some("fs_main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: config.format,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: None,
+                    unclipped_depth: false,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    conservative: false,
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: wgpu::TextureFormat::Depth24Plus,
+                    depth_write_enabled: Some(true),
+                    depth_compare: Some(wgpu::CompareFunction::Less),
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            });
+
+        let canonical_cross_section_pipeline =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("canonical cross section pipeline"),
+                layout: Some(&canonical_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &canonical_cross_section_shader,
+                    entry_point: Some("vs_main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    buffers: &[],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &canonical_cross_section_shader,
                     entry_point: Some("fs_main"),
                     compilation_options: wgpu::PipelineCompilationOptions::default(),
                     targets: &[Some(wgpu::ColorTargetState {
@@ -907,7 +1270,7 @@ impl Renderer {
         queue.write_buffer(&quad_vertex_buffer, 0, bytemuck::cast_slice(&quad_vertices));
 
         // Cone wireframe vertices
-        let cone_verts = build_wireframe(settings);
+        let cone_verts = build_wireframe(geometry);
         let cone_vertex_count = cone_verts.len() as u32;
         let cone_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("cone vertex buffer"),
@@ -917,7 +1280,7 @@ impl Renderer {
         });
         queue.write_buffer(&cone_vertex_buffer, 0, bytemuck::cast_slice(&cone_verts));
 
-        let axis_verts = build_world_axes(settings);
+        let axis_verts = build_world_axes(geometry);
         let axis_vertex_count = axis_verts.len() as u32;
         let axis_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("world axis vertex buffer"),
@@ -959,6 +1322,9 @@ impl Renderer {
             css_height: height as f32,
             particle_3d_pipeline,
             cross_section_pipeline,
+            canonical_particle_3d_pipeline,
+            canonical_cross_section_pipeline,
+            canonical_particle_bind_group_layout,
             filter_fill_pipeline,
             cone_pipeline,
             axis_pipeline,
@@ -1102,7 +1468,12 @@ impl Renderer {
             camera_up: [up.x, up.y, up.z, 0.0],
             camera_forward: [forward.x, forward.y, forward.z, 0.0],
             light_dir: [-0.45, -0.9, -0.25, 0.0],
-            params: [simulation.settings().render_radius, 0.0, 0.0, 0.0],
+            params: [
+                simulation.render_radius(),
+                1.0 / CANONICAL_COLOR_MAX_SPEED,
+                simulation.grain_radius_scale(),
+                simulation.moisture_inv_cap(),
+            ],
         };
         self.queue.write_buffer(
             &self.particle_3d_uniform_buffer,
@@ -1116,7 +1487,18 @@ impl Renderer {
             .unwrap_or(CROSS_SECTION_ASPECT);
         let cross_section_uniforms = CrossSectionUniforms {
             bounds: cross_section_world_bounds(cross_section_aspect),
-            params: [0.0, 0.28, 1.0, 0.0],
+            params: [
+                0.0,
+                0.28,
+                simulation.grain_radius_scale(),
+                simulation.render_radius(),
+            ],
+            material: [
+                simulation.moisture_inv_cap(),
+                1.0 / CANONICAL_COLOR_MAX_SPEED,
+                0.0,
+                0.0,
+            ],
         };
         self.queue.write_buffer(
             &self.cross_section_uniform_buffer,
@@ -1153,6 +1535,60 @@ impl Renderer {
         );
 
         self.sync_filter_mesh_vertices(simulation);
+
+        let canonical_bind_groups = match simulation.particle_source() {
+            ParticleRenderSource::Canonical {
+                positions,
+                velocities,
+                phases,
+            } => Some((
+                self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("canonical particle 3d bind group"),
+                    layout: &self.canonical_particle_bind_group_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: self.particle_3d_uniform_buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: positions.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: velocities.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: phases.as_entire_binding(),
+                        },
+                    ],
+                }),
+                self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("canonical cross section bind group"),
+                    layout: &self.canonical_particle_bind_group_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: self.cross_section_uniform_buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: positions.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: velocities.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: phases.as_entire_binding(),
+                        },
+                    ],
+                }),
+            )),
+            ParticleRenderSource::Packed { .. } => None,
+        };
 
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame)
@@ -1239,36 +1675,74 @@ impl Renderer {
 
             // Draw particles
             if simulation.particle_count() > 0 {
-                pass.set_pipeline(&self.particle_3d_pipeline);
-                pass.set_bind_group(0, &self.particle_3d_bind_group, &[]);
-                pass.set_vertex_buffer(0, self.quad_vertex_buffer.slice(..));
-                pass.set_vertex_buffer(1, simulation.render_buffer().slice(..));
-                pass.draw(0..6, 0..simulation.particle_count() as u32);
+                match simulation.particle_source() {
+                    ParticleRenderSource::Packed { render_buffer } => {
+                        pass.set_pipeline(&self.particle_3d_pipeline);
+                        pass.set_bind_group(0, &self.particle_3d_bind_group, &[]);
+                        pass.set_vertex_buffer(0, self.quad_vertex_buffer.slice(..));
+                        pass.set_vertex_buffer(1, render_buffer.slice(..));
+                        pass.draw(0..6, 0..simulation.particle_count() as u32);
 
-                if let Some((overlay_x, overlay_y, overlay_width, overlay_height, _)) =
-                    cross_section_viewport
-                {
-                    pass.set_viewport(
-                        overlay_x,
-                        overlay_y,
-                        overlay_width,
-                        overlay_height,
-                        0.0,
-                        1.0,
-                    );
-                    pass.set_pipeline(&self.cross_section_pipeline);
-                    pass.set_bind_group(0, &self.cross_section_bind_group, &[]);
-                    pass.set_vertex_buffer(0, self.quad_vertex_buffer.slice(..));
-                    pass.set_vertex_buffer(1, simulation.render_buffer().slice(..));
-                    pass.draw(0..6, 0..simulation.particle_count() as u32);
-                    pass.set_viewport(
-                        0.0,
-                        0.0,
-                        self.config.width as f32,
-                        self.config.height as f32,
-                        0.0,
-                        1.0,
-                    );
+                        if let Some((overlay_x, overlay_y, overlay_width, overlay_height, _)) =
+                            cross_section_viewport
+                        {
+                            pass.set_viewport(
+                                overlay_x,
+                                overlay_y,
+                                overlay_width,
+                                overlay_height,
+                                0.0,
+                                1.0,
+                            );
+                            pass.set_pipeline(&self.cross_section_pipeline);
+                            pass.set_bind_group(0, &self.cross_section_bind_group, &[]);
+                            pass.set_vertex_buffer(0, self.quad_vertex_buffer.slice(..));
+                            pass.set_vertex_buffer(1, render_buffer.slice(..));
+                            pass.draw(0..6, 0..simulation.particle_count() as u32);
+                            pass.set_viewport(
+                                0.0,
+                                0.0,
+                                self.config.width as f32,
+                                self.config.height as f32,
+                                0.0,
+                                1.0,
+                            );
+                        }
+                    }
+                    ParticleRenderSource::Canonical { .. } => {
+                        let Some((particle_bind_group, cross_section_bind_group)) =
+                            canonical_bind_groups.as_ref()
+                        else {
+                            return Err(JsValue::from_str("canonical particle bind group missing"));
+                        };
+                        pass.set_pipeline(&self.canonical_particle_3d_pipeline);
+                        pass.set_bind_group(0, particle_bind_group, &[]);
+                        pass.draw(0..6, 0..simulation.particle_count() as u32);
+
+                        if let Some((overlay_x, overlay_y, overlay_width, overlay_height, _)) =
+                            cross_section_viewport
+                        {
+                            pass.set_viewport(
+                                overlay_x,
+                                overlay_y,
+                                overlay_width,
+                                overlay_height,
+                                0.0,
+                                1.0,
+                            );
+                            pass.set_pipeline(&self.canonical_cross_section_pipeline);
+                            pass.set_bind_group(0, cross_section_bind_group, &[]);
+                            pass.draw(0..6, 0..simulation.particle_count() as u32);
+                            pass.set_viewport(
+                                0.0,
+                                0.0,
+                                self.config.width as f32,
+                                self.config.height as f32,
+                                0.0,
+                                1.0,
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -1279,8 +1753,8 @@ impl Renderer {
     }
 }
 
-fn build_world_axes(settings: &MpmSettings) -> Vec<AxisVertex> {
-    let origin = cup_bottom_origin(settings);
+fn build_world_axes(geometry: &RenderSceneGeometry) -> Vec<AxisVertex> {
+    let origin = cup_bottom_origin(geometry);
     let mut verts = Vec::new();
     push_axis(
         &mut verts,
@@ -1309,12 +1783,12 @@ fn build_world_axes(settings: &MpmSettings) -> Vec<AxisVertex> {
     verts
 }
 
-fn cup_bottom_origin(settings: &MpmSettings) -> Vec3 {
-    settings
+fn cup_bottom_origin(geometry: &RenderSceneGeometry) -> Vec3 {
+    geometry
         .obstacles
         .iter()
         .find_map(|obstacle| match obstacle {
-            Obstacle::Cylinder { center, bot_y, .. } => {
+            RenderObstacle::Cylinder { center, bot_y, .. } => {
                 let half_thickness = OBSTACLE_WALL_THICKNESS * 0.5;
                 Some(Vec3::new(
                     center.x,
@@ -1377,14 +1851,14 @@ fn push_axis_line(verts: &mut Vec<AxisVertex>, start: Vec3, end: Vec3, color: [f
     });
 }
 
-fn build_wireframe(settings: &MpmSettings) -> Vec<[f32; 3]> {
+fn build_wireframe(geometry: &RenderSceneGeometry) -> Vec<[f32; 3]> {
     let segments = 32;
     let verticals = 16;
     let mut verts = Vec::new();
 
-    for obs in &settings.obstacles {
+    for obs in &geometry.obstacles {
         match obs {
-            Obstacle::TruncatedCone {
+            RenderObstacle::TruncatedCone {
                 center,
                 top_radius,
                 bot_radius,
@@ -1412,7 +1886,7 @@ fn build_wireframe(settings: &MpmSettings) -> Vec<[f32; 3]> {
                     ]);
                 }
             }
-            Obstacle::Cylinder {
+            RenderObstacle::Cylinder {
                 center,
                 radius,
                 top_y,
@@ -1494,7 +1968,7 @@ fn build_wireframe(settings: &MpmSettings) -> Vec<[f32; 3]> {
         }
     }
 
-    push_spout_wireframe(&mut verts, settings);
+    push_spout_wireframe(&mut verts, geometry);
     verts
 }
 
@@ -1507,8 +1981,8 @@ fn push_ring(verts: &mut Vec<[f32; 3]>, cx: f32, y: f32, cz: f32, r: f32, segmen
     }
 }
 
-fn push_spout_wireframe(verts: &mut Vec<[f32; 3]>, settings: &MpmSettings) {
-    let spout = settings.spout;
+fn push_spout_wireframe(verts: &mut Vec<[f32; 3]>, geometry: &RenderSceneGeometry) {
+    let spout = geometry.spout;
     let direction = spout.direction.normalized();
     let base = spout.origin - direction * spout.stem_length;
     let (basis_a, basis_b) = spout_basis(direction);

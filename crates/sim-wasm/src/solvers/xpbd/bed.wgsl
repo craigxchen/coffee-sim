@@ -1,0 +1,105 @@
+// Dry granular bed (position-based; Macklin "Unified Particle Physics" 2014, with XPBD friction
+// from Macklin et al. 2020). Grains solve direct position corrections — non-penetration + Coulomb
+// friction + light cohesion — over their grain neighbors, written into `dp[i]` (Jacobi) and
+// applied by the shared `apply_dp` (which also adds grain–boundary friction). Concatenated after
+// `common.wgsl` + `water.wgsl`.
+//
+// Friction budget is μ · (accumulated normal impulse this frame), NOT μ · overlap. The
+// non-penetration solve drives overlap → 0 at rest, so an overlap-based budget would vanish
+// exactly when the pile needs to hold its slope (→ continuous creep). The accumulated normal
+// correction is load-scaled (a deep grain is pushed harder, every iteration) and stays non-zero
+// at static rest, so the pile holds a true repose without any freeze hack.
+//
+// This kernel keeps its binding set minimal and does NOT bind `status`: the
+// convergence early-exit is enforced by `apply_dp`/`residual_reduce`, so a wasted projection
+// after convergence is harmless (its dp is never applied).
+
+@compute @workgroup_size(256)
+fn bed_project(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= params.particle_count) { return; }
+    if (phase[i] != PHASE_GRAIN) { return; }
+    // Swelling: this grain's effective contact diameter + mass grow with its absorbed volume
+    // (pred.w = V_abs). Dry grains (V_abs=0) reduce to grain_diameter / grain_mass exactly.
+    let v_abs_i = pred[i].w;
+    let d_i = grain_eff_diameter(v_abs_i);
+    let m_i = grain_eff_mass(v_abs_i);
+    let xi = pred[i].xyz;
+    let prev_i = pos[i].xyz;
+
+    var separation = vec3<f32>(0.0); // non-penetration (+ cohesion) push
+    var tangential = vec3<f32>(0.0); // unclamped tangential-relative-motion removal
+    var normal_mag = 0.0;            // total normal-correction magnitude this iteration
+    var max_pen = 0.0;
+
+    let base = cell_coord(xi);
+    for (var dz = -1; dz <= 1; dz = dz + 1) {
+        for (var dy = -1; dy <= 1; dy = dy + 1) {
+            for (var dx = -1; dx <= 1; dx = dx + 1) {
+                let nc = base + vec3<i32>(dx, dy, dz);
+                if (nc.x < 0 || nc.y < 0 || nc.z < 0) { continue; }
+                let dims = vec3<i32>(params.grid_dims.xyz);
+                if (nc.x >= dims.x || nc.y >= dims.y || nc.z >= dims.z) { continue; }
+                let cid = cell_id(nc);
+                let lo = cell_start[cid];
+                let hi = cell_start[cid + 1u];
+                for (var s = lo; s < hi; s = s + 1u) {
+                    let j = sorted_indices[s];
+                    if (j == i) { continue; }
+                    if (phase[j] != PHASE_GRAIN) { continue; } // grain contacts only
+                    // Per-pair swollen contact distance (sum of effective radii) + cohesion reach,
+                    // and an effective inverse-mass split so a heavier (wetter) grain moves less.
+                    // All reduce to the dry constants + ½/½ when both grains are dry.
+                    let d_j = grain_eff_diameter(pred[j].w);
+                    let d = 0.5 * (d_i + d_j);
+                    let coh = params.cohesion_range * d / params.grain_diameter;
+                    let w_i = grain_eff_mass(pred[j].w) / (m_i + grain_eff_mass(pred[j].w));
+                    let dvec = xi - pred[j].xyz;
+                    var r = length(dvec);
+                    if (r >= coh) { continue; }
+                    var n: vec3<f32>;
+                    if (r < 1e-6) {
+                        n = vec3<f32>(0.0, 1.0, 0.0); // deterministic separation for coincident grains
+                        r = 1e-6;
+                    } else {
+                        n = dvec / r;
+                    }
+                    if (r < d) {
+                        // --- non-penetration (effective inverse-mass split) ---
+                        let overlap = d - r;
+                        max_pen = max(max_pen, overlap);
+                        let push = overlap * w_i;
+                        separation = separation + n * push;
+                        normal_mag = normal_mag + push;
+                        // --- tangential relative displacement this frame (this grain's share) ---
+                        let rel = (xi - prev_i) - (pred[j].xyz - pos[j].xyz);
+                        tangential = tangential - (rel - dot(rel, n) * n) * w_i;
+                    } else {
+                        // --- cohesion just past contact (linear falloff): dry baseline + the
+                        // capillary (wet) curve, min-combined so a wet grain can't glue a dry one.
+                        let coh_str = params.dry_cohesion
+                            + min(wet_cohesion(v_abs_i), wet_cohesion(pred[j].w));
+                        if (coh_str > 0.0) {
+                            let f = coh_str * (1.0 - (r - d) / (coh - d));
+                            separation = separation - n * f; // pull i toward j (direction −n)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Accumulate the normal impulse over the frame's iterations; the Coulomb budget is μ times it.
+    // (Static if the desired tangential removal is within the cone, else slip to the limit.)
+    let impulse = normal_impulse[i] + normal_mag;
+    normal_impulse[i] = impulse;
+    let limit = params.friction_mu * impulse;
+    let tlen = length(tangential);
+    var friction = tangential;
+    if (tlen > limit) {
+        friction = tangential * (limit / tlen);
+    }
+
+    dp[i] = vec4<f32>(separation + friction, 0.0);
+    c_residual[i] = max_pen / d_i;
+}

@@ -1,12 +1,17 @@
 use coffee_sim_core::Vec3;
 
+use crate::solvers::base::{
+    CommonMetrics, FrameContext, FrameSnapshot, FrameSolver, ResetContext, SceneSpec,
+};
+use crate::ui::{RenderObstacle, RenderSceneGeometry, RenderSpout, RenderView};
+
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::JsValue;
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::{closure::Closure, JsCast};
 
 pub(crate) mod bed;
-mod brew_config;
+pub(crate) mod brew_config;
 mod filter;
 mod filter_mesh;
 pub(crate) mod inflow;
@@ -20,12 +25,12 @@ mod state;
 pub(crate) mod units;
 
 pub(crate) use filter::FilterConfig;
+pub(crate) use filter_mesh::FilterMesh;
 #[cfg(target_arch = "wasm32")]
 pub(crate) use filter_mesh::{MAX_FILL_VERTEX_COUNT, MAX_RENDER_VERTEX_COUNT};
 
 use bed::{BedConfig, BedInit};
 use brew_config::{kozeny_carman_permeability_m2, DEFAULT_BREW};
-use filter_mesh::FilterMesh;
 use inflow::{EmissionResult, InflowState, SpoutSettings, MASS_UNITS_PER_ML};
 use pipelines::MpmPipelines;
 use state::{
@@ -495,6 +500,50 @@ impl MpmSettings {
             .retain(|obstacle| matches!(obstacle, Obstacle::Cylinder { .. }));
         settings
     }
+
+    pub(crate) fn render_scene_geometry(&self) -> RenderSceneGeometry {
+        RenderSceneGeometry {
+            bounds_size: self.bounds_size,
+            render_radius: self.render_radius,
+            obstacles: self
+                .obstacles
+                .iter()
+                .map(|obstacle| match obstacle {
+                    Obstacle::TruncatedCone {
+                        center,
+                        top_radius,
+                        bot_radius,
+                        top_y,
+                        bot_y,
+                    } => RenderObstacle::TruncatedCone {
+                        center: *center,
+                        top_radius: *top_radius,
+                        bot_radius: *bot_radius,
+                        top_y: *top_y,
+                        bot_y: *bot_y,
+                    },
+                    Obstacle::Cylinder {
+                        center,
+                        radius,
+                        top_y,
+                        bot_y,
+                    } => RenderObstacle::Cylinder {
+                        center: *center,
+                        radius: *radius,
+                        top_y: *top_y,
+                        bot_y: *bot_y,
+                    },
+                })
+                .collect(),
+            spout: RenderSpout {
+                origin: self.spout.origin,
+                direction: self.spout.direction,
+                stem_length: self.spout.stem_length,
+                stem_radius: self.spout.stem_radius,
+                nozzle_radius: self.spout.nozzle_radius,
+            },
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -623,6 +672,7 @@ fn v60_support_cone(filter: &FilterConfig) -> Obstacle {
     }
 }
 
+#[allow(dead_code)]
 fn cup_region(settings: &MpmSettings) -> Option<(f32, f32, f32)> {
     settings
         .obstacles
@@ -1199,6 +1249,7 @@ impl MpmSim3D {
         );
     }
 
+    #[allow(dead_code)]
     fn water_diagnostics_from_particle_data(
         &self,
         data: &[f32],
@@ -1487,6 +1538,7 @@ impl MpmSim3D {
         diagnostics
     }
 
+    #[allow(dead_code)]
     fn update_hydrostatic_diagnostics(
         &self,
         data: &[f32],
@@ -1752,6 +1804,7 @@ impl MpmSim3D {
         // there is no per-frame mesh work here.
     }
 
+    #[allow(dead_code)]
     pub fn reset(&mut self, queue: &wgpu::Queue, _device: &wgpu::Device) {
         self.num_water = 0;
         self.num_bed = 0;
@@ -1835,19 +1888,57 @@ impl MpmSim3D {
         self.settings.filter.as_ref().map(filter_config_key)
     }
 
+    #[allow(dead_code)]
     pub fn settings(&self) -> &MpmSettings {
         &self.settings
     }
 
-    pub(crate) fn render_view(&self) -> crate::ui::RenderView<'_> {
-        crate::ui::RenderView::new(
-            self.settings(),
+    pub(crate) fn render_view(&self) -> RenderView<'_> {
+        RenderView::new(
+            self.settings.bounds_size,
+            self.settings.render_radius,
             self.particle_count(),
             self.render_buffer(),
             self.filter_render_vertices(),
             self.filter_fill_vertices(),
             self.static_filter_mesh_key(),
         )
+    }
+
+    pub(crate) fn common_metrics(&self) -> CommonMetrics {
+        let metrics = self.latest_metrics();
+        CommonMetrics {
+            particle_count: self.particle_count(),
+            water_slots_used: self.water_slots_used(),
+            bed_particle_count: self.bed_particle_count(),
+            max_particles: self.max_particles(),
+            sim_time_s: self.total_time(),
+            frame_emitted_mass: self.frame_emitted_mass(),
+            frame_emitted_ml: self.frame_emitted_ml(),
+            total_emitted_mass: self.total_emitted_mass(),
+            total_emitted_ml: self.total_emitted_ml(),
+            frame_dropped_particles: self.frame_dropped_particles(),
+            total_dropped_particles: self.total_dropped_particles(),
+            flow_rate_ml_s: self.flow_rate_ml_s(),
+            exit_speed: self.exit_speed(),
+            exit_speed_m_s: self.exit_speed_m_s(),
+            spout_position: self.spout_position(),
+            has_bed: self.settings.bed.is_some(),
+            last_pressure_pairs: self.last_pressure_rbgs_pairs(),
+            max_abs_divergence: metrics.max_abs_div,
+            fluid_cell_count: metrics.fluid_cells,
+            div_clamp_fires: metrics.div_clamp_fires,
+            pressure_clamp_fires: metrics.pressure_clamp_fires,
+            mass_overflow_fires: metrics.mass_overflow_fires,
+            projection_residual_max_abs_divergence: metrics.projection_residual_max_abs_div,
+            projection_residual_mean_abs_divergence: metrics.projection_residual_mean_abs_div,
+            projection_residual_cell_count: metrics.projection_residual_cells,
+            mean_tds: metrics.mean_tds,
+            cup_tds: metrics.cup_tds,
+            extraction_yield: metrics.extraction_yield,
+            estimated_cup_tds: self.estimated_cup_tds(),
+            estimated_extraction_yield: self.estimated_extraction_yield(),
+        }
     }
 
     pub fn set_pressure_residual_adaptation(&mut self, target: f32, max_pairs: u32) {
@@ -1986,6 +2077,7 @@ impl MpmSim3D {
     }
 
     #[cfg(target_arch = "wasm32")]
+    #[allow(dead_code)]
     pub async fn water_diagnostics(
         &self,
         device: &wgpu::Device,
@@ -2075,6 +2167,7 @@ impl MpmSim3D {
     /// Async staging-buffer readback for the GPU metrics counters.
     ///
     #[cfg(target_arch = "wasm32")]
+    #[allow(dead_code)]
     pub async fn refresh_metrics(
         &mut self,
         device: &wgpu::Device,
@@ -2237,33 +2330,60 @@ impl MpmSim3D {
     }
 }
 
-impl crate::solvers::base::Solver for MpmSim3D {
-    fn id(&self) -> crate::solvers::base::SolverId {
-        crate::solvers::base::SolverId::Mpm
+impl FrameSolver for MpmSim3D {
+    fn reset(&mut self, ctx: ResetContext<'_>) -> CommonMetrics {
+        MpmSim3D::reset(self, ctx.queue, ctx.device);
+        self.common_metrics()
     }
 
-    fn info(&self) -> crate::solvers::base::SolverInfo {
-        crate::solvers::registry::info_for(self.id())
+    fn reset_scene(
+        &mut self,
+        ctx: ResetContext<'_>,
+        scene: &SceneSpec,
+    ) -> Result<CommonMetrics, String> {
+        let settings = match scene {
+            SceneSpec::CenterPour => MpmSettings::benchmark_center_pour(),
+            SceneSpec::FreeStream => MpmSettings::benchmark_free_stream(),
+            SceneSpec::Debug { id } => DebugScene::from_id(id)
+                .ok_or_else(|| format!("unknown debug scene: {id}"))?
+                .settings(),
+        };
+        *self = MpmSim3D::new(ctx.device, ctx.queue, settings);
+        if let SceneSpec::Debug { id } = scene {
+            let scene =
+                DebugScene::from_id(id).ok_or_else(|| format!("unknown debug scene: {id}"))?;
+            scene.seed(self, ctx.queue);
+        }
+        Ok(self.common_metrics())
     }
 
-    fn reset(&mut self, queue: &wgpu::Queue, device: &wgpu::Device) {
-        MpmSim3D::reset(self, queue, device);
+    fn step_frame(&mut self, ctx: FrameContext<'_>) -> CommonMetrics {
+        MpmSim3D::step_frame(self, ctx.device, ctx.queue, ctx.dt);
+        self.common_metrics()
     }
 
-    fn step_frame(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, dt: f32) {
-        MpmSim3D::step_frame(self, device, queue, dt);
+    fn snapshot(&self) -> FrameSnapshot<'_> {
+        FrameSnapshot {
+            render: self.render_view(),
+            metrics: self.common_metrics(),
+        }
     }
 
-    fn render_view(&self) -> crate::ui::RenderView<'_> {
-        MpmSim3D::render_view(self)
+    fn set_water_velocity_m_s(&mut self, speed_m_s: f32) {
+        MpmSim3D::set_exit_speed_m_s(self, speed_m_s);
     }
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
+    fn set_spout_position(&mut self, x: f32, y: f32, z: f32) {
+        MpmSim3D::set_spout_position(self, x, y, z);
     }
 
-    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
-        self
+    fn set_pressure_residual_adaptation(&mut self, target: f32, max_pairs: u32) {
+        MpmSim3D::set_pressure_residual_adaptation(self, target, max_pairs);
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn metrics_buffer(&self) -> Option<wgpu::Buffer> {
+        Some(MpmSim3D::metrics_buffer(self))
     }
 }
 
@@ -2353,6 +2473,17 @@ mod tests {
         assert!((dx - dz).abs() < 1e-5);
         let height_covered = s.grid_dims[1] as f32 * dx;
         assert!(height_covered >= s.bounds_size.y - dx);
+    }
+
+    #[test]
+    fn default_v60_render_radii_match_shared_solver_visual_style() {
+        let s = MpmSettings::default_v60();
+        let dx = s.bounds_size.x / s.grid_dims[0] as f32;
+        let water_radius = dx * DEFAULT_BREW.water_sample_radius_dx;
+        let grain_radius = dx * DEFAULT_BREW.bed_sample_radius_dx;
+
+        assert!((water_radius - crate::ui::STANDARD_WATER_RENDER_RADIUS).abs() < 1e-6);
+        assert!((grain_radius - crate::ui::STANDARD_GRAIN_RENDER_RADIUS).abs() < 1e-6);
     }
 
     #[test]
