@@ -4,6 +4,8 @@
 pub(crate) mod emission;
 #[cfg(any(target_arch = "wasm32", test))]
 pub(crate) mod engine;
+#[cfg(test)]
+mod evals;
 #[cfg(any(target_arch = "wasm32", test))]
 pub(crate) mod models;
 #[cfg(any(target_arch = "wasm32", test))]

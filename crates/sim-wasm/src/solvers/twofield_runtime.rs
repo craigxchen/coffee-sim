@@ -219,6 +219,10 @@ fn setup_for_scene_spec(scene_spec: &SceneSpec) -> Result<(Scene, Materials, Con
                 tf_absorb_rate: 0.15,
                 tf_wet_cohesion: 4.0,
                 tf_filter_floor: true,
+                tf_flip_c_surface: 0.1,
+                tf_flip_density_gate: 0.5,
+                tf_flip_div_scale: 1.0,
+                tf_flip_water_splash_cap: 20.0,
                 ..Config::default()
             };
             Ok((scene, materials, config))
@@ -235,6 +239,10 @@ fn setup_for_scene_spec(scene_spec: &SceneSpec) -> Result<(Scene, Materials, Con
                 nozzle_radius: 0.55,
                 max_speed: 12.0,
                 xsph_viscosity_c: 0.02,
+                tf_flip_c_surface: 0.1,
+                tf_flip_density_gate: 0.5,
+                tf_flip_div_scale: 1.0,
+                tf_flip_water_splash_cap: 20.0,
                 ..Config::default()
             };
             Ok((scene, materials, config))

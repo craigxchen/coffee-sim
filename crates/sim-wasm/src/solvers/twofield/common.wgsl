@@ -6,11 +6,13 @@
 // each pipeline's auto layout (`layout: None`) keeps only the bindings its entry point
 // actually uses, but an index never means two different buffers.
 //
-// Storage-buffer budget (KTD-7): the device requests 9 storage buffers per stage
-// (src/utils/gpu.rs NEEDED_STORAGE_BUFFERS) and U2 does NOT raise it — the widest entry point
-// (g2p_water) binds 5 (see MAX_STORAGE_BUFFERS_PER_ENTRY_POINT in mod.rs for the per-pass
-// derivation). Grid mass+momentum share ONE array<atomic<i32>> with stride 4 (mass, mom.xyz)
-// rather than four arrays — one binding, one clear pass, contiguous per-node lanes.
+// Storage-buffer budget (KTD-7): the widest entry point binds 7 storage buffers
+// (MAX_STORAGE_BUFFERS_PER_ENTRY_POINT in mod.rs — g2p_solid / cell_classify; see the per-pass
+// derivation there); the device requests 9 per stage (src/utils/gpu.rs NEEDED_STORAGE_BUFFERS),
+// both within the 16 hardware cap. U1 adds NO binding (the flip knob is a Params lane, and
+// g2p_water reads only the already-bound vel/grid_vel). Grid mass+momentum share ONE
+// array<atomic<i32>> with stride 4 (mass, mom.xyz) rather than four arrays — one binding, one
+// clear pass, contiguous per-node lanes.
 //
 // Tint discipline: any workgroupBarrier() must be reachable from uniform control flow — no
 // early returns before a barrier (clamp indices and predicate the work instead). No pass in
@@ -19,7 +21,7 @@
 const PHASE_WATER: u32 = 0u;
 const PHASE_SOLID: u32 = 1u;
 
-// Byte-identical to the Rust `Params` (160 bytes; vec4-aligned tail).
+// Byte-identical to the Rust `Params` (272 bytes after the U1 `flip` vec4; vec4-aligned tail).
 struct Params {
     box_min: vec4<f32>,     // simulation domain (w unused)
     box_max: vec4<f32>,     // (w unused)
@@ -50,9 +52,20 @@ struct Params {
     wet1: vec4<f32>, // (suction body-force accel a_suction, bloom_delay seconds, filter_floor
                      //  flag, V_dry = grain sphere volume π/6·d³)
     dbg: vec4<f32>,  // diagnostic toggles (test-only): .x = density-relief enable (1 = on);
-                     //  .y carried a prototyped relief dead-band that was DROPPED — now unread
-                     //  (the settled-pool stirring fix is the G2P PIC blend, PIC_BLEND_DEFAULT —
-                     //  see transfers.wgsl / mod.rs); .zw reserved
+                     //  .y = SDF wall-BC mode selector: ≤ 0.5 → binary no-penetration band
+                     //  (default, byte-identical to pre-coverage); > 0.5 → graded coverage weight
+                     //  (wall_coverage in pressure.wgsl — the embedded-boundary L1 path). (Formerly
+                     //  a dropped relief dead-band; the settled-pool stirring fix is the G2P PIC
+                     //  blend PIC_BLEND_DEFAULT.) .z = temper-K rate divisor for the uncapped path
+                     //  (0 ⇒ K=1 full uncap; legacy cap 30; sweet spot K∈(1,30)). .w = uncapped two-sided
+                     //  density-target mode (≤ 0.5 → legacy rate-limited two-sided relief, default
+                     //  & byte-identical; > 0.5 → relief uncapped to full strength, driving ρ→ρ₀
+                     //  — the over-pack fix; see cell_classify in pressure.wgsl / surface.wgsl).
+    flip: vec4<f32>, // U1 surface-weighted dissipation knob (g2p_water, transfers.wgsl):
+                     //  (c_surface, density_gate, div_scale, water_splash_cap). DISABLED default —
+                     //  c_surface = 1.0 ⇒ v = v_grid = pure-PIC; div_scale ≤ 0 ⇒ merge discriminator
+                     //  off; water_splash_cap ≤ 0 ⇒ fall back to the global max_speed. The U2 curve
+                     //  reads these; plumbed-but-unused in U1 (default path stays pure-PIC).
 };
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -145,6 +158,21 @@ fn bspline_w(fx: vec3<f32>) -> array<vec3<f32>, 3> {
     return w;
 }
 
+// Analytic d/dfx of bspline_w (per axis), so ∂w/∂x = dw/h (the 1/h chain-rule scale is applied
+// by the caller). Used by g2p_water's mass-gradient gather (U2 surface-weighted dissipation):
+// ∇w_3d = (dw.x·w.y·w.z, w.x·dw.y·w.z, w.x·w.y·dw.z)/h. NOT reusable from APIC's B (which uses the
+// d-offset form, not ∇w) — a few extra ALU ops, no new binding.
+//   d/dfx [0.5·(1.5−fx)²] = −(1.5 − fx)
+//   d/dfx [0.75 − (fx−1)²] = −2·(fx − 1)
+//   d/dfx [0.5·(fx−0.5)²]  =  (fx − 0.5)
+fn bspline_dw(fx: vec3<f32>) -> array<vec3<f32>, 3> {
+    var dw: array<vec3<f32>, 3>;
+    dw[0] = -(1.5 - fx);
+    dw[1] = -2.0 * (fx - 1.0);
+    dw[2] = fx - 0.5;
+    return dw;
+}
+
 // --- grid indexing -----------------------------------------------------------------------------
 // Flat node index, x-fastest. Node world position = grid_origin + (i,j,k)·h.
 fn node_index(n: vec3<i32>) -> u32 {
@@ -159,12 +187,12 @@ fn node_coords(flat: u32) -> vec3<u32> {
 // --- SDF cavity geometry (mirrors utils/sdf.rs; interior positive, gradient toward the cavity) --
 // Byte-identical to the Rust `Primitive` (64 bytes). Cone radii in `a` are OUTER wall radii.
 struct Primitive {
-    kind: u32,          // 0 = cone, 1 = cylinder
+    kind: u32,          // 0 = cone, 1 = cylinder, 2 = poly-cup
     species_mask: u32,
     friction: f32,
     flags: u32,         // bit0 = apex_open
-    a: vec4<f32>,       // cone:(apex_y, apex_r, top_y, top_r)  cyl:(floor_y, rim_y, radius, _)
-    b: vec4<f32>,       // cone:(thickness, hole_radius, center_x, center_z)  cyl:(center_x, center_z, _, _)
+    a: vec4<f32>,       // cone:(apex_y, apex_r, top_y, top_r)  cyl:(floor_y, rim_y, radius, _)  poly:(floor_y, rim_y, apothem, sides)
+    b: vec4<f32>,       // cone:(thickness, hole_radius, center_x, center_z)  cyl/poly:(center_x, center_z, _, _)
     c: vec4<f32>,       // reserved
 };
 @group(0) @binding(8) var<storage, read> solids: array<Primitive>;
@@ -259,8 +287,37 @@ fn cyl_cavity(prim: Primitive, p: vec3<f32>) -> SolidHit {
     return SolidHit(d_floor, vec3<f32>(0.0, 1.0, 0.0), prim.friction);
 }
 
+// DIAGNOSTIC: regular N-gon prism cup (mirror of sdf.rs::poly_cavity). Face normals at 2πk/N
+// (k=0 → +x), so sides=4 is an axis-aligned square. Inner side dist = apothem − max_k(rel·n_k).
+fn poly_cavity(prim: Primitive, p: vec3<f32>) -> SolidHit {
+    let floor_y = prim.a.x;
+    let rim_y = prim.a.y;
+    let apothem = prim.a.z;
+    let sides = max(u32(prim.a.w), 3u);
+    let center = vec2<f32>(prim.b.x, prim.b.y);
+    let rel = vec2<f32>(p.x - center.x, p.z - center.y);
+    let y = p.y;
+    if (y > rim_y) { return SolidHit(SDF_FREE, vec3<f32>(0.0, 1.0, 0.0), prim.friction); }
+    var maxproj = -1.0e30;
+    var bestn = vec2<f32>(1.0, 0.0);
+    let tau = 6.28318530718;
+    for (var k = 0u; k < sides; k = k + 1u) {
+        let ang = tau * f32(k) / f32(sides);
+        let nk = vec2<f32>(cos(ang), sin(ang));
+        let proj = dot(rel, nk);
+        if (proj > maxproj) { maxproj = proj; bestn = nk; }
+    }
+    let d_side = apothem - maxproj;
+    let d_floor = y - floor_y;
+    if (d_side <= d_floor) {
+        return SolidHit(d_side, sdf_normalize3(vec3<f32>(-bestn.x, 0.0, -bestn.y)), prim.friction);
+    }
+    return SolidHit(d_floor, vec3<f32>(0.0, 1.0, 0.0), prim.friction);
+}
+
 fn solid_cavity(prim: Primitive, p: vec3<f32>) -> SolidHit {
     if (prim.kind == 0u) { return cone_cavity(prim, p); }
+    if (prim.kind == 2u) { return poly_cavity(prim, p); }
     return cyl_cavity(prim, p);
 }
 
@@ -275,4 +332,114 @@ fn solid_union(p: vec3<f32>, ph: u32) -> SolidHit {
         if (hit.dist < best.dist) { best = hit; }
     }
     return best;
+}
+
+// MULTI-NORMAL wall BC (plan 2026-06-17-002): all cavity FACES within `band` of p, generalizing
+// solid_union's single most-penetrated pick. At a concave seam (cup floor∩wall) two faces are
+// in-band and BOTH must be constrained — solid_union would return only one, leaving the other
+// direction free (the corner over-pack). `band` is passed in (= WALL_BAND·h; WALL_BAND lives in
+// pressure.wgsl, concatenated after this file). Floor face is pushed FIRST per primitive so the
+// rank-aware basis build (build_constraint_basis) never drops it. cone stays single-normal (it is
+// one smooth converging surface, not discrete faces). Cap WF_MAX candidates.
+const WF_MAX: u32 = 4u;
+struct WallFaces { n: array<vec3<f32>, 4>, count: u32 };
+
+fn wf_push(wf: ptr<function, WallFaces>, nrm: vec3<f32>) {
+    let c = (*wf).count;
+    if (c < WF_MAX && length(nrm) > SDF_EPS) {
+        (*wf).n[c] = sdf_normalize3(nrm);
+        (*wf).count = c + 1u;
+    }
+}
+
+// Orthonormal constraint basis Q (≤3 columns) for the MULTI-NORMAL wall BC: the active box-face
+// axes plus the in-band SDF wall normals, orthonormalized by modified Gram-Schmidt. The projector
+// is P = I − Q·Qᵀ — a TRUE orthogonal projector (PSD for ANY normals, even a non-orthogonal poly
+// vertical edge, where a raw Σ n̂n̂ᵀ would be non-PSD and break A = D·M̃⁻¹·G). `node_setup` builds
+// M̃⁻¹ = invr·P and `drag_fold` applies v ← P·v from the SAME basis (lockstep). box_mask bits:
+// 1 = x axis constrained, 2 = y, 4 = z (the axes node_setup/drag_fold zero on box faces). Rank-aware:
+// box axes first, then wall faces residualized + dropped if near-dependent, stop at rank 3 — so a
+// floor normal is never crowded out (the floor face is pushed first by wall_binding_faces).
+const CB_RESIDUAL_MIN: f32 = 1.0e-3;
+struct CBasis { q: array<vec3<f32>, 3>, count: u32 };
+
+fn cb_push_ortho(cb: ptr<function, CBasis>, v: vec3<f32>) {
+    if ((*cb).count >= 3u) { return; }
+    var r = v;
+    for (var j = 0u; j < (*cb).count; j = j + 1u) {
+        r = r - (*cb).q[j] * dot((*cb).q[j], r);
+    }
+    let len = length(r);
+    if (len > CB_RESIDUAL_MIN) {
+        (*cb).q[(*cb).count] = r / len;
+        (*cb).count = (*cb).count + 1u;
+    }
+}
+
+fn build_constraint_basis(box_mask: u32, faces: WallFaces) -> CBasis {
+    var cb: CBasis;
+    cb.count = 0u;
+    if ((box_mask & 1u) != 0u) { cb_push_ortho(&cb, vec3<f32>(1.0, 0.0, 0.0)); }
+    if ((box_mask & 2u) != 0u) { cb_push_ortho(&cb, vec3<f32>(0.0, 1.0, 0.0)); }
+    if ((box_mask & 4u) != 0u) { cb_push_ortho(&cb, vec3<f32>(0.0, 0.0, 1.0)); }
+    for (var i = 0u; i < faces.count; i = i + 1u) {
+        cb_push_ortho(&cb, faces.n[i]);
+    }
+    return cb;
+}
+
+// Apply P = I − Q·Qᵀ to a vector (Q orthonormal ⇒ subtract each column's projection of the
+// ORIGINAL v). Used by drag_fold for the velocity BC; node_setup builds the matrix form inline.
+fn cbasis_project_vec(cb: CBasis, v: vec3<f32>) -> vec3<f32> {
+    var out = v;
+    for (var i = 0u; i < cb.count; i = i + 1u) {
+        out = out - cb.q[i] * dot(cb.q[i], v);
+    }
+    return out;
+}
+
+fn wall_binding_faces(p: vec3<f32>, ph: u32, band: f32) -> WallFaces {
+    var wf: WallFaces;
+    wf.count = 0u;
+    let ns = params.num_solids;
+    for (var i = 0u; i < ns; i = i + 1u) {
+        let prim = solids[i];
+        if ((prim.species_mask & (1u << ph)) == 0u) { continue; }
+        if (prim.kind == 0u) {
+            // cone: single smooth surface — one nearest normal, in-band only.
+            let hit = cone_cavity(prim, p);
+            if (hit.dist < band) { wf_push(&wf, hit.grad); }
+        } else if (prim.kind == 2u) {
+            // poly cup: floor + every in-band side face (vertical edges yield 2 sides).
+            let floor_y = prim.a.x; let rim_y = prim.a.y; let apothem = prim.a.z;
+            let sides = max(u32(prim.a.w), 3u);
+            let center = vec2<f32>(prim.b.x, prim.b.y);
+            let rel = vec2<f32>(p.x - center.x, p.z - center.y);
+            if (p.y <= rim_y) {
+                if ((p.y - floor_y) < band) { wf_push(&wf, vec3<f32>(0.0, 1.0, 0.0)); }
+                let tau = 6.28318530718;
+                for (var k = 0u; k < sides; k = k + 1u) {
+                    let ang = tau * f32(k) / f32(sides);
+                    let nk = vec2<f32>(cos(ang), sin(ang));
+                    if ((apothem - dot(rel, nk)) < band) {
+                        wf_push(&wf, vec3<f32>(-nk.x, 0.0, -nk.y));
+                    }
+                }
+            }
+        } else {
+            // cylinder cup: floor + radial side face when in-band.
+            let floor_y = prim.a.x; let rim_y = prim.a.y; let radius = prim.a.z;
+            let center = vec2<f32>(prim.b.x, prim.b.y);
+            let rel = vec2<f32>(p.x - center.x, p.z - center.y);
+            let r = length(rel);
+            if (p.y <= rim_y) {
+                if ((p.y - floor_y) < band) { wf_push(&wf, vec3<f32>(0.0, 1.0, 0.0)); }
+                if ((radius - r) < band && r >= SDF_EPS) {
+                    let rh = rel / r;
+                    wf_push(&wf, vec3<f32>(-rh.x, 0.0, -rh.y));
+                }
+            }
+        }
+    }
+    return wf;
 }

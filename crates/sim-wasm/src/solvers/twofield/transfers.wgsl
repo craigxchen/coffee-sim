@@ -16,6 +16,31 @@
 // Only the WATER range [0, water_count) is touched here — the U6 solid-mass P2G and the drag
 // fold live in coupling.wgsl (KTD-1 phase-range dispatches, no per-particle phase branch).
 
+// --- U2 surface-weighted velocity-averaging dissipation consts (g2p_water) --------------------
+// Compile-time tuning for the merge-discriminator curve (the runtime lanes are params.flip =
+// (c_surface, density_gate, div_scale, water_splash_cap); see common.wgsl). Starting values —
+// to be re-tuned by the visual oracle in U4; they have NO effect on the disabled default path
+// (c_surface = 1.0 ⇒ c = 1 ⇒ v = v_grid, C unchanged = pure-PIC).
+//   APPROACH_SCALE — gain on the directional approach-into-density signal (the robust merge
+//     term; post-projection div is weak). approach is a speed (world units/frame); a merging
+//     drip approaches the slow pool at O(several) units, so a scale of 0.5 saturates merge≈1
+//     by ~2 units of approach.
+//   W — width of the density smoothstep above density_gate (in rest-cell units, where a fully
+//     packed cell reads m_local/(8·particle_mass) ≈ 1); 0.25 ramps the bulk term over a
+//     quarter-cell of fill above the gate.
+//   AFFINE_DAMP_K — how much of the affine C is shed at full preserve (c = c_surface): C is
+//     multiplied by (1 − K·(1−c)), so c=1 ⇒ ×1 (bulk unchanged), strong preserve ⇒ C shed by
+//     ~K. ≈0.75 mirrors the prototype's affine_damp.
+const APPROACH_SCALE: f32 = 0.5;
+const DENSITY_W: f32 = 0.25;
+const AFFINE_DAMP_K: f32 = 0.75;
+const GRAD_M_EPS: f32 = 1.0e-6;
+// dens_c (bulk-calm term) must damp ONLY the settled pool (dense AND slow) — a dense but
+// fast-moving pour stream must NOT be bulk-damped or the free water re-mushes. Gate dens_c off
+// as cell speed rises past DENS_SLOW_HI (visual-oracle starting values; tune by eye).
+const DENS_SLOW_LO: f32 = 0.5;
+const DENS_SLOW_HI: f32 = 3.0;
+
 // Zero the fixed-point water-field lanes (mass + momentum), the solid-volume lane (U6), and
 // the per-cell particle counts for this frame's scatter (cells < nodes, so the node-sized
 // dispatch covers both).
@@ -84,6 +109,12 @@ fn p2g_water(@builtin(global_invocation_id) gid: vec3<u32>) {
     );
     atomicAdd(&cell_cnt[cell_index(ci)], 1u);
 
+    // U3 separate water-splash cap (flip.w): the crown's peak velocity survives a higher cap on
+    // the water path while the solid clamps stay on the global max_speed. Sentinel ≤ 0 ⇒ fall
+    // back to the global max_speed (byte-identical default). The FP momentum-headroom bound in
+    // common.wgsl is re-derived against this cap (∝ 8192/cap).
+    let water_cap = select(params.max_speed, params.flip.w, params.flip.w > 0.0);
+
     for (var k = 0; k < 3; k = k + 1) {
         for (var j = 0; j < 3; j = j + 1) {
             for (var i = 0; i < 3; i = i + 1) {
@@ -91,11 +122,11 @@ fn p2g_water(@builtin(global_invocation_id) gid: vec3<u32>) {
                 let node = base + vec3<i32>(i, j, k);
                 let d = (vec3<f32>(node) - xl) * h; // x_i − x_p (world units)
                 var vaff = v + vec3<f32>(dot(c0, d), dot(c1, d), dot(c2, d));
-                // Clamp the scattered magnitude to the velocity cap — this is what makes the
+                // Clamp the scattered magnitude to the water-splash cap — this is what makes the
                 // FP_SCALE momentum-headroom bound in common.wgsl hold by construction.
                 let s = length(vaff);
-                if (s > params.max_speed) {
-                    vaff = vaff * (params.max_speed / s);
+                if (s > water_cap) {
+                    vaff = vaff * (water_cap / s);
                 }
                 let idx = node_index(node) * 4u;
                 atomicAdd(&grid_fp[idx + 0u], fp_encode(m * wijk));
@@ -168,22 +199,37 @@ fn g2p_water(@builtin(global_invocation_id) gid: vec3<u32>) {
     base = clamp(base, vec3<i32>(0), vec3<i32>(params.grid_dims.xyz) - vec3<i32>(3));
     let fx = xl - vec3<f32>(base);
     var w = bspline_w(fx);
+    // U2: analytic weight derivative (1/h-scaled below) for the mass-gradient gather. The full
+    // 3D gradient at node (i,j,k) is (dw[i].x·w[j].y·w[k].z, w[i].x·dw[j].y·w[k].z,
+    // w[i].x·w[j].y·dw[k].z)/h. NOT reusable from B (which uses the d-offset form).
+    var dw = bspline_dw(fx);
 
     var v = vec3<f32>(0.0);
     var b0 = vec3<f32>(0.0); // rows of B = Σ w·v_i·dᵀ
     var b1 = vec3<f32>(0.0);
     var b2 = vec3<f32>(0.0);
+    var m_local = 0.0;             // U2: Σ w·node_mass (local density, grid_vel[].w)
+    var grad_m = vec3<f32>(0.0);   // U2: Σ ∇w·node_mass (mass gradient, world units)
     for (var k = 0; k < 3; k = k + 1) {
         for (var j = 0; j < 3; j = j + 1) {
             for (var i = 0; i < 3; i = i + 1) {
                 let wijk = w[i].x * w[j].y * w[k].z;
                 let node = base + vec3<i32>(i, j, k);
                 let d = (vec3<f32>(node) - xl) * h;
-                let gv = grid_vel[node_index(node)].xyz;
+                let gvel = grid_vel[node_index(node)];
+                let gv = gvel.xyz;
+                let gm = gvel.w; // decoded node mass
                 v = v + wijk * gv;
                 b0 = b0 + (wijk * gv.x) * d;
                 b1 = b1 + (wijk * gv.y) * d;
                 b2 = b2 + (wijk * gv.z) * d;
+                m_local = m_local + wijk * gm;
+                let gw = vec3<f32>(
+                    dw[i].x * w[j].y * w[k].z,
+                    w[i].x * dw[j].y * w[k].z,
+                    w[i].x * w[j].y * dw[k].z,
+                ) / h;
+                grad_m = grad_m + gw * gm;
             }
         }
     }
@@ -200,10 +246,53 @@ fn g2p_water(@builtin(global_invocation_id) gid: vec3<u32>) {
     var c1 = b1 * (dinv * apic_keep);
     var c2 = b2 * (dinv * apic_keep);
 
-    // Velocity cap backstop (anti-blow-up; the other half of the FP headroom contract).
+    // U2 surface-weighted velocity-averaging dissipation (KTD1/KTD2). `v` so far is the full
+    // local grid average v_grid (today's value = pure-PIC velocity). We blend it toward the
+    // particle's RETAINED momentum v_own by a surface-weighted strength c: c→1 (full average =
+    // calm bulk) where the particle merges into a dense slow neighborhood, c→c_surface (small =
+    // momentum-preserving = splash) for separating/coherent-free surface water. The DISABLED
+    // default (flip.x = c_surface = 1.0) makes c≡1 ⇒ v=v_grid, factor=1 ⇒ C unchanged ⇒
+    // byte-identical pure-PIC.
+    let c_surface = params.flip.x;     // small near-surface smoothing (1.0 ⇒ disabled = pure-PIC)
+    let density_gate = params.flip.y;  // bulk density gate (rest-cell units)
+    let div_scale = params.flip.z;     // merge-discriminator scale; ≤0 ⇒ whole discriminator off
+    let v_grid = v;
+    let v_own = vel[p].xyz + params.gravity.xyz * params.dt;
+    // Local velocity divergence ∇·v = dinv·trace(B) (B alone is NOT the gradient until ×dinv).
+    // Post-projection so weak/noisy — an input, not a proof (the approach term is the robust one).
+    let div = dinv * (b0.x + b1.y + b2.z);
+    // Directional approach into density: a drip merging INTO the pool moves UP the mass gradient
+    // (approach>0 ⇒ dissipate); a crown moving toward air reads approach≈0 ⇒ preserve. Stable
+    // normalization (NOT normalize(grad_m+eps), which biases the direction).
+    let n = grad_m / max(length(grad_m), GRAD_M_EPS);
+    let approach = max(0.0, dot(v_own - v_grid, n));
+    // Merge discriminator — the WHOLE block gated on div_scale>0 (≤0 ⇒ merge=0 = the density-only
+    // R5 negative control, same shader). Compressive div<0 OR fast approach-into-density ⇒ merge.
+    var merge = 0.0;
+    if (div_scale > 0.0) {
+        merge = clamp(max(-div * div_scale, approach * APPROACH_SCALE), 0.0, 1.0);
+    }
+    // Density term: calm the dense bulk even without merge-motion — but ONLY when the cell is
+    // also SLOW (the settled pool), never a dense fast pour stream (which must stay lively).
+    let slow = 1.0 - smoothstep(DENS_SLOW_LO, DENS_SLOW_HI, length(v_grid));
+    let dens_c = smoothstep(density_gate, density_gate + DENSITY_W, m_local / (8.0 * params.particle_mass)) * slow;
+    // Final smoothing strength, floored at c_surface (never below the preserve setpoint).
+    let c = clamp(max(max(c_surface, merge), dens_c), c_surface, 1.0);
+    // Apply: blend velocity toward the local average by c; damp the affine C proportional to the
+    // preserve amount (c=1 ⇒ ×1 = bulk unchanged; strong preserve ⇒ C shed by ~AFFINE_DAMP_K).
+    v = mix(v_own, v_grid, c);
+    let affine_keep = 1.0 - AFFINE_DAMP_K * (1.0 - c);
+    c0 = c0 * affine_keep;
+    c1 = c1 * affine_keep;
+    c2 = c2 * affine_keep;
+
+    // Velocity cap backstop (anti-blow-up; the other half of the FP headroom contract). U3: the
+    // water path uses the separate splash cap (flip.w) so the crown survives; sentinel ≤ 0 ⇒
+    // global max_speed (byte-identical default).
+    let water_cap = select(params.max_speed, params.flip.w, params.flip.w > 0.0);
     let s = length(v);
-    if (s > params.max_speed) {
-        v = v * (params.max_speed / s);
+    if (s > water_cap) {
+        v = v * (water_cap / s);
     }
 
     x = x + v * params.dt;
