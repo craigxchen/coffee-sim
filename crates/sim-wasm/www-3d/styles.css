@@ -26,6 +26,7 @@ html, body {
 }
 
 .sidebar {
+  min-width: 0;
   padding: clamp(16px, 1.6vw, 24px);
   background: var(--panel);
   border-right: 1px solid var(--panel-border);
@@ -104,6 +105,7 @@ h1 {
 }
 
 .control-panel {
+  min-width: 0;
   display: grid;
   gap: 10px;
   padding: 12px;
@@ -344,6 +346,7 @@ h1 {
 }
 
 .slider-field {
+  min-width: 0;
   display: flex;
   justify-content: space-between;
   align-items: baseline;
@@ -359,11 +362,24 @@ h1 {
 }
 
 .solver-field {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
   align-items: center;
+}
+
+.solver-field span {
+  min-width: 0;
+}
+
+.solver-field select {
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
 }
 
 select {
   min-width: 96px;
+  max-width: 100%;
   height: 32px;
   padding: 4px 28px 4px 10px;
   border-radius: 8px;

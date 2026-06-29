@@ -1,10 +1,11 @@
-import init, { WasmSim3D } from "./pkg/coffee_sim_wasm.js?v=perf-improvements-1";
+import init, { WasmSim3D } from "./pkg/coffee_sim_wasm.js?v=particle-size-2";
 
 const canvas = document.getElementById("sim-canvas");
 const viewCubeStage = document.getElementById("view-cube-stage");
 const toggleButton = document.getElementById("toggle");
 const resetButton = document.getElementById("reset");
 const solverSelect = document.getElementById("solver-select");
+const solverEyebrow = document.getElementById("solver-eyebrow");
 const sceneMainTab = document.getElementById("scene-tab-main");
 const sceneDebugTab = document.getElementById("scene-tab-debug");
 const sceneMainPanel = document.getElementById("scene-panel-main");
@@ -67,7 +68,7 @@ const TIMESERIES_SAMPLE_INTERVAL = 6;
 const TIMESERIES_MAX_SAMPLES = 720;
 const HUD_REFRESH_INTERVAL = 6;
 const MAX_RENDER_DPR = 1.5;
-const ACTIVE_SOLVER_ID = "mpm";
+let activeSolverId = "mpm";
 let metricsSamplesPending = 0;
 let latestExactMetrics = null;
 const AUTO_PAUSE_DELAY_MS = 30_000;
@@ -248,8 +249,9 @@ async function bootstrap() {
   try {
     buildTimeseriesCharts();
     buildTimeseriesMenu();
-    await init();
+    await init(new URL("./pkg/coffee_sim_wasm_bg.wasm?v=particle-size-2", import.meta.url));
     app = await WasmSim3D.create(canvas);
+    populateSolverSelect();
     app.loadBenchmarkCenterPour();
     fixedStepSeconds = 1 / 60;
     syncControlDefaultsFromSim();
@@ -291,7 +293,7 @@ async function bootstrap() {
   });
 
   solverSelect.addEventListener("change", () => {
-    syncSolverSelect();
+    selectSolver(solverSelect.value);
   });
 
   toggleTimeseriesButton.addEventListener("click", () => {
@@ -319,6 +321,7 @@ async function bootstrap() {
   });
 
   sceneDebugTab.addEventListener("click", () => {
+    if (activeSolverId !== "mpm") return;
     setSceneTab("debug");
   });
 
@@ -331,6 +334,7 @@ async function bootstrap() {
   });
 
   sceneDebugPanel.addEventListener("click", (event) => {
+    if (activeSolverId !== "mpm") return;
     const button = event.target.closest("[data-debug-scene]");
     if (!button || !sceneDebugPanel.contains(button)) return;
     loadDebugScene(button.dataset.debugScene);
@@ -1001,13 +1005,67 @@ function applySpoutControls() {
 }
 
 function applySceneControls() {
+  const debugAvailable = activeSolverId === "mpm";
+  sceneDebugTab.disabled = !debugAvailable;
+  sceneDebugTab.setAttribute("aria-disabled", debugAvailable ? "false" : "true");
+  for (const button of sceneDebugPanel.querySelectorAll("button")) {
+    button.disabled = !debugAvailable;
+  }
+  if (!debugAvailable && currentSceneId.startsWith("debug:")) {
+    setSceneTab("main");
+  }
+}
+
+function populateSolverSelect() {
+  const solvers = Array.from(app.availableSolvers());
+  solverSelect.textContent = "";
+  for (const solver of solvers) {
+    const option = document.createElement("option");
+    option.value = solver.id;
+    option.textContent = solver.experimental
+      ? `${solver.name} (experimental)`
+      : solver.name;
+    solverSelect.append(option);
+  }
+  activeSolverId = app.activeSolver();
+  syncSolverSelect();
 }
 
 function syncSolverSelect() {
-  solverSelect.value = ACTIVE_SOLVER_ID;
+  activeSolverId = app?.activeSolver?.() ?? activeSolverId;
+  solverSelect.value = activeSolverId;
+  const selectedSolver = solverSelect.selectedOptions[0]?.textContent ?? "MPM";
+  solverEyebrow.textContent = `Coffee Sim / ${selectedSolver.replace(" (experimental)", "")}`;
+  applySceneControls();
+}
+
+function selectSolver(solverId) {
+  try {
+    app.setSolver(solverId);
+    activeSolverId = app.activeSolver();
+    if (activeSolverId !== "mpm" && currentSceneId.startsWith("debug:")) {
+      currentSceneId = "center-pour";
+      currentSceneMode = "Center Pour";
+      setSceneTab("main");
+    }
+    fixedStepSeconds = 1 / 60;
+    lastFrameTime = 0;
+    syncControlDefaultsFromSim();
+    applySceneControls();
+    setPaused(false);
+    syncUi();
+    resetTimeseries();
+  } catch (error) {
+    console.warn("Coffee sim solver switch failed", error);
+  } finally {
+    syncSolverSelect();
+  }
 }
 
 function setSceneTab(tabName) {
+  if (tabName === "debug" && activeSolverId !== "mpm") {
+    tabName = "main";
+  }
   const debugSelected = tabName === "debug";
   sceneMainTab.classList.toggle("is-active", !debugSelected);
   sceneDebugTab.classList.toggle("is-active", debugSelected);
@@ -1018,6 +1076,7 @@ function setSceneTab(tabName) {
 }
 
 function finishSceneLoad({ sceneId, label, tab, pausedOnLoad = false }) {
+  activeSolverId = app.activeSolver();
   syncControlDefaultsFromSim();
   applySceneControls();
   fixedStepSeconds = 1 / 60;
@@ -1052,6 +1111,10 @@ function loadFreeStreamScene() {
 }
 
 function loadDebugScene(sceneId) {
+  if (activeSolverId !== "mpm") {
+    loadCenterPourScene();
+    return;
+  }
   app.loadDebugScene(sceneId);
   finishSceneLoad({
     sceneId: `debug:${sceneId}`,
@@ -1063,6 +1126,10 @@ function loadDebugScene(sceneId) {
 
 function reloadCurrentScene() {
   if (currentSceneId.startsWith("debug:")) {
+    if (activeSolverId !== "mpm") {
+      loadCenterPourScene();
+      return;
+    }
     loadDebugScene(currentSceneId.slice("debug:".length));
   } else {
     app.reset();
@@ -1159,6 +1226,8 @@ function publishDebugHooks() {
     isPaused: () => paused,
     loadDebugScene,
     debugScenes: Object.fromEntries(DEBUG_SCENE_LABELS),
+    activeSolver: () => activeSolverId,
+    setSolver: selectSolver,
     setPressureResidualAdaptation: (target, maxPairs) => {
       app.setPressureResidualAdaptation(target, maxPairs);
     },
@@ -1254,12 +1323,19 @@ function loadEvaluationScene(scene) {
     setSceneTab("main");
   } else if (scene === "water-block" || DEBUG_SCENE_LABELS.has(scene)) {
     const sceneId = scene === "water-block" ? "filter-water-block" : scene;
-    app.loadDebugScene(sceneId);
-    currentSceneMode = DEBUG_SCENE_LABELS.get(sceneId) ?? sceneId;
-    currentSceneId = `debug:${sceneId}`;
-    setSceneTab("debug");
-    if (DEBUG_SCENE_PAUSE_ON_LOAD.has(sceneId)) {
-      app.stepFrame(0);
+    if (activeSolverId === "mpm") {
+      app.loadDebugScene(sceneId);
+      currentSceneMode = DEBUG_SCENE_LABELS.get(sceneId) ?? sceneId;
+      currentSceneId = `debug:${sceneId}`;
+      setSceneTab("debug");
+      if (DEBUG_SCENE_PAUSE_ON_LOAD.has(sceneId)) {
+        app.stepFrame(0);
+      }
+    } else {
+      app.loadBenchmarkCenterPour();
+      currentSceneMode = "Center Pour";
+      currentSceneId = "center-pour";
+      setSceneTab("main");
     }
   } else {
     app.loadBenchmarkCenterPour();

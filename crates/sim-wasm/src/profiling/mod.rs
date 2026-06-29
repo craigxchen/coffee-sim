@@ -3,6 +3,19 @@ use std::str::FromStr;
 
 use serde::Serialize;
 
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Profile {
+    pub(crate) passes: Vec<(String, f32)>,
+    pub(crate) dispatches_per_frame: u32,
+}
+
+impl Profile {
+    #[allow(dead_code)]
+    pub(crate) fn total_micros(&self) -> f32 {
+        self.passes.iter().map(|(_, micros)| *micros).sum()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SolverSpec {
     Mpm,
