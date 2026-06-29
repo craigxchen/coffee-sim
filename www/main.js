@@ -10,7 +10,21 @@ const toggleButton = document.getElementById("toggle");
 const resetButton = document.getElementById("reset");
 const sceneCenterPourButton = document.getElementById("scene-center-pour");
 const sceneFreeStreamButton = document.getElementById("scene-free-stream");
+const sceneMainTab = document.getElementById("scene-tab-main");
+const sceneDebugTab = document.getElementById("scene-tab-debug");
+const sceneMainPanel = document.getElementById("scene-panel-main");
+const sceneDebugPanel = document.getElementById("scene-panel-debug");
 const solverSelect = document.getElementById("solver-select");
+
+// Debug scenes that should load with a tuned spout: id -> { velocity?, spout? } overrides applied
+// after loadDebugScene. Off-center wall pour parks the stream toward the filter wall; the free-jet
+// runs slow + thin; the high-velocity impact runs fast. Anything not listed keeps the sim defaults.
+const DEBUG_SCENE_OVERRIDES = new Map([
+  ["off-center-filter-wall-pour", { velocity: 0.28, spout: [2.0, 5.0, 0.0] }],
+  ["sparse-free-jet", { velocity: 0.18, spout: [0.0, 5.0, 0.0] }],
+  ["high-velocity-jet-impact", { velocity: 0.48, spout: [0.0, 5.0, 0.0] }],
+  ["particle-capacity-stress", { velocity: 0.42, spout: [0.0, 5.0, 0.0] }],
+]);
 const waterVelocityInput = document.getElementById("water-velocity");
 const waterVelocityValue = document.getElementById("water-velocity-value");
 const spoutPlane = document.getElementById("spout-plane");
@@ -101,6 +115,17 @@ function installListeners() {
     app.loadWaterOnly();
     syncControlDefaultsFromSim();
     syncUi();
+  });
+
+  // Scene-group tabs (Scenes / Debug Scenes).
+  sceneMainTab.addEventListener("click", () => setSceneTab("main"));
+  sceneDebugTab.addEventListener("click", () => setSceneTab("debug"));
+
+  // Delegated handler: any [data-debug-scene] button loads that scene by id.
+  sceneDebugPanel.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-debug-scene]");
+    if (!button || !sceneDebugPanel.contains(button)) return;
+    loadDebugScene(button.dataset.debugScene);
   });
 
   solverSelect.addEventListener("change", () => {
@@ -325,6 +350,34 @@ function syncControlDefaultsFromSim() {
   spoutX = clamp(snap(app.spoutX()), SPOUT_X_MIN, SPOUT_X_MAX);
   spoutZ = clamp(snap(app.spoutZ()), SPOUT_Z_MIN, SPOUT_Z_MAX);
   spoutHeightInput.value = app.spoutY().toFixed(1);
+}
+
+// Toggle the Scenes / Debug Scenes tab pair (mirrors main's setSceneTab).
+function setSceneTab(which) {
+  const debug = which === "debug";
+  sceneMainTab.classList.toggle("is-active", !debug);
+  sceneDebugTab.classList.toggle("is-active", debug);
+  sceneMainTab.setAttribute("aria-selected", String(!debug));
+  sceneDebugTab.setAttribute("aria-selected", String(debug));
+  sceneMainPanel.hidden = debug;
+  sceneDebugPanel.hidden = !debug;
+}
+
+// Load a Debug Scenes catalog entry by kebab id, then apply any per-scene spout/velocity override.
+function loadDebugScene(sceneId) {
+  app.loadDebugScene(sceneId);
+  const override = DEBUG_SCENE_OVERRIDES.get(sceneId);
+  if (override) {
+    if (override.velocity !== undefined) {
+      app.setWaterVelocityMetersPerSecond(override.velocity);
+    }
+    if (override.spout) {
+      const [x, y, z] = override.spout;
+      app.setSpoutPosition(x, y, z);
+    }
+  }
+  syncControlDefaultsFromSim();
+  syncUi();
 }
 
 // Fill the solver dropdown from the registry catalog ("id|name" rows) and select the active one.

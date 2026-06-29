@@ -241,6 +241,270 @@ impl Scene {
         }
     }
 
+    // === Debug-scene catalog (ported by INTENT from the `main` MPM branch's DebugScene enum) ===
+    //
+    // Two families:
+    //  * Filter/bed scenes use the full V60 dripper (support cone + grains-only filter + cup), like
+    //    `v60`/`v60_pour`. Water is seeded inside the cone (cone-aware rejection trims it).
+    //  * Cup-water scenes isolate the cup: they keep the same dripper geometry (so the cup wall/floor
+    //    are present) but seed water ONLY inside the cup cavity (rim -3.5, floor -8, radius 3) with no
+    //    bed — the rewrite analogue of main's `cup_only_water_scene` (filter/bed stripped).
+    // Where a `main` scene is deeply MPM-specific (per-cell pressure-solve tuning), only the geometry/
+    // seed intent is ported; solver-tuning knobs live in `web::setup_for`, not the `Scene`.
+
+    /// DEBUG (`filter-water-block`): a still block of water resting inside the filter cone over the
+    /// coffee bed, no pour — the static filter-confinement counterpart to [`Scene::v60`]. Same V60
+    /// geometry + bed; the water column just settles. (main: `seed_filter_water_block`.)
+    pub fn debug_filter_water_block() -> Self {
+        Self::v60()
+    }
+
+    /// DEBUG (`off-center-filter-wall-pour`): the V60 pour brew, but the live spout is parked toward
+    /// the filter wall (off-axis) so the stream runs down one side. Same geometry/bed as
+    /// [`Scene::v60_pour`]; `web::setup_for` parks the spout off-center.
+    pub fn debug_off_center_filter_wall_pour() -> Self {
+        Self::v60_pour()
+    }
+
+    /// DEBUG (`seeded-paper-wall-sheet`): a thin sheet of water clinging to the filter wall, no pour —
+    /// tests wall contact / sheet drainage on the grains-only filter. Approximated as a tall, thin
+    /// water slab offset against one side of the filter cone (rejection trims it to the cavity); the
+    /// bed is dropped so the sheet drains freely. (main: `seed_paper_wall_sheet`, an arc of particles
+    /// hugging the wall.)
+    pub fn debug_seeded_paper_wall_sheet() -> Self {
+        Self {
+            dose_g: 0.0,
+            water_ml: 60.0,
+            pour_water_ml: 0.0,
+            gravity: [0.0, -20.0, 0.0],
+            box_min: [-7.0, -10.0, -7.0],
+            box_max: [7.0, 10.0, 7.0],
+            solids: crate::utils::geometry::v60_dripper(),
+            // Thin slab offset to +x, hugging the filter wall; rejection trims it to the cavity so it
+            // starts as a sheet on the wall rather than a centered column.
+            regions: vec![SeedRegion {
+                min: [0.6, -1.0, -2.2],
+                max: [2.4, 2.2, 2.2],
+                species: Species::Water,
+            }],
+        }
+    }
+
+    /// DEBUG (`filter-apex-drain`): water seeded low in the filter cone near the apex with NO bed —
+    /// it drains straight through the support-cone outlet into the cup. Same dripper as
+    /// [`Scene::v60_pour_water_only`] minus the pour; a small low water plug seeds the drain.
+    /// (main: `seed_filter_apex_drain`.)
+    pub fn debug_filter_apex_drain() -> Self {
+        Self {
+            dose_g: 0.0,
+            water_ml: 40.0,
+            pour_water_ml: 0.0,
+            gravity: [0.0, -20.0, 0.0],
+            box_min: [-7.0, -10.0, -7.0],
+            box_max: [7.0, 10.0, 7.0],
+            solids: crate::utils::geometry::v60_dripper(),
+            // A small plug low in the cone (just above the apex); rejection trims it to the cavity.
+            regions: vec![SeedRegion {
+                min: [-1.2, -2.6, -1.2],
+                max: [1.2, -0.4, 1.2],
+                species: Species::Water,
+            }],
+        }
+    }
+
+    /// DEBUG (`cup-wall-floor-corner-contact`): cup-only water resting in a wedge against one wall +
+    /// the floor — the wall/floor corner-contact stability case. Seeds a water slab biased to +x and
+    /// low in the cup cavity (rejection trims it to the cylinder). No bed, no pour.
+    /// (main: `seed_cup_wall_floor_corner_contact`.)
+    pub fn debug_cup_wall_floor_corner_contact() -> Self {
+        Self {
+            dose_g: 0.0,
+            water_ml: 120.0,
+            pour_water_ml: 0.0,
+            gravity: [0.0, -20.0, 0.0],
+            box_min: [-7.0, -10.0, -7.0],
+            box_max: [7.0, 10.0, 7.0],
+            solids: crate::utils::geometry::v60_dripper(),
+            // Slab in the +x half of the cup floor (corner against the +x wall); cup rejection trims.
+            regions: vec![SeedRegion {
+                min: [0.3, -7.85, -2.85],
+                max: [2.85, -6.4, 2.85],
+                species: Species::Water,
+            }],
+        }
+    }
+
+    /// DEBUG (`asymmetric-cup-mound-settle`): cup-only water seeded as an off-center mound that
+    /// settles into a level pool — tests asymmetric free-surface relaxation. Approximated as a water
+    /// slab offset to one quadrant of the cup floor (rejection trims it to the cylinder). No bed/pour.
+    /// (main: `seed_asymmetric_cup_mound`, an offset ellipsoid.)
+    pub fn debug_asymmetric_cup_mound_settle() -> Self {
+        Self {
+            dose_g: 0.0,
+            water_ml: 120.0,
+            pour_water_ml: 0.0,
+            gravity: [0.0, -20.0, 0.0],
+            box_min: [-7.0, -10.0, -7.0],
+            box_max: [7.0, 10.0, 7.0],
+            solids: crate::utils::geometry::v60_dripper(),
+            // Off-center mound: a taller slab biased to the (+x, -z) quadrant; cup rejection trims it.
+            regions: vec![SeedRegion {
+                min: [-0.4, -7.85, -2.85],
+                max: [2.85, -4.8, 0.6],
+                species: Species::Water,
+            }],
+        }
+    }
+
+    /// DEBUG (`hydrostatic-column`): cup-only water as a tall, narrow on-axis column — the classic
+    /// hydrostatic-pressure / no-spurious-drift check. Seeds a thin centered column in the cup cavity.
+    /// No bed, no pour. (main: `seed_hydrostatic_column`.)
+    pub fn debug_hydrostatic_column() -> Self {
+        Self {
+            dose_g: 0.0,
+            water_ml: 120.0,
+            pour_water_ml: 0.0,
+            gravity: [0.0, -20.0, 0.0],
+            box_min: [-7.0, -10.0, -7.0],
+            box_max: [7.0, 10.0, 7.0],
+            solids: crate::utils::geometry::v60_dripper(),
+            // Narrow centered column (radius ~1) standing tall in the cup; cup rejection trims it.
+            regions: vec![SeedRegion {
+                min: [-1.0, -7.85, -1.0],
+                max: [1.0, -4.0, 1.0],
+                species: Species::Water,
+            }],
+        }
+    }
+
+    /// DEBUG (`dam-break-slosh`): cup-only water filling one half of the cup, released so it surges
+    /// across and sloshes back. The cup analogue of [`Scene::dam_break`]. Seeds a half-cup slab biased
+    /// to -x in the cup cavity (rejection trims it). No bed, no pour.
+    /// (main: `seed_dam_break_slosh`.)
+    pub fn debug_dam_break_slosh() -> Self {
+        Self {
+            dose_g: 0.0,
+            water_ml: 120.0,
+            pour_water_ml: 0.0,
+            gravity: [0.0, -20.0, 0.0],
+            box_min: [-7.0, -10.0, -7.0],
+            box_max: [7.0, 10.0, 7.0],
+            solids: crate::utils::geometry::v60_dripper(),
+            // Half-cup dam in the -x half, ~2.3 units tall; cup rejection trims it to the cylinder.
+            regions: vec![SeedRegion {
+                min: [-2.85, -7.85, -2.85],
+                max: [-0.2, -5.5, 2.85],
+                species: Species::Water,
+            }],
+        }
+    }
+
+    /// DEBUG (`sparse-free-jet`): a thin, slow pour into the EMPTY cup — a sparse free stream that
+    /// falls and pools. Same dripper as [`Scene::v60_pour_water_only`] (no bed); `web::setup_for` runs
+    /// it with a thin nozzle + low velocity so the stream stays sparse. (main: `debug_sparse_free_jet`.)
+    pub fn debug_sparse_free_jet() -> Self {
+        Self::v60_pour_water_only()
+    }
+
+    /// DEBUG (`high-velocity-jet-impact`): a fast pour plunging onto a shallow seeded pool in the cup —
+    /// the jet-impact / crater case. Reuses the cup pool seed (like [`Scene::v60_cup_static_full`]) AND
+    /// declares a pour so the (fast) emitter drives the impact. No bed.
+    /// (main: `seed_high_velocity_jet_impact_pool` + a high-speed inflow.)
+    pub fn debug_high_velocity_jet_impact() -> Self {
+        Self {
+            dose_g: 0.0,
+            water_ml: 100.0,
+            pour_water_ml: 150.0, // declares a pour so the fast jet emitter runs; headroom for inflow
+            gravity: [0.0, -20.0, 0.0],
+            box_min: [-7.0, -10.0, -7.0],
+            box_max: [7.0, 10.0, 7.0],
+            solids: crate::utils::geometry::v60_dripper(),
+            // Shallow target pool on the cup floor; cup rejection trims it to the cylinder.
+            regions: vec![SeedRegion {
+                min: [-2.85, -7.85, -2.85],
+                max: [2.85, -6.9, 2.85],
+                species: Species::Water,
+            }],
+        }
+    }
+
+    /// DEBUG (`uniform-bed-saturation`): the full V60 bed pre-seeded with water filling its pore
+    /// space (a water column co-located with the bed) — the uniform-saturation / drainage case. Same
+    /// geometry/bed as [`Scene::v60`]; the water column spans the bed instead of resting above it.
+    /// No pour. (main: `seed_uniform_bed_saturation`.)
+    pub fn debug_uniform_bed_saturation() -> Self {
+        Self {
+            dose_g: 15.0,
+            water_ml: 250.0,
+            pour_water_ml: 0.0,
+            gravity: [0.0, -20.0, 0.0],
+            box_min: [-7.0, -10.0, -7.0],
+            box_max: [7.0, 10.0, 7.0],
+            solids: crate::utils::geometry::v60_dripper(),
+            regions: vec![
+                // Coffee bed (same block as v60; rejection trims to the filter cavity).
+                SeedRegion {
+                    min: [-2.5, -2.8, -2.5],
+                    max: [2.5, 0.2, 2.5],
+                    species: Species::Grain,
+                },
+                // Water seeded over the SAME y-span as the bed, so it starts inside the pore space
+                // (uniform saturation) rather than as a column resting on top.
+                SeedRegion {
+                    min: [-2.5, -2.8, -2.5],
+                    max: [2.5, 0.4, 2.5],
+                    species: Species::Water,
+                },
+            ],
+        }
+    }
+
+    /// DEBUG (`permeability-comparison`): the V60 pour brew with a TIGHTER bed (lower permeability) so
+    /// water ponds and drains slowly — the permeability/drawdown stress case. Same geometry/bed/pour
+    /// as [`Scene::v60_pour`]; `web::setup_for` lowers the bed porosity + stiffens the Darcy drag.
+    /// (main: `debug_permeability_comparison`, Kozeny–Carman at a finer grind.)
+    pub fn debug_permeability_comparison() -> Self {
+        Self::v60_pour()
+    }
+
+    /// DEBUG (`particle-capacity-stress`): the V60 pour brew driven at a high flow rate to push the
+    /// particle pool — the capacity/throughput stress case. Same geometry/bed as [`Scene::v60_pour`]
+    /// with a larger `pour_water_ml` budget so the pool is sized big; `web::setup_for` runs a fat,
+    /// fast nozzle. (main: `debug_particle_capacity_stress`, max_particles 32k + high inflow.)
+    pub fn debug_particle_capacity_stress() -> Self {
+        Self {
+            pour_water_ml: 500.0, // big pool headroom for the high-flow stress
+            ..Self::v60_pour()
+        }
+    }
+
+    /// DEBUG (`sand-wall`, NEW — no `main` equivalent): a plain box with a vertical wall of GRAINS on
+    /// one side and a block of water on the other, released to surge into/through the wall. Tests
+    /// water/solid coupling (percolation + the wall eroding/holding). Reuses the
+    /// [`Scene::dam_through_sand`] recipe at a comparison footprint; no pour, no cup geometry.
+    pub fn sand_wall() -> Self {
+        Self {
+            gravity: [0.0, -20.0, 0.0],
+            box_min: [0.0, 0.0, 0.0],
+            box_max: [30.0, 22.0, 12.0],
+            regions: vec![
+                // Vertical sand column spanning the box depth, set right of center.
+                SeedRegion {
+                    min: [16.0, 0.0, 0.0],
+                    max: [22.0, 15.0, 12.0],
+                    species: Species::Grain,
+                },
+                // Water block on the left, released toward the wall (builds head to drive flow).
+                SeedRegion {
+                    min: [1.0, 1.0, 1.0],
+                    max: [12.0, 15.0, 11.0],
+                    species: Species::Water,
+                },
+            ],
+            ..Self::default()
+        }
+    }
+
     /// Whether this scene injects water over the brew (pour emission). When true the solver sizes its
     /// particle pool with headroom for `pour_water_ml`; when false the pool is exactly the seed.
     pub fn declares_pour(&self) -> bool {

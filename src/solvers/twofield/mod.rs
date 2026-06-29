@@ -352,10 +352,15 @@ struct Params {
     // (≤ 0.5 → legacy rate-limited (DENSITY_RELAX) two-sided relief, default & byte-identical;
     // > 0.5 → relief uncapped to full strength, driving ρ→ρ₀ — the over-pack fix).
     dbg: [f32; 4],
+    // U1 surface-weighted dissipation knob (transfers.wgsl g2p_water). Lanes =
+    // (c_surface, density_gate, div_scale, water_splash_cap). DISABLED by default
+    // (c_surface = 1.0 ⇒ v = v_grid = pure-PIC; div_scale = 0 ⇒ merge discriminator off;
+    // water_splash_cap = 0 ⇒ fall back to the global max_speed). The U2 curve reads these.
+    flip: [f32; 4],
 }
 
 // Params is uploaded as a uniform and must stay byte-identical to the WGSL `Params`.
-const _: () = assert!(std::mem::size_of::<Params>() == 256);
+const _: () = assert!(std::mem::size_of::<Params>() == 272);
 
 /// GPU record for one static SDF solid — byte-identical to the WGSL `Primitive` (64 bytes,
 /// vec4-aligned; mirrors the xpbd packing of `utils::sdf` primitives). Cone radii in `a` are
@@ -868,6 +873,13 @@ impl TwofieldSolver {
     /// stirring-vs-crater tradeoff sweep). Production keeps `PIC_BLEND_DEFAULT`.
     pub fn set_pic_blend_for_test(&mut self, blend: f32) {
         self.params.pic_blend = blend.clamp(0.0, 1.0);
+    }
+
+    /// Set the U3 separate water-splash velocity cap (`flip.w`) directly — dev/test only (the
+    /// FP-overflow headroom probe at a raised water cap). `0.0` is the disabled sentinel
+    /// (water path falls back to the global `max_speed`, byte-identical).
+    pub fn set_water_splash_cap_for_test(&mut self, cap: f32) {
+        self.params.flip[3] = cap;
     }
 
     /// Toggle the density relief (over-density relief + under-density suction) — dev/test only,
@@ -1557,6 +1569,16 @@ impl Solver for TwofieldSolver {
             // wall BC hit). Resolve that before defaulting MULTI / retiring the selector.
             // Tests override via set_relief_for_test / set_wall_bc_mode_for_test.
             dbg: [1.0, WALL_BC_SINGLE, 0.0, 0.0],
+            // U1 surface-weighted dissipation knob: (c_surface, density_gate, div_scale,
+            // water_splash_cap). Default DISABLED (c_surface = 1.0 ⇒ pure-PIC; div_scale = 0 ⇒
+            // merge off; water_splash_cap = 0 ⇒ global max_speed), so g2p_water is byte-identical
+            // to the pure-PIC baseline. The U2 curve reads these lanes.
+            flip: [
+                cfg.tf_flip_c_surface,
+                cfg.tf_flip_density_gate,
+                cfg.tf_flip_div_scale,
+                cfg.tf_flip_water_splash_cap,
+            ],
         };
         let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("twofield-params"),

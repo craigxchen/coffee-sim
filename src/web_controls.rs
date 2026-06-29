@@ -32,7 +32,9 @@ pub fn kettle_pos_for_pad(u: f32, v: f32, height: f32, half_extent: f32) -> [f32
     ]
 }
 
-/// The scenes the web UI exposes, mapped from the original's main scene buttons.
+/// The scenes the web UI exposes. The first two are the main "Scenes" tab; the rest are the
+/// "Debug Scenes" catalog, ported by intent from the `main` MPM branch's `DebugScene` enum (plus the
+/// new `SandWall`). Kebab ids match `main`'s debug-scene ids (with `sand-wall` added).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WebScene {
     /// "Center Pour" — the V60 brew (continuous pour; the water-velocity + spout controls drive the
@@ -40,31 +42,98 @@ pub enum WebScene {
     CenterPour,
     /// "Water Only" — a water dam with no bed (the original's free-stream).
     WaterOnly,
+
+    // --- Debug catalog ---
+    /// `filter-water-block` — a still water block in the filter cone over the bed, no pour.
+    FilterWaterBlock,
+    /// `off-center-filter-wall-pour` — V60 pour with the spout parked toward the filter wall.
+    OffCenterFilterWallPour,
+    /// `seeded-paper-wall-sheet` — a thin water sheet clinging to the filter wall, no pour.
+    SeededPaperWallSheet,
+    /// `filter-apex-drain` — water low in the filter cone, no bed, draining through the apex.
+    FilterApexDrain,
+    /// `cup-wall-floor-corner-contact` — cup-only water in a wall/floor corner wedge.
+    CupWallFloorCornerContact,
+    /// `asymmetric-cup-mound-settle` — cup-only off-center water mound settling level.
+    AsymmetricCupMoundSettle,
+    /// `hydrostatic-column` — cup-only tall narrow on-axis water column.
+    HydrostaticColumn,
+    /// `dam-break-slosh` — cup-only half-fill released to slosh.
+    DamBreakSlosh,
+    /// `sparse-free-jet` — a thin slow pour into the empty cup.
+    SparseFreeJet,
+    /// `high-velocity-jet-impact` — a fast pour plunging onto a shallow cup pool.
+    HighVelocityJetImpact,
+    /// `uniform-bed-saturation` — the V60 bed pre-saturated with water, no pour.
+    UniformBedSaturation,
+    /// `permeability-comparison` — V60 pour with a tighter (lower-permeability) bed.
+    PermeabilityComparison,
+    /// `particle-capacity-stress` — V60 pour driven at a high flow rate.
+    ParticleCapacityStress,
+    /// `sand-wall` (NEW) — a grain wall on one side, a water block released against it.
+    SandWall,
 }
 
 impl WebScene {
-    /// Parse the frontend's scene id.
+    /// Parse the frontend's scene id (kebab-case).
     pub fn from_id(id: &str) -> Option<Self> {
         match id {
             "center-pour" => Some(Self::CenterPour),
             "water-only" => Some(Self::WaterOnly),
+            "filter-water-block" => Some(Self::FilterWaterBlock),
+            "off-center-filter-wall-pour" => Some(Self::OffCenterFilterWallPour),
+            "seeded-paper-wall-sheet" => Some(Self::SeededPaperWallSheet),
+            "filter-apex-drain" => Some(Self::FilterApexDrain),
+            "cup-wall-floor-corner-contact" => Some(Self::CupWallFloorCornerContact),
+            "asymmetric-cup-mound-settle" => Some(Self::AsymmetricCupMoundSettle),
+            "hydrostatic-column" => Some(Self::HydrostaticColumn),
+            "dam-break-slosh" => Some(Self::DamBreakSlosh),
+            "sparse-free-jet" => Some(Self::SparseFreeJet),
+            "high-velocity-jet-impact" => Some(Self::HighVelocityJetImpact),
+            "uniform-bed-saturation" => Some(Self::UniformBedSaturation),
+            "permeability-comparison" => Some(Self::PermeabilityComparison),
+            "particle-capacity-stress" => Some(Self::ParticleCapacityStress),
+            "sand-wall" => Some(Self::SandWall),
             _ => None,
         }
     }
 
-    /// The `Scene` to build. Both scenes pour into the same V60 cone+cup geometry (the live
-    /// velocity/spout controls feed `EmissionInput`); CenterPour has a coffee bed, WaterOnly does not.
+    /// The `Scene` to build for this UI scene.
     pub fn build(self) -> Scene {
         match self {
             Self::CenterPour => Scene::v60_pour(),
             Self::WaterOnly => Scene::v60_pour_water_only(),
+            Self::FilterWaterBlock => Scene::debug_filter_water_block(),
+            Self::OffCenterFilterWallPour => Scene::debug_off_center_filter_wall_pour(),
+            Self::SeededPaperWallSheet => Scene::debug_seeded_paper_wall_sheet(),
+            Self::FilterApexDrain => Scene::debug_filter_apex_drain(),
+            Self::CupWallFloorCornerContact => Scene::debug_cup_wall_floor_corner_contact(),
+            Self::AsymmetricCupMoundSettle => Scene::debug_asymmetric_cup_mound_settle(),
+            Self::HydrostaticColumn => Scene::debug_hydrostatic_column(),
+            Self::DamBreakSlosh => Scene::debug_dam_break_slosh(),
+            Self::SparseFreeJet => Scene::debug_sparse_free_jet(),
+            Self::HighVelocityJetImpact => Scene::debug_high_velocity_jet_impact(),
+            Self::UniformBedSaturation => Scene::debug_uniform_bed_saturation(),
+            Self::PermeabilityComparison => Scene::debug_permeability_comparison(),
+            Self::ParticleCapacityStress => Scene::debug_particle_capacity_stress(),
+            Self::SandWall => Scene::sand_wall(),
         }
     }
 
-    /// Whether this scene accepts the live pour controls. Both V60 scenes do (water is poured into
-    /// the cone in each).
+    /// Whether this scene accepts the live pour controls. The pour-driven scenes (the V60 pours +
+    /// the free-jet / jet-impact / permeability / capacity debug scenes) feed `EmissionInput`; the
+    /// seeded-block / cup-static / settle scenes are released-only.
     pub fn accepts_pour(self) -> bool {
-        matches!(self, Self::CenterPour | Self::WaterOnly)
+        matches!(
+            self,
+            Self::CenterPour
+                | Self::WaterOnly
+                | Self::OffCenterFilterWallPour
+                | Self::SparseFreeJet
+                | Self::HighVelocityJetImpact
+                | Self::PermeabilityComparison
+                | Self::ParticleCapacityStress
+        )
     }
 }
 
@@ -114,16 +183,73 @@ mod tests {
         assert!((q[0] - 6.0).abs() < 1e-6 && (q[2] + 6.0).abs() < 1e-6);
     }
 
+    /// Every scene id the UI can emit, paired with its variant — also the source of truth this test
+    /// round-trips through `from_id`/`build`/`accepts_pour`.
+    const SCENES: &[(&str, WebScene)] = &[
+        ("center-pour", WebScene::CenterPour),
+        ("water-only", WebScene::WaterOnly),
+        ("filter-water-block", WebScene::FilterWaterBlock),
+        (
+            "off-center-filter-wall-pour",
+            WebScene::OffCenterFilterWallPour,
+        ),
+        ("seeded-paper-wall-sheet", WebScene::SeededPaperWallSheet),
+        ("filter-apex-drain", WebScene::FilterApexDrain),
+        (
+            "cup-wall-floor-corner-contact",
+            WebScene::CupWallFloorCornerContact,
+        ),
+        (
+            "asymmetric-cup-mound-settle",
+            WebScene::AsymmetricCupMoundSettle,
+        ),
+        ("hydrostatic-column", WebScene::HydrostaticColumn),
+        ("dam-break-slosh", WebScene::DamBreakSlosh),
+        ("sparse-free-jet", WebScene::SparseFreeJet),
+        ("high-velocity-jet-impact", WebScene::HighVelocityJetImpact),
+        ("uniform-bed-saturation", WebScene::UniformBedSaturation),
+        ("permeability-comparison", WebScene::PermeabilityComparison),
+        ("particle-capacity-stress", WebScene::ParticleCapacityStress),
+        ("sand-wall", WebScene::SandWall),
+    ];
+
     #[test]
-    fn scene_ids_resolve() {
-        assert_eq!(WebScene::from_id("center-pour"), Some(WebScene::CenterPour));
-        assert_eq!(WebScene::from_id("water-only"), Some(WebScene::WaterOnly));
+    fn scene_ids_resolve_and_build() {
+        for &(id, scene) in SCENES {
+            assert_eq!(WebScene::from_id(id), Some(scene), "id {id} resolves");
+            // Every scene builds without panicking.
+            let _ = scene.build();
+        }
         assert_eq!(WebScene::from_id("nope"), None);
-        // Both V60 scenes accept the live pour controls (water is poured into the cone in each).
-        assert!(WebScene::CenterPour.accepts_pour());
-        assert!(WebScene::WaterOnly.accepts_pour());
-        // Both build a scene.
-        let _ = WebScene::CenterPour.build();
-        let _ = WebScene::WaterOnly.build();
+    }
+
+    #[test]
+    fn pour_scenes_accept_pour_and_seeded_scenes_do_not() {
+        // Pour-driven scenes feed EmissionInput.
+        for s in [
+            WebScene::CenterPour,
+            WebScene::WaterOnly,
+            WebScene::OffCenterFilterWallPour,
+            WebScene::SparseFreeJet,
+            WebScene::HighVelocityJetImpact,
+            WebScene::PermeabilityComparison,
+            WebScene::ParticleCapacityStress,
+        ] {
+            assert!(s.accepts_pour(), "{s:?} should accept pour");
+        }
+        // Seeded-block / cup-static / settle scenes are released-only.
+        for s in [
+            WebScene::FilterWaterBlock,
+            WebScene::SeededPaperWallSheet,
+            WebScene::FilterApexDrain,
+            WebScene::CupWallFloorCornerContact,
+            WebScene::AsymmetricCupMoundSettle,
+            WebScene::HydrostaticColumn,
+            WebScene::DamBreakSlosh,
+            WebScene::UniformBedSaturation,
+            WebScene::SandWall,
+        ] {
+            assert!(!s.accepts_pour(), "{s:?} should not accept pour");
+        }
     }
 }

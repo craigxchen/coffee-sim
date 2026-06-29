@@ -301,13 +301,18 @@ fn pour_uncapped_density_stability() {
         }
         (blown, pockets, settle_lambda)
     };
-    println!("\n==== VIOLENT-POUR STABILITY (flow 8.0, WALL_BC_SINGLE, 400 pour + 200 settle) ====");
+    println!(
+        "\n==== VIOLENT-POUR STABILITY (flow 8.0, WALL_BC_SINGLE, 400 pour + 200 settle) ===="
+    );
     let _ = run("legacy", false); // baseline comparison (printed)
     let (blown, pockets, settle) = run("uncapped target", true);
     // R10: the uncapped target must not detonate and must not sustain a crushing bubble. The
     // pour-transient λ is allowed (a real transient cavity); the SETTLED λ must drain small —
     // the <100 bar mirrors `poured_cup_water_fills_not_corner`.
-    assert!(!blown, "uncapped target detonated on the violent pour (flow 8)");
+    assert!(
+        !blown,
+        "uncapped target detonated on the violent pour (flow 8)"
+    );
     assert!(
         pockets == 0,
         "uncapped target left {pockets} CELL_POCKET cells after settle (a sustained crushing pocket)"

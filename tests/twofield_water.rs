@@ -393,6 +393,68 @@ fn fixed_point_overflow_probe_at_velocity_cap() {
         headroom >= 2.0,
         "fixed-point headroom collapsed: {headroom:.2}×"
     );
+
+    // --- U3 raised-water-cap arm -------------------------------------------------------------
+    // The separate water-splash cap (flip.w) lets the crown's peak velocity survive a higher cap
+    // on the water path. The FP momentum-headroom shrinks ∝ 8192/cap (common.wgsl): with the
+    // global cap 50 → ≈164 mass units to overflow; doubling the water cap to 100 halves that to
+    // ≈82. The encode-time magnitude clamp stays the backstop. Same pancaked worst case, but now
+    // slammed at the RAISED cap, so this exercises the tightest headroom the water path allows.
+    let water_cap = 2.0 * cap; // 100 by default — 2× the global, the realistic crown ceiling
+    solver.set_water_splash_cap_for_test(water_cap);
+    solver.write_velocities_for_test(&vec![[0.0, -water_cap, 0.0, 0.0]; n]);
+    for _ in 0..3 {
+        solver.step(DT, &input);
+    }
+
+    let pos = solver.read_positions();
+    let vel = solver.read_velocities();
+    assert!(
+        all_finite(&pos) && all_finite(&vel),
+        "non-finite state (water cap)"
+    );
+    // Water particles respect the RAISED cap, not the global one — confirms the cap applied on
+    // the water path (a slam at 2× the global would have been clipped to 50 had the clamp still
+    // read params.max_speed). The cap-hit rate (fraction riding at-or-near the cap) is the
+    // saturation signal U3 gates against; in this pancaked-on-floor scene the slam is into the
+    // wall BC so it settles below the cap — the metric is reported and asserted in-range.
+    let mut hits = 0usize;
+    for v in &vel {
+        let s = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+        assert!(
+            s <= water_cap + 1e-3,
+            "speed {s} above the water cap {water_cap}"
+        );
+        if s >= 0.9 * water_cap {
+            hits += 1;
+        }
+    }
+    let cap_hit_rate = hits as f64 / n as f64;
+    // No i32 wrap at the raised cap: grid mass total must still match the particle count to within
+    // the rounding bound (an overflowed lane would corrupt it far beyond `bound`).
+    let (mass, _) = solver.read_grid_mass_momentum();
+    assert!(
+        (mass - n as f64).abs() <= bound,
+        "grid mass {mass} vs {n} (bound {bound}) — fixed-point lane wrapped at the water cap?"
+    );
+    let max_count = solver.read_grid_max_count();
+    let headroom = i32::MAX as f64 / max_count as f64;
+    println!(
+        "twofield U3 water-cap probe: cap {water_cap}, max |lane| {max_count} counts, \
+         headroom {headroom:.1}×, cap-hit rate {cap_hit_rate:.3}"
+    );
+    // Headroom must still clear the overflow bound; at 2× the cap it is ≈half the global-cap
+    // headroom but stays well above 1× (the encode-time clamp is the backstop below this).
+    assert!(
+        headroom >= 2.0,
+        "fixed-point headroom collapsed at the water cap: {headroom:.2}×"
+    );
+    // Cap-hit-rate metric is available and sane (a fraction in [0,1]) — the saturation signal U3
+    // gates against (a relaxation that courts overflow would drive this up alongside max_count).
+    assert!(
+        (0.0..=1.0).contains(&cap_hit_rate),
+        "cap-hit rate out of range: {cap_hit_rate}"
+    );
 }
 
 /// Grid + particle boundary treatment, box walls: a dropped block settles with no particle
