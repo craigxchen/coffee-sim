@@ -1,0 +1,26 @@
+You are an expert reviewer (Rust + wgpu + wasm/WebGPU + web frontend) reviewing an implementation plan written by Claude Code. It plans porting an original v1 WEB UI's look onto a coffee-sim REWRITE that is currently native-only, by standing up the rewrite's wasm + WebGPU browser build and porting the v1 frontend to drive the new XPBD solver.
+
+Respond with a VERDICT on the FIRST LINE: **APPROVE**, **REVISE**, or **REJECT**. Then give rigorous, specific reasoning. You have READ-ONLY repo access — actually read the files before judging.
+
+Read, in order:
+1. The plan: `docs/plans/2026-06-06-003-feat-web-ui-port-plan.md`.
+2. The ORIGINAL v1 web app (the blueprint), on the `main` branch — read via `git show main:<path>`: `crates/sim-wasm/Cargo.toml`, `crates/sim-wasm/src/lib.rs`, `crates/sim-wasm/src/renderer.rs`, `crates/sim-wasm/www-3d/index.html`, `crates/sim-wasm/www-3d/main.js`, `crates/sim-wasm/www-3d/styles.css`.
+3. The rewrite surfaces it reuses/edits (current branch): `Cargo.toml`, `src/lib.rs` (does it exist? what's in it?), `src/utils/gpu.rs` (the pollster::block_on sites + GpuContext), `src/ui/render.rs` + `src/ui/camera.rs` + `src/ui/mod.rs` (is the renderer truly surface-agnostic / any winit coupling?), `src/engine/simulator.rs` + `src/engine/scene.rs` + `src/engine/state.rs` (Simulator/Scene/Metrics), `src/emission/mod.rs` + `src/emission/pour.rs` (EmissionInput, PourScript, mL↔sim scale), `src/utils/config.rs` (nozzle_radius/discharge_coeff), `examples/water_app.rs` (the native shell), `KEEP.md` (unit scales: ML_PER_SIM_UNIT3, SIM_UNITS_PER_METER), `AGENTS.md`.
+
+Judge these specifically, plus anything else:
+
+1. **Dual-target build (KTD-1, U1).** Is `crate-type = ["cdylib","rlib"]` + splitting winit/pollster under `cfg(not(wasm32))` and wasm deps under `cfg(wasm32)` correct and complete for THIS crate? Does `src/lib.rs` exist and re-export what's needed, or does the plan need to account for creating/extending it? Will the existing examples (which use winit) still build on native and be correctly excluded on wasm — note examples are separate targets, do they need cfg-gating too? Is the getrandom `wasm_js` rustflag + feature the right fix for the version in Cargo.lock? Anything else that breaks the wasm link (other transitive deps that assume native, e.g. anything pulling std threads/time)?
+
+2. **wgpu-29 web specifics (KTD-4, U3).** Verify against the actual code + wgpu 29: is `get_current_texture()` actually returning `CurrentSurfaceTexture` in this version, and does the rewrite's current render path use the old Result form (so the reshape is needed)? Is `Instance::new(InstanceDescriptor{ backends: BROWSER_WEBGPU, ..new_without_display_handle() })` the correct v29 web instance construction? Is `web_sys_unstable_apis` truly unnecessary at 29.0.1? Is `Depth32Float` WebGPU-baseline? Any wgpu-29 surface/config gotchas the plan misses?
+
+3. **Renderer reuse (KTD-3, U2).** Is `ui::Renderer` genuinely surface-agnostic (takes a TextureView, not a window)? Confirm `GpuContext::new_web` only needs the canvas-surface + async path and nothing in Renderer/Simulator/XpbdSolver assumes a native-only feature (timestamp queries are flagged — anything else? buffer mapping/readback in the per-frame path? `pollster::block_on` anywhere in the solver step or particle extraction that runs on web?).
+
+4. **Velocity→flow conversion (KTD-6, R6, U4).** Is converting the v1 m/s water-velocity slider to `EmissionInput.flow_rate` via A_eff = π·nozzle_radius²·discharge_coeff and the unit scale sound and unit-correct given how the rewrite's emitter actually consumes flow_rate (read src/emission)? Does v1 actually do exit-speed→flow this way? Is preserving the m/s label worth it vs relabeling to Flow? Flag unit errors.
+
+5. **API/handle design (KTD, U4) + one-way data flow.** Is the CoffeeSimApp method set sufficient to drive the ported main.js (cross-check against v1's WasmSim3D methods that main.js calls)? Does using `Simulator` vs bare `XpbdSolver` matter (e.g. does Simulator expose reset/scene-switch the handle needs)? Any place the plan would have JS write solver state (violating one-way flow)?
+
+6. **Frontend port + scope (U5).** Is porting index.html/styles.css/main.js near-verbatim minus the debug-stats/timeseries/debug-scenes realistic? The plan defers the cross-section RENDER pass but ships the CSS overlay frame — is that an acceptable "looks the same" caveat or a problem? Does main.js have v1 couplings (e.g. the `REQUIRED_STORAGE_BUFFERS_PER_SHADER_STAGE = 10` preflight that main.js sets — the rewrite must NOT request 10) that the port must strip? Is the CSS-view-cube-over-GPU-gizmo decision (KTD-7) coherent (skip the gizmo pass on web)?
+
+7. **Testing/verification.** Web can't be tested headless in CI. The plan pushes logic to native unit tests + build gates + manual browser smoke. Is that the right call, and are the native-testable seams (velocity→flow, spout mapping, scene selection) actually extractable as non-wasm Rust?
+
+Also flag: any missing implementation unit, any sequencing problem (U1→U5 deps), any wasm/WebGPU gotcha (resize/DPR, devicePixelRatio, surface lost on tab switch, async readback), and whether the unit breakdown is sound. End with a concrete bulleted list of REVISE items if the verdict is REVISE.

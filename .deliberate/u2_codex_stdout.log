@@ -1,0 +1,2627 @@
+OpenAI Codex v0.137.0
+--------
+workdir: /Users/cxc/Github/coffee-sim
+model: gpt-5.5
+provider: openai
+approval: never
+sandbox: read-only
+reasoning effort: high
+reasoning summaries: none
+session id: 019e9861-9187-7002-bca2-74676ba92899
+--------
+user
+You are reviewing the IMPLEMENTATION of Unit 2 of an approved plan (Rust + wgpu coffee sim), diff
+below. Unit 2 = "emission core": an InflowState + emit() that turns EmissionInput into activated water
+particles via the plan's volume-consistent arclength-credit emitter. Verdict on FIRST LINE: APPROVE,
+REVISE, or REJECT, then explain. Maintainer is a physics reviewer who rejects hand-waving.
+
+The plan's emitter design (verify the code matches and is correct):
+- Orifice: A_eff = pi*nozzle_radius^2*discharge_coeff; exit_speed = flow_rate / A_eff (flow_rate is
+  sim-volume/s).
+- Volume budget: accumulator += flow_rate/V_w*dt; want = floor(accumulator). Carries the fraction;
+  never reset on zero flow (only on Reset/seed).
+- Arclength credit: axial += exit_speed*dt; release a layer each time axial >= particle_spacing
+  (decrement by spacing), placing the layer at depth = residual axial below the nozzle.
+- Volume-consistent layer count: N_layer = ceil(A_eff*spacing/V_w); throughput
+  (exit_speed/spacing)*N_layer >= flow/V_w so backlog stays sub-layer.
+- Clamp-before-decrement: accumulator -= emitted count (not want); recipe overflow warns+clamps.
+- Backlog drains in drawdown (gate: flow>0 OR accumulator>=1; uses last_exit_speed when flow=0).
+- Emitted particles: phase=0, pos.w=1, chem=(0,pour_t,0,0), vel=dir*exit_speed; disc over
+  r_eff=sqrt(discharge_coeff)*nozzle_radius via golden angle; written into the active pool range,
+  active_count grows, phase_mirror grows, total_emitted_water_mass tracks.
+
+Be rigorous about:
+1. Is the arclength/volume algebra correct and does emitted count actually track flow/V_w*T (no
+   permanent backlog, no over-delivery)? Does the clamp-before-decrement preserve dose?
+2. Layer-depth placement: is `depth = axial after decrement` correct so consecutive layers (within a
+   frame AND across frames) are exactly particle_spacing apart? Any double-count or off-by-one?
+3. Determinism (cursor-based golden angle), and is the disc packing ~rest density (PBF-safe)?
+4. The drawdown backlog drain via last_exit_speed — correct, no infinite loop when flow=0?
+5. The GPU writes: correct offsets (active_count*16 / *4), correct buffers, and active_count grows
+   only after the writes. phase_mirror stays in sync. Any race or stale params?
+6. Does emit() run at the right point in step() (before params.particle_count upload + dispatch)?
+7. Any way a non-pour scene (flow_rate=0 default) is perturbed? (emit must no-op.)
+
+The diff follows.
+========================================================================
+diff --git a/src/solvers/xpbd/mod.rs b/src/solvers/xpbd/mod.rs
+index 97cbf47..9f67e27 100644
+--- a/src/solvers/xpbd/mod.rs
++++ b/src/solvers/xpbd/mod.rs
+@@ -331,6 +331,9 @@ pub struct XpbdSolver {
+     cached_yield: f32,
+     cached_tds: f32,
+ 
++    /// Pour-emission state (water injected over the brew). Inactive when no pour drives it.
++    inflow: Inflow,
++
+     // retained for reset (exact re-seed of the initial block + phase tags + chem state)
+     initial_positions: Vec<[f32; 4]>,
+     initial_phases: Vec<u32>,
+@@ -351,6 +354,49 @@ struct CupRegion {
+     y_max: f32,
+ }
+ 
++/// Pour-emission state + spout parameters (host-side). Turns `EmissionInput` into activated water
++/// particles via the volume-consistent arclength-credit emitter (KTD-3): the volume accumulator is
++/// the master particle-count budget; layers release one `particle_spacing` of stream travel apart
++/// (the axial credit) so the inlet packs to the fluid's rest density (PBF-safe — no spike, no void).
++struct Inflow {
++    // Static (from Config/Materials at build).
++    nozzle_radius: f32,
++    discharge_coeff: f32,
++    spacing: f32,
++    v_w: f32,
++    pour_t: f32,
++    // State.
++    accumulator: f32, // volume budget in particles (carries the sub-particle fraction)
++    axial: f32,       // arclength credit (scene units) toward the next layer
++    last_exit_speed: f32, // drains backlog at the last cadence when flow drops to 0
++    cursor: u64,      // golden-angle determinism across all emitted particles
++    emitted_mass: f32, // running total emitted water mass (conservation accounting, R7)
++}
++
++/// Orthonormal disc basis perpendicular to a (unit) pour direction `dir`.
++fn disc_basis(dir: [f32; 3]) -> ([f32; 3], [f32; 3]) {
++    let cross = |a: [f32; 3], b: [f32; 3]| {
++        [
++            a[1] * b[2] - a[2] * b[1],
++            a[2] * b[0] - a[0] * b[2],
++            a[0] * b[1] - a[1] * b[0],
++        ]
++    };
++    let norm = |v: [f32; 3]| {
++        let l = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt().max(1.0e-9);
++        [v[0] / l, v[1] / l, v[2] / l]
++    };
++    // Reference axis not parallel to dir.
++    let refv = if dir[1].abs() < 0.9 {
++        [0.0, 1.0, 0.0]
++    } else {
++        [1.0, 0.0, 0.0]
++    };
++    let u = norm(cross(dir, refv));
++    let w = cross(dir, u);
++    (u, w)
++}
++
+ /// Seed the scene's initial particles on a jittered lattice, one block per region. Returns
+ /// positions and the matching per-particle phase tags (0=water, 1=grain).
+ fn seed_block(scene: &Scene, mats: &Materials, cfg: &Config) -> (Vec<[f32; 4]>, Vec<u32>) {
+@@ -460,6 +506,12 @@ impl XpbdSolver {
+         // Restore the host phase mirror to the seed baseline.
+         self.phase_mirror.clear();
+         self.phase_mirror.extend_from_slice(&self.initial_phases);
++        // Reset the pour-emission state (the recipe restarts from t=0 on reset).
++        self.inflow.accumulator = 0.0;
++        self.inflow.axial = 0.0;
++        self.inflow.last_exit_speed = 0.0;
++        self.inflow.cursor = 0;
++        self.inflow.emitted_mass = 0.0;
+         // Clear the yield/TDS cache so metrics() reports 0 after a reset (matching the re-zeroed
+         // chem) rather than stale values until the next sample_diagnostics.
+         self.cached_yield = 0.0;
+@@ -739,6 +791,125 @@ impl XpbdSolver {
+         self.has_water
+     }
+ 
++    /// Total water mass emitted by the pour so far (conservation accounting, R7) (dev/test).
++    pub fn total_emitted_water_mass(&self) -> f32 {
++        self.inflow.emitted_mass
++    }
++
++    /// Activate pour-emitted water particles for this frame from `EmissionInput` (KTD-3): a
++    /// volume-consistent arclength-credit emitter. The volume accumulator (flow_rate/V_w·dt) is the
++    /// master count budget; layers release one `particle_spacing` of stream travel apart, each filling
++    /// a golden-angle disc with up to `N_layer = ceil(A_eff·spacing/V_w)` particles, so the inlet packs
++    /// to the fluid's rest density (no PBF spike). Particles are written into the active pool range and
++    /// `active_count` grows. No-ops when not pouring and no backlog remains.
++    fn emit(&mut self, input: &EmissionInput, dt: f32) {
++        let flow = input.flow_rate.max(0.0);
++        // Gate: pour active, or a whole particle of backlog still to drain (R4 — drawdown drain).
++        if flow <= 0.0 && self.inflow.accumulator < 1.0 {
++            return;
++        }
++        let a_eff = std::f32::consts::PI
++            * self.inflow.nozzle_radius
++            * self.inflow.nozzle_radius
++            * self.inflow.discharge_coeff;
++        let a_eff = a_eff.max(1.0e-9);
++        // Orifice relation: exit_speed derived from flow + effective area (KTD-3). While draining a
++        // backlog at zero flow, keep the last cadence so the stream tail stays correctly spaced.
++        let exit_speed = if flow > 0.0 {
++            let es = flow / a_eff;
++            self.inflow.last_exit_speed = es;
++            self.inflow.accumulator += flow / self.inflow.v_w * dt;
++            es
++        } else {
++            self.inflow.last_exit_speed
++        };
++        if exit_speed <= 0.0 {
++            return;
++        }
++        // Volume-consistent layer capacity (ceil ⇒ throughput ≥ flow/V_w, no permanent backlog).
++        let n_layer = ((a_eff * self.inflow.spacing / self.inflow.v_w).ceil() as u32).max(1);
++
++        // Pour direction (downward, tilted by pour_angle toward +x) + a perpendicular disc basis.
++        let a = input.pour_angle;
++        let dir = [a.sin(), -a.cos(), 0.0];
++        let (u, w) = disc_basis(dir);
++        let r_eff = self.inflow.nozzle_radius * self.inflow.discharge_coeff.sqrt();
++        const GOLDEN: f32 = 2.399_963_2;
++
++        self.inflow.axial += exit_speed * dt;
++        let kettle = input.kettle_pos;
++        let mut want = self.inflow.accumulator.floor() as u32;
++        let mut new_pos: Vec<[f32; 4]> = Vec::new();
++        let mut new_vel: Vec<[f32; 4]> = Vec::new();
++        let mut new_chem: Vec<[f32; 4]> = Vec::new();
++        let mut new_phase: Vec<u32> = Vec::new();
++        let mut clamped = false;
++        while self.inflow.axial >= self.inflow.spacing && want > 0 {
++            self.inflow.axial -= self.inflow.spacing;
++            let depth = self.inflow.axial; // residual stream travel below the nozzle ⇒ layer depth
++            let avail = self.capacity - (self.active_count + new_pos.len() as u32);
++            if avail == 0 {
++                clamped = true;
++                break;
++            }
++            let this_layer = n_layer.min(want).min(avail);
++            for i in 0..this_layer {
++                let frac = (i as f32 + 0.5) / n_layer as f32;
++                let r = r_eff * frac.sqrt();
++                let theta = self.inflow.cursor as f32 * GOLDEN;
++                self.inflow.cursor += 1;
++                let (ct, st) = (theta.cos(), theta.sin());
++                let off = [
++                    u[0] * r * ct + w[0] * r * st,
++                    u[1] * r * ct + w[1] * r * st,
++                    u[2] * r * ct + w[2] * r * st,
++                ];
++                new_pos.push([
++                    kettle[0] + dir[0] * depth + off[0],
++                    kettle[1] + dir[1] * depth + off[1],
++                    kettle[2] + dir[2] * depth + off[2],
++                    1.0, // moisture lane f_w = 1 (full water)
++                ]);
++                new_vel.push([
++                    dir[0] * exit_speed,
++                    dir[1] * exit_speed,
++                    dir[2] * exit_speed,
++                    0.0,
++                ]);
++                new_chem.push([0.0, self.inflow.pour_t, 0.0, 0.0]); // c=0, T=pour temperature
++                new_phase.push(0); // water
++            }
++            want -= this_layer;
++        }
++        let emit_n = new_pos.len() as u32;
++        if emit_n == 0 {
++            return;
++        }
++        // Clamp-before-decrement: subtract only what was actually emitted (R4) — unspent budget stays
++        // as backlog rather than being silently burned.
++        self.inflow.accumulator -= emit_n as f32;
++        self.inflow.emitted_mass += emit_n as f32 * self.params.particle_mass;
++        if clamped {
++            eprintln!(
++                "xpbd pour: pool capacity {} reached; emission clamped (a recipe scene must declare \
++                 enough pour_water_ml to size the pool to its dose)",
++                self.capacity
++            );
++        }
++        let off_v4 = (self.active_count as u64) * 16;
++        let off_u32 = (self.active_count as u64) * 4;
++        self.queue
++            .write_buffer(&self.pos, off_v4, bytemuck::cast_slice(&new_pos));
++        self.queue
++            .write_buffer(self.chem.as_ref(), off_v4, bytemuck::cast_slice(&new_chem));
++        self.queue
++            .write_buffer(&self.vel, off_v4, bytemuck::cast_slice(&new_vel));
++        self.queue
++            .write_buffer(&self.phase, off_u32, bytemuck::cast_slice(&new_phase));
++        self.active_count += emit_n;
++        self.phase_mirror.extend_from_slice(&new_phase);
++    }
++
+     /// Read back per-particle water concentration `c` (chem `.x`; for a grain `.x` is its fast pool).
+     /// Dev/test/inspection only — stalls the GPU.
+     pub fn read_concentration(&self) -> Vec<f32> {
+@@ -1534,6 +1705,18 @@ impl Solver for XpbdSolver {
+             cup,
+             cached_yield: 0.0,
+             cached_tds: 0.0,
++            inflow: Inflow {
++                nozzle_radius: cfg.nozzle_radius,
++                discharge_coeff: cfg.discharge_coeff,
++                spacing: s,
++                v_w,
++                pour_t: mats.pour_t,
++                accumulator: 0.0,
++                axial: 0.0,
++                last_exit_speed: 0.0,
++                cursor: 0,
++                emitted_mass: 0.0,
++            },
+             initial_positions: positions,
+             phase_mirror: phases.clone(),
+             initial_phases: phases,
+@@ -1545,12 +1728,15 @@ impl Solver for XpbdSolver {
+         self.seed();
+     }
+ 
+-    fn step(&mut self, dt: f32, _input: &EmissionInput) {
+-        // Pool invariant: the live set never exceeds the allocated capacity (U2's emit() clamps to it).
++    fn step(&mut self, dt: f32, input: &EmissionInput) {
++        // Pour emission first (grows active_count for this frame); no-op when not pouring. Uses the
++        // full frame dt (flow integrated once per frame, then simulated by all substeps).
++        self.emit(input, dt);
++        // Pool invariant: the live set never exceeds the allocated capacity (emit() clamps to it).
+         debug_assert!(self.active_count <= self.capacity);
+         self.params.dt = dt / self.substeps as f32;
+         // The live set the kernels guard against (i >= particle_count returns) — refreshed each frame
+-        // so pour-grown active_count takes effect (U2 wires emission before this upload).
++        // so pour-grown active_count takes effect (emit() above ran first).
+         self.params.particle_count = self.active_count;
+         self.queue
+             .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&self.params));
+diff --git a/src/utils/config.rs b/src/utils/config.rs
+index 4a707d1..d5c56a0 100644
+--- a/src/utils/config.rs
++++ b/src/utils/config.rs
+@@ -94,6 +94,14 @@ pub struct Config {
+     /// Extraction/thermal opt-in gate (step 5). 0 = the extraction + thermal passes don't run, so
+     /// existing scenes are byte-unchanged; a brew scene sets it > 0 to enable dissolution kinetics.
+     pub extract_rate: f32,
++
++    // --- pour emission (spout settings) ---
++    /// Pour spout nozzle radius (scene units). With the discharge coefficient it sets the effective
++    /// flux area `A_eff = π·r²·discharge_coeff`, which fixes the stream's exit speed from the flow
++    /// rate and the emitted-layer particle count (so the inlet packs to the fluid's rest density).
++    pub nozzle_radius: f32,
++    /// Orifice discharge coefficient `∈ (0,1]` (vena-contracta loss). Folded into `A_eff`.
++    pub discharge_coeff: f32,
+ }
+ 
+ impl Default for Config {
+@@ -156,6 +164,9 @@ impl Default for Config {
+             pbf_eps: 0.05,
+             // Extraction/thermal OFF by default (step 5; like absorb_rate): a brew scene opts in.
+             extract_rate: 0.0,
++            // Pour spout: a thin stream by default; a pour scene tunes these to its grind/flow.
++            nozzle_radius: 0.5,
++            discharge_coeff: 1.0,
+         }
+     }
+ }
+diff --git a/tests/xpbd_emission.rs b/tests/xpbd_emission.rs
+index 04a30b9..feddb6c 100644
+--- a/tests/xpbd_emission.rs
++++ b/tests/xpbd_emission.rs
+@@ -6,6 +6,7 @@
+ //! U2, so `active_count` stays at the seed). Pass selection must treat a declared pour as "water
+ //! present" even when only grains are seeded.
+ 
++use coffee_sim::emission::PourEvent;
+ use coffee_sim::engine::scene::{SeedRegion, Species};
+ use coffee_sim::engine::Scene;
+ use coffee_sim::models::Materials;
+@@ -15,6 +16,30 @@ use coffee_sim::utils::config::Config;
+ use coffee_sim::utils::gpu::GpuContext;
+ use coffee_sim::EmissionInput;
+ 
++const DT: f32 = 1.0 / 60.0;
++
++/// A straight-down pour from `kettle` at `flow` (sim-volume/s).
++fn pour(kettle: [f32; 3], flow: f32) -> EmissionInput {
++    EmissionInput {
++        kettle_pos: kettle,
++        flow_rate: flow,
++        pour_angle: 0.0,
++        event: PourEvent::None,
++    }
++}
++
++/// An empty box that opts into a pour (no seeds) — for counting emission in isolation.
++fn empty_pour_scene(pour_ml: f32) -> Scene {
++    Scene {
++        pour_water_ml: pour_ml,
++        gravity: [0.0, 0.0, 0.0],
++        box_min: [0.0, 0.0, 0.0],
++        box_max: [12.0, 12.0, 12.0],
++        regions: vec![],
++        ..Scene::default()
++    }
++}
++
+ /// A mixed water+grain scene (water present, so `has_water` is true regardless of pour).
+ fn mixed_scene() -> Scene {
+     Scene {
+@@ -169,3 +194,203 @@ fn reset_restores_seed_active_count() {
+     solver.reset(&scene);
+     assert_eq!(solver.active_count(), seed);
+ }
++
++// --- U2: emission core ---------------------------------------------------------------------------
++
++/// Rate fidelity + no starvation: over T seconds at constant flow, the emitted particle count tracks
++/// flow/V_w·T (the arclength-credit emitter must NOT starve at realistic — sub-spacing-per-frame —
++/// pour speeds, which the old per-frame floor did).
++#[test]
++fn emission_rate_matches_flow_no_starvation() {
++    let Some(gpu) = GpuContext::new_headless() else {
++        eprintln!("xpbd_emission: no GPU adapter; skipping.");
++        return;
++    };
++    // Solve off so active_count == emitted count (emission is independent of the solve).
++    let cfg = Config {
++        max_iters: 0,
++        ..Config::default()
++    };
++    let mut solver =
++        XpbdSolver::build(&empty_pour_scene(9999.0), &Materials::default(), &cfg, &gpu);
++    let v_w = solver.water_particle_volume();
++    let flow = 5.0;
++    let steps = 120u32; // 2 s
++    for _ in 0..steps {
++        solver.step(DT, &pour([6.0, 11.0, 6.0], flow));
++    }
++    let emitted = solver.active_count();
++    let expected = flow / v_w * (steps as f32 * DT);
++    assert!(
++        emitted > 0,
++        "emitter starved (0 particles) — arclength credit broken"
++    );
++    assert!(
++        (emitted as f32 - expected).abs() <= 0.10 * expected + 8.0,
++        "emitted {emitted} far from expected {expected:.1}"
++    );
++    // Emitted-mass counter tracks the count.
++    let m = solver.total_emitted_water_mass();
++    assert!(
++        (m - emitted as f32 * 1.0).abs() <= 1.0e-3,
++        "emitted-mass {m} != count {emitted} × particle_mass"
++    );
++}
++
++/// A gentle pour (sub-spacing travel per frame) still emits — direct guard against the starvation
++/// failure mode the per-frame floor caused.
++#[test]
++fn gentle_pour_does_not_starve() {
++    let Some(gpu) = GpuContext::new_headless() else {
++        eprintln!("xpbd_emission: no GPU adapter; skipping.");
++        return;
++    };
++    let cfg = Config {
++        max_iters: 0,
++        ..Config::default()
++    };
++    let mut solver =
++        XpbdSolver::build(&empty_pour_scene(9999.0), &Materials::default(), &cfg, &gpu);
++    // Very gentle flow → exit_speed·dt ≪ particle_spacing; the old floor(travel/spacing)=0 would emit 0.
++    for _ in 0..240 {
++        solver.step(DT, &pour([6.0, 11.0, 6.0], 0.4));
++    }
++    assert!(
++        solver.active_count() > 0,
++        "gentle pour starved to 0 particles"
++    );
++}
++
++/// Emitted particles are seeded as full, cold-of-solute water at the pour temperature.
++#[test]
++fn emitted_particles_are_seeded_water() {
++    let Some(gpu) = GpuContext::new_headless() else {
++        eprintln!("xpbd_emission: no GPU adapter; skipping.");
++        return;
++    };
++    let cfg = Config {
++        max_iters: 0,
++        ..Config::default()
++    };
++    let mats = Materials::default();
++    let mut solver = XpbdSolver::build(&empty_pour_scene(9999.0), &mats, &cfg, &gpu);
++    for _ in 0..30 {
++        solver.step(DT, &pour([6.0, 11.0, 6.0], 5.0));
++    }
++    let phase = solver.read_phases();
++    let chem = solver.read_chem();
++    let moisture = solver.read_moisture();
++    assert!(!phase.is_empty(), "no emission");
++    assert_eq!(phase.len(), solver.active_count() as usize);
++    for (i, &ph) in phase.iter().enumerate() {
++        assert_eq!(ph, 0, "emitted particle {i} not water");
++        assert!((moisture[i] - 1.0).abs() <= 1.0e-6, "emitted f_w != 1");
++        assert!(chem[i][0].abs() <= 1.0e-6, "emitted c != 0");
++        assert!(
++            (chem[i][1] - mats.pour_t).abs() <= 1.0e-6,
++            "emitted T != pour_t"
++        );
++    }
++}
++
++/// Determinism: identical pour inputs produce identical emission (count + positions).
++#[test]
++fn emission_is_deterministic() {
++    let Some(gpu) = GpuContext::new_headless() else {
++        eprintln!("xpbd_emission: no GPU adapter; skipping.");
++        return;
++    };
++    let cfg = Config {
++        max_iters: 0,
++        ..Config::default()
++    };
++    let run = || {
++        let mut solver =
++            XpbdSolver::build(&empty_pour_scene(9999.0), &Materials::default(), &cfg, &gpu);
++        for _ in 0..60 {
++            solver.step(DT, &pour([6.0, 11.0, 6.0], 5.0));
++        }
++        (solver.active_count(), solver.read_positions())
++    };
++    let (n1, p1) = run();
++    let (n2, p2) = run();
++    assert_eq!(n1, n2, "emission count not deterministic");
++    for (a, b) in p1.iter().zip(&p2) {
++        assert_eq!(a, b, "emission positions not deterministic");
++    }
++}
++
++/// Capacity clamp: emission never exceeds the allocated pool (active_count saturates at capacity).
++#[test]
++fn emission_clamps_at_capacity() {
++    let Some(gpu) = GpuContext::new_headless() else {
++        eprintln!("xpbd_emission: no GPU adapter; skipping.");
++        return;
++    };
++    let cfg = Config {
++        max_iters: 0,
++        ..Config::default()
++    };
++    // Tiny dose → small capacity; pour far more than it can hold.
++    let mut solver = XpbdSolver::build(&empty_pour_scene(50.0), &Materials::default(), &cfg, &gpu);
++    let cap = solver.pool_capacity();
++    assert!(cap > 0);
++    for _ in 0..600 {
++        solver.step(DT, &pour([6.0, 11.0, 6.0], 20.0));
++        assert!(
++            solver.active_count() <= cap,
++            "active_count {} exceeded capacity {cap}",
++            solver.active_count()
++        );
++    }
++    assert_eq!(
++        solver.active_count(),
++        cap,
++        "pour did not fill the pool to capacity"
++    );
++}
++
++/// PBF-safe inlet: continuous emission into a closed box with the FULL incompressibility solve on
++/// stays finite and bounded — no density-spike eruption (the failure the arclength/rest-density inlet
++/// is designed to prevent).
++#[test]
++fn emission_into_full_solve_does_not_erupt() {
++    let Some(gpu) = GpuContext::new_headless() else {
++        eprintln!("xpbd_emission: no GPU adapter; skipping.");
++        return;
++    };
++    let mats = Materials::default();
++    let cfg = Config::default(); // full water solve on
++    let scene = Scene {
++        pour_water_ml: 4000.0,
++        gravity: [0.0, -20.0, 0.0],
++        box_min: [0.0, 0.0, 0.0],
++        box_max: [12.0, 16.0, 12.0],
++        regions: vec![],
++        ..Scene::default()
++    };
++    let mut solver = XpbdSolver::build(&scene, &mats, &cfg, &gpu);
++    for _ in 0..300 {
++        solver.step(DT, &pour([6.0, 14.0, 6.0], 20.0));
++    }
++    let pos = solver.read_positions();
++    let vel = solver.read_velocities();
++    assert!(
++        solver.active_count() > 50,
++        "too little emitted ({}) to be a meaningful stability test",
++        solver.active_count()
++    );
++    assert!(
++        pos.iter()
++            .all(|p| p[0].is_finite() && p[1].is_finite() && p[2].is_finite()),
++        "non-finite position (inlet eruption)"
++    );
++    let vmax = vel
++        .iter()
++        .map(|v| (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt())
++        .fold(0.0f32, f32::max);
++    assert!(
++        vmax <= cfg.max_speed + 1.0,
++        "velocity blew past the cap (eruption): vmax {vmax}"
++    );
++}
+
+codex
+I’ll verify the emitted-count algebra against the surrounding solver state, especially pool sizing, particle volume/mass, and where `step()` uploads params before dispatch.
+exec
+/bin/zsh -lc "sed -n '1480,1775p' src/solvers/xpbd/mod.rs" in /Users/cxc/Github/coffee-sim
+exec
+/bin/zsh -lc "sed -n '700,880p' src/solvers/xpbd/mod.rs" in /Users/cxc/Github/coffee-sim
+ succeeded in 0ms:
+                    (8, &cell_start),
+                    (9, &sorted_indices),
+                    (11, &phase),
+                    (14, &fluid_impulse),
+                    (15, &vel_frozen),
+                ],
+            ),
+            buoyancy_water: bg(
+                &pipelines.buoyancy_water,
+                &[
+                    (0, &params_buf),
+                    (2, &pred),
+                    (3, &vel),
+                    (5, &lambda),
+                    (8, &cell_start),
+                    (9, &sorted_indices),
+                    (11, &phase),
+                    (15, &vel_frozen),
+                ],
+            ),
+            apply_drag_pred: bg(
+                &pipelines.apply_drag_pred,
+                &[
+                    (0, &params_buf),
+                    (2, &pred),
+                    (3, &vel),
+                    (11, &phase),
+                    (15, &vel_frozen),
+                    (19, &solids),
+                ],
+            ),
+            wet_count: bg(
+                &pipelines.wet_count,
+                &[
+                    (0, &params_buf),
+                    (2, &pred),
+                    (8, &cell_start),
+                    (9, &sorted_indices),
+                    (11, &phase),
+                    (17, &wet_count),
+                ],
+            ),
+            wet_water: bg(
+                &pipelines.wet_water,
+                &[
+                    (0, &params_buf),
+                    (1, &pos),
+                    (2, &pred),
+                    (8, &cell_start),
+                    (9, &sorted_indices),
+                    (11, &phase),
+                    (17, &wet_count),
+                ],
+            ),
+            wet_grain: bg(
+                &pipelines.wet_grain,
+                &[
+                    (0, &params_buf),
+                    (1, &pos),
+                    (2, &pred),
+                    (3, &vel),
+                    (8, &cell_start),
+                    (9, &sorted_indices),
+                    (11, &phase),
+                    (17, &wet_count),
+                ],
+            ),
+            diss_count: bg(
+                &pipelines.diss_count,
+                &[
+                    (0, &params_buf),
+                    (1, &pos),
+                    (3, &vel),
+                    (8, &cell_start),
+                    (9, &sorted_indices),
+                    (11, &phase),
+                    (21, &diss_neighbors),
+                ],
+            ),
+            dissolve_grain: bg(
+                &pipelines.dissolve_grain,
+                &[
+                    (0, &params_buf),
+                    (1, &pos),
+                    (8, &cell_start),
+                    (9, &sorted_indices),
+                    (11, &phase),
+                    (20, &chem),
+                    (21, &diss_neighbors),
+                    (22, &chem_frozen),
+                ],
+            ),
+            dissolve_water: bg(
+                &pipelines.dissolve_water,
+                &[
+                    (0, &params_buf),
+                    (1, &pos),
+                    (8, &cell_start),
+                    (9, &sorted_indices),
+                    (11, &phase),
+                    (20, &chem),
+                    (21, &diss_neighbors),
+                    (22, &chem_frozen),
+                ],
+            ),
+            thermal_exchange: bg(
+                &pipelines.thermal_exchange,
+                &[
+                    (0, &params_buf),
+                    (1, &pos),
+                    (8, &cell_start),
+                    (9, &sorted_indices),
+                    (11, &phase),
+                    (20, &chem),
+                    (22, &chem_frozen),
+                ],
+            ),
+            apply_dp: bg(
+                &pipelines.apply_dp,
+                &[
+                    (0, &params_buf),
+                    (1, &pos),
+                    (2, &pred),
+                    (6, &dp),
+                    (10, &status),
+                    (11, &phase),
+                    (19, &solids),
+                ],
+            ),
+            finalize: bg(
+                &pipelines.finalize,
+                &[
+                    (0, &params_buf),
+                    (1, &pos),
+                    (2, &pred),
+                    (3, &vel),
+                    (7, &c_residual),
+                    (11, &phase),
+                    (14, &fluid_impulse),
+                ],
+            ),
+            xsph: bg(
+                &pipelines.xsph,
+                &[
+                    (0, &params_buf),
+                    (1, &pos),
+                    (3, &vel),
+                    (4, &vel_smoothed),
+                    (8, &cell_start),
+                    (9, &sorted_indices),
+                    (11, &phase),
+                ],
+            ),
+        };
+
+        let ts = if gpu.timestamps_supported {
+            // Generous upper bound: water density loop (≈6 passes/iter) + bed contact loop
+            // (≈4 passes/iter) + coupling/finalize overhead; clamped to the query-set cap.
+            let passes_per_step = 12 + 6 * water_iters + 5 * bed_iters;
+            let capacity = (2 * passes_per_step * cfg.substeps).clamp(2, 512);
+            let qset = device.create_query_set(&wgpu::QuerySetDescriptor {
+                label: Some("xpbd-timestamps"),
+                ty: wgpu::QueryType::Timestamp,
+                count: capacity,
+            });
+            let resolve = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("xpbd-ts-resolve"),
+                size: (capacity as u64) * 8,
+                usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+            let readback = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("xpbd-ts-readback"),
+                size: (capacity as u64) * 8,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            Some(Timestamps {
+                qset,
+                capacity,
+                resolve,
+                readback,
+                period_ns: queue.get_timestamp_period(),
+                labels: Vec::new(),
+                count: 0,
+            })
+        } else {
+            None
+        };
+
+        Self {
+            device,
+            queue,
+            params,
+            capacity,
+            active_count,
+            num_cells,
+            substeps: cfg.substeps.max(1),
+            has_water,
+            has_grain,
+            water_iters,
+            water_regrid,
+            bed_iters,
+            bed_regrid,
+            drag_subiters,
+            params_buf,
+            pos,
+            vel,
+            pred,
+            vel_smoothed,
+            vel_frozen,
+            lambda,
+            phase,
+            status,
+            status_readback,
+            pos_readback,
+            chem,
+            chem_frozen,
+            pipelines,
+            bind_groups,
+            ts,
+            dispatches: 0,
+            cached_diag: XpbdDiagnostics::default(),
+            cached_passes: Vec::new(),
+            total_dose,
+            cup,
+            cached_yield: 0.0,
+            cached_tds: 0.0,
+            inflow: Inflow {
+                nozzle_radius: cfg.nozzle_radius,
+                discharge_coeff: cfg.discharge_coeff,
+                spacing: s,
+                v_w,
+                pour_t: mats.pour_t,
+                accumulator: 0.0,
+                axial: 0.0,
+                last_exit_speed: 0.0,
+                cursor: 0,
+                emitted_mass: 0.0,
+            },
+            initial_positions: positions,
+            phase_mirror: phases.clone(),
+            initial_phases: phases,
+            initial_chem,
+        }
+    }
+
+    fn reset(&mut self, _scene: &Scene) {
+        self.seed();
+    }
+
+    fn step(&mut self, dt: f32, input: &EmissionInput) {
+        // Pour emission first (grows active_count for this frame); no-op when not pouring. Uses the
+        // full frame dt (flow integrated once per frame, then simulated by all substeps).
+        self.emit(input, dt);
+        // Pool invariant: the live set never exceeds the allocated capacity (emit() clamps to it).
+        debug_assert!(self.active_count <= self.capacity);
+        self.params.dt = dt / self.substeps as f32;
+        // The live set the kernels guard against (i >= particle_count returns) — refreshed each frame
+        // so pour-grown active_count takes effect (emit() above ran first).
+        self.params.particle_count = self.active_count;
+        self.queue
+            .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&self.params));
+
+        let np = groups(self.active_count);
+        let nc = groups(self.num_cells);
+        let mut cursor = 0u32;
+        let mut labels: Vec<String> = Vec::new();
+        let mut dispatches = 0u32;
+
+        let mut enc = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("xpbd-frame"),
+            });
+
+        // Pass sequence is chosen from which species are present. Water runs the density solve
+        // (+ grain exclusion when mixed); grain runs the contact subcycle; mixed runs both, with
+        // the bed contact AFTER the water/fluid passes so grains respond. Single-species scenes
+        // keep their adaptive early-exit (residual_reduce); mixed runs fixed iteration counts.
+        let mixed = self.has_water && self.has_grain;
+        let p = &self.pipelines;
+        let b = &self.bind_groups;
+        let ts_ref = self.ts.as_ref();
+        {
+            let mut pass = |enc: &mut wgpu::CommandEncoder,
+                            pipe: &wgpu::ComputePipeline,
+                            bg: &wgpu::BindGroup,
+                            label: &str,
+                            groups: u32| {
+                dispatch_pass(
+                    enc,
+                    pipe,
+                    bg,
+                    ts_ref,
+                    &mut cursor,
+
+ succeeded in 0ms:
+        if let Some(ts) = &self.ts {
+            if ts.count >= 2 {
+                let size = (ts.count as u64) * 8;
+                let slice = ts.readback.slice(0..size);
+                let (tx, rx) = std::sync::mpsc::channel();
+                slice.map_async(wgpu::MapMode::Read, move |r| {
+                    let _ = tx.send(r);
+                });
+                let _ = self.device.poll(wgpu::PollType::Wait {
+                    submission_index: None,
+                    timeout: None,
+                });
+                rx.recv().unwrap().unwrap();
+                let times: Vec<u64> = bytemuck::cast_slice(&slice.get_mapped_range()).to_vec();
+                ts.readback.unmap();
+                let mut passes = Vec::new();
+                for (idx, label) in ts.labels.iter().enumerate() {
+                    let b = times[idx * 2];
+                    let e = times[idx * 2 + 1];
+                    let us = (e.saturating_sub(b)) as f32 * ts.period_ns / 1000.0;
+                    passes.push((label.clone(), us));
+                }
+                self.cached_passes = passes;
+            }
+        }
+
+        self.sample_extraction();
+    }
+
+    /// Refresh the cached yield/TDS from the current chem + positions (a blocking readback, folded
+    /// into `sample_diagnostics`). Yield = dissolved solute / total soluble dose; TDS = cup solute /
+    /// cup water mass, over the catch-cup region. All water volumes scale by the remaining fraction
+    /// `f_w` (deactivated water `f_w ≤ roundoff` is excluded). Phase is the immutable seed tag.
+    fn sample_extraction(&mut self) {
+        if self.total_dose <= 1.0e-9 {
+            return; // no coffee dose (e.g. water-only scene) ⇒ yield/TDS stay 0
+        }
+        let chem = self.read_vec4(self.chem.as_ref());
+        let pos = self.read_vec4(self.pos.as_ref());
+        let v_w = self.params.particle_mass / self.params.rest_density;
+        let rho_w = self.params.rest_density;
+        let mut dissolved = 0.0f32;
+        let mut cup_solute = 0.0f32;
+        let mut cup_water_mass = 0.0f32;
+        for (i, (c, p)) in chem.iter().zip(&pos).enumerate() {
+            if self.phase_mirror[i] != 0 {
+                continue; // water only (mirror covers seed + pour-emitted particles)
+            }
+            let f_w = p[3];
+            if f_w <= self.params.absorb_roundoff {
+                continue; // deactivated water carries no solute
+            }
+            let solute = c[0] * f_w * v_w; // c·(f_w·V_w)
+            dissolved += solute;
+            if let Some(cup) = self.cup {
+                let dx = p[0] - cup.cx;
+                let dz = p[2] - cup.cz;
+                if dx * dx + dz * dz < cup.radius * cup.radius
+                    && p[1] >= cup.y_min
+                    && p[1] <= cup.y_max
+                {
+                    cup_solute += solute;
+                    cup_water_mass += f_w * v_w * rho_w; // = f_w · particle_mass
+                }
+            }
+        }
+        self.cached_yield = dissolved / self.total_dose;
+        self.cached_tds = if cup_water_mass > 1.0e-9 {
+            cup_solute / cup_water_mass
+        } else {
+            0.0
+        };
+    }
+
+    pub fn diagnostics(&self) -> XpbdDiagnostics {
+        self.cached_diag
+    }
+
+    /// Live particle count currently simulated (grows as the pour activates pool slots) (dev/test).
+    pub fn active_count(&self) -> u32 {
+        self.active_count
+    }
+
+    /// Allocated particle-pool capacity (buffer size in particles) (dev/test).
+    pub fn pool_capacity(&self) -> u32 {
+        self.capacity
+    }
+
+    /// Whether the per-frame water/coupling/wetting/extraction passes run (true if a water region is
+    /// seeded OR the scene declares a pour) (dev/test).
+    pub fn has_water_passes(&self) -> bool {
+        self.has_water
+    }
+
+    /// Total water mass emitted by the pour so far (conservation accounting, R7) (dev/test).
+    pub fn total_emitted_water_mass(&self) -> f32 {
+        self.inflow.emitted_mass
+    }
+
+    /// Activate pour-emitted water particles for this frame from `EmissionInput` (KTD-3): a
+    /// volume-consistent arclength-credit emitter. The volume accumulator (flow_rate/V_w·dt) is the
+    /// master count budget; layers release one `particle_spacing` of stream travel apart, each filling
+    /// a golden-angle disc with up to `N_layer = ceil(A_eff·spacing/V_w)` particles, so the inlet packs
+    /// to the fluid's rest density (no PBF spike). Particles are written into the active pool range and
+    /// `active_count` grows. No-ops when not pouring and no backlog remains.
+    fn emit(&mut self, input: &EmissionInput, dt: f32) {
+        let flow = input.flow_rate.max(0.0);
+        // Gate: pour active, or a whole particle of backlog still to drain (R4 — drawdown drain).
+        if flow <= 0.0 && self.inflow.accumulator < 1.0 {
+            return;
+        }
+        let a_eff = std::f32::consts::PI
+            * self.inflow.nozzle_radius
+            * self.inflow.nozzle_radius
+            * self.inflow.discharge_coeff;
+        let a_eff = a_eff.max(1.0e-9);
+        // Orifice relation: exit_speed derived from flow + effective area (KTD-3). While draining a
+        // backlog at zero flow, keep the last cadence so the stream tail stays correctly spaced.
+        let exit_speed = if flow > 0.0 {
+            let es = flow / a_eff;
+            self.inflow.last_exit_speed = es;
+            self.inflow.accumulator += flow / self.inflow.v_w * dt;
+            es
+        } else {
+            self.inflow.last_exit_speed
+        };
+        if exit_speed <= 0.0 {
+            return;
+        }
+        // Volume-consistent layer capacity (ceil ⇒ throughput ≥ flow/V_w, no permanent backlog).
+        let n_layer = ((a_eff * self.inflow.spacing / self.inflow.v_w).ceil() as u32).max(1);
+
+        // Pour direction (downward, tilted by pour_angle toward +x) + a perpendicular disc basis.
+        let a = input.pour_angle;
+        let dir = [a.sin(), -a.cos(), 0.0];
+        let (u, w) = disc_basis(dir);
+        let r_eff = self.inflow.nozzle_radius * self.inflow.discharge_coeff.sqrt();
+        const GOLDEN: f32 = 2.399_963_2;
+
+        self.inflow.axial += exit_speed * dt;
+        let kettle = input.kettle_pos;
+        let mut want = self.inflow.accumulator.floor() as u32;
+        let mut new_pos: Vec<[f32; 4]> = Vec::new();
+        let mut new_vel: Vec<[f32; 4]> = Vec::new();
+        let mut new_chem: Vec<[f32; 4]> = Vec::new();
+        let mut new_phase: Vec<u32> = Vec::new();
+        let mut clamped = false;
+        while self.inflow.axial >= self.inflow.spacing && want > 0 {
+            self.inflow.axial -= self.inflow.spacing;
+            let depth = self.inflow.axial; // residual stream travel below the nozzle ⇒ layer depth
+            let avail = self.capacity - (self.active_count + new_pos.len() as u32);
+            if avail == 0 {
+                clamped = true;
+                break;
+            }
+            let this_layer = n_layer.min(want).min(avail);
+            for i in 0..this_layer {
+                let frac = (i as f32 + 0.5) / n_layer as f32;
+                let r = r_eff * frac.sqrt();
+                let theta = self.inflow.cursor as f32 * GOLDEN;
+                self.inflow.cursor += 1;
+                let (ct, st) = (theta.cos(), theta.sin());
+                let off = [
+                    u[0] * r * ct + w[0] * r * st,
+                    u[1] * r * ct + w[1] * r * st,
+                    u[2] * r * ct + w[2] * r * st,
+                ];
+                new_pos.push([
+                    kettle[0] + dir[0] * depth + off[0],
+                    kettle[1] + dir[1] * depth + off[1],
+                    kettle[2] + dir[2] * depth + off[2],
+                    1.0, // moisture lane f_w = 1 (full water)
+                ]);
+                new_vel.push([
+                    dir[0] * exit_speed,
+                    dir[1] * exit_speed,
+                    dir[2] * exit_speed,
+                    0.0,
+                ]);
+                new_chem.push([0.0, self.inflow.pour_t, 0.0, 0.0]); // c=0, T=pour temperature
+                new_phase.push(0); // water
+
+exec
+/bin/zsh -lc "rg -n \"water_particle_volume|particle_mass|pool_capacity|active_count\\(|fn step\\(|phase_mirror|write_buffer\\(&self\\.params_buf|struct EmissionInput|pour_water_ml\" src tests" in /Users/cxc/Github/coffee-sim
+ succeeded in 0ms:
+src/engine/simulator.rs:63:    pub fn step(&mut self, dt: f32, input: &EmissionInput) -> State {
+tests/xpbd_coupling.rs:36:            mats.particle_mass
+tests/xpbd_coupling.rs:52:                mats.particle_mass
+tests/xpbd_extraction.rs:133:    let v_w = solver.water_particle_volume();
+tests/xpbd_extraction.rs:329:    let v_w = solver.water_particle_volume();
+tests/xpbd_extraction.rs:481:    let v_w = solver.water_particle_volume();
+tests/xpbd_extraction.rs:534:/// particle_mass·cp_water, C_grain = grain_mass·cp_grain.
+tests/xpbd_extraction.rs:542:                mats.particle_mass * mats.cp_water * c[1] // water T at .y
+tests/xpbd_extraction.rs:683:        let v_w = solver.water_particle_volume();
+tests/xpbd_extraction.rs:780:    let v_w = solver.water_particle_volume();
+src/engine/scene.rs:37:    pub pour_water_ml: f32,
+src/engine/scene.rs:57:            pour_water_ml: 0.0,
+src/engine/scene.rs:83:            pour_water_ml: 0.0, // fixed-column V60; the continuous-pour variant is `v60_pour()`
+src/engine/scene.rs:179:    /// particle pool with headroom for `pour_water_ml`; when false the pool is exactly the seed.
+src/engine/scene.rs:181:        self.pour_water_ml > 0.0
+tests/xpbd_emission.rs:34:        pour_water_ml: pour_ml,
+tests/xpbd_emission.rs:78:    assert_eq!(solver.active_count(), seed);
+tests/xpbd_emission.rs:80:        solver.pool_capacity(),
+tests/xpbd_emission.rs:99:        pour_water_ml: 500.0, // big headroom
+tests/xpbd_emission.rs:105:    assert_eq!(base.pool_capacity(), seed);
+tests/xpbd_emission.rs:107:        withcap.pool_capacity() > seed,
+tests/xpbd_emission.rs:109:        withcap.pool_capacity()
+tests/xpbd_emission.rs:112:    assert_eq!(base.active_count(), seed);
+tests/xpbd_emission.rs:113:    assert_eq!(withcap.active_count(), seed);
+tests/xpbd_emission.rs:122:        withcap.active_count(),
+tests/xpbd_emission.rs:150:        pour_water_ml: 250.0,
+tests/xpbd_emission.rs:167:        pour_water_ml: 0.0,
+tests/xpbd_emission.rs:180:fn reset_restores_seed_active_count() {
+tests/xpbd_emission.rs:186:        pour_water_ml: 500.0,
+tests/xpbd_emission.rs:195:    assert_eq!(solver.active_count(), seed);
+tests/xpbd_emission.rs:216:    let v_w = solver.water_particle_volume();
+tests/xpbd_emission.rs:222:    let emitted = solver.active_count();
+tests/xpbd_emission.rs:236:        "emitted-mass {m} != count {emitted} × particle_mass"
+tests/xpbd_emission.rs:259:        solver.active_count() > 0,
+tests/xpbd_emission.rs:284:    assert_eq!(phase.len(), solver.active_count() as usize);
+tests/xpbd_emission.rs:313:        (solver.active_count(), solver.read_positions())
+tests/xpbd_emission.rs:336:    let cap = solver.pool_capacity();
+tests/xpbd_emission.rs:341:            solver.active_count() <= cap,
+tests/xpbd_emission.rs:343:            solver.active_count()
+tests/xpbd_emission.rs:347:        solver.active_count(),
+tests/xpbd_emission.rs:365:        pour_water_ml: 4000.0,
+tests/xpbd_emission.rs:379:        solver.active_count() > 50,
+tests/xpbd_emission.rs:381:        solver.active_count()
+tests/xpbd_wetting.rs:88:/// Effective-mass momentum: water `particle_mass·f_w`, grain `grain_mass + ρ_w·V_abs`.
+tests/xpbd_wetting.rs:101:                mats.particle_mass * m
+tests/xpbd_wetting.rs:216:    let v_w = solver.water_particle_volume();
+tests/xpbd_wetting.rs:259:    let v_w = solver.water_particle_volume();
+tests/xpbd_wetting.rs:260:    let rho_w = mats.particle_mass / v_w;
+tests/xpbd_wetting.rs:326:    let v_w = solver.water_particle_volume();
+tests/xpbd_wetting.rs:436:    let v_w = solver.water_particle_volume();
+tests/xpbd_wetting.rs:548:    let v_w = solver.water_particle_volume();
+tests/xpbd_wetting.rs:549:    let rho_w = mats.particle_mass / v_w;
+tests/xpbd_wetting.rs:681:    let v_w = solver.water_particle_volume();
+tests/xpbd_water.rs:88:        mats.particle_mass,
+tests/xpbd_water.rs:136:    let (ok, interior) = density_in_band(&pos, mats.support_radius, mats.particle_mass, rho0, 17);
+tests/xpbd_geometry.rs:62:        pour_water_ml: 0.0,
+tests/xpbd_geometry.rs:128:        pour_water_ml: 0.0,
+tests/xpbd_geometry.rs:178:        pour_water_ml: 0.0,
+src/models/mod.rs:30:    pub particle_mass: f32,
+src/models/mod.rs:102:            particle_mass: 1.0,
+src/models/wetting.rs:58:pub fn water_eff_mass(particle_mass: f32, f_w: f32) -> f32 {
+src/models/wetting.rs:59:    particle_mass * f_w
+src/emission/mod.rs:19:pub struct EmissionInput {
+src/solvers/noop.rs:27:    fn step(&mut self, _dt: f32, _input: &EmissionInput) {
+src/solvers/noop.rs:55:    fn step(&mut self, _dt: f32, _input: &EmissionInput) {
+src/solvers/base.rs:61:    fn step(&mut self, dt: f32, input: &EmissionInput);
+src/solvers/xpbd/wetting.wgsl:18:fn wet_v_water() -> f32 { return params.particle_mass / params.rest_density; }
+src/solvers/xpbd/mod.rs:47:    particle_mass: f32,
+src/solvers/xpbd/mod.rs:102:    cp_water: f32,     // water specific heat (C_water = particle_mass·f_w·cp_water)
+src/solvers/xpbd/mod.rs:344:    phase_mirror: Vec<u32>,
+src/solvers/xpbd/mod.rs:507:        self.phase_mirror.clear();
+src/solvers/xpbd/mod.rs:508:        self.phase_mirror.extend_from_slice(&self.initial_phases);
+src/solvers/xpbd/mod.rs:579:    /// Single water-particle volume `V_w = particle_mass / rest_density` (dev/test only). Lets a
+src/solvers/xpbd/mod.rs:581:    pub fn water_particle_volume(&self) -> f32 {
+src/solvers/xpbd/mod.rs:582:        self.params.particle_mass / self.params.rest_density
+src/solvers/xpbd/mod.rs:739:        let v_w = self.params.particle_mass / self.params.rest_density;
+src/solvers/xpbd/mod.rs:745:            if self.phase_mirror[i] != 0 {
+src/solvers/xpbd/mod.rs:762:                    cup_water_mass += f_w * v_w * rho_w; // = f_w · particle_mass
+src/solvers/xpbd/mod.rs:779:    pub fn active_count(&self) -> u32 {
+src/solvers/xpbd/mod.rs:784:    pub fn pool_capacity(&self) -> u32 {
+src/solvers/xpbd/mod.rs:891:        self.inflow.emitted_mass += emit_n as f32 * self.params.particle_mass;
+src/solvers/xpbd/mod.rs:895:                 enough pour_water_ml to size the pool to its dose)",
+src/solvers/xpbd/mod.rs:910:        self.phase_mirror.extend_from_slice(&new_phase);
+src/solvers/xpbd/mod.rs:927:            .zip(&self.phase_mirror)
+src/solvers/xpbd/mod.rs:939:        let m = mats.particle_mass;
+src/solvers/xpbd/mod.rs:981:            (scene.pour_water_ml / ML_PER_SIM_UNIT3 / v_w).ceil() as u32
+src/solvers/xpbd/mod.rs:1003:            particle_mass: m,
+src/solvers/xpbd/mod.rs:1721:            phase_mirror: phases.clone(),
+src/solvers/xpbd/mod.rs:1731:    fn step(&mut self, dt: f32, input: &EmissionInput) {
+src/solvers/xpbd/mod.rs:1742:            .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&self.params));
+src/solvers/xpbd/coupling.wgsl:76:    // (V_abs=0, f_w=1) ⇒ the original particle_mass/grain_mass split. w_self computed per neighbor.
+src/solvers/xpbd/coupling.wgsl:367:    let m_w = max(water_eff_mass(pred[i].w), params.particle_mass * params.pbf_eps);
+src/solvers/xpbd/water.wgsl:17:    let m = params.particle_mass;
+src/solvers/xpbd/water.wgsl:122:    let m = params.particle_mass;
+src/solvers/xpbd/common.wgsl:24:    particle_mass: f32,
+src/solvers/xpbd/common.wgsl:349:fn water_eff_mass(f_w: f32) -> f32 { return params.particle_mass * f_w; }
+
+codex
+I found the implementation in the working tree, so I’m checking a few adjacent details rather than relying only on the pasted diff: capacity accounting, initial buffer sizes, and whether newly written slots are visible to the frame’s kernels.
+exec
+/bin/zsh -lc "sed -n '920,1025p' src/solvers/xpbd/mod.rs" in /Users/cxc/Github/coffee-sim
+exec
+/bin/zsh -lc "sed -n '560,620p' src/solvers/xpbd/mod.rs" in /Users/cxc/Github/coffee-sim
+ succeeded in 0ms:
+    pub fn read_moisture(&self) -> Vec<f32> {
+        self.read_vec4(self.pos.as_ref())
+            .iter()
+            .map(|p| p[3])
+            .collect()
+    }
+
+    /// Read back the per-particle chem/thermal lanes (dev/test only — stalls the GPU): grain =
+    /// (s_f, s_s, T_g, _), water = (c, T_w, _, _). Used by the extraction tests + yield/TDS readout.
+    pub fn read_chem(&self) -> Vec<[f32; 4]> {
+        self.read_vec4(self.chem.as_ref())
+    }
+
+    /// Read back the predicted-position buffer (dev/test only — stalls the GPU). `pred.w` mirrors
+    /// the moisture snapshot; a test asserts it survives every `pred` writer through a full step.
+    pub fn read_pred(&self) -> Vec<[f32; 4]> {
+        self.read_vec4(&self.pred)
+    }
+
+    /// Single water-particle volume `V_w = particle_mass / rest_density` (dev/test only). Lets a
+    /// conservation test convert the water moisture lane `f_w` into an absolute volume.
+    pub fn water_particle_volume(&self) -> f32 {
+        self.params.particle_mass / self.params.rest_density
+    }
+
+    /// Overwrite current particle velocities (dev/test only).
+    pub fn write_velocities_for_test(&self, velocities: &[[f32; 4]]) {
+        assert_eq!(
+            velocities.len(),
+            self.active_count as usize,
+            "velocity seed length must match particle count"
+        );
+        self.queue
+            .write_buffer(&self.vel, 0, bytemuck::cast_slice(velocities));
+    }
+
+    /// Overwrite the per-particle chem/thermal lanes (dev/test only): grain = (s_f, s_s, T_g, _),
+    /// water = (c, T_w, _, _). Lets a test pre-seed a saturated water field or a known thermal state.
+    pub fn write_chem_for_test(&self, chem: &[[f32; 4]]) {
+        assert_eq!(
+            chem.len(),
+            self.active_count as usize,
+            "chem seed length must match particle count"
+        );
+        self.queue
+            .write_buffer(self.chem.as_ref(), 0, bytemuck::cast_slice(chem));
+    }
+
+    /// Overwrite the per-particle moisture lane `pos.w` (dev/test only): water `f_w`, grain `V_abs`.
+    /// Lets a test pre-wet grains so the dissolution pass runs with `absorb_rate=0` (constant `f_w`),
+    /// isolating solute conservation from the wetting volume transfer.
+    pub fn write_moisture_for_test(&self, moisture: &[f32]) {
+        let mut pos = self.read_vec4(self.pos.as_ref());
+        assert_eq!(
+            pos.len(),
+            moisture.len(),
+            "moisture seed length must match particle count"
+        );
+        for (p, &m) in pos.iter_mut().zip(moisture) {
+            p[3] = m;
+        }
+
+ succeeded in 0ms:
+    }
+
+    /// Read back per-particle temperature (phase-aware: water `T` is chem `.y`, grain `T` is `.z`).
+    /// Dev/test/inspection only — stalls the GPU.
+    pub fn read_temperature(&self) -> Vec<f32> {
+        self.read_vec4(self.chem.as_ref())
+            .iter()
+            .zip(&self.phase_mirror)
+            .map(|(c, &ph)| if ph == 0 { c[1] } else { c[2] })
+            .collect()
+    }
+}
+
+impl Solver for XpbdSolver {
+    fn build(scene: &Scene, mats: &Materials, cfg: &Config, gpu: &GpuContext) -> Self {
+        let device = gpu.device.clone();
+        let queue = gpu.queue.clone();
+        let s = mats.particle_spacing;
+        let h = mats.support_radius;
+        let m = mats.particle_mass;
+
+        let (positions, phases) = seed_block(scene, mats, cfg);
+        let seed_count = positions.len() as u32;
+
+        // Which species are present drives the per-frame passes. The grain bed solves contacts
+        // (harder to converge than water): its own iteration cap + more frequent grid rebuild.
+        // A declared pour means water WILL be present even if no water region is seeded, so the
+        // water/coupling/wetting/extraction passes must be selected.
+        let has_water =
+            scene.regions.iter().any(|r| r.species == Species::Water) || scene.declares_pour();
+        let has_grain = scene.regions.iter().any(|r| r.species == Species::Grain);
+        let water_iters = cfg.max_iters;
+        let water_regrid = REGRID_INTERVAL;
+        let bed_iters = cfg.bed_max_iters;
+        let bed_regrid = cfg.bed_regrid_interval.max(1);
+        let drag_subiters = cfg.drag_subiters;
+        // The shared `status` residual machinery (single-species early-exit) tracks the sole
+        // species; a mixed scene runs fixed iteration counts (no early-exit), so it doesn't use it.
+        let (param_iters, residual_tolerance) = if has_grain && !has_water {
+            (bed_iters, cfg.bed_residual_tolerance)
+        } else {
+            (water_iters, cfg.residual_tolerance)
+        };
+        let grain_volume = std::f32::consts::FRAC_PI_6 * mats.grain_diameter.powi(3);
+
+        // Grid cell must cover the largest neighbor query: the water support radius h, OR the
+        // grain contact diameter when grains are coarser than the water (so grain neighbors aren't
+        // missed). For single-resolution scenes (grain_diameter ≤ h) this is just h.
+        let cell_size = h.max(mats.grain_diameter);
+        let nx = (((scene.box_max[0] - scene.box_min[0]) / cell_size).ceil() as u32).max(1);
+        let ny = (((scene.box_max[1] - scene.box_min[1]) / cell_size).ceil() as u32).max(1);
+        let nz = (((scene.box_max[2] - scene.box_min[2]) / cell_size).ceil() as u32).max(1);
+        let num_cells = nx * ny * nz;
+
+        let rest_density = kernels::rest_density(s, h, m);
+        // Particle pool: buffers are sized to `capacity` = the seed plus headroom for a declared pour
+        // dose (KTD-7: water_ml / 5.20 ml·unit⁻³ / V_w particles). `active_count` (the live, dispatched
+        // set) starts at the seed and grows as the pour activates dormant slots. Non-pour scenes get
+        // `capacity == active_count == seed_count`, so the layout/dispatch is byte-identical to before.
+        let v_w = m / rest_density;
+        let dose_headroom = if scene.declares_pour() {
+            (scene.pour_water_ml / ML_PER_SIM_UNIT3 / v_w).ceil() as u32
+        } else {
+            0
+        };
+        let capacity = seed_count + dose_headroom;
+        let active_count = seed_count;
+        let dq = cfg.s_corr_dq_ratio * h;
+        let s_corr_wq = kernels::w_poly6(dq, h);
+        // Resolve the user-facing drag scale through Kozeny-Carman once at build time, stored in
+        // `drag_gamma` (live-porosity drag in a later unit makes this per-particle).
+        let permeability = kozeny_carman(mats.grain_diameter, mats.porosity);
+        let resolved_drag_gamma = drag_rate(permeability, cfg.drag_gamma);
+
+        let params = Params {
+            box_min: [scene.box_min[0], scene.box_min[1], scene.box_min[2], 0.0],
+            box_max: [scene.box_max[0], scene.box_max[1], scene.box_max[2], 0.0],
+            gravity: [scene.gravity[0], scene.gravity[1], scene.gravity[2], 0.0],
+            grid_origin: [scene.box_min[0], scene.box_min[1], scene.box_min[2], 0.0],
+            grid_dims: [nx, ny, nz, num_cells],
+            dt: 1.0 / 60.0,
+            h,
+            rest_density,
+            particle_mass: m,
+            s_corr_k: cfg.s_corr_k,
+            s_corr_n: cfg.s_corr_n,
+            s_corr_wq,
+            relaxation_eps: cfg.relaxation_eps,
+            position_relaxation: cfg.position_relaxation,
+            xsph_c: cfg.xsph_viscosity_c,
+            max_speed: cfg.max_speed,
+            spiky_r_min: cfg.spiky_r_min_ratio * h,
+            cell_size,
+            particle_count: active_count, // live count; grows as the pour activates pool slots
+            num_solids: scene.solids.len() as u32,
+            min_iters: cfg.min_iters,
+            max_iters: param_iters,
+            residual_tolerance,
+            lambda_noncohesive: cfg.lambda_clamp_noncohesive as u32,
+            max_correction: cfg.max_correction_ratio * h,
+            velocity_damping: cfg.velocity_damping,
+            grain_diameter: mats.grain_diameter,
+            friction_mu: mats.friction_mu,
+            floor_mu: mats.floor_mu,
+            dry_cohesion: mats.dry_cohesion,
+            cohesion_range: crate::models::cohesion::COHESION_RANGE_RATIO * mats.grain_diameter,
+
+exec
+/bin/zsh -lc "sed -n '40,120p' src/engine/simulator.rs" in /Users/cxc/Github/coffee-sim
+ succeeded in 0ms:
+            materials,
+            config,
+            active_id: id,
+            active_info,
+            solver,
+            frame: 0,
+        }
+    }
+
+    pub fn active_id(&self) -> SolverId {
+        self.active_id
+    }
+
+    pub fn active_info(&self) -> &SolverInfo {
+        &self.active_info
+    }
+
+    pub fn frame(&self) -> u64 {
+        self.frame
+    }
+
+    /// Advance one frame. The solver does its own internal substepping; we just pass the
+    /// frame `dt`, then pull the canonical snapshot.
+    pub fn step(&mut self, dt: f32, input: &EmissionInput) -> State {
+        self.solver.step(dt, input);
+        self.frame += 1;
+        State {
+            particles: self.solver.particles(),
+            metrics: self.solver.metrics(),
+            profile: self.solver.profile(),
+        }
+    }
+
+    /// Rebuild a different solver on the **same** scene — the runtime solver-switch.
+    pub fn switch_solver(&mut self, id: SolverId) {
+        self.solver = build_solver(id, &self.scene, &self.materials, &self.config, &self.gpu);
+        self.active_id = id;
+        self.active_info = info_for(id);
+    }
+}
+
+exec
+/bin/zsh -lc "sed -n '1,80p' src/emission/mod.rs && sed -n '1,120p' src/engine/scene.rs" in /Users/cxc/Github/coffee-sim
+ succeeded in 0ms:
+//! Particle emission (coffee + water) as its own block, so emitting each species can be
+//! tested independently to verify their physics in isolation.
+//!
+//! Phase 0: the `EmissionInput` control type (the per-frame input handed to the active
+//! solver). The emission logic itself lands later.
+
+/// A discrete pour event delivered alongside the continuous controls.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum PourEvent {
+    #[default]
+    None,
+    StartBloom,
+    StopBloom,
+    Reset,
+}
+
+/// Per-frame pour/emission control input fed to `Solver::step`.
+#[derive(Clone, Copy, Debug)]
+pub struct EmissionInput {
+    /// Kettle spout position (world space).
+    pub kettle_pos: [f32; 3],
+    /// Volumetric flow rate (scene units / s).
+    pub flow_rate: f32,
+    /// Pour angle (radians).
+    pub pour_angle: f32,
+    /// Discrete event for this frame, if any.
+    pub event: PourEvent,
+}
+
+impl Default for EmissionInput {
+    fn default() -> Self {
+        Self {
+            kettle_pos: [0.0, 0.0, 0.0],
+            flow_rate: 0.0,
+            pour_angle: 0.0,
+            event: PourEvent::None,
+        }
+    }
+}
+//! `Scene` — the user-facing brew description, immutable input to `Solver::build`/`reset`.
+//!
+//! Carries the simulation box, gravity, a list of **seed regions** (each a block of one species),
+//! and any static **solids** (analytic SDF geometry — a V60 dripper, a cup) the particles collide
+//! with. Single-species scenes have one region and no solids; the coupling scenes seed both a grain
+//! bed and a water column; the V60 scene adds dripper geometry. Reference recipe values are in
+//! `KEEP.md` §1.
+
+pub use crate::utils::sdf::{SdfPrimitive, SolidKind};
+
+/// Which material a seed region is. The solver shares one particle system + grid across both,
+/// tagged per particle by `phase`; the per-frame pass sequence is chosen from which species are present.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Species {
+    Water,
+    Grain,
+}
+
+/// An axis-aligned block seeded with one species at build/reset.
+#[derive(Clone, Copy, Debug)]
+pub struct SeedRegion {
+    pub min: [f32; 3],
+    pub max: [f32; 3],
+    pub species: Species,
+}
+
+/// Immutable brew/scene description handed to a solver at build/reset.
+#[derive(Clone, Debug)]
+pub struct Scene {
+    /// Coffee dose (grams) — placeholder for the recipe-driven scenes.
+    pub dose_g: f32,
+    /// Brew water (milliliters) — placeholder for the recipe-driven scenes.
+    pub water_ml: f32,
+    /// Water delivered by a continuous pour over the brew (mL). `0` = no pour (water comes only from
+    /// the seeded regions; the solver sizes its particle pool to exactly the seed). `> 0` opts a scene
+    /// into pour emission and sizes the pool with headroom for the dosed water. (Phase: pour emission.)
+    pub pour_water_ml: f32,
+
+    /// Gravity vector (scene units / s²).
+    pub gravity: [f32; 3],
+    /// Axis-aligned simulation domain (inclusive bounds).
+    pub box_min: [f32; 3],
+    pub box_max: [f32; 3],
+    /// Regions seeded with particles at build/reset (one per species block).
+    pub regions: Vec<SeedRegion>,
+    /// Static solid geometry (analytic SDF) the particles collide with — empty for the AABB-only
+    /// scenes. When non-empty, seeding rejects lattice points that fall outside a solid's cavity for
+    /// their species (so a bed starts inside the dripper, not through its wall).
+    pub solids: Vec<SdfPrimitive>,
+}
+
+impl Default for Scene {
+    fn default() -> Self {
+        Self {
+            dose_g: 0.0,
+            water_ml: 0.0,
+            pour_water_ml: 0.0,
+            gravity: [0.0, -20.0, 0.0],
+            box_min: [0.0, 0.0, 0.0],
+            box_max: [32.0, 40.0, 32.0],
+            // A 16³ water block against one wall — a dam-break that's lively but not a torture
+            // column (a too-tall column over-compresses the pool and triggers squeeze-out
+            // eruptions). Settles to a shallow pool over the floor.
+            regions: vec![SeedRegion {
+                min: [1.0, 1.0, 8.0],
+                max: [17.0, 17.0, 24.0],
+                species: Species::Water,
+            }],
+            solids: Vec::new(),
+        }
+    }
+}
+
+impl Scene {
+    /// A V60 brew: the dripper geometry (support cone + grains-only filter + cup) with a coffee bed
+    /// seeded inside the cone and a water column above it. Origin-centered domain. Bed/water blocks
+    /// are seeded generously and **cone-aware rejection** (in `seed_block`) trims them to the cavity,
+    /// so no grain starts through the filter wall. Dimensions are reference values (`KEEP.md` §2/§4).
+    pub fn v60() -> Self {
+        Self {
+            dose_g: 15.0,
+            water_ml: 250.0,
+            pour_water_ml: 0.0, // fixed-column V60; the continuous-pour variant is `v60_pour()`
+            gravity: [0.0, -20.0, 0.0],
+            box_min: [-7.0, -10.0, -7.0],
+            box_max: [7.0, 10.0, 7.0],
+            solids: crate::utils::geometry::v60_dripper(),
+            regions: vec![
+                // Coffee bed: a block spanning the lower cone; rejection trims it to the (grains-only)
+                // filter cavity so the bed is cone-shaped and starts inside the paper.
+                SeedRegion {
+                    min: [-2.5, -2.8, -2.5],
+                    max: [2.5, 0.2, 2.5],
+                    species: Species::Grain,
+                },
+                // Water column above the bed; rejection trims it to the support-cone cavity.
+                SeedRegion {
+                    min: [-2.0, 0.6, -2.0],
+                    max: [2.0, 2.6, 2.0],
+                    species: Species::Water,
+                },
+            ],
+        }
+    }
+
+    /// A dam-break: a tall water column released in a box. The water-core gate scene.
+    pub fn dam_break() -> Self {
+        Self::default()
+    }
+
+    /// A dry-bed drop: a low, wide grain block poured onto the flat floor — it slumps into a
+    /// stable static heap. The granular-bed gate scene. Wider floor so the heap never touches a
+    /// wall (wall contact would confine the pile and corrupt the repose).
+    pub fn bed_drop() -> Self {
+        Self {
+            box_max: [48.0, 40.0, 48.0],
+            regions: vec![SeedRegion {
+                min: [15.0, 2.0, 15.0],
+                max: [33.0, 12.0, 33.0],
+                species: Species::Grain,
+
+codex
+The main implementation issue is emerging in the arclength layer loop: the residual-depth placement is internally consistent, but the loop can consume axial credit even when volume budget cannot fund a whole layer. I’m checking exact line numbers now so the verdict is grounded.
+exec
+/bin/zsh -lc "nl -ba src/solvers/xpbd/mod.rs | sed -n '960,990p'" in /Users/cxc/Github/coffee-sim
+exec
+/bin/zsh -lc "nl -ba src/solvers/xpbd/mod.rs | sed -n '1728,1745p'" in /Users/cxc/Github/coffee-sim
+ succeeded in 0ms:
+  1728	        self.seed();
+  1729	    }
+  1730	
+  1731	    fn step(&mut self, dt: f32, input: &EmissionInput) {
+  1732	        // Pour emission first (grows active_count for this frame); no-op when not pouring. Uses the
+  1733	        // full frame dt (flow integrated once per frame, then simulated by all substeps).
+  1734	        self.emit(input, dt);
+  1735	        // Pool invariant: the live set never exceeds the allocated capacity (emit() clamps to it).
+  1736	        debug_assert!(self.active_count <= self.capacity);
+  1737	        self.params.dt = dt / self.substeps as f32;
+  1738	        // The live set the kernels guard against (i >= particle_count returns) — refreshed each frame
+  1739	        // so pour-grown active_count takes effect (emit() above ran first).
+  1740	        self.params.particle_count = self.active_count;
+  1741	        self.queue
+  1742	            .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&self.params));
+  1743	
+  1744	        let np = groups(self.active_count);
+  1745	        let nc = groups(self.num_cells);
+
+ succeeded in 0ms:
+   960	        } else {
+   961	            (water_iters, cfg.residual_tolerance)
+   962	        };
+   963	        let grain_volume = std::f32::consts::FRAC_PI_6 * mats.grain_diameter.powi(3);
+   964	
+   965	        // Grid cell must cover the largest neighbor query: the water support radius h, OR the
+   966	        // grain contact diameter when grains are coarser than the water (so grain neighbors aren't
+   967	        // missed). For single-resolution scenes (grain_diameter ≤ h) this is just h.
+   968	        let cell_size = h.max(mats.grain_diameter);
+   969	        let nx = (((scene.box_max[0] - scene.box_min[0]) / cell_size).ceil() as u32).max(1);
+   970	        let ny = (((scene.box_max[1] - scene.box_min[1]) / cell_size).ceil() as u32).max(1);
+   971	        let nz = (((scene.box_max[2] - scene.box_min[2]) / cell_size).ceil() as u32).max(1);
+   972	        let num_cells = nx * ny * nz;
+   973	
+   974	        let rest_density = kernels::rest_density(s, h, m);
+   975	        // Particle pool: buffers are sized to `capacity` = the seed plus headroom for a declared pour
+   976	        // dose (KTD-7: water_ml / 5.20 ml·unit⁻³ / V_w particles). `active_count` (the live, dispatched
+   977	        // set) starts at the seed and grows as the pour activates dormant slots. Non-pour scenes get
+   978	        // `capacity == active_count == seed_count`, so the layout/dispatch is byte-identical to before.
+   979	        let v_w = m / rest_density;
+   980	        let dose_headroom = if scene.declares_pour() {
+   981	            (scene.pour_water_ml / ML_PER_SIM_UNIT3 / v_w).ceil() as u32
+   982	        } else {
+   983	            0
+   984	        };
+   985	        let capacity = seed_count + dose_headroom;
+   986	        let active_count = seed_count;
+   987	        let dq = cfg.s_corr_dq_ratio * h;
+   988	        let s_corr_wq = kernels::w_poly6(dq, h);
+   989	        // Resolve the user-facing drag scale through Kozeny-Carman once at build time, stored in
+   990	        // `drag_gamma` (live-porosity drag in a later unit makes this per-particle).
+
+exec
+/bin/zsh -lc "nl -ba src/solvers/xpbd/mod.rs | sed -n '810,910p'" in /Users/cxc/Github/coffee-sim
+ succeeded in 0ms:
+   810	        }
+   811	        let a_eff = std::f32::consts::PI
+   812	            * self.inflow.nozzle_radius
+   813	            * self.inflow.nozzle_radius
+   814	            * self.inflow.discharge_coeff;
+   815	        let a_eff = a_eff.max(1.0e-9);
+   816	        // Orifice relation: exit_speed derived from flow + effective area (KTD-3). While draining a
+   817	        // backlog at zero flow, keep the last cadence so the stream tail stays correctly spaced.
+   818	        let exit_speed = if flow > 0.0 {
+   819	            let es = flow / a_eff;
+   820	            self.inflow.last_exit_speed = es;
+   821	            self.inflow.accumulator += flow / self.inflow.v_w * dt;
+   822	            es
+   823	        } else {
+   824	            self.inflow.last_exit_speed
+   825	        };
+   826	        if exit_speed <= 0.0 {
+   827	            return;
+   828	        }
+   829	        // Volume-consistent layer capacity (ceil ⇒ throughput ≥ flow/V_w, no permanent backlog).
+   830	        let n_layer = ((a_eff * self.inflow.spacing / self.inflow.v_w).ceil() as u32).max(1);
+   831	
+   832	        // Pour direction (downward, tilted by pour_angle toward +x) + a perpendicular disc basis.
+   833	        let a = input.pour_angle;
+   834	        let dir = [a.sin(), -a.cos(), 0.0];
+   835	        let (u, w) = disc_basis(dir);
+   836	        let r_eff = self.inflow.nozzle_radius * self.inflow.discharge_coeff.sqrt();
+   837	        const GOLDEN: f32 = 2.399_963_2;
+   838	
+   839	        self.inflow.axial += exit_speed * dt;
+   840	        let kettle = input.kettle_pos;
+   841	        let mut want = self.inflow.accumulator.floor() as u32;
+   842	        let mut new_pos: Vec<[f32; 4]> = Vec::new();
+   843	        let mut new_vel: Vec<[f32; 4]> = Vec::new();
+   844	        let mut new_chem: Vec<[f32; 4]> = Vec::new();
+   845	        let mut new_phase: Vec<u32> = Vec::new();
+   846	        let mut clamped = false;
+   847	        while self.inflow.axial >= self.inflow.spacing && want > 0 {
+   848	            self.inflow.axial -= self.inflow.spacing;
+   849	            let depth = self.inflow.axial; // residual stream travel below the nozzle ⇒ layer depth
+   850	            let avail = self.capacity - (self.active_count + new_pos.len() as u32);
+   851	            if avail == 0 {
+   852	                clamped = true;
+   853	                break;
+   854	            }
+   855	            let this_layer = n_layer.min(want).min(avail);
+   856	            for i in 0..this_layer {
+   857	                let frac = (i as f32 + 0.5) / n_layer as f32;
+   858	                let r = r_eff * frac.sqrt();
+   859	                let theta = self.inflow.cursor as f32 * GOLDEN;
+   860	                self.inflow.cursor += 1;
+   861	                let (ct, st) = (theta.cos(), theta.sin());
+   862	                let off = [
+   863	                    u[0] * r * ct + w[0] * r * st,
+   864	                    u[1] * r * ct + w[1] * r * st,
+   865	                    u[2] * r * ct + w[2] * r * st,
+   866	                ];
+   867	                new_pos.push([
+   868	                    kettle[0] + dir[0] * depth + off[0],
+   869	                    kettle[1] + dir[1] * depth + off[1],
+   870	                    kettle[2] + dir[2] * depth + off[2],
+   871	                    1.0, // moisture lane f_w = 1 (full water)
+   872	                ]);
+   873	                new_vel.push([
+   874	                    dir[0] * exit_speed,
+   875	                    dir[1] * exit_speed,
+   876	                    dir[2] * exit_speed,
+   877	                    0.0,
+   878	                ]);
+   879	                new_chem.push([0.0, self.inflow.pour_t, 0.0, 0.0]); // c=0, T=pour temperature
+   880	                new_phase.push(0); // water
+   881	            }
+   882	            want -= this_layer;
+   883	        }
+   884	        let emit_n = new_pos.len() as u32;
+   885	        if emit_n == 0 {
+   886	            return;
+   887	        }
+   888	        // Clamp-before-decrement: subtract only what was actually emitted (R4) — unspent budget stays
+   889	        // as backlog rather than being silently burned.
+   890	        self.inflow.accumulator -= emit_n as f32;
+   891	        self.inflow.emitted_mass += emit_n as f32 * self.params.particle_mass;
+   892	        if clamped {
+   893	            eprintln!(
+   894	                "xpbd pour: pool capacity {} reached; emission clamped (a recipe scene must declare \
+   895	                 enough pour_water_ml to size the pool to its dose)",
+   896	                self.capacity
+   897	            );
+   898	        }
+   899	        let off_v4 = (self.active_count as u64) * 16;
+   900	        let off_u32 = (self.active_count as u64) * 4;
+   901	        self.queue
+   902	            .write_buffer(&self.pos, off_v4, bytemuck::cast_slice(&new_pos));
+   903	        self.queue
+   904	            .write_buffer(self.chem.as_ref(), off_v4, bytemuck::cast_slice(&new_chem));
+   905	        self.queue
+   906	            .write_buffer(&self.vel, off_v4, bytemuck::cast_slice(&new_vel));
+   907	        self.queue
+   908	            .write_buffer(&self.phase, off_u32, bytemuck::cast_slice(&new_phase));
+   909	        self.active_count += emit_n;
+   910	        self.phase_mirror.extend_from_slice(&new_phase);
+
+codex
+The GPU write ordering itself looks sound for `pos`, `vel`, `chem`, and `phase`, but I’m checking whether any other per-particle buffers need initialization before newly active slots participate in the first substep.
+exec
+/bin/zsh -lc "sed -n '1,180p' src/solvers/xpbd/water.wgsl" in /Users/cxc/Github/coffee-sim
+ succeeded in 0ms:
+// Water incompressibility (Position Based Fluids — Macklin & Müller 2013): the constant-density
+// constraint + λ, the s_corr artificial-pressure Δp, the convergence reduction, and XSPH
+// viscosity. Concatenated after `common.wgsl`, which declares Params/Status/bindings + the SPH
+// and grid helpers these kernels use.
+//
+// Every density sum is phase-guarded: a grain neighbor has no fluid density and must not enter
+// the water constraint (and grain particles skip the water solve entirely). For a single-species
+// water scene the guards are pass-throughs, so water behaviour is unchanged.
+
+@compute @workgroup_size(256)
+fn compute_lambda(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= params.particle_count) { return; }
+    if (status.converged != 0u) { return; }
+    if (phase[i] != PHASE_WATER) { return; } // grains have no density constraint
+    let h = params.h;
+    let m = params.particle_mass;
+    let xi = pred[i].xyz;
+    // Wetting: water carries a remaining-volume fraction f_w in pred.w. A near-empty particle is
+    // skipped (inert), and every water contributes its f_w-weighted mass — so the density solve
+    // matches the actual fluid at the wet front. f_w≡1 (no absorption) ⇒ identical to before.
+    let f_i = pred[i].w;
+    if (f_i <= params.pbf_eps) {
+        lambda[i] = 0.0;
+        c_residual[i] = 0.0;
+        return;
+    }
+
+    var rho = m * f_i * w_poly6(0.0, h);
+    var sum_g = vec3<f32>(0.0);
+    var sum_g2 = 0.0;
+
+    let base = cell_coord(xi);
+    for (var dz = -1; dz <= 1; dz = dz + 1) {
+        for (var dy = -1; dy <= 1; dy = dy + 1) {
+            for (var dx = -1; dx <= 1; dx = dx + 1) {
+                let nc = base + vec3<i32>(dx, dy, dz);
+                if (nc.x < 0 || nc.y < 0 || nc.z < 0) { continue; }
+                let dims = vec3<i32>(params.grid_dims.xyz);
+                if (nc.x >= dims.x || nc.y >= dims.y || nc.z >= dims.z) { continue; }
+                let cid = cell_id(nc);
+                let lo = cell_start[cid];
+                let hi = cell_start[cid + 1u];
+                for (var s = lo; s < hi; s = s + 1u) {
+                    let j = sorted_indices[s];
+                    if (j == i) { continue; }
+                    if (phase[j] != PHASE_WATER) { continue; } // skip grain neighbors
+                    let fj = pred[j].w;
+                    if (fj <= params.pbf_eps) { continue; } // skip near-empty (absorbed) water
+                    let d = xi - pred[j].xyz;
+                    let r = length(d);
+                    if (r >= h) { continue; }
+                    rho = rho + m * fj * w_poly6(r, h);
+                    let gj = m * fj * spiky_grad(d, h, params.spiky_r_min);
+                    sum_g = sum_g + gj;
+                    sum_g2 = sum_g2 + dot(gj, gj);
+                }
+            }
+        }
+    }
+
+    // Pore-modulated rest density: where grains are present the water target is ρ₀·(1−α_s), so
+    // pore water packs to fill only the pore fraction (α_s+α_f=1) instead of full ρ₀ — which would
+    // over-fill and get expelled. α_s=0 (single-species water) → unmodulated ρ₀ (identical).
+    let pore = max(1.0 - alpha_s[i], 0.05);
+    let inv_rho0 = 1.0 / (params.rest_density * pore);
+    let c = rho * inv_rho0 - 1.0;
+    let denom = (dot(sum_g, sum_g) + sum_g2) * inv_rho0 * inv_rho0 + params.relaxation_eps;
+    var lam = -c / denom;
+    if (params.lambda_noncohesive != 0u && lam > 0.0) {
+        lam = 0.0;
+    }
+    lambda[i] = lam;
+    // Convergence is measured on COMPRESSION only: free-surface particles always have
+    // c ≈ −1 (density deficit), which incompressibility neither can nor should fix, so
+    // including them would prevent early-exit forever. max(0, c) = over-density violation.
+    c_residual[i] = max(0.0, c);
+}
+
+var<workgroup> sdata: array<f32, 256>;
+
+@compute @workgroup_size(256)
+fn residual_reduce(@builtin(local_invocation_id) lid: vec3<u32>) {
+    if (status.converged != 0u) { return; }
+    let tid = lid.x;
+    var local_max = 0.0;
+    var i = tid;
+    loop {
+        if (i >= params.particle_count) { break; }
+        local_max = max(local_max, c_residual[i]);
+        i = i + 256u;
+    }
+    sdata[tid] = local_max;
+    workgroupBarrier();
+    var stride = 128u;
+    loop {
+        if (stride == 0u) { break; }
+        if (tid < stride) {
+            sdata[tid] = max(sdata[tid], sdata[tid + stride]);
+        }
+        workgroupBarrier();
+        stride = stride / 2u;
+    }
+    if (tid == 0u) {
+        let gmax = sdata[0];
+        status.residual_bits = bitcast<u32>(gmax);
+        status.iters_done = status.iters_done + 1u;
+        if (status.iters_done >= params.min_iters && gmax < params.residual_tolerance) {
+            status.converged = 1u;
+            status.effective_iters = status.iters_done;
+        }
+    }
+}
+
+@compute @workgroup_size(256)
+fn compute_dp(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= params.particle_count) { return; }
+    if (status.converged != 0u) { return; }
+    if (phase[i] != PHASE_WATER) { return; } // grains are projected by bed_project
+    let h = params.h;
+    let m = params.particle_mass;
+    let xi = pred[i].xyz;
+    let lam_i = lambda[i];
+    // Skip near-empty (absorbed) water; weight neighbor contributions by their f_w (pred.w) to match
+    // compute_lambda. f_w≡1 (no absorption) ⇒ identical to before.
+    if (pred[i].w <= params.pbf_eps) {
+        dp[i] = vec4<f32>(0.0);
+        return;
+    }
+
+    var sum = vec3<f32>(0.0);
+    let base = cell_coord(xi);
+    for (var dz = -1; dz <= 1; dz = dz + 1) {
+        for (var dy = -1; dy <= 1; dy = dy + 1) {
+            for (var dx = -1; dx <= 1; dx = dx + 1) {
+                let nc = base + vec3<i32>(dx, dy, dz);
+                if (nc.x < 0 || nc.y < 0 || nc.z < 0) { continue; }
+                let dims = vec3<i32>(params.grid_dims.xyz);
+                if (nc.x >= dims.x || nc.y >= dims.y || nc.z >= dims.z) { continue; }
+                let cid = cell_id(nc);
+                let lo = cell_start[cid];
+                let hi = cell_start[cid + 1u];
+                for (var s = lo; s < hi; s = s + 1u) {
+                    let j = sorted_indices[s];
+                    if (j == i) { continue; }
+                    if (phase[j] != PHASE_WATER) { continue; } // skip grain neighbors
+                    let fj = pred[j].w;
+                    if (fj <= params.pbf_eps) { continue; } // skip near-empty (absorbed) water
+                    let d = xi - pred[j].xyz;
+                    let r = length(d);
+                    if (r >= h) { continue; }
+                    let wr = w_poly6(r, h);
+                    let ratio = wr / params.s_corr_wq;
+                    let scorr = -params.s_corr_k * pow(ratio, params.s_corr_n);
+                    let gj = m * fj * spiky_grad(d, h, params.spiky_r_min);
+                    sum = sum + (lam_i + lambda[j] + scorr) * gj;
+                }
+            }
+        }
+    }
+    let pore = max(1.0 - alpha_s[i], 0.05);
+    let inv_rho0 = 1.0 / (params.rest_density * pore);
+    dp[i] = vec4<f32>(sum * inv_rho0, 0.0);
+}
+
+@compute @workgroup_size(256)
+fn xsph(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= params.particle_count) { return; }
+    // Viscosity is a fluid term; grains pass through unchanged (so the vel_smoothed→vel copy in a
+    // mixed scene doesn't clobber grain velocities).
+    if (phase[i] != PHASE_WATER) {
+        vel_smoothed[i] = vel[i];
+        return;
+    }
+    let h = params.h;
+    let xi = pos[i].xyz;
+    let vi = vel[i].xyz;
+    var dv = vec3<f32>(0.0);
+
+exec
+/bin/zsh -lc "nl -ba src/solvers/xpbd/mod.rs | sed -n '1744,1905p'" in /Users/cxc/Github/coffee-sim
+ succeeded in 0ms:
+  1744	        let np = groups(self.active_count);
+  1745	        let nc = groups(self.num_cells);
+  1746	        let mut cursor = 0u32;
+  1747	        let mut labels: Vec<String> = Vec::new();
+  1748	        let mut dispatches = 0u32;
+  1749	
+  1750	        let mut enc = self
+  1751	            .device
+  1752	            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+  1753	                label: Some("xpbd-frame"),
+  1754	            });
+  1755	
+  1756	        // Pass sequence is chosen from which species are present. Water runs the density solve
+  1757	        // (+ grain exclusion when mixed); grain runs the contact subcycle; mixed runs both, with
+  1758	        // the bed contact AFTER the water/fluid passes so grains respond. Single-species scenes
+  1759	        // keep their adaptive early-exit (residual_reduce); mixed runs fixed iteration counts.
+  1760	        let mixed = self.has_water && self.has_grain;
+  1761	        let p = &self.pipelines;
+  1762	        let b = &self.bind_groups;
+  1763	        let ts_ref = self.ts.as_ref();
+  1764	        {
+  1765	            let mut pass = |enc: &mut wgpu::CommandEncoder,
+  1766	                            pipe: &wgpu::ComputePipeline,
+  1767	                            bg: &wgpu::BindGroup,
+  1768	                            label: &str,
+  1769	                            groups: u32| {
+  1770	                dispatch_pass(
+  1771	                    enc,
+  1772	                    pipe,
+  1773	                    bg,
+  1774	                    ts_ref,
+  1775	                    &mut cursor,
+  1776	                    &mut labels,
+  1777	                    label,
+  1778	                    groups,
+  1779	                    &mut dispatches,
+  1780	                );
+  1781	            };
+  1782	            for _ in 0..self.substeps {
+  1783	                pass(&mut enc, &p.predict, &b.predict, "predict", np);
+  1784	
+  1785	                if self.has_water {
+  1786	                    for it in 0..self.water_iters {
+  1787	                        if it % self.water_regrid == 0 {
+  1788	                            pass(&mut enc, &p.grid_clear, &b.grid_clear, "grid_clear", nc);
+  1789	                            pass(&mut enc, &p.grid_count, &b.grid_count, "grid_count", np);
+  1790	                            pass(&mut enc, &p.grid_scan, &b.grid_scan, "grid_scan", 1);
+  1791	                            pass(&mut enc, &p.grid_clear, &b.grid_clear, "grid_clear", nc);
+  1792	                            pass(
+  1793	                                &mut enc,
+  1794	                                &p.grid_scatter,
+  1795	                                &b.grid_scatter,
+  1796	                                "grid_scatter",
+  1797	                                np,
+  1798	                            );
+  1799	                        }
+  1800	                        if mixed {
+  1801	                            // Solid fraction (live from current pred) → pore-modulated water target.
+  1802	                            pass(
+  1803	                                &mut enc,
+  1804	                                &p.compute_fractions,
+  1805	                                &b.compute_fractions,
+  1806	                                "compute_fractions",
+  1807	                                np,
+  1808	                            );
+  1809	                        }
+  1810	                        pass(
+  1811	                            &mut enc,
+  1812	                            &p.compute_lambda,
+  1813	                            &b.compute_lambda,
+  1814	                            "compute_lambda",
+  1815	                            np,
+  1816	                        );
+  1817	                        pass(&mut enc, &p.compute_dp, &b.compute_dp, "compute_dp", np);
+  1818	                        if mixed {
+  1819	                            // Grain exclusion (A.2), two-way: water out of grain bodies + reaction.
+  1820	                            pass(
+  1821	                                &mut enc,
+  1822	                                &p.exclude_water,
+  1823	                                &b.exclude_water,
+  1824	                                "exclude_water",
+  1825	                                np,
+  1826	                            );
+  1827	                            pass(
+  1828	                                &mut enc,
+  1829	                                &p.exclude_grain,
+  1830	                                &b.exclude_grain,
+  1831	                                "exclude_grain",
+  1832	                                np,
+  1833	                            );
+  1834	                        }
+  1835	                        pass(&mut enc, &p.apply_dp, &b.apply_dp, "apply_dp", np);
+  1836	                        // Adaptive early-exit only for single-species water (mixed runs fixed iters).
+  1837	                        if !mixed {
+  1838	                            pass(
+  1839	                                &mut enc,
+  1840	                                &p.residual_reduce,
+  1841	                                &b.residual_reduce,
+  1842	                                "residual_reduce",
+  1843	                                1,
+  1844	                            );
+  1845	                        }
+  1846	                    }
+  1847	                }
+  1848	
+  1849	                if mixed && self.drag_subiters > 0 {
+  1850	                    pass(&mut enc, &p.grid_clear, &b.grid_clear, "grid_clear", nc);
+  1851	                    pass(&mut enc, &p.grid_count, &b.grid_count, "grid_count", np);
+  1852	                    pass(&mut enc, &p.grid_scan, &b.grid_scan, "grid_scan", 1);
+  1853	                    pass(&mut enc, &p.grid_clear, &b.grid_clear, "grid_clear", nc);
+  1854	                    pass(
+  1855	                        &mut enc,
+  1856	                        &p.grid_scatter,
+  1857	                        &b.grid_scatter,
+  1858	                        "grid_scatter",
+  1859	                        np,
+  1860	                    );
+  1861	                    pass(
+  1862	                        &mut enc,
+  1863	                        &p.compute_coupling_scale,
+  1864	                        &b.compute_coupling_scale,
+  1865	                        "compute_coupling_scale",
+  1866	                        np,
+  1867	                    );
+  1868	                    for _ in 0..self.drag_subiters {
+  1869	                        enc.copy_buffer_to_buffer(
+  1870	                            self.vel.as_ref(),
+  1871	                            0,
+  1872	                            &self.vel_frozen,
+  1873	                            0,
+  1874	                            (self.active_count as u64) * 16,
+  1875	                        );
+  1876	                        pass(&mut enc, &p.drag_water, &b.drag_water, "drag_water", np);
+  1877	                        pass(&mut enc, &p.drag_grain, &b.drag_grain, "drag_grain", np);
+  1878	                        pass(
+  1879	                            &mut enc,
+  1880	                            &p.apply_drag_pred,
+  1881	                            &b.apply_drag_pred,
+  1882	                            "apply_drag_pred",
+  1883	                            np,
+  1884	                        );
+  1885	                    }
+  1886	                }
+  1887	
+  1888	                if mixed && self.params.buoyancy_scale > 0.0 {
+  1889	                    pass(&mut enc, &p.grid_clear, &b.grid_clear, "grid_clear", nc);
+  1890	                    pass(&mut enc, &p.grid_count, &b.grid_count, "grid_count", np);
+  1891	                    pass(&mut enc, &p.grid_scan, &b.grid_scan, "grid_scan", 1);
+  1892	                    pass(&mut enc, &p.grid_clear, &b.grid_clear, "grid_clear", nc);
+  1893	                    pass(
+  1894	                        &mut enc,
+  1895	                        &p.grid_scatter,
+  1896	                        &b.grid_scatter,
+  1897	                        "grid_scatter",
+  1898	                        np,
+  1899	                    );
+  1900	                    enc.copy_buffer_to_buffer(
+  1901	                        self.vel.as_ref(),
+  1902	                        0,
+  1903	                        &self.vel_frozen,
+  1904	                        0,
+  1905	                        (self.active_count as u64) * 16,
+
+exec
+/bin/zsh -lc "rg -n \"predict|copy|pred\\[|lambda\\[|status\\[|phase\\[\" src/solvers/xpbd/*.wgsl src/solvers/xpbd/mod.rs" in /Users/cxc/Github/coffee-sim
+ succeeded in 0ms:
+src/solvers/xpbd/extraction.wgsl:49:    let ph_i = phase[i];
+src/solvers/xpbd/extraction.wgsl:68:                    if (phase[j] == ph_i) { continue; } // opposite species only
+src/solvers/xpbd/extraction.wgsl:86:    if (phase[i] != PHASE_GRAIN) { return; }
+src/solvers/xpbd/extraction.wgsl:108:                    if (phase[j] != PHASE_WATER) { continue; }
+src/solvers/xpbd/extraction.wgsl:132:    if (phase[i] != PHASE_WATER) { return; }
+src/solvers/xpbd/extraction.wgsl:156:                    if (phase[j] != PHASE_GRAIN) { continue; }
+src/solvers/xpbd/extraction.wgsl:193:    let ph_i = phase[i];
+src/solvers/xpbd/extraction.wgsl:215:                    let ph_j = phase[j];
+src/solvers/xpbd/bed.wgsl:21:    if (phase[i] != PHASE_GRAIN) { return; }
+src/solvers/xpbd/bed.wgsl:24:    let v_abs_i = pred[i].w;
+src/solvers/xpbd/bed.wgsl:27:    let xi = pred[i].xyz;
+src/solvers/xpbd/bed.wgsl:49:                    if (phase[j] != PHASE_GRAIN) { continue; } // grain contacts only
+src/solvers/xpbd/bed.wgsl:53:                    let d_j = grain_eff_diameter(pred[j].w);
+src/solvers/xpbd/bed.wgsl:56:                    let w_i = grain_eff_mass(pred[j].w) / (m_i + grain_eff_mass(pred[j].w));
+src/solvers/xpbd/bed.wgsl:57:                    let dvec = xi - pred[j].xyz;
+src/solvers/xpbd/bed.wgsl:75:                        let rel = (xi - prev_i) - (pred[j].xyz - pos[j].xyz);
+src/solvers/xpbd/bed.wgsl:81:                            + min(wet_cohesion(v_abs_i), wet_cohesion(pred[j].w));
+src/solvers/xpbd/wetting.wgsl:13:// its own slot, so no atomics are needed. Runs after finalize; the next predict mirrors the new pos.w.
+src/solvers/xpbd/wetting.wgsl:30:    let ph_i = phase[i];
+src/solvers/xpbd/wetting.wgsl:31:    let xi = pred[i].xyz;
+src/solvers/xpbd/wetting.wgsl:48:                    let ph_j = phase[j];
+src/solvers/xpbd/wetting.wgsl:50:                    let r = length(xi - pred[j].xyz);
+src/solvers/xpbd/wetting.wgsl:53:                        if (pred[j].w > params.absorb_roundoff) { n = n + 1u; } // non-empty water
+src/solvers/xpbd/wetting.wgsl:55:                        if (pred[j].w < v_cap) { n = n + 1u; } // unsaturated grain (demand > 0)
+src/solvers/xpbd/wetting.wgsl:68:    if (phase[i] != PHASE_WATER) { return; }
+src/solvers/xpbd/wetting.wgsl:69:    let f_w = pred[i].w;
+src/solvers/xpbd/wetting.wgsl:75:    let xi = pred[i].xyz;
+src/solvers/xpbd/wetting.wgsl:90:                    if (phase[j] != PHASE_GRAIN) { continue; }
+src/solvers/xpbd/wetting.wgsl:91:                    let r = length(xi - pred[j].xyz);
+src/solvers/xpbd/wetting.wgsl:93:                    let v_abs_g = pred[j].w;
+src/solvers/xpbd/wetting.wgsl:110:    if (phase[i] != PHASE_GRAIN) { return; }
+src/solvers/xpbd/wetting.wgsl:111:    let v_abs = pred[i].w;
+src/solvers/xpbd/wetting.wgsl:118:    let xi = pred[i].xyz;
+src/solvers/xpbd/wetting.wgsl:134:                    if (phase[j] != PHASE_WATER) { continue; }
+src/solvers/xpbd/wetting.wgsl:135:                    let r = length(xi - pred[j].xyz);
+src/solvers/xpbd/wetting.wgsl:137:                    let f_w = pred[j].w;
+src/solvers/xpbd/water.wgsl:15:    if (phase[i] != PHASE_WATER) { return; } // grains have no density constraint
+src/solvers/xpbd/water.wgsl:18:    let xi = pred[i].xyz;
+src/solvers/xpbd/water.wgsl:22:    let f_i = pred[i].w;
+src/solvers/xpbd/water.wgsl:24:        lambda[i] = 0.0;
+src/solvers/xpbd/water.wgsl:47:                    if (phase[j] != PHASE_WATER) { continue; } // skip grain neighbors
+src/solvers/xpbd/water.wgsl:48:                    let fj = pred[j].w;
+src/solvers/xpbd/water.wgsl:50:                    let d = xi - pred[j].xyz;
+src/solvers/xpbd/water.wgsl:73:    lambda[i] = lam;
+src/solvers/xpbd/water.wgsl:120:    if (phase[i] != PHASE_WATER) { return; } // grains are projected by bed_project
+src/solvers/xpbd/water.wgsl:123:    let xi = pred[i].xyz;
+src/solvers/xpbd/water.wgsl:124:    let lam_i = lambda[i];
+src/solvers/xpbd/water.wgsl:127:    if (pred[i].w <= params.pbf_eps) {
+src/solvers/xpbd/water.wgsl:147:                    if (phase[j] != PHASE_WATER) { continue; } // skip grain neighbors
+src/solvers/xpbd/water.wgsl:148:                    let fj = pred[j].w;
+src/solvers/xpbd/water.wgsl:150:                    let d = xi - pred[j].xyz;
+src/solvers/xpbd/water.wgsl:157:                    sum = sum + (lam_i + lambda[j] + scorr) * gj;
+src/solvers/xpbd/water.wgsl:171:    // Viscosity is a fluid term; grains pass through unchanged (so the vel_smoothed→vel copy in a
+src/solvers/xpbd/water.wgsl:173:    if (phase[i] != PHASE_WATER) {
+src/solvers/xpbd/mod.rs:187:    predict: wgpu::ComputePipeline,
+src/solvers/xpbd/mod.rs:218:    predict: wgpu::BindGroup,
+src/solvers/xpbd/mod.rs:294:    // readback/copy), vel_smoothed (copy src), lambda (test seeding), status (+ readbacks),
+src/solvers/xpbd/mod.rs:310:    // snapshot copy, re-seeding, and exposure as concentration/temperature; `chem_frozen` (b22) is the
+src/solvers/xpbd/mod.rs:490:    /// tags, and zeroed velocities. (`normal_impulse` is reset every frame in `predict`.)
+src/solvers/xpbd/mod.rs:529:        enc.copy_buffer_to_buffer(src, 0, &self.pos_readback, 0, size);
+src/solvers/xpbd/mod.rs:573:    /// Read back the predicted-position buffer (dev/test only — stalls the GPU). `pred.w` mirrors
+src/solvers/xpbd/mod.rs:644:        enc.copy_buffer_to_buffer(self.phase.as_ref(), 0, &self.pos_readback, 0, size);
+src/solvers/xpbd/mod.rs:672:        enc.copy_buffer_to_buffer(
+src/solvers/xpbd/mod.rs:1106:        // accumulated-normal-impulse buffer (the friction budget; reset each frame in predict).
+src/solvers/xpbd/mod.rs:1172:        // readback for yield/TDS + the snapshot copy); `chem_frozen` (binding 22) is the per-substep
+src/solvers/xpbd/mod.rs:1266:            predict: make("predict"),
+src/solvers/xpbd/mod.rs:1313:            predict: bg(
+src/solvers/xpbd/mod.rs:1314:                &pipelines.predict,
+src/solvers/xpbd/mod.rs:1783:                pass(&mut enc, &p.predict, &b.predict, "predict", np);
+src/solvers/xpbd/mod.rs:1869:                        enc.copy_buffer_to_buffer(
+src/solvers/xpbd/mod.rs:1900:                    enc.copy_buffer_to_buffer(
+src/solvers/xpbd/mod.rs:1964:                    enc.copy_buffer_to_buffer(
+src/solvers/xpbd/mod.rs:1975:                // momentum merge isn't clobbered by the xsph velocity copy. Reads the frozen pred.w
+src/solvers/xpbd/mod.rs:1976:                // snapshot, writes the new moisture to pos.w; the next predict mirrors it.
+src/solvers/xpbd/mod.rs:1997:                // used) + a frozen chem copy; writes only the live chem buffer. Rebuilds the grid
+src/solvers/xpbd/mod.rs:2013:                    enc.copy_buffer_to_buffer(
+src/solvers/xpbd/mod.rs:2038:                    enc.copy_buffer_to_buffer(
+src/solvers/xpbd/mod.rs:2059:                enc.copy_buffer_to_buffer(&ts.resolve, 0, &ts.readback, 0, (cursor as u64) * 8);
+src/solvers/xpbd/common.wgsl:2:// kernels both species use (predict, grid build, apply_dp, finalize). The water-incompressibility
+src/solvers/xpbd/common.wgsl:114:// Per-grain accumulated normal-correction magnitude this frame (reset in predict). The Coulomb
+src/solvers/xpbd/common.wgsl:123:// under fluid load. Reset in predict, written by drag_grain, read in finalize.
+src/solvers/xpbd/common.wgsl:394:fn predict(@builtin(global_invocation_id) gid: vec3<u32>) {
+src/solvers/xpbd/common.wgsl:411:    // Mirror the moisture lane (pos.w) into pred.w so the predicted-state kernels can read it; the
+src/solvers/xpbd/common.wgsl:413:    pred[i] = vec4<f32>(np, pos[i].w);
+src/solvers/xpbd/common.wgsl:430:    let cell = cell_id(cell_coord(pred[i].xyz));
+src/solvers/xpbd/common.wgsl:483:    let cell = cell_id(cell_coord(pred[i].xyz));
+src/solvers/xpbd/common.wgsl:500:    var proposed = pred[i].xyz + d;
+src/solvers/xpbd/common.wgsl:508:    let contact = select(0.0, 0.5 * params.grain_diameter, phase[i] == PHASE_GRAIN);
+src/solvers/xpbd/common.wgsl:513:        let hit = solid_union(proposed, phase[i]);
+src/solvers/xpbd/common.wgsl:524:    if (phase[i] == PHASE_GRAIN) {
+src/solvers/xpbd/common.wgsl:557:                let h2 = solid_union(newp, phase[i]);
+src/solvers/xpbd/common.wgsl:564:        pred[i] = vec4<f32>(newp, pred[i].w); // preserve the moisture snapshot in pred.w
+src/solvers/xpbd/common.wgsl:566:        pred[i] = vec4<f32>(clamped, pred[i].w); // preserve the moisture snapshot in pred.w
+src/solvers/xpbd/common.wgsl:574:    let xi = pred[i].xyz;
+src/solvers/xpbd/common.wgsl:577:    if (phase[i] == PHASE_GRAIN) {
+src/solvers/xpbd/coupling.wgsl:9://     symmetric pair of gathers (exclude_water + exclude_grain) reading the same predicted
+src/solvers/xpbd/coupling.wgsl:23:    let xi = pred[i].xyz;
+src/solvers/xpbd/coupling.wgsl:39:                    if (phase[j] != PHASE_GRAIN) { continue; } // solid fraction from grains only
+src/solvers/xpbd/coupling.wgsl:40:                    let r = length(xi - pred[j].xyz);
+src/solvers/xpbd/coupling.wgsl:44:                    a_s = a_s + grain_eff_volume(pred[j].w) * w_poly6(r, h);
+src/solvers/xpbd/coupling.wgsl:74:    if (phase[i] != PHASE_WATER) { return; }
+src/solvers/xpbd/coupling.wgsl:77:    let m_w = water_eff_mass(pred[i].w);
+src/solvers/xpbd/coupling.wgsl:78:    let xi = pred[i].xyz;
+src/solvers/xpbd/coupling.wgsl:93:                    if (phase[j] != PHASE_GRAIN) { continue; }
+src/solvers/xpbd/coupling.wgsl:94:                    let m_g = grain_eff_mass(pred[j].w);
+src/solvers/xpbd/coupling.wgsl:95:                    push = push + exclusion_push(xi, pred[j].xyz, m_g / (m_w + m_g));
+src/solvers/xpbd/coupling.wgsl:109:    if (phase[i] != PHASE_GRAIN) { return; }
+src/solvers/xpbd/coupling.wgsl:112:    let m_g = grain_eff_mass(pred[i].w);
+src/solvers/xpbd/coupling.wgsl:113:    let xi = pred[i].xyz;
+src/solvers/xpbd/coupling.wgsl:128:                    if (phase[j] != PHASE_WATER) { continue; }
+src/solvers/xpbd/coupling.wgsl:131:                    let m_w = water_eff_mass(pred[j].w);
+src/solvers/xpbd/coupling.wgsl:132:                    push = push + exclusion_push(xi, pred[j].xyz, m_w / (m_w + m_g));
+src/solvers/xpbd/coupling.wgsl:170:    let ph_i = phase[i];
+src/solvers/xpbd/coupling.wgsl:171:    let xi = pred[i].xyz;
+src/solvers/xpbd/coupling.wgsl:195:                    if (phase[j] == ph_i) { continue; }
+src/solvers/xpbd/coupling.wgsl:196:                    let r = length(xi - pred[j].xyz);
+src/solvers/xpbd/coupling.wgsl:213:    let m_i = eff_mass(self_phase, pred[i].w);
+src/solvers/xpbd/coupling.wgsl:214:    let m_j = eff_mass(phase[j], pred[j].w);
+src/solvers/xpbd/coupling.wgsl:222:    if (phase[i] != PHASE_WATER) { return; }
+src/solvers/xpbd/coupling.wgsl:223:    let xi = pred[i].xyz;
+src/solvers/xpbd/coupling.wgsl:239:                    if (phase[j] != PHASE_GRAIN) { continue; }
+src/solvers/xpbd/coupling.wgsl:240:                    let r = length(xi - pred[j].xyz);
+src/solvers/xpbd/coupling.wgsl:256:    if (phase[i] != PHASE_GRAIN) { return; }
+src/solvers/xpbd/coupling.wgsl:257:    let xi = pred[i].xyz;
+src/solvers/xpbd/coupling.wgsl:273:                    if (phase[j] != PHASE_WATER) { continue; }
+src/solvers/xpbd/coupling.wgsl:274:                    let r = length(xi - pred[j].xyz);
+src/solvers/xpbd/coupling.wgsl:287:    return max(-lambda[i], 0.0);
+src/solvers/xpbd/coupling.wgsl:294:    if (phase[i] != PHASE_GRAIN) { return; }
+src/solvers/xpbd/coupling.wgsl:295:    let xi = pred[i].xyz;
+src/solvers/xpbd/coupling.wgsl:311:                    if (phase[j] != PHASE_WATER) { continue; }
+src/solvers/xpbd/coupling.wgsl:312:                    let d = xi - pred[j].xyz;
+src/solvers/xpbd/coupling.wgsl:322:    let m_g = grain_eff_mass(pred[i].w); // swelling: heavier wet grain accelerates less
+src/solvers/xpbd/coupling.wgsl:325:    let dv = grain_buoyancy_factor(pred[i].w) * impulse / m_g;
+src/solvers/xpbd/coupling.wgsl:334:    if (phase[i] != PHASE_WATER) { return; }
+src/solvers/xpbd/coupling.wgsl:335:    let xi = pred[i].xyz;
+src/solvers/xpbd/coupling.wgsl:352:                    if (phase[j] != PHASE_GRAIN) { continue; }
+src/solvers/xpbd/coupling.wgsl:353:                    let d = xi - pred[j].xyz;
+src/solvers/xpbd/coupling.wgsl:359:                    impulse = impulse + grain_buoyancy_factor(pred[j].w) * params.buoyancy_scale *
+src/solvers/xpbd/coupling.wgsl:367:    let m_w = max(water_eff_mass(pred[i].w), params.particle_mass * params.pbf_eps);
+src/solvers/xpbd/coupling.wgsl:376:    var p = pred[i].xyz + params.dt * dv;
+src/solvers/xpbd/coupling.wgsl:380:        let hit = solid_union(p, phase[i]);
+src/solvers/xpbd/coupling.wgsl:382:        let contact = select(0.0, 0.5 * params.grain_diameter, phase[i] == PHASE_GRAIN);
+src/solvers/xpbd/coupling.wgsl:389:    pred[i] = vec4<f32>(clamp(p, params.box_min.xyz, params.box_max.xyz), pred[i].w);
+
+codex
+The first pass initializes `pred` from `pos` and velocity, and phase is already written before the params upload, so the new slots do enter the frame cleanly. No extra dormant-buffer initialization issue surfaced there.
+exec
+/bin/zsh -lc "nl -ba src/solvers/xpbd/common.wgsl | sed -n '394,420p'" in /Users/cxc/Github/coffee-sim
+exec
+/bin/zsh -lc "nl -ba src/solvers/xpbd/mod.rs | sed -n '280,335p'" in /Users/cxc/Github/coffee-sim
+exec
+/bin/zsh -lc "nl -ba src/solvers/xpbd/mod.rs | sed -n '480,512p'" in /Users/cxc/Github/coffee-sim
+ succeeded in 0ms:
+   394	fn predict(@builtin(global_invocation_id) gid: vec3<u32>) {
+   395	    let i = gid.x;
+   396	    if (i == 0u) {
+   397	        atomicStore(&status.overflow, 0u);
+   398	        atomicStore(&status.max_occupancy, 0u);
+   399	        status.converged = 0u;
+   400	        status.iters_done = 0u;
+   401	        status.effective_iters = params.max_iters;
+   402	        status.residual_bits = 0u;
+   403	    }
+   404	    if (i >= params.particle_count) { return; }
+   405	    normal_impulse[i] = 0.0; // reset the per-frame friction-budget accumulator (grains)
+   406	    fluid_impulse[i] = 0.0; // reset the per-frame water↔grain wake signal
+   407	    let p = pos[i].xyz;
+   408	    let v = vel[i].xyz;
+   409	    let g = params.gravity.xyz;
+   410	    let np = p + params.dt * v + (params.dt * params.dt) * g;
+   411	    // Mirror the moisture lane (pos.w) into pred.w so the predicted-state kernels can read it; the
+   412	    // absorption passes treat pred.w as the frozen per-frame snapshot.
+   413	    pred[i] = vec4<f32>(np, pos[i].w);
+   414	}
+   415	
+   416	@compute @workgroup_size(256)
+   417	fn grid_clear(@builtin(global_invocation_id) gid: vec3<u32>) {
+   418	    let c = gid.x;
+   419	    if (c >= params.grid_dims.w) { return; }
+   420	    atomicStore(&cell_count[c], 0u);
+
+ succeeded in 0ms:
+   280	    /// Which species are present (from the scene's seed regions) — selects the per-frame passes.
+   281	    has_water: bool,
+   282	    has_grain: bool,
+   283	    /// Water density-solve iteration cap + grid-rebuild interval.
+   284	    water_iters: u32,
+   285	    water_regrid: u32,
+   286	    /// Bed contact-solve iteration cap + grid-rebuild interval.
+   287	    bed_iters: u32,
+   288	    bed_regrid: u32,
+   289	    /// Jacobi sub-iterations for implicit water↔grain velocity drag (mixed scenes only).
+   290	    drag_subiters: u32,
+   291	
+   292	    // Buffers referenced every frame only through the bind groups (which retain them) are
+   293	    // not held here. We keep the ones we touch directly: params (write), pos/vel (expose +
+   294	    // readback/copy), vel_smoothed (copy src), lambda (test seeding), status (+ readbacks),
+   295	    // phase (expose + re-seed).
+   296	    params_buf: wgpu::Buffer,
+   297	    pos: Arc<wgpu::Buffer>,
+   298	    vel: Arc<wgpu::Buffer>,
+   299	    pred: wgpu::Buffer, // retained for read_pred (test: pred.w mirror survives the frame)
+   300	    vel_smoothed: wgpu::Buffer,
+   301	    vel_frozen: wgpu::Buffer,
+   302	    lambda: wgpu::Buffer,
+   303	    phase: Arc<wgpu::Buffer>,
+   304	    status: wgpu::Buffer,
+   305	    status_readback: wgpu::Buffer,
+   306	    pos_readback: wgpu::Buffer,
+   307	    // The `solids` buffer (binding 19) is not held here: like dp / c_residual it lives only in the
+   308	    // collision bind groups, which keep its GPU resource alive (geometry is static, never re-uploaded).
+   309	    // Phase 1.5 chem/thermal state: `chem` (b20, live) is retained for readback (yield/TDS), the
+   310	    // snapshot copy, re-seeding, and exposure as concentration/temperature; `chem_frozen` (b22) is the
+   311	    // per-substep snapshot the chem passes read.
+   312	    chem: Arc<wgpu::Buffer>,
+   313	    // The per-substep snapshot the dissolution/thermal passes read while writing the live `chem`.
+   314	    chem_frozen: wgpu::Buffer,
+   315	    pipelines: Pipelines,
+   316	    bind_groups: BindGroups,
+   317	    ts: Option<Timestamps>,
+   318	
+   319	    dispatches: u32,
+   320	    cached_diag: XpbdDiagnostics,
+   321	    cached_passes: Vec<(String, f32)>,
+   322	
+   323	    // --- extraction yield/TDS readout (Phase 1.5 U7) ---
+   324	    /// Total dry-coffee dose `grain_mass · n_grain` — the yield denominator (real-coffee convention:
+   325	    /// yield = dissolved solute / total dry mass, so yield ≤ `soluble_fraction`). Set at build.
+   326	    total_dose: f32,
+   327	    /// Catch-cup region (from the scene's cylinder solid) for the TDS readout; `None` ⇒ TDS = 0.
+   328	    cup: Option<CupRegion>,
+   329	    /// Cached yield/TDS, refreshed by `sample_diagnostics` (the stalling cache point) and returned
+   330	    /// by `metrics()` without a GPU sync.
+   331	    cached_yield: f32,
+   332	    cached_tds: f32,
+   333	
+   334	    /// Pour-emission state (water injected over the brew). Inactive when no pour drives it.
+   335	    inflow: Inflow,
+
+ succeeded in 0ms:
+   480	    ) -> wgpu::Buffer {
+   481	        device.create_buffer(&wgpu::BufferDescriptor {
+   482	            label: Some(label),
+   483	            size: bytes.max(4),
+   484	            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | extra,
+   485	            mapped_at_creation: false,
+   486	        })
+   487	    }
+   488	
+   489	    /// Re-seed the particles to the original block (exact, deterministic): positions, phase
+   490	    /// tags, and zeroed velocities. (`normal_impulse` is reset every frame in `predict`.)
+   491	    fn seed(&mut self) {
+   492	        // Reset the live set to the seed (drops any pour-emitted particles); writes only the seed
+   493	        // range — dormant pool slots stay inert. `params.particle_count = active_count` is refreshed
+   494	        // each frame in step().
+   495	        self.active_count = self.initial_positions.len() as u32;
+   496	        self.queue
+   497	            .write_buffer(&self.pos, 0, bytemuck::cast_slice(&self.initial_positions));
+   498	        self.queue
+   499	            .write_buffer(&self.phase, 0, bytemuck::cast_slice(&self.initial_phases));
+   500	        let zeros = vec![[0.0f32; 4]; self.initial_positions.len()];
+   501	        self.queue
+   502	            .write_buffer(&self.vel, 0, bytemuck::cast_slice(&zeros));
+   503	        // Re-seed chem/thermal state (pools, c=0, pour temperature) so a reset restarts the brew.
+   504	        self.queue
+   505	            .write_buffer(&self.chem, 0, bytemuck::cast_slice(&self.initial_chem));
+   506	        // Restore the host phase mirror to the seed baseline.
+   507	        self.phase_mirror.clear();
+   508	        self.phase_mirror.extend_from_slice(&self.initial_phases);
+   509	        // Reset the pour-emission state (the recipe restarts from t=0 on reset).
+   510	        self.inflow.accumulator = 0.0;
+   511	        self.inflow.axial = 0.0;
+   512	        self.inflow.last_exit_speed = 0.0;
+
+exec
+/bin/zsh -lc "sed -n '80,115p' src/models/mod.rs" in /Users/cxc/Github/coffee-sim
+ succeeded in 0ms:
+    pub soluble_fraction: f32,
+    /// Reference grind diameter for the surface-area factor (`area ∝ d_ref/d_p`).
+    pub d_ref: f32,
+    /// Flux half-saturation for the flow→extraction bridge `u/(u+u_half)`.
+    pub u_half: f32,
+    /// Moisture-gate onset saturation (a grain below this is too dry to extract).
+    pub s_on: f32,
+    /// Thermal pair conductance `κ`, per-species specific heats (`C = mass·cp`), ambient heat-loss
+    /// rate, ambient temperature, and the initial brew-water (pour) temperature. Normalized scale.
+    pub kappa: f32,
+    pub cp_water: f32,
+    pub cp_grain: f32,
+    pub h_amb: f32,
+    pub t_amb: f32,
+    pub pour_t: f32,
+}
+
+impl Default for Materials {
+    fn default() -> Self {
+        Self {
+            particle_spacing: 1.0,
+            support_radius: 2.0,
+            particle_mass: 1.0,
+            // Grain defaults (coffee-grounds-ish): grains touch at the lattice pitch, steep
+            // friction, light cohesion + rolling damping so the sphere pile isn't too shallow.
+            // Calibrated against the standing-heap invariant, not an exact repose angle.
+            grain_diameter: 1.0,
+            water_grain_distance: 1.0, // = grain_diameter: water rests on the bed (override for porous flow)
+            friction_mu: 0.8,
+            floor_mu: 0.8,
+            dry_cohesion: cohesion::dry(),
+            rolling_damping: 0.9,
+            // Coupling: grains a bit denser than water (a settled bed resists being lifted); 40%
+            // bed porosity (KEEP.md §1).
+            grain_mass: 1.5,
+            porosity: 0.40,
+
+exec
+/bin/zsh -lc "rg -n \"particle_spacing|support_radius|rest_density\\(\" src/models src/utils src/solvers/xpbd -g '*.rs'" in /Users/cxc/Github/coffee-sim
+ succeeded in 0ms:
+src/solvers/xpbd/mod.rs:359:/// the master particle-count budget; layers release one `particle_spacing` of stream travel apart
+src/solvers/xpbd/mod.rs:414:        // it. When grain_diameter == particle_spacing (the default), both seed identically.
+src/solvers/xpbd/mod.rs:418:            Species::Water => (mats.particle_spacing, 0u32, 1.0f32),
+src/solvers/xpbd/mod.rs:801:    /// master count budget; layers release one `particle_spacing` of stream travel apart, each filling
+src/solvers/xpbd/mod.rs:937:        let s = mats.particle_spacing;
+src/solvers/xpbd/mod.rs:938:        let h = mats.support_radius;
+src/solvers/xpbd/mod.rs:974:        let rest_density = kernels::rest_density(s, h, m);
+src/models/mod.rs:18:/// **derived** at solver build time from the rest lattice (`Σ_j W_poly6` at `particle_spacing`),
+src/models/mod.rs:26:    pub particle_spacing: f32,
+src/models/mod.rs:28:    pub support_radius: f32,
+src/models/mod.rs:100:            particle_spacing: 1.0,
+src/models/mod.rs:101:            support_radius: 2.0,
+src/utils/kernels.rs:46:pub fn rest_density(spacing: f32, support_radius: f32, mass: f32) -> f32 {
+src/utils/kernels.rs:47:    let h = support_radius;
+src/utils/kernels.rs:92:        let dense = rest_density(0.8, 2.0, 1.0);
+src/utils/kernels.rs:93:        let sparse = rest_density(1.2, 2.0, 1.0);
+src/models/cohesion.rs:19:/// beyond it grains don't interact. Must stay below `support_radius / grain_diameter` so the
+
+codex
+I’m also checking the default geometry implied by `A_eff`, `spacing`, and `V_w`, because the code’s “partial layer” behavior matters for whether the inlet is actually rest-density-like rather than just volume-correct.
+exec
+/bin/zsh -lc "sed -n '1,80p' src/utils/kernels.rs" in /Users/cxc/Github/coffee-sim
+ succeeded in 0ms:
+//! SPH smoothing kernels + gradients (CPU reference + tests). The WGSL solver implements
+//! the same functions on the GPU; these mirror them for `ρ₀` computation and unit tests.
+//!
+//! Poly6 for density, spiky gradient for the pressure/correction forces — the standard PBF
+//! pairing (Macklin & Müller 2013). v1's validated weights are recorded in `KEEP.md` §3.
+
+use std::f32::consts::PI;
+
+/// Poly6 smoothing kernel `W(r, h)` for `0 ≤ r ≤ h`, else 0.
+/// `W(r,h) = 315/(64π h⁹) · (h² − r²)³`.
+pub fn w_poly6(r: f32, h: f32) -> f32 {
+    if r >= h || r < 0.0 {
+        return 0.0;
+    }
+    let h2 = h * h;
+    let coeff = 315.0 / (64.0 * PI * h.powi(9));
+    let t = h2 - r * r;
+    coeff * t * t * t
+}
+
+/// Magnitude of the spiky kernel gradient for `0 < r ≤ h`, else 0.
+/// `|∇W(r,h)| = 45/(π h⁶) · (h − r)²`.
+pub fn spiky_grad_mag(r: f32, h: f32) -> f32 {
+    if r >= h || r <= 0.0 {
+        return 0.0;
+    }
+    let coeff = 45.0 / (PI * h.powi(6));
+    let t = h - r;
+    coeff * t * t
+}
+
+/// Spiky kernel gradient vector `∇_i W(x_i − x_j, h)` (points from j toward i).
+/// `d = x_i − x_j`. Returns zero for `r ≥ h` or `r == 0` (degenerate — caller jitters/clamps).
+pub fn spiky_grad(d: [f32; 3], h: f32) -> [f32; 3] {
+    let r = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+    if r >= h || r <= 0.0 {
+        return [0.0, 0.0, 0.0];
+    }
+    let m = spiky_grad_mag(r, h) / r; // includes the 1/r from normalizing d
+    [m * d[0], m * d[1], m * d[2]]
+}
+
+/// Rest density `ρ₀ = Σ_j m · W_poly6(|x_i − x_j|, h)` over a full cubic lattice neighborhood
+/// at `spacing`, evaluated at a lattice site. Deterministic constant used by the density
+/// constraint so a perfectly-packed block reads `C = 0`.
+pub fn rest_density(spacing: f32, support_radius: f32, mass: f32) -> f32 {
+    let h = support_radius;
+    let reach = (h / spacing).ceil() as i32;
+    let mut rho = 0.0;
+    for i in -reach..=reach {
+        for j in -reach..=reach {
+            for k in -reach..=reach {
+                let d = [i as f32 * spacing, j as f32 * spacing, k as f32 * spacing];
+                let r = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+                rho += mass * w_poly6(r, h);
+            }
+        }
+    }
+    rho
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn poly6_shape() {
+        let h = 2.0;
+        assert!(w_poly6(0.0, h) > 0.0);
+        assert_eq!(w_poly6(h, h), 0.0);
+        assert_eq!(w_poly6(h + 0.1, h), 0.0);
+        // Monotonically decreasing on [0, h].
+        assert!(w_poly6(0.3, h) > w_poly6(1.0, h));
+        assert!(w_poly6(1.0, h) > w_poly6(1.9, h));
+    }
+
+    #[test]
+    fn spiky_grad_shape() {
+        let h = 2.0;
+        assert_eq!(spiky_grad_mag(0.0, h), 0.0); // r==0 degenerate → 0 (caller clamps)
+
+exec
+/bin/zsh -lc 'cargo test emission_rate_matches_flow_no_starvation --test xpbd_emission' in /Users/cxc/Github/coffee-sim
+ succeeded in 1002ms:
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.13s
+     Running tests/xpbd_emission.rs (target/debug/deps/xpbd_emission-438c60c2d8183240)
+
+running 1 test
+test emission_rate_matches_flow_no_starvation ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.86s
+
+
+exec
+/bin/zsh -lc "rg -n \"fn groups|groups\\(\" src/solvers/xpbd/mod.rs src -g '*.rs'" in /Users/cxc/Github/coffee-sim
+ succeeded in 0ms:
+src/solvers/xpbd/mod.rs:32:fn groups(n: u32) -> u32 {
+src/solvers/xpbd/mod.rs:1744:        let np = groups(self.active_count);
+src/solvers/xpbd/mod.rs:1745:        let nc = groups(self.num_cells);
+src/solvers/xpbd/mod.rs:2136:    pass.dispatch_workgroups(groups, 1, 1);
+src/solvers/xpbd/mod.rs:32:fn groups(n: u32) -> u32 {
+src/solvers/xpbd/mod.rs:1744:        let np = groups(self.active_count);
+src/solvers/xpbd/mod.rs:1745:        let nc = groups(self.num_cells);
+src/solvers/xpbd/mod.rs:2136:    pass.dispatch_workgroups(groups, 1, 1);
+
+exec
+/bin/zsh -lc 'cargo test no_pour_active_count_stays_seed --test xpbd_emission' in /Users/cxc/Github/coffee-sim
+ succeeded in 0ms:
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.05s
+     Running tests/xpbd_emission.rs (target/debug/deps/xpbd_emission-438c60c2d8183240)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out; finished in 0.00s
+
+
+exec
+/bin/zsh -lc "nl -ba src/solvers/xpbd/mod.rs | sed -n '28,36p' && nl -ba tests/xpbd_emission.rs | sed -n '60,130p'" in /Users/cxc/Github/coffee-sim
+ succeeded in 0ms:
+    28	/// Volume scale (KEEP.md §27): mL per sim-unit³. Converts a scene's pour dose (mL) into a particle
+    29	/// capacity (and the emission rate, in the pour-emission unit).
+    30	const ML_PER_SIM_UNIT3: f32 = 5.20;
+    31	
+    32	fn groups(n: u32) -> u32 {
+    33	    n.div_ceil(WG)
+    34	}
+    35	
+    36	#[repr(C)]
+    60	        ..Scene::default()
+    61	    }
+    62	}
+    63	
+    64	/// Non-pour scene: capacity is exactly the seed count, active_count equals it, and no dormant slots.
+    65	#[test]
+    66	fn non_pour_scene_capacity_equals_seed() {
+    67	    let Some(gpu) = GpuContext::new_headless() else {
+    68	        eprintln!("xpbd_emission: no GPU adapter; skipping.");
+    69	        return;
+    70	    };
+    71	    let solver = XpbdSolver::build(
+    72	        &mixed_scene(),
+    73	        &Materials::default(),
+    74	        &Config::default(),
+    75	        &gpu,
+    76	    );
+    77	    let seed = solver.read_phases().len() as u32;
+    78	    assert_eq!(solver.active_count(), seed);
+    79	    assert_eq!(
+    80	        solver.pool_capacity(),
+    81	        seed,
+    82	        "non-pour scene allocated headroom"
+    83	    );
+    84	}
+    85	
+    86	/// Declaring a pour grows the pool capacity but NOT the live set (emission lands in U2); the dormant
+    87	/// slots must be provably inert — the live solve must match the no-pour build step-for-step.
+    88	#[test]
+    89	fn dormant_capacity_is_inert() {
+    90	    let Some(gpu) = GpuContext::new_headless() else {
+    91	        eprintln!("xpbd_emission: no GPU adapter; skipping.");
+    92	        return;
+    93	    };
+    94	    let mats = Materials::default();
+    95	    let cfg = Config::default();
+    96	
+    97	    let mut base = XpbdSolver::build(&mixed_scene(), &mats, &cfg, &gpu);
+    98	    let pour = Scene {
+    99	        pour_water_ml: 500.0, // big headroom
+   100	        ..mixed_scene()
+   101	    };
+   102	    let mut withcap = XpbdSolver::build(&pour, &mats, &cfg, &gpu);
+   103	
+   104	    let seed = base.read_phases().len() as u32;
+   105	    assert_eq!(base.pool_capacity(), seed);
+   106	    assert!(
+   107	        withcap.pool_capacity() > seed,
+   108	        "pour scene did not allocate headroom: {} vs seed {seed}",
+   109	        withcap.pool_capacity()
+   110	    );
+   111	    // Both start with the same live set (no emission yet).
+   112	    assert_eq!(base.active_count(), seed);
+   113	    assert_eq!(withcap.active_count(), seed);
+   114	
+   115	    for _ in 0..40 {
+   116	        base.step(1.0 / 60.0, &EmissionInput::default());
+   117	        withcap.step(1.0 / 60.0, &EmissionInput::default());
+   118	    }
+   119	    // active_count unchanged (emission not wired), and the live solve is identical — the dormant
+   120	    // capacity does not perturb the simulated particles.
+   121	    assert_eq!(
+   122	        withcap.active_count(),
+   123	        seed,
+   124	        "active_count drifted without emission"
+   125	    );
+   126	    let pa = base.read_positions();
+   127	    let pb = withcap.read_positions();
+   128	    assert_eq!(pa.len(), pb.len());
+   129	    for (i, (a, b)) in pa.iter().zip(&pb).enumerate() {
+   130	        for k in 0..4 {
+
+codex
+REVISE
+
+**Findings**
+
+- [src/solvers/xpbd/mod.rs:847](/Users/cxc/Github/coffee-sim/src/solvers/xpbd/mod.rs:847): capacity clamp is not quite correct. If `active_count == capacity`, the loop decrements `axial`, sets `clamped`, then `emit_n == 0` returns before the warning at line 892. That silently consumes arclength for a layer that was not emitted and violates the “overflow warns+clamps” requirement. Check capacity before spending axial, or emit the clamp warning before the zero-emission return.
+
+- [src/solvers/xpbd/mod.rs:856](/Users/cxc/Github/coffee-sim/src/solvers/xpbd/mod.rs:856): partial layers are center-biased. `i` restarts at zero for every layer, while `cursor` only changes angle, so when `this_layer < n_layer` the outer annuli are repeatedly skipped. For non-integer `A_eff * spacing / V_w`, many layers are partial, so the stream is not actually sampled over `r_eff` at rest-density area. Use a deterministic per-layer slot order or carry a radial slot cursor so partial layers distribute over the full disc.
+
+- [src/solvers/xpbd/mod.rs:805](/Users/cxc/Github/coffee-sim/src/solvers/xpbd/mod.rs:805): `EmissionInput.event == Reset` is ignored. `seed()` resets inflow state, but the plan says the accumulator resets on Reset/seed. If Reset events are part of the emitter contract, this leaves stale accumulator/axial/cursor state.
+
+The core volume algebra is otherwise mostly right: `A_eff`, `exit_speed`, `accumulator += flow / V_w * dt`, `N_layer = ceil(A_eff * spacing / V_w)`, and subtracting only `emit_n` prevent over-delivery and preserve dose under normal capacity. `depth = axial after decrement` is the right placement for emitted layers: within a frame layers are exactly `spacing` apart, and across frames the retained residual gives the next layer one spacing behind the previous layer’s advected position.
+
+GPU writes and step ordering look correct: writes use `active_count * 16` for vec4 buffers and `active_count * 4` for phase, `active_count` grows after writes, params upload happens after emission, and `predict` initializes `pred` for newly active particles. With default `flow_rate = 0` and no backlog, `emit()` returns before mutating state, so non-pour scenes are not perturbed.
+
+I ran the narrow rate test: `cargo test emission_rate_matches_flow_no_starvation --test xpbd_emission` passed.
+tokens used
+93,476
+REVISE
+
+**Findings**
+
+- [src/solvers/xpbd/mod.rs:847](/Users/cxc/Github/coffee-sim/src/solvers/xpbd/mod.rs:847): capacity clamp is not quite correct. If `active_count == capacity`, the loop decrements `axial`, sets `clamped`, then `emit_n == 0` returns before the warning at line 892. That silently consumes arclength for a layer that was not emitted and violates the “overflow warns+clamps” requirement. Check capacity before spending axial, or emit the clamp warning before the zero-emission return.
+
+- [src/solvers/xpbd/mod.rs:856](/Users/cxc/Github/coffee-sim/src/solvers/xpbd/mod.rs:856): partial layers are center-biased. `i` restarts at zero for every layer, while `cursor` only changes angle, so when `this_layer < n_layer` the outer annuli are repeatedly skipped. For non-integer `A_eff * spacing / V_w`, many layers are partial, so the stream is not actually sampled over `r_eff` at rest-density area. Use a deterministic per-layer slot order or carry a radial slot cursor so partial layers distribute over the full disc.
+
+- [src/solvers/xpbd/mod.rs:805](/Users/cxc/Github/coffee-sim/src/solvers/xpbd/mod.rs:805): `EmissionInput.event == Reset` is ignored. `seed()` resets inflow state, but the plan says the accumulator resets on Reset/seed. If Reset events are part of the emitter contract, this leaves stale accumulator/axial/cursor state.
+
+The core volume algebra is otherwise mostly right: `A_eff`, `exit_speed`, `accumulator += flow / V_w * dt`, `N_layer = ceil(A_eff * spacing / V_w)`, and subtracting only `emit_n` prevent over-delivery and preserve dose under normal capacity. `depth = axial after decrement` is the right placement for emitted layers: within a frame layers are exactly `spacing` apart, and across frames the retained residual gives the next layer one spacing behind the previous layer’s advected position.
+
+GPU writes and step ordering look correct: writes use `active_count * 16` for vec4 buffers and `active_count * 4` for phase, `active_count` grows after writes, params upload happens after emission, and `predict` initializes `pred` for newly active particles. With default `flow_rate = 0` and no backlog, `emit()` returns before mutating state, so non-pour scenes are not perturbed.
+
+I ran the narrow rate test: `cargo test emission_rate_matches_flow_no_starvation --test xpbd_emission` passed.

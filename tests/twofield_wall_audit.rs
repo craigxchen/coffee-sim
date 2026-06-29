@@ -851,7 +851,9 @@ fn uncapped_density_reduces_overpack() {
         }
         let pos = s.read_positions();
         let n = s.phase_counts().0 as usize;
-        mean_nb(&pos[..n], (-0.6, 0.6), (-4.0, -3.0), 0.6).0.max(1.0)
+        mean_nb(&pos[..n], (-0.6, 0.6), (-4.0, -3.0), 0.6)
+            .0
+            .max(1.0)
     };
     let measure = |uncapped: bool| -> (f64, f64) {
         let mut s =
@@ -922,7 +924,9 @@ fn temper_k_sweep_overpack() {
         }
         let pos = s.read_positions();
         let n = s.phase_counts().0 as usize;
-        mean_nb(&pos[..n], (-0.6, 0.6), (-4.0, -3.0), 0.6).0.max(1.0)
+        mean_nb(&pos[..n], (-0.6, 0.6), (-4.0, -3.0), 0.6)
+            .0
+            .max(1.0)
     };
     let measure = |label: &str, uncapped: bool, k: f32| {
         let mut s =
@@ -955,6 +959,10 @@ fn temper_k_sweep_overpack() {
     measure("uncapped K=5", true, 5.0);
     measure("uncapped K=10", true, 10.0);
     measure("uncapped K=30", true, 30.0); // sanity: ≈ legacy
-    println!("  → cross with the settled sweep: K≥3 is QUIET; pick the smallest-still-quiet K that");
-    println!("    de-mushes most (interior nearest rest). Candidate ≈ K=3. Eyeball it in the webapp.");
+    println!(
+        "  → cross with the settled sweep: K≥3 is QUIET; pick the smallest-still-quiet K that"
+    );
+    println!(
+        "    de-mushes most (interior nearest rest). Candidate ≈ K=3. Eyeball it in the webapp."
+    );
 }

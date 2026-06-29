@@ -23,9 +23,53 @@
           <div class="slider-field">
             <span>Scenes</span>
           </div>
-          <div id="scene-panel-main" class="scene-panel controls">
+          <div class="scene-tabs" role="tablist" aria-label="Scene groups">
+            <button
+              id="scene-tab-main"
+              class="scene-tab is-active"
+              type="button"
+              role="tab"
+              aria-selected="true"
+              aria-controls="scene-panel-main"
+            >
+              Scenes
+            </button>
+            <button
+              id="scene-tab-debug"
+              class="scene-tab"
+              type="button"
+              role="tab"
+              aria-selected="false"
+              aria-controls="scene-panel-debug"
+            >
+              Debug Scenes
+            </button>
+          </div>
+          <div id="scene-panel-main" class="scene-panel controls" role="tabpanel" aria-labelledby="scene-tab-main">
             <button id="scene-center-pour">Center Pour</button>
             <button id="scene-free-stream">Water Only</button>
+          </div>
+          <div
+            id="scene-panel-debug"
+            class="scene-panel controls debug-scene-grid"
+            role="tabpanel"
+            aria-labelledby="scene-tab-debug"
+            hidden
+          >
+            <button data-debug-scene="filter-water-block">Water Block</button>
+            <button data-debug-scene="off-center-filter-wall-pour">Off-Center Wall Pour</button>
+            <button data-debug-scene="seeded-paper-wall-sheet">Paper-Wall Sheet</button>
+            <button data-debug-scene="filter-apex-drain">Filter Apex Drain</button>
+            <button data-debug-scene="cup-wall-floor-corner-contact">Cup Corner Contact</button>
+            <button data-debug-scene="asymmetric-cup-mound-settle">Asymmetric Mound</button>
+            <button data-debug-scene="hydrostatic-column">Hydrostatic Column</button>
+            <button data-debug-scene="dam-break-slosh">Dam Break Slosh</button>
+            <button data-debug-scene="sparse-free-jet">Sparse Free Jet</button>
+            <button data-debug-scene="high-velocity-jet-impact">High-Velocity Impact</button>
+            <button data-debug-scene="uniform-bed-saturation">Uniform Bed Saturation</button>
+            <button data-debug-scene="permeability-comparison">Permeability Stress</button>
+            <button data-debug-scene="particle-capacity-stress">Capacity Stress</button>
+            <button data-debug-scene="sand-wall">Sand Wall</button>
           </div>
         </div>
         <div class="control-panel">

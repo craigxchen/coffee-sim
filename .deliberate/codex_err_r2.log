@@ -1,0 +1,1515 @@
+OpenAI Codex v0.137.0
+--------
+workdir: /Users/cxc/Github/coffee-sim
+model: gpt-5.5
+provider: openai
+approval: never
+sandbox: read-only
+reasoning effort: high
+reasoning summaries: none
+session id: 019ea005-791d-7ec1-a294-d30a8b9c3e2d
+--------
+user
+You are the same expert physics-simulation reviewer. This is ROUND 2. In round 1 you returned REVISE with 12 findings on this water↔grain coupling plan. The plan has been revised to fold ALL 12. Verify the folds actually resolve each finding (don't just trust the changelog), then give a verdict on the FIRST LINE: **APPROVE**, **REVISE**, or **REJECT**, followed by any remaining or newly-introduced issues. Be rigorous — if a fold is hand-wavy or introduces a new problem, say so.
+
+How each round-1 finding was addressed (verify against the plan body):
+1. α_s not a hard barrier → KTD-2 adds an explicit RETENTION FALLBACK: minimum-porosity floor in the water density target + residual porous resistance (weak ∇α_s penalty / near-saturation drag limit, NOT sphere exclusion); U2 gains "no free-fall through a static bed" + flux/COM anti-tunneling gates.
+2. Don't remove exclusion before drag → REORDERED to U1(kernel) → U3(drag) → U2(remove exclusion UNDER drag) → U4(sleep) → U5(finer water) → U6(verify); U2 now depends on U3.
+3. Pair-level symmetric drag (per-particle α leaks momentum) → KTD-3: symmetric pair coefficient β_ij (harmonic combiner from stored per-particle coeffs), ONE pair impulse J_ij=m_eff_pair·(1−e^{−dt/τ_ij})·(u_j−u_i) applied +J/m_i / −J/m_j off vel_frozen; U3 test asserts equal-and-opposite under ε_i≠ε_j.
+4. Per-neighbor exponential over-damps → KTD-3: exponential applied to the AGGREGATE local drag β_i=Σ_j β_ij W_ij V_j with normalized weight distribution; U3 neighbor-count relaxation test (N vs 2N → same rate).
+5. Stable ≠ mobilizing → KTD-4: explicit mobilization INEQUALITY (pour-zone impulse > surface-grain yield/contact/rolling resistance; bulk < fluidization) as calibration target + gate.
+6. Wide kernel perf/normalization → KTD-5: water PBF keeps its OWN radius h (grid cell only widens candidate list); neighbor-count instrumentation; ε clamp ≥0.35.
+7. Wake gate fragile/unit-dependent → KTD-9: dimensionless wake gate (impulse vs grain submerged weight, or sustained flow speed) + explicit fluid_impulse decay; U4 dt/subiter-invariance test.
+8. One observable under-determines calibration → KTD-6: BANDED multi-observable calibration (coarse/fine drawdown ratio, pour-zone displacement band, bulk ceiling, water-retention height, no long-run drift).
+9. coupling_scale lanes → KTD-8: explicit (x=aggregate inv-τ/β, y=normalization/ε); confirmed no pass needs α_s+ε+β simultaneously; no new bindings on 8/8 passes.
+10. Buoyancy/drag double-count → KTD-7: drag forces grains from RELATIVE VELOCITY only; hydrostatic-saturated-bed-at-rest gate (zero net accel beyond buoyancy) + flowing-bed drag-from-slip-only.
+11. Fine-water eruption too late → KTD-3/KTD-10: drag RESOLUTION-NORMALIZED in U3 (before U5); two-resolution per-grain drag-invariance test.
+12. Inverted tunneling test criteria → U2: bounded downward flux through bed bottom, saturation profile stays in bed, water COM plateaus, no one-signed saturated-tail leak (≥2000-step).
+
+Open the plan and judge whether these are specified concretely enough to implement, whether any fold is internally inconsistent, and whether anything is still missing (e.g. the retention "residual resistance" mechanism is still vague — is it concrete enough? does the mobilization inequality have a measurable form? is the symmetric-pair + aggregate-normalization combination actually self-consistent — can you have BOTH a per-pair J_ij AND an aggregate normalization without double-normalizing?).
+
+## Revised Plan (round 2)
+---
+title: "feat: Physically-grounded water↔grain coupling (unresolved SPH-DEM: porosity field + Darcy drag, no fluid-solid collision)"
+status: active
+date: 2026-06-06
+deliberated: 2026-06-06
+type: feat
+---
+
+# feat: Physically-grounded water↔grain coupling
+
+> Re-ground the water↔coffee-grain mechanical coupling so the pour actually moves the grounds, using the standard **unresolved SPH-DEM** architecture: water and sand *see each other via a porosity field + a relative-velocity drag closure*, never sphere-sphere collision (which causes porous locking). Water is finer than the grains; both phases stay in one unified position-based solver.
+>
+> **Revised after Codex /deliberate round 1 (REVISE → folded).** Key changes: drag is landed **before** exclusion is removed; the drag is a **pair-symmetric, aggregate-normalized, resolution-normalized** exponential Darcy impulse; removing exclusion gains an explicit **α_s retention fallback** (porosity floor + residual resistance); calibration uses **multiple banded observables**; buoyancy/drag **double-counting** is explicitly avoided; the wake criterion is **normalized**; anti-tunneling gates are sharpened.
+
+## Summary
+
+The bed never moves under the pour because the water↔grain coupling is both miscalibrated and partly wrong in kind. Two mechanisms are at fault: (1) a **soft water↔grain non-penetration "exclusion"** — a partial sphere-sphere contact that is mass-biased so grains barely feel it *and* is exactly the kind of fluid-solid collision that causes **porous locking** (fine fluid wedging in grain voids → bed dilates/locks); and (2) an **implicit drag ~3 orders of magnitude too weak** — the per-substep velocity-blend `β = rate·dt/(1+rate·dt) ≈ 5×10⁻⁴`, far below the grain sleep threshold, so grains read as frozen.
+
+The fix is the textbook **unresolved (semi-resolved) SPH-DEM coupling** (Robinson et al. 2013; Macklin "Unified Particle Physics" 2014): keep PBF for water and rigid XPBD contact for sand-sand, and couple the two phases through (a) the **volumetric solid-fraction field** `α_s` the solver already computes (water density targets `ρ₀·(1−α_s)`, so water packs into pore volume) **backed by an explicit retention floor** so it actually resists free-fall, and (b) a **physically-grounded Darcy drag with an exponential/implicit integrator, formulated as a symmetric pair impulse** strong enough to both set drainage *and* mobilize the bed surface. Only **after** that drag is landed and characterized is the old exclusion removed. Water particles are made genuinely finer than grains, with a **wider coupling kernel** so the porosity/drag field stays smooth.
+
+Coffee pour-over sits at pore Reynolds number ≈ 0.3–12 (Darcian), so the Ergun inertial term is negligible — viscous Darcy drag suffices. At realistic flow the bed is ~3–4× minimum fluidization, so the physical target is **mild grain rearrangement at the pour impingement zone, not a churning bed** — that bounds both the calibration and the verification.
+
+---
+
+## Problem Frame
+
+- **What's wrong:** Water saturates/swells the grounds (the scalar absorption pass works) but the bed shows zero mechanical agitation even at max pour velocity. Diagnosed root causes: the soft water↔grain exclusion (mass-biased, locking-prone) and the ~1000×-too-weak drag (`src/solvers/xpbd/coupling.wgsl`).
+- **Goal:** The pour mechanically and *physically* moves the grounds — water percolates the pore network while exerting real drag that rearranges the surface — without the bed locking, exploding, unrealistically fluidizing, or letting water free-fall/pool through.
+- **Architecture (user-directed, confirmed by literature):** geometric asymmetry. Sand↔sand: rigid XPBD contact at full sand radius. Water↔water: PBF density at the small water radius. Water↔sand: **no sphere collision** — porosity field (with a retention floor) + relative-velocity drag.
+- **Hard constraints (project doctrine):**
+  - Volume + momentum conservation are **gated invariants**; drag must stay a symmetric, equal-and-opposite, dissipative **pair** impulse (no float atomics — the symmetric `vel_frozen` gather idiom).
+  - **8 storage buffers per shader stage** is a hard WebGPU ceiling (`drag_water`/`drag_grain`/`buoyancy_grain`/`compute_lambda`/`compute_dp`/`bed_project` are already at 8/8). Browser/Tint portable.
+  - **No SI/real-unit system is wired today** (reduced sim units). A real-unit conversion is a cross-cutting calibration project (`KEEP.md §2`) — **out of scope**; calibrate by **banded** causal-lever inequalities.
+  - **Never `#[ignore]` a test to go green** (`AGENTS.md`): inverting invariants get *rewritten* to the new physics.
+
+---
+
+## Requirements
+
+- **R1.** Remove the water↔grain sphere exclusion **only after** a physically meaningful drag is landed; the `α_s` porosity field **plus an explicit retention floor/residual resistance** carries the volume coupling so water packs into pores and does **not** free-fall, pool below, or ghost through the bed.
+- **R2.** Replace the velocity-blend drag with a **Darcy** relative-velocity drag (viscous only; Re < ~12) as an **exponential/implicit, pair-symmetric, aggregate-normalized** impulse — momentum-conserving and dissipative, resolution-invariant, strong enough that pour-zone impulse **exceeds** surface-grain contact/yield resistance (mobilizes) while bulk impulse stays **below** fluidization.
+- **R3.** Couple the porosity field and drag through a **coupling kernel wider than the water PBF kernel** (≈ 2–3× grain diameter) for a smooth void fraction; the **water PBF keeps its own query radius** even though the grid cell grows; clamp porosity `ε ≥ ~0.35`. Instrument avg/max neighbor counts.
+- **R4.** Water particles are **finer than grains** (`R_w < R_s`), seeded accordingly, at a modest absolute count (the ~200k perf push is deferred); the drag is resolution-normalized *before* this step so refinement doesn't erupt or change bed forcing.
+- **R5.** Grain **sleep/wake** is reconciled with the strong drag via a **dimensionless/normalized** wake criterion (impulse relative to grain weight, or local flow speed over a minimum duration) with explicit `fluid_impulse` decay: the pour mobilizes surface grains; a dry or saturated-static bed settles without creep.
+- **R6.** **Buoyancy stays a separate pressure-gradient term**, not folded into drag, and is **not double-counted** with the α_s-modified pressure field; the density-aware "don't launch dense grains" fix remains intact.
+- **R7.** Conservation gates hold (momentum drift bounded, drag KE non-increasing, water volume conserved incl. saturated tail). Wetting/extraction/fines scalar layers remain functionally unchanged on top.
+- **R8.** Behavior is verified by **banded** causal-lever inequalities: coarse-grind drains faster than fine (ratio band); pour-zone grain displacement within a band; bulk displacement under a ceiling; water retention height within a band; finer resolution does not change per-grain drag (invariance) or erupt.
+
+---
+
+## Key Technical Decisions
+
+- **KTD-1 — Unresolved SPH-DEM coupling, not resolved collision.** Water↔grain interaction is a body force from a locally-averaged porosity field + drag closure (Robinson 2013), **not** sphere-sphere non-penetration (which causes porous locking, spurious collision-pressure, bed dilation). User-specified and literature-standard.
+- **KTD-2 — Keep `α_s` as the volume channel, but back it with an explicit retention floor; remove exclusion only after drag lands.** `α_s` density modulation alone is **not** a hard barrier (a sparse/under-neighbored water particle can advect through, pool below, or ghost in high-α_s zones — Codex r1.1). So: (a) enforce a **minimum-porosity floor** in the water density target and a **residual porous resistance** (a weak `∇α_s`-driven volumetric penalty / a strong near-saturation drag limit — *not* sphere exclusion) so water is hydraulically retained; (b) **land the Darcy drag first** (U3) and remove exclusion **under** that drag (U2), gated by a "no free-fall through a static bed" test (Codex r1.2). Removal stays the goal; retention is the explicit safety net.
+- **KTD-3 — Darcy drag: viscous-only, exponential, PAIR-SYMMETRIC, AGGREGATE-NORMALIZED, RESOLUTION-NORMALIZED.** Per-grain Darcy `β = 150·μ·(1−ε)²/(ε³·d²)` (Kozeny–Carman structure, already `porosity_drag_factor ∝ d⁻²`). Drop the Ergun inertial term (Darcian). To conserve momentum under *asymmetric per-particle porosity* (Codex r1.3): form a **symmetric pair coefficient** `β_ij` from stored per-particle coefficients (deterministic harmonic combiner), one pair impulse `J_ij = m_eff_pair·(1 − e^(−Δt/τ_ij))·(u_j − u_i)`, applied `+J/m_i` and `−J/m_j` in the two mirrored gathers off `vel_frozen`. To avoid over-damping when summed over many neighbors (Codex r1.4): apply the exponential to the **aggregate** local drag (`β_i = Σ_j β_ij W_ij V_j`), distributing by normalized weights — *not* `1−e^{−dt/τ}` summed per pair. **Resolution-normalize** so the total drag force on a grain is invariant as water is refined (Codex r1.11) — done here, before U5. The exponential integrator is unconditionally stable (the current β-blend is its weak first-order approximation; the bug is the tiny rate).
+- **KTD-4 — Mobilization is a separate, explicit criterion from stability (Codex r1.5).** Viscous drag damps; bed *rearrangement* requires the pour-zone drag impulse over a frame to **exceed** the surface grains' static-yield + contact + rolling resistance, while bulk-bed impulse stays **below** the fluidization threshold. This inequality is a calibration target and a gate, not an emergent hope.
+- **KTD-5 — Wide coupling kernel `h_c`, water PBF keeps its own radius.** Compute `α_s`/drag porosity over `h_c ≈ 2–3× grain_diameter` for a smooth field; set `cell_size = max(h_c, grain_diameter, h)`, but the **water PBF density solve still distance-culls to its own `h`** (Codex r1.6) — the larger cell only widens the candidate list. Clamp `ε ∈ [0.35, 0.999]`. Instrument avg/max neighbor counts per pass (the wider gather can spike PBF/drag/sort cost).
+- **KTD-6 — Reduced units; calibrate by BANDED multi-observable inequalities (Codex r1.8).** No SI system is wired (`KEEP.md §2`). Calibrate the one free drag scale against *several* bands simultaneously: coarse/fine drawdown ratio, bounded pour-zone displacement, a bulk-displacement ceiling, water-retention height, and zero long-run momentum/volume drift — one observable is under-determined. Real-unit conversion is deferred.
+- **KTD-7 — Buoyancy separate AND not double-counted with drag (Codex r1.10).** Buoyancy stays `−V·∇P` over the PBF `λ` field (density-aware `grain_buoyancy_factor`). Because that pressure gradient already arises from the α_s-modified PBF constraint, ensure drag forces grains only from **relative velocity**, never re-applying the pressure-gradient term. Gate: a hydrostatic saturated bed at rest has zero net grain acceleration beyond buoyancy balance; a flowing bed receives drag from relative velocity only.
+- **KTD-8 — `coupling_scale` lane allocation is explicit; 8-buffer budget held (Codex r1.9).** Precompute into the existing `coupling_scale: vec2<f32>`: `x = aggregate inverse-stopping-time (or β_i)`, `y = normalization (Σ W_ij V_j) or local ε`. Confirm **no pass needs `α_s`, `ε`, and `β` simultaneously** — derive ε from α_s at point of use. Add no bindings to the already-8/8 drag passes; never bit-pack two physical quantities into one lane.
+- **KTD-9 — Normalized, decaying wake criterion (Codex r1.7).** Replace the raw `fluid_impulse > wake_threshold` (which scales with dt/subiters/neighbor count) with a **dimensionless** gate (drag impulse relative to grain submerged weight, or local relative-flow speed sustained over a minimum duration) and an explicit `fluid_impulse` decay/reset so saturated tails don't creep.
+- **KTD-10 — Water finer than grains is realism, sequenced last with drag already resolution-normalized.** `R_w < R_s` improves the look + fluid detail but stresses CFL/kernel normalization (XSPH eruption lesson). Because KTD-3 resolution-normalizes drag, refinement won't change bed forcing; still run the spacing-invariance gate. Keep the count modest; defer the 200k push.
+
+---
+
+## High-Level Technical Design
+
+**Constraint classes (geometric asymmetry):**
+
+```mermaid
+graph TD
+  subgraph Water phase (fine, R_w)
+    W[water particles] -- "PBF density rho0*(1-as), own radius h, porosity floor" --> W
+  end
+  subgraph Sand phase (coarse, R_s)
+    S[grain particles] -- "rigid XPBD contact + friction" --> S
+  end
+  W -. "porosity field a_s + residual resistance (kernel h_c)" .-> S
+  S -. "a_s modulates water density target (floored)" .-> W
+  W == "symmetric-pair exponential Darcy drag" ==> S
+  S == "equal+opposite pair impulse (vel_frozen)" ==> W
+  P[buoyancy: -V*gradP, separate, not double-counted] --- S
+  X[NO water-sand sphere collision]:::x
+  classDef x fill:#511,stroke:#a33,color:#fff
+```
+
+**Per-substep pass order (REVISED — drag before exclusion removal). Bold = changed from today.**
+
+```
+predict
+water density loop (×water_iters):
+    [regrid + reorder every k]
+    compute_fractions        → a_s over h_c            (KTD-5 wider kernel)
+    compute_boundary (solids)
+    compute_lambda           → rho0*(1-a_s), **porosity floor**, **own radius h**  (KTD-2,5)
+    compute_dp
+    exclude_water/grain      → **present until U2 lands; removed after drag (U3) is in**
+    apply_dp                 → **grain dp=0 once exclusion removed**
+drag subiters (×drag_subiters):
+    compute_coupling_scale   → **aggregate beta_i + normalization into coupling_scale vec2**  (KTD-3,8)
+    vel→vel_frozen
+    drag_water / drag_grain  → **symmetric pair exponential impulse, resolution-normalized**   (KTD-3,4)
+    apply_drag_pred
+buoyancy:                    → **separate, not double-counted; hydrostatic-rest gate**  (KTD-7)
+bed contact loop: bed_project + apply_dp                (unchanged — sand-sand)
+finalize                     → **normalized, decaying wake criterion**                  (KTD-9)
+xsph (water)                 (resolution normalization — watched)
+wetting / extraction / fines (unchanged scalar layers)
+```
+
+**Symmetric-pair exponential drag (directional pseudo-code, not spec):**
+
+```
+# Pass A (compute_coupling_scale): per particle i, over opposite phase j in h_c
+eps_i      = clamp(1 - alpha_s[i], 0.35, 0.999)
+beta_i     = 150 * mu * (1-eps_i)^2 / (eps_i^3 * d^2)        # reduced units, calibrated scale
+norm_i     = Σ_j W(h_c)_ij * V_j                              # aggregate normalization
+coupling_scale[i] = vec2(beta_i, norm_i)                      # KTD-8 lanes
+
+# Pass B (drag_grain / drag_water): symmetric pair impulse off vel_frozen
+beta_ij    = harmonic(beta_i, beta_j)                         # symmetric combiner
+tau_ij     = m_eff_pair / (beta_ij * V_pair)
+J_ij       = (1 - exp(-dt / tau_ij)) * m_eff_pair * (vf[j] - vf[i]) * (W_ij / norm_aggregate)
+vel[i]    += (+/-) J_ij / m_i                                 # mirrored: +J/m_i on i, -J/m_j on j
+fluid_impulse[i] += |J_ij| (for the normalized wake gate, KTD-9)
+```
+
+---
+
+## Implementation Units
+
+> Sequence (dependency order): **U1 → U3 → U2 → U4 → U5 → U6** (drag before exclusion removal). U-IDs are stable; the numeric labels stay attached to their concepts.
+
+### U1. Wide, smooth coupling kernel for the porosity field
+
+**Goal:** Decouple the `α_s`/drag coupling kernel `h_c` from the water PBF `h`; keep water PBF on its own radius; clamp porosity; instrument neighbor counts.
+
+**Requirements:** R3.
+
+**Dependencies:** none.
+
+**Files:** `src/solvers/xpbd/coupling.wgsl` (`compute_fractions`, `porosity_drag_factor`), `src/solvers/xpbd/common.wgsl` (Params: `coupling_h`), `src/solvers/xpbd/mod.rs` (`h_c`, `cell_size = max(h_c, grain_diameter, h)`, neighbor-count diagnostics), `src/models/mod.rs` (Materials: `coupling_radius` or derived), `tests/xpbd_coupling.rs`.
+
+**Approach:** `α_s`/drag porosity gather over `h_c ≈ 2–3× grain_diameter`; the water PBF density gather still distance-culls to `h` even though the grid cell is larger (the cell only widens the candidate list). Clamp `ε ∈ [0.35, 0.999]` at use. Add avg/max neighbor-count instrumentation per pass. Legacy single-resolution scenes stay byte-stable when `h_c` resolves to the prior radius.
+
+**Patterns to follow:** existing `cell_size = max(h, grain_diameter)`; `porosity_drag_factor` clamp.
+
+**Test scenarios:**
+- α_s smooth (monotonic, bounded `[0, packing_limit]`, low per-particle variance vs. an `h_c=h` baseline) with water finer than grains.
+- ε clamp holds in a dense cluster (drag coefficient finite).
+- Water PBF unaffected: density residual on a pure-water dam unchanged when only `h_c` differs (PBF still uses `h`).
+- Neighbor-count instrumentation reports avg/max; flags if the wider cell spikes counts beyond a budget.
+- Legacy `dam_through_sand` α_s byte-unchanged when `h_c` resolves to prior `h`.
+
+**Verification:** smooth bounded porosity with fine water; water PBF + legacy scenes unaffected; neighbor counts observable.
+
+---
+
+### U3. Darcy drag — symmetric-pair exponential impulse, aggregate- & resolution-normalized
+
+**Goal:** Replace the weak velocity-blend with a physically-grounded Darcy drag that conserves momentum under per-particle porosity, doesn't over-damp across neighbors, is resolution-invariant, and is strong enough (by an explicit inequality) to mobilize the bed surface. Lands **before** exclusion is removed.
+
+**Requirements:** R2, R4 (resolution normalization), R6 (no double-count).
+
+**Dependencies:** U1.
+
+**Files:** `src/solvers/xpbd/coupling.wgsl` (`compute_coupling_scale`, `drag_delta_for_pair`, `drag_water`, `drag_grain`), `src/models/permeability.rs` (Darcy `β`/`τ` from K-C `k`), `src/utils/config.rs` (single calibratable drag scale; revisit `drag_beta_max`), `src/solvers/xpbd/mod.rs`, `tests/xpbd_coupling.rs`.
+
+**Approach:** `compute_coupling_scale` precomputes the **aggregate** `β_i` and normalization into `coupling_scale.vec2` (KTD-8 lanes — no new binding; drag passes stay 8/8). `drag_delta_for_pair` forms a **symmetric** `β_ij` (harmonic combiner), one pair impulse `J_ij = (1−e^{−Δt/τ_ij})·m_eff_pair·(vf_j−vf_i)·(W_ij/norm)`, applied `+J/m_i` / `−J/m_j` (KTD-3). Resolution-normalize so per-grain total drag is invariant under water refinement (KTD-3/r1.11). Calibrate the scale (with U6's bands) so pour-zone impulse exceeds surface-grain resistance while bulk stays sub-fluidization (KTD-4). Buoyancy untouched; ensure drag uses relative velocity only (no pressure-gradient term — KTD-7). Exclusion still present this unit (removed in U2).
+
+**Execution note:** Characterize first — capture baseline grain displacement + water↔grain relative velocity (headless) before the change, so "now it moves" is measured.
+
+**Patterns to follow:** the symmetric `drag_delta_for_pair` / `vel_frozen` / harmonic-k combiner; `kozeny_carman` + `drag_rate` in `permeability.rs`.
+
+**Test scenarios:**
+- **Momentum conserved under asymmetric porosity:** a pair with `ε_i ≠ ε_j` still produces an exactly equal-and-opposite impulse; `Σ m_eff·v` drift within tolerance (`< 2e-4`-class).
+- **No over-damping across neighbors:** a grain with N water neighbors relaxes toward the aggregate slip velocity at the intended rate, not N× faster (compare N vs 2N neighbors at fixed φ → same relaxation).
+- **Resolution invariance:** total drag force on a fixed grain is invariant (within a band) as water particles are refined (two-resolution column test) — *before* U5.
+- **Dissipative:** relative velocity monotonically damped, KE non-increasing.
+- **Stable at strong coupling:** `Δt/τ ≫ 1` (real regime) — grain velocity bounded, no eruption/oscillation.
+- **Mobilization inequality:** pour-zone drag impulse over a frame exceeds the surface-grain static-yield/contact resistance (measured), while a bulk-bed grain's impulse stays below it.
+- **Grind ordering preserved:** `coarse_grind_draws_down_faster_than_fine` passes.
+
+**Verification:** conserved + dissipative + resolution-invariant drag that demonstrably mobilizes the pour zone but not the bulk; grind ordering kept.
+
+---
+
+### U2. Remove the water↔grain exclusion under drag, with an α_s retention floor
+
+**Goal:** Delete the soft sphere-sphere exclusion; the `α_s` density target **plus a porosity floor + residual resistance** retains water in the pore network (no free-fall/pooling/ghosting).
+
+**Requirements:** R1.
+
+**Dependencies:** U1, **U3** (drag must be landed first).
+
+**Files:** `src/solvers/xpbd/coupling.wgsl` (delete `exclusion_push`/`exclude_*`; add the residual-resistance / porosity-floor term in `compute_lambda`/`compute_dp` or a small dedicated term), `src/solvers/xpbd/water.wgsl` (porosity floor in the density target), `src/solvers/xpbd/mod.rs` (drop the two passes; grain `dp = 0` in the water-loop `apply_dp`), `src/solvers/xpbd/common.wgsl`/`src/models/mod.rs`/`src/utils/config.rs` (drop `exclusion_relax`/`water_grain_distance` if unused), `tests/xpbd_coupling.rs`.
+
+**Approach:** Remove the exclusion passes/params. Add the retention fallback (KTD-2): a minimum-porosity floor in the water density target + a residual porous resistance (a weak `∇α_s` volumetric penalty or a near-saturation drag limit) so water cannot advect freely through the solid. Ensure no stale grain `dp` is applied in the water loop (grains a clean no-op there; bed loop owns grain position). Water now threads pores via the density field + drag, not collision.
+
+**Patterns to follow:** `compute_dp` already skips grains (`water.wgsl`); pipeline/binding registration in `mod.rs`.
+
+**Test scenarios:**
+- **No free-fall through a static bed (gate on this commit):** with a static grain bed + a water column, water does **not** advect through to the floor — bounded downward flux through the bed bottom; water column COM plateaus *inside/above* the bed, not below it.
+- **Saturation profile stays inside the bed** (no ghost water in high-α_s zones below where it should be); no persistent one-signed volume leak in the saturated tail (≥2000-step check).
+- **Rewrite** `water_threads_the_bed_without_tunneling`: replace the `min_wg > 0.55·d_wg` standoff (inverted by design) with: water permeates (min distance drops) **and** bed structure intact (grain top not crushed, `vmax` bounded), **and** the anti-tunneling flux/COM gates above.
+- Conservation: water volume conserved; no eruption.
+
+**Verification:** exclusion gone; water retained in the pore network (no free-fall/pool); bed structure + conservation intact.
+
+---
+
+### U4. Reconcile grain sleep/wake (normalized criterion + decay)
+
+**Goal:** The pour mobilizes surface grains; a dry or saturated-static bed settles to rest — via a dimensionless wake gate with explicit decay.
+
+**Requirements:** R5.
+
+**Dependencies:** U3.
+
+**Files:** `src/solvers/xpbd/common.wgsl` (`finalize` sleep/wake; `fluid_impulse` decay), `src/solvers/xpbd/coupling.wgsl` (`fluid_impulse` accumulation from the pair impulse), `src/utils/config.rs`, `tests/xpbd_bed.rs`, `tests/xpbd_coupling.rs`.
+
+**Approach:** Replace raw `fluid_impulse > wake_threshold` with a **dimensionless** wake gate (drag impulse relative to grain submerged weight, or sustained local relative-flow speed) so the threshold is independent of dt/subiters/neighbor count (KTD-9). Add explicit `fluid_impulse` decay so a saturated, no-longer-flowing bed sleeps. Ensure `rolling_damping` doesn't fully cancel drag-driven surface motion. Dry bed (mixed gates off) untouched.
+
+**Patterns to follow:** the `fluid_impulse` reset→accumulate→consume chain.
+
+**Test scenarios:**
+- Dry bed unchanged: `bed_settles_into_a_static_heap` passes.
+- Saturated static bed (pour stopped): grains settle, no perpetual creep (impulse decays below the normalized gate).
+- Active pour: impingement-zone grains stay mobile frame-to-frame; the gate fires on flow, not on transient impulse noise.
+- Gate is dt/subiter-invariant: doubling subiters does not change which grains wake.
+
+**Verification:** dry + saturated-static settle; active-pour mobilizes; wake gate resolution/step-invariant.
+
+---
+
+### U5. Make water finer than grains (resolution + seeding + eruption guard)
+
+**Goal:** Water finer than grains for realism, at a modest count, without eruption — drag already resolution-normalized (U3).
+
+**Requirements:** R4.
+
+**Dependencies:** U1, U2, U3, U4.
+
+**Files:** `src/engine/scene.rs` (`v60_pour` water vs grain spacing), `src/models/mod.rs` (water spacing vs grain_diameter ratio), `examples/pour.rs`/`pour_render.rs`, `src/utils/config.rs` (substeps/CFL), `tests/xpbd_statics.rs`, `tests/xpbd_coupling.rs`.
+
+**Approach:** Water spacing `< grain_diameter` (grain ≈ 2–3× water) at a modest count (defer 200k). Confirm grid (U1) covers the disparity. Run the spacing-invariance gate; keep `max_correction_ratio`; auto-scale substeps if CFL demands. Because U3 resolution-normalized drag, per-grain forcing is invariant across refinement.
+
+**Execution note:** Refine incrementally, re-running the spacing-invariance + drag-invariance gates at each step.
+
+**Patterns to follow:** species-aware `seed_block` spacing; `rest_lattice_is_a_quiet_fixed_point_across_resolutions`.
+
+**Test scenarios:**
+- Spacing-invariance: rest residual within the gate bound; no eruption at the finer water spacing.
+- Drag-invariance re-checked at the new ratio (per-grain total drag unchanged within band).
+- Percolation + mobilization (U2/U3 invariants) hold at the finer resolution.
+- Visual coherence (non-gated): fine water threads the coarser bed.
+
+**Verification:** finer water stable, percolates, mobilizes, reads as water-in-pores; drag invariant.
+
+---
+
+### U6. Verification suite + headless instrumentation (banded calibration)
+
+**Goal:** Lock the new physics with banded causal-lever gates and instrumentation; verify buoyancy/drag decoupling and resolution invariance.
+
+**Requirements:** R7, R8.
+
+**Dependencies:** U2, U3, U4, U5.
+
+**Files:** `tests/xpbd_coupling.rs` (rewritten + new gates), `tests/xpbd_wetting.rs` (re-validate conservation), `examples/pour.rs` (headless metrics: pour-zone vs bulk grain displacement, water↔grain relative velocity, downward flux, water COM/retention height, drawdown), `src/solvers/xpbd/mod.rs` diagnostics if needed.
+
+**Approach:** Instrument the metrics; gate behavior as **banded inequalities** (KTD-6).
+
+**Test scenarios:**
+- **Pour agitates the surface (banded):** pour-zone grain displacement within `[lo, hi]` over N frames, and exceeds bulk displacement (localized).
+- **No full fluidization:** bulk grain displacement under a ceiling; bed top not collapsed; mean grain-y profile not fluidized (per ~3–4× `u_mf`).
+- **Buoyancy/drag decoupling:** hydrostatic saturated bed at rest → zero net grain accel beyond buoyancy balance; flowing bed → drag from relative velocity only (no double-count).
+- **Grind ordering (banded):** coarse/fine drawdown ratio within a band.
+- **Water retention height** within a band (not pooled below, not perched on top).
+- **Conservation:** momentum drift bounded, drag KE non-increasing, water volume conserved incl. ≥2000-step saturated-tail (no one-signed leak).
+- **Resolution invariance:** per-grain total drag invariant across two water resolutions.
+- **Full suite:** green except the 3 documented pre-existing reds.
+
+**Verification:** all banded gates pass; instrumentation shows localized surface motion, grind-ordered drainage, retained water, conserved + decoupled forces.
+
+---
+
+## Scope Boundaries
+
+In scope: the mechanical water↔grain coupling re-grounding (porosity field + retention floor + symmetric-pair exponential Darcy drag, exclusion removal under drag, finer water, normalized sleep/wake, buoyancy separation/decoupling) and its verification.
+
+### Deferred to Follow-Up Work
+- **Real-unit (SI) system** (cross-cutting per `KEEP.md §2`); calibrate in reduced units by banded inequality.
+- **~200k-particle perf scaling** (fused passes / Morton order — `PERF_NOTES.md`).
+- **Ergun inertial term / Di Felice high-Re drag** (negligible at pour-over Re).
+- **Virtual/added-mass interphase force** (`solver_xpbd.md §3.3`, never built) and the concentration-gradient dispersion force (superseded by fines).
+- **Resolved pore-scale collision** (rejected — porous locking).
+
+### Non-Goals
+- Changing the PBF water core, sand-sand contact/friction/repose, or the wetting/extraction/fines scalar layers (re-validated, not redesigned).
+- Any water↔grain sphere non-penetration.
+
+---
+
+## Risks & Mitigations
+
+- **Removing exclusion lets water free-fall/pool (Codex r1.1).** Mitigation: land drag first (U3), add the porosity floor + residual resistance (KTD-2), gate on the "no free-fall through a static bed" + flux/COM tests (U2).
+- **Per-particle porosity leaks momentum (Codex r1.3).** Mitigation: symmetric pair `β_ij` + single mirrored pair impulse (KTD-3); the asymmetric-porosity conservation test (U3).
+- **Over-damping across many neighbors (Codex r1.4).** Mitigation: aggregate normalization (KTD-3); the neighbor-count relaxation test.
+- **Drag stable but not mobilizing (Codex r1.5).** Mitigation: explicit mobilization inequality (KTD-4) as a calibration target + gate.
+- **Under-determined calibration (Codex r1.8).** Mitigation: multi-observable bands (KTD-6).
+- **Wider kernel spikes cost / wake gate is unit-dependent (Codex r1.6/r1.7).** Mitigation: water PBF keeps own radius + neighbor instrumentation (KTD-5); dimensionless decaying wake gate (KTD-9).
+- **Buoyancy/drag double-count (Codex r1.10).** Mitigation: drag from relative velocity only; hydrostatic-rest gate (KTD-7).
+- **Fine-water eruption (Codex r1.11).** Mitigation: resolution-normalize drag in U3 (before U5); spacing-invariance + drag-invariance gates.
+- **8-buffer ceiling.** Mitigation: explicit `coupling_scale` vec2 lanes, no new bindings on 8/8 passes (KTD-8).
+- **Reduced-unit calibration reads arbitrary.** Mitigation: anchor to the ~3–4× `u_mf` physics; assert bands.
+
+---
+
+## Verification
+
+- `cargo test` — rewritten/new `tests/xpbd_coupling.rs` gates (mobilization inequality, no-fluidization, grind-ratio band, conservation incl. saturated tail, dissipation, buoyancy/drag decoupling, resolution invariance, anti-tunneling flux/COM); `tests/xpbd_bed.rs` (dry + saturated-static) and `tests/xpbd_statics.rs` (spacing-invariance) pass; suite green except the 3 documented pre-existing reds.
+- Native visual — `SCENE=v60pour cargo run --release --example water_app`: fine water threads the coarser bed; the pour rearranges the surface at the impingement point; the bed drains, retains water, and does not churn/suspend or free-fall through.
+- Web — `wasm-pack build --target web --out-dir www/pkg`, hard-refresh: same behavior; Tint compiles the new WGSL; ≤ 8 storage buffers per stage; no new console errors.
+- Process — continue `/deliberate` (Codex, gpt-5.5 high) rounds until APPROVE, folding each REVISE.
+
+---
+
+## Sources & Research
+
+External research was load-bearing (KTD-1/3/4/5 and R8's realism bar) and Codex /deliberate round 1 hardened the conservation/sequencing/anti-tunneling specifics:
+
+- **Robinson et al. 2013** (arXiv:1301.0752) — SPH-DEM *unresolved* coupling: porosity-field + Di Felice drag; fluid kernel coarser than ~2× particle diameter for a smooth field. Architectural basis.
+- **Implicit Incompressible Porous SPH** (arXiv:2504.07739, 2025) — fluid/solid coexist; implicit (linear-in-v⁺) porous drag — the XPBD-compatible form.
+- **Macklin et al. 2014, "Unified Particle Physics"** — PBF + rigid coupling; buoyancy from volume-exclusion/pressure (informs KTD-7).
+- **Ergun 1952 / Di Felice 1994 / Gidaspow** — drag closures; viscous `150·μ(1−ε)²/(ε³d²)`; K-C permeability; inertial term negligible at pour-over Re.
+- **Coffee puck permeability** (Royal Society Open Science 2025, DOI 10.1098/rsos.252031) — `k ≈ 2.6–35 ×10⁻¹³ m²`, bed Re ≈ 2–12 (Darcian).
+- **Fluidization estimate** — V60 `u_s ≈ 3–4× u_mf` → surface rearrangement, not suspension — R8's bar.
+- **Codex /deliberate round 1** (`.deliberate/codex_review.md`) — REVISE: pair-symmetric conservation, aggregate normalization, drag-before-exclusion sequencing, α_s retention floor, mobilization inequality, banded calibration, normalized wake, buoyancy/drag decoupling, resolution normalization, sharper anti-tunneling gates.
+- Codebase grounding: `src/solvers/xpbd/{coupling,water,bed,common}.wgsl`, `mod.rs` step order + 8/8 buffer budget, `src/models/{permeability,mod}.rs`, `tests/xpbd_{coupling,bed,wetting,statics}.rs`; learnings from `solver_xpbd.md`, `KEEP.md`, `AGENTS.md`.
+
+codex
+I’ll review the revised text against the twelve prior findings and spot-check the current XPBD coupling shape so the verdict is grounded in both the plan and the repo constraints.
+exec
+/bin/zsh -lc 'rg -n "coupling_scale|drag_delta_for_pair|exclude_|exclusion|fluid_impulse|compute_fractions|porosity|buoyancy|storage" src/solvers/xpbd tests -S' in /Users/cxc/Github/coffee-sim
+exec
+/bin/zsh -lc 'rg -n "drag_water|drag_grain|compute_coupling_scale|compute_lambda|compute_dp|bed_project|bind_group|Storage" src/solvers/xpbd/mod.rs src/solvers/xpbd/*.wgsl -S' in /Users/cxc/Github/coffee-sim
+ succeeded in 0ms:
+src/solvers/xpbd/water.wgsl:10:// Wall density compensation, precomputed into c_residual for compute_lambda to add (see the note
+src/solvers/xpbd/water.wgsl:11:// there). Its own pass because compute_lambda already binds 8 storage buffers (the WebGPU limit)
+src/solvers/xpbd/water.wgsl:30:fn compute_lambda(@builtin(global_invocation_id) gid: vec3<u32>) {
+src/solvers/xpbd/water.wgsl:85:    // scratch handoff — compute_lambda needs `solids`, but is already at the 8-storage-buffer limit,
+src/solvers/xpbd/water.wgsl:152:fn compute_dp(@builtin(global_invocation_id) gid: vec3<u32>) {
+src/solvers/xpbd/water.wgsl:156:    if (phase[i] != PHASE_WATER) { return; } // grains are projected by bed_project
+src/solvers/xpbd/water.wgsl:162:    // compute_lambda. f_w≡1 (no absorption) ⇒ identical to before.
+src/solvers/xpbd/bed.wgsl:18:fn bed_project(@builtin(global_invocation_id) gid: vec3<u32>) {
+src/solvers/xpbd/common.wgsl:125:// under fluid load. Reset in predict, written by drag_grain, read in finalize.
+src/solvers/xpbd/common.wgsl:648:        let pen = c_residual[i]; // final normalized penetration from the last bed_project
+src/solvers/xpbd/coupling.wgsl:112:    // Add onto the water density Δp already in dp (compute_dp wrote it this iteration).
+src/solvers/xpbd/coupling.wgsl:149:    // Grains get no water-density Δp (compute_dp skips them), so SET dp here (the bed contact
+src/solvers/xpbd/coupling.wgsl:175:fn compute_coupling_scale(@builtin(global_invocation_id) gid: vec3<u32>) {
+src/solvers/xpbd/coupling.wgsl:245:fn drag_water(@builtin(global_invocation_id) gid: vec3<u32>) {
+src/solvers/xpbd/coupling.wgsl:275:    fluid_impulse[i] = fluid_impulse[i]; // keep drag_water's auto-layout at the shared 8 buffers
+src/solvers/xpbd/coupling.wgsl:279:fn drag_grain(@builtin(global_invocation_id) gid: vec3<u32>) {
+src/solvers/xpbd/mod.rs:198:    compute_lambda: wgpu::ComputePipeline,
+src/solvers/xpbd/mod.rs:200:    compute_dp: wgpu::ComputePipeline,
+src/solvers/xpbd/mod.rs:201:    bed_project: wgpu::ComputePipeline,
+src/solvers/xpbd/mod.rs:205:    compute_coupling_scale: wgpu::ComputePipeline,
+src/solvers/xpbd/mod.rs:206:    drag_water: wgpu::ComputePipeline,
+src/solvers/xpbd/mod.rs:207:    drag_grain: wgpu::ComputePipeline,
+src/solvers/xpbd/mod.rs:236:    compute_lambda: wgpu::BindGroup,
+src/solvers/xpbd/mod.rs:238:    compute_dp: wgpu::BindGroup,
+src/solvers/xpbd/mod.rs:239:    bed_project: wgpu::BindGroup,
+src/solvers/xpbd/mod.rs:243:    compute_coupling_scale: wgpu::BindGroup,
+src/solvers/xpbd/mod.rs:244:    drag_water: wgpu::BindGroup,
+src/solvers/xpbd/mod.rs:245:    drag_grain: wgpu::BindGroup,
+src/solvers/xpbd/mod.rs:341:    bind_groups: BindGroups,
+src/solvers/xpbd/mod.rs:1475:            compute_lambda: make("compute_lambda"),
+src/solvers/xpbd/mod.rs:1477:            compute_dp: make("compute_dp"),
+src/solvers/xpbd/mod.rs:1478:            bed_project: make("bed_project"),
+src/solvers/xpbd/mod.rs:1482:            compute_coupling_scale: make("compute_coupling_scale"),
+src/solvers/xpbd/mod.rs:1483:            drag_water: make("drag_water"),
+src/solvers/xpbd/mod.rs:1484:            drag_grain: make("drag_grain"),
+src/solvers/xpbd/mod.rs:1505:            let layout = pipe.get_bind_group_layout(0);
+src/solvers/xpbd/mod.rs:1513:            device.create_bind_group(&wgpu::BindGroupDescriptor {
+src/solvers/xpbd/mod.rs:1519:        let bind_groups = BindGroups {
+src/solvers/xpbd/mod.rs:1598:            compute_lambda: bg(
+src/solvers/xpbd/mod.rs:1599:                &pipelines.compute_lambda,
+src/solvers/xpbd/mod.rs:1616:            compute_dp: bg(
+src/solvers/xpbd/mod.rs:1617:                &pipelines.compute_dp,
+src/solvers/xpbd/mod.rs:1630:            bed_project: bg(
+src/solvers/xpbd/mod.rs:1631:                &pipelines.bed_project,
+src/solvers/xpbd/mod.rs:1680:            compute_coupling_scale: bg(
+src/solvers/xpbd/mod.rs:1681:                &pipelines.compute_coupling_scale,
+src/solvers/xpbd/mod.rs:1692:            drag_water: bg(
+src/solvers/xpbd/mod.rs:1693:                &pipelines.drag_water,
+src/solvers/xpbd/mod.rs:1706:            drag_grain: bg(
+src/solvers/xpbd/mod.rs:1707:                &pipelines.drag_grain,
+src/solvers/xpbd/mod.rs:1998:            bind_groups,
+src/solvers/xpbd/mod.rs:2065:        let b = &self.bind_groups;
+src/solvers/xpbd/mod.rs:2178:                            // Wall density compensation into c_residual (consumed by compute_lambda,
+src/solvers/xpbd/mod.rs:2190:                            &p.compute_lambda,
+src/solvers/xpbd/mod.rs:2191:                            &b.compute_lambda,
+src/solvers/xpbd/mod.rs:2192:                            "compute_lambda",
+src/solvers/xpbd/mod.rs:2195:                        pass(&mut enc, &p.compute_dp, &b.compute_dp, "compute_dp", np);
+src/solvers/xpbd/mod.rs:2241:                        &p.compute_coupling_scale,
+src/solvers/xpbd/mod.rs:2242:                        &b.compute_coupling_scale,
+src/solvers/xpbd/mod.rs:2243:                        "compute_coupling_scale",
+src/solvers/xpbd/mod.rs:2254:                        pass(&mut enc, &p.drag_water, &b.drag_water, "drag_water", np);
+src/solvers/xpbd/mod.rs:2255:                        pass(&mut enc, &p.drag_grain, &b.drag_grain, "drag_grain", np);
+src/solvers/xpbd/mod.rs:2323:                        pass(&mut enc, &p.bed_project, &b.bed_project, "bed_project", np);
+src/solvers/xpbd/mod.rs:2518:    bind_group: &wgpu::BindGroup,
+src/solvers/xpbd/mod.rs:2545:    pass.set_bind_group(0, Some(bind_group), &[]);
+
+ succeeded in 0ms:
+src/solvers/xpbd/fines.wgsl:6:// feed local permeability via the α_s deviation (compute_fractions, U4). They carry NO inertial
+tests/xpbd_coupling.rs:3://! Step 1 (grain exclusion + pore-modulated water density; drag/buoyancy come later): a water
+tests/xpbd_coupling.rs:76:fn buoyancy_only_config(scale: f32) -> Config {
+tests/xpbd_coupling.rs:82:        buoyancy_scale: scale,
+tests/xpbd_coupling.rs:151:fn buoyancy_conserves_momentum_and_lifts_grain() {
+tests/xpbd_coupling.rs:179:    let mut solver = XpbdSolver::build(&scene, &mats, &buoyancy_only_config(1.0), &gpu);
+tests/xpbd_coupling.rs:183:    // PBF λ is negative under compression; pressure is -λ in the buoyancy kernels.
+tests/xpbd_coupling.rs:191:    assert!(drift < 1.0e-4, "buoyancy momentum drift: {drift}");
+tests/xpbd_coupling.rs:201:fn buoyancy_pressure_proxy_lifts_fine_bed_without_blowup() {
+tests/xpbd_coupling.rs:230:        let mut solver = XpbdSolver::build(&scene, &mats, &buoyancy_only_config(scale), &gpu);
+tests/xpbd_coupling.rs:254:        "buoyancy pressure-proxy test blew up"
+tests/xpbd_coupling.rs:256:    // Density-aware buoyancy (added in Phase 1.4) scales the lift by ρ_water/ρ_grain, so this very
+tests/xpbd_coupling.rs:257:    // dense grain (ρ≈30× water) lifts only a little — but it must still rise vs no buoyancy, finitely.
+tests/xpbd_coupling.rs:548:    // collapsed to ~0). The exclusion is a soft constraint, so allow a modest overlap margin.
+src/solvers/xpbd/mod.rs:58:    num_solids: u32, // count of static SDF solids in the `solids` storage buffer (0 = none)
+src/solvers/xpbd/mod.rs:77:    exclusion_relax: f32,
+src/solvers/xpbd/mod.rs:80:    buoyancy_scale: f32,
+src/solvers/xpbd/mod.rs:129:// Primitive is a storage-buffer element and must stay byte-identical to the WGSL `Primitive`.
+src/solvers/xpbd/mod.rs:202:    compute_fractions: wgpu::ComputePipeline,
+src/solvers/xpbd/mod.rs:203:    exclude_water: wgpu::ComputePipeline,
+src/solvers/xpbd/mod.rs:204:    exclude_grain: wgpu::ComputePipeline,
+src/solvers/xpbd/mod.rs:205:    compute_coupling_scale: wgpu::ComputePipeline,
+src/solvers/xpbd/mod.rs:208:    buoyancy_grain: wgpu::ComputePipeline,
+src/solvers/xpbd/mod.rs:209:    buoyancy_water: wgpu::ComputePipeline,
+src/solvers/xpbd/mod.rs:240:    compute_fractions: wgpu::BindGroup,
+src/solvers/xpbd/mod.rs:241:    exclude_water: wgpu::BindGroup,
+src/solvers/xpbd/mod.rs:242:    exclude_grain: wgpu::BindGroup,
+src/solvers/xpbd/mod.rs:243:    compute_coupling_scale: wgpu::BindGroup,
+src/solvers/xpbd/mod.rs:246:    buoyancy_grain: wgpu::BindGroup,
+src/solvers/xpbd/mod.rs:247:    buoyancy_water: wgpu::BindGroup,
+src/solvers/xpbd/mod.rs:511:    fn storage(
+src/solvers/xpbd/mod.rs:520:            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | extra,
+src/solvers/xpbd/mod.rs:1148:        // `drag_gamma` (live-porosity drag in a later unit makes this per-particle).
+src/solvers/xpbd/mod.rs:1149:        let permeability = kozeny_carman(mats.grain_diameter, mats.porosity);
+src/solvers/xpbd/mod.rs:1189:            exclusion_relax: cfg.exclusion_relax,
+src/solvers/xpbd/mod.rs:1192:            buoyancy_scale: cfg.buoyancy_scale,
+src/solvers/xpbd/mod.rs:1240:        let pos = Arc::new(Self::storage(
+src/solvers/xpbd/mod.rs:1248:        let pred = Self::storage(&device, "xpbd-pred", vec4, wgpu::BufferUsages::COPY_SRC);
+src/solvers/xpbd/mod.rs:1249:        let vel = Arc::new(Self::storage(
+src/solvers/xpbd/mod.rs:1255:        let vel_smoothed = Self::storage(
+src/solvers/xpbd/mod.rs:1261:        let vel_frozen = Self::storage(
+src/solvers/xpbd/mod.rs:1267:        let lambda = Self::storage(&device, "xpbd-lambda", f32s, wgpu::BufferUsages::empty());
+src/solvers/xpbd/mod.rs:1268:        let dp = Self::storage(&device, "xpbd-dp", vec4, wgpu::BufferUsages::empty());
+src/solvers/xpbd/mod.rs:1270:            Self::storage(&device, "xpbd-cresidual", f32s, wgpu::BufferUsages::empty());
+src/solvers/xpbd/mod.rs:1273:        let phase = Arc::new(Self::storage(
+src/solvers/xpbd/mod.rs:1280:        let normal_impulse = Self::storage(
+src/solvers/xpbd/mod.rs:1287:        // scenes (which never run compute_fractions) read α_s=0 → the water solve is unmodulated.
+src/solvers/xpbd/mod.rs:1288:        let alpha_s = Self::storage(&device, "xpbd-alpha-s", f32s, wgpu::BufferUsages::empty());
+src/solvers/xpbd/mod.rs:1289:        let fluid_impulse = Self::storage(
+src/solvers/xpbd/mod.rs:1296:        let coupling_scale = Self::storage(
+src/solvers/xpbd/mod.rs:1303:        let wet_count = Self::storage(&device, "xpbd-wet-count", f32s, wgpu::BufferUsages::empty());
+src/solvers/xpbd/mod.rs:1306:        let cell_count = Self::storage(
+src/solvers/xpbd/mod.rs:1312:        let cell_start = Self::storage(
+src/solvers/xpbd/mod.rs:1318:        let sorted_indices = Self::storage(
+src/solvers/xpbd/mod.rs:1327:        // response). Each stays within the 8-storage-buffer budget (finalize is at 7).
+src/solvers/xpbd/mod.rs:1335:            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+src/solvers/xpbd/mod.rs:1364:        let chem = Arc::new(Self::storage(
+src/solvers/xpbd/mod.rs:1371:        let chem_frozen = Self::storage(
+src/solvers/xpbd/mod.rs:1379:        let pos_scratch = Self::storage(
+src/solvers/xpbd/mod.rs:1385:        let pred_scratch = Self::storage(
+src/solvers/xpbd/mod.rs:1391:        let vel_scratch = Self::storage(
+src/solvers/xpbd/mod.rs:1397:        let chem_scratch = Self::storage(
+src/solvers/xpbd/mod.rs:1403:        let phase_scratch = Self::storage(
+src/solvers/xpbd/mod.rs:1412:        let diss_neighbors = Self::storage(
+src/solvers/xpbd/mod.rs:1418:        let status = Self::storage(
+src/solvers/xpbd/mod.rs:1479:            compute_fractions: make("compute_fractions"),
+src/solvers/xpbd/mod.rs:1480:            exclude_water: make("exclude_water"),
+src/solvers/xpbd/mod.rs:1481:            exclude_grain: make("exclude_grain"),
+src/solvers/xpbd/mod.rs:1482:            compute_coupling_scale: make("compute_coupling_scale"),
+src/solvers/xpbd/mod.rs:1485:            buoyancy_grain: make("buoyancy_grain"),
+src/solvers/xpbd/mod.rs:1486:            buoyancy_water: make("buoyancy_water"),
+src/solvers/xpbd/mod.rs:1529:                    (14, &fluid_impulse),
+src/solvers/xpbd/mod.rs:1644:            compute_fractions: bg(
+src/solvers/xpbd/mod.rs:1645:                &pipelines.compute_fractions,
+src/solvers/xpbd/mod.rs:1653:                    (20, &chem), // lodged fines (chem.w) → α_s deviation (Phase 6); 6 storage buffers
+src/solvers/xpbd/mod.rs:1656:            exclude_water: bg(
+src/solvers/xpbd/mod.rs:1657:                &pipelines.exclude_water,
+src/solvers/xpbd/mod.rs:1668:            exclude_grain: bg(
+src/solvers/xpbd/mod.rs:1669:                &pipelines.exclude_grain,
+src/solvers/xpbd/mod.rs:1680:            compute_coupling_scale: bg(
+src/solvers/xpbd/mod.rs:1681:                &pipelines.compute_coupling_scale,
+src/solvers/xpbd/mod.rs:1689:                    (16, &coupling_scale),
+src/solvers/xpbd/mod.rs:1701:                    (14, &fluid_impulse),
+src/solvers/xpbd/mod.rs:1703:                    (16, &coupling_scale),
+src/solvers/xpbd/mod.rs:1715:                    (14, &fluid_impulse),
+src/solvers/xpbd/mod.rs:1717:                    (16, &coupling_scale),
+src/solvers/xpbd/mod.rs:1720:            buoyancy_grain: bg(
+src/solvers/xpbd/mod.rs:1721:                &pipelines.buoyancy_grain,
+src/solvers/xpbd/mod.rs:1730:                    (14, &fluid_impulse),
+src/solvers/xpbd/mod.rs:1734:            buoyancy_water: bg(
+src/solvers/xpbd/mod.rs:1735:                &pipelines.buoyancy_water,
+src/solvers/xpbd/mod.rs:1845:            // wetting block has finished for the substep. Count is eligibility-only (5 storage);
+src/solvers/xpbd/mod.rs:1846:            // the transfers read live vel for the per-pair flux and write only chem.w (8 storage).
+src/solvers/xpbd/mod.rs:1907:                    (14, &fluid_impulse),
+src/solvers/xpbd/mod.rs:2060:        // (+ grain exclusion when mixed); grain runs the contact subcycle; mixed runs both, with
+src/solvers/xpbd/mod.rs:2171:                                &p.compute_fractions,
+src/solvers/xpbd/mod.rs:2172:                                &b.compute_fractions,
+src/solvers/xpbd/mod.rs:2173:                                "compute_fractions",
+src/solvers/xpbd/mod.rs:2197:                            // Grain exclusion (A.2), two-way: water out of grain bodies + reaction.
+src/solvers/xpbd/mod.rs:2200:                                &p.exclude_water,
+src/solvers/xpbd/mod.rs:2201:                                &b.exclude_water,
+src/solvers/xpbd/mod.rs:2202:                                "exclude_water",
+src/solvers/xpbd/mod.rs:2207:                                &p.exclude_grain,
+src/solvers/xpbd/mod.rs:2208:                                &b.exclude_grain,
+src/solvers/xpbd/mod.rs:2209:                                "exclude_grain",
+src/solvers/xpbd/mod.rs:2241:                        &p.compute_coupling_scale,
+src/solvers/xpbd/mod.rs:2242:                        &b.compute_coupling_scale,
+src/solvers/xpbd/mod.rs:2243:                        "compute_coupling_scale",
+src/solvers/xpbd/mod.rs:2266:                if mixed && self.params.buoyancy_scale > 0.0 {
+src/solvers/xpbd/mod.rs:2287:                        &p.buoyancy_grain,
+src/solvers/xpbd/mod.rs:2288:                        &b.buoyancy_grain,
+src/solvers/xpbd/mod.rs:2289:                        "buoyancy_grain",
+src/solvers/xpbd/mod.rs:2294:                        &p.buoyancy_water,
+src/solvers/xpbd/mod.rs:2295:                        &b.buoyancy_water,
+src/solvers/xpbd/mod.rs:2296:                        "buoyancy_water",
+src/solvers/xpbd/extraction.wgsl:20:// at exactly 8 storage buffers — no room for a separate `pred` binding.)
+src/solvers/xpbd/coupling.wgsl:4://  1. compute_fractions — per-particle solid fraction α_s = Σ_grain V_g W (clamped to the packing
+src/solvers/xpbd/coupling.wgsl:7://  2. grain exclusion (A.2) — a two-way geometric non-penetration between water and grain
+src/solvers/xpbd/coupling.wgsl:9://     symmetric pair of gathers (exclude_water + exclude_grain) reading the same predicted
+src/solvers/xpbd/coupling.wgsl:14://  4. buoyancy / pressure-gradient lift — symmetric gathers over the converged water λ field.
+src/solvers/xpbd/coupling.wgsl:19:fn compute_fractions(@builtin(global_invocation_id) gid: vec3<u32>) {
+src/solvers/xpbd/coupling.wgsl:59:        result = clamp(result + fines_dev, 0.0, 0.95); // 0.95 = 1 − φ_f_min (porosity_drag_factor)
+src/solvers/xpbd/coupling.wgsl:66:fn exclusion_push(xi: vec3<f32>, xj: vec3<f32>, w_self: f32) -> vec3<f32> {
+src/solvers/xpbd/coupling.wgsl:78:    return params.exclusion_relax * (d_wg - r) * w_self * n;
+src/solvers/xpbd/coupling.wgsl:82:fn exclude_water(@builtin(global_invocation_id) gid: vec3<u32>) {
+src/solvers/xpbd/coupling.wgsl:107:                    push = push + exclusion_push(xi, pred[j].xyz, m_g / (m_w + m_g));
+src/solvers/xpbd/coupling.wgsl:117:fn exclude_grain(@builtin(global_invocation_id) gid: vec3<u32>) {
+src/solvers/xpbd/coupling.wgsl:122:    // Effective masses (swelling), mirror of exclude_water. Same per-pair m_w/m_g read from pred.w on
+src/solvers/xpbd/coupling.wgsl:144:                    push = push + exclusion_push(xi, pred[j].xyz, m_w / (m_w + m_g));
+src/solvers/xpbd/coupling.wgsl:160:// Live-porosity drag (wetting only): the local drag rate scales with local permeability k(φ_f),
+src/solvers/xpbd/coupling.wgsl:161:// φ_f = 1−α_s, relative to the reference porosity the build-time rate was resolved at. The K-C
+src/solvers/xpbd/coupling.wgsl:162:// d²/180 cancels in the ratio, so this is a pure porosity factor. As the bed wets/swells, α_s↑ ⇒
+src/solvers/xpbd/coupling.wgsl:164:// porosity discontinuity — deferred.)
+src/solvers/xpbd/coupling.wgsl:165:const WET_REF_POROSITY: f32 = 0.40; // must match Materials.porosity (build-time drag resolution)
+src/solvers/xpbd/coupling.wgsl:166:fn porosity_drag_factor(a_s: f32) -> f32 {
+src/solvers/xpbd/coupling.wgsl:168:    let pr = WET_REF_POROSITY;
+src/solvers/xpbd/coupling.wgsl:175:fn compute_coupling_scale(@builtin(global_invocation_id) gid: vec3<u32>) {
+src/solvers/xpbd/coupling.wgsl:180:    // Per-particle drag RATE: the local-porosity-modulated rate when wetting OR fines are active
+src/solvers/xpbd/coupling.wgsl:182:    // live-porosity gate so a no-wetting fines scene still drives drag from local permeability.
+src/solvers/xpbd/coupling.wgsl:185:        rate_i = params.drag_gamma * porosity_drag_factor(alpha_s[i]);
+src/solvers/xpbd/coupling.wgsl:215:        // Harmonic-k path: store the raw rate + the cap. drag_delta_for_pair forms the symmetric
+src/solvers/xpbd/coupling.wgsl:217:        coupling_scale[i] = vec2<f32>(rate_i, cap_i);
+src/solvers/xpbd/coupling.wgsl:220:        coupling_scale[i] = vec2<f32>(min(beta_from_rate(rate_i), cap_i), 0.0);
+src/solvers/xpbd/coupling.wgsl:224:fn drag_delta_for_pair(i: u32, j: u32, self_phase: u32) -> vec3<f32> {
+src/solvers/xpbd/coupling.wgsl:225:    let cs_i = coupling_scale[i];
+src/solvers/xpbd/coupling.wgsl:226:    let cs_j = coupling_scale[j];
+src/solvers/xpbd/coupling.wgsl:268:                    dv = dv + drag_delta_for_pair(i, j, PHASE_WATER);
+src/solvers/xpbd/coupling.wgsl:275:    fluid_impulse[i] = fluid_impulse[i]; // keep drag_water's auto-layout at the shared 8 buffers
+src/solvers/xpbd/coupling.wgsl:302:                    dv = dv + drag_delta_for_pair(i, j, PHASE_GRAIN);
+src/solvers/xpbd/coupling.wgsl:309:    fluid_impulse[i] = fluid_impulse[i] + params.grain_mass * length(dv);
+src/solvers/xpbd/coupling.wgsl:317:fn buoyancy_grain(@builtin(global_invocation_id) gid: vec3<u32>) {
+src/solvers/xpbd/coupling.wgsl:341:                    impulse = impulse + params.buoyancy_scale * pressure_for_water(j) *
+src/solvers/xpbd/coupling.wgsl:351:    let dv = grain_buoyancy_factor(pred[i].w) * impulse / m_g;
+src/solvers/xpbd/coupling.wgsl:353:    fluid_impulse[i] = fluid_impulse[i] + m_g * length(dv);
+src/solvers/xpbd/coupling.wgsl:357:fn buoyancy_water(@builtin(global_invocation_id) gid: vec3<u32>) {
+src/solvers/xpbd/coupling.wgsl:385:                    impulse = impulse + grain_buoyancy_factor(pred[j].w) * params.buoyancy_scale *
+src/solvers/xpbd/coupling.wgsl:413:    // Preserve the moisture snapshot in pred.w — this runs in the drag/buoyancy subcycle before
+src/solvers/xpbd/water.wgsl:11:// there). Its own pass because compute_lambda already binds 8 storage buffers (the WebGPU limit)
+src/solvers/xpbd/water.wgsl:85:    // scratch handoff — compute_lambda needs `solids`, but is already at the 8-storage-buffer limit,
+src/solvers/xpbd/water.wgsl:115:    // No early `return` on status.converged here: a return gated on a read_write storage read is
+tests/xpbd_extraction.rs:72:        buoyancy_scale: 0.0,
+tests/xpbd_extraction.rs:771:        buoyancy_scale: 0.0,
+src/solvers/xpbd/common.wgsl:54:    exclusion_relax: f32,     // under-relaxation on the A.2 correction
+src/solvers/xpbd/common.wgsl:57:    buoyancy_scale: f32,
+src/solvers/xpbd/common.wgsl:59:    water_grain_distance: f32, // water↔grain exclusion contact (≤ grain spacing lets water thread pores)
+src/solvers/xpbd/common.wgsl:101:@group(0) @binding(1) var<storage, read_write> pos: array<vec4<f32>>;
+src/solvers/xpbd/common.wgsl:102:@group(0) @binding(2) var<storage, read_write> pred: array<vec4<f32>>;
+src/solvers/xpbd/common.wgsl:103:@group(0) @binding(3) var<storage, read_write> vel: array<vec4<f32>>;
+src/solvers/xpbd/common.wgsl:104:@group(0) @binding(4) var<storage, read_write> vel_smoothed: array<vec4<f32>>;
+src/solvers/xpbd/common.wgsl:105:@group(0) @binding(5) var<storage, read_write> lambda: array<f32>;
+src/solvers/xpbd/common.wgsl:106:@group(0) @binding(6) var<storage, read_write> dp: array<vec4<f32>>;
+src/solvers/xpbd/common.wgsl:107:@group(0) @binding(7) var<storage, read_write> c_residual: array<f32>;
+src/solvers/xpbd/common.wgsl:112:@group(0) @binding(8) var<storage, read_write> cell_start: array<u32>;
+src/solvers/xpbd/common.wgsl:113:@group(0) @binding(9) var<storage, read_write> sorted_indices: array<u32>;
+src/solvers/xpbd/common.wgsl:114:@group(0) @binding(10) var<storage, read_write> status: Status;
+src/solvers/xpbd/common.wgsl:115:@group(0) @binding(11) var<storage, read_write> phase: array<u32>;
+src/solvers/xpbd/common.wgsl:118:@group(0) @binding(12) var<storage, read_write> normal_impulse: array<f32>;
+src/solvers/xpbd/common.wgsl:120:// iteration by compute_fractions in mixed scenes; zero in single-species scenes (so the water
+src/solvers/xpbd/common.wgsl:122:// the pore fraction (drainage-ready), and the geometric exclusion keeps water out of grain bodies.
+src/solvers/xpbd/common.wgsl:123:@group(0) @binding(13) var<storage, read_write> alpha_s: array<f32>;
+src/solvers/xpbd/common.wgsl:126:@group(0) @binding(14) var<storage, read_write> fluid_impulse: array<f32>;
+src/solvers/xpbd/common.wgsl:129:@group(0) @binding(15) var<storage, read_write> vel_frozen: array<vec4<f32>>;
+src/solvers/xpbd/common.wgsl:132:// (fines active): (.x = raw drag rate ∝ 1/k_local, .y = anti-overshoot cap) — drag_delta_for_pair
+src/solvers/xpbd/common.wgsl:134:@group(0) @binding(16) var<storage, read_write> coupling_scale: array<vec2<f32>>;
+src/solvers/xpbd/common.wgsl:138:@group(0) @binding(17) var<storage, read_write> wet_neighbors: array<u32>;
+src/solvers/xpbd/common.wgsl:140:@group(0) @binding(18) var<storage, read_write> cell_count: array<atomic<u32>>;
+src/solvers/xpbd/common.wgsl:155:@group(0) @binding(19) var<storage, read> solids: array<Primitive>;
+src/solvers/xpbd/common.wgsl:272:@group(0) @binding(20) var<storage, read_write> chem: array<vec4<f32>>;
+src/solvers/xpbd/common.wgsl:273:@group(0) @binding(22) var<storage, read> chem_frozen: array<vec4<f32>>;
+src/solvers/xpbd/common.wgsl:277:@group(0) @binding(21) var<storage, read_write> diss_neighbors: array<vec2<f32>>;
+src/solvers/xpbd/common.wgsl:283:@group(0) @binding(23) var<storage, read_write> pos_scratch: array<vec4<f32>>;
+src/solvers/xpbd/common.wgsl:284:@group(0) @binding(24) var<storage, read_write> pred_scratch: array<vec4<f32>>;
+src/solvers/xpbd/common.wgsl:285:@group(0) @binding(25) var<storage, read_write> vel_scratch: array<vec4<f32>>;
+src/solvers/xpbd/common.wgsl:286:@group(0) @binding(26) var<storage, read_write> chem_scratch: array<vec4<f32>>;
+src/solvers/xpbd/common.wgsl:287:@group(0) @binding(27) var<storage, read_write> phase_scratch: array<u32>;
+src/solvers/xpbd/common.wgsl:391:// Density-aware buoyancy scaling: the buoyant acceleration is ∝ ρ_water/ρ_grain, so a grain DENSER
+src/solvers/xpbd/common.wgsl:393:// (ρ→ρ_water) is neutrally buoyant. Clamped ≤ 1. Both buoyancy passes apply the grain's factor per
+src/solvers/xpbd/common.wgsl:396:fn grain_buoyancy_factor(v_abs: f32) -> f32 {
+src/solvers/xpbd/common.wgsl:441:    fluid_impulse[i] = 0.0; // reset the per-frame water↔grain wake signal
+src/solvers/xpbd/common.wgsl:529:// stays within the 8-storage-buffer budget; both read the same (still-original) sorted_indices, so
+src/solvers/xpbd/common.wgsl:659:        if (fluid_impulse[i] <= params.wake_threshold && length(v) < params.grain_sleep_speed) {
+src/solvers/xpbd/bed.wgsl:13:// To stay within the WebGPU 8-storage-buffer limit this kernel does NOT bind `status`: the
+tests/xpbd_channeling.rs:201:// 8-storage-buffer limit, so it needs a restructure). Set aside for a follow-up; the migration,
+tests/xpbd_fines.rs:288:        buoyancy_scale: 0.0,
+tests/xpbd_wetting.rs:5://! `apply_drag_pred`, which runs in the drag/buoyancy subcycle and previously zeroed `.w`. The
+tests/xpbd_wetting.rs:18:/// passes (drag/buoyancy → `apply_drag_pred`) actually run.
+tests/xpbd_wetting.rs:48:/// Config that isolates absorption: density/bed/drag/buoyancy/viscosity off, wetting on. Lets the
+tests/xpbd_wetting.rs:55:        buoyancy_scale: 0.0,
+tests/xpbd_wetting.rs:141:fn moisture_lane_survives_steps_with_drag_and_buoyancy() {
+tests/xpbd_wetting.rs:146:    // Default config keeps drag (subiters=4) and buoyancy (scale=1) on, so apply_drag_pred runs.
+tests/xpbd_wetting.rs:430:    // Full physics ON (density, bed, drag, buoyancy) PLUS absorption — the realistic mixed path,
+tests/xpbd_wetting.rs:495:        buoyancy_scale: 0.0,
+tests/xpbd_wetting.rs:525:fn live_porosity_drag_path_conserves_momentum() {
+tests/xpbd_wetting.rs:531:    // Drag ON with absorption ON (so live-porosity drag + effective masses are active), gravity off,
+tests/xpbd_wetting.rs:532:    // density/bed/buoyancy off. The only momentum exchanges are the symmetric drag impulse and the
+tests/xpbd_wetting.rs:541:        buoyancy_scale: 0.0,
+tests/xpbd_wetting.rs:627:            buoyancy_scale: 0.0,
+
+exec
+/bin/zsh -lc 'rg -n "struct Params|coupling|drag|porosity|fluid_impulse|water_grain|exclusion|grain_buoyancy" src/solvers/xpbd src/models src/utils -S' in /Users/cxc/Github/coffee-sim
+ succeeded in 0ms:
+src/solvers/xpbd/fines.wgsl:1:// Fines migration (XPBD Phase 6). Concatenated after common/water/bed/coupling/wetting/extraction.
+src/solvers/xpbd/wetting.wgsl:1:// Wetting / absorption (XPBD step 4). Concatenated after common/water/bed/coupling.
+src/models/permeability.rs:5:/// `d` is grain diameter and `phi` is bed porosity. Smaller grains lower permeability and
+src/models/permeability.rs:6:/// therefore increase drag. The porosity term is clamped away from singular endpoints so callers
+src/models/permeability.rs:14:/// Resolve the solver drag rate from permeability.
+src/models/permeability.rs:15:pub fn drag_rate(k: f32, gamma: f32) -> f32 {
+src/models/permeability.rs:21:    use super::{drag_rate, kozeny_carman};
+src/models/permeability.rs:24:    fn finer_grind_has_lower_permeability_and_higher_drag() {
+src/models/permeability.rs:31:        assert!(drag_rate(fine, gamma) > drag_rate(coarse, gamma));
+src/models/permeability.rs:35:    /// scales as `d²` at fixed porosity, so the solver's resolved drag rate
+src/models/permeability.rs:36:    /// (`γ = drag_gamma / k`, wired in `solvers::xpbd::build`) scales as `d⁻²`.
+src/models/permeability.rs:48:        // d² scaling at fixed porosity: doubling the grind quadruples permeability.
+src/models/permeability.rs:55:        // The solver wires γ = drag_gamma / k, so resolved drag ∝ d⁻²: halving the
+src/models/permeability.rs:56:        // grain diameter quadruples the drag rate (the grind→flow knob).
+src/models/permeability.rs:58:        let drag_ratio =
+src/models/permeability.rs:59:            drag_rate(kozeny_carman(0.6, phi), gamma) / drag_rate(kozeny_carman(1.2, phi), gamma);
+src/models/permeability.rs:61:            (drag_ratio - 4.0).abs() < 1e-4,
+src/models/permeability.rs:62:            "γ(d/2)/γ(d) = {drag_ratio}, expected 4"
+src/solvers/xpbd/mod.rs:1://! PBF water core under `SolverId::Xpbd` — water incompressibility only (no bed/coupling).
+src/solvers/xpbd/mod.rs:16:use crate::models::permeability::{drag_rate, kozeny_carman};
+src/solvers/xpbd/mod.rs:38:struct Params {
+src/solvers/xpbd/mod.rs:73:    // --- water/bed coupling (mixed scenes) ---
+src/solvers/xpbd/mod.rs:77:    exclusion_relax: f32,
+src/solvers/xpbd/mod.rs:78:    drag_gamma: f32,
+src/solvers/xpbd/mod.rs:79:    drag_beta_max: f32,
+src/solvers/xpbd/mod.rs:82:    water_grain_distance: f32,
+src/solvers/xpbd/mod.rs:205:    compute_coupling_scale: wgpu::ComputePipeline,
+src/solvers/xpbd/mod.rs:206:    drag_water: wgpu::ComputePipeline,
+src/solvers/xpbd/mod.rs:207:    drag_grain: wgpu::ComputePipeline,
+src/solvers/xpbd/mod.rs:210:    apply_drag_pred: wgpu::ComputePipeline,
+src/solvers/xpbd/mod.rs:243:    compute_coupling_scale: wgpu::BindGroup,
+src/solvers/xpbd/mod.rs:244:    drag_water: wgpu::BindGroup,
+src/solvers/xpbd/mod.rs:245:    drag_grain: wgpu::BindGroup,
+src/solvers/xpbd/mod.rs:248:    apply_drag_pred: wgpu::BindGroup,
+src/solvers/xpbd/mod.rs:307:    /// Jacobi sub-iterations for implicit water↔grain velocity drag (mixed scenes only).
+src/solvers/xpbd/mod.rs:308:    drag_subiters: u32,
+src/solvers/xpbd/mod.rs:932:    /// Whether the per-frame water/coupling/wetting/extraction passes run (true if a water region is
+src/solvers/xpbd/mod.rs:1104:        // water/coupling/wetting/extraction passes must be selected.
+src/solvers/xpbd/mod.rs:1113:        let drag_subiters = cfg.drag_subiters;
+src/solvers/xpbd/mod.rs:1147:        // Resolve the user-facing drag scale through Kozeny-Carman once at build time, stored in
+src/solvers/xpbd/mod.rs:1148:        // `drag_gamma` (live-porosity drag in a later unit makes this per-particle).
+src/solvers/xpbd/mod.rs:1149:        let permeability = kozeny_carman(mats.grain_diameter, mats.porosity);
+src/solvers/xpbd/mod.rs:1150:        let resolved_drag_gamma = drag_rate(permeability, cfg.drag_gamma);
+src/solvers/xpbd/mod.rs:1189:            exclusion_relax: cfg.exclusion_relax,
+src/solvers/xpbd/mod.rs:1190:            drag_gamma: resolved_drag_gamma,
+src/solvers/xpbd/mod.rs:1191:            drag_beta_max: cfg.drag_beta_max,
+src/solvers/xpbd/mod.rs:1194:            water_grain_distance: mats.water_grain_distance,
+src/solvers/xpbd/mod.rs:1286:        // Per-particle solid fraction α_s (coupling). Zero-initialized by wgpu, so single-species
+src/solvers/xpbd/mod.rs:1289:        let fluid_impulse = Self::storage(
+src/solvers/xpbd/mod.rs:1296:        let coupling_scale = Self::storage(
+src/solvers/xpbd/mod.rs:1298:            "xpbd-coupling-scale",
+src/solvers/xpbd/mod.rs:1439:        // Params/Status/bindings + shared kernels; `water`/`bed`/`coupling`/`wetting` add the
+src/solvers/xpbd/mod.rs:1446:            include_str!("coupling.wgsl"),
+src/solvers/xpbd/mod.rs:1482:            compute_coupling_scale: make("compute_coupling_scale"),
+src/solvers/xpbd/mod.rs:1483:            drag_water: make("drag_water"),
+src/solvers/xpbd/mod.rs:1484:            drag_grain: make("drag_grain"),
+src/solvers/xpbd/mod.rs:1487:            apply_drag_pred: make("apply_drag_pred"),
+src/solvers/xpbd/mod.rs:1529:                    (14, &fluid_impulse),
+src/solvers/xpbd/mod.rs:1680:            compute_coupling_scale: bg(
+src/solvers/xpbd/mod.rs:1681:                &pipelines.compute_coupling_scale,
+src/solvers/xpbd/mod.rs:1689:                    (16, &coupling_scale),
+src/solvers/xpbd/mod.rs:1692:            drag_water: bg(
+src/solvers/xpbd/mod.rs:1693:                &pipelines.drag_water,
+src/solvers/xpbd/mod.rs:1701:                    (14, &fluid_impulse),
+src/solvers/xpbd/mod.rs:1703:                    (16, &coupling_scale),
+src/solvers/xpbd/mod.rs:1706:            drag_grain: bg(
+src/solvers/xpbd/mod.rs:1707:                &pipelines.drag_grain,
+src/solvers/xpbd/mod.rs:1715:                    (14, &fluid_impulse),
+src/solvers/xpbd/mod.rs:1717:                    (16, &coupling_scale),
+src/solvers/xpbd/mod.rs:1730:                    (14, &fluid_impulse),
+src/solvers/xpbd/mod.rs:1747:            apply_drag_pred: bg(
+src/solvers/xpbd/mod.rs:1748:                &pipelines.apply_drag_pred,
+src/solvers/xpbd/mod.rs:1907:                    (14, &fluid_impulse),
+src/solvers/xpbd/mod.rs:1927:            // (≈4 passes/iter) + coupling/finalize overhead; clamped to the query-set cap.
+src/solvers/xpbd/mod.rs:1929:            // Baseline covers coupling/finalize + the wetting/extraction/fines blocks (~8 passes
+src/solvers/xpbd/mod.rs:1978:            drag_subiters,
+src/solvers/xpbd/mod.rs:2060:        // (+ grain exclusion when mixed); grain runs the contact subcycle; mixed runs both, with
+src/solvers/xpbd/mod.rs:2197:                            // Grain exclusion (A.2), two-way: water out of grain bodies + reaction.
+src/solvers/xpbd/mod.rs:2227:                if mixed && self.drag_subiters > 0 {
+src/solvers/xpbd/mod.rs:2241:                        &p.compute_coupling_scale,
+src/solvers/xpbd/mod.rs:2242:                        &b.compute_coupling_scale,
+src/solvers/xpbd/mod.rs:2243:                        "compute_coupling_scale",
+src/solvers/xpbd/mod.rs:2246:                    for _ in 0..self.drag_subiters {
+src/solvers/xpbd/mod.rs:2254:                        pass(&mut enc, &p.drag_water, &b.drag_water, "drag_water", np);
+src/solvers/xpbd/mod.rs:2255:                        pass(&mut enc, &p.drag_grain, &b.drag_grain, "drag_grain", np);
+src/solvers/xpbd/mod.rs:2258:                            &p.apply_drag_pred,
+src/solvers/xpbd/mod.rs:2259:                            &b.apply_drag_pred,
+src/solvers/xpbd/mod.rs:2260:                            "apply_drag_pred",
+src/solvers/xpbd/mod.rs:2301:                        &p.apply_drag_pred,
+src/solvers/xpbd/mod.rs:2302:                        &b.apply_drag_pred,
+src/solvers/xpbd/mod.rs:2303:                        "apply_drag_pred",
+src/solvers/xpbd/coupling.wgsl:1:// Water/bed coupling (XPBD step 3, mechanical subset). Concatenated after common/water/bed.
+src/solvers/xpbd/coupling.wgsl:7://  2. grain exclusion (A.2) — a two-way geometric non-penetration between water and grain
+src/solvers/xpbd/coupling.wgsl:11://  3. implicit drag — symmetric frozen-velocity gathers using the Kozeny-Carman-resolved drag
+src/solvers/xpbd/coupling.wgsl:12://     rate in params.drag_gamma. The same pair scale is used by both phases, so each pair impulse
+src/solvers/xpbd/coupling.wgsl:59:        result = clamp(result + fines_dev, 0.0, 0.95); // 0.95 = 1 − φ_f_min (porosity_drag_factor)
+src/solvers/xpbd/coupling.wgsl:66:fn exclusion_push(xi: vec3<f32>, xj: vec3<f32>, w_self: f32) -> vec3<f32> {
+src/solvers/xpbd/coupling.wgsl:67:    let d_wg = params.water_grain_distance; // water–grain contact distance (< grain spacing ⇒ pores)
+src/solvers/xpbd/coupling.wgsl:78:    return params.exclusion_relax * (d_wg - r) * w_self * n;
+src/solvers/xpbd/coupling.wgsl:107:                    push = push + exclusion_push(xi, pred[j].xyz, m_g / (m_w + m_g));
+src/solvers/xpbd/coupling.wgsl:144:                    push = push + exclusion_push(xi, pred[j].xyz, m_w / (m_w + m_g));
+src/solvers/xpbd/coupling.wgsl:160:// Live-porosity drag (wetting only): the local drag rate scales with local permeability k(φ_f),
+src/solvers/xpbd/coupling.wgsl:161:// φ_f = 1−α_s, relative to the reference porosity the build-time rate was resolved at. The K-C
+src/solvers/xpbd/coupling.wgsl:162:// d²/180 cancels in the ratio, so this is a pure porosity factor. As the bed wets/swells, α_s↑ ⇒
+src/solvers/xpbd/coupling.wgsl:164:// porosity discontinuity — deferred.)
+src/solvers/xpbd/coupling.wgsl:165:const WET_REF_POROSITY: f32 = 0.40; // must match Materials.porosity (build-time drag resolution)
+src/solvers/xpbd/coupling.wgsl:166:fn porosity_drag_factor(a_s: f32) -> f32 {
+src/solvers/xpbd/coupling.wgsl:175:fn compute_coupling_scale(@builtin(global_invocation_id) gid: vec3<u32>) {
+src/solvers/xpbd/coupling.wgsl:180:    // Per-particle drag RATE: the local-porosity-modulated rate when wetting OR fines are active
+src/solvers/xpbd/coupling.wgsl:182:    // live-porosity gate so a no-wetting fines scene still drives drag from local permeability.
+src/solvers/xpbd/coupling.wgsl:183:    var rate_i = params.drag_gamma;
+src/solvers/xpbd/coupling.wgsl:185:        rate_i = params.drag_gamma * porosity_drag_factor(alpha_s[i]);
+src/solvers/xpbd/coupling.wgsl:213:    let cap_i = params.drag_beta_max / max(n, 1.0);
+src/solvers/xpbd/coupling.wgsl:215:        // Harmonic-k path: store the raw rate + the cap. drag_delta_for_pair forms the symmetric
+src/solvers/xpbd/coupling.wgsl:217:        coupling_scale[i] = vec2<f32>(rate_i, cap_i);
+src/solvers/xpbd/coupling.wgsl:219:        // Legacy/global path (byte-identical): capped β in .x; drag uses min(β_i, β_j) as before.
+src/solvers/xpbd/coupling.wgsl:220:        coupling_scale[i] = vec2<f32>(min(beta_from_rate(rate_i), cap_i), 0.0);
+src/solvers/xpbd/coupling.wgsl:224:fn drag_delta_for_pair(i: u32, j: u32, self_phase: u32) -> vec3<f32> {
+src/solvers/xpbd/coupling.wgsl:225:    let cs_i = coupling_scale[i];
+src/solvers/xpbd/coupling.wgsl:226:    let cs_j = coupling_scale[j];
+src/solvers/xpbd/coupling.wgsl:229:        // Harmonic mean of the per-particle permeabilities ⟺ arithmetic mean of their drag rates
+src/solvers/xpbd/coupling.wgsl:245:fn drag_water(@builtin(global_invocation_id) gid: vec3<u32>) {
+src/solvers/xpbd/coupling.wgsl:268:                    dv = dv + drag_delta_for_pair(i, j, PHASE_WATER);
+src/solvers/xpbd/coupling.wgsl:275:    fluid_impulse[i] = fluid_impulse[i]; // keep drag_water's auto-layout at the shared 8 buffers
+src/solvers/xpbd/coupling.wgsl:279:fn drag_grain(@builtin(global_invocation_id) gid: vec3<u32>) {
+src/solvers/xpbd/coupling.wgsl:302:                    dv = dv + drag_delta_for_pair(i, j, PHASE_GRAIN);
+src/solvers/xpbd/coupling.wgsl:309:    fluid_impulse[i] = fluid_impulse[i] + params.grain_mass * length(dv);
+src/solvers/xpbd/coupling.wgsl:351:    let dv = grain_buoyancy_factor(pred[i].w) * impulse / m_g;
+src/solvers/xpbd/coupling.wgsl:353:    fluid_impulse[i] = fluid_impulse[i] + m_g * length(dv);
+src/solvers/xpbd/coupling.wgsl:385:                    impulse = impulse + grain_buoyancy_factor(pred[j].w) * params.buoyancy_scale *
+src/solvers/xpbd/coupling.wgsl:398:fn apply_drag_pred(@builtin(global_invocation_id) gid: vec3<u32>) {
+src/solvers/xpbd/coupling.wgsl:404:    // the drag micro-step needs neither pos nor the floor_mu machinery). No-op when num_solids == 0.
+src/solvers/xpbd/coupling.wgsl:413:    // Preserve the moisture snapshot in pred.w — this runs in the drag/buoyancy subcycle before
+src/solvers/xpbd/extraction.wgsl:1:// Extraction (XPBD step 5, Phase 1.5). Concatenated after common/water/bed/coupling/wetting.
+src/solvers/xpbd/common.wgsl:15:struct Params {
+src/solvers/xpbd/common.wgsl:50:    // --- water/bed coupling (mixed scenes) ---
+src/solvers/xpbd/common.wgsl:54:    exclusion_relax: f32,     // under-relaxation on the A.2 correction
+src/solvers/xpbd/common.wgsl:55:    drag_gamma: f32,
+src/solvers/xpbd/common.wgsl:56:    drag_beta_max: f32,
+src/solvers/xpbd/common.wgsl:59:    water_grain_distance: f32, // water↔grain exclusion contact (≤ grain spacing lets water thread pores)
+src/solvers/xpbd/common.wgsl:122:// the pore fraction (drainage-ready), and the geometric exclusion keeps water out of grain bodies.
+src/solvers/xpbd/common.wgsl:124:// Per-grain accumulated |water↔grain drag impulse| this frame; it wakes the static dead-band
+src/solvers/xpbd/common.wgsl:125:// under fluid load. Reset in predict, written by drag_grain, read in finalize.
+src/solvers/xpbd/common.wgsl:126:@group(0) @binding(14) var<storage, read_write> fluid_impulse: array<f32>;
+src/solvers/xpbd/common.wgsl:127:// Frozen velocity snapshot for symmetric water↔grain drag gathers. Both drag passes read the
+src/solvers/xpbd/common.wgsl:130:// Per-particle drag blend cap computed from the opposite-phase neighbor count.
+src/solvers/xpbd/common.wgsl:131:// Per-particle drag pairing data. Legacy/global path: (.x = capped β, .y = unused). Harmonic-k path
+src/solvers/xpbd/common.wgsl:132:// (fines active): (.x = raw drag rate ∝ 1/k_local, .y = anti-overshoot cap) — drag_delta_for_pair
+src/solvers/xpbd/common.wgsl:134:@group(0) @binding(16) var<storage, read_write> coupling_scale: array<vec2<f32>>;
+src/solvers/xpbd/common.wgsl:143:// < 0 through the wall. Only the collision passes (apply_dp / apply_drag_pred) reach `solid_union`,
+src/solvers/xpbd/common.wgsl:396:fn grain_buoyancy_factor(v_abs: f32) -> f32 {
+src/solvers/xpbd/common.wgsl:441:    fluid_impulse[i] = 0.0; // reset the per-frame water↔grain wake signal
+src/solvers/xpbd/common.wgsl:659:        if (fluid_impulse[i] <= params.wake_threshold && length(v) < params.grain_sleep_speed) {
+src/models/mod.rs:36:    /// Water↔grain exclusion contact distance. Defaults to `grain_diameter` (water rests on the
+src/models/mod.rs:39:    pub water_grain_distance: f32,
+src/models/mod.rs:49:    // --- coupling (water ↔ bed) ---
+src/models/mod.rs:52:    /// Bed porosity φ (pore/fluid volume fraction of a packed bed) — the Kozeny–Carman input.
+src/models/mod.rs:53:    pub porosity: f32,
+src/models/mod.rs:117:            water_grain_distance: 1.0, // = grain_diameter: water rests on the bed (override for porous flow)
+src/models/mod.rs:123:            // bed porosity (KEEP.md §1).
+src/models/mod.rs:125:            porosity: 0.40,
+src/models/cohesion.rs:6://! §1 (porosity 0.40, grind ≈ 450 µm) / §5 (dry-bed settle bands).
+src/utils/config.rs:68:    // --- water/bed coupling (mixed scenes) ---
+src/utils/config.rs:71:    /// Under-relaxation on the grain-exclusion position correction (A.2).
+src/utils/config.rs:72:    pub exclusion_relax: f32,
+src/utils/config.rs:73:    /// Drag rate scale: `γ = drag_gamma / k` (Kozeny–Carman k); higher = stiffer drag. (step 2)
+src/utils/config.rs:74:    pub drag_gamma: f32,
+src/utils/config.rs:75:    /// Per-particle accumulated-drag-blend cap `β_max < 1` (anti-overshoot). (step 2)
+src/utils/config.rs:76:    pub drag_beta_max: f32,
+src/utils/config.rs:77:    /// Drag Jacobi sub-iterations per frame. 0 disables drag. (step 2)
+src/utils/config.rs:78:    pub drag_subiters: u32,
+src/utils/config.rs:162:            // Coupling: drag_gamma is a scale resolved through Kozeny-Carman at solver build.
+src/utils/config.rs:164:            exclusion_relax: 0.5,
+src/utils/config.rs:165:            drag_gamma: 0.02,
+src/utils/config.rs:166:            drag_beta_max: 0.8,
+src/utils/config.rs:167:            drag_subiters: 4,
+src/utils/config.rs:170:            // Wetting OFF by default (like drag_subiters=0): scenes opt in with absorb_rate>0 until
+
+codex
+The current code confirms the plan’s assumptions about `vel_frozen`, `coupling_scale`, explicit exclusion passes, and tight bind-group pressure. I’m reading the drag and water-density kernels now, because most remaining risk is in whether the proposed math can be implemented without hidden conservation or normalization errors.
+exec
+/bin/zsh -lc "sed -n '1,260p' src/solvers/xpbd/coupling.wgsl" in /Users/cxc/Github/coffee-sim
+ succeeded in 0ms:
+// Water/bed coupling (XPBD step 3, mechanical subset). Concatenated after common/water/bed.
+//
+// Two mechanisms, both active only in mixed (water+grain) scenes:
+//  1. compute_fractions — per-particle solid fraction α_s = Σ_grain V_g W (clamped to the packing
+//     limit). The water density solve (water.wgsl) reads it and targets ρ₀·(1−α_s), so pore water
+//     packs to the pore fraction (drainage-ready) instead of full ρ₀ (which would be expelled).
+//  2. grain exclusion (A.2) — a two-way geometric non-penetration between water and grain
+//     particles: water can't pass through grain bodies, so it rests on / sits in the bed. Run as a
+//     symmetric pair of gathers (exclude_water + exclude_grain) reading the same predicted
+//     positions, with opposite-mass weights → momentum-conserving without float atomics.
+//  3. implicit drag — symmetric frozen-velocity gathers using the Kozeny-Carman-resolved drag
+//     rate in params.drag_gamma. The same pair scale is used by both phases, so each pair impulse
+//     is equal-and-opposite to float tolerance.
+//  4. buoyancy / pressure-gradient lift — symmetric gathers over the converged water λ field.
+//     PBF λ is non-positive under compression in this solver, so pressure is −λ. The grain pass
+//     applies +J/m_g and the water pass applies −J/m_w for the same pair, avoiding float atomics.
+
+@compute @workgroup_size(256)
+fn compute_fractions(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= params.particle_count) { return; }
+    let h = params.h;
+    let xi = pred[i].xyz;
+    var a_s = 0.0;
+    var fines_dev = 0.0; // Σ_j (lodged fines − uniform baseline)·W from grain neighbors (Phase 6)
+    let base = cell_coord(xi);
+    for (var dz = -1; dz <= 1; dz = dz + 1) {
+        for (var dy = -1; dy <= 1; dy = dy + 1) {
+            for (var dx = -1; dx <= 1; dx = dx + 1) {
+                let nc = base + vec3<i32>(dx, dy, dz);
+                if (nc.x < 0 || nc.y < 0 || nc.z < 0) { continue; }
+                let dims = vec3<i32>(params.grid_dims.xyz);
+                if (nc.x >= dims.x || nc.y >= dims.y || nc.z >= dims.z) { continue; }
+                let cid = cell_id(nc);
+                let lo = cell_start[cid];
+                let hi = cell_start[cid + 1u];
+                for (var s = lo; s < hi; s = s + 1u) {
+                    let j = sorted_indices[s];
+                    if (j == i) { continue; }
+                    if (phase[j] != PHASE_GRAIN) { continue; } // solid fraction from grains only
+                    let r = length(xi - pred[j].xyz);
+                    if (r >= h) { continue; }
+                    // Swollen grains occupy more space: use the effective volume V_eff = V_dry + V_abs
+                    // (grain pred.w = V_abs). Dry grains (V_abs=0) ⇒ params.grain_volume, unchanged.
+                    let w = w_poly6(r, h);
+                    a_s = a_s + grain_eff_volume(pred[j].w) * w;
+                    // Migration-induced fines deviation from the seeded baseline (grain chem.w).
+                    fines_dev = fines_dev + (chem[j].w - params.fines.y) * w;
+                }
+            }
+        }
+    }
+    // Grain-skeleton packing clamp first, then the fines pore-clogging deviation ON TOP (KTD-2):
+    // lodged fines fill the pore space the packing limit leaves open, so accumulation can push α_s
+    // above packing_limit (toward the φ_f floor) while erosion opens channels. Baseline-relative, so
+    // fines_rate=0 leaves α_s exactly min(a_s, packing_limit) — byte-unchanged.
+    var result = min(a_s, params.packing_limit);
+    if (params.fines.x > 0.0) {
+        result = clamp(result + fines_dev, 0.0, 0.95); // 0.95 = 1 − φ_f_min (porosity_drag_factor)
+    }
+    alpha_s[i] = result;
+}
+
+// Water↔grain contact separation for one pair, opposite-mass weighted. Both passes call this with
+// the same (xi, xj) so the pair impulse is identical and conservation holds (to float tolerance).
+fn exclusion_push(xi: vec3<f32>, xj: vec3<f32>, w_self: f32) -> vec3<f32> {
+    let d_wg = params.water_grain_distance; // water–grain contact distance (< grain spacing ⇒ pores)
+    let dvec = xi - xj;
+    var r = length(dvec);
+    if (r >= d_wg) { return vec3<f32>(0.0); }
+    var n: vec3<f32>;
+    if (r < 1e-6) {
+        n = vec3<f32>(0.0, 1.0, 0.0); // coincident → push apart vertically (deterministic)
+        r = 1e-6;
+    } else {
+        n = dvec / r;
+    }
+    return params.exclusion_relax * (d_wg - r) * w_self * n;
+}
+
+@compute @workgroup_size(256)
+fn exclude_water(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= params.particle_count) { return; }
+    if (status.converged != 0u) { return; }
+    if (phase[i] != PHASE_WATER) { return; }
+    // Effective masses (swelling): heavier wet grains / lighter shrunk water shift the split. Dry
+    // (V_abs=0, f_w=1) ⇒ the original particle_mass/grain_mass split. w_self computed per neighbor.
+    let m_w = water_eff_mass(pred[i].w);
+    let xi = pred[i].xyz;
+    var push = vec3<f32>(0.0);
+    let base = cell_coord(xi);
+    for (var dz = -1; dz <= 1; dz = dz + 1) {
+        for (var dy = -1; dy <= 1; dy = dy + 1) {
+            for (var dx = -1; dx <= 1; dx = dx + 1) {
+                let nc = base + vec3<i32>(dx, dy, dz);
+                if (nc.x < 0 || nc.y < 0 || nc.z < 0) { continue; }
+                let dims = vec3<i32>(params.grid_dims.xyz);
+                if (nc.x >= dims.x || nc.y >= dims.y || nc.z >= dims.z) { continue; }
+                let cid = cell_id(nc);
+                let lo = cell_start[cid];
+                let hi = cell_start[cid + 1u];
+                for (var s = lo; s < hi; s = s + 1u) {
+                    let j = sorted_indices[s];
+                    if (phase[j] != PHASE_GRAIN) { continue; }
+                    let m_g = grain_eff_mass(pred[j].w);
+                    push = push + exclusion_push(xi, pred[j].xyz, m_g / (m_w + m_g));
+                }
+            }
+        }
+    }
+    // Add onto the water density Δp already in dp (compute_dp wrote it this iteration).
+    dp[i] = dp[i] + vec4<f32>(push, 0.0);
+}
+
+@compute @workgroup_size(256)
+fn exclude_grain(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= params.particle_count) { return; }
+    if (status.converged != 0u) { return; }
+    if (phase[i] != PHASE_GRAIN) { return; }
+    // Effective masses (swelling), mirror of exclude_water. Same per-pair m_w/m_g read from pred.w on
+    // both sides ⇒ the antisymmetric correction still conserves momentum exactly.
+    let m_g = grain_eff_mass(pred[i].w);
+    let xi = pred[i].xyz;
+    var push = vec3<f32>(0.0);
+    let base = cell_coord(xi);
+    for (var dz = -1; dz <= 1; dz = dz + 1) {
+        for (var dy = -1; dy <= 1; dy = dy + 1) {
+            for (var dx = -1; dx <= 1; dx = dx + 1) {
+                let nc = base + vec3<i32>(dx, dy, dz);
+                if (nc.x < 0 || nc.y < 0 || nc.z < 0) { continue; }
+                let dims = vec3<i32>(params.grid_dims.xyz);
+                if (nc.x >= dims.x || nc.y >= dims.y || nc.z >= dims.z) { continue; }
+                let cid = cell_id(nc);
+                let lo = cell_start[cid];
+                let hi = cell_start[cid + 1u];
+                for (var s = lo; s < hi; s = s + 1u) {
+                    let j = sorted_indices[s];
+                    if (phase[j] != PHASE_WATER) { continue; }
+                    // Mirror of the water-side push for this pair (swapped args give −n); grain's
+                    // opposite-mass weight m_w/(m_w+m_g) → exact pair antisymmetry.
+                    let m_w = water_eff_mass(pred[j].w);
+                    push = push + exclusion_push(xi, pred[j].xyz, m_w / (m_w + m_g));
+                }
+            }
+        }
+    }
+    // Grains get no water-density Δp (compute_dp skips them), so SET dp here (the bed contact
+    // subcycle that follows will overwrite it again). Always write, so a grain with no water
+    // neighbors gets dp=0 rather than a stale value.
+    dp[i] = vec4<f32>(push, 0.0);
+}
+
+fn beta_from_rate(rate: f32) -> f32 {
+    let x = max(rate * params.dt, 0.0);
+    return x / (1.0 + x); // implicit: rate→∞ ⇒ β→1 (no overshoot); bounds rate·dt
+}
+
+// Live-porosity drag (wetting only): the local drag rate scales with local permeability k(φ_f),
+// φ_f = 1−α_s, relative to the reference porosity the build-time rate was resolved at. The K-C
+// d²/180 cancels in the ratio, so this is a pure porosity factor. As the bed wets/swells, α_s↑ ⇒
+// φ_f↓ ⇒ k↓ ⇒ rate↑ ⇒ drainage slows. (Bulk-correct; a harmonic-k pair blend would be sharper at a
+// porosity discontinuity — deferred.)
+const WET_REF_POROSITY: f32 = 0.40; // must match Materials.porosity (build-time drag resolution)
+fn porosity_drag_factor(a_s: f32) -> f32 {
+    let phi = clamp(1.0 - a_s, 0.05, 0.999); // clamp away from 0 (K-C diverges)
+    let pr = WET_REF_POROSITY;
+    let num = pr * pr * pr * (1.0 - phi) * (1.0 - phi);
+    let den = phi * phi * phi * (1.0 - pr) * (1.0 - pr);
+    return num / max(den, 1.0e-12); // k_ref / k_local
+}
+
+@compute @workgroup_size(256)
+fn compute_coupling_scale(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= params.particle_count) { return; }
+    let ph_i = phase[i];
+    let xi = pred[i].xyz;
+    // Per-particle drag RATE: the local-porosity-modulated rate when wetting OR fines are active
+    // (both change local k via α_s), else the global rate. The fines clause extends the
+    // live-porosity gate so a no-wetting fines scene still drives drag from local permeability.
+    var rate_i = params.drag_gamma;
+    if (params.k_abs > 0.0 || params.fines.x > 0.0) {
+        rate_i = params.drag_gamma * porosity_drag_factor(alpha_s[i]);
+    }
+    var n = 0.0;
+
+    let base = cell_coord(xi);
+    for (var dz = -1; dz <= 1; dz = dz + 1) {
+        for (var dy = -1; dy <= 1; dy = dy + 1) {
+            for (var dx = -1; dx <= 1; dx = dx + 1) {
+                let nc = base + vec3<i32>(dx, dy, dz);
+                if (nc.x < 0 || nc.y < 0 || nc.z < 0) { continue; }
+                let dims = vec3<i32>(params.grid_dims.xyz);
+                if (nc.x >= dims.x || nc.y >= dims.y || nc.z >= dims.z) { continue; }
+                let cid = cell_id(nc);
+                let lo = cell_start[cid];
+                let hi = cell_start[cid + 1u];
+                for (var s = lo; s < hi; s = s + 1u) {
+                    let j = sorted_indices[s];
+                    if (j == i) { continue; }
+                    if (phase[j] == ph_i) { continue; }
+                    let r = length(xi - pred[j].xyz);
+                    if (r >= params.h) { continue; }
+                    n = n + 1.0;
+                }
+            }
+        }
+    }
+
+    // Cap so Σ_j s ≤ β_max (anti-overshoot): each pair scale ≤ β_max/N.
+    let cap_i = params.drag_beta_max / max(n, 1.0);
+    if (params.fines.x > 0.0) {
+        // Harmonic-k path: store the raw rate + the cap. drag_delta_for_pair forms the symmetric
+        // harmonic-mean-k pair scale (= arithmetic mean of rates, since rate ∝ 1/k) and caps it.
+        coupling_scale[i] = vec2<f32>(rate_i, cap_i);
+    } else {
+        // Legacy/global path (byte-identical): capped β in .x; drag uses min(β_i, β_j) as before.
+        coupling_scale[i] = vec2<f32>(min(beta_from_rate(rate_i), cap_i), 0.0);
+    }
+}
+
+fn drag_delta_for_pair(i: u32, j: u32, self_phase: u32) -> vec3<f32> {
+    let cs_i = coupling_scale[i];
+    let cs_j = coupling_scale[j];
+    var s: f32;
+    if (params.fines.x > 0.0) {
+        // Harmonic mean of the per-particle permeabilities ⟺ arithmetic mean of their drag rates
+        // (rate ∝ 1/k) — dominated by the lower-k / higher-resistance side, so a clog barrier holds
+        // at its edge instead of leaking (min(rate) would pick the clear side). Symmetric in (i,j),
+        // so the pair impulse stays equal-and-opposite (momentum conserved).
+        let rate_pair = 0.5 * (cs_i.x + cs_j.x);
+        s = min(beta_from_rate(rate_pair), min(cs_i.y, cs_j.y));
+    } else {
+        s = min(cs_i.x, cs_j.x); // legacy/global: min of capped betas (byte-identical)
+    }
+    // Effective masses (swelling) keep momentum conserved.
+    let m_i = eff_mass(self_phase, pred[i].w);
+    let m_j = eff_mass(phase[j], pred[j].w);
+    return s * (m_j / (m_i + m_j)) * (vel_frozen[j].xyz - vel_frozen[i].xyz);
+}
+
+@compute @workgroup_size(256)
+fn drag_water(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= params.particle_count) { return; }
+    if (phase[i] != PHASE_WATER) { return; }
+    let xi = pred[i].xyz;
+    var dv = vec3<f32>(0.0);
+
+    let base = cell_coord(xi);
+    for (var dz = -1; dz <= 1; dz = dz + 1) {
+        for (var dy = -1; dy <= 1; dy = dy + 1) {
+            for (var dx = -1; dx <= 1; dx = dx + 1) {
+                let nc = base + vec3<i32>(dx, dy, dz);
+                if (nc.x < 0 || nc.y < 0 || nc.z < 0) { continue; }
+                let dims = vec3<i32>(params.grid_dims.xyz);
+                if (nc.x >= dims.x || nc.y >= dims.y || nc.z >= dims.z) { continue; }
+                let cid = cell_id(nc);
+
+exec
+/bin/zsh -lc "sed -n '260,430p' src/solvers/xpbd/coupling.wgsl" in /Users/cxc/Github/coffee-sim
+exec
+/bin/zsh -lc "sed -n '30,190p' src/solvers/xpbd/water.wgsl" in /Users/cxc/Github/coffee-sim
+ succeeded in 0ms:
+                let cid = cell_id(nc);
+                let lo = cell_start[cid];
+                let hi = cell_start[cid + 1u];
+                for (var s = lo; s < hi; s = s + 1u) {
+                    let j = sorted_indices[s];
+                    if (phase[j] != PHASE_GRAIN) { continue; }
+                    let r = length(xi - pred[j].xyz);
+                    if (r >= params.h) { continue; }
+                    dv = dv + drag_delta_for_pair(i, j, PHASE_WATER);
+                }
+            }
+        }
+    }
+
+    vel[i] = vec4<f32>(vel_frozen[i].xyz + dv, 0.0);
+    fluid_impulse[i] = fluid_impulse[i]; // keep drag_water's auto-layout at the shared 8 buffers
+}
+
+@compute @workgroup_size(256)
+fn drag_grain(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= params.particle_count) { return; }
+    if (phase[i] != PHASE_GRAIN) { return; }
+    let xi = pred[i].xyz;
+    var dv = vec3<f32>(0.0);
+
+    let base = cell_coord(xi);
+    for (var dz = -1; dz <= 1; dz = dz + 1) {
+        for (var dy = -1; dy <= 1; dy = dy + 1) {
+            for (var dx = -1; dx <= 1; dx = dx + 1) {
+                let nc = base + vec3<i32>(dx, dy, dz);
+                if (nc.x < 0 || nc.y < 0 || nc.z < 0) { continue; }
+                let dims = vec3<i32>(params.grid_dims.xyz);
+                if (nc.x >= dims.x || nc.y >= dims.y || nc.z >= dims.z) { continue; }
+                let cid = cell_id(nc);
+                let lo = cell_start[cid];
+                let hi = cell_start[cid + 1u];
+                for (var s = lo; s < hi; s = s + 1u) {
+                    let j = sorted_indices[s];
+                    if (phase[j] != PHASE_WATER) { continue; }
+                    let r = length(xi - pred[j].xyz);
+                    if (r >= params.h) { continue; }
+                    dv = dv + drag_delta_for_pair(i, j, PHASE_GRAIN);
+                }
+            }
+        }
+    }
+
+    vel[i] = vec4<f32>(vel_frozen[i].xyz + dv, 0.0);
+    fluid_impulse[i] = fluid_impulse[i] + params.grain_mass * length(dv);
+}
+
+fn pressure_for_water(i: u32) -> f32 {
+    return max(-lambda[i], 0.0);
+}
+
+@compute @workgroup_size(256)
+fn buoyancy_grain(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= params.particle_count) { return; }
+    if (phase[i] != PHASE_GRAIN) { return; }
+    let xi = pred[i].xyz;
+    var impulse = vec3<f32>(0.0);
+
+    let base = cell_coord(xi);
+    for (var dz = -1; dz <= 1; dz = dz + 1) {
+        for (var dy = -1; dy <= 1; dy = dy + 1) {
+            for (var dx = -1; dx <= 1; dx = dx + 1) {
+                let nc = base + vec3<i32>(dx, dy, dz);
+                if (nc.x < 0 || nc.y < 0 || nc.z < 0) { continue; }
+                let dims = vec3<i32>(params.grid_dims.xyz);
+                if (nc.x >= dims.x || nc.y >= dims.y || nc.z >= dims.z) { continue; }
+                let cid = cell_id(nc);
+                let lo = cell_start[cid];
+                let hi = cell_start[cid + 1u];
+                for (var s = lo; s < hi; s = s + 1u) {
+                    let j = sorted_indices[s];
+                    if (phase[j] != PHASE_WATER) { continue; }
+                    let d = xi - pred[j].xyz;
+                    let r = length(d);
+                    if (r >= params.h) { continue; }
+                    impulse = impulse + params.buoyancy_scale * pressure_for_water(j) *
+                        spiky_grad(d, params.h, params.spiky_r_min);
+                }
+            }
+        }
+    }
+
+    let m_g = grain_eff_mass(pred[i].w); // swelling: heavier wet grain accelerates less
+    // Density-aware: a denser-than-water grain is buoyed less (sinks); same factor on the water side
+    // (per pair) keeps momentum conserved. Uniform over this grain's pairs, so scale the total.
+    let dv = grain_buoyancy_factor(pred[i].w) * impulse / m_g;
+    vel[i] = vec4<f32>(vel_frozen[i].xyz + dv, 0.0);
+    fluid_impulse[i] = fluid_impulse[i] + m_g * length(dv);
+}
+
+@compute @workgroup_size(256)
+fn buoyancy_water(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= params.particle_count) { return; }
+    if (phase[i] != PHASE_WATER) { return; }
+    let xi = pred[i].xyz;
+    let pressure = pressure_for_water(i);
+    var impulse = vec3<f32>(0.0);
+
+    let base = cell_coord(xi);
+    for (var dz = -1; dz <= 1; dz = dz + 1) {
+        for (var dy = -1; dy <= 1; dy = dy + 1) {
+            for (var dx = -1; dx <= 1; dx = dx + 1) {
+                let nc = base + vec3<i32>(dx, dy, dz);
+                if (nc.x < 0 || nc.y < 0 || nc.z < 0) { continue; }
+                let dims = vec3<i32>(params.grid_dims.xyz);
+                if (nc.x >= dims.x || nc.y >= dims.y || nc.z >= dims.z) { continue; }
+                let cid = cell_id(nc);
+                let lo = cell_start[cid];
+                let hi = cell_start[cid + 1u];
+                for (var s = lo; s < hi; s = s + 1u) {
+                    let j = sorted_indices[s];
+                    if (phase[j] != PHASE_GRAIN) { continue; }
+                    let d = xi - pred[j].xyz;
+                    let r = length(d);
+                    if (r >= params.h) { continue; }
+                    // Grain pass pair: J_gw = s*p_w*∇W(x_g − x_w). Here d = x_w − x_g, so
+                    // ∇W(d) = −∇W(x_g − x_w), making this exactly −J_gw for the same pair. The grain's
+                    // density factor matches the grain-pass scaling → equal-and-opposite per pair.
+                    impulse = impulse + grain_buoyancy_factor(pred[j].w) * params.buoyancy_scale *
+                        pressure * spiky_grad(d, params.h, params.spiky_r_min);
+                }
+            }
+        }
+    }
+
+    // Effective water mass, floored so a near-empty (absorbed) particle can't blow up the divide.
+    let m_w = max(water_eff_mass(pred[i].w), params.particle_mass * params.pbf_eps);
+    vel[i] = vec4<f32>(vel_frozen[i].xyz + impulse / m_w, 0.0);
+}
+
+@compute @workgroup_size(256)
+fn apply_drag_pred(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= params.particle_count) { return; }
+    let dv = vel[i].xyz - vel_frozen[i].xyz;
+    var p = pred[i].xyz + params.dt * dv;
+    // Static-solid push-out (push-out + species gate only; friction is owned by apply_dp/finalize, so
+    // the drag micro-step needs neither pos nor the floor_mu machinery). No-op when num_solids == 0.
+    if (params.num_solids > 0u) {
+        let hit = solid_union(p, phase[i]);
+        // Water projects to the surface (offset 0, dissipative); grains keep a radius standoff.
+        let contact = select(0.0, 0.5 * params.grain_diameter, phase[i] == PHASE_GRAIN);
+        if (hit.dist < contact) {
+            p = p + (contact - hit.dist) * hit.grad;
+        }
+    }
+    // Preserve the moisture snapshot in pred.w — this runs in the drag/buoyancy subcycle before
+    // absorption, so zeroing .w here would wipe the per-frame snapshot the wetting passes read.
+    pred[i] = vec4<f32>(clamp(p, params.box_min.xyz, params.box_max.xyz), pred[i].w);
+}
+
+ succeeded in 0ms:
+fn compute_lambda(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= params.particle_count) { return; }
+    if (status.converged != 0u) { return; }
+    if (phase[i] != PHASE_WATER) { return; } // grains have no density constraint
+    let h = params.h;
+    let m = params.particle_mass;
+    let xi = pred[i].xyz;
+    // Wetting: water carries a remaining-volume fraction f_w in pred.w. A near-empty particle is
+    // skipped (inert), and every water contributes its f_w-weighted mass — so the density solve
+    // matches the actual fluid at the wet front. f_w≡1 (no absorption) ⇒ identical to before.
+    let f_i = pred[i].w;
+    if (f_i <= params.pbf_eps) {
+        lambda[i] = 0.0;
+        c_residual[i] = 0.0;
+        return;
+    }
+
+    var rho = m * f_i * w_poly6(0.0, h);
+    var sum_g = vec3<f32>(0.0);
+    var sum_g2 = 0.0;
+
+    let base = cell_coord(xi);
+    for (var dz = -1; dz <= 1; dz = dz + 1) {
+        for (var dy = -1; dy <= 1; dy = dy + 1) {
+            for (var dx = -1; dx <= 1; dx = dx + 1) {
+                let nc = base + vec3<i32>(dx, dy, dz);
+                if (nc.x < 0 || nc.y < 0 || nc.z < 0) { continue; }
+                let dims = vec3<i32>(params.grid_dims.xyz);
+                if (nc.x >= dims.x || nc.y >= dims.y || nc.z >= dims.z) { continue; }
+                let cid = cell_id(nc);
+                let lo = cell_start[cid];
+                let hi = cell_start[cid + 1u];
+                for (var s = lo; s < hi; s = s + 1u) {
+                    let j = sorted_indices[s];
+                    if (j == i) { continue; }
+                    if (phase[j] != PHASE_WATER) { continue; } // skip grain neighbors
+                    let fj = pred[j].w;
+                    if (fj <= params.pbf_eps) { continue; } // skip near-empty (absorbed) water
+                    let d = xi - pred[j].xyz;
+                    let r = length(d);
+                    if (r >= h) { continue; }
+                    rho = rho + m * fj * w_poly6(r, h);
+                    let gj = m * fj * spiky_grad(d, h, params.spiky_r_min);
+                    sum_g = sum_g + gj;
+                    sum_g2 = sum_g2 + dot(gj, gj);
+                }
+            }
+        }
+    }
+
+    // Boundary (wall) density compensation: a near-wall particle's kernel is partly cut off by the
+    // solid, so the fluid-only sum above under-reads — strongest at the cup's floor/side corner,
+    // where the deficit hid genuine over-packing and let it accumulate into squeeze-out eruptions.
+    // The cut-off fraction ρ₀·f_i·ψ(d) was precomputed by `compute_boundary` into c_residual (a
+    // scratch handoff — compute_lambda needs `solids`, but is already at the 8-storage-buffer limit,
+    // so a separate pass that CAN bind `solids` stages the value here). Overwritten with the real
+    // residual at the end of this kernel. Solid scenes only; AABB-only scenes never dispatch the
+    // boundary pass, so c_residual is untouched and this term is skipped (byte-unchanged).
+    if (params.num_solids > 0u) {
+        rho = rho + c_residual[i];
+    }
+
+    // Pore-modulated rest density: where grains are present the water target is ρ₀·(1−α_s), so
+    // pore water packs to fill only the pore fraction (α_s+α_f=1) instead of full ρ₀ — which would
+    // over-fill and get expelled. α_s=0 (single-species water) → unmodulated ρ₀ (identical).
+    let pore = max(1.0 - alpha_s[i], 0.05);
+    let inv_rho0 = 1.0 / (params.rest_density * pore);
+    let c = rho * inv_rho0 - 1.0;
+    let denom = (dot(sum_g, sum_g) + sum_g2) * inv_rho0 * inv_rho0 + params.relaxation_eps;
+    var lam = -c / denom;
+    if (params.lambda_noncohesive != 0u && lam > 0.0) {
+        lam = 0.0;
+    }
+    lambda[i] = lam;
+    // Convergence is measured on COMPRESSION only: free-surface particles always have
+    // c ≈ −1 (density deficit), which incompressibility neither can nor should fix, so
+    // including them would prevent early-exit forever. max(0, c) = over-density violation.
+    c_residual[i] = max(0.0, c);
+}
+
+var<workgroup> sdata: array<f32, 256>;
+
+@compute @workgroup_size(256)
+fn residual_reduce(@builtin(local_invocation_id) lid: vec3<u32>) {
+    // No early `return` on status.converged here: a return gated on a read_write storage read is
+    // non-uniform control flow, and the workgroupBarrier()s below must be reached uniformly by every
+    // invocation (WGSL spec). The browser's Tint compiler rejects the early-out — failing the whole
+    // module — while native naga tolerates it. Instead we always run the (single-workgroup, cheap)
+    // reduction and gate only the bookkeeping write, which leaves `status` untouched once converged —
+    // observably identical to the early-out, and valid uniform control flow on both compilers.
+    let tid = lid.x;
+    var local_max = 0.0;
+    var i = tid;
+    loop {
+        if (i >= params.particle_count) { break; }
+        local_max = max(local_max, c_residual[i]);
+        i = i + 256u;
+    }
+    sdata[tid] = local_max;
+    workgroupBarrier();
+    var stride = 128u;
+    loop {
+        if (stride == 0u) { break; }
+        if (tid < stride) {
+            sdata[tid] = max(sdata[tid], sdata[tid + stride]);
+        }
+        workgroupBarrier();
+        stride = stride / 2u;
+    }
+    if (tid == 0u && status.converged == 0u) {
+        let gmax = sdata[0];
+        status.residual_bits = bitcast<u32>(gmax);
+        status.iters_done = status.iters_done + 1u;
+        if (status.iters_done >= params.min_iters && gmax < params.residual_tolerance) {
+            status.converged = 1u;
+            status.effective_iters = status.iters_done;
+        }
+    }
+}
+
+@compute @workgroup_size(256)
+fn compute_dp(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= params.particle_count) { return; }
+    if (status.converged != 0u) { return; }
+    if (phase[i] != PHASE_WATER) { return; } // grains are projected by bed_project
+    let h = params.h;
+    let m = params.particle_mass;
+    let xi = pred[i].xyz;
+    let lam_i = lambda[i];
+    // Skip near-empty (absorbed) water; weight neighbor contributions by their f_w (pred.w) to match
+    // compute_lambda. f_w≡1 (no absorption) ⇒ identical to before.
+    if (pred[i].w <= params.pbf_eps) {
+        dp[i] = vec4<f32>(0.0);
+        return;
+    }
+
+    var sum = vec3<f32>(0.0);
+    let base = cell_coord(xi);
+    for (var dz = -1; dz <= 1; dz = dz + 1) {
+        for (var dy = -1; dy <= 1; dy = dy + 1) {
+            for (var dx = -1; dx <= 1; dx = dx + 1) {
+                let nc = base + vec3<i32>(dx, dy, dz);
+                if (nc.x < 0 || nc.y < 0 || nc.z < 0) { continue; }
+                let dims = vec3<i32>(params.grid_dims.xyz);
+                if (nc.x >= dims.x || nc.y >= dims.y || nc.z >= dims.z) { continue; }
+                let cid = cell_id(nc);
+                let lo = cell_start[cid];
+                let hi = cell_start[cid + 1u];
+                for (var s = lo; s < hi; s = s + 1u) {
+                    let j = sorted_indices[s];
+                    if (j == i) { continue; }
+                    if (phase[j] != PHASE_WATER) { continue; } // skip grain neighbors
+                    let fj = pred[j].w;
+                    if (fj <= params.pbf_eps) { continue; } // skip near-empty (absorbed) water
+                    let d = xi - pred[j].xyz;
+                    let r = length(d);
+                    if (r >= h) { continue; }
+                    let wr = w_poly6(r, h);
+                    let ratio = wr / params.s_corr_wq;
+
+exec
+/bin/zsh -lc "sed -n '630,675p' src/solvers/xpbd/common.wgsl" in /Users/cxc/Github/coffee-sim
+ succeeded in 0ms:
+                }
+            }
+            newp = clamp(newp, params.box_min.xyz, params.box_max.xyz);
+        }
+        pred[i] = vec4<f32>(newp, pred[i].w); // preserve the moisture snapshot in pred.w
+    } else {
+        pred[i] = vec4<f32>(clamped, pred[i].w); // preserve the moisture snapshot in pred.w
+    }
+}
+
+@compute @workgroup_size(256)
+fn finalize(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= params.particle_count) { return; }
+    let xi = pred[i].xyz;
+    var v = ((xi - pos[i].xyz) / params.dt) * params.velocity_damping;
+
+    if (phase[i] == PHASE_GRAIN) {
+        let pen = c_residual[i]; // final normalized penetration from the last bed_project
+        // Rolling-resistance proxy: bleed grain kinetic energy so spheres don't roll the pile
+        // shallow — but ONLY while in contact. An airborne grain isn't rolling, so damping its
+        // free-fall would just rob the impact of the energy it needs to flow into a heap.
+        if (pen > 1e-4) {
+            v = v * params.rolling_damping;
+        }
+        // Static-yield regularization (NOT freezing): below a small speed a grain is treated as
+        // at rest. Gravity and the contact solve still run for it every frame, so an unsupported
+        // grain immediately re-accelerates and penetration is never masked — this only removes
+        // the sub-threshold numerical jitter a Jacobi contact pile never fully shakes off.
+        if (fluid_impulse[i] <= params.wake_threshold && length(v) < params.grain_sleep_speed) {
+            v = vec3<f32>(0.0);
+        }
+    } else if (params.num_solids > 0u) {
+        // Canonical XPBD static-collision VELOCITY response (Müller et al. 2020). apply_dp already
+        // clamped POSITION out of the wall; here we set the post-collision VELOCITY independently of
+        // that push (the cure for wall "eruption": otherwise v=(pred-pos)/dt folds the outward push
+        // into v and the particle is flung off). One pass over the blocking solids: at a contacted
+        // surface split v, cancel the normal component (restitution 0 — inelastic; NOT a v·n≥0 clamp,
+        // which would permit the eruption) and apply Coulomb friction. A cup's side and floor meet in
+        // a concave corner where the nearest-face normal cancels only one axis, so on a cylinder floor
+        // we additionally zero v.y — both axes handled without a second sweep over `solids`.
+        let contact = 0.25 * params.h;
+        for (var s = 0u; s < params.num_solids; s = s + 1u) {
+            let prim = solids[s];
+            if ((prim.species_mask & (1u << phase[i])) == 0u) { continue; }
+            let hit = solid_cavity(prim, xi);
+
+codex
+The strongest fold is the sequencing: U3 before U2 is now explicit, and U2’s anti-tunneling tests are much sharper. The weaker folds are the ones that say “or” where the implementation needs one signed, conservative mechanism, and the drag section still mixes two different normalizations.
+codex
+**REVISE**
+
+The revision is materially better, but several folds are still not concrete or internally consistent enough to implement safely.
+
+1. **KTD-3’s drag math is still inconsistent.**  
+   The plan claims both a pair-symmetric impulse and aggregate-normalized exponential damping, but the pseudo-code computes `tau_ij` per pair, applies `exp(-dt/tau_ij)`, then multiplies by `W_ij / norm_aggregate`. That is not “exponential on the aggregate”; it is a per-pair exponential with a post weight. If `norm_aggregate` is receiver-local, the mirrored water/grain gathers will not produce equal-and-opposite impulses. If it is pair-symmetric, it no longer represents each particle’s aggregate neighbor normalization. This leaves round-1 findings #3, #4, and #11 only partially resolved.
+
+2. **`coupling_scale: vec2` lane usage is not actually nailed down.**  
+   KTD-8 says `x = aggregate inverse-stopping-time/β`, `y = normalization/ε`, but the pseudo-code stores `x = beta_i`, `y = norm_i`. U3 then needs local `β_i`, paired `β_ij`, aggregate rate, and normalization. The plan must specify exactly which two quantities are stored at each pass and how the missing ones are derived without extra bindings.
+
+3. **The retention fallback remains hand-wavy.**  
+   “Weak `∇α_s` volumetric penalty / near-saturation drag limit” is still an unresolved fork, not an implementation. A `∇α_s` penalty is a pressure-like/body-force term and needs a signed formula plus an equal-and-opposite grain reaction or a clear conservation exception. A near-saturation drag limit only resists slip; it cannot by itself provide static hydraulic retention at zero relative velocity. The U2 tests are good, but the mechanism is not yet specified enough to satisfy finding #1.
+
+4. **The mobilization inequality is still not measurable enough.**  
+   “Pour-zone impulse > surface-grain yield/contact/rolling resistance; bulk < fluidization” is the right criterion, but the plan does not define how to measure yield resistance in this XPBD solver: from `normal_impulse`, friction coefficient, gravity/submerged weight, rolling damping, empirical dry-bed threshold, or a probe test. Without that, the gate can become post-hoc tuning. Finding #5 is improved but not closed.
+
+5. **Wake gating still risks counting buoyancy as wake impulse.**  
+   The current code accumulates `fluid_impulse` from drag and buoyancy: [coupling.wgsl](/Users/cxc/Github/coffee-sim/src/solvers/xpbd/coupling.wgsl:309) and [coupling.wgsl](/Users/cxc/Github/coffee-sim/src/solvers/xpbd/coupling.wgsl:353). The plan says wake should be normalized and decaying, but it does not explicitly require a drag-only wake accumulator or a flow-speed accumulator. Hydrostatic saturated beds can still wake from pressure/buoyancy unless this is separated.
+
+6. **Buoyancy/drag decoupling conflicts with the optional `∇α_s` penalty.**  
+   KTD-7 correctly says drag must be relative-velocity-only and buoyancy remains pressure-gradient-only. But if U2 chooses the `∇α_s` residual resistance path, that is another pressure/volume-force channel from the same porosity field. The plan must define whether it is conservative, how grains receive the reaction, and how the hydrostatic-rest gate distinguishes it from double-counted buoyancy.
+
+Resolved or mostly resolved: U3-before-U2 sequencing, water PBF keeping its own `h`, ε clamp and neighbor instrumentation, multi-observable calibration direction, finer-water sequencing after drag normalization, and the sharper U2 anti-tunneling tests. The remaining blockers are concentrated in the exact drag formulation and the retention/wake force accounting.
+tokens used
+49,075

@@ -1,0 +1,21 @@
+You are an expert reviewer (GPU physics + numerical methods + Rust/wgpu) reviewing an implementation plan written by Claude Code for a coffee pour-over simulator (Rust + wgpu + WGSL, single unified XPBD/PBF GPU solver).
+
+Respond with a VERDICT on the FIRST LINE: **APPROVE**, **REVISE**, or **REJECT**. Then give rigorous, specific reasoning. You have READ-ONLY access to the repo — actually read the files before judging.
+
+Read, in order:
+1. The plan under review: `.deliberate/claude_plan.md` (condensation) and the full plan `docs/plans/2026-06-06-002-feat-fines-migration-channeling-plan.md`.
+2. The source-of-truth spec it builds on: `docs/plans/solver_xpbd.md` (esp. build phase 6 and the four interphase forces in §3) and `docs/plans/models.md`.
+3. The code it reuses/edits: `src/solvers/xpbd/coupling.wgsl` (compute_fractions, porosity_drag_factor, the buoyancy momentum-pair template), `src/solvers/xpbd/wetting.wgsl` (the conservation-safe transfer trio + inelastic-merge momentum), `src/solvers/xpbd/extraction.wgsl` (chem_frozen sequencing), the chem buffer layout + seed_chem + the cell-order reorder + step() pass pipeline in `src/solvers/xpbd/mod.rs`, `src/models/mod.rs` (Materials), `src/utils/config.rs` (Config), `src/engine/state.rs` (Metrics).
+4. Prior art the plan cites: `.deliberate/codex_review_porosity.md` if present.
+
+Judge the plan on these four focus questions specifically, plus anything else you find:
+
+1. KTD-3 — modeling fines as a sub-grid TRANSPORTED SCALAR (erode → advect on water → redeposit) instead of solver_xpbd.md's interphase force #4 (a concentration-gradient force dispersing grain particles down the α_s gradient). Is this physically and numerically the right call for "fines slow drawdown by clogging"? What does the scalar model fail to capture that force #4 would, and vice versa? Is the divergence from the source-of-truth spec justified?
+
+2. Conservation design — the signed-net erosion/deposition trio (count + grain + water passes over a frozen chem snapshot, identical min-capped allocation on both sides, atomic-free, each writes only its own slot; momentum via inelastic merge like wet_grain; symmetric roundoff floors on both lanes). Compare against the actual wetting.wgsl implementation. Where could volume or momentum still leak? Is "suspended fines add to water effective mass" handled consistently everywhere effective mass is used (drag, exclusion, buoyancy)? Does advecting suspended fines on the water particle interact badly with water particles being deactivated/absorbed (f_w → 0) or drained?
+
+3. State budget — fines in the free chem.w lane for BOTH species, no new buffer, riding the existing chem cell-order reorder. Verify chem.w is genuinely free for both species and untouched by all passes, and that the reorder copies the full chem vec4. Is the gated baseline-deviation (chem.w − fines_seed) read in compute_fractions correct given the one-substep lag, and does adding a chem binding to compute_fractions stay ≤ 8 storage buffers? Are the three new fines passes ≤ 8 storage buffers each?
+
+4. Channeling emergence — permeability feedback via the gated baseline-deviation term folded into the existing BULK per-particle α_s → porosity_drag_factor (Kozeny–Carman). Will channeling actually emerge and self-amplify with the bulk factor, or is the harmonic-mean-k pair blend (recommended in the porosity review for sharp porosity discontinuities, which fines create) actually REQUIRED in this plan rather than deferred? Is measuring evenness as CoV of downward water flux across horizontal bins a sound, falsifiable channeling signal?
+
+Also flag: any conservation/stability hole, any 8-buffer violation, any test that asserts a tuned target instead of a law/inequality, any missing edge case, and whether the unit breakdown/ordering is sound. Be concrete (name files, functions, params). End with a bulleted list of specific REVISE items if the verdict is REVISE.

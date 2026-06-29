@@ -1,0 +1,16 @@
+You are an expert reviewer (GPU physics + numerical methods / MPM + Rust/wgpu) reviewing ROUND 3 of an IMPLEMENTATION PLAN for the two-field GPU MPM water solver (Rust + wgpu + WGSL; collocated grid, fixed-point i32 atomics, no float atomics, under-converged local-Jacobi mixture pressure). Narrowed to the transfer/dissipation lever; incompressibility-pressure work is DEFERRED to a follow-up (do not penalize).
+
+Respond with a VERDICT on the FIRST LINE: **APPROVE**, **REVISE**, or **REJECT**. Then specific reasoning. READ-ONLY repo — read the files. Judge plan soundness, not prose.
+
+Read the plan: `docs/plans/2026-06-18-001-feat-twofield-surface-weighted-dissipation-plan.md`. Origin: `docs/brainstorms/2026-06-18-twofield-water-splash-dynamics-requirements.md`. Code refs as needed (transfers.wgsl g2p_water/`B`/clamp sites; coupling.wgsl:292 drag_fold water clamp; mod.rs Params + pipeline order project→g2p; common.wgsl FP headroom; xpbd water.wgsl xsph; main shader.rs support_ratio drip block; PERF_NOTES).
+
+YOUR ROUND-2 verdict was REVISE. Verify each item is now ADEQUATELY addressed (don't re-raise resolved; flag superficial patches):
+1. Water cap must cover ALL water-path clamp sites — `p2g_water`, the water-grid clamp in `drag_fold` (coupling.wgsl:292, runs before project/g2p), and `g2p_water` — leaving solid clamps (`solid_update`/`g2p_solid`) on the global `max_speed`. (Plan KTD5 + U3.)
+2. `water_splash_cap` must have an explicit Params home with updated layout size. (Plan: `flip:[f32;4]` = (c_surface, density_gate, div_scale, water_splash_cap), assert 256→272, affine-damp `k` demoted to a compile-time const. KTD4 + U1.)
+3. `approach_into_density` must be a concrete directional signal computable in g2p_water from available data. (Plan: gather `grad_m = Σ(∇w)·grid_vel.w` in the existing loop — `∇w` already used for `B`, no new buffer — and `approach = max(0, dot(v_own−v_grid, normalize(grad_m+ε)))`. KTD2 + U2.)
+4. R5 telemetry + density-only control must be actually wired: an inert per-particle `c` diagnostic readback (byte-identity preserved) and a runtime toggle for the control (not a compile-time second shader). (Plan: inert diagnostic readback per the DensU1 pattern; control = `div_scale ≤ 0` runtime sentinel, same shader. KTD4 + U1 + U2 R5 scenario.)
+5. Downgrade remaining "crown/splash restored" wording to transfer-side liveliness vs disabled baseline. (Plan: Summary, U2/U4 verification, R1.)
+
+Then re-judge holistically on the revised text: is the plan now implementation-ready (an implementer could start U1→U4 without inventing design), is the drip-stir guard genuinely robust given the post-projection constraint, are constraints (no new production buffer, Tint, FP headroom re-derivation, operator consistency untouched, perf) sound, and are the gates falsifiable (esp. the R5 telemetry+control and the transfer-side splash signal)?
+
+Flag any remaining hole, new issue from the revision, physics error, or underspecified item. Be concrete (files, U-IDs, R-IDs). End with a bulleted list of specific REVISE items if the verdict is REVISE.

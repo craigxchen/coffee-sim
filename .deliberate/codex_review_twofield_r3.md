@@ -1,0 +1,9 @@
+APPROVE
+
+1. The round-2 folds are present and materially addressed. The plan now pins φ-weighting to continuity/operator terms, adds source-term projection gates, moves Skempton-B to U7, uses constrained-solid reactions for frozen-bed buoyancy, re-runs operator gates after U4 rows, defines bubble multipliers consistently across coarse/fine solves, gates face-velocity consistency, strengthens the drag/projection split reference, audits over-packing as effective stress only, explicitly scopes the U6 concurrency exception, separates offline GCI from real-time sweep budgets, and fixes the 200k gate composition.
+
+2. No remaining blocker rises to REVISE. The only implementation-sensitive area I would watch is U6’s frozen-skeleton bookkeeping: drag/projection impulses into a kinematically constrained solid must be recorded as constraint reactions rather than silently discarded. The plan already contains enough reaction-load language in U6 and the full impulse ledger in U7, so this is an execution note, not a plan defect.
+
+3. The gates are falsifiable. The plan repeatedly pre-registers tolerances, knob grids, dispatch/substep ceilings, scene composition, and halt conditions; it avoids self-calibrated success criteria in the key risky places: U3 divergence floor, U4 cavity floor, U6 Darcy entry, U9 pond/drain bands, U7 consolidation/load sharing, and U8 200k runtime.
+
+4. The physics dependencies are sequenced acceptably. U6’s early L2 spike is now explicitly limited to rigid-skeleton formulation risk, while U7 owns deformable poromechanics, effective-stress coupling, Skempton-B, and stress partition audits. That separation is implementable and does not overclaim what U6 proves.

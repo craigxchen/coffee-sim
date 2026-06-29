@@ -1,0 +1,3509 @@
+OpenAI Codex v0.137.0
+--------
+workdir: /Users/cxc/Github/coffee-sim
+model: gpt-5.5
+provider: openai
+approval: never
+sandbox: read-only
+reasoning effort: high
+reasoning summaries: none
+session id: 019e9e08-e677-7be2-9a0f-00b77c577729
+--------
+user
+You are an expert reviewer (GPU physics + numerical methods + Rust/wgpu) doing ROUND 3 of a plan cross-review for a coffee pour-over simulator (Rust + wgpu + WGSL, single unified XPBD/PBF GPU solver). Round 1 = REVISE (8 items, folded). Round 2 = REVISE (7 implementability items, folded). Your job: confirm convergence and catch anything the round-2 fixes INTRODUCED. If the plan is implementable as written, APPROVE.
+
+Respond with a VERDICT on the FIRST LINE: **APPROVE**, **REVISE**, or **REJECT**. Then give specific reasoning. READ-ONLY repo access — read the files.
+
+Read, in order:
+1. Your prior reviews: `.deliberate/codex_review.md` (round 1) and `.deliberate/codex_review_r2.md` (round 2).
+2. The twice-revised plan: `docs/plans/2026-06-06-002-feat-fines-migration-channeling-plan.md` (authoritative).
+3. The code: `src/solvers/xpbd/coupling.wgsl` (compute_fractions, porosity_drag_factor, compute_coupling_scale, drag_delta_for_pair, beta_from_rate, the coupling_scale buffer binding 16), `src/solvers/xpbd/wetting.wgsl`, `src/solvers/xpbd/extraction.wgsl`, `src/solvers/xpbd/common.wgsl` (Params, the coupling_scale + wet_neighbors bindings), `src/solvers/xpbd/mod.rs` (bind groups, step() pipeline, grid reorder of coupling_scale if any), `src/engine/state.rs`.
+
+Verify the round-2 fixes are coherent and complete:
+
+1. coupling_scale → vec2 (k, cap) rework (KTD-7/U3). Is widening binding-16 coupling_scale from f32 to vec2<f32> actually safe? Check: does coupling_scale participate in the cell-order reorder (and if so does the plan account for the wider element)? Do drag_water/drag_grain stay ≤ 8 storage with the wider buffer (it's the same binding, so yes — but confirm)? Is computing harmonic-mean-k from stored per-particle k, then beta_from_rate, then a symmetric min-cap, actually equal-and-opposite per pair (momentum-conserving)? Is there any case where storing raw resistance vs k matters for the harmonic mean (harmonic mean of k != reciprocal of mean of resistance unless done consistently)?
+
+2. Post-packing-clamp deviation (KTD-2/U4). alpha_s[i] = clamp(min(a_s_grains, packing_limit) + fines_dev, 0, 1 - phi_f_min). Is letting alpha_s exceed packing_limit safe for every OTHER consumer of alpha_s and the density target? In particular: water.wgsl targets rho0*(1 - alpha_s) for pore water — does alpha_s > packing_limit (toward 1) drive the pore-water density target toward 0 and destabilize the density solve or expel water unphysically? Is there a consumer that assumes alpha_s <= packing_limit?
+
+3. Gate extension (U4): compute_coupling_scale gate k_abs>0 || fines_rate>0. With fines_rate=0 is it still byte-identical? With fines_rate>0 but k_abs=0 (no wetting), does porosity_drag_factor + the new vec2 path behave (WET_REF_POROSITY assumptions still valid)?
+
+4. pos.w vs pred.w (KTD-5/KTD-10): are all fines passes consistently on live pos/pos.w, and does the fines block's own grid rebuild use pos (consistent with reading pos)? Any remaining place the plan still says pred for fines?
+
+5. wet_neighbors reuse (KTD-5): is referencing the existing binding-17 wet_neighbors identifier from the fines passes actually valid WGSL given how this codebase concatenates shader files and declares bindings once in common.wgsl? Any lifetime hazard with the wetting block within the same substep?
+
+6. Anything the revisions introduced: contradictions, buffer miscounts, broken byte-unchanged claims, or test scenarios that no longer match the design.
+
+If APPROVE, list what to watch during implementation. If REVISE, give a concrete bulleted list of only the remaining must-fix items (do not re-raise resolved ones).
+
+codex
+I’ll read the prior reviews, revised plan, and the XPBD shader/Rust integration files first, then compare the round-2 deltas against actual bindings and data flow.
+exec
+/bin/zsh -lc "sed -n '1,240p' .deliberate/codex_review.md" in /Users/cxc/Github/coffee-sim
+exec
+/bin/zsh -lc "sed -n '1,260p' .deliberate/codex_review_r2.md" in /Users/cxc/Github/coffee-sim
+exec
+/bin/zsh -lc "sed -n '1,260p' docs/plans/2026-06-06-002-feat-fines-migration-channeling-plan.md" in /Users/cxc/Github/coffee-sim
+ succeeded in 0ms:
+REVISE
+
+Most round-1 issues were addressed, but a few implementability gaps remain.
+
+**Findings**
+
+- KTD-10 is not airtight as written. The plan puts fines after wetting, but its U2/KTD-5 bind lists use `pred`; wetting updates `pos.w` while `pred.w` remains the start-substep snapshot. For deactivation safety, fines caps/forced deposition must read post-wetting `pos.w`, following extraction’s pattern, not wetting’s frozen-`pred.w` pattern. See [wetting.wgsl](/Users/cxc/Github/coffee-sim/src/solvers/xpbd/wetting.wgsl:76) vs [extraction.wgsl](/Users/cxc/Github/coffee-sim/src/solvers/xpbd/extraction.wgsl:23).
+
+- U2 has an internal buffer-count contradiction. It says all fines passes read `vel` for flux, but KTD-5 counts `fines_count` as 6 buffers without `vel`. Either `fines_count` must not depend on flux direction, or its actual count is 7. Transfer passes stay at 8 if they use `pos, phase, cell_start, sorted_indices, chem_frozen, wet_neighbors, chem, vel`.
+
+- Harmonic-mean-k is mathematically right, but not implementable as a simple operation on today’s `coupling_scale`. Current code stores capped beta-like scale in one `f32` and pairs with `min(scale_i, scale_j)` [coupling.wgsl](/Users/cxc/Github/coffee-sim/src/solvers/xpbd/coupling.wgsl:210). Harmonic-k requires uncapped local permeability/resistance plus cap information; beta is nonlinear, and the cap destroys invertibility. The plan should explicitly rework `compute_coupling_scale`, likely by widening the existing binding 16 buffer to `vec2<f32>` for `(resistance_or_k, cap)` so drag stays within 8 storage bindings.
+
+- Fines-only permeability currently would not affect drag unless the existing gate changes. `compute_coupling_scale` only uses `porosity_drag_factor(alpha_s[i])` when `params.k_abs > 0.0` [coupling.wgsl](/Users/cxc/Github/coffee-sim/src/solvers/xpbd/coupling.wgsl:177). U4 must explicitly make that `k_abs > 0 || fines_rate > 0`, while keeping `fines_rate = 0` byte-unchanged.
+
+- The α_s deviation can fight the packing clamp. `compute_fractions` ends with `alpha_s[i] = min(a_s, params.packing_limit)` [coupling.wgsl](/Users/cxc/Github/coffee-sim/src/solvers/xpbd/coupling.wgsl:49). Adding lodged fines before that clamp may erase positive clogging in already packed regions, while negative deviations still open channels. The massless-volume model is coherent, but the plan needs to say whether clog volume may exceed the grain-skeleton packing clamp, or prove the intended scenes have headroom.
+
+- Reusing `wet_neighbors` is safe only if implemented as the same WGSL binding/identifier or a global rename. The shader has one binding-17 declaration, `wet_neighbors` [common.wgsl](/Users/cxc/Github/coffee-sim/src/solvers/xpbd/common.wgsl:133); a second `fines_neighbors` declaration at binding 17 would be invalid.
+
+- KTD-1/KTD-9 are otherwise correct: `chem.w` is free today, preserved by dissolution/thermal, emitted water seeds `.w = 0`, and reorder copies full `chem` vec4. But the plan later says water `chem.w` remains free for Bloom; that contradicts KTD-1 because water `.w` is suspended fines.
+
+The unit DAG is sound: U1→U2, U3 independent, U4 needs U2+U3, U5 independent, U6 depends on U2-U5. Evenness is now a falsifiable flux metric with law/inequality tests. Massless fines and the momentum non-perturbation guard are the right narrowed claim.
+ succeeded in 0ms:
+REVISE
+
+The scalar fines model is the right direction for “fines slow drawdown by clogging.” `solver_xpbd.md` force #4 moves the grain skeleton down an `alpha_s` gradient; that can model granular dispersion or anti-overpacking, but it does not represent a conserved sub-grid fines inventory washing out of fast paths and redepositing downstream. The plan’s erode -> Lagrangian water transport -> redeposit abstraction is physically better for clogging and easier to conserve.
+
+That divergence is justified, but the plan should stop implying it closes all of §3 interphase force #4. It does not capture fines-driven rearrangement of the bed skeleton, granular segregation, or true diffusion of solid particles down concentration gradients. Force #4 would capture those mechanical effects; the scalar model captures pore clogging and washout. They are complementary.
+
+The main blocker is conservation and mass consistency. `wetting.wgsl` is not directly transferable as-is: `wet_water` changes only water volume, and `wet_grain` is the only velocity-writing transfer pass. A fines transfer writes both grain and water velocities depending on signed direction. If `fines_grain` runs before `fines_water` and both read live `vel`, the second pass can see already-merged destination/source velocities and leak momentum. The plan needs an explicit frozen velocity snapshot, not just frozen `chem`.
+
+That frozen-velocity requirement collides with the 8-storage-buffer budget. A momentum-safe fines write pass likely needs `pos`, live `vel`, frozen/source `vel`, `cell_start`, `sorted_indices`, `phase`, live `chem`, frozen `chem`, and neighbor/count scratch: 9 storage buffers. Current `drag_grain` and `buoyancy_grain` are already at 8 storage buffers, and `drag_water` is kept at the same layout with the `fluid_impulse[i] = fluid_impulse[i]` trick. The plan’s “three new passes <= 8” claim is not established; with the conservation design as stated, it is probably false unless the implementation splits chem and velocity updates, recomputes counts, or drops a binding some other way.
+
+`chem.w` itself is a good storage choice. In current code, `seed_chem` initializes `.w = 0`, `dissolve_grain`, `dissolve_water`, and `thermal_exchange` preserve `cf.w`, emitted water seeds `.w = 0`, and `grid_reorder_b` copies the full `chem` `vec4` through `chem_scratch`. Adding `chem` to `compute_fractions` is also budget-safe: current storage bindings are `pred`, `cell_start`, `sorted_indices`, `phase`, `alpha_s`; adding `chem` makes 6.
+
+But “suspended fines add to water effective mass” is not handled consistently. Current `water_eff_mass`, `grain_eff_mass`, `eff_mass`, `grain_buoyancy_factor`, drag, exclusion, buoyancy, and thermal capacity all depend on `pos/pred.w`, not `chem.w`. If fines mass is physically inertial, the plan must change all relevant effective-mass paths. If it is only a clogging scalar, the momentum-conservation test must not claim full effective-mass conservation for suspended fines. Trying to add `chem` to drag and buoyancy also hits the 8-buffer ceiling in the current layouts.
+
+There is also a water deactivation hole. Water with `f_w <= absorb_roundoff` or `pbf_eps` is skipped by wetting/extraction/PBF paths, but `chem.w` could still hold suspended fines. If a fine-laden water particle is absorbed to near-zero `f_w`, the fines become inert hidden mass unless the fines pass forces deposition before/at deactivation or caps suspended fines by active water volume. Drained water in the cup is less of a closed-system leak, but the plan needs to specify whether cup-carried suspended fines are removed, measured, or still allowed to redeposit.
+
+The permeability feedback is directionally correct but too optimistic. Bulk `alpha_s -> porosity_drag_factor` can produce some self-amplification, but fines create exactly the sharp permeability discontinuities called out in `.deliberate/codex_review_porosity.md`. Current drag uses per-particle `coupling_scale` and pair `min(scale_i, scale_j)`. Since the rate is effectively resistance-like (`~1/k`), `min(rate)` selects the weaker resistance side at an interface. That weakens clog barriers. For this plan’s channeling claim, the harmonic-mean-of-`k` pair blend should be in scope, or the channeling gate should be downgraded to a prototype risk.
+
+The `evenness` metric is a reasonable falsifiable signal if defined precisely as volume-weighted downward water flux across bed cross-section bins. It should use `max(-v_y, 0) * f_w * V_w`, exclude the inlet stream and cup/outlet region, ignore inactive water, and handle empty bins deterministically. “Uniform baseline near 1” is a tuned target; better tests are synthetic velocity fields and paired uniform vs non-uniform comparisons.
+
+**Revise Items**
+- Add an explicit frozen-velocity design for fines momentum, or narrow the claim to volume-conserving scalar transfer without inertial mass.
+- Rework the fines pass layouts and document storage-buffer counts from actual bindings. The stated transfer trio likely exceeds 8 storage buffers once velocity conservation is made order-independent.
+- Decide whether fines mass participates in `eff_mass`. If yes, update drag, exclusion, buoyancy, thermal capacity, and tests within buffer limits. If no, remove/soften “effective-mass-weighted momentum” claims.
+- Handle fine-laden inactive water: cap suspended fines by `f_w`, force redeposition before water deactivation, or explicitly account for drained/cup fines.
+- Include the harmonic-mean-`k` pair blend now, or make channeling amplification an explicit risk/gate rather than a deferred enhancement.
+- Define `fines_neighbors` concretely: binding number, type, whether it reuses `diss_neighbors`, and how it coexists with the existing single WGSL binding declarations.
+- Fix `Params` accounting: there are only two `_pad_chem*` fields, but the plan adds three fines scalars.
+- Tighten diagnostics tests to laws and paired inequalities; avoid “near 1” evenness targets unless backed by a synthetic construction with a clear bound.
+ succeeded in 0ms:
+---
+status: active
+type: feat
+date: 2026-06-06
+deepened: 2026-06-06
+origin: docs/plans/solver_xpbd.md (build phase 6 / step 6), docs/plans/models.md (fines open question)
+title: "feat: Phase 6 — fines migration + transient permeability + channeling"
+---
+
+# feat: Phase 6 — Fines Migration + Transient Permeability + Channeling
+
+## Summary
+
+Add **fines migration** to the XPBD solver and make **channeling** observable — the first
+two of the three Phase 6 (`solver_xpbd.md` step 6) phenomena. Bloom/CO₂ is deferred to a
+follow-up plan.
+
+Coffee *fines* (broken-cell fragments, dust) detach from grains under flow, ride the draining
+water, and re-deposit where the flow slackens — locally clogging the pore space, lowering
+permeability, and **slowing drawdown**. That same redistribution is what makes a non-uniform
+bed *channel*: fast paths erode clear (permeability rises) while slow regions silt up
+(permeability falls), a self-reinforcing loop. Channeling is therefore **emergent**, not a
+scripted mechanism — this plan adds the physics that lets it emerge and the **metrics**
+(`evenness`, `drawdown_time`) that let a test see it.
+
+Fines are modeled as a **massless clogging/transport scalar** (KTD-4): they occupy
+permeability-relevant pore volume but carry no inertial mass, so the transfer moves a conserved
+scalar only — it writes no velocities, perturbs no momentum, and stays well inside the
+8-storage-buffer budget. The work rides existing seams rather than inventing machinery:
+- Fines live in the free `chem.w` lane (both species) — verified free and untouched by every
+  pass; rides the existing chem cell-order reorder (`grid_reorder_b` copies the full `vec4`) for
+  free. No new storage buffer.
+- Erosion/deposition is **one conservation-safe two-sided scalar transfer** (count + grain +
+  water passes over a frozen `chem` snapshot with an identical signed allocation), the shape of
+  the wetting (`wetting.wgsl`) and dissolution (`extraction.wgsl`) trios — but volume-only, with
+  no velocity writes.
+- The permeability feedback is a gated **deviation term** folded into the existing per-particle
+  `α_s` (`compute_fractions`), which drives the live Kozeny–Carman drag factor. To make
+  channeling actually *amplify*, the drag pair-combiner is sharpened from `min(rate)` to a
+  **harmonic-mean-k blend** (KTD-7) so clog barriers aren't leaked at their edges.
+- Suspended fines **advect for free** on the carrying water particle (Lagrangian, like solute
+  `c`) — no transport pass.
+
+Everything is gated off by default (`Config.fines_rate = 0`), so existing scenes and the test
+suite stay byte-unchanged.
+
+---
+
+## Problem Frame
+
+`solver_xpbd.md` lists three Phase 6 phenomena under one gate: *"channeling emerges from flow
+non-uniformity; fines slow drawdown; fresh coffee blooms."* The solver today has none of them
+(confirmed: no `fines` channel, no concentration-gradient force, no freshness/CO₂ state) — but
+it has the **hooks**: drag already reads a live per-particle porosity (`α_s`) and converts it to
+a local permeability via Kozeny–Carman (`coupling.wgsl` `porosity_drag_factor`), and the
+`Metrics` struct already declares `drawdown_time` and `evenness` (both currently hard-zero,
+never computed — `src/engine/state.rs:11-12`).
+
+This plan delivers **fines migration + channeling** (the physically coupled pair — channeling
+emergence *depends on* fines redistributing local permeability). Bloom is independent and
+deferred.
+
+**Origin divergence (see KTD-3).** `solver_xpbd.md:33` frames fines migration as interphase
+force #4, a "concentration-gradient force [that] drives grain dispersion down the α_s gradient."
+This plan models fines as a sub-grid transported scalar instead. Per the Codex cross-review,
+these are **complementary, not interchangeable**: the scalar model captures pore clogging and
+washout (what "fines slow drawdown" needs); force #4 captures mechanical rearrangement of the
+*grain skeleton* (granular segregation, solid diffusion down a concentration gradient). This
+plan does the former and does **not** claim to deliver force #4 — which, with force #3
+(virtual/added mass), remains unbuilt and out of scope (see Scope Boundaries).
+
+---
+
+## Requirements
+
+Grouped by capability. IDs are stable across revisions.
+
+**Fines transport & conservation**
+- R1. Grains carry a conserved fines inventory (seeded from a material fines fraction); fines
+  erode into overlapping flowing water and re-deposit into grains where flow is slow, modeled
+  as a transported scalar — **not** a new particle species and **not** a grain-dispersion force.
+- R2. Every fines transfer conserves **total fines volume** to float tolerance — a hard
+  constraint, including the long-run asymptotic tail (no one-signed roundoff sink, per the
+  saturated-tail leak class). Fines are massless (KTD-4), so the transfer writes no velocities
+  and leaves water/grain momentum unperturbed; the conservation gate is volume, plus a
+  momentum-non-perturbation guard.
+- R3. Suspended fines advect on their carrying water particle (Lagrangian), with no numerical
+  diffusion pass; fines on a water particle that is deactivated (absorbed, `f_w→0`) or drained
+  are not silently lost (R-handled via KTD-10).
+
+**Transient permeability & channeling**
+- R4. Net-accumulated fines locally raise solid fraction `α_s` (lower permeability) and
+  net-eroded regions lower it, feeding the drag/Kozeny–Carman factor — so enabling fines
+  measurably **increases whole-bed drawdown time** versus fines-off, all else equal.
+- R5. The drag pair-combiner resolves a porosity discontinuity by **harmonic-mean-k**, not
+  `min(rate)`, so a clog barrier is not leaked at its low-resistance edge — a precondition for
+  channeling self-amplifying (KTD-7). The combiner stays symmetric (momentum-conserving).
+- R6. Under a non-uniform pour/bed, flow non-uniformity (channeling) is detectable as a
+  degraded `evenness` and is **amplified — not created** — by fines redistribution. No
+  zone/scene/SDF-gated heuristic produces it.
+
+**Observability**
+- R7. The solver computes and exposes `evenness` (volume-weighted downward-flux uniformity) and
+  `drawdown_time` in `Metrics`, replacing the current hard-zero placeholders.
+
+**Inertness**
+- R8. With `Config.fines_rate = 0` (default), the solver is byte-unchanged versus today: no new
+  pass runs, `compute_fractions` takes its existing path, the drag combiner takes its existing
+  `min` path, existing scenes and suites are unaffected.
+
+---
+
+## Key Technical Decisions
+
+- KTD-1 — **Fines live in the `chem.w` lane, both species; no new buffer.** Verified in-code
+  (Codex cross-review): `seed_chem` sets `.w = 0`; `dissolve_grain`/`dissolve_water`/
+  `thermal_exchange` preserve `cf.w`; emitted water seeds `.w = 0`; `grid_reorder_b` copies the
+  full `chem` `vec4` through `chem_scratch`. Grain `chem.w` = lodged-fines volume (seeded to
+  `params.fines.y`); water `chem.w` = suspended-fines volume (seeded 0). Rejected: a new storage
+  binding (the ceiling is tight — `drag_*`/`buoyancy_grain` are at 8/8) and lossy f32
+  lane-packing (the porosity review's top correctness risk).
+- KTD-2 — **Permeability feedback as a gated baseline *deviation*, applied past the packing
+  clamp.** Only when `params.fines.x > 0`, `compute_fractions` adds the summed grain-neighbor
+  fines deviation `Σ_j (chem[j].w − params.fines.y)·W` into the local solid fraction. Crucially
+  it is added **after** the grain-skeleton packing clamp, not before: today the pass ends
+  `alpha_s[i] = min(a_s, packing_limit)` (`coupling.wgsl:49`), and folding fines in before the
+  clamp would erase positive clogging in already-packed regions while still letting negative
+  (erosion) deviations open channels — an asymmetric artifact. So:
+  `alpha_s[i] = clamp( min(a_s_grains, packing_limit) + fines_dev, 0.0, 1.0 − φ_f_min )`.
+  Physically right: fines clog the *pore* space the grain packing limit leaves open, so clog can
+  push `α_s` above `packing_limit` (toward the `φ_f` floor), while erosion lowers it. The
+  calibrated bed permeability (`porosity = 0.40`) bakes in the baseline fines, so only
+  migration-induced deviation changes drainage, and the fines-off path is literally the old code
+  (R8). Budget-safe: `compute_fractions` storage today is `pred, cell_start, sorted_indices,
+  phase, alpha_s` (5) → +`chem` = 6.
+- KTD-3 — **Fines as sub-grid scalar transport, complementary to (not a replacement for)
+  interphase force #4.** Diverges from `solver_xpbd.md:33` for the *clogging/washout* mechanism;
+  does not deliver the *grain-skeleton rearrangement* force #4 would. Both can coexist later;
+  force #4 is deferred, not subsumed. (See Alternatives.)
+- KTD-4 — **Fines are a massless clogging/transport scalar.** They occupy permeability-relevant
+  pore volume (the α_s deviation, KTD-2) but carry **no inertial mass**: the transfer moves
+  `chem.w` only, writes no velocities, and leaves water/grain momentum untouched. Rationale:
+  fines are a small mass fraction and drawdown-slowing is a *permeability* effect, not an
+  inertial one; this also avoids a frozen-velocity snapshot (which would push a momentum-safe
+  write pass to ~9 storage buffers, over the limit) and avoids threading `chem.w` into
+  `water_eff_mass`/`eff_mass`/`grain_buoyancy_factor`/drag/exclusion/buoyancy/thermal (each of
+  which keys off `pos.w` and several of which are already at 8/8). The conservation claim is
+  therefore **volume-only**; the momentum check is a *non-perturbation* guard, not an
+  effective-mass merge. (Inertial fines is a deferred enhancement.)
+- KTD-5 — **One signed-net erosion/deposition transfer, volume-conserving.** A single trio
+  (`fines_count`, `fines_grain`, `fines_water`) computes a per-pair signed transfer from a
+  frozen `chem` snapshot using an identical water-normalized `min`-capped allocation on both
+  sides (grain→water when local Darcy flux is high, water→grain when low). Each pass writes only
+  its own `chem.w` slot (atomic-free). Symmetric roundoff floors on both lanes (the
+  `wet_sat_cutoff` lesson) prevent a tail sink. Buffer/timing specifics:
+  - **Read `pos`/`pos.w`, not `pred`.** The block runs *after* wetting (which writes `pos.w`);
+    `pred.w` is the stale start-of-substep snapshot. Like the extraction block, fines reads the
+    live post-wetting `pos`/`pos.w` so the deactivation cap (KTD-10) sees the current `f_w`.
+  - **`fines_count` is eligibility-only (no `vel`).** It counts opposite-species neighbors in
+    range (optionally checking `chem_frozen.w` pool state) — flux affects only the transfer
+    magnitude/direction, not eligibility. Count buffers: `pos, phase, cell_start,
+    sorted_indices, chem_frozen, wet_neighbors` (≤ 6).
+  - **Transfer passes read `vel` for flux.** The flux signal is the local `|v_water − v_grain|`.
+    `fines_grain`/`fines_water` = `pos, phase, cell_start, sorted_indices, chem_frozen,
+    wet_neighbors, chem (write), vel` (= 8, at the ceiling like `drag_*`).
+  - **Reuse the `wet_neighbors` binding/identifier directly** (binding 17, `u32`,
+    `common.wgsl:133`) — do **not** declare a second `fines_neighbors` at the same binding (WGSL
+    forbids it). Either reference `wet_neighbors` by name in the fines passes, or rename it
+    globally to a neutral `neighbor_count`. Lifetimes don't overlap within a substep.
+- KTD-6 — **`evenness` precise definition.** `evenness ∈ [0,1]`, from the coefficient of
+  variation of **volume-weighted downward water flux** `max(-v_y, 0) · f_w · V_w` accumulated
+  into horizontal cross-section bins over the bed region — **excluding** the inlet pour stream
+  and the cup/outlet region, **ignoring** inactive water (`f_w ≤ pbf_eps`), with deterministic
+  empty-bin handling. 1 = uniform; a channel shows as a high-flux column → low evenness.
+  `drawdown_time` = time for the free-water column above the bed to clear a height/count
+  threshold. Both are CPU-readback samplers (the `sample_extraction` pattern, `mod.rs:750`),
+  refreshed by `sample_diagnostics`. No new reduction shader.
+- KTD-7 — **Harmonic-mean-k drag pair-combiner (requires reworking `compute_coupling_scale`).**
+  Today the drag pair scale takes `min(coupling_scale[i], coupling_scale[j])` where
+  `coupling_scale` is a single `f32` holding a *capped, nonlinear* `β = beta_from_rate(...)`
+  (`coupling.wgsl:206,212`). Since rate ~ 1/k, `min` selects the *weaker-resistance* side at an
+  interface and leaks clog barriers. The fix is a harmonic mean of the per-pair **permeabilities**
+  (dominated by the lower-k / higher-resistance side) — but it is **not** a simple swap on the
+  existing `β`: `β` is nonlinear and the cap destroys invertibility, so harmonic-k can't be
+  recovered from it. So `compute_coupling_scale` is reworked to store, per particle, the
+  **uncapped local resistance/permeability and the cap** — by widening the existing
+  `coupling_scale` buffer (binding 16) from `f32` to `vec2<f32>` = `(k_or_resistance, cap)`
+  (same binding, no new buffer, drag stays ≤ 8). `drag_delta_for_pair` then forms the symmetric
+  harmonic-mean-k, converts to `β`, and applies the (symmetric `min`) cap. Harmonic mean is
+  symmetric, so pair antisymmetry — and momentum conservation — is preserved. Gated to the
+  fines-active path (or applied generally with the existing drag/coupling suite re-verified) so
+  default behavior is unchanged (R8). This is the porosity review's recommendation and is
+  **required** for the channeling-amplification gate (R6), not deferred.
+- KTD-8 — **One-substep lag on the fines→α_s feedback is acceptable.** The fines block runs at
+  the end of a substep; `compute_fractions` reads it at the start of the next. Same lagged
+  explicit/Jacobi coupling pattern already used for drag/contact, and the regime the porosity
+  review blessed given Kozeny–Carman's low-φ blow-up is tamed (`porosity_drag_factor` clamps
+  `φ_f ∈ [0.05, 0.999]`).
+- KTD-9 — **New knobs.** `Config.fines_rate` (default 0) gates + scales the feature (mirrors
+  `extract_rate`); `Materials.fines_fraction` (default 0.0) seeds the inventory. The WGSL
+  `Params` gains a single `fines: vec4<f32> = (rate, seed, crit_flux, _)` — a clean 16-byte
+  addition that fixes the accounting (the two existing `_pad_chem*` slots cannot hold the three
+  new scalars).
+- KTD-10 — **Fine-laden inactive/drained water.** Suspended fines on a water particle that gets
+  absorbed to `f_w→0` or drains must not vanish. Mitigations: (a) cap a water particle's
+  suspended fines by its **post-wetting active volume** (read live `pos.w`, per the KTD-5 timing
+  rule — not the stale frozen `pred.w`) and force deposition to rise as `f_w → 0` (shed before
+  deactivation); (b) the closed-system conservation gate runs with absorption **off** so no
+  deactivation occurs (clean Σ invariant); (c) brew/draining scenes treat suspended fines on
+  drained water as a **measured cup-fines sink** (accounted like yield), not an unaccounted leak.
+
+---
+
+## High-Level Technical Design
+
+### Fines lifecycle (the self-reinforcing loop)
+
+```mermaid
+flowchart TB
+  seed["grain chem.w = fines_seed S (uniform)"] --> flux{local Darcy flux<br/>|v_water − v_grain|}
+  flux -->|high| erode["erosion: grain chem.w → water chem.w (scalar)"]
+  flux -->|low| deposit["deposition: water chem.w → grain chem.w (scalar)"]
+  erode --> advect["suspended fines advect on the<br/>water particle (free, Lagrangian)"]
+  advect --> deposit
+  deposit --> dev["grain fines deviation = chem.w − S"]
+  dev --> frac["compute_fractions: α_s += deviation (gated)"]
+  frac --> perm["porosity_drag_factor + harmonic-k pair blend: k↓ ⇒ drag↑"]
+  perm --> slow["local drainage slows"]
+  slow --> flux
+  slow --> chan["clogged regions slow further,<br/>cleared paths stay fast ⇒ channeling amplifies"]
+```
+
+The loop is the point: erosion and deposition are flux-gated, the deviation feeds the
+permeability factor, the harmonic-k combiner keeps the clog barrier sharp, and slower local
+drainage changes the flux driving the next step. Channeling is the macroscopic signature of this
+loop on a non-uniform bed. Fines carry volume into the loop, not momentum (KTD-4).
+
+### Where the new pass block slots into `step()`
+
+The fines transfer is its own gated block, after the extraction/thermal block (`mod.rs` step 9),
+where post-finalize velocities give a settled flux signal — mirroring that block's structure but
+writing only `chem.w`:
+
+```text
+per substep (existing):
+  ... predict → water density loop → drag → buoyancy → bed → finalize → xsph
+      → wetting (if k_abs>0) → extraction/thermal (if extract_rate>0)
+  + NEW fines block (if fines_rate>0):
+      grid rebuild → copy chem → chem_frozen
+      fines_count → fines_grain → fines_water        # signed-net SCALAR transfer (no vel writes)
+
+per substep (modified):
+  water density loop → compute_fractions             # + gated fines deviation term (KTD-2)
+  drag subcycle      → drag pair scale               # + harmonic-k combiner (KTD-7)
+```
+
+---
+
+## Implementation Units
+
+
+codex
+The revised plan has addressed most prior objections structurally. I’m continuing through the implementation units and then checking the exact shader declarations and host bind group layout for any newly introduced mismatch.
+exec
+/bin/zsh -lc "sed -n '1,280p' src/solvers/xpbd/coupling.wgsl" in /Users/cxc/Github/coffee-sim
+exec
+/bin/zsh -lc "sed -n '261,620p' docs/plans/2026-06-06-002-feat-fines-migration-channeling-plan.md" in /Users/cxc/Github/coffee-sim
+ succeeded in 0ms:
+// Water/bed coupling (XPBD step 3, mechanical subset). Concatenated after common/water/bed.
+//
+// Two mechanisms, both active only in mixed (water+grain) scenes:
+//  1. compute_fractions — per-particle solid fraction α_s = Σ_grain V_g W (clamped to the packing
+//     limit). The water density solve (water.wgsl) reads it and targets ρ₀·(1−α_s), so pore water
+//     packs to the pore fraction (drainage-ready) instead of full ρ₀ (which would be expelled).
+//  2. grain exclusion (A.2) — a two-way geometric non-penetration between water and grain
+//     particles: water can't pass through grain bodies, so it rests on / sits in the bed. Run as a
+//     symmetric pair of gathers (exclude_water + exclude_grain) reading the same predicted
+//     positions, with opposite-mass weights → momentum-conserving without float atomics.
+//  3. implicit drag — symmetric frozen-velocity gathers using the Kozeny-Carman-resolved drag
+//     rate in params.drag_gamma. The same pair scale is used by both phases, so each pair impulse
+//     is equal-and-opposite to float tolerance.
+//  4. buoyancy / pressure-gradient lift — symmetric gathers over the converged water λ field.
+//     PBF λ is non-positive under compression in this solver, so pressure is −λ. The grain pass
+//     applies +J/m_g and the water pass applies −J/m_w for the same pair, avoiding float atomics.
+
+@compute @workgroup_size(256)
+fn compute_fractions(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= params.particle_count) { return; }
+    let h = params.h;
+    let xi = pred[i].xyz;
+    var a_s = 0.0;
+    let base = cell_coord(xi);
+    for (var dz = -1; dz <= 1; dz = dz + 1) {
+        for (var dy = -1; dy <= 1; dy = dy + 1) {
+            for (var dx = -1; dx <= 1; dx = dx + 1) {
+                let nc = base + vec3<i32>(dx, dy, dz);
+                if (nc.x < 0 || nc.y < 0 || nc.z < 0) { continue; }
+                let dims = vec3<i32>(params.grid_dims.xyz);
+                if (nc.x >= dims.x || nc.y >= dims.y || nc.z >= dims.z) { continue; }
+                let cid = cell_id(nc);
+                let lo = cell_start[cid];
+                let hi = cell_start[cid + 1u];
+                for (var s = lo; s < hi; s = s + 1u) {
+                    let j = sorted_indices[s];
+                    if (j == i) { continue; }
+                    if (phase[j] != PHASE_GRAIN) { continue; } // solid fraction from grains only
+                    let r = length(xi - pred[j].xyz);
+                    if (r >= h) { continue; }
+                    // Swollen grains occupy more space: use the effective volume V_eff = V_dry + V_abs
+                    // (grain pred.w = V_abs). Dry grains (V_abs=0) ⇒ params.grain_volume, unchanged.
+                    a_s = a_s + grain_eff_volume(pred[j].w) * w_poly6(r, h);
+                }
+            }
+        }
+    }
+    alpha_s[i] = min(a_s, params.packing_limit);
+}
+
+// Water↔grain contact separation for one pair, opposite-mass weighted. Both passes call this with
+// the same (xi, xj) so the pair impulse is identical and conservation holds (to float tolerance).
+fn exclusion_push(xi: vec3<f32>, xj: vec3<f32>, w_self: f32) -> vec3<f32> {
+    let d_wg = params.water_grain_distance; // water–grain contact distance (< grain spacing ⇒ pores)
+    let dvec = xi - xj;
+    var r = length(dvec);
+    if (r >= d_wg) { return vec3<f32>(0.0); }
+    var n: vec3<f32>;
+    if (r < 1e-6) {
+        n = vec3<f32>(0.0, 1.0, 0.0); // coincident → push apart vertically (deterministic)
+        r = 1e-6;
+    } else {
+        n = dvec / r;
+    }
+    return params.exclusion_relax * (d_wg - r) * w_self * n;
+}
+
+@compute @workgroup_size(256)
+fn exclude_water(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= params.particle_count) { return; }
+    if (status.converged != 0u) { return; }
+    if (phase[i] != PHASE_WATER) { return; }
+    // Effective masses (swelling): heavier wet grains / lighter shrunk water shift the split. Dry
+    // (V_abs=0, f_w=1) ⇒ the original particle_mass/grain_mass split. w_self computed per neighbor.
+    let m_w = water_eff_mass(pred[i].w);
+    let xi = pred[i].xyz;
+    var push = vec3<f32>(0.0);
+    let base = cell_coord(xi);
+    for (var dz = -1; dz <= 1; dz = dz + 1) {
+        for (var dy = -1; dy <= 1; dy = dy + 1) {
+            for (var dx = -1; dx <= 1; dx = dx + 1) {
+                let nc = base + vec3<i32>(dx, dy, dz);
+                if (nc.x < 0 || nc.y < 0 || nc.z < 0) { continue; }
+                let dims = vec3<i32>(params.grid_dims.xyz);
+                if (nc.x >= dims.x || nc.y >= dims.y || nc.z >= dims.z) { continue; }
+                let cid = cell_id(nc);
+                let lo = cell_start[cid];
+                let hi = cell_start[cid + 1u];
+                for (var s = lo; s < hi; s = s + 1u) {
+                    let j = sorted_indices[s];
+                    if (phase[j] != PHASE_GRAIN) { continue; }
+                    let m_g = grain_eff_mass(pred[j].w);
+                    push = push + exclusion_push(xi, pred[j].xyz, m_g / (m_w + m_g));
+                }
+            }
+        }
+    }
+    // Add onto the water density Δp already in dp (compute_dp wrote it this iteration).
+    dp[i] = dp[i] + vec4<f32>(push, 0.0);
+}
+
+@compute @workgroup_size(256)
+fn exclude_grain(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= params.particle_count) { return; }
+    if (status.converged != 0u) { return; }
+    if (phase[i] != PHASE_GRAIN) { return; }
+    // Effective masses (swelling), mirror of exclude_water. Same per-pair m_w/m_g read from pred.w on
+    // both sides ⇒ the antisymmetric correction still conserves momentum exactly.
+    let m_g = grain_eff_mass(pred[i].w);
+    let xi = pred[i].xyz;
+    var push = vec3<f32>(0.0);
+    let base = cell_coord(xi);
+    for (var dz = -1; dz <= 1; dz = dz + 1) {
+        for (var dy = -1; dy <= 1; dy = dy + 1) {
+            for (var dx = -1; dx <= 1; dx = dx + 1) {
+                let nc = base + vec3<i32>(dx, dy, dz);
+                if (nc.x < 0 || nc.y < 0 || nc.z < 0) { continue; }
+                let dims = vec3<i32>(params.grid_dims.xyz);
+                if (nc.x >= dims.x || nc.y >= dims.y || nc.z >= dims.z) { continue; }
+                let cid = cell_id(nc);
+                let lo = cell_start[cid];
+                let hi = cell_start[cid + 1u];
+                for (var s = lo; s < hi; s = s + 1u) {
+                    let j = sorted_indices[s];
+                    if (phase[j] != PHASE_WATER) { continue; }
+                    // Mirror of the water-side push for this pair (swapped args give −n); grain's
+                    // opposite-mass weight m_w/(m_w+m_g) → exact pair antisymmetry.
+                    let m_w = water_eff_mass(pred[j].w);
+                    push = push + exclusion_push(xi, pred[j].xyz, m_w / (m_w + m_g));
+                }
+            }
+        }
+    }
+    // Grains get no water-density Δp (compute_dp skips them), so SET dp here (the bed contact
+    // subcycle that follows will overwrite it again). Always write, so a grain with no water
+    // neighbors gets dp=0 rather than a stale value.
+    dp[i] = vec4<f32>(push, 0.0);
+}
+
+fn beta_from_rate(rate: f32) -> f32 {
+    let x = max(rate * params.dt, 0.0);
+    return x / (1.0 + x); // implicit: rate→∞ ⇒ β→1 (no overshoot); bounds rate·dt
+}
+
+fn drag_pair_beta() -> f32 {
+    return beta_from_rate(params.drag_gamma);
+}
+
+// Live-porosity drag (wetting only): the local drag rate scales with local permeability k(φ_f),
+// φ_f = 1−α_s, relative to the reference porosity the build-time rate was resolved at. The K-C
+// d²/180 cancels in the ratio, so this is a pure porosity factor. As the bed wets/swells, α_s↑ ⇒
+// φ_f↓ ⇒ k↓ ⇒ rate↑ ⇒ drainage slows. (Bulk-correct; a harmonic-k pair blend would be sharper at a
+// porosity discontinuity — deferred.)
+const WET_REF_POROSITY: f32 = 0.40; // must match Materials.porosity (build-time drag resolution)
+fn porosity_drag_factor(a_s: f32) -> f32 {
+    let phi = clamp(1.0 - a_s, 0.05, 0.999); // clamp away from 0 (K-C diverges)
+    let pr = WET_REF_POROSITY;
+    let num = pr * pr * pr * (1.0 - phi) * (1.0 - phi);
+    let den = phi * phi * phi * (1.0 - pr) * (1.0 - pr);
+    return num / max(den, 1.0e-12); // k_ref / k_local
+}
+
+@compute @workgroup_size(256)
+fn compute_coupling_scale(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= params.particle_count) { return; }
+    let ph_i = phase[i];
+    let xi = pred[i].xyz;
+    // Per-particle drag blend: global rate, or the local-porosity rate when wetting is active. The
+    // result is the FULL per-pair scale (the multi-neighbor cap is folded in below), so drag uses
+    // min(scale_i, scale_j) directly — which, for the global rate, equals the old beta·min(c_i,c_j).
+    var beta_i = drag_pair_beta();
+    if (params.k_abs > 0.0) {
+        beta_i = beta_from_rate(params.drag_gamma * porosity_drag_factor(alpha_s[i]));
+    }
+    var n = 0.0;
+
+    let base = cell_coord(xi);
+    for (var dz = -1; dz <= 1; dz = dz + 1) {
+        for (var dy = -1; dy <= 1; dy = dy + 1) {
+            for (var dx = -1; dx <= 1; dx = dx + 1) {
+                let nc = base + vec3<i32>(dx, dy, dz);
+                if (nc.x < 0 || nc.y < 0 || nc.z < 0) { continue; }
+                let dims = vec3<i32>(params.grid_dims.xyz);
+                if (nc.x >= dims.x || nc.y >= dims.y || nc.z >= dims.z) { continue; }
+                let cid = cell_id(nc);
+                let lo = cell_start[cid];
+                let hi = cell_start[cid + 1u];
+                for (var s = lo; s < hi; s = s + 1u) {
+                    let j = sorted_indices[s];
+                    if (j == i) { continue; }
+                    if (phase[j] == ph_i) { continue; }
+                    let r = length(xi - pred[j].xyz);
+                    if (r >= params.h) { continue; }
+                    n = n + 1.0;
+                }
+            }
+        }
+    }
+
+    // Cap so Σ_j min(scale_i, scale_j) ≤ β_max (anti-overshoot). min(beta_i, β_max/N) = beta_i·c_i
+    // with the old cap c_i = min(1, β_max/(N·beta_i)), so the global-rate path is unchanged.
+    coupling_scale[i] = min(beta_i, params.drag_beta_max / max(n, 1.0));
+}
+
+fn drag_delta_for_pair(i: u32, j: u32, self_phase: u32) -> vec3<f32> {
+    // coupling_scale already folds in the (possibly local-porosity) rate + the cap, so the symmetric
+    // pair scale is just min of the two. Effective masses (swelling) keep momentum conserved.
+    let s = min(coupling_scale[i], coupling_scale[j]);
+    let m_i = eff_mass(self_phase, pred[i].w);
+    let m_j = eff_mass(phase[j], pred[j].w);
+    return s * (m_j / (m_i + m_j)) * (vel_frozen[j].xyz - vel_frozen[i].xyz);
+}
+
+@compute @workgroup_size(256)
+fn drag_water(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= params.particle_count) { return; }
+    if (phase[i] != PHASE_WATER) { return; }
+    let xi = pred[i].xyz;
+    var dv = vec3<f32>(0.0);
+
+    let base = cell_coord(xi);
+    for (var dz = -1; dz <= 1; dz = dz + 1) {
+        for (var dy = -1; dy <= 1; dy = dy + 1) {
+            for (var dx = -1; dx <= 1; dx = dx + 1) {
+                let nc = base + vec3<i32>(dx, dy, dz);
+                if (nc.x < 0 || nc.y < 0 || nc.z < 0) { continue; }
+                let dims = vec3<i32>(params.grid_dims.xyz);
+                if (nc.x >= dims.x || nc.y >= dims.y || nc.z >= dims.z) { continue; }
+                let cid = cell_id(nc);
+                let lo = cell_start[cid];
+                let hi = cell_start[cid + 1u];
+                for (var s = lo; s < hi; s = s + 1u) {
+                    let j = sorted_indices[s];
+                    if (phase[j] != PHASE_GRAIN) { continue; }
+                    let r = length(xi - pred[j].xyz);
+                    if (r >= params.h) { continue; }
+                    dv = dv + drag_delta_for_pair(i, j, PHASE_WATER);
+                }
+            }
+        }
+    }
+
+    vel[i] = vec4<f32>(vel_frozen[i].xyz + dv, 0.0);
+    fluid_impulse[i] = fluid_impulse[i]; // keep drag_water's auto-layout at the shared 8 buffers
+}
+
+@compute @workgroup_size(256)
+fn drag_grain(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= params.particle_count) { return; }
+    if (phase[i] != PHASE_GRAIN) { return; }
+    let xi = pred[i].xyz;
+    var dv = vec3<f32>(0.0);
+
+    let base = cell_coord(xi);
+    for (var dz = -1; dz <= 1; dz = dz + 1) {
+        for (var dy = -1; dy <= 1; dy = dy + 1) {
+            for (var dx = -1; dx <= 1; dx = dx + 1) {
+                let nc = base + vec3<i32>(dx, dy, dz);
+                if (nc.x < 0 || nc.y < 0 || nc.z < 0) { continue; }
+                let dims = vec3<i32>(params.grid_dims.xyz);
+                if (nc.x >= dims.x || nc.y >= dims.y || nc.z >= dims.z) { continue; }
+                let cid = cell_id(nc);
+                let lo = cell_start[cid];
+                let hi = cell_start[cid + 1u];
+                for (var s = lo; s < hi; s = s + 1u) {
+                    let j = sorted_indices[s];
+                    if (phase[j] != PHASE_WATER) { continue; }
+                    let r = length(xi - pred[j].xyz);
+                    if (r >= params.h) { continue; }
+                    dv = dv + drag_delta_for_pair(i, j, PHASE_GRAIN);
+                }
+            }
+        }
+    }
+
+ succeeded in 0ms:
+### U1. Fines state, seeding, gate, and CPU model
+
+- **Goal:** Establish the massless fines scalar (`chem.w` both species), its seed, the opt-in
+  knobs, the `Params` fines vec4, and a CPU model twin — no behavioral change yet.
+- **Requirements:** R1 (state shape), R8 (inertness).
+- **Dependencies:** none.
+- **Files:**
+  - `src/models/fines.rs` (new) — CPU twins: `fines_seed(grain_volume, fines_fraction)`,
+    `net_rate(flux, crit_flux, rate) -> f32` (signed: + erodes / − deposits, single zero-crossing
+    at `crit_flux`, bounded), with unit tests.
+  - `src/models/mod.rs` — `pub mod fines;`; add `fines_fraction: f32` (default `0.0`) to
+    `Materials` under a `// --- fines (Phase 6) ---` block.
+  - `src/utils/config.rs` — add `fines_rate: f32` (default `0.0`) to `Config` (opt-in gate +
+    rate scale; mirrors `extract_rate`).
+  - `src/solvers/xpbd/common.wgsl` — add `fines: vec4<f32>` (rate, seed, crit_flux, _) to the
+    WGSL `Params` mirror (do **not** try to reuse the two `_pad_chem*` slots — three scalars
+    won't fit; KTD-9).
+  - `src/solvers/xpbd/mod.rs` — extend the Rust `Params` mirror with the fines vec4; resolve
+    `fines_seed = fines_fraction · grain_volume` at build; seed grain `chem.w = fines_seed`,
+    water `chem.w = 0` in `seed_chem` (`mod.rs:476`); add a `read_fines()` helper (or document
+    indexing `read_chem().w`).
+- **Approach:** Pure plumbing. Re-confirm the cell-order reorder carries `chem.w` (it copies the
+  full `chem` vec4 via `chem_scratch` — verify no writer drops `.w`).
+- **Patterns to follow:** the `extract_rate` gate + pool-seed wiring; the `pos.w`
+  phase-multiplex convention; CPU-twin modules under `src/models/`.
+- **Test scenarios:**
+  - Covers R8. *Inertness, byte-level:* a representative mixed scene stepped N frames with
+    `fines_rate = 0` produces identical positions/velocities/chem to baseline (the new pass must
+    not run; `compute_fractions` and the drag combiner take their old paths).
+  - *Seed correctness:* after build with `fines_fraction > 0`, every grain `chem.w ==
+    fines_seed` (±1e-6), every water `chem.w == 0`; total = `Σ grain · fines_seed`.
+  - *CPU model:* `net_rate` is monotone in flux, crosses zero once at `crit_flux`, is bounded;
+    `fines_seed == fines_fraction · grain_volume`.
+  - Test expectation for the `Config`/`Materials`/`Params` field additions: none (pure
+    declarations; covered by inertness + seed tests).
+
+### U2. Erosion + deposition scalar transfer (volume-conserving, massless)
+
+- **Goal:** Move fines grain↔water under a flux-gated signed-net scalar transfer that conserves
+  total fines volume exactly and perturbs no momentum.
+- **Requirements:** R1, R2, R3.
+- **Dependencies:** U1.
+- **Files:**
+  - `src/solvers/xpbd/fines.wgsl` (new) — `fines_count` (eligibility-only: opposite-species
+    neighbors in range over the frozen snapshot; **no `vel`**), `fines_grain`, `fines_water`
+    (read the **frozen** `chem` snapshot + `vel` for the per-pair flux `|v_water − v_grain|`,
+    compute an identical per-pair signed `take = clamp(net_rate(flux)·dt·…)` two-sided-`min`
+    capped so neither lane over-draws, write only their own `chem.w`). All read live `pos`/`pos.w`
+    (post-wetting), **not `pred`** (KTD-5). **No velocity writes** (massless, KTD-4).
+  - `src/solvers/xpbd/mod.rs` — concat `fines.wgsl`; create the three pipelines + bind groups
+    (counts per KTD-5: count ≤ 6, transfers = 8); add the gated fines block to `step()` after the
+    extraction/thermal block (grid rebuild → `chem → chem_frozen` copy → `fines_count` →
+    `fines_grain` → `fines_water`); reuse `chem_frozen` (binding 22) and the existing
+    `wet_neighbors` binding/identifier (binding 17) for the count — no second declaration.
+  - `tests/xpbd_fines.rs` — conservation gates below.
+- **Approach:** Signed-net so one trio handles both directions: high local flux ⇒ erosion
+  (grain→water), low flux ⇒ deposition (water→grain). KTD-10: deposition rate rises as the
+  neighbor water's `f_w → 0` (shed before deactivation), and suspended fines are capped by active
+  water volume. Symmetric roundoff floors on both lanes (the `wet_sat_cutoff` floor pattern).
+- **Patterns to follow:** the wetting trio `wet_count`/`wet_water`/`wet_grain` (`wetting.wgsl`)
+  for the two-sided capped allocation over a frozen snapshot — but **drop** `wet_grain`'s
+  inelastic-velocity merge (fines are massless); the dissolution trio (`extraction.wgsl`) for
+  the `chem_frozen` copy-then-read sequencing.
+- **Test scenarios:**
+  - Covers R2. *Volume conservation (closed system, absorption OFF):* a sealed mixed scene,
+    `fines_rate > 0`, stepped; `Σ(grain chem.w + water chem.w)` invariant to < 0.1%.
+  - Covers R2. *Long-run saturated-tail gate:* ≥ 2000 steps driving strong transfer toward
+    equilibrium; post-equilibrium drift slope ≈ 0 (pins the one-signed-ulp leak class). Reuse the
+    wetting saturated-tail gate shape.
+  - Covers R2. *Momentum non-perturbation:* with the fines block on, total water+grain momentum
+    `Σ m_eff·v` (using the existing `pos.w`-based `eff_mass`) is **identical** to a fines-off
+    control across the block — the fines passes must not touch `vel`.
+  - Covers R1/R3. *Directionality:* a high-flux column drops grain `chem.w` and raises the
+    co-located/downstream water `chem.w`; a stagnant region reverses — net scalar moves fast→slow.
+  - Covers R3. *Deactivation safety:* a fine-laden water absorbed toward `f_w→0` deposits its
+    fines first; `Σ` fines stays invariant (no stranded hidden volume).
+  - *No-flux null:* water and grain at rest ⇒ net transfer ≈ 0 (no spurious erosion).
+  - *Buffer budget:* each new pass's bind-group list is ≤ 8 storage buffers (documented counts;
+    build does not panic).
+
+### U3. Harmonic-mean-k drag pair-combiner
+
+- **Goal:** Sharpen the drag pair scale so a porosity discontinuity is resolved by the
+  higher-resistance side, making clog barriers hold and channeling self-amplify (R5/R6).
+- **Requirements:** R5 (and a precondition for R6).
+- **Dependencies:** none (independent of fines transport; parallelizable with U1/U2).
+- **Files:**
+  - `src/solvers/xpbd/coupling.wgsl` — rework `compute_coupling_scale` to store, per particle,
+    the **uncapped local resistance/permeability and the cap** in a widened `coupling_scale`
+    (`vec2<f32>` = `(k_or_resistance, cap)`), instead of a single capped `β`. Change
+    `drag_delta_for_pair` to form the symmetric **harmonic-mean-k** from the two particles'
+    stored `k`, convert to `β` (`beta_from_rate`), then apply the symmetric (`min`) cap — keeping
+    `drag_water`/`drag_grain` equal-and-opposite per pair. Gate the harmonic path to
+    `fines_rate > 0` (or apply generally and re-verify), so default behavior is unchanged (R8).
+  - `src/solvers/xpbd/common.wgsl` / `src/solvers/xpbd/mod.rs` — widen the `coupling_scale`
+    buffer (binding 16) element type to `vec2<f32>` (same binding, no new buffer; drag passes
+    stay ≤ 8).
+  - `tests/xpbd_coupling.rs` — combiner tests below (extend the existing coupling suite).
+- **Approach:** The current path stores a *capped, nonlinear* `β` (`coupling.wgsl:206`) and
+  pairs with `min` (`:212`); since rate ~ 1/k, `min` selects the lower resistance at an interface
+  and leaks the clog barrier. Harmonic-mean-k can't be recovered from the capped `β`, hence the
+  `vec2` widening to carry raw `k` + cap. Harmonic mean of `k` is dominated by the lower-`k`
+  (higher-resistance) side — the correct upwinding for a clog — and is symmetric, so momentum is
+  preserved. Smallest viable edit that keeps the anti-overshoot cap and the buffer budget.
+- **Patterns to follow:** `compute_coupling_scale` (`coupling.wgsl:166`) and
+  `drag_delta_for_pair` (`coupling.wgsl:209`); the symmetric-pair-scalar requirement from
+  `.deliberate/codex_review_porosity.md`.
+- **Test scenarios:**
+  - Covers R5. *Symmetry / momentum:* across a water↔grain pair the drag impulse remains exactly
+    equal-and-opposite (momentum conserved to float tolerance) under the new combiner.
+  - Covers R5. *Clog upwinding:* at a synthetic interface (one side high-α_s/low-k, one side
+    low-α_s/high-k), the pair resistance tracks the **high-resistance** side (harmonic), not the
+    low — assert versus the old `min` behavior on the same inputs.
+  - Covers R8. *Default unchanged:* with `fines_rate = 0`, existing `tests/xpbd_coupling.rs`
+    drag/buoyancy/conservation assertions still pass (gated path or re-verified).
+  - *Stability:* a strong k-discontinuity does not blow up (β cap + φ_f clamp hold).
+
+### U4. Fines → transient permeability coupling
+
+- **Goal:** Make lodged-fines deviation change local permeability so accumulation slows drainage
+  and erosion speeds it — producing R4 and (with U3) channeling amplification.
+- **Requirements:** R4, R6 (amplification), R8 (gated).
+- **Dependencies:** U2 (fines exist), U3 (sharp combiner for crisp amplification).
+- **Files:**
+  - `src/solvers/xpbd/coupling.wgsl` — two gated edits, both no-ops when `params.fines.x == 0`:
+    (1) in `compute_fractions`, accumulate the summed grain-neighbor fines deviation
+    `Σ_j (chem[j].w − params.fines.y)·W` and add it **after** the grain packing clamp
+    (`alpha_s[i] = clamp(min(a_s_grains, packing_limit) + fines_dev, 0.0, 1.0 − φ_f_min)`, per
+    KTD-2); (2) extend the live-porosity gate in `compute_coupling_scale` from
+    `if (params.k_abs > 0.0)` to `if (params.k_abs > 0.0 || params.fines.x > 0.0)` — otherwise
+    the fines-driven `α_s` change never reaches drag in a no-wetting scene.
+  - `src/solvers/xpbd/mod.rs` — bind `chem` into the `compute_fractions` pipeline's bind group
+    (→ 6 storage buffers, safe).
+  - `tests/xpbd_fines.rs` — local-permeability test below.
+- **Approach:** Reuse `α_s → porosity_drag_factor → drag` (KTD-2/KTD-7/KTD-8). The deviation is
+  signed: clogged regions (`chem.w > S`) raise `α_s` (slow) — and, applied past the packing
+  clamp, can push above `packing_limit` to model pore clogging — while eroded regions
+  (`chem.w < S`) lower it (speed). One-substep lag intentional and safe (KTD-8). The `φ_f` clamp
+  plus bounded `net_rate·dt` guard Kozeny–Carman's low-φ sensitivity.
+- **Patterns to follow:** `grain_eff_volume(pred[j].w)` usage already in `compute_fractions`
+  (`coupling.wgsl:44`); the `if (params.k_abs > 0.0)` gating style.
+- **Test scenarios:**
+  - Covers R4. *Fines slow drawdown:* identical brew run with `fines_rate = 0` vs `> 0`; the
+    fines-on run has a strictly longer `drawdown_time` (uses U5's sampler). Causal lever, not a
+    tuned absolute.
+  - *Local cause:* a seeded over-clogged patch (`chem.w` written above `S` via a test-write
+    helper) shows lower reconstructed downward water velocity through it than a baseline patch —
+    isolates the permeability response from the transfer.
+  - Covers R8. *Gated:* `fines_rate = 0` ⇒ drainage behavior matches baseline.
+  - *Stability:* a heavily-clogged region does not NaN/blow up; KE bounded over a long run.
+
+### U5. Brew-evenness & drawdown-time diagnostics
+
+- **Goal:** Compute and expose `evenness` and `drawdown_time` in `Metrics`, replacing the
+  hard-zero placeholders, so channeling and drawdown are observable.
+- **Requirements:** R7.
+- **Dependencies:** none (depends only on the solver; parallelizable with U1–U4).
+- **Files:**
+  - `src/solvers/xpbd/mod.rs` — add a `sample_channeling` CPU readback (positions + velocities +
+    moisture + phases) computing `evenness` per KTD-6 (CoV of volume-weighted downward flux
+    `max(-v_y,0)·f_w·V_w` across bed cross-section bins, excluding inlet + cup/outlet, ignoring
+    inactive water, deterministic empty bins) and `drawdown_time` (free-water column clears a
+    threshold); cache like `cached_yield`/`cached_tds`; call from `sample_diagnostics`
+    (`mod.rs:743`); populate the fields in `metrics()` (`mod.rs:2280`).
+  - `src/engine/state.rs` — no struct change; align field docs to the KTD-6 definitions.
+  - `tests/xpbd_channeling.rs` (new) — diagnostic tests below.
+- **Approach:** Pure observation, no physics change. Follow the existing CPU-readback sampler
+  (the documented sync point tests already call).
+- **Patterns to follow:** `sample_extraction` (`mod.rs:750`) readback + cache; the
+  `read_positions`/`read_velocities`/`read_moisture`/`read_phases` helpers; the
+  `sample_diagnostics` → `metrics()` flow (`tests/xpbd_extraction.rs:697`).
+- **Test scenarios:**
+  - Covers R7. *Wiring:* after `sample_diagnostics()`, `evenness ∈ [0,1]` and `drawdown_time ≥ 0`
+    are finite and non-default for a real brew.
+  - *Synthetic uniform field:* a test-written perfectly-uniform downward-flux field yields
+    `evenness` at its analytic upper bound (CoV = 0 ⇒ 1) — a constructed bound, not a tuned
+    "near 1".
+  - *Synthetic channel field:* a single injected high-flux column yields a strictly lower
+    `evenness` than the uniform field (paired inequality) — the metric responds to a channel.
+  - *Drawdown ordering:* a coarser grind (faster drain) gives a strictly shorter `drawdown_time`
+    than a finer grind — ties the metric to a known causal lever.
+
+### U6. Fines + channeling integration gates
+
+- **Goal:** Prove the gate end-to-end: fines slow drawdown, and channeling emerges from flow
+  non-uniformity and is amplified by fines.
+- **Requirements:** R4, R6 (and exercises R1–R3, R5, R7 in integration).
+- **Dependencies:** U2, U3, U4, U5.
+- **Files:** `tests/xpbd_channeling.rs` — integration scenarios; reuse `Scene::v60()` and the
+  `mixed_scene` helpers.
+- **Approach:** Build on the brew scene; seed non-uniformity (off-center pour, or a low-packing
+  stripe) and measure metrics over a brew vs matched uniform controls. Assertions are
+  **inequalities / causal directions**, not tuned targets (AGENTS.md doctrine).
+- **Patterns to follow:** the brew-scene tests in `tests/xpbd_extraction.rs`; the
+  conservation-as-gate idiom for the closed-system checks.
+- **Test scenarios:**
+  - Covers R4. *Fines slow drawdown (integration):* full brew, `fines_rate` on vs off →
+    `drawdown_time` strictly larger with fines.
+  - Covers R6. *Channeling emerges:* a non-uniform bed/pour produces lower `evenness` than a
+    matched uniform run; the flow field shows a preferential high-flux path (corroborated via
+    `read_velocities`).
+  - Covers R6. *Fines amplify, don't create:* channeling is present without fines (pure flow
+    non-uniformity) and **more pronounced** with fines on; the only knob is `fines_rate` (no
+    zone-gating).
+  - Covers R3/KTD-10. *Cup-fines accounting:* in a draining brew, fines leaving on drained water
+    are accounted (closed-system Σ over the bed + measured drained sink balances) — no
+    unaccounted leak.
+  - *Regression guard:* the three pre-existing red tests on `rewrite`
+    (`xpbd_extraction::no_extraction_without_opt_in`,
+    `xpbd_extraction::brew_populates_finite_yield_and_tds`,
+    `xpbd_wetting::wetting_with_full_solve_conserves_volume_and_stays_finite`) are no more red;
+    this plan adds no new failures. Note whether the wetting-conservation red is the same
+    saturated-tail class before extending near it.
+
+---
+
+## Alternatives Considered
+
+- **Fines as interphase force #4 (grain dispersion down ∇α_s).** The `solver_xpbd.md` framing.
+  Not the right primary mechanism for "fines slow drawdown by clogging": it moves the grain
+  skeleton, not a sub-grid fines population, so it can't represent fines washing out of channels
+  and silting up slow zones without distorting bed structure, and it's harder to conserve. Per
+  the Codex cross-review the two are **complementary** — force #4 captures granular segregation /
+  solid diffusion the scalar model omits — so it is deferred, not subsumed.
+- **Inertial (mass-carrying) fines.** Physically more complete (suspended fines add water
+  effective mass; transfer conserves momentum via an inelastic merge). Rejected for this plan
+  (KTD-4): it needs a frozen-velocity snapshot (pushing a momentum-safe write pass to ~9 storage
+  buffers, over the limit) and threading `chem.w` through every effective-mass path
+  (`eff_mass`/drag/exclusion/buoyancy/thermal — several at 8/8). The mass is small and the gate
+  is permeability-mediated, so massless is the right minimal call; inertial fines is a deferred
+  enhancement if a momentum effect is ever needed.
+- **Fines as a third particle species.** Physically literal but expensive (more particles,
+  another phase in every neighbor loop, new buffers against the ceiling). The scalar model
+  delivers the same observable at a fraction of the cost. (`models.md` already leans this way:
+  "transport in the solver.")
+- **Defer the harmonic-k blend.** Rejected (KTD-7): with the existing `min(rate)` combiner the
+  clog barrier leaks at its low-resistance edge, so channeling would not reliably amplify — the
+  blend is a precondition for R6, not a polish item.
+- **`evenness` = extraction/concentration uniformity** (brew-quality flavor). Richer and more
+  user-facing, but needs a full extraction brew and couples the metric to kinetics. Deferred;
+  flow-uniformity is the direct, lighter signal for the "flow non-uniformity" gate.
+
+---
+
+## Scope Boundaries
+
+**In scope:** massless fines erosion/advection/deposition (scalar transport), fines→transient-
+permeability coupling, the harmonic-mean-k drag combiner, `evenness`/`drawdown_time` metrics, and
+the tests proving fines slow drawdown + channeling emerges/amplifies.
+
+### Deferred to Follow-Up Work
+- **Bloom / CO₂ outgassing (the third Phase 6 phenomenon).** Its own plan. Decided model (per
+  product direction): a **swelling source + CO₂ particle emission** — fresh grounds carry a CO₂
+  inventory ≈ **1% of dry bean mass**, released on wetting as (a) a transient effective-volume
+  source (reusing the swelling seam that already raises `α_s`/packing in Phase 1.4) and (b)
+  emitted gas particles. Note for that plan: after this plan claims `chem.w` for fines on **both
+  species**, grain `chem` lanes are **full** (`s_f, s_s, T_g, fines`) and water has only `chem.z`
+  free (`c, T_w, free, fines`). So the per-grain CO₂ inventory will need a **new storage buffer**;
+  water `chem.z` is the only spare lane.
+- **Inertial fines** (momentum-carrying suspended fines) — only if a momentum effect is needed.
+- **Interphase force #4 (grain-skeleton dispersion / ∇α_s)** — complementary mechanical effect,
+  not delivered here.
+- **Extraction-evenness metric** (brew-quality flavor of `evenness`).
+- **Fines as a higher-`s_f` extraction source** (`models.md` open question). Not needed for the
+  drawdown/channeling gate.
+
+### Outside this phase
+- **Interphase force #3 (virtual/added mass)** — still unbuilt in the coupling layer; tracked
+  against `solver_xpbd.md` §3, not this gate.
+- **Absolute yield/TDS calibration** — a separate calibration track.
+
+---
+
+## Risks & Dependencies
+
+- **Conservation tail leak (high prior).** Two-lane transfers with mixed fraction/absolute units
+  have leaked one-signed in the asymptotic tail before (the wetting `wet_sat_cutoff` fix).
+  *Mitigation:* symmetric roundoff floors on both lanes (KTD-5) and the mandatory ≥2000-step
+  saturated-tail gate (U2).
+- **Fine-laden water deactivation/drain leak.** Suspended fines stranded when `f_w→0` or water
+  drains. *Mitigation:* KTD-10 (cap by `f_w` + forced deposition before deactivation; closed
+  conservation gate with absorption off; measured cup-fines sink for draining brews; U6 cup
+  accounting test).
+- **8-storage-buffer ceiling.** Resolved for the stated design: massless fines means the
+  transfer writes only `chem.w` (no frozen-velocity), so passes are 6/8/8; `compute_fractions`
+  gains `chem` → 6; the harmonic-k combiner edits existing drag passes without adding buffers.
+  *Mitigation:* documented counts in U2/U3/U4; the build panics on a bind-group mismatch, so any
+  regression is caught immediately.
+- **Reorder desync.** Fines live in `chem.w`, and `chem` is already reordered (`grid_reorder_b`
+  copies the full vec4) — but the reorder area has *uncommitted* working-tree edits
+  (`common.wgsl`, `mod.rs`, `water.wgsl`). *Mitigation:* U1 verifies `chem.w` survives the live
+  reorder; coordinate with that in-flight change.
+- **Channeling still too weak even with harmonic-k.** *Mitigation:* `fines_rate` and
+  `fines_crit_flux` are tuning levers; the gate is an inequality (emergence + amplification
+  direction), not a magnitude.
+- **Harmonic-k combiner perturbs existing calibration.** Changing the drag combiner can shift
+  drawdown-vs-grind behavior. *Mitigation:* gate it to `fines_rate > 0` (or apply generally and
+  re-verify the existing coupling suite); U3 asserts default-unchanged.
+- **Kozeny–Carman low-φ blow-up** where fines clog hard. *Mitigation:* the existing `φ_f ∈
+  [0.05, 0.999]` clamp plus bounded `net_rate·dt`.
+- **Pre-existing red tests (×3 on `rewrite`).** Do not attribute Phase 6 failures to them, and do
+  not let this work add new failures (U6 regression guard).
+
+**Verification gates (AGENTS.md):** `cargo fmt --check`; `cargo clippy --all-targets -- -D
+warnings`; `cargo test`; `cargo run --example phase0_noop`. Every new compute stage ≤ 8 storage
+buffers; never `#[ignore]`/delete a test to go green; `todo!()` stubs compile inert.
+
+---
+
+## Sources & Research
+
+- `docs/plans/solver_xpbd.md` — build phase 6 gate; the four interphase forces (KTD-3 divergence).
+- `docs/plans/models.md` — fines open question ("pool init here, transport in the solver");
+  Kozeny–Carman.
+- `.deliberate/codex_review_porosity.md` — prior art for the permeability coupling: symmetric
+  pair scalar for momentum, harmonic-mean-k over `min` at porosity discontinuities, clamp `φ_f`
+  and cap `rate·dt`, avoid lossy lane-packing. Shaped KTD-1, KTD-2, KTD-5, KTD-7, KTD-8.
+- `.deliberate/codex_review.md` — the gpt-5.5 cross-review of this plan (REVISE). Folded in:
+  massless-fines decision (KTD-4), volume-only conservation + momentum-non-perturbation (R2/U2),
+  documented buffer counts and `fines_neighbors` reuse (KTD-5), `chem.w`-freeness verification
+  (KTD-1), the deactivation hole (KTD-10), harmonic-k brought in scope (KTD-7/U3), the `Params`
+  fines-vec4 accounting fix (KTD-9), the precise `evenness` definition + law-based tests (KTD-6,
+  U5), and softening the force-#4 claim to "complementary" (KTD-3).
+- `.deliberate/codex_review_r2.md` — round-2 cross-review of the revised plan (REVISE,
+  implementability gaps only). Folded in: read live `pos.w` post-wetting not `pred.w` (KTD-5/
+  KTD-10), the `fines_count`-has-no-`vel` buffer fix (KTD-5), reworking `compute_coupling_scale`
+  to a `vec2` `(k, cap)` so harmonic-k is implementable (KTD-7/U3), extending the
+  `porosity_drag_factor` gate to `k_abs>0 || fines_rate>0` (U4), applying the α_s deviation past
+  the packing clamp (KTD-2/U4), reusing the `wet_neighbors` binding/identifier rather than a
+  second declaration (KTD-5), and fixing the water-`chem.w`-free-for-Bloom contradiction
+  (Deferred Work).
+- `docs/ideation/2026-06-05-physics-validation-test-suite-ideation.md` — CPU-twin + analytic-gate
+  test doctrine; conservation-as-gate template; the fine-spacing/eruption lesson.
+- In-repo templates reused: `src/solvers/xpbd/wetting.wgsl` (conservation-safe transfer trio),
+  `src/solvers/xpbd/extraction.wgsl` (`chem_frozen` sequencing), `src/solvers/xpbd/coupling.wgsl`
+  (`compute_fractions`, `porosity_drag_factor`, `compute_coupling_scale`, `drag_delta_for_pair`),
+  `src/solvers/xpbd/mod.rs` (`sample_extraction` readback, `seed_chem`, `grid_reorder_b`),
+  `src/engine/state.rs` (`Metrics`).
+- External research: not run. Local patterns are strong and the physics (Kozeny–Carman, fines
+  clogging) is settled; modeling is constrained by the existing solver architecture.
+
+exec
+/bin/zsh -lc "sed -n '1,240p' src/solvers/xpbd/common.wgsl" in /Users/cxc/Github/coffee-sim
+ succeeded in 0ms:
+// Shared core for the unified XPBD solver: params/status/bindings, SPH + grid math, and the
+// kernels both species use (predict, grid build, apply_dp, finalize). The water-incompressibility
+// kernels live in `water.wgsl`; the granular-bed kernel in `bed.wgsl`. The three files are
+// concatenated into one shader module at build time (WGSL has no imports), so this file declares
+// everything the others reference.
+//
+// Two species share one particle system + neighbor grid, tagged by `phase`: water solves a
+// density constraint (water.wgsl); grains solve contact + friction + cohesion (bed.wgsl). A
+// scene is single-species for now, so the step loop runs only that species' passes — but the
+// per-particle `phase` guards keep each kernel correct regardless of who calls it.
+
+const PHASE_WATER: u32 = 0u;
+const PHASE_GRAIN: u32 = 1u;
+
+struct Params {
+    box_min: vec4<f32>,
+    box_max: vec4<f32>,
+    gravity: vec4<f32>,
+    grid_origin: vec4<f32>,   // = box_min
+    grid_dims: vec4<u32>,     // nx, ny, nz, num_cells
+    dt: f32,
+    h: f32,
+    rest_density: f32,
+    particle_mass: f32,
+    s_corr_k: f32,
+    s_corr_n: f32,
+    s_corr_wq: f32,           // W_poly6(Δq, h)
+    relaxation_eps: f32,
+    position_relaxation: f32, // ω
+    xsph_c: f32,
+    max_speed: f32,
+    spiky_r_min: f32,         // ε_r · h
+    cell_size: f32,           // = h
+    particle_count: u32,
+    num_solids: u32,          // count of static SDF solids in the `solids` buffer (0 = none)
+    min_iters: u32,
+    max_iters: u32,
+    residual_tolerance: f32,
+    lambda_noncohesive: u32,
+    max_correction: f32,
+    velocity_damping: f32,
+    // --- granular bed (grain phase) ---
+    grain_diameter: f32,      // contact diameter d (separation kicks in below this)
+    friction_mu: f32,         // grain–grain Coulomb coefficient
+    floor_mu: f32,            // grain–boundary (floor/wall) Coulomb coefficient
+    dry_cohesion: f32,        // weak short-range attraction strength (0 = none)
+    cohesion_range: f32,      // cohesion/contact search reach (absolute; d ≤ r < this)
+    rolling_damping: f32,     // grain velocity retained per frame (rolling-resistance proxy)
+    grain_sleep_speed: f32,   // static-yield dead-band: below this a grain is treated as at rest
+    // --- water/bed coupling (mixed scenes) ---
+    grain_mass: f32,
+    grain_volume: f32,        // (π/6)·grain_diameter³ — effective volume for the α_s sum
+    packing_limit: f32,       // α_s clamp (~0.64)
+    exclusion_relax: f32,     // under-relaxation on the A.2 correction
+    drag_gamma: f32,
+    drag_beta_max: f32,
+    buoyancy_scale: f32,
+    wake_threshold: f32,
+    water_grain_distance: f32, // water↔grain exclusion contact (≤ grain spacing lets water thread pores)
+    // --- wetting / cohesion (Phase 1.4) ---
+    r_max: f32,                // moisture ratio at saturation (mass water / mass dry grain)
+    rho_ratio: f32,            // ρ_s/ρ_w — converts absorbed water mass → swelling volume
+    s_peak: f32,               // saturation at the cohesion-curve peak
+    c_max: f32,                // peak wet cohesion strength (0 until calibrated)
+    k_abs: f32,                // absorption rate constant (1/s)
+    absorb_roundoff: f32,      // f_w deactivation floor (exact-conservation; ≪ pbf_eps)
+    pbf_eps: f32,              // PBF skips water with remaining fraction ≤ this
+    // --- extraction + thermal (Phase 1.5) ---
+    extract_rate: f32,         // opt-in gate (0 = off)
+    k0_fast: f32,
+    k0_slow: f32,
+    ea_over_r: f32,
+    t_ref: f32,
+    c_sat: f32,
+    d_ref: f32,
+    u_half: f32,
+    s_on: f32,
+    kappa: f32,
+    cp_water: f32,
+    cp_grain: f32,
+    h_amb: f32,
+    t_amb: f32,
+    _pad_chem0: f32,
+    _pad_chem1: f32,
+};
+
+struct Status {
+    overflow: atomic<u32>,
+    max_occupancy: atomic<u32>,
+    converged: u32,
+    iters_done: u32,
+    effective_iters: u32,
+    residual_bits: u32,
+    _pad0: u32,
+    _pad1: u32,
+};
+
+@group(0) @binding(0) var<uniform> params: Params;
+@group(0) @binding(1) var<storage, read_write> pos: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read_write> pred: array<vec4<f32>>;
+@group(0) @binding(3) var<storage, read_write> vel: array<vec4<f32>>;
+@group(0) @binding(4) var<storage, read_write> vel_smoothed: array<vec4<f32>>;
+@group(0) @binding(5) var<storage, read_write> lambda: array<f32>;
+@group(0) @binding(6) var<storage, read_write> dp: array<vec4<f32>>;
+@group(0) @binding(7) var<storage, read_write> c_residual: array<f32>;
+// Counting-sort spatial hash (no fixed buckets / overflow): cell_start is the exclusive prefix sum
+// of per-cell counts (num_cells+1 entries), and sorted_indices holds particle indices grouped by
+// cell. Gather cell c = sorted_indices[cell_start[c] .. cell_start[c+1]]. cell_count (binding 18) is
+// the transient counter used only while (re)building the grid.
+@group(0) @binding(8) var<storage, read_write> cell_start: array<u32>;
+@group(0) @binding(9) var<storage, read_write> sorted_indices: array<u32>;
+@group(0) @binding(10) var<storage, read_write> status: Status;
+@group(0) @binding(11) var<storage, read_write> phase: array<u32>;
+// Per-grain accumulated normal-correction magnitude this frame (reset in predict). The Coulomb
+// friction budget is μ·normal_impulse — load-scaled and non-zero at static rest, unlike μ·overlap.
+@group(0) @binding(12) var<storage, read_write> normal_impulse: array<f32>;
+// Per-particle solid fraction α_s = Σ grain V_g W (clamped to the packing limit). Computed each
+// iteration by compute_fractions in mixed scenes; zero in single-species scenes (so the water
+// density solve is unmodulated there). The water target becomes ρ₀·(1−α_s) → pore water packs to
+// the pore fraction (drainage-ready), and the geometric exclusion keeps water out of grain bodies.
+@group(0) @binding(13) var<storage, read_write> alpha_s: array<f32>;
+// Per-grain accumulated |water↔grain drag impulse| this frame; it wakes the static dead-band
+// under fluid load. Reset in predict, written by drag_grain, read in finalize.
+@group(0) @binding(14) var<storage, read_write> fluid_impulse: array<f32>;
+// Frozen velocity snapshot for symmetric water↔grain drag gathers. Both drag passes read the
+// same snapshot so every pair computes equal-and-opposite impulses without atomics.
+@group(0) @binding(15) var<storage, read_write> vel_frozen: array<vec4<f32>>;
+// Per-particle drag blend cap computed from the opposite-phase neighbor count.
+@group(0) @binding(16) var<storage, read_write> coupling_scale: array<f32>;
+// Per-particle count of ELIGIBLE opposite-species neighbors for absorption (wetting): water → N_w
+// (# unsaturated grains), grain → N_g (# non-empty waters). Written by wet_count, read by both
+// transfer passes so the two-sided allocation take_wg is identical (and conservation-safe).
+@group(0) @binding(17) var<storage, read_write> wet_neighbors: array<u32>;
+// Transient per-cell particle counter for the counting-sort grid build (count → scan → scatter).
+@group(0) @binding(18) var<storage, read_write> cell_count: array<atomic<u32>>;
+
+// Static SDF solid geometry (read-only). Each Primitive is a cavity: sample > 0 inside (allowed),
+// < 0 through the wall. Only the collision passes (apply_dp / apply_drag_pred) reach `solid_union`,
+// so this binding is absent from every other kernel's auto-derived layout (8-buffer budget holds).
+// Byte-identical to the Rust `Primitive` (64 bytes). Cone radii in `a` are OUTER wall radii.
+struct Primitive {
+    kind: u32,          // 0 = cone, 1 = cylinder
+    species_mask: u32,
+    friction: f32,
+    flags: u32,         // bit0 = apex_open
+    a: vec4<f32>,       // cone:(apex_y, apex_r, top_y, top_r)  cyl:(floor_y, rim_y, radius, _)
+    b: vec4<f32>,       // cone:(thickness, hole_radius, center_x, center_z)  cyl:(center_x, center_z, _, _)
+    c: vec4<f32>,       // reserved
+};
+@group(0) @binding(19) var<storage, read> solids: array<Primitive>;
+
+const PI: f32 = 3.14159265358979;
+
+// --- SDF cavity geometry (mirrors utils/sdf.rs; interior positive, gradient toward the cavity) ---
+const SDF_EPS: f32 = 1.0e-6;
+const SDF_FREE: f32 = 1.0e30;
+
+struct SolidHit { dist: f32, grad: vec3<f32>, friction: f32 };
+struct SegCP { p: vec2<f32>, interior: bool };
+
+fn sdf_normalize2(v: vec2<f32>) -> vec2<f32> {
+    let len = length(v);
+    if (len > SDF_EPS) { return v / len; }
+    return vec2<f32>(0.0, 0.0);
+}
+fn sdf_normalize3(v: vec3<f32>) -> vec3<f32> {
+    let len = length(v);
+    if (len > SDF_EPS) { return v / len; }
+    return vec3<f32>(0.0, 0.0, 0.0);
+}
+fn sdf_closest_on_segment(p: vec2<f32>, a: vec2<f32>, b: vec2<f32>) -> SegCP {
+    let ab = b - a;
+    let len2 = dot(ab, ab);
+    if (len2 < SDF_EPS) { return SegCP(a, false); }
+    let t = dot(p - a, ab) / len2;
+    let tc = clamp(t, 0.0, 1.0);
+    return SegCP(a + ab * tc, t > SDF_EPS && t < 1.0 - SDF_EPS);
+}
+
+fn cone_cavity(prim: Primitive, p: vec3<f32>) -> SolidHit {
+    let apex_y = prim.a.x;
+    let apex_r = prim.a.y;
+    let top_y = prim.a.z;
+    let top_r = prim.a.w;
+    let thickness = prim.b.x;
+    let hole_radius = prim.b.y;
+    let center = vec2<f32>(prim.b.z, prim.b.w);
+    let apex_open = (prim.flags & 1u) != 0u;
+
+    let rel = vec2<f32>(p.x - center.x, p.z - center.y);
+    let r = length(rel);
+    let y = p.y;
+    var rhat = vec2<f32>(0.0, 0.0);
+    if (r >= SDF_EPS) { rhat = rel / r; } // axis guard before building the 3D gradient
+
+    if (y > top_y) { return SolidHit(SDF_FREE, vec3<f32>(0.0, 1.0, 0.0), prim.friction); }
+    if (apex_open && y < apex_y) { return SolidHit(SDF_FREE, vec3<f32>(0.0, -1.0, 0.0), prim.friction); }
+
+    let inner_apex = max(apex_r - thickness, hole_radius);
+    let inner_top = max(top_r - thickness, hole_radius);
+    let a2 = vec2<f32>(inner_apex, apex_y);
+    let b2 = vec2<f32>(inner_top, top_y);
+    let cp = sdf_closest_on_segment(vec2<f32>(r, y), a2, b2);
+    let d2d = length(vec2<f32>(r, y) - cp.p);
+
+    let height = top_y - apex_y;
+    var t = 0.0;
+    if (height > SDF_EPS) { t = (y - apex_y) / height; }
+    let inner = max(mix(apex_r, top_r, t) - thickness, hole_radius);
+    let inside = (y >= apex_y) && (r <= inner);
+    var dist = -d2d;
+    if (inside) { dist = d2d; }
+
+    let dir = vec2<f32>(r, y) - cp.p;
+    var n2d = vec2<f32>(0.0, 0.0);
+    if (length(dir) > SDF_EPS) {
+        if (inside) { n2d = sdf_normalize2(dir); } else { n2d = sdf_normalize2(-dir); }
+    } else if (cp.interior) {
+        let ab = b2 - a2;
+        n2d = sdf_normalize2(vec2<f32>(-ab.y, ab.x)); // smooth-wall analytic normal (never zero here)
+    }
+    let grad = sdf_normalize3(vec3<f32>(n2d.x * rhat.x, n2d.y, n2d.x * rhat.y));
+    return SolidHit(dist, grad, prim.friction);
+}
+
+fn cyl_cavity(prim: Primitive, p: vec3<f32>) -> SolidHit {
+    let floor_y = prim.a.x;
+    let rim_y = prim.a.y;
+    let radius = prim.a.z;
+    let center = vec2<f32>(prim.b.x, prim.b.y);
+    let rel = vec2<f32>(p.x - center.x, p.z - center.y);
+    let r = length(rel);
+    let y = p.y;
+    if (y > rim_y) { return SolidHit(SDF_FREE, vec3<f32>(0.0, 1.0, 0.0), prim.friction); }
+    let d_side = radius - r;
+    let d_floor = y - floor_y;
+    if (d_side <= d_floor) {
+        var rhat = vec2<f32>(0.0, 0.0);
+        if (r >= SDF_EPS) { rhat = rel / r; }
+        return SolidHit(d_side, sdf_normalize3(vec3<f32>(-rhat.x, 0.0, -rhat.y)), prim.friction);
+
+exec
+/bin/zsh -lc "sed -n '1,260p' src/solvers/xpbd/wetting.wgsl" in /Users/cxc/Github/coffee-sim
+exec
+/bin/zsh -lc "sed -n '280,620p' src/solvers/xpbd/coupling.wgsl" in /Users/cxc/Github/coffee-sim
+ succeeded in 0ms:
+// Wetting / absorption (XPBD step 4). Concatenated after common/water/bed/coupling.
+//
+// Dry grains absorb nearby water, conserving volume AND mass: the water volume transferred leaves
+// the fluid phase (water's remaining-volume fraction f_w shrinks) and becomes grain volume (V_abs
+// grows — the grain swells, applied in a later unit). Atomic-free and conservation-safe via a
+// deterministic, water-normalized two-sided allocation read from the frozen pred.w snapshot:
+//
+//   take_wg = min( f_w·V_w / N_w , demand_g / N_g )
+//
+// computed identically in the water pass (sums Σ_g take, shrinks its own f_w) and the grain pass
+// (sums Σ_w take into its own V_abs + the absorbed momentum). The two-sided cap bounds both per-water
+// (Σ_g ≤ f_w·V_w) and per-grain (Σ_w ≤ demand_g ≤ deficit, no V_cap overshoot). Each pass writes only
+// its own slot, so no atomics are needed. Runs after finalize; the next predict mirrors the new pos.w.
+//
+// moisture lane convention (pos.w / its frozen mirror pred.w): water = f_w ∈ [0,1], grain = V_abs ≥ 0.
+
+fn wet_v_cap() -> f32 { return params.r_max * params.rho_ratio * params.grain_volume; }
+// Saturation cutoff: a grain within `absorb_roundoff` of capacity is treated as full. Mirrors the
+// water lane's `absorb_roundoff` f_w deactivation floor. Without it the demand asymptotes toward
+// V_cap forever, and once the per-step `take` drops below the near-capacity grain's f32 ulp the grain
+// rounds its gain away (`v_abs + take == v_abs`) while the water still records the loss — a one-signed
+// volume sink that only shows up in the deep tail. Flooring demand to 0 here stops that tail cleanly.
+fn wet_sat_cutoff() -> f32 { let c = wet_v_cap(); return c - c * params.absorb_roundoff; }
+fn wet_v_water() -> f32 { return params.particle_mass / params.rest_density; }
+fn wet_demand(v_abs: f32) -> f32 {
+    if (v_abs >= wet_sat_cutoff()) { return 0.0; }
+    return (wet_v_cap() - v_abs) * (1.0 - exp(-params.k_abs * params.dt));
+}
+
+// Per-particle count of ELIGIBLE opposite-species neighbors in range (from the frozen pred.w):
+// for a water this is N_w (# unsaturated grains), for a grain it is N_g (# non-empty waters). Both
+// passes read this same buffer, so take_wg is identical on each side.
+@compute @workgroup_size(256)
+fn wet_count(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= params.particle_count) { return; }
+    let ph_i = phase[i];
+    let xi = pred[i].xyz;
+    let cutoff = wet_sat_cutoff();
+    var n = 0u;
+    let base = cell_coord(xi);
+    for (var dz = -1; dz <= 1; dz = dz + 1) {
+        for (var dy = -1; dy <= 1; dy = dy + 1) {
+            for (var dx = -1; dx <= 1; dx = dx + 1) {
+                let nc = base + vec3<i32>(dx, dy, dz);
+                if (nc.x < 0 || nc.y < 0 || nc.z < 0) { continue; }
+                let dims = vec3<i32>(params.grid_dims.xyz);
+                if (nc.x >= dims.x || nc.y >= dims.y || nc.z >= dims.z) { continue; }
+                let cid = cell_id(nc);
+                let lo = cell_start[cid];
+                let hi = cell_start[cid + 1u];
+                for (var s = lo; s < hi; s = s + 1u) {
+                    let j = sorted_indices[s];
+                    if (j == i) { continue; }
+                    let ph_j = phase[j];
+                    if (ph_j == ph_i) { continue; } // opposite species only
+                    let r = length(xi - pred[j].xyz);
+                    if (r >= params.h) { continue; }
+                    if (ph_j == PHASE_WATER) {
+                        if (pred[j].w > params.absorb_roundoff) { n = n + 1u; } // non-empty water
+                    } else {
+                        if (pred[j].w < cutoff) { n = n + 1u; } // unsaturated grain (demand > 0)
+                    }
+                }
+            }
+        }
+    }
+    wet_neighbors[i] = n;
+}
+
+@compute @workgroup_size(256)
+fn wet_water(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= params.particle_count) { return; }
+    if (phase[i] != PHASE_WATER) { return; }
+    let f_w = pred[i].w;
+    let n_w = f32(wet_neighbors[i]);
+    if (f_w <= params.absorb_roundoff || n_w <= 0.0) { return; } // inert / no eligible grains
+
+    let cutoff = wet_sat_cutoff();
+    let v_w = wet_v_water();
+    let xi = pred[i].xyz;
+    var total = 0.0;
+    let base = cell_coord(xi);
+    for (var dz = -1; dz <= 1; dz = dz + 1) {
+        for (var dy = -1; dy <= 1; dy = dy + 1) {
+            for (var dx = -1; dx <= 1; dx = dx + 1) {
+                let nc = base + vec3<i32>(dx, dy, dz);
+                if (nc.x < 0 || nc.y < 0 || nc.z < 0) { continue; }
+                let dims = vec3<i32>(params.grid_dims.xyz);
+                if (nc.x >= dims.x || nc.y >= dims.y || nc.z >= dims.z) { continue; }
+                let cid = cell_id(nc);
+                let lo = cell_start[cid];
+                let hi = cell_start[cid + 1u];
+                for (var s = lo; s < hi; s = s + 1u) {
+                    let j = sorted_indices[s];
+                    if (phase[j] != PHASE_GRAIN) { continue; }
+                    let r = length(xi - pred[j].xyz);
+                    if (r >= params.h) { continue; }
+                    let v_abs_g = pred[j].w;
+                    if (v_abs_g >= cutoff) { continue; } // saturated grain ineligible
+                    let n_g = f32(wet_neighbors[j]);
+                    if (n_g <= 0.0) { continue; }
+                    total = total + min(f_w * v_w / n_w, wet_demand(v_abs_g) / n_g);
+                }
+            }
+        }
+    }
+    // Volume only leaves via the capped transfer (no force-dump); the cap guarantees total ≤ f_w·V_w.
+    pos[i] = vec4<f32>(pos[i].xyz, max(f_w - total / v_w, 0.0));
+}
+
+@compute @workgroup_size(256)
+fn wet_grain(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= params.particle_count) { return; }
+    if (phase[i] != PHASE_GRAIN) { return; }
+    let v_abs = pred[i].w;
+    let v_cap = wet_v_cap();
+    let n_g = f32(wet_neighbors[i]);
+    let demand_g = wet_demand(v_abs);
+    if (demand_g <= 0.0 || n_g <= 0.0) { return; } // saturated / no eligible water
+
+    let v_w = wet_v_water();
+    let xi = pred[i].xyz;
+    var d_v = 0.0;
+    var p_abs = vec3<f32>(0.0);
+    let base = cell_coord(xi);
+    for (var dz = -1; dz <= 1; dz = dz + 1) {
+        for (var dy = -1; dy <= 1; dy = dy + 1) {
+            for (var dx = -1; dx <= 1; dx = dx + 1) {
+                let nc = base + vec3<i32>(dx, dy, dz);
+                if (nc.x < 0 || nc.y < 0 || nc.z < 0) { continue; }
+                let dims = vec3<i32>(params.grid_dims.xyz);
+                if (nc.x >= dims.x || nc.y >= dims.y || nc.z >= dims.z) { continue; }
+                let cid = cell_id(nc);
+                let lo = cell_start[cid];
+                let hi = cell_start[cid + 1u];
+                for (var s = lo; s < hi; s = s + 1u) {
+                    let j = sorted_indices[s];
+                    if (phase[j] != PHASE_WATER) { continue; }
+                    let r = length(xi - pred[j].xyz);
+                    if (r >= params.h) { continue; }
+                    let f_w = pred[j].w;
+                    if (f_w <= params.absorb_roundoff) { continue; }
+                    let n_w = f32(wet_neighbors[j]);
+                    if (n_w <= 0.0) { continue; }
+                    // Identical formula + frozen snapshot as wet_water → water-loss == grain-gain.
+                    let take = min(f_w * v_w / n_w, demand_g / n_g);
+                    d_v = d_v + take;
+                    p_abs = p_abs + take * params.rest_density * vel[j].xyz;
+                }
+            }
+        }
+    }
+    // Exact per-substep inelastic merge of the absorbed mass (m_old is the pre-absorption mass).
+    let m_old = params.grain_mass + params.rest_density * v_abs;
+    let dm = params.rest_density * d_v;
+    vel[i] = vec4<f32>((m_old * vel[i].xyz + p_abs) / (m_old + dm), 0.0);
+    pos[i] = vec4<f32>(pos[i].xyz, v_abs + d_v);
+}
+
+ succeeded in 0ms:
+    }
+
+    vel[i] = vec4<f32>(vel_frozen[i].xyz + dv, 0.0);
+    fluid_impulse[i] = fluid_impulse[i] + params.grain_mass * length(dv);
+}
+
+fn pressure_for_water(i: u32) -> f32 {
+    return max(-lambda[i], 0.0);
+}
+
+@compute @workgroup_size(256)
+fn buoyancy_grain(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= params.particle_count) { return; }
+    if (phase[i] != PHASE_GRAIN) { return; }
+    let xi = pred[i].xyz;
+    var impulse = vec3<f32>(0.0);
+
+    let base = cell_coord(xi);
+    for (var dz = -1; dz <= 1; dz = dz + 1) {
+        for (var dy = -1; dy <= 1; dy = dy + 1) {
+            for (var dx = -1; dx <= 1; dx = dx + 1) {
+                let nc = base + vec3<i32>(dx, dy, dz);
+                if (nc.x < 0 || nc.y < 0 || nc.z < 0) { continue; }
+                let dims = vec3<i32>(params.grid_dims.xyz);
+                if (nc.x >= dims.x || nc.y >= dims.y || nc.z >= dims.z) { continue; }
+                let cid = cell_id(nc);
+                let lo = cell_start[cid];
+                let hi = cell_start[cid + 1u];
+                for (var s = lo; s < hi; s = s + 1u) {
+                    let j = sorted_indices[s];
+                    if (phase[j] != PHASE_WATER) { continue; }
+                    let d = xi - pred[j].xyz;
+                    let r = length(d);
+                    if (r >= params.h) { continue; }
+                    impulse = impulse + params.buoyancy_scale * pressure_for_water(j) *
+                        spiky_grad(d, params.h, params.spiky_r_min);
+                }
+            }
+        }
+    }
+
+    let m_g = grain_eff_mass(pred[i].w); // swelling: heavier wet grain accelerates less
+    // Density-aware: a denser-than-water grain is buoyed less (sinks); same factor on the water side
+    // (per pair) keeps momentum conserved. Uniform over this grain's pairs, so scale the total.
+    let dv = grain_buoyancy_factor(pred[i].w) * impulse / m_g;
+    vel[i] = vec4<f32>(vel_frozen[i].xyz + dv, 0.0);
+    fluid_impulse[i] = fluid_impulse[i] + m_g * length(dv);
+}
+
+@compute @workgroup_size(256)
+fn buoyancy_water(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= params.particle_count) { return; }
+    if (phase[i] != PHASE_WATER) { return; }
+    let xi = pred[i].xyz;
+    let pressure = pressure_for_water(i);
+    var impulse = vec3<f32>(0.0);
+
+    let base = cell_coord(xi);
+    for (var dz = -1; dz <= 1; dz = dz + 1) {
+        for (var dy = -1; dy <= 1; dy = dy + 1) {
+            for (var dx = -1; dx <= 1; dx = dx + 1) {
+                let nc = base + vec3<i32>(dx, dy, dz);
+                if (nc.x < 0 || nc.y < 0 || nc.z < 0) { continue; }
+                let dims = vec3<i32>(params.grid_dims.xyz);
+                if (nc.x >= dims.x || nc.y >= dims.y || nc.z >= dims.z) { continue; }
+                let cid = cell_id(nc);
+                let lo = cell_start[cid];
+                let hi = cell_start[cid + 1u];
+                for (var s = lo; s < hi; s = s + 1u) {
+                    let j = sorted_indices[s];
+                    if (phase[j] != PHASE_GRAIN) { continue; }
+                    let d = xi - pred[j].xyz;
+                    let r = length(d);
+                    if (r >= params.h) { continue; }
+                    // Grain pass pair: J_gw = s*p_w*∇W(x_g − x_w). Here d = x_w − x_g, so
+                    // ∇W(d) = −∇W(x_g − x_w), making this exactly −J_gw for the same pair. The grain's
+                    // density factor matches the grain-pass scaling → equal-and-opposite per pair.
+                    impulse = impulse + grain_buoyancy_factor(pred[j].w) * params.buoyancy_scale *
+                        pressure * spiky_grad(d, params.h, params.spiky_r_min);
+                }
+            }
+        }
+    }
+
+    // Effective water mass, floored so a near-empty (absorbed) particle can't blow up the divide.
+    let m_w = max(water_eff_mass(pred[i].w), params.particle_mass * params.pbf_eps);
+    vel[i] = vec4<f32>(vel_frozen[i].xyz + impulse / m_w, 0.0);
+}
+
+@compute @workgroup_size(256)
+fn apply_drag_pred(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= params.particle_count) { return; }
+    let dv = vel[i].xyz - vel_frozen[i].xyz;
+    var p = pred[i].xyz + params.dt * dv;
+    // Static-solid push-out (push-out + species gate only; friction is owned by apply_dp/finalize, so
+    // the drag micro-step needs neither pos nor the floor_mu machinery). No-op when num_solids == 0.
+    if (params.num_solids > 0u) {
+        let hit = solid_union(p, phase[i]);
+        // Water projects to the surface (offset 0, dissipative); grains keep a radius standoff.
+        let contact = select(0.0, 0.5 * params.grain_diameter, phase[i] == PHASE_GRAIN);
+        if (hit.dist < contact) {
+            p = p + (contact - hit.dist) * hit.grad;
+        }
+    }
+    // Preserve the moisture snapshot in pred.w — this runs in the drag/buoyancy subcycle before
+    // absorption, so zeroing .w here would wipe the per-frame snapshot the wetting passes read.
+    pred[i] = vec4<f32>(clamp(p, params.box_min.xyz, params.box_max.xyz), pred[i].w);
+}
+
+exec
+/bin/zsh -lc "sed -n '1,260p' src/solvers/xpbd/extraction.wgsl" in /Users/cxc/Github/coffee-sim
+ succeeded in 0ms:
+// Extraction (XPBD step 5, Phase 1.5). Concatenated after common/water/bed/coupling/wetting.
+//
+// Wet grains dissolve two-pool solute into overlapping water's concentration `c`, conserving the
+// solute inventory exactly without atomics — the same frozen-snapshot, two-sided, count-normalized
+// allocation as the wetting transfer:
+//
+//   take_gw = min( release_g / N_w ,  max(c_sat − c_w, 0)·(f_w·V_w) / N_g )
+//
+// computed identically in `dissolve_grain` (decrements its pools by Σ_w take, split proportionally
+// across the two pools) and `dissolve_water` (adds Σ_g take to its own `c`). Both read the FROZEN
+// chem snapshot (`chem_frozen`) + the frozen counts/flux (`diss_neighbors`) and write only the live
+// `chem`, so grain-loss == water-gain to float tolerance and there is no read/write race. The grain's
+// `release` is a pure function of its frozen state + per-grain aggregate flux, so the water pass
+// recomputes the same value. The `(1−c/c_sat)` driving force is realized as the water-headroom cap.
+//
+// Runs AFTER wetting/finalize, so it reads `pos` for both position (pos.xyz == pred.xyz post-finalize,
+// matching the rebuilt grid) and the POST-WETTING moisture (pos.w) — the grain's current saturation
+// gates extraction and the water's current volume sizes the headroom. The dissolution passes write
+// only `chem`, so reading `pos` is race-free. (Using `pos` for both also keeps both transfer passes
+// at exactly 8 storage buffers — no room for a separate `pred` binding.)
+//
+// Eligibility (identical on all three passes): opposite species within `h`, and both particles
+// "active" — grain wet (pos.w = V_abs > absorb_roundoff) and water mobile (pos.w = f_w > roundoff).
+// chem lanes: grain (s_f, s_s, T_g, _), water (c, T_w, _, _). moisture lane pos.w as in wetting.
+
+// Per-grain two-pool release this substep (rf, rs, rf+rs), a pure function of the grain's FROZEN
+// state + aggregate flux (so both transfer passes recompute it identically). No driving term here —
+// the (1−c/c_sat) driving force lives in the per-pair water-headroom cap.
+fn diss_release(g: u32) -> vec3<f32> {
+    let cf = chem_frozen[g];        // (s_f, s_s, T_g, _)
+    let flux_g = diss_neighbors[g].y;
+    let sat = clamp(pos[g].w / wet_v_cap(), 0.0, 1.0); // grain moisture saturation (V_abs / V_cap)
+    let kbase = params.extract_rate
+        * ex_arrhenius(cf.z, params.ea_over_r, params.t_ref)
+        * ex_area(params.grain_diameter, params.d_ref)
+        * ex_flux(flux_g, params.u_half)
+        * ex_wet_gate(sat, params.s_on);
+    let rf = ex_release(cf.x, kbase * params.k0_fast, params.dt);
+    let rs = ex_release(cf.y, kbase * params.k0_slow, params.dt);
+    return vec3<f32>(rf, rs, rf + rs);
+}
+
+// Per-particle eligible-opposite-species count + (for grains) the aggregate relative-velocity flux,
+// from the post-wetting positions/moisture + finalized velocity. Both transfer passes read this.
+@compute @workgroup_size(256)
+fn diss_count(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= params.particle_count) { return; }
+    let ph_i = phase[i];
+    let xi = pos[i].xyz;
+    let vi = vel[i].xyz;
+    var n = 0u;
+    var flux_acc = 0.0;
+    let base = cell_coord(xi);
+    for (var dz = -1; dz <= 1; dz = dz + 1) {
+        for (var dy = -1; dy <= 1; dy = dy + 1) {
+            for (var dx = -1; dx <= 1; dx = dx + 1) {
+                let nc = base + vec3<i32>(dx, dy, dz);
+                if (nc.x < 0 || nc.y < 0 || nc.z < 0) { continue; }
+                let dims = vec3<i32>(params.grid_dims.xyz);
+                if (nc.x >= dims.x || nc.y >= dims.y || nc.z >= dims.z) { continue; }
+                let cid = cell_id(nc);
+                let lo = cell_start[cid];
+                let hi = cell_start[cid + 1u];
+                for (var s = lo; s < hi; s = s + 1u) {
+                    let j = sorted_indices[s];
+                    if (j == i) { continue; }
+                    if (phase[j] == ph_i) { continue; } // opposite species only
+                    if (length(xi - pos[j].xyz) >= params.h) { continue; }
+                    if (pos[j].w <= params.absorb_roundoff) { continue; } // inactive neighbor
+                    n = n + 1u;
+                    if (ph_i == PHASE_GRAIN) { flux_acc = flux_acc + length(vi - vel[j].xyz); }
+                }
+            }
+        }
+    }
+    var flux_g = 0.0;
+    if (ph_i == PHASE_GRAIN && n > 0u) { flux_g = flux_acc / f32(n); }
+    diss_neighbors[i] = vec2<f32>(f32(n), flux_g);
+}
+
+@compute @workgroup_size(256)
+fn dissolve_grain(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= params.particle_count) { return; }
+    if (phase[i] != PHASE_GRAIN) { return; }
+    if (pos[i].w <= params.absorb_roundoff) { return; } // dry grain doesn't extract
+    let rel = diss_release(i);
+    let n_w = diss_neighbors[i].x;
+    if (rel.z <= 0.0 || n_w <= 0.0) { return; } // no pools/rate or no eligible water
+
+    let v_w = wet_v_water();
+    let xi = pos[i].xyz;
+    var total = 0.0;
+    let base = cell_coord(xi);
+    for (var dz = -1; dz <= 1; dz = dz + 1) {
+        for (var dy = -1; dy <= 1; dy = dy + 1) {
+            for (var dx = -1; dx <= 1; dx = dx + 1) {
+                let nc = base + vec3<i32>(dx, dy, dz);
+                if (nc.x < 0 || nc.y < 0 || nc.z < 0) { continue; }
+                let dims = vec3<i32>(params.grid_dims.xyz);
+                if (nc.x >= dims.x || nc.y >= dims.y || nc.z >= dims.z) { continue; }
+                let cid = cell_id(nc);
+                let lo = cell_start[cid];
+                let hi = cell_start[cid + 1u];
+                for (var s = lo; s < hi; s = s + 1u) {
+                    let j = sorted_indices[s];
+                    if (phase[j] != PHASE_WATER) { continue; }
+                    if (length(xi - pos[j].xyz) >= params.h) { continue; }
+                    let f_w = pos[j].w;
+                    if (f_w <= params.absorb_roundoff) { continue; }
+                    let n_g = diss_neighbors[j].x;
+                    if (n_g <= 0.0) { continue; }
+                    let headroom = max(params.c_sat - chem_frozen[j].x, 0.0) * (f_w * v_w);
+                    total = total + min(rel.z / n_w, headroom / n_g);
+                }
+            }
+        }
+    }
+    // Deplete the two pools proportionally (Σtake ≤ rel.z ⇒ pools stay ≥ 0). Base off the frozen
+    // snapshot; T lane preserved.
+    let cf = chem_frozen[i];
+    let sf = max(cf.x - total * rel.x / rel.z, 0.0);
+    let ss = max(cf.y - total * rel.y / rel.z, 0.0);
+    chem[i] = vec4<f32>(sf, ss, cf.z, cf.w);
+}
+
+@compute @workgroup_size(256)
+fn dissolve_water(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= params.particle_count) { return; }
+    if (phase[i] != PHASE_WATER) { return; }
+    let f_w = pos[i].w;
+    if (f_w <= params.absorb_roundoff) { return; } // immobile water
+    let n_g = diss_neighbors[i].x;
+    if (n_g <= 0.0) { return; }
+
+    let v_w = wet_v_water();
+    let cf = chem_frozen[i];
+    let headroom = max(params.c_sat - cf.x, 0.0) * (f_w * v_w);
+    let xi = pos[i].xyz;
+    var total = 0.0;
+    let base = cell_coord(xi);
+    for (var dz = -1; dz <= 1; dz = dz + 1) {
+        for (var dy = -1; dy <= 1; dy = dy + 1) {
+            for (var dx = -1; dx <= 1; dx = dx + 1) {
+                let nc = base + vec3<i32>(dx, dy, dz);
+                if (nc.x < 0 || nc.y < 0 || nc.z < 0) { continue; }
+                let dims = vec3<i32>(params.grid_dims.xyz);
+                if (nc.x >= dims.x || nc.y >= dims.y || nc.z >= dims.z) { continue; }
+                let cid = cell_id(nc);
+                let lo = cell_start[cid];
+                let hi = cell_start[cid + 1u];
+                for (var s = lo; s < hi; s = s + 1u) {
+                    let j = sorted_indices[s];
+                    if (phase[j] != PHASE_GRAIN) { continue; }
+                    if (length(xi - pos[j].xyz) >= params.h) { continue; }
+                    if (pos[j].w <= params.absorb_roundoff) { continue; } // dry grain
+                    let rel = diss_release(j);
+                    let n_w = diss_neighbors[j].x;
+                    if (rel.z <= 0.0 || n_w <= 0.0) { continue; }
+                    // Identical take + frozen snapshot as dissolve_grain → grain-loss == water-gain.
+                    total = total + min(rel.z / n_w, headroom / n_g);
+                }
+            }
+        }
+    }
+    // Concentration rises by the dissolved solute over the remaining water volume (≤ c_sat by the
+    // headroom cap). T lane preserved.
+    chem[i] = vec4<f32>(cf.x + total / (f_w * v_w), cf.y, cf.z, cf.w);
+}
+
+// --- Thermal exchange (U6) -------------------------------------------------------------------------
+// Per-particle lumped heat conduction + ambient loss. The temperature lane differs by species
+// (grain T = chem.z, water T = chem.y), so read/write go through phase-aware helpers. Capacity
+// C = effective_mass · specific_heat (water mass scales with f_w; wet-grain mass includes the
+// absorbed water ρ·V_abs). Runs after dissolution on a FRESH chem_frozen snapshot, so it preserves
+// the post-dissolution c/pools (it writes only the T lane). Reads `pos` for moisture/position (same
+// rationale as the dissolution passes); the grid was rebuilt for diss_count and is still valid.
+
+fn th_temp(ph: u32, cf: vec4<f32>) -> f32 {
+    return select(cf.y, cf.z, ph == PHASE_GRAIN); // water T at .y, grain T at .z
+}
+fn th_capacity(ph: u32, w: f32) -> f32 {
+    let cp = select(params.cp_water, params.cp_grain, ph == PHASE_GRAIN);
+    return eff_mass(ph, w) * cp;
+}
+
+@compute @workgroup_size(256)
+fn thermal_exchange(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= params.particle_count) { return; }
+    let ph_i = phase[i];
+    let cf_i = chem_frozen[i];
+    let t_i = th_temp(ph_i, cf_i);
+    let c_i = th_capacity(ph_i, pos[i].w);
+
+    var q_sum = 0.0;
+    let xi = pos[i].xyz;
+    let base = cell_coord(xi);
+    for (var dz = -1; dz <= 1; dz = dz + 1) {
+        for (var dy = -1; dy <= 1; dy = dy + 1) {
+            for (var dx = -1; dx <= 1; dx = dx + 1) {
+                let nc = base + vec3<i32>(dx, dy, dz);
+                if (nc.x < 0 || nc.y < 0 || nc.z < 0) { continue; }
+                let dims = vec3<i32>(params.grid_dims.xyz);
+                if (nc.x >= dims.x || nc.y >= dims.y || nc.z >= dims.z) { continue; }
+                let cid = cell_id(nc);
+                let lo = cell_start[cid];
+                let hi = cell_start[cid + 1u];
+                for (var s = lo; s < hi; s = s + 1u) {
+                    let j = sorted_indices[s];
+                    if (j == i) { continue; }
+                    if (length(xi - pos[j].xyz) >= params.h) { continue; }
+                    let ph_j = phase[j];
+                    let c_j = th_capacity(ph_j, pos[j].w);
+                    if (c_j <= 1e-6) { continue; } // empty neighbor carries no heat
+                    let t_j = th_temp(ph_j, chem_frozen[j]);
+                    // Antisymmetric pair heat (q_ji = −q_ij) → Σ C·T conserved across the pass.
+                    q_sum = q_sum + th_pair_heat(t_i, c_i, t_j, c_j, params.kappa, params.dt);
+                }
+            }
+        }
+    }
+
+    var t_new = t_i;
+    if (c_i > 1e-6) { t_new = t_i + q_sum / c_i; } // zero-capacity particle exchanges nothing
+    t_new = t_new + th_ambient(t_new, params.t_amb, params.h_amb, params.dt);
+
+    // Write only the T lane, preserving the post-dissolution c/pools from the frozen snapshot.
+    if (ph_i == PHASE_GRAIN) {
+        chem[i] = vec4<f32>(cf_i.x, cf_i.y, t_new, cf_i.w);
+    } else {
+        chem[i] = vec4<f32>(cf_i.x, t_new, cf_i.z, cf_i.w);
+    }
+}
+
+exec
+/bin/zsh -lc "rg -n \"coupling_scale|grid_reorder|chem_frozen|wet_neighbors|binding\\(16\\)|sample_diagnostics|struct Params|Metrics|compute_fractions|drag_water|drag_grain|water_eff_mass|alpha_s|target\" src/solvers/xpbd/mod.rs src/solvers/xpbd/common.wgsl src/solvers/xpbd/water.wgsl src/engine/state.rs" in /Users/cxc/Github/coffee-sim
+ succeeded in 0ms:
+src/solvers/xpbd/water.wgsl:93:    // Pore-modulated rest density: where grains are present the water target is ρ₀·(1−α_s), so
+src/solvers/xpbd/water.wgsl:96:    let pore = max(1.0 - alpha_s[i], 0.05);
+src/solvers/xpbd/water.wgsl:193:    let pore = max(1.0 - alpha_s[i], 0.05);
+src/solvers/xpbd/common.wgsl:15:struct Params {
+src/solvers/xpbd/common.wgsl:118:// iteration by compute_fractions in mixed scenes; zero in single-species scenes (so the water
+src/solvers/xpbd/common.wgsl:119:// density solve is unmodulated there). The water target becomes ρ₀·(1−α_s) → pore water packs to
+src/solvers/xpbd/common.wgsl:121:@group(0) @binding(13) var<storage, read_write> alpha_s: array<f32>;
+src/solvers/xpbd/common.wgsl:123:// under fluid load. Reset in predict, written by drag_grain, read in finalize.
+src/solvers/xpbd/common.wgsl:129:@group(0) @binding(16) var<storage, read_write> coupling_scale: array<f32>;
+src/solvers/xpbd/common.wgsl:133:@group(0) @binding(17) var<storage, read_write> wet_neighbors: array<u32>;
+src/solvers/xpbd/common.wgsl:265:// `chem_frozen` is the per-substep snapshot the dissolution/thermal passes read (so writes to live
+src/solvers/xpbd/common.wgsl:268:@group(0) @binding(22) var<storage, read> chem_frozen: array<vec4<f32>>;
+src/solvers/xpbd/common.wgsl:277:// consistent and their gathers are near-contiguous for free). Bound only by the grid_reorder_* passes.
+src/solvers/xpbd/common.wgsl:379:fn water_eff_mass(f_w: f32) -> f32 { return params.particle_mass * f_w; }
+src/solvers/xpbd/common.wgsl:383:    return water_eff_mass(w);
+src/solvers/xpbd/common.wgsl:520:// the particle that belongs at `slot`. grid_reorder_a/b GATHER the persistent payload into scratch by
+src/solvers/xpbd/common.wgsl:522:// grid_reorder_identity rewrites sorted_indices to the identity permutation. The unchanged neighbor
+src/solvers/xpbd/common.wgsl:527:fn grid_reorder_a(@builtin(global_invocation_id) gid: vec3<u32>) {
+src/solvers/xpbd/common.wgsl:537:fn grid_reorder_b(@builtin(global_invocation_id) gid: vec3<u32>) {
+src/solvers/xpbd/common.wgsl:548:fn grid_reorder_identity(@builtin(global_invocation_id) gid: vec3<u32>) {
+src/engine/state.rs:8:pub struct Metrics {
+src/engine/state.rs:22:    pub metrics: Metrics,
+src/solvers/xpbd/mod.rs:15:use crate::engine::{Metrics, Scene};
+src/solvers/xpbd/mod.rs:38:struct Params {
+src/solvers/xpbd/mod.rs:192:    grid_reorder_a: wgpu::ComputePipeline,
+src/solvers/xpbd/mod.rs:193:    grid_reorder_b: wgpu::ComputePipeline,
+src/solvers/xpbd/mod.rs:194:    grid_reorder_identity: wgpu::ComputePipeline,
+src/solvers/xpbd/mod.rs:200:    compute_fractions: wgpu::ComputePipeline,
+src/solvers/xpbd/mod.rs:203:    compute_coupling_scale: wgpu::ComputePipeline,
+src/solvers/xpbd/mod.rs:204:    drag_water: wgpu::ComputePipeline,
+src/solvers/xpbd/mod.rs:205:    drag_grain: wgpu::ComputePipeline,
+src/solvers/xpbd/mod.rs:227:    grid_reorder_a: wgpu::BindGroup,
+src/solvers/xpbd/mod.rs:228:    grid_reorder_b: wgpu::BindGroup,
+src/solvers/xpbd/mod.rs:229:    grid_reorder_identity: wgpu::BindGroup,
+src/solvers/xpbd/mod.rs:235:    compute_fractions: wgpu::BindGroup,
+src/solvers/xpbd/mod.rs:238:    compute_coupling_scale: wgpu::BindGroup,
+src/solvers/xpbd/mod.rs:239:    drag_water: wgpu::BindGroup,
+src/solvers/xpbd/mod.rs:240:    drag_grain: wgpu::BindGroup,
+src/solvers/xpbd/mod.rs:320:    // snapshot copy, re-seeding, and exposure as concentration/temperature; `chem_frozen` (b22) is the
+src/solvers/xpbd/mod.rs:324:    chem_frozen: wgpu::Buffer,
+src/solvers/xpbd/mod.rs:325:    // Cell-order reorder scratch (gather targets for the water-loop locality reorder; copied back into
+src/solvers/xpbd/mod.rs:346:    /// Cached yield/TDS, refreshed by `sample_diagnostics` (the stalling cache point) and returned
+src/solvers/xpbd/mod.rs:533:        // chem) rather than stale values until the next sample_diagnostics.
+src/solvers/xpbd/mod.rs:682:    pub fn sample_diagnostics(&mut self) {
+src/solvers/xpbd/mod.rs:747:    /// into `sample_diagnostics`). Yield = dissolved solute / total soluble dose; TDS = cup solute /
+src/solvers/xpbd/mod.rs:1157:        // scenes (which never run compute_fractions) read α_s=0 → the water solve is unmodulated.
+src/solvers/xpbd/mod.rs:1158:        let alpha_s = Self::storage(&device, "xpbd-alpha-s", f32s, wgpu::BufferUsages::empty());
+src/solvers/xpbd/mod.rs:1165:        let coupling_scale = Self::storage(
+src/solvers/xpbd/mod.rs:1208:        // readback for yield/TDS + the snapshot copy); `chem_frozen` (binding 22) is the per-substep
+src/solvers/xpbd/mod.rs:1240:        let chem_frozen = Self::storage(
+src/solvers/xpbd/mod.rs:1246:        // Cell-order reorder scratch: gather targets for the water-loop locality reorder. COPY_SRC so
+src/solvers/xpbd/mod.rs:1339:            grid_reorder_a: make("grid_reorder_a"),
+src/solvers/xpbd/mod.rs:1340:            grid_reorder_b: make("grid_reorder_b"),
+src/solvers/xpbd/mod.rs:1341:            grid_reorder_identity: make("grid_reorder_identity"),
+src/solvers/xpbd/mod.rs:1347:            compute_fractions: make("compute_fractions"),
+src/solvers/xpbd/mod.rs:1350:            compute_coupling_scale: make("compute_coupling_scale"),
+src/solvers/xpbd/mod.rs:1351:            drag_water: make("drag_water"),
+src/solvers/xpbd/mod.rs:1352:            drag_grain: make("drag_grain"),
+src/solvers/xpbd/mod.rs:1424:            grid_reorder_a: bg(
+src/solvers/xpbd/mod.rs:1425:                &pipelines.grid_reorder_a,
+src/solvers/xpbd/mod.rs:1437:            grid_reorder_b: bg(
+src/solvers/xpbd/mod.rs:1438:                &pipelines.grid_reorder_b,
+src/solvers/xpbd/mod.rs:1448:            grid_reorder_identity: bg(
+src/solvers/xpbd/mod.rs:1449:                &pipelines.grid_reorder_identity,
+src/solvers/xpbd/mod.rs:1474:                    (13, &alpha_s),
+src/solvers/xpbd/mod.rs:1492:                    (13, &alpha_s),
+src/solvers/xpbd/mod.rs:1509:            compute_fractions: bg(
+src/solvers/xpbd/mod.rs:1510:                &pipelines.compute_fractions,
+src/solvers/xpbd/mod.rs:1517:                    (13, &alpha_s),
+src/solvers/xpbd/mod.rs:1544:            compute_coupling_scale: bg(
+src/solvers/xpbd/mod.rs:1545:                &pipelines.compute_coupling_scale,
+src/solvers/xpbd/mod.rs:1552:                    (13, &alpha_s),
+src/solvers/xpbd/mod.rs:1553:                    (16, &coupling_scale),
+src/solvers/xpbd/mod.rs:1556:            drag_water: bg(
+src/solvers/xpbd/mod.rs:1557:                &pipelines.drag_water,
+src/solvers/xpbd/mod.rs:1567:                    (16, &coupling_scale),
+src/solvers/xpbd/mod.rs:1570:            drag_grain: bg(
+src/solvers/xpbd/mod.rs:1571:                &pipelines.drag_grain,
+src/solvers/xpbd/mod.rs:1581:                    (16, &coupling_scale),
+src/solvers/xpbd/mod.rs:1680:                    (22, &chem_frozen),
+src/solvers/xpbd/mod.rs:1693:                    (22, &chem_frozen),
+src/solvers/xpbd/mod.rs:1705:                    (22, &chem_frozen),
+src/solvers/xpbd/mod.rs:1811:            chem_frozen,
+src/solvers/xpbd/mod.rs:1928:                                &p.grid_reorder_a,
+src/solvers/xpbd/mod.rs:1929:                                &b.grid_reorder_a,
+src/solvers/xpbd/mod.rs:1930:                                "grid_reorder_a",
+src/solvers/xpbd/mod.rs:1956:                                &p.grid_reorder_b,
+src/solvers/xpbd/mod.rs:1957:                                &b.grid_reorder_b,
+src/solvers/xpbd/mod.rs:1958:                                "grid_reorder_b",
+src/solvers/xpbd/mod.rs:1977:                                &p.grid_reorder_identity,
+src/solvers/xpbd/mod.rs:1978:                                &b.grid_reorder_identity,
+src/solvers/xpbd/mod.rs:1979:                                "grid_reorder_identity",
+src/solvers/xpbd/mod.rs:1984:                            // Solid fraction (live from current pred) → pore-modulated water target.
+src/solvers/xpbd/mod.rs:1987:                                &p.compute_fractions,
+src/solvers/xpbd/mod.rs:1988:                                &b.compute_fractions,
+src/solvers/xpbd/mod.rs:1989:                                "compute_fractions",
+src/solvers/xpbd/mod.rs:2057:                        &p.compute_coupling_scale,
+src/solvers/xpbd/mod.rs:2058:                        &b.compute_coupling_scale,
+src/solvers/xpbd/mod.rs:2059:                        "compute_coupling_scale",
+src/solvers/xpbd/mod.rs:2070:                        pass(&mut enc, &p.drag_water, &b.drag_water, "drag_water", np);
+src/solvers/xpbd/mod.rs:2071:                        pass(&mut enc, &p.drag_grain, &b.drag_grain, "drag_grain", np);
+src/solvers/xpbd/mod.rs:2210:                        &self.chem_frozen,
+src/solvers/xpbd/mod.rs:2235:                        &self.chem_frozen,
+src/solvers/xpbd/mod.rs:2280:    fn metrics(&self) -> Metrics {
+src/solvers/xpbd/mod.rs:2281:        Metrics {
+
+exec
+/bin/zsh -lc "sed -n '250,410p' src/solvers/xpbd/common.wgsl" in /Users/cxc/Github/coffee-sim
+ succeeded in 0ms:
+// Species-filtered union: the most-penetrated (min signed-distance) solid that blocks `phase`.
+fn solid_union(p: vec3<f32>, phase: u32) -> SolidHit {
+    var best = SolidHit(SDF_FREE, vec3<f32>(0.0, 0.0, 0.0), 0.0);
+    let n = params.num_solids;
+    for (var i = 0u; i < n; i = i + 1u) {
+        let prim = solids[i];
+        if ((prim.species_mask & (1u << phase)) == 0u) { continue; }
+        let hit = solid_cavity(prim, p);
+        if (hit.dist < best.dist) { best = hit; }
+    }
+    return best;
+}
+
+// --- Phase 1.5 chem/thermal state + kinetics (mirrors models/extraction.rs + models/thermal.rs) ---
+// Per-particle vec4: grain (s_f, s_s, T_g, _), water (c, T_w, _, _). `chem` is the live buffer;
+// `chem_frozen` is the per-substep snapshot the dissolution/thermal passes read (so writes to live
+// `chem` don't race the reads). Referenced only by the chem passes (U5/U6).
+@group(0) @binding(20) var<storage, read_write> chem: array<vec4<f32>>;
+@group(0) @binding(22) var<storage, read> chem_frozen: array<vec4<f32>>;
+// Per-particle dissolution scratch (b21): grain → (N_w eligible-water count, flux_g aggregate relative
+// speed), water → (N_g eligible-grain count, _). Written by diss_count, read by both transfer passes so
+// each recomputes the identical per-grain release/take. Transient within the extraction sub-stage.
+@group(0) @binding(21) var<storage, read_write> diss_neighbors: array<vec2<f32>>;
+
+// Particle-reorder scratch (cell-order locality). Once per water-loop rebuild the persistent payload
+// is gathered into cell order so the density-solve neighbor gathers read contiguous memory. Only the
+// water density loop reorders; later blocks inherit the cell-sorted layout (so their reads stay
+// consistent and their gathers are near-contiguous for free). Bound only by the grid_reorder_* passes.
+@group(0) @binding(23) var<storage, read_write> pos_scratch: array<vec4<f32>>;
+@group(0) @binding(24) var<storage, read_write> pred_scratch: array<vec4<f32>>;
+@group(0) @binding(25) var<storage, read_write> vel_scratch: array<vec4<f32>>;
+@group(0) @binding(26) var<storage, read_write> chem_scratch: array<vec4<f32>>;
+@group(0) @binding(27) var<storage, read_write> phase_scratch: array<u32>;
+
+// Normalized Arrhenius (1 at t_ref, exponent-clamped for finiteness).
+fn ex_arrhenius(t: f32, ea_over_r: f32, t_ref: f32) -> f32 {
+    if (t <= 1e-6 || t_ref <= 1e-6) { return 1.0; }
+    let arg = -ea_over_r * (1.0 / t - 1.0 / t_ref);
+    return exp(clamp(arg, -30.0, 30.0));
+}
+fn ex_area(d_p: f32, d_ref: f32) -> f32 {
+    if (d_p <= 1e-6) { return 1.0; }
+    return d_ref / d_p;
+}
+fn ex_flux(u_rel: f32, u_half: f32) -> f32 {
+    let u = max(u_rel, 0.0);
+    return clamp(u / (u + max(u_half, 1e-6)), 0.0, 1.0);
+}
+fn ex_wet_gate(saturation: f32, s_on: f32) -> f32 {
+    if (s_on <= 1e-6) { return select(0.0, 1.0, saturation > 0.0); }
+    return smoothstep(0.0, s_on, saturation);
+}
+fn ex_driving(c: f32, c_sat: f32) -> f32 {
+    if (c_sat <= 1e-6) { return 0.0; }
+    return clamp(1.0 - c / c_sat, 0.0, 1.0);
+}
+fn ex_release(pool: f32, k_eff: f32, dt: f32) -> f32 {
+    let frac = 1.0 - exp(-max(k_eff, 0.0) * max(dt, 0.0));
+    return clamp(pool * frac, 0.0, max(pool, 0.0));
+}
+// Capacity-weighted pair heat from j into i, symmetrically clamped (antisymmetric → conserves energy).
+fn th_pair_heat(t_i: f32, c_i: f32, t_j: f32, c_j: f32, kappa: f32, dt: f32) -> f32 {
+    let sum = c_i + c_j;
+    if (sum <= 1e-6) { return 0.0; }
+    let raw = max(kappa, 0.0) * (t_j - t_i) * max(dt, 0.0);
+    let cap = (c_i * c_j / sum) * (t_j - t_i);
+    return clamp(raw, min(cap, 0.0), max(cap, 0.0));
+}
+fn th_ambient(t: f32, t_amb: f32, h_amb: f32, dt: f32) -> f32 {
+    return -clamp(h_amb * dt, 0.0, 1.0) * (t - t_amb);
+}
+
+fn w_poly6(r: f32, h: f32) -> f32 {
+    if (r >= h) { return 0.0; }
+    let t = h * h - r * r;
+    let coeff = 315.0 / (64.0 * PI * pow(h, 9.0));
+    return coeff * t * t * t;
+}
+
+// True spiky gradient ∇W(d) for d = x_i − x_j (decreases with r ⇒ negative along d), with an
+// r→0 safeguard so near-coincident particles still get a finite separation force.
+fn spiky_grad(d: vec3<f32>, h: f32, r_min: f32) -> vec3<f32> {
+    let len = length(d);
+    if (len >= h) { return vec3<f32>(0.0); }
+    var r = len;
+    var dir: vec3<f32>;
+    if (len < r_min) {
+        r = r_min;
+        if (len < 1e-8) {
+            dir = vec3<f32>(1.0, 0.0, 0.0); // deterministic fallback direction
+        } else {
+            dir = d / len;
+        }
+    } else {
+        dir = d / len;
+    }
+    let coeff = 45.0 / (PI * pow(h, 6.0));
+    let t = h - r;
+    return -coeff * t * t * dir;
+}
+
+// Analytic boundary (wall) density compensation — the SPH wall-deficiency fix. A solid wall cuts
+// off the part of a near-wall particle's kernel sphere that lies in the solid, so the fluid-only
+// density sum under-reads even when the fluid is packed (worst at a concave corner, neighbors gone
+// on two sides). `boundary_psi(d)` is the fraction of the poly6 kernel MASS beyond a plane at
+// signed distance d (cavity interior positive): ψ(h)=0, ψ(0)=0.5, ψ(−h)=1. Adding ρ₀·ψ back makes
+// near-wall water read its TRUE density, so the compression-only solve relieves over-packed corners
+// continuously instead of storing the compression and releasing it as a squeeze-out eruption.
+// Exact closed form: ψ(d) = ∫_{z>d} W_poly6 dV = 0.5 − (315/256)·poly(d/h), poly the cap integral.
+// Explicit products (not pow) so a penetrating d<0 (t<0) stays finite — pow(negative,·) is NaN.
+fn boundary_psi(d: f32, h: f32) -> f32 {
+    let t = clamp(d / h, -1.0, 1.0);
+    let t2 = t * t;
+    let t3 = t2 * t;
+    let t5 = t3 * t2;
+    let t7 = t5 * t2;
+    let t9 = t7 * t2;
+    let poly = t - (4.0 / 3.0) * t3 + (6.0 / 5.0) * t5 - (4.0 / 7.0) * t7 + (1.0 / 9.0) * t9;
+    return 0.5 - (315.0 / 256.0) * poly;
+}
+
+// --- Phase-1.4 swelling + effective mass (from the moisture lane: grain pred.w = V_abs, water = f_w).
+// A grain swells by exactly the absorbed volume; its mass gains the absorbed water's mass; a water
+// shrinks proportionally. Dry/full state (V_abs=0, f_w=1) ⇒ the original constants exactly.
+fn grain_eff_volume(v_abs: f32) -> f32 { return params.grain_volume + v_abs; }
+fn grain_eff_diameter(v_abs: f32) -> f32 {
+    return params.grain_diameter * pow(grain_eff_volume(v_abs) / params.grain_volume, 1.0 / 3.0);
+}
+fn grain_eff_mass(v_abs: f32) -> f32 { return params.grain_mass + params.rest_density * v_abs; }
+fn water_eff_mass(f_w: f32) -> f32 { return params.particle_mass * f_w; }
+// Effective mass of a particle from its phase + moisture-lane value `w` (grain V_abs / water f_w).
+fn eff_mass(ph: u32, w: f32) -> f32 {
+    if (ph == PHASE_GRAIN) { return grain_eff_mass(w); }
+    return water_eff_mass(w);
+}
+
+// Density-aware buoyancy scaling: the buoyant acceleration is ∝ ρ_water/ρ_grain, so a grain DENSER
+// than water (dry coffee, ρ≈several×) is barely buoyed and still sinks, while a saturated grain
+// (ρ→ρ_water) is neutrally buoyant. Clamped ≤ 1. Both buoyancy passes apply the grain's factor per
+// pair, so the impulse stays equal-and-opposite (momentum conserved). Fixes the dam over-lift where
+// the uncalibrated λ proxy launched denser-than-water grains out of the column.
+fn grain_buoyancy_factor(v_abs: f32) -> f32 {
+    let rho_g = grain_eff_mass(v_abs) / max(grain_eff_volume(v_abs), 1.0e-6);
+    return clamp(params.rest_density / max(rho_g, 1.0e-6), 0.0, 1.0);
+}
+
+// Saturation→cohesion curve (mirrors models::cohesion::for_saturation): a piecewise-linear bump,
+// 0 at dry (s=0) and full saturation (s=1), peak c_max at s_peak, with s = V_abs / V_cap.
+fn wet_cohesion(v_abs: f32) -> f32 {
+    let v_cap = params.r_max * params.rho_ratio * params.grain_volume;
+    let s = clamp(v_abs / max(v_cap, 1.0e-12), 0.0, 1.0);
+    let sp = clamp(params.s_peak, 1.0e-6, 1.0 - 1.0e-6);
+    var g: f32;
+    if (s <= sp) {
+        g = s / sp;
+    } else {
+        g = (1.0 - s) / (1.0 - sp);
+    }
+    return params.c_max * g;
+}
+
+
+exec
+/bin/zsh -lc "sed -n '1,120p' src/engine/state.rs" in /Users/cxc/Github/coffee-sim
+ succeeded in 0ms:
+//! The canonical per-frame snapshot decoupling solvers from rendering/profiling.
+
+use crate::profiling::Profile;
+use crate::utils::buffers::ParticleBuffers;
+
+/// Brew-outcome metrics. Zeros for a no-op solver.
+#[derive(Clone, Debug, Default)]
+pub struct Metrics {
+    pub extraction_yield: f32,
+    pub tds: f32,
+    pub drawdown_time: f32,
+    pub evenness: f32,
+    pub particle_count: u32,
+    pub iteration_count: u32,
+}
+
+/// What `ui` and `profiling` see each frame — never a solver's internals, which is what
+/// makes them solver-agnostic.
+#[derive(Clone, Default)]
+pub struct State {
+    pub particles: ParticleBuffers,
+    pub metrics: Metrics,
+    pub profile: Profile,
+}
+
+exec
+/bin/zsh -lc "sed -n '510,565p' src/solvers/xpbd/common.wgsl" in /Users/cxc/Github/coffee-sim
+exec
+/bin/zsh -lc "sed -n '80,110p' src/solvers/xpbd/water.wgsl && sed -n '180,205p' src/solvers/xpbd/water.wgsl" in /Users/cxc/Github/coffee-sim
+ succeeded in 0ms:
+fn grid_scatter(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= params.particle_count) { return; }
+    let cell = cell_id(cell_coord(pred[i].xyz));
+    // cell_count was re-zeroed after the scan, so it serves as the per-cell write cursor here.
+    let local = atomicAdd(&cell_count[cell], 1u);
+    sorted_indices[cell_start[cell] + local] = i;
+}
+
+// Cell-order reorder (memory locality). After grid_scatter, sorted_indices[slot] = the old index of
+// the particle that belongs at `slot`. grid_reorder_a/b GATHER the persistent payload into scratch by
+// that mapping (read pre-reorder source, write scratch); the host copies scratch back, then
+// grid_reorder_identity rewrites sorted_indices to the identity permutation. The unchanged neighbor
+// loops then gather `j = sorted_indices[s] = s` ⇒ contiguous reads. Split into two passes so each
+// stays within the 8-storage-buffer budget; both read the same (still-original) sorted_indices, so
+// there is no chunk hazard. active-range only (dormant pool slots are never dispatched).
+@compute @workgroup_size(256)
+fn grid_reorder_a(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let slot = gid.x;
+    if (slot >= params.particle_count) { return; }
+    let src = sorted_indices[slot];
+    pos_scratch[slot] = pos[src];
+    pred_scratch[slot] = pred[src];
+    vel_scratch[slot] = vel[src];
+}
+
+@compute @workgroup_size(256)
+fn grid_reorder_b(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let slot = gid.x;
+    if (slot >= params.particle_count) { return; }
+    let src = sorted_indices[slot];
+    chem_scratch[slot] = chem[src];
+    phase_scratch[slot] = phase[src];
+}
+
+// Runs AFTER all gathers + copy-backs: the payload is now cell-sorted, so sorted_indices is the
+// identity permutation and the existing `j = sorted_indices[s]` gathers read contiguous memory.
+@compute @workgroup_size(256)
+fn grid_reorder_identity(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let slot = gid.x;
+    if (slot >= params.particle_count) { return; }
+    sorted_indices[slot] = slot;
+}
+
+@compute @workgroup_size(256)
+fn apply_dp(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= params.particle_count) { return; }
+    if (status.converged != 0u) { return; }
+    // Cap the per-iteration correction so no single overcorrection can launch a particle.
+    var d = params.position_relaxation * dp[i].xyz;
+    let dl = length(d);
+    if (dl > params.max_correction) {
+        d = d * (params.max_correction / dl);
+    }
+    var proposed = pred[i].xyz + d;
+
+ succeeded in 0ms:
+
+    // Boundary (wall) density compensation: a near-wall particle's kernel is partly cut off by the
+    // solid, so the fluid-only sum above under-reads — strongest at the cup's floor/side corner,
+    // where the deficit hid genuine over-packing and let it accumulate into squeeze-out eruptions.
+    // The cut-off fraction ρ₀·f_i·ψ(d) was precomputed by `compute_boundary` into c_residual (a
+    // scratch handoff — compute_lambda needs `solids`, but is already at the 8-storage-buffer limit,
+    // so a separate pass that CAN bind `solids` stages the value here). Overwritten with the real
+    // residual at the end of this kernel. Solid scenes only; AABB-only scenes never dispatch the
+    // boundary pass, so c_residual is untouched and this term is skipped (byte-unchanged).
+    if (params.num_solids > 0u) {
+        rho = rho + c_residual[i];
+    }
+
+    // Pore-modulated rest density: where grains are present the water target is ρ₀·(1−α_s), so
+    // pore water packs to fill only the pore fraction (α_s+α_f=1) instead of full ρ₀ — which would
+    // over-fill and get expelled. α_s=0 (single-species water) → unmodulated ρ₀ (identical).
+    let pore = max(1.0 - alpha_s[i], 0.05);
+    let inv_rho0 = 1.0 / (params.rest_density * pore);
+    let c = rho * inv_rho0 - 1.0;
+    let denom = (dot(sum_g, sum_g) + sum_g2) * inv_rho0 * inv_rho0 + params.relaxation_eps;
+    var lam = -c / denom;
+    if (params.lambda_noncohesive != 0u && lam > 0.0) {
+        lam = 0.0;
+    }
+    lambda[i] = lam;
+    // Convergence is measured on COMPRESSION only: free-surface particles always have
+    // c ≈ −1 (density deficit), which incompressibility neither can nor should fix, so
+    // including them would prevent early-exit forever. max(0, c) = over-density violation.
+    c_residual[i] = max(0.0, c);
+}
+
+                    if (fj <= params.pbf_eps) { continue; } // skip near-empty (absorbed) water
+                    let d = xi - pred[j].xyz;
+                    let r = length(d);
+                    if (r >= h) { continue; }
+                    let wr = w_poly6(r, h);
+                    let ratio = wr / params.s_corr_wq;
+                    let scorr = -params.s_corr_k * pow(ratio, params.s_corr_n);
+                    let gj = m * fj * spiky_grad(d, h, params.spiky_r_min);
+                    sum = sum + (lam_i + lambda[j] + scorr) * gj;
+                }
+            }
+        }
+    }
+    let pore = max(1.0 - alpha_s[i], 0.05);
+    let inv_rho0 = 1.0 / (params.rest_density * pore);
+    dp[i] = vec4<f32>(sum * inv_rho0, 0.0);
+}
+
+@compute @workgroup_size(256)
+fn xsph(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= params.particle_count) { return; }
+    // Viscosity is a fluid term; grains pass through unchanged (so the vel_smoothed→vel copy in a
+    // mixed scene doesn't clobber grain velocities).
+    if (phase[i] != PHASE_WATER) {
+        vel_smoothed[i] = vel[i];
+
+codex
+A key code fact so far: the current cell-order reorder only moves persistent payload (`pos`, `pred`, `vel`, `chem`, `phase`). `coupling_scale` is transient and recomputed after the grid rebuild/reorder, so widening it does not require a reorder scratch path.
+exec
+/bin/zsh -lc "sed -n '1,120p' src/solvers/xpbd/mod.rs" in /Users/cxc/Github/coffee-sim
+ succeeded in 0ms:
+//! PBF water core under `SolverId::Xpbd` — water incompressibility only (no bed/coupling).
+//!
+//! Classic Position Based Fluids (Macklin & Müller 2013): a constant-density constraint +
+//! `s_corr` artificial pressure (anti-clumping), with XSPH viscosity damping the surface
+//! jitter that artificial pressure injects. Adaptive constraint iterations decide
+//! convergence GPU-side (no per-iteration readback). See `docs/plans/solver_xpbd.md`.
+
+use std::sync::Arc;
+
+use bytemuck::{Pod, Zeroable};
+use wgpu::util::DeviceExt;
+
+use crate::emission::EmissionInput;
+use crate::engine::scene::Species;
+use crate::engine::{Metrics, Scene};
+use crate::models::permeability::{drag_rate, kozeny_carman};
+use crate::models::Materials;
+use crate::profiling::Profile;
+use crate::solvers::base::Solver;
+use crate::utils::buffers::ParticleBuffers;
+use crate::utils::config::Config;
+use crate::utils::gpu::GpuContext;
+use crate::utils::kernels;
+
+const WG: u32 = 256;
+/// Rebuild the neighbor grid every this-many solver iterations (anti-stale-grid).
+const REGRID_INTERVAL: u32 = 4;
+/// Volume scale (KEEP.md §27): mL per sim-unit³. Converts a scene's pour dose (mL) into a particle
+/// capacity (and the emission rate, in the pour-emission unit).
+const ML_PER_SIM_UNIT3: f32 = 5.20;
+
+fn groups(n: u32) -> u32 {
+    n.div_ceil(WG)
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct Params {
+    box_min: [f32; 4],
+    box_max: [f32; 4],
+    gravity: [f32; 4],
+    grid_origin: [f32; 4],
+    grid_dims: [u32; 4], // nx, ny, nz, num_cells
+    dt: f32,
+    h: f32,
+    rest_density: f32,
+    particle_mass: f32,
+    s_corr_k: f32,
+    s_corr_n: f32,
+    s_corr_wq: f32,
+    relaxation_eps: f32,
+    position_relaxation: f32,
+    xsph_c: f32,
+    max_speed: f32,
+    spiky_r_min: f32,
+    cell_size: f32,
+    particle_count: u32,
+    num_solids: u32, // count of static SDF solids in the `solids` storage buffer (0 = none)
+    min_iters: u32,
+    max_iters: u32,
+    residual_tolerance: f32,
+    lambda_noncohesive: u32,
+    max_correction: f32,
+    velocity_damping: f32,
+    // --- granular bed (grain phase) ---
+    grain_diameter: f32,
+    friction_mu: f32,
+    floor_mu: f32,
+    dry_cohesion: f32,
+    cohesion_range: f32,
+    rolling_damping: f32,
+    grain_sleep_speed: f32,
+    // --- water/bed coupling (mixed scenes) ---
+    grain_mass: f32,
+    grain_volume: f32, // (π/6)·grain_diameter³ — effective volume for the α_s sum
+    packing_limit: f32,
+    exclusion_relax: f32,
+    drag_gamma: f32,
+    drag_beta_max: f32,
+    buoyancy_scale: f32,
+    wake_threshold: f32,
+    water_grain_distance: f32,
+    // --- wetting / cohesion (Phase 1.4) ---
+    r_max: f32,           // moisture ratio at saturation (mass water / mass dry grain)
+    rho_ratio: f32,       // ρ_s/ρ_w — converts absorbed water mass → swelling volume
+    s_peak: f32,          // saturation at the cohesion-curve peak
+    c_max: f32,           // peak wet cohesion strength (0 until calibrated)
+    k_abs: f32,           // absorption rate constant (1/s)
+    absorb_roundoff: f32, // f_w deactivation floor (exact-conservation; ≪ pbf_eps)
+    pbf_eps: f32,         // PBF skips water with remaining fraction ≤ this
+    // --- extraction + thermal (Phase 1.5) ---
+    extract_rate: f32, // opt-in gate (0 = extraction/thermal off; existing scenes byte-unchanged)
+    k0_fast: f32,      // base fast-pool dissolution rate (1/s)
+    k0_slow: f32,      // base slow-pool dissolution rate (1/s)
+    ea_over_r: f32,    // Arrhenius Ea/R (temperature sensitivity)
+    t_ref: f32,        // Arrhenius reference temperature (k_T(t_ref)=1)
+    c_sat: f32,        // max solute concentration (driving force → 0 here)
+    d_ref: f32,        // reference grind diameter for surface area ∝ 1/d
+    u_half: f32,       // flux half-saturation (saturating flow→extraction bridge)
+    s_on: f32,         // moisture-gate onset saturation (dry grain doesn't extract)
+    kappa: f32,        // thermal conductance (pair heat κ)
+    cp_water: f32,     // water specific heat (C_water = particle_mass·f_w·cp_water)
+    cp_grain: f32,     // grain specific heat (C_grain = grain_eff_mass·cp_grain)
+    h_amb: f32,        // ambient heat-loss rate
+    t_amb: f32,        // ambient temperature
+    _pad_chem0: f32,
+    _pad_chem1: f32,
+}
+
+// Params is uploaded as a uniform and must stay byte-identical to the WGSL `Params`.
+const _: () = assert!(std::mem::size_of::<Params>() == 320);
+
+/// GPU record for one static SDF solid — byte-identical to the WGSL `Primitive` (64 bytes,
+/// vec4-aligned). Cone radii in `a` are OUTER wall radii; the cavity surface is `outer − thickness`.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct Primitive {
+    kind: u32,         // 0 = cone, 1 = cylinder
+    species_mask: u32, // MASK_* bits
+    friction: f32,
+
+exec
+/bin/zsh -lc "sed -n '1120,1180p' src/solvers/xpbd/mod.rs" in /Users/cxc/Github/coffee-sim
+ succeeded in 0ms:
+            &device,
+            "xpbd-vel",
+            vec4,
+            wgpu::BufferUsages::COPY_SRC,
+        ));
+        let vel_smoothed = Self::storage(
+            &device,
+            "xpbd-vel-smoothed",
+            vec4,
+            wgpu::BufferUsages::COPY_SRC,
+        );
+        let vel_frozen = Self::storage(
+            &device,
+            "xpbd-vel-frozen",
+            vec4,
+            wgpu::BufferUsages::empty(),
+        );
+        let lambda = Self::storage(&device, "xpbd-lambda", f32s, wgpu::BufferUsages::empty());
+        let dp = Self::storage(&device, "xpbd-dp", vec4, wgpu::BufferUsages::empty());
+        let c_residual =
+            Self::storage(&device, "xpbd-cresidual", f32s, wgpu::BufferUsages::empty());
+        // Per-particle species tag (exposed to the renderer for color-by-phase) and the per-grain
+        // accumulated-normal-impulse buffer (the friction budget; reset each frame in predict).
+        let phase = Arc::new(Self::storage(
+            &device,
+            "xpbd-phase",
+            f32s,
+            wgpu::BufferUsages::COPY_SRC,
+        ));
+        queue.write_buffer(&phase, 0, bytemuck::cast_slice(&phases));
+        let normal_impulse = Self::storage(
+            &device,
+            "xpbd-normal-impulse",
+            f32s,
+            wgpu::BufferUsages::empty(),
+        );
+        // Per-particle solid fraction α_s (coupling). Zero-initialized by wgpu, so single-species
+        // scenes (which never run compute_fractions) read α_s=0 → the water solve is unmodulated.
+        let alpha_s = Self::storage(&device, "xpbd-alpha-s", f32s, wgpu::BufferUsages::empty());
+        let fluid_impulse = Self::storage(
+            &device,
+            "xpbd-fluid-impulse",
+            f32s,
+            wgpu::BufferUsages::empty(),
+        );
+        let coupling_scale = Self::storage(
+            &device,
+            "xpbd-coupling-scale",
+            f32s,
+            wgpu::BufferUsages::empty(),
+        );
+        // Per-particle eligible-opposite-species neighbor count for the wetting allocation (u32).
+        let wet_count = Self::storage(&device, "xpbd-wet-count", f32s, wgpu::BufferUsages::empty());
+        // Counting-sort grid: transient per-cell counter, exclusive-prefix-sum offsets (num_cells+1),
+        // and a contiguous particle-index array (num_particles). No fixed buckets / overflow.
+        let cell_count = Self::storage(
+            &device,
+            "xpbd-cellcount",
+            (num_cells as u64) * 4,
+            wgpu::BufferUsages::empty(),
+        );
+
+exec
+/bin/zsh -lc "sed -n '1420,1590p' src/solvers/xpbd/mod.rs" in /Users/cxc/Github/coffee-sim
+ succeeded in 0ms:
+                    (9, &sorted_indices),
+                    (18, &cell_count),
+                ],
+            ),
+            grid_reorder_a: bg(
+                &pipelines.grid_reorder_a,
+                &[
+                    (0, &params_buf),
+                    (1, &pos),
+                    (2, &pred),
+                    (3, &vel),
+                    (9, &sorted_indices),
+                    (23, &pos_scratch),
+                    (24, &pred_scratch),
+                    (25, &vel_scratch),
+                ],
+            ),
+            grid_reorder_b: bg(
+                &pipelines.grid_reorder_b,
+                &[
+                    (0, &params_buf),
+                    (9, &sorted_indices),
+                    (11, &phase),
+                    (20, &chem),
+                    (26, &chem_scratch),
+                    (27, &phase_scratch),
+                ],
+            ),
+            grid_reorder_identity: bg(
+                &pipelines.grid_reorder_identity,
+                &[(0, &params_buf), (9, &sorted_indices)],
+            ),
+            compute_boundary: bg(
+                &pipelines.compute_boundary,
+                &[
+                    (0, &params_buf),
+                    (2, &pred),
+                    (7, &c_residual),
+                    (10, &status),
+                    (11, &phase),
+                    (19, &solids),
+                ],
+            ),
+            compute_lambda: bg(
+                &pipelines.compute_lambda,
+                &[
+                    (0, &params_buf),
+                    (2, &pred),
+                    (5, &lambda),
+                    (7, &c_residual),
+                    (8, &cell_start),
+                    (9, &sorted_indices),
+                    (10, &status),
+                    (11, &phase),
+                    (13, &alpha_s),
+                ],
+            ),
+            residual_reduce: bg(
+                &pipelines.residual_reduce,
+                &[(0, &params_buf), (7, &c_residual), (10, &status)],
+            ),
+            compute_dp: bg(
+                &pipelines.compute_dp,
+                &[
+                    (0, &params_buf),
+                    (2, &pred),
+                    (5, &lambda),
+                    (6, &dp),
+                    (8, &cell_start),
+                    (9, &sorted_indices),
+                    (10, &status),
+                    (11, &phase),
+                    (13, &alpha_s),
+                ],
+            ),
+            bed_project: bg(
+                &pipelines.bed_project,
+                &[
+                    (0, &params_buf),
+                    (1, &pos),
+                    (2, &pred),
+                    (6, &dp),
+                    (7, &c_residual),
+                    (8, &cell_start),
+                    (9, &sorted_indices),
+                    (11, &phase),
+                    (12, &normal_impulse),
+                ],
+            ),
+            compute_fractions: bg(
+                &pipelines.compute_fractions,
+                &[
+                    (0, &params_buf),
+                    (2, &pred),
+                    (8, &cell_start),
+                    (9, &sorted_indices),
+                    (11, &phase),
+                    (13, &alpha_s),
+                ],
+            ),
+            exclude_water: bg(
+                &pipelines.exclude_water,
+                &[
+                    (0, &params_buf),
+                    (2, &pred),
+                    (6, &dp),
+                    (8, &cell_start),
+                    (9, &sorted_indices),
+                    (10, &status),
+                    (11, &phase),
+                ],
+            ),
+            exclude_grain: bg(
+                &pipelines.exclude_grain,
+                &[
+                    (0, &params_buf),
+                    (2, &pred),
+                    (6, &dp),
+                    (8, &cell_start),
+                    (9, &sorted_indices),
+                    (10, &status),
+                    (11, &phase),
+                ],
+            ),
+            compute_coupling_scale: bg(
+                &pipelines.compute_coupling_scale,
+                &[
+                    (0, &params_buf),
+                    (2, &pred),
+                    (8, &cell_start),
+                    (9, &sorted_indices),
+                    (11, &phase),
+                    (13, &alpha_s),
+                    (16, &coupling_scale),
+                ],
+            ),
+            drag_water: bg(
+                &pipelines.drag_water,
+                &[
+                    (0, &params_buf),
+                    (2, &pred),
+                    (3, &vel),
+                    (8, &cell_start),
+                    (9, &sorted_indices),
+                    (11, &phase),
+                    (14, &fluid_impulse),
+                    (15, &vel_frozen),
+                    (16, &coupling_scale),
+                ],
+            ),
+            drag_grain: bg(
+                &pipelines.drag_grain,
+                &[
+                    (0, &params_buf),
+                    (2, &pred),
+                    (3, &vel),
+                    (8, &cell_start),
+                    (9, &sorted_indices),
+                    (11, &phase),
+                    (14, &fluid_impulse),
+                    (15, &vel_frozen),
+                    (16, &coupling_scale),
+                ],
+            ),
+            buoyancy_grain: bg(
+                &pipelines.buoyancy_grain,
+                &[
+                    (0, &params_buf),
+                    (2, &pred),
+                    (3, &vel),
+                    (5, &lambda),
+
+exec
+/bin/zsh -lc "sed -n '1900,2250p' src/solvers/xpbd/mod.rs" in /Users/cxc/Github/coffee-sim
+ succeeded in 0ms:
+            };
+            for _ in 0..self.substeps {
+                pass(&mut enc, &p.predict, &b.predict, "predict", np);
+
+                if self.has_water {
+                    for it in 0..self.water_iters {
+                        if it % self.water_regrid == 0 {
+                            pass(&mut enc, &p.grid_clear, &b.grid_clear, "grid_clear", nc);
+                            pass(&mut enc, &p.grid_count, &b.grid_count, "grid_count", np);
+                            pass(&mut enc, &p.grid_scan, &b.grid_scan, "grid_scan", 1);
+                            pass(&mut enc, &p.grid_clear, &b.grid_clear, "grid_clear", nc);
+                            pass(
+                                &mut enc,
+                                &p.grid_scatter,
+                                &b.grid_scatter,
+                                "grid_scatter",
+                                np,
+                            );
+                            // Cell-order reorder (memory locality): gather the persistent payload
+                            // (pos/pred/vel/chem/phase) into cell order, then set sorted_indices to
+                            // identity so the density gathers below read contiguous memory. Water-loop
+                            // only — later blocks inherit this cell-sorted layout (reads stay
+                            // consistent, gathers stay near-contiguous). Single shared mapping
+                            // (sorted_indices read-only until the identity write) → no chunk hazard.
+                            let nbytes_v4 = (self.active_count as u64) * 16;
+                            let nbytes_u32 = (self.active_count as u64) * 4;
+                            pass(
+                                &mut enc,
+                                &p.grid_reorder_a,
+                                &b.grid_reorder_a,
+                                "grid_reorder_a",
+                                np,
+                            );
+                            enc.copy_buffer_to_buffer(
+                                &self.pos_scratch,
+                                0,
+                                &self.pos,
+                                0,
+                                nbytes_v4,
+                            );
+                            enc.copy_buffer_to_buffer(
+                                &self.pred_scratch,
+                                0,
+                                &self.pred,
+                                0,
+                                nbytes_v4,
+                            );
+                            enc.copy_buffer_to_buffer(
+                                &self.vel_scratch,
+                                0,
+                                &self.vel,
+                                0,
+                                nbytes_v4,
+                            );
+                            pass(
+                                &mut enc,
+                                &p.grid_reorder_b,
+                                &b.grid_reorder_b,
+                                "grid_reorder_b",
+                                np,
+                            );
+                            enc.copy_buffer_to_buffer(
+                                &self.chem_scratch,
+                                0,
+                                &self.chem,
+                                0,
+                                nbytes_v4,
+                            );
+                            enc.copy_buffer_to_buffer(
+                                &self.phase_scratch,
+                                0,
+                                &self.phase,
+                                0,
+                                nbytes_u32,
+                            );
+                            pass(
+                                &mut enc,
+                                &p.grid_reorder_identity,
+                                &b.grid_reorder_identity,
+                                "grid_reorder_identity",
+                                np,
+                            );
+                        }
+                        if mixed {
+                            // Solid fraction (live from current pred) → pore-modulated water target.
+                            pass(
+                                &mut enc,
+                                &p.compute_fractions,
+                                &b.compute_fractions,
+                                "compute_fractions",
+                                np,
+                            );
+                        }
+                        if self.has_solids {
+                            // Wall density compensation into c_residual (consumed by compute_lambda,
+                            // then overwritten with the convergence residual). Solid scenes only.
+                            pass(
+                                &mut enc,
+                                &p.compute_boundary,
+                                &b.compute_boundary,
+                                "compute_boundary",
+                                np,
+                            );
+                        }
+                        pass(
+                            &mut enc,
+                            &p.compute_lambda,
+                            &b.compute_lambda,
+                            "compute_lambda",
+                            np,
+                        );
+                        pass(&mut enc, &p.compute_dp, &b.compute_dp, "compute_dp", np);
+                        if mixed {
+                            // Grain exclusion (A.2), two-way: water out of grain bodies + reaction.
+                            pass(
+                                &mut enc,
+                                &p.exclude_water,
+                                &b.exclude_water,
+                                "exclude_water",
+                                np,
+                            );
+                            pass(
+                                &mut enc,
+                                &p.exclude_grain,
+                                &b.exclude_grain,
+                                "exclude_grain",
+                                np,
+                            );
+                        }
+                        pass(&mut enc, &p.apply_dp, &b.apply_dp, "apply_dp", np);
+                        // Adaptive early-exit only for single-species water (mixed runs fixed iters).
+                        if !mixed {
+                            pass(
+                                &mut enc,
+                                &p.residual_reduce,
+                                &b.residual_reduce,
+                                "residual_reduce",
+                                1,
+                            );
+                        }
+                    }
+                }
+
+                if mixed && self.drag_subiters > 0 {
+                    pass(&mut enc, &p.grid_clear, &b.grid_clear, "grid_clear", nc);
+                    pass(&mut enc, &p.grid_count, &b.grid_count, "grid_count", np);
+                    pass(&mut enc, &p.grid_scan, &b.grid_scan, "grid_scan", 1);
+                    pass(&mut enc, &p.grid_clear, &b.grid_clear, "grid_clear", nc);
+                    pass(
+                        &mut enc,
+                        &p.grid_scatter,
+                        &b.grid_scatter,
+                        "grid_scatter",
+                        np,
+                    );
+                    pass(
+                        &mut enc,
+                        &p.compute_coupling_scale,
+                        &b.compute_coupling_scale,
+                        "compute_coupling_scale",
+                        np,
+                    );
+                    for _ in 0..self.drag_subiters {
+                        enc.copy_buffer_to_buffer(
+                            self.vel.as_ref(),
+                            0,
+                            &self.vel_frozen,
+                            0,
+                            (self.active_count as u64) * 16,
+                        );
+                        pass(&mut enc, &p.drag_water, &b.drag_water, "drag_water", np);
+                        pass(&mut enc, &p.drag_grain, &b.drag_grain, "drag_grain", np);
+                        pass(
+                            &mut enc,
+                            &p.apply_drag_pred,
+                            &b.apply_drag_pred,
+                            "apply_drag_pred",
+                            np,
+                        );
+                    }
+                }
+
+                if mixed && self.params.buoyancy_scale > 0.0 {
+                    pass(&mut enc, &p.grid_clear, &b.grid_clear, "grid_clear", nc);
+                    pass(&mut enc, &p.grid_count, &b.grid_count, "grid_count", np);
+                    pass(&mut enc, &p.grid_scan, &b.grid_scan, "grid_scan", 1);
+                    pass(&mut enc, &p.grid_clear, &b.grid_clear, "grid_clear", nc);
+                    pass(
+                        &mut enc,
+                        &p.grid_scatter,
+                        &b.grid_scatter,
+                        "grid_scatter",
+                        np,
+                    );
+                    enc.copy_buffer_to_buffer(
+                        self.vel.as_ref(),
+                        0,
+                        &self.vel_frozen,
+                        0,
+                        (self.active_count as u64) * 16,
+                    );
+                    pass(
+                        &mut enc,
+                        &p.buoyancy_grain,
+                        &b.buoyancy_grain,
+                        "buoyancy_grain",
+                        np,
+                    );
+                    pass(
+                        &mut enc,
+                        &p.buoyancy_water,
+                        &b.buoyancy_water,
+                        "buoyancy_water",
+                        np,
+                    );
+                    pass(
+                        &mut enc,
+                        &p.apply_drag_pred,
+                        &b.apply_drag_pred,
+                        "apply_drag_pred",
+                        np,
+                    );
+                }
+
+                if self.has_grain {
+                    for it in 0..self.bed_iters {
+                        if it % self.bed_regrid == 0 {
+                            pass(&mut enc, &p.grid_clear, &b.grid_clear, "grid_clear", nc);
+                            pass(&mut enc, &p.grid_count, &b.grid_count, "grid_count", np);
+                            pass(&mut enc, &p.grid_scan, &b.grid_scan, "grid_scan", 1);
+                            pass(&mut enc, &p.grid_clear, &b.grid_clear, "grid_clear", nc);
+                            pass(
+                                &mut enc,
+                                &p.grid_scatter,
+                                &b.grid_scatter,
+                                "grid_scatter",
+                                np,
+                            );
+                        }
+                        pass(&mut enc, &p.bed_project, &b.bed_project, "bed_project", np);
+                        pass(&mut enc, &p.apply_dp, &b.apply_dp, "apply_dp", np);
+                        if !mixed {
+                            pass(
+                                &mut enc,
+                                &p.residual_reduce,
+                                &b.residual_reduce,
+                                "residual_reduce",
+                                1,
+                            );
+                        }
+                    }
+                }
+
+                pass(&mut enc, &p.finalize, &b.finalize, "finalize", np);
+
+                // XSPH viscosity is a fluid term; runs only when water is present.
+                if self.has_water {
+                    pass(&mut enc, &p.xsph, &b.xsph, "xsph", np);
+                    enc.copy_buffer_to_buffer(
+                        &self.vel_smoothed,
+                        0,
+                        &self.vel,
+                        0,
+                        (self.active_count as u64) * 16,
+                    );
+                }
+
+                // Wetting / absorption (mixed scenes; opt-in via absorb_rate>0). Runs last in the
+                // substep — after finalize/xsph so it reads final positions/velocities and its grain
+                // momentum merge isn't clobbered by the xsph velocity copy. Reads the frozen pred.w
+                // snapshot, writes the new moisture to pos.w; the next predict mirrors it.
+                if mixed && self.params.k_abs > 0.0 {
+                    pass(&mut enc, &p.grid_clear, &b.grid_clear, "grid_clear", nc);
+                    pass(&mut enc, &p.grid_count, &b.grid_count, "grid_count", np);
+                    pass(&mut enc, &p.grid_scan, &b.grid_scan, "grid_scan", 1);
+                    pass(&mut enc, &p.grid_clear, &b.grid_clear, "grid_clear", nc);
+                    pass(
+                        &mut enc,
+                        &p.grid_scatter,
+                        &b.grid_scatter,
+                        "grid_scatter",
+                        np,
+                    );
+                    pass(&mut enc, &p.wet_count, &b.wet_count, "wet_count", np);
+                    pass(&mut enc, &p.wet_water, &b.wet_water, "wet_water", np);
+                    pass(&mut enc, &p.wet_grain, &b.wet_grain, "wet_grain", np);
+                }
+
+                // Extraction / dissolution (mixed scenes; opt-in via extract_rate>0). Wet grains
+                // dissolve two-pool solute into overlapping water's concentration, conserving the
+                // solute inventory exactly. Reads the frozen pred.w moisture (same snapshot wetting
+                // used) + a frozen chem copy; writes only the live chem buffer. Rebuilds the grid
+                // itself so it's independent of the wetting block's gate.
+                if mixed && self.params.extract_rate > 0.0 {
+                    pass(&mut enc, &p.grid_clear, &b.grid_clear, "grid_clear", nc);
+                    pass(&mut enc, &p.grid_count, &b.grid_count, "grid_count", np);
+                    pass(&mut enc, &p.grid_scan, &b.grid_scan, "grid_scan", 1);
+                    pass(&mut enc, &p.grid_clear, &b.grid_clear, "grid_clear", nc);
+                    pass(
+                        &mut enc,
+                        &p.grid_scatter,
+                        &b.grid_scatter,
+                        "grid_scatter",
+                        np,
+                    );
+                    // Snapshot the live chem so both transfer passes read a frozen state while
+                    // writing disjoint slots of the live buffer (race-free conservation).
+                    enc.copy_buffer_to_buffer(
+                        self.chem.as_ref(),
+                        0,
+                        &self.chem_frozen,
+                        0,
+                        (self.active_count as u64) * 16,
+                    );
+                    pass(&mut enc, &p.diss_count, &b.diss_count, "diss_count", np);
+                    pass(
+                        &mut enc,
+                        &p.dissolve_grain,
+                        &b.dissolve_grain,
+                        "dissolve_grain",
+                        np,
+                    );
+                    pass(
+                        &mut enc,
+                        &p.dissolve_water,
+                        &b.dissolve_water,
+                        "dissolve_water",
+                        np,
+                    );
+                    // Thermal exchange + ambient loss (U6). Re-snapshot the post-dissolution chem so
+                    // the pass preserves the updated c/pools (it writes only the T lane), then run on
+                    // the still-valid grid. T evolved here feeds the NEXT substep's k_T (one-step lag).
+                    enc.copy_buffer_to_buffer(
+                        self.chem.as_ref(),
+                        0,
+                        &self.chem_frozen,
+                        0,
+                        (self.active_count as u64) * 16,
+                    );
+                    pass(
+                        &mut enc,
+                        &p.thermal_exchange,
+                        &b.thermal_exchange,
+                        "thermal_exchange",
+                        np,
+                    );
+                }
+            }
+        }
+
+        if let Some(ts) = &self.ts {
+
+exec
+/bin/zsh -lc "sed -n '2250,2305p' src/solvers/xpbd/mod.rs" in /Users/cxc/Github/coffee-sim
+exec
+/bin/zsh -lc "sed -n '1590,1660p' src/solvers/xpbd/mod.rs" in /Users/cxc/Github/coffee-sim
+ succeeded in 0ms:
+        if let Some(ts) = &self.ts {
+            if cursor >= 2 {
+                enc.resolve_query_set(&ts.qset, 0..cursor, &ts.resolve, 0);
+                enc.copy_buffer_to_buffer(&ts.resolve, 0, &ts.readback, 0, (cursor as u64) * 8);
+            }
+        }
+
+        self.queue.submit(Some(enc.finish()));
+
+        self.dispatches = dispatches;
+        if let Some(ts) = self.ts.as_mut() {
+            ts.labels = labels;
+            ts.count = cursor;
+        }
+    }
+
+    fn particles(&self) -> ParticleBuffers {
+        ParticleBuffers {
+            particle_count: self.active_count,
+            position: Some(Arc::clone(&self.pos)),
+            velocity: Some(Arc::clone(&self.vel)),
+            phase_tag: Some(Arc::clone(&self.phase)),
+            // The chem buffer carries both lanes: water concentration `c` (.x) and temperature `T`
+            // (.y). The renderer reads the relevant lane per field; both share the one buffer.
+            concentration: Some(Arc::clone(&self.chem)),
+            temperature: Some(Arc::clone(&self.chem)),
+            ..Default::default()
+        }
+    }
+
+    fn metrics(&self) -> Metrics {
+        Metrics {
+            particle_count: self.active_count,
+            iteration_count: self.cached_diag.effective_iters,
+            extraction_yield: self.cached_yield,
+            tds: self.cached_tds,
+            ..Default::default()
+        }
+    }
+
+    fn profile(&self) -> Profile {
+        Profile {
+            passes: self.cached_passes.clone(),
+            dispatches_per_frame: self.dispatches,
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_pass(
+    enc: &mut wgpu::CommandEncoder,
+    pipeline: &wgpu::ComputePipeline,
+    bind_group: &wgpu::BindGroup,
+    ts: Option<&Timestamps>,
+    cursor: &mut u32,
+    labels: &mut Vec<String>,
+
+ succeeded in 0ms:
+                    (5, &lambda),
+                    (8, &cell_start),
+                    (9, &sorted_indices),
+                    (11, &phase),
+                    (14, &fluid_impulse),
+                    (15, &vel_frozen),
+                ],
+            ),
+            buoyancy_water: bg(
+                &pipelines.buoyancy_water,
+                &[
+                    (0, &params_buf),
+                    (2, &pred),
+                    (3, &vel),
+                    (5, &lambda),
+                    (8, &cell_start),
+                    (9, &sorted_indices),
+                    (11, &phase),
+                    (15, &vel_frozen),
+                ],
+            ),
+            apply_drag_pred: bg(
+                &pipelines.apply_drag_pred,
+                &[
+                    (0, &params_buf),
+                    (2, &pred),
+                    (3, &vel),
+                    (11, &phase),
+                    (15, &vel_frozen),
+                    (19, &solids),
+                ],
+            ),
+            wet_count: bg(
+                &pipelines.wet_count,
+                &[
+                    (0, &params_buf),
+                    (2, &pred),
+                    (8, &cell_start),
+                    (9, &sorted_indices),
+                    (11, &phase),
+                    (17, &wet_count),
+                ],
+            ),
+            wet_water: bg(
+                &pipelines.wet_water,
+                &[
+                    (0, &params_buf),
+                    (1, &pos),
+                    (2, &pred),
+                    (8, &cell_start),
+                    (9, &sorted_indices),
+                    (11, &phase),
+                    (17, &wet_count),
+                ],
+            ),
+            wet_grain: bg(
+                &pipelines.wet_grain,
+                &[
+                    (0, &params_buf),
+                    (1, &pos),
+                    (2, &pred),
+                    (3, &vel),
+                    (8, &cell_start),
+                    (9, &sorted_indices),
+                    (11, &phase),
+                    (17, &wet_count),
+                ],
+            ),
+            diss_count: bg(
+                &pipelines.diss_count,
+                &[
+
+exec
+/bin/zsh -lc "sed -n '680,790p' src/solvers/xpbd/mod.rs" in /Users/cxc/Github/coffee-sim
+ succeeded in 0ms:
+    /// Sample GPU diagnostics (status + per-pass timestamps) into the caches that
+    /// `metrics()`/`profile()` return. Blocks (dev/test/periodic only).
+    pub fn sample_diagnostics(&mut self) {
+        // --- status ---
+        let mut enc = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("status-readback"),
+            });
+        enc.copy_buffer_to_buffer(
+            &self.status,
+            0,
+            &self.status_readback,
+            0,
+            std::mem::size_of::<StatusRaw>() as u64,
+        );
+        self.queue.submit(Some(enc.finish()));
+        let slice = self.status_readback.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        let _ = self.device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        });
+        rx.recv().unwrap().unwrap();
+        let raw: StatusRaw = *bytemuck::from_bytes(&slice.get_mapped_range());
+        self.status_readback.unmap();
+        self.cached_diag = XpbdDiagnostics {
+            overflow: raw.overflow != 0,
+            max_occupancy: raw.max_occupancy,
+            effective_iters: raw.effective_iters,
+            residual: f32::from_bits(raw.residual_bits),
+        };
+
+        // --- timestamps ---
+        if let Some(ts) = &self.ts {
+            if ts.count >= 2 {
+                let size = (ts.count as u64) * 8;
+                let slice = ts.readback.slice(0..size);
+                let (tx, rx) = std::sync::mpsc::channel();
+                slice.map_async(wgpu::MapMode::Read, move |r| {
+                    let _ = tx.send(r);
+                });
+                let _ = self.device.poll(wgpu::PollType::Wait {
+                    submission_index: None,
+                    timeout: None,
+                });
+                rx.recv().unwrap().unwrap();
+                let times: Vec<u64> = bytemuck::cast_slice(&slice.get_mapped_range()).to_vec();
+                ts.readback.unmap();
+                let mut passes = Vec::new();
+                for (idx, label) in ts.labels.iter().enumerate() {
+                    let b = times[idx * 2];
+                    let e = times[idx * 2 + 1];
+                    let us = (e.saturating_sub(b)) as f32 * ts.period_ns / 1000.0;
+                    passes.push((label.clone(), us));
+                }
+                self.cached_passes = passes;
+            }
+        }
+
+        self.sample_extraction();
+    }
+
+    /// Refresh the cached yield/TDS from the current chem + positions (a blocking readback, folded
+    /// into `sample_diagnostics`). Yield = dissolved solute / total soluble dose; TDS = cup solute /
+    /// cup water mass, over the catch-cup region. All water volumes scale by the remaining fraction
+    /// `f_w` (deactivated water `f_w ≤ roundoff` is excluded). Phase is the immutable seed tag.
+    fn sample_extraction(&mut self) {
+        if self.total_dose <= 1.0e-9 {
+            return; // no coffee dose (e.g. water-only scene) ⇒ yield/TDS stay 0
+        }
+        let chem = self.read_vec4(self.chem.as_ref());
+        let pos = self.read_vec4(self.pos.as_ref());
+        let v_w = self.params.particle_mass / self.params.rest_density;
+        let rho_w = self.params.rest_density;
+        let mut dissolved = 0.0f32;
+        let mut cup_solute = 0.0f32;
+        let mut cup_water_mass = 0.0f32;
+        for (i, (c, p)) in chem.iter().zip(&pos).enumerate() {
+            if self.phase_mirror[i] != 0 {
+                continue; // water only (mirror covers seed + pour-emitted particles)
+            }
+            let f_w = p[3];
+            if f_w <= self.params.absorb_roundoff {
+                continue; // deactivated water carries no solute
+            }
+            let solute = c[0] * f_w * v_w; // c·(f_w·V_w)
+            dissolved += solute;
+            if let Some(cup) = self.cup {
+                let dx = p[0] - cup.cx;
+                let dz = p[2] - cup.cz;
+                if dx * dx + dz * dz < cup.radius * cup.radius
+                    && p[1] >= cup.y_min
+                    && p[1] <= cup.y_max
+                {
+                    cup_solute += solute;
+                    cup_water_mass += f_w * v_w * rho_w; // = f_w · particle_mass
+                }
+            }
+        }
+        self.cached_yield = dissolved / self.total_dose;
+        self.cached_tds = if cup_water_mass > 1.0e-9 {
+            cup_solute / cup_water_mass
+        } else {
+            0.0
+        };
+    }
+
+
+exec
+/bin/zsh -lc "sed -n '1660,1715p' src/solvers/xpbd/mod.rs" in /Users/cxc/Github/coffee-sim
+ succeeded in 0ms:
+                &[
+                    (0, &params_buf),
+                    (1, &pos),
+                    (3, &vel),
+                    (8, &cell_start),
+                    (9, &sorted_indices),
+                    (11, &phase),
+                    (21, &diss_neighbors),
+                ],
+            ),
+            dissolve_grain: bg(
+                &pipelines.dissolve_grain,
+                &[
+                    (0, &params_buf),
+                    (1, &pos),
+                    (8, &cell_start),
+                    (9, &sorted_indices),
+                    (11, &phase),
+                    (20, &chem),
+                    (21, &diss_neighbors),
+                    (22, &chem_frozen),
+                ],
+            ),
+            dissolve_water: bg(
+                &pipelines.dissolve_water,
+                &[
+                    (0, &params_buf),
+                    (1, &pos),
+                    (8, &cell_start),
+                    (9, &sorted_indices),
+                    (11, &phase),
+                    (20, &chem),
+                    (21, &diss_neighbors),
+                    (22, &chem_frozen),
+                ],
+            ),
+            thermal_exchange: bg(
+                &pipelines.thermal_exchange,
+                &[
+                    (0, &params_buf),
+                    (1, &pos),
+                    (8, &cell_start),
+                    (9, &sorted_indices),
+                    (11, &phase),
+                    (20, &chem),
+                    (22, &chem_frozen),
+                ],
+            ),
+            apply_dp: bg(
+                &pipelines.apply_dp,
+                &[
+                    (0, &params_buf),
+                    (1, &pos),
+                    (2, &pred),
+                    (6, &dp),
+                    (10, &status),
+
+exec
+/bin/zsh -lc "rg -n \"pred|pos\\.w|pos\" docs/plans/2026-06-06-002-feat-fines-migration-channeling-plan.md" in /Users/cxc/Github/coffee-sim
+ succeeded in 0ms:
+19:water, and re-deposit where the flow slackens — locally clogging the pore space, lowering
+33:- Erosion/deposition is **one conservation-safe two-sided scalar transfer** (count + grain +
+80:  erode into overlapping flowing water and re-deposit into grains where flow is slow, modeled
+103:- R7. The solver computes and exposes `evenness` (volume-weighted downward-flux uniformity) and
+127:  clamp would erase positive clogging in already-packed regions while still letting negative
+134:  (R8). Budget-safe: `compute_fractions` storage today is `pred, cell_start, sorted_indices,
+147:  which keys off `pos.w` and several of which are already at 8/8). The conservation claim is
+150:- KTD-5 — **One signed-net erosion/deposition transfer, volume-conserving.** A single trio
+156:  - **Read `pos`/`pos.w`, not `pred`.** The block runs *after* wetting (which writes `pos.w`);
+157:    `pred.w` is the stale start-of-substep snapshot. Like the extraction block, fines reads the
+158:    live post-wetting `pos`/`pos.w` so the deactivation cap (KTD-10) sees the current `f_w`.
+159:  - **`fines_count` is eligibility-only (no `vel`).** It counts opposite-species neighbors in
+161:    magnitude/direction, not eligibility. Count buffers: `pos, phase, cell_start,
+164:    `fines_grain`/`fines_water` = `pos, phase, cell_start, sorted_indices, chem_frozen,
+206:  suspended fines by its **post-wetting active volume** (read live `pos.w`, per the KTD-5 timing
+207:  rule — not the stale frozen `pred.w`) and force deposition to rise as `f_w → 0` (shed before
+222:  flux -->|low| deposit["deposition: water chem.w → grain chem.w (scalar)"]
+224:  advect --> deposit
+225:  deposit --> dev["grain fines deviation = chem.w − S"]
+233:The loop is the point: erosion and deposition are flux-gated, the deviation feeds the
+241:where post-finalize velocities give a settled flux signal — mirroring that block's structure but
+246:  ... predict → water density loop → drag → buoyancy → bed → finalize → xsph
+269:    `net_rate(flux, crit_flux, rate) -> f32` (signed: + erodes / − deposits, single zero-crossing
+284:- **Patterns to follow:** the `extract_rate` gate + pool-seed wiring; the `pos.w`
+288:    `fines_rate = 0` produces identical positions/velocities/chem to baseline (the new pass must
+297:### U2. Erosion + deposition scalar transfer (volume-conserving, massless)
+304:  - `src/solvers/xpbd/fines.wgsl` (new) — `fines_count` (eligibility-only: opposite-species
+308:    capped so neither lane over-draws, write only their own `chem.w`). All read live `pos`/`pos.w`
+309:    (post-wetting), **not `pred`** (KTD-5). **No velocity writes** (massless, KTD-4).
+317:  (grain→water), low flux ⇒ deposition (water→grain). KTD-10: deposition rate rises as the
+328:    equilibrium; post-equilibrium drift slope ≈ 0 (pins the one-signed-ulp leak class). Reuse the
+331:    `Σ m_eff·v` (using the existing `pos.w`-based `eff_mass`) is **identical** to a fines-off
+335:  - Covers R3. *Deactivation safety:* a fine-laden water absorbed toward `f_w→0` deposits its
+353:    `drag_water`/`drag_grain` equal-and-opposite per pair. Gate the harmonic path to
+370:    equal-and-opposite (momentum conserved to float tolerance) under the new combiner.
+400:- **Patterns to follow:** `grain_eff_volume(pred[j].w)` usage already in `compute_fractions`
+414:- **Goal:** Compute and expose `evenness` and `drawdown_time` in `Metrics`, replacing the
+419:  - `src/solvers/xpbd/mod.rs` — add a `sample_channeling` CPU readback (positions + velocities +
+430:  `read_positions`/`read_velocities`/`read_moisture`/`read_phases` helpers; the
+507:**In scope:** massless fines erosion/advection/deposition (scalar transport), fines→transient-
+541:  drains. *Mitigation:* KTD-10 (cap by `f_w` + forced deposition before deactivation; closed
+585:  implementability gaps only). Folded in: read live `pos.w` post-wetting not `pred.w` (KTD-5/
+
+exec
+/bin/zsh -lc "sed -n '470,515p' src/solvers/xpbd/common.wgsl" in /Users/cxc/Github/coffee-sim
+ succeeded in 0ms:
+// 256 chunk sums, then each thread writes its chunk's prefixes.
+@compute @workgroup_size(256)
+fn grid_scan(@builtin(local_invocation_id) lid: vec3<u32>) {
+    let n = params.grid_dims.w;
+    let tid = lid.x;
+    let threads = 256u;
+    let chunk = (n + threads - 1u) / threads;
+    let begin = tid * chunk;
+
+    var s = 0u;
+    for (var k = 0u; k < chunk; k = k + 1u) {
+        let idx = begin + k;
+        if (idx < n) { s = s + atomicLoad(&cell_count[idx]); }
+    }
+    scan_tmp[tid] = s;
+    workgroupBarrier();
+
+    if (tid == 0u) {
+        var acc = 0u;
+        for (var t = 0u; t < threads; t = t + 1u) {
+            let v = scan_tmp[t];
+            scan_tmp[t] = acc;
+            acc = acc + v;
+        }
+        scan_total = acc;
+    }
+    workgroupBarrier();
+
+    var run = scan_tmp[tid];
+    for (var k = 0u; k < chunk; k = k + 1u) {
+        let idx = begin + k;
+        if (idx < n) {
+            cell_start[idx] = run;
+            run = run + atomicLoad(&cell_count[idx]);
+        }
+    }
+    if (tid == 0u) { cell_start[n] = scan_total; }
+}
+
+@compute @workgroup_size(256)
+fn grid_scatter(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= params.particle_count) { return; }
+    let cell = cell_id(cell_coord(pred[i].xyz));
+    // cell_count was re-zeroed after the scan, so it serves as the per-cell write cursor here.
+    let local = atomicAdd(&cell_count[cell], 1u);
+
+exec
+/bin/zsh -lc "sed -n '435,470p' src/solvers/xpbd/common.wgsl" in /Users/cxc/Github/coffee-sim
+ succeeded in 0ms:
+    normal_impulse[i] = 0.0; // reset the per-frame friction-budget accumulator (grains)
+    fluid_impulse[i] = 0.0; // reset the per-frame water↔grain wake signal
+    let p = pos[i].xyz;
+    let v = vel[i].xyz;
+    let g = params.gravity.xyz;
+    let np = p + params.dt * v + (params.dt * params.dt) * g;
+    // Mirror the moisture lane (pos.w) into pred.w so the predicted-state kernels can read it; the
+    // absorption passes treat pred.w as the frozen per-frame snapshot.
+    pred[i] = vec4<f32>(np, pos[i].w);
+}
+
+@compute @workgroup_size(256)
+fn grid_clear(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let c = gid.x;
+    if (c >= params.grid_dims.w) { return; }
+    atomicStore(&cell_count[c], 0u);
+}
+
+// Counting-sort grid build: grid_clear (zero cell_count) → grid_count → grid_scan → grid_clear →
+// grid_scatter. No fixed buckets, so no overflow and no wasted memory — every neighbor is gathered.
+
+@compute @workgroup_size(256)
+fn grid_count(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= params.particle_count) { return; }
+    let cell = cell_id(cell_coord(pred[i].xyz));
+    let slot = atomicAdd(&cell_count[cell], 1u);
+    atomicMax(&status.max_occupancy, slot + 1u);
+}
+
+var<workgroup> scan_tmp: array<u32, 256>;
+var<workgroup> scan_total: u32;
+
+// Single-workgroup exclusive prefix sum of cell_count → cell_start (num_cells+1; the last entry is
+// the total). Dispatched as ONE workgroup; each thread scans a contiguous chunk, thread 0 scans the
+// 256 chunk sums, then each thread writes its chunk's prefixes.
+
+exec
+/bin/zsh -lc "rg -n \"fn finalize|pos\\[i\\]\" src/solvers/xpbd/common.wgsl | head -20 && sed -n '590,650p' src/solvers/xpbd/common.wgsl" in /Users/cxc/Github/coffee-sim
+ succeeded in 0ms:
+437:    let p = pos[i].xyz;
+443:    pred[i] = vec4<f32>(np, pos[i].w);
+612:            let disp = newp - pos[i].xyz;
+636:fn finalize(@builtin(global_invocation_id) gid: vec3<u32>) {
+640:    var v = ((xi - pos[i].xyz) / params.dt) * params.velocity_damping;
+694:    pos[i] = vec4<f32>(xi, pos[i].w); // preserve the persistent moisture lane (pos.w)
+        // The boundary normal response is the box clamp delta and/or the SDF push above. Apply
+        // Coulomb friction along the *dominant* boundary: remove the grain's tangential drift
+        // (relative to its frame-start position) up to mu · |normal correction|, using the solid's
+        // friction when the SDF push dominated, else floor_mu. This is the angle-of-repose mechanism.
+        let push = clamped - proposed;
+        let box_mag = length(push);
+        var newp = clamped;
+        var n = vec3<f32>(0.0, 0.0, 0.0);
+        var nmag = 0.0;
+        var mu = params.floor_mu;
+        if (box_mag >= sdf_mag) {
+            if (box_mag > 1e-6) {
+                n = push / box_mag;
+                nmag = box_mag;
+                mu = params.floor_mu;
+            }
+        } else {
+            n = sdf_n;
+            nmag = sdf_mag;
+            mu = sdf_mu;
+        }
+        if (nmag > 1e-6) {
+            let disp = newp - pos[i].xyz;
+            let tang = disp - dot(disp, n) * n;
+            let tlen = length(tang);
+            if (tlen > 1e-8) {
+                let remove = min(tlen, mu * nmag);
+                newp = newp - (tang / tlen) * remove;
+            }
+            // Post-friction SDF recheck: the tangential slide can re-enter a wall (only the box is
+            // re-clamped below), so re-project out of the solid first, then re-clamp to the box.
+            if (params.num_solids > 0u) {
+                let h2 = solid_union(newp, phase[i]);
+                if (h2.dist < contact) {
+                    newp = newp + (contact - h2.dist) * h2.grad;
+                }
+            }
+            newp = clamp(newp, params.box_min.xyz, params.box_max.xyz);
+        }
+        pred[i] = vec4<f32>(newp, pred[i].w); // preserve the moisture snapshot in pred.w
+    } else {
+        pred[i] = vec4<f32>(clamped, pred[i].w); // preserve the moisture snapshot in pred.w
+    }
+}
+
+@compute @workgroup_size(256)
+fn finalize(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= params.particle_count) { return; }
+    let xi = pred[i].xyz;
+    var v = ((xi - pos[i].xyz) / params.dt) * params.velocity_damping;
+
+    if (phase[i] == PHASE_GRAIN) {
+        let pen = c_residual[i]; // final normalized penetration from the last bed_project
+        // Rolling-resistance proxy: bleed grain kinetic energy so spheres don't roll the pile
+        // shallow — but ONLY while in contact. An airborne grain isn't rolling, so damping its
+        // free-fall would just rob the impact of the energy it needs to flow into a heap.
+        if (pen > 1e-4) {
+            v = v * params.rolling_damping;
+        }
+        // Static-yield regularization (NOT freezing): below a small speed a grain is treated as
+
+exec
+/bin/zsh -lc "sed -n '650,710p' src/solvers/xpbd/common.wgsl" in /Users/cxc/Github/coffee-sim
+ succeeded in 0ms:
+        // Static-yield regularization (NOT freezing): below a small speed a grain is treated as
+        // at rest. Gravity and the contact solve still run for it every frame, so an unsupported
+        // grain immediately re-accelerates and penetration is never masked — this only removes
+        // the sub-threshold numerical jitter a Jacobi contact pile never fully shakes off.
+        if (fluid_impulse[i] <= params.wake_threshold && length(v) < params.grain_sleep_speed) {
+            v = vec3<f32>(0.0);
+        }
+    } else if (params.num_solids > 0u) {
+        // Canonical XPBD static-collision VELOCITY response (Müller et al. 2020). apply_dp already
+        // clamped POSITION out of the wall; here we set the post-collision VELOCITY independently of
+        // that push (the cure for wall "eruption": otherwise v=(pred-pos)/dt folds the outward push
+        // into v and the particle is flung off). One pass over the blocking solids: at a contacted
+        // surface split v, cancel the normal component (restitution 0 — inelastic; NOT a v·n≥0 clamp,
+        // which would permit the eruption) and apply Coulomb friction. A cup's side and floor meet in
+        // a concave corner where the nearest-face normal cancels only one axis, so on a cylinder floor
+        // we additionally zero v.y — both axes handled without a second sweep over `solids`.
+        let contact = 0.25 * params.h;
+        for (var s = 0u; s < params.num_solids; s = s + 1u) {
+            let prim = solids[s];
+            if ((prim.species_mask & (1u << phase[i])) == 0u) { continue; }
+            let hit = solid_cavity(prim, xi);
+            if (hit.dist < contact) {
+                let n = hit.grad; // unit (sdf_normalize3)
+                let vn = dot(v, n);
+                v = v - vn * n; // restitution 0: cancel normal velocity, decoupled from the push
+                let vt = length(v);
+                if (vt > 1e-6) {
+                    let fric = min(hit.friction * abs(vn), vt); // Coulomb: bounded by the normal impulse
+                    v = v - (v / vt) * fric;
+                }
+            }
+            if (prim.kind == 1u
+                && xi.y - prim.a.x < contact
+                && length(vec2<f32>(xi.x - prim.b.x, xi.z - prim.b.y)) < prim.a.z) {
+                v.y = 0.0; // concave corner: the floor axis the side normal can't cancel
+            }
+        }
+    }
+
+    let sp = length(v);
+    if (sp > params.max_speed) {
+        v = v * (params.max_speed / sp);
+    }
+    vel[i] = vec4<f32>(v, 0.0);
+    pos[i] = vec4<f32>(xi, pos[i].w); // preserve the persistent moisture lane (pos.w)
+}
+
+codex
+APPROVE
+
+The round-2 fixes converge. I do not see a remaining must-fix introduced by the revisions.
+
+Key checks:
+
+- `coupling_scale` widening is safe if implementation doubles the buffer byte size and updates WGSL/Rust element type together. Binding 16 is transient and is not part of cell-order reorder; reorder only moves `pos/pred/vel` and `chem/phase` in [common.wgsl](/Users/cxc/Github/coffee-sim/src/solvers/xpbd/common.wgsl:527). Drag bind counts stay unchanged at 8 storage buffers because binding 16 is the same slot.
+- Harmonic-k can be momentum-conserving: both `drag_water` and `drag_grain` call the same pair scalar, so harmonic mean plus symmetric `min(cap_i, cap_j)` remains equal-and-opposite. Store semantics must be consistent: either store `k` and compute harmonic mean directly, or store resistance `R=1/k` and use `k_pair = 2/(R_i + R_j)`. Do not harmonic-mean resistance.
+- Post-packing fines deviation is acceptable. Other consumers do not appear to require `alpha_s <= packing_limit`; water already floors pore fraction with `max(1.0 - alpha_s, 0.05)` in [water.wgsl](/Users/cxc/Github/coffee-sim/src/solvers/xpbd/water.wgsl:96), and drag clamps porosity similarly in [coupling.wgsl](/Users/cxc/Github/coffee-sim/src/solvers/xpbd/coupling.wgsl:154). This can intentionally expel water from severely clogged regions, but bounded by existing floors/correction caps.
+- The `k_abs > 0 || fines_rate > 0` gate is coherent. With `fines_rate = 0`, the old scalar beta/min path must be retained for byte identity. With `fines_rate > 0` and `k_abs = 0`, `alpha_s -> porosity_drag_factor` is still meaningful; `k_abs` was only preventing live porosity from reaching drag in no-wetting scenes.
+- The `pos.w`/`pred.w` issue is resolved in the plan. Fines passes read live `pos`/`pos.w`. The shared grid build keys on `pred.xyz`, but after `finalize`, `pos.xyz == pred.xyz`, and wetting/extraction do not move xyz, so this is coherent as long as fines stays in that post-finalize block.
+- Reusing `wet_neighbors` is valid. It is declared once at binding 17 in [common.wgsl](/Users/cxc/Github/coffee-sim/src/solvers/xpbd/common.wgsl:133), and the plan now says to reference that identifier directly, avoiding duplicate WGSL binding declarations. No lifetime hazard: wetting is done before fines overwrites the scratch.
+
+Watch during implementation:
+
+- Make the `vec2` fields explicit, preferably `(k_or_factor, beta_cap)` with a comment explaining the unit.
+- Preserve the old `min(capped_beta_i, capped_beta_j)` path exactly when `fines_rate == 0`.
+- Resize `xpbd-coupling-scale` from `N * 4` to `N * 8`.
+- Add `chem` to `compute_fractions` only, keeping it at 6 storage buffers.
+- Keep fines grid use after `finalize`; if a future pass moves `pos.xyz` after finalize, the pred-keyed grid would need revisiting.
+- Test the high-clog clamp case specifically, because it is stable by design but numerically stiff.
+tokens used
+72,958
+APPROVE
+
+The round-2 fixes converge. I do not see a remaining must-fix introduced by the revisions.
+
+Key checks:
+
+- `coupling_scale` widening is safe if implementation doubles the buffer byte size and updates WGSL/Rust element type together. Binding 16 is transient and is not part of cell-order reorder; reorder only moves `pos/pred/vel` and `chem/phase` in [common.wgsl](/Users/cxc/Github/coffee-sim/src/solvers/xpbd/common.wgsl:527). Drag bind counts stay unchanged at 8 storage buffers because binding 16 is the same slot.
+- Harmonic-k can be momentum-conserving: both `drag_water` and `drag_grain` call the same pair scalar, so harmonic mean plus symmetric `min(cap_i, cap_j)` remains equal-and-opposite. Store semantics must be consistent: either store `k` and compute harmonic mean directly, or store resistance `R=1/k` and use `k_pair = 2/(R_i + R_j)`. Do not harmonic-mean resistance.
+- Post-packing fines deviation is acceptable. Other consumers do not appear to require `alpha_s <= packing_limit`; water already floors pore fraction with `max(1.0 - alpha_s, 0.05)` in [water.wgsl](/Users/cxc/Github/coffee-sim/src/solvers/xpbd/water.wgsl:96), and drag clamps porosity similarly in [coupling.wgsl](/Users/cxc/Github/coffee-sim/src/solvers/xpbd/coupling.wgsl:154). This can intentionally expel water from severely clogged regions, but bounded by existing floors/correction caps.
+- The `k_abs > 0 || fines_rate > 0` gate is coherent. With `fines_rate = 0`, the old scalar beta/min path must be retained for byte identity. With `fines_rate > 0` and `k_abs = 0`, `alpha_s -> porosity_drag_factor` is still meaningful; `k_abs` was only preventing live porosity from reaching drag in no-wetting scenes.
+- The `pos.w`/`pred.w` issue is resolved in the plan. Fines passes read live `pos`/`pos.w`. The shared grid build keys on `pred.xyz`, but after `finalize`, `pos.xyz == pred.xyz`, and wetting/extraction do not move xyz, so this is coherent as long as fines stays in that post-finalize block.
+- Reusing `wet_neighbors` is valid. It is declared once at binding 17 in [common.wgsl](/Users/cxc/Github/coffee-sim/src/solvers/xpbd/common.wgsl:133), and the plan now says to reference that identifier directly, avoiding duplicate WGSL binding declarations. No lifetime hazard: wetting is done before fines overwrites the scratch.
+
+Watch during implementation:
+
+- Make the `vec2` fields explicit, preferably `(k_or_factor, beta_cap)` with a comment explaining the unit.
+- Preserve the old `min(capped_beta_i, capped_beta_j)` path exactly when `fines_rate == 0`.
+- Resize `xpbd-coupling-scale` from `N * 4` to `N * 8`.
+- Add `chem` to `compute_fractions` only, keeping it at 6 storage buffers.
+- Keep fines grid use after `finalize`; if a future pass moves `pos.xyz` after finalize, the pred-keyed grid would need revisiting.
+- Test the high-clog clamp case specifically, because it is stable by design but numerically stiff.

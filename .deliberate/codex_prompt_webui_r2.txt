@@ -1,0 +1,24 @@
+You are an expert reviewer (Rust + wgpu + wasm/WebGPU + web frontend) doing ROUND 2 of a plan cross-review. In round 1 you returned REVISE; the author folded your items into the plan (a substantial restructure). Verify the fold holds, catch anything the restructure INTRODUCED, and confirm it's implementation-ready. If so, APPROVE.
+
+Respond with a VERDICT on the FIRST LINE: **APPROVE**, **REVISE**, or **REJECT**. Then specific reasoning. READ-ONLY repo access — read the files.
+
+Read:
+1. Your round-1 review: `.deliberate/codex_review_webui.md`.
+2. The REVISED plan: `docs/plans/2026-06-06-003-feat-web-ui-port-plan.md`.
+3. As needed to verify: the rewrite's `src/solvers/xpbd/mod.rs` (the `sample_diagnostics()` blocking readback at ~line 704, the `metrics()` cache, the metrics buffers, and `exit_speed = flow / A_eff` at ~957), `src/engine/scene.rs` (`v60_pour`/`dam_break` + whether `XpbdSolver::build`/`reset`/`particles`/`metrics` give the handle everything it needs), `src/utils/gpu.rs` (the async split + a `new_web` shape), `examples/water_app.rs` (the ownership the handle mirrors + the surface acquire), `src/emission/{mod.rs,pour.rs}`, `KEEP.md` (SIM_UNITS_PER_METER, ML_PER_SIM_UNIT3), and v1's `crates/sim-wasm/src/lib.rs` async `sampleMetrics`/`waterDiagnostics` (via `git show main:`).
+
+Verify each folded change specifically:
+
+1. KTD-5 (handle owns GpuContext + XpbdSolver directly). Does `XpbdSolver` (via the `Solver` trait + its inherent methods) actually expose everything the handle needs — build, reset, step, particles(), metrics(), and a way to rebuild on scene change? Does owning `GpuContext` separately from the solver work given how `XpbdSolver::build(scene, mats, cfg, gpu)` borrows `gpu` (lifetime/ownership — does the solver hold a reference to GpuContext, or clone Arc handles)? Is reset-via-rebuild (drop + `XpbdSolver::build` again) sound, or does it leak GPU resources / need explicit teardown?
+
+2. KTD-6 / U4 (web-safe async metrics). Is the proposed `map_async` + Promise path actually feasible against how `sample_diagnostics()` currently computes yield/TDS/evenness/drawdown? Those values are computed CPU-side after reading back buffers — can the async path reuse that compute, or does it need the readback buffers exposed? Does cloning `Arc<Device>/Arc<Queue>` to avoid holding `&mut self` across `.await` actually work for a `#[wasm_bindgen]` method (which takes `&mut self`)? Any borrow/lifetime problem returning a Promise from `&mut self`? Is "sample every N frames" enough, or is there a staleness/correctness issue (e.g. the cup-TDS sampling cadence the solver assumes)?
+
+3. KTD-7 (velocity→flow). Now stated as `flow_rate_sim = π·r²·discharge·(speed_m_s·SIM_UNITS_PER_METER)`. Cross-check units against how `EmissionInput.flow_rate` is consumed and `exit_speed = flow/A_eff` is derived in mod.rs — does the round-trip actually recover `speed_m_s·SIM_UNITS_PER_METER` as exit speed? Is `A_eff = π·r²·discharge_coeff` the exact area the solver uses (read the emitter)? Any factor-of error?
+
+4. KTD-3 + U2 (web acquire, native untouched). Confirm the native surface acquire is in `examples/water_app.rs` (not `ui::render`) and already uses the enum, so the plan correctly leaves native alone. Is the async `request()` split of `gpu.rs` clean given the three current call sites?
+
+5. U1 (build). Is excluding winit examples from the wasm build actually achievable as described (per-`[[example]]` required-features vs just not targeting them)? Does anything else in the lib (not examples) pull a native-only crate that would break `wasm-pack build` even though `cargo check --target wasm32` passed (e.g. pollster used inside the lib's non-test code paths, serde_json, std::time::Instant in the solver/profiler)? Grep for `std::time`, `Instant`, `pollster::` usage in non-cfg'd lib code.
+
+6. Anything the restructure introduced: contradictions between KTDs and units, a dangling reference to the dropped native-reshape unit, U-ID/sequencing issues, or scope/sources mismatches. Does the unit DAG (U1→U2→U3→U4→U5) hold?
+
+If APPROVE, list what to watch during implementation. If REVISE, give a concrete bulleted list of only the remaining must-fix items (don't re-raise resolved ones).

@@ -1,0 +1,1365 @@
+OpenAI Codex v0.137.0
+--------
+workdir: /Users/cxc/Github/coffee-sim
+model: gpt-5.5
+provider: openai
+approval: never
+sandbox: read-only
+reasoning effort: high
+reasoning summaries: none
+session id: 019ea3df-313c-7c50-a50f-b042ec85890a
+--------
+user
+You are reviewing an implementation plan for a CORE change to a GPU PBF (Position-Based Fluids) solver in Rust + WGSL (wgpu 29 / WebGPU). The author is a physics reviewer who rejects hand-waving. Respond with a verdict on the FIRST LINE: **APPROVE**, **REVISE**, or **REJECT**. Then give specific, actionable findings. Be rigorous and concrete.
+
+Focus the review on:
+1. PHYSICS CORRECTNESS of completing the SPH boundary condition: the plan adds an analytic SDF boundary GRADIENT g_b = ρ₀·f_i·ψ'(d)·n̂ to the constraint Jacobian (sum_g) and applies λ_i·g_b as a position correction in compute_dp, where the engine already adds the boundary DENSITY ρ₀·f_i·ψ(d) to rho. Is this the correct Akinci-2012-style boundary force? Is ψ'(d) = −(315/256)(1−t²)⁴/h the right derivative of boundary_psi = 0.5 − (315/256)·poly(t) with poly(t)=t−(4/3)t³+(6/5)t⁵−(4/7)t⁷+(1/9)t⁹? Is the SIGN of g_b correct so the force pushes fluid AWAY from the wall (anti-climb), given n̂ = SDF gradient points into the fluid and ψ increases toward the wall (so ψ'<0)?
+2. The decision to add g_b to sum_g (the ∇_{p_i}C self term, flowing into dot(sum_g,sum_g)) but NOT to sum_g2 (because the wall is not a DOF). Is that the correct PBF/Macklin constraint-gradient treatment for a non-moving boundary?
+3. compute_dp adding only λ_i·g_b (no λ_b, no s_corr). Correct?
+4. Stability risk: could this wall force over-push / cause near-wall or concave-corner (cup floor∧wall) instability or eruptions? Is the sequencing (land force with heuristic still present, verify, THEN remove the v.y=0 heuristic) sound?
+5. The Route B choice (stage g_b from a dedicated cheap compute_boundary pass into a new persistent buffer, vs computing solids inline in the hot compute_lambda/compute_dp kernels). Buffer budget: compute_lambda and compute_dp are at 8 storage buffers, the device limit is 16, so +1 buffer → 9 is fine. Sound?
+6. Whether the verification (no-climb gate replacing the heuristic + preserve the existing boundary-density eruption prevention + re-run water/geometry/coupling/wetting) is sufficient.
+7. Any missing edge case, unit-sequencing hazard, or correctness gap.
+
+## Plan to Review
+
+---
+status: active
+type: fix
+date: 2026-06-07
+origin: none (direct from in-session diagnosis)
+---
+
+# fix: PBF solid-wall pressure force (structural anti-climb boundary condition)
+
+## Summary
+
+Water climbs and sticks to confining solid walls (the V60 cup/cone) in a thin sheet above the bulk pool surface. The root cause is in the PBF density/pressure constraint (`src/solvers/xpbd/water.wgsl`): the engine already treats a solid wall as contributing **virtual density** (`compute_boundary` stages `ρ₀·f_i·boundary_psi(d,h)`, the analytic poly6 kernel-mass occluded by the wall, which `compute_lambda` adds to `rho` — added originally to stop floor over-packing eruptions), but the wall contributes **no force**: the constraint gradient (`sum_g`/`sum_g2`) and the position correction (`compute_dp`) sum over fluid neighbors only. So a near-wall over-pressured column has no wall-normal pressure to balance it and relieves itself *up* the unblocked wall direction; the geometric `apply_dp` push-out then pins the climbed particles to the surface. A heuristic in `finalize` (`v.y = 0` for upward-moving water at a wall) currently masks the symptom.
+
+This plan completes the boundary condition (Akinci 2012, analytic via the SDF — no boundary particles): add the analytic boundary **gradient** `g_b = ρ₀·f_i·ψ'(d)·n̂` to the constraint Jacobian and apply `λ_i·g_b` as a wall-normal pressure force in `compute_dp`. The wall then exerts a real pressure that balances the near-wall fluid → hydrostatic equilibrium → no climb. The `v.y=0` heuristic is then removed and its coverage replaced by a structural no-climb gate.
+
+The boundary gradient is computed once per iteration in the existing cheap `compute_boundary` pass (which already evaluates the SDF) and staged into a new persistent scratch buffer the two hot density kernels read (**Route B**). This takes `compute_lambda` and `compute_dp` from 8 → 9 storage buffers per stage — within the project's real 16-buffer device limit.
+
+---
+
+## Problem Frame
+
+**Symptom (observed in the V60 water-only scene under an active pour):** a thin layer of water creeps up the cup wall and persists above the bulk pool surface. Headless probe (radius-bin: wall water at `r≈3` vs bulk pool): baseline wall water reached `y ≈ −3.16` (above the cup rim at `−3.5`) while the pool sat ~3–4 units lower. The wall layer *accumulates* over time and recedes when the pour stops — i.e., a real climbing/sticking artifact, not a transient splash.
+
+**Root cause (confirmed by reading the solver):**
+- `compute_boundary` → `c_residual[i] = ρ₀·f_i·boundary_psi(d,h)`; `compute_lambda` does `rho += c_residual[i]`. The wall's **density** is accounted for (near-wall `C_i` reads correctly; this term prevents floor over-packing eruptions).
+- `compute_lambda`'s constraint gradient `sum_g = Σ_fluid m_j·∇W` and `compute_dp`'s correction `Δp_i = (1/ρ₀)·Σ_fluid (λ_i+λ_j+s_corr)·∇W` have **no boundary term**. The wall exerts no pressure force in the solve.
+- Result: over-dense near-wall fluid (`C_i>0`, `λ_i<0`) relieves along `Σ_fluid ∇W`, which — with no wall-side neighbor and no wall force — points up the wall. `apply_dp`'s geometric push-out pins the result to the surface; `finalize`'s wall response cancels the *radial* velocity but Coulomb friction `∝ |v_n|` is ~0 for a slider, so nothing returns it. The heuristic `v.y=0` only kills the resulting upward velocity after the position damage is done.
+
+**Why a heuristic is the wrong fix:** the artifact is position-driven by the pressure solve. Velocity post-processing in `finalize` is too late and doesn't address the missing physics (the wall should push back).
+
+**Current baseline note:** the `v.y=0` heuristic and the `Scene::v60_pour_water_only` scene used by the new gate are **currently uncommitted** in the working tree (added this session alongside the water↔grain coupling re-grounding). This plan removes the heuristic (U5) and reuses that scene (U6); both are the baseline this plan builds on.
+
+---
+
+## Requirements
+
+- **R1.** The solid wall exerts a wall-normal **pressure force** in the PBF density/pressure solve, consistent with the existing density term (same `boundary_psi`, same `f_i` weighting, same `num_solids` gate, water-only).
+- **R2.** Water no longer forms a climbing/sticking sheet above the pool surface on a confining wall (cup/cone), under an active pour and at rest.
+- **R3.** The `finalize` `v.y=0` no-upward-wall-slip heuristic is **removed**; its coverage is replaced by a structural no-climb verification gate.
+- **R4.** The existing boundary **density** compensation (floor over-packing / eruption prevention) is **preserved** — the force term is added alongside it, not in place of it.
+- **R5.** AABB-only scenes (`num_solids == 0`) stay **byte-unchanged**; compression-only λ (`lambda_noncohesive`) preserved; the term is **water-only** (matches `compute_boundary`'s `PHASE_WATER` guard — grains keep their standoff + repose-friction wall handling).
+- **R6.** Stays within the project's **16** storage-buffers-per-stage device limit and remains browser-portable (wgpu 29 / Tint); the requested device limit must actually be granted (headless adapter + target browsers).
+- **R7.** No new instability: water incompressibility, long-run no-eruption, cone settling, V60 drainage, coupling, and wetting conservation all still hold.
+
+---
+
+## Key Technical Decisions
+
+- **KTD-1 — Route B (stage the gradient from `compute_boundary`) over Route A (bind `solids` into the hot kernels).** `compute_lambda` and `compute_dp` are the two heaviest per-iteration kernels (they run `min..max` iters every substep). `compute_boundary` already runs once per iteration alongside them and already evaluates the SDF (`solid_union`) once per particle. Route B reuses that single SDF eval and stages the gradient; Route A would pay a fresh `solid_union` per particle *inside* both hot density loops. Chosen: **B** (user-confirmed). Cost: one persistent scratch buffer.
+- **KTD-2 — Dedicated `boundary_grad` buffer, not packed into `c_residual`.** `c_residual` is double-purposed today: `compute_boundary` stages the boundary *density* there, `compute_lambda` reads it then **overwrites** it with the convergence residual (`max(0,c)`) for `residual_reduce`. Since `compute_dp` runs after `compute_lambda`, the gradient cannot ride in `c_residual` (it would be clobbered before `compute_dp` reads it). The gradient needs a buffer that survives the `compute_lambda → compute_dp` sequence → a new buffer. Keep the existing `c_residual` density-staging flow unchanged (minimal change); a future consolidation (carry both density and gradient in one vec4, freeing `c_residual`'s double duty) is deferred.
+- **KTD-3 — The storage-buffer limit is 16, not 8.** `compute_lambda` and `compute_dp` are already at exactly 8 storage buffers (`pred, lambda, c_residual|dp, cell_start, sorted_indices, status, phase, alpha_s`); adding `boundary_grad` makes them 9. The project's real per-stage device limit is **16** (the long-standing "WebGPU baseline = 8, never exceed" assumption was over-conservative for this project's deployment target). The device must request and be granted `max_storage_buffers_per_shader_stage = 16`; 9 sits comfortably inside it. Verify the grant on the headless adapter and confirm in a target browser (no headless WebGPU in CI). Other compute passes already bind `solids` (`buoyancy_grain`, `apply_dp`, `apply_drag_pred`), so the device tolerates solids in compute passes.
+- **KTD-4 — Analytic SDF boundary force (no boundary particles).** Mirror the existing analytic density term. The gradient is the spatial derivative of the staged density contribution: `g_b = ρ₀·f_i·ψ'(d)·n̂`, with `n̂ = hit.grad` (SDF gradient, points into the fluid) and `ψ'(d) = dψ/dd = −(315/256)·(1−t²)⁴/h`, `t = d/h` — the closed-form derivative of `boundary_psi` (note `poly'(t) = (1−t²)⁴`). Same `num_solids`/`PHASE_WATER`/range (`d < h`) gating as the density term.
+- **KTD-5 — Boundary contributes to `sum_g` but NOT `sum_g2`.** In the PBF constraint Jacobian, the wall contributes to `∇_{p_i}C_i` (the self term, which flows into `dot(sum_g, sum_g)`), so `sum_g += g_b`. It does **not** add a `|∇_{p_b}C|²` term to `sum_g2` because the wall is not a degree of freedom (it does not move). This is the standard Akinci/Macklin treatment.
+- **KTD-6 — Boundary force uses `λ_i` only.** `compute_dp` adds `λ_i · g_b` (no `λ_b` — the wall has no constraint multiplier; no `s_corr` — that is a fluid-fluid anti-clustering term). This is the wall-normal repulsion.
+- **KTD-7 — Remove the heuristic only after the force is verified stable (sequencing).** Land U1–U4 (force in the solve) with the heuristic still present, confirm no eruption/instability, then remove the heuristic (U5) and confirm the force alone holds via the no-climb gate (U6). This keeps a safety net during the risky core-solver change.
+- **KTD-8 — Preserve compression-only λ and the AABB byte-identical guarantee.** The force term is added strictly inside the `num_solids > 0` boundary path; scenes with no solids never dispatch `compute_boundary` and read a zeroed/absent term, so the water-core suite stays byte-unchanged.
+
+---
+
+## High-Level Technical Design
+
+Per water density-solve iteration (unchanged order; the new data flow is the `boundary_grad` buffer threading `compute_boundary → compute_lambda → compute_dp`):
+
+```mermaid
+flowchart LR
+    CB["compute_boundary<br/>(binds solids)<br/>c_residual = ρ₀·f·ψ(d)  [density, existing]<br/>boundary_grad = ρ₀·f·ψ'(d)·n̂  [gradient, NEW]"]
+    CL["compute_lambda<br/>rho += c_residual  [existing]<br/>sum_g += boundary_grad  [NEW → Jacobian self-term]<br/>λ = −C / (|sum_g|²+sum_g2+ε)<br/>c_residual := max(0,C)  [overwrites density staging]"]
+    CD["compute_dp<br/>Δp = (1/ρ₀)·[Σ_fluid (λ_i+λ_j+s_corr)∇W<br/>+ λ_i·boundary_grad]  [NEW wall force]"]
+    AP["apply_dp<br/>(geometric push-out, unchanged)"]
+    CB --> CL --> CD --> AP
+    CB -. boundary_grad .-> CD
+```
+
+Force balance intuition: with the wall contributing both density (so `C_i` is correct) **and** gradient/force (so `Δp` includes a wall-normal repulsion `λ_i·g_b`), a near-wall over-pressured column is pushed *away from the wall* instead of *up* it → hydrostatic equilibrium → no climb. `finalize`'s `v.y=0` becomes unnecessary.
+
+---
+
+## Implementation Units
+
+> Sequence (dependency order): **U1 → U2 → U3 → U4 → U5 → U6**. The force (U1–U4) lands and is verified stable before the heuristic is removed (U5), per KTD-7.
+
+### U1. Analytic boundary-gradient derivative helper
+
+**Goal:** Provide `ψ'(d)`, the closed-form derivative of `boundary_psi`, for the wall-force gradient magnitude.
+
+**Requirements:** R1, R4.
+
+**Dependencies:** none.
+
+**Files:** `src/solvers/xpbd/common.wgsl` (add the derivative helper next to `boundary_psi`).
+
+**Approach:** Add `boundary_psi_deriv(d, h) -> f32` returning `dψ/dd = −(315/256)·(1−t²)⁴/h`, `t = clamp(d/h, −1, 1)` (mirror `boundary_psi`'s clamping). This is the analytic derivative of the existing `boundary_psi` (`poly'(t) = (1−t²)⁴`), so the force is exactly consistent with the density term. Pure WGSL helper; no bindings.
+
+**Patterns to follow:** the existing `boundary_psi` in `src/solvers/xpbd/common.wgsl` (same `t`, same clamping, same `315/256` constant).
+
+**Test scenarios:** `Test expectation: none -- pure analytic helper, exercised through the U6 integration gates (the derivative's correctness shows up as no-climb + preserved stability; a standalone WGSL unit harness does not exist).`
+
+**Verification:** compiles (native naga + browser Tint); consumed by U3.
+
+---
+
+### U2. Storage-buffer infrastructure: 16-buffer limit + `boundary_grad` buffer
+
+**Goal:** Make room for the wall-force gradient: request the real 16-buffer device limit, allocate the persistent `boundary_grad` buffer, and bind it into the three boundary-aware passes.
+
+**Requirements:** R6.
+
+**Dependencies:** none (independent of U1).
+
+**Files:** `src/utils/gpu.rs` (device `required_limits`: `max_storage_buffers_per_shader_stage = 16`; remove the stale "do NOT exceed 8" comment + the baseline-only doc note), `src/solvers/xpbd/common.wgsl` (declare the new `boundary_grad: array<vec4<f32>>` binding), `src/solvers/xpbd/mod.rs` (allocate the buffer sized to capacity; add it to the `compute_boundary`, `compute_lambda`, and `compute_dp` bind groups).
+
+**Approach:** Switch `required_limits` from `wgpu::Limits::default()` to a limits value that raises `max_storage_buffers_per_shader_stage` to 16 (keep all other limits at the WebGPU baseline). Allocate `boundary_grad` as a `vec4<f32>` per particle (`.xyz` = wall-force gradient; `.w` reserved/zero), sized to the particle-pool capacity like the other per-particle scratch buffers. Declare it at the next free binding in `common.wgsl`. Add it to the three bind groups. `compute_boundary` 5→6 storage buffers; `compute_lambda` 8→9; `compute_dp` 8→9 — all within 16. **Verify** the headless adapter grants the raised limit at device-request time (fail loudly if not). Note the browser-portability requirement (the target browser must grant 16; no headless WebGPU in CI, so this is a manual check at U6).
+
+**Execution note:** Land this as a no-op data-plumbing step first (buffer allocated + bound + zero-initialized, not yet read/written by the physics) so the limit raise and bind-group wiring are verified green before the physics changes in U3/U4.
+
+**Patterns to follow:** existing per-particle scratch buffer allocation + bind-group construction in `src/solvers/xpbd/mod.rs` (e.g., `fluid_impulse`, `coupling_scale`); the binding-declaration style in `src/solvers/xpbd/common.wgsl`.
+
+**Test scenarios:**
+- Device builds successfully with the raised limit on the headless adapter (the existing GPU-gated test harness constructing a solver is sufficient — it fails at device request if 16 is not granted).
+- AABB-only scene (no solids) still runs and stays byte-unchanged vs. before (the buffer is allocated but unread until U3/U4) — covered by the unchanged water-core suite.
+
+**Verification:** full existing suite stays green (the buffer is inert this unit); device-request succeeds headless.
+
+---
+
+### U3. Stage the boundary gradient in `compute_boundary`
+
+**Goal:** Compute and stage `g_b = ρ₀·f_i·ψ'(d)·n̂` for near-wall water, once per iteration, alongside the existing density staging.
+
+**Requirements:** R1, R4, R5.
+
+**Dependencies:** U1, U2.
+
+**Files:** `src/solvers/xpbd/water.wgsl` (`compute_boundary`).
+
+**Approach:** In `compute_boundary` (already binds `solids`, already computes `let hit = solid_union(pred[i].xyz, PHASE_WATER)` and the density when `hit.dist < h`), also write `boundary_grad[i] = ρ₀·f_i·boundary_psi_deriv(hit.dist, h)·hit.grad` (the sign of `boundary_psi_deriv` is negative as `ψ` increases toward the wall; combined with `hit.grad` pointing into the fluid, `g_b` is the inward-pointing wall-force direction — confirm the sign at implementation against the density term's intent: the resulting `compute_dp` force must push fluid *away* from the wall). Zero `boundary_grad[i]` in the early-out paths (non-water, `f_i ≤ pbf_eps`, `hit.dist ≥ h`) exactly where `c_residual` is already zeroed, so the two stay consistent. Same `num_solids` gate (the pass only dispatches when solids exist).
+
+**Technical design (directional, not literal):** `boundary_grad[i] = rho0 * f_i * boundary_psi_deriv(hit.dist, h) * hit.grad;` written in the same `if (hit.dist < params.h)` branch that already sets `c_residual[i]`; zeroed in the same early returns.
+
+**Patterns to follow:** the existing `compute_boundary` density staging in `src/solvers/xpbd/water.wgsl` — mirror its guards and zeroing exactly.
+
+**Test scenarios:** `Test expectation: none -- staging pass; correctness verified through U4's consumption and the U6 gates (no standalone WGSL harness).`
+
+**Verification:** compiles; `boundary_grad` is non-zero only for near-wall water in solid scenes; consumed in U4.
+
+---
+
+### U4. Apply the wall pressure force in the constraint solve
+
+**Goal:** Make the wall exert a wall-normal pressure: add the boundary gradient to the constraint Jacobian (`compute_lambda`) and apply `λ_i·g_b` as a position correction (`compute_dp`).
+
+**Requirements:** R1, R2, R5, R8.
+
+**Dependencies:** U3.
+
+**Files:** `src/solvers/xpbd/water.wgsl` (`compute_lambda`, `compute_dp`).
+
+**Approach:**
+- `compute_lambda`: after the fluid-neighbor loop, when `num_solids > 0`, add the staged gradient to the constraint Jacobian self-term: `sum_g += boundary_grad[i].xyz`. Do **not** add anything to `sum_g2` (KTD-5 — the wall is not a DOF). `λ` then accounts for the wall. The existing `rho += c_residual[i]` density term is unchanged.
+- `compute_dp`: after the fluid-neighbor correction sum, when `num_solids > 0`, add `λ_i · boundary_grad[i].xyz` to the correction `sum` before `dp = sum / ρ₀` (KTD-6 — only `λ_i`, no `λ_b`, no `s_corr`). This is the wall-normal repulsion.
+- Gate both strictly on `num_solids > 0` so AABB scenes are byte-unchanged (R5). Compression-only λ unchanged.
+
+**Execution note:** This is the core physics change. After landing it (heuristic still present), run the eruption/incompressibility gates (water suite incl. `long_run_no_global_eruption`) and the V60 fill before proceeding — verify the wall force does not over-push or destabilize near walls/corners.
+
+**Technical design (directional, not literal):**
+- `compute_lambda`: `if (params.num_solids > 0u) { sum_g = sum_g + boundary_grad[i].xyz; }` (placed with the existing `rho += c_residual[i]` boundary block, before computing `denom`/`lam`).
+- `compute_dp`: `if (params.num_solids > 0u) { sum = sum + lam_i * boundary_grad[i].xyz; }` (before `dp[i] = sum * inv_rho0`).
+
+**Patterns to follow:** the existing `sum_g`/`sum_g2`/`denom` math in `compute_lambda` and the `sum`/`inv_rho0` correction in `compute_dp` (`src/solvers/xpbd/water.wgsl`); the `num_solids > 0` gating already used for the density term.
+
+**Test scenarios:** (integration-level; the assertions live in U6)
+- Near-wall hydrostatic column reaches equilibrium without climbing (the U6 no-climb gate).
+- No eruption / incompressibility preserved with the force active and the heuristic still present (U6 re-run of the water eruption + cone-settle gates).
+- AABB-only scene byte-unchanged (`num_solids==0` path untouched).
+
+**Verification:** with the heuristic still in place, the full water + geometry suites stay green and the V60 water-only fill shows the climb already reduced (pre-U5 check).
+
+---
+
+### U5. Remove the `v.y=0` no-upward-wall-slip heuristic
+
+**Goal:** Delete the heuristic now that the wall exerts a real pressure force.
+
+**Requirements:** R3.
+
+**Dependencies:** U4.
+
+**Files:** `src/solvers/xpbd/common.wgsl` (`finalize` — remove the water `v.y > 0 → v.y = 0` wall block and its comment).
+
+**Approach:** Remove the block added this session in `finalize`'s solid-wall velocity response (`if (phase[i] != PHASE_GRAIN && v.y > 0.0) { v.y = 0.0; }`). The wall's pressure force (U4) now provides the structural restoring behavior. Grain wall handling (standoff + repose friction) and the water normal-velocity cancel + Coulomb friction are unchanged.
+
+**Test scenarios:** `Test expectation: none -- a deletion; its replacement coverage is the U6 no-climb gate, which must pass with the heuristic gone.`
+
+**Verification:** the U6 no-climb gate passes with the heuristic removed (the force alone holds the boundary).
+
+---
+
+### U6. Verification: structural no-climb gate + regression sweep
+
+**Goal:** Lock the structural fix with a gate that replaces the heuristic, confirm the existing boundary-density (eruption) behavior is preserved, and confirm no regression across the solver.
+
+**Requirements:** R2, R3, R4, R7.
+
+**Dependencies:** U4, U5.
+
+**Files:** `tests/xpbd_emission.rs` (new no-climb gate using `Scene::v60_pour_water_only` + the radius-bin probe), `tests/xpbd_water.rs` / `tests/xpbd_geometry.rs` (re-run; add a preserve-boundary-density assertion if not already covered).
+
+**Approach:** Add a no-climb gate reusing the existing water-only V60 scene and the radius-bin probe pattern from the diagnosis: run a pour, bin grain-free water by horizontal radius, and assert wall-region water (`r ≈ cup radius 3`) stays near the bulk pool surface — specifically `wall_max_y` does not exceed the bulk pool surface by more than a small band and stays at/below the cup rim (`−3.5`). Baseline (no fix) climbed to `−3.16`; the heuristic reached `−3.63`; the structural fix should keep the wall layer at the pool surface, not a detached sheet above it. Assert the existing boundary-density eruption prevention is intact (no over-packing eruption in the V60 fill; the floor/corner stays bounded). Re-run the full affected suites.
+
+**Test scenarios:**
+- **No wall climb (replaces the heuristic):** V60 water-only pour, ~480 steps; over the steady window, wall-region water (`r∈[2.6,3.2]`) `max_y` stays ≤ the cup rim (`−3.5`) and within a small band of the bulk pool `max_y` (no detached layer above the surface). This is the gate that must pass with the heuristic removed.
+- **Boundary density preserved (eruption prevention):** the dense/floor-corner fill does not erupt and stays finite with density in band — the original reason `compute_boundary` exists is not regressed.
+- **Incompressibility / no eruption:** `tests/xpbd_water.rs` settles, interior density in band, `long_run_no_global_eruption` holds.
+- **Cone settle + drainage:** `water_in_cone_settles_without_bouncing` and the V60 end-to-end drainage (water reaches the cup, grains trapped) still pass.
+- **Coupling + wetting unaffected:** `tests/xpbd_coupling.rs` (all) and `tests/xpbd_wetting.rs` conservation (incl. the 2000-step saturated tail) stay green.
+- **AABB byte-unchanged:** water-core single-species scenes unchanged (`num_solids==0`).
+
+**Verification:** new no-climb gate green with the heuristic removed; boundary-density/eruption gate green; water + geometry + coupling + wetting suites green; manual browser check (rebuild wasm) confirms the device grants 16 buffers and the wall layer no longer climbs.
+
+---
+
+## Scope Boundaries
+
+**In scope:** the wall **pressure-force** term in the PBF water density/pressure constraint (gradient in `compute_lambda`, force in `compute_dp`), the analytic derivative helper, the staging buffer + 16-buffer limit, removal of the `v.y=0` heuristic, and verification.
+
+### Deferred to Follow-Up Work
+- **Consolidate `c_residual`'s double duty** — carry both boundary density and gradient in one `vec4` (`boundary_grad`), freeing `c_residual` to be purely the convergence residual. A clarity refactor, not needed for correctness; deferred to keep this change minimal.
+- **Boundary handling for the grain phase** — grains use their own wall standoff + repose friction; a pressure-style boundary for grains is out of scope.
+- **Sampled boundary particles (Akinci full)** — the analytic SDF term suffices for these primitive cavities (cone/cylinder); sampled boundary particles would only matter for arbitrary meshes.
+
+### Non-Goals
+- Surface tension / cohesion (compression-only λ is intentional — no meniscus pull).
+- The pour-agitation / stream-coherence work (separate; the coupling re-grounding's deferred follow-up).
+- Raising any device limit other than `max_storage_buffers_per_shader_stage`.
+
+---
+
+## Risks & Mitigations
+
+- **Near-wall over-push / instability (highest).** A too-strong wall force could over-correct and destabilize fluid near walls/corners. *Mitigation:* the force is scaled by `λ_i` (the same multiplier that bounds the fluid-fluid correction) and the analytic `ψ'` (bounded, → 0 at `d=h`); land it with the heuristic still present (KTD-7) and gate on the eruption/long-run tests before removing the heuristic.
+- **Concave corner (cup floor∧wall).** The SDF union's nearest-surface normal at a corner is one-sided; the force there may be imperfect. *Mitigation:* the existing density term already uses the same `hit.grad` at corners without issue; the floor-corner eruption gate (U6) guards it.
+- **Buffer-limit portability.** Requesting 16 storage buffers/stage must be granted by the device/browser. *Mitigation:* the project's real limit is 16 (per the corrected constraint); verify the headless adapter grants it at device request (fail loud) and manually confirm in a target WebGPU browser (no headless WebGPU in CI). 9 ≪ 16, so headroom is comfortable.
+- **Tint uniform-control-flow.** New per-particle work in `compute_lambda`/`compute_dp` must keep any barriers in uniform control flow (the `residual_reduce` lesson). *Mitigation:* the boundary term is straight-line per-particle math (no barriers); browser-compile check at U6.
+- **Sign error in `g_b`.** Wrong sign would *add* to the climb. *Mitigation:* derive the sign from the density term's intent (force pushes fluid away from the wall) and confirm against the no-climb gate during U3/U4.
+
+---
+
+## Verification
+
+- New **no-climb gate** (`tests/xpbd_emission.rs`, V60 water-only, radius-bin probe): wall-region water max-y ≤ rim and near the bulk pool surface, heuristic removed.
+- **Boundary-density/eruption preserved**: V60 fill stays finite, density in band, no floor over-packing eruption.
+- **Water core**: incompressibility in band, settles, `long_run_no_global_eruption`.
+- **Geometry**: `water_in_cone_settles_without_bouncing`, V60 drainage end-to-end, grains trapped.
+- **Coupling** (all) and **wetting** conservation (incl. 2000-step saturated tail) green.
+- **Portability**: headless device grants 16 buffers; manual browser check (rebuilt wasm) shows the wall layer no longer climbs.
+- `cargo fmt` + `clippy` clean.
+
+---
+
+## Sources & Research
+
+- In-session diagnosis (this conversation): identified the density-only boundary term, the missing gradient/force, the position-driven (not velocity-driven) climb, and the radius-bin probe baseline (`−3.16` climb vs `−3.5` rim; heuristic `−3.63`).
+- Akinci et al. 2012, *Versatile Rigid-Fluid Coupling for Incompressible SPH* — boundary particles contribute to both density and the pressure-gradient force; this plan's analytic-SDF term is the closed-form equivalent for primitive cavities.
+- Existing engine pattern: the analytic `boundary_psi` density term (`src/solvers/xpbd/{water,common}.wgsl`) — the local precedent this fix completes (density → density + force).
+- Project conventions: `docs/ARCHITECTURE.md`, `docs/plans/solver_xpbd.md`.
+
+codex
+I’ll check the actual WGSL conventions for `boundary_psi`, SDF normal orientation, and PBF scaling before giving the verdict, because the sign and normalization depend on those local definitions.
+exec
+/bin/zsh -lc 'rg -n "poly6|spiky|grad|rho0|lambda|s_corr|c_residual|alpha_s|inv_rho0|PHASE_WATER|PHASE_GRAIN" src/solvers/xpbd/*.wgsl src/solvers/xpbd/**/*.wgsl' in /Users/cxc/Github/coffee-sim
+exec
+/bin/zsh -lc "rg -n \"boundary_psi|compute_boundary|compute_lambda|compute_dp|solid_union|struct SolidHit|hit\\.grad|finalize\" src/solvers/xpbd src/utils src/models tests" in /Users/cxc/Github/coffee-sim
+ succeeded in 0ms:
+src/solvers/xpbd/wetting.wgsl:13:// its own slot, so no atomics are needed. Runs after finalize; the next predict mirrors the new pos.w.
+tests/xpbd_integrator.rs:5://! `finalize`'s wall branch is skipped (gated on `num_solids > 0`). So the
+src/solvers/xpbd/mod.rs:196:    compute_boundary: wgpu::ComputePipeline,
+src/solvers/xpbd/mod.rs:197:    compute_lambda: wgpu::ComputePipeline,
+src/solvers/xpbd/mod.rs:199:    compute_dp: wgpu::ComputePipeline,
+src/solvers/xpbd/mod.rs:219:    finalize: wgpu::ComputePipeline,
+src/solvers/xpbd/mod.rs:232:    compute_boundary: wgpu::BindGroup,
+src/solvers/xpbd/mod.rs:233:    compute_lambda: wgpu::BindGroup,
+src/solvers/xpbd/mod.rs:235:    compute_dp: wgpu::BindGroup,
+src/solvers/xpbd/mod.rs:255:    finalize: wgpu::BindGroup,
+src/solvers/xpbd/mod.rs:1435:        // query the geometry — the position-solve collision passes and `finalize` (wall velocity
+src/solvers/xpbd/mod.rs:1436:        // response). Each stays within the 16-storage-buffer budget (finalize is at 7).
+src/solvers/xpbd/mod.rs:1583:            compute_boundary: make("compute_boundary"),
+src/solvers/xpbd/mod.rs:1584:            compute_lambda: make("compute_lambda"),
+src/solvers/xpbd/mod.rs:1586:            compute_dp: make("compute_dp"),
+src/solvers/xpbd/mod.rs:1606:            finalize: make("finalize"),
+src/solvers/xpbd/mod.rs:1694:            compute_boundary: bg(
+src/solvers/xpbd/mod.rs:1695:                &pipelines.compute_boundary,
+src/solvers/xpbd/mod.rs:1705:            compute_lambda: bg(
+src/solvers/xpbd/mod.rs:1706:                &pipelines.compute_lambda,
+src/solvers/xpbd/mod.rs:1723:            compute_dp: bg(
+src/solvers/xpbd/mod.rs:1724:                &pipelines.compute_dp,
+src/solvers/xpbd/mod.rs:1980:            finalize: bg(
+src/solvers/xpbd/mod.rs:1981:                &pipelines.finalize,
+src/solvers/xpbd/mod.rs:2009:            // (≈4 passes/iter) + coupling/finalize overhead; clamped to the query-set cap.
+src/solvers/xpbd/mod.rs:2011:            // Baseline covers coupling/finalize + the wetting/extraction/fines blocks (~8 passes
+src/solvers/xpbd/mod.rs:2264:                            // Wall density compensation into c_residual (consumed by compute_lambda,
+src/solvers/xpbd/mod.rs:2268:                                &p.compute_boundary,
+src/solvers/xpbd/mod.rs:2269:                                &b.compute_boundary,
+src/solvers/xpbd/mod.rs:2270:                                "compute_boundary",
+src/solvers/xpbd/mod.rs:2276:                            &p.compute_lambda,
+src/solvers/xpbd/mod.rs:2277:                            &b.compute_lambda,
+src/solvers/xpbd/mod.rs:2278:                            "compute_lambda",
+src/solvers/xpbd/mod.rs:2281:                        pass(&mut enc, &p.compute_dp, &b.compute_dp, "compute_dp", np);
+src/solvers/xpbd/mod.rs:2406:                pass(&mut enc, &p.finalize, &b.finalize, "finalize", np);
+src/solvers/xpbd/mod.rs:2421:                // substep — after finalize/xsph so it reads final positions/velocities and its grain
+tests/xpbd_cup.rs:8://! intermittent upward "squeeze-out" eruptions. `compute_boundary` adds the cut-off fraction back
+src/solvers/xpbd/extraction.wgsl:16:// Runs AFTER wetting/finalize, so it reads `pos` for both position (pos.xyz == pred.xyz post-finalize,
+src/solvers/xpbd/extraction.wgsl:44:// from the post-wetting positions/moisture + finalized velocity. Both transfer passes read this.
+src/solvers/xpbd/common.wgsl:2:// kernels both species use (predict, grid build, apply_dp, finalize). The water-incompressibility
+src/solvers/xpbd/common.wgsl:127:// buoyancy contribution), read in finalize.
+src/solvers/xpbd/common.wgsl:143:// < 0 through the wall. Only the collision passes (apply_dp / apply_drag_pred) reach `solid_union`,
+src/solvers/xpbd/common.wgsl:163:struct SolidHit { dist: f32, grad: vec3<f32>, friction: f32 };
+src/solvers/xpbd/common.wgsl:256:fn solid_union(p: vec3<f32>, phase: u32) -> SolidHit {
+src/solvers/xpbd/common.wgsl:359:// on two sides). `boundary_psi(d)` is the fraction of the poly6 kernel MASS beyond a plane at
+src/solvers/xpbd/common.wgsl:365:fn boundary_psi(d: f32, h: f32) -> f32 {
+src/solvers/xpbd/common.wgsl:577:    // 0, so AABB-only scenes are byte-unchanged; solid_union returns FREE for non-applicable species.
+src/solvers/xpbd/common.wgsl:583:        let hit = solid_union(proposed, phase[i]);
+src/solvers/xpbd/common.wgsl:586:            proposed = proposed + sdf_mag * hit.grad;
+src/solvers/xpbd/common.wgsl:587:            sdf_n = hit.grad;
+src/solvers/xpbd/common.wgsl:627:                let h2 = solid_union(newp, phase[i]);
+src/solvers/xpbd/common.wgsl:641:fn finalize(@builtin(global_invocation_id) gid: vec3<u32>) {
+src/solvers/xpbd/common.wgsl:679:                let n = hit.grad; // unit (sdf_normalize3)
+src/solvers/xpbd/coupling.wgsl:136:    // zero-flow saturated bed reads ≈0 and stays asleep). finalize consults it to keep a grain in
+src/solvers/xpbd/coupling.wgsl:320:    // Static-solid push-out (push-out + species gate only; friction is owned by apply_dp/finalize, so
+src/solvers/xpbd/coupling.wgsl:323:        let hit = solid_union(p, phase[i]);
+src/solvers/xpbd/coupling.wgsl:327:            p = p + (contact - hit.dist) * hit.grad;
+src/solvers/xpbd/water.wgsl:10:// Wall density compensation, precomputed into c_residual for compute_lambda to add (see the note
+src/solvers/xpbd/water.wgsl:11:// there). Its own pass to keep the SDF eval (`solids`) out of the hot density loop; compute_lambda
+src/solvers/xpbd/water.wgsl:16:fn compute_boundary(@builtin(global_invocation_id) gid: vec3<u32>) {
+src/solvers/xpbd/water.wgsl:24:    let hit = solid_union(pred[i].xyz, PHASE_WATER);
+src/solvers/xpbd/water.wgsl:26:        c_residual[i] = params.rest_density * f_i * boundary_psi(hit.dist, params.h);
+src/solvers/xpbd/water.wgsl:31:fn compute_lambda(@builtin(global_invocation_id) gid: vec3<u32>) {
+src/solvers/xpbd/water.wgsl:85:    // The cut-off fraction ρ₀·f_i·ψ(d) was precomputed by `compute_boundary` into c_residual (a
+src/solvers/xpbd/water.wgsl:86:    // scratch handoff — keeping the SDF eval out of compute_lambda's hot density loop, a separate
+src/solvers/xpbd/water.wgsl:153:fn compute_dp(@builtin(global_invocation_id) gid: vec3<u32>) {
+src/solvers/xpbd/water.wgsl:166:    // compute_lambda. f_w≡1 (no absorption) ⇒ identical to before.
+tests/xpbd_fines.rs:263:    // release/strain transfer is ACTIVE), but with no forces, predict+finalize preserve velocity
+tests/xpbd_fines.rs:320:    // Tolerance well above the predict→finalize f32 round-trip drift (~1e-5 over 20 steps) but far
+
+ succeeded in 0ms:
+src/solvers/xpbd/fines.wgsl:85:    if (phase[i] != PHASE_GRAIN) { return; }
+src/solvers/xpbd/fines.wgsl:106:                    if (phase[j] != PHASE_WATER) { continue; }
+src/solvers/xpbd/fines.wgsl:137:    if (phase[i] != PHASE_WATER) { return; }
+src/solvers/xpbd/fines.wgsl:157:                    if (phase[j] != PHASE_GRAIN) { continue; }
+src/solvers/xpbd/water.wgsl:2:// constraint + λ, the s_corr artificial-pressure Δp, the convergence reduction, and XSPH
+src/solvers/xpbd/water.wgsl:10:// Wall density compensation, precomputed into c_residual for compute_lambda to add (see the note
+src/solvers/xpbd/water.wgsl:11:// there). Its own pass to keep the SDF eval (`solids`) out of the hot density loop; compute_lambda
+src/solvers/xpbd/water.wgsl:14:// scene has SDF solids, so AABB-only scenes never run it and c_residual stays the residual buffer.
+src/solvers/xpbd/water.wgsl:20:    c_residual[i] = 0.0;
+src/solvers/xpbd/water.wgsl:21:    if (phase[i] != PHASE_WATER) { return; }
+src/solvers/xpbd/water.wgsl:24:    let hit = solid_union(pred[i].xyz, PHASE_WATER);
+src/solvers/xpbd/water.wgsl:26:        c_residual[i] = params.rest_density * f_i * boundary_psi(hit.dist, params.h);
+src/solvers/xpbd/water.wgsl:31:fn compute_lambda(@builtin(global_invocation_id) gid: vec3<u32>) {
+src/solvers/xpbd/water.wgsl:35:    if (phase[i] != PHASE_WATER) { return; } // grains have no density constraint
+src/solvers/xpbd/water.wgsl:44:        lambda[i] = 0.0;
+src/solvers/xpbd/water.wgsl:45:        c_residual[i] = 0.0;
+src/solvers/xpbd/water.wgsl:49:    var rho = m * f_i * w_poly6(0.0, h);
+src/solvers/xpbd/water.wgsl:67:                    if (phase[j] != PHASE_WATER) { continue; } // skip grain neighbors
+src/solvers/xpbd/water.wgsl:73:                    rho = rho + m * fj * w_poly6(r, h);
+src/solvers/xpbd/water.wgsl:74:                    let gj = m * fj * spiky_grad(d, h, params.spiky_r_min);
+src/solvers/xpbd/water.wgsl:85:    // The cut-off fraction ρ₀·f_i·ψ(d) was precomputed by `compute_boundary` into c_residual (a
+src/solvers/xpbd/water.wgsl:86:    // scratch handoff — keeping the SDF eval out of compute_lambda's hot density loop, a separate
+src/solvers/xpbd/water.wgsl:89:    // boundary pass, so c_residual is untouched and this term is skipped (byte-unchanged).
+src/solvers/xpbd/water.wgsl:91:        rho = rho + c_residual[i];
+src/solvers/xpbd/water.wgsl:97:    let pore = 1.0 - min(alpha_s[i], 1.0 - params.min_pore_fraction);
+src/solvers/xpbd/water.wgsl:98:    let inv_rho0 = 1.0 / (params.rest_density * pore);
+src/solvers/xpbd/water.wgsl:99:    let c = rho * inv_rho0 - 1.0;
+src/solvers/xpbd/water.wgsl:100:    let denom = (dot(sum_g, sum_g) + sum_g2) * inv_rho0 * inv_rho0 + params.relaxation_eps;
+src/solvers/xpbd/water.wgsl:102:    if (params.lambda_noncohesive != 0u && lam > 0.0) {
+src/solvers/xpbd/water.wgsl:105:    lambda[i] = lam;
+src/solvers/xpbd/water.wgsl:109:    c_residual[i] = max(0.0, c);
+src/solvers/xpbd/water.wgsl:127:        local_max = max(local_max, c_residual[i]);
+src/solvers/xpbd/water.wgsl:157:    if (phase[i] != PHASE_WATER) {
+src/solvers/xpbd/water.wgsl:164:    let lam_i = lambda[i];
+src/solvers/xpbd/water.wgsl:166:    // compute_lambda. f_w≡1 (no absorption) ⇒ identical to before.
+src/solvers/xpbd/water.wgsl:187:                    if (phase[j] != PHASE_WATER) { continue; } // skip grain neighbors
+src/solvers/xpbd/water.wgsl:193:                    let wr = w_poly6(r, h);
+src/solvers/xpbd/water.wgsl:194:                    let ratio = wr / params.s_corr_wq;
+src/solvers/xpbd/water.wgsl:195:                    let scorr = -params.s_corr_k * pow(ratio, params.s_corr_n);
+src/solvers/xpbd/water.wgsl:196:                    let gj = m * fj * spiky_grad(d, h, params.spiky_r_min);
+src/solvers/xpbd/water.wgsl:197:                    sum = sum + (lam_i + lambda[j] + scorr) * gj;
+src/solvers/xpbd/water.wgsl:202:    let pore = 1.0 - min(alpha_s[i], 1.0 - params.min_pore_fraction);
+src/solvers/xpbd/water.wgsl:203:    let inv_rho0 = 1.0 / (params.rest_density * pore);
+src/solvers/xpbd/water.wgsl:204:    dp[i] = vec4<f32>(sum * inv_rho0, 0.0);
+src/solvers/xpbd/water.wgsl:213:    if (phase[i] != PHASE_WATER) {
+src/solvers/xpbd/water.wgsl:222:    // (v_j−v_i) W). Without it, Σ W_poly6 ∝ 1/h³ grows as the resolution refines, so a fixed xsph_c
+src/solvers/xpbd/water.wgsl:244:                    dv = dv + (vel[j].xyz - vi) * (w_poly6(r, h) * v_w);
+src/solvers/xpbd/wetting.wgsl:59:                    if (ph_j == PHASE_WATER) {
+src/solvers/xpbd/wetting.wgsl:75:    if (phase[i] != PHASE_WATER) { return; }
+src/solvers/xpbd/wetting.wgsl:97:                    if (phase[j] != PHASE_GRAIN) { continue; }
+src/solvers/xpbd/wetting.wgsl:117:    if (phase[i] != PHASE_GRAIN) { return; }
+src/solvers/xpbd/wetting.wgsl:141:                    if (phase[j] != PHASE_WATER) { continue; }
+src/solvers/xpbd/water.wgsl:2:// constraint + λ, the s_corr artificial-pressure Δp, the convergence reduction, and XSPH
+src/solvers/xpbd/water.wgsl:10:// Wall density compensation, precomputed into c_residual for compute_lambda to add (see the note
+src/solvers/xpbd/water.wgsl:11:// there). Its own pass to keep the SDF eval (`solids`) out of the hot density loop; compute_lambda
+src/solvers/xpbd/water.wgsl:14:// scene has SDF solids, so AABB-only scenes never run it and c_residual stays the residual buffer.
+src/solvers/xpbd/water.wgsl:20:    c_residual[i] = 0.0;
+src/solvers/xpbd/water.wgsl:21:    if (phase[i] != PHASE_WATER) { return; }
+src/solvers/xpbd/water.wgsl:24:    let hit = solid_union(pred[i].xyz, PHASE_WATER);
+src/solvers/xpbd/water.wgsl:26:        c_residual[i] = params.rest_density * f_i * boundary_psi(hit.dist, params.h);
+src/solvers/xpbd/water.wgsl:31:fn compute_lambda(@builtin(global_invocation_id) gid: vec3<u32>) {
+src/solvers/xpbd/water.wgsl:35:    if (phase[i] != PHASE_WATER) { return; } // grains have no density constraint
+src/solvers/xpbd/water.wgsl:44:        lambda[i] = 0.0;
+src/solvers/xpbd/water.wgsl:45:        c_residual[i] = 0.0;
+src/solvers/xpbd/water.wgsl:49:    var rho = m * f_i * w_poly6(0.0, h);
+src/solvers/xpbd/water.wgsl:67:                    if (phase[j] != PHASE_WATER) { continue; } // skip grain neighbors
+src/solvers/xpbd/water.wgsl:73:                    rho = rho + m * fj * w_poly6(r, h);
+src/solvers/xpbd/water.wgsl:74:                    let gj = m * fj * spiky_grad(d, h, params.spiky_r_min);
+src/solvers/xpbd/water.wgsl:85:    // The cut-off fraction ρ₀·f_i·ψ(d) was precomputed by `compute_boundary` into c_residual (a
+src/solvers/xpbd/water.wgsl:86:    // scratch handoff — keeping the SDF eval out of compute_lambda's hot density loop, a separate
+src/solvers/xpbd/water.wgsl:89:    // boundary pass, so c_residual is untouched and this term is skipped (byte-unchanged).
+src/solvers/xpbd/water.wgsl:91:        rho = rho + c_residual[i];
+src/solvers/xpbd/water.wgsl:97:    let pore = 1.0 - min(alpha_s[i], 1.0 - params.min_pore_fraction);
+src/solvers/xpbd/water.wgsl:98:    let inv_rho0 = 1.0 / (params.rest_density * pore);
+src/solvers/xpbd/water.wgsl:99:    let c = rho * inv_rho0 - 1.0;
+src/solvers/xpbd/water.wgsl:100:    let denom = (dot(sum_g, sum_g) + sum_g2) * inv_rho0 * inv_rho0 + params.relaxation_eps;
+src/solvers/xpbd/water.wgsl:102:    if (params.lambda_noncohesive != 0u && lam > 0.0) {
+src/solvers/xpbd/water.wgsl:105:    lambda[i] = lam;
+src/solvers/xpbd/water.wgsl:109:    c_residual[i] = max(0.0, c);
+src/solvers/xpbd/water.wgsl:127:        local_max = max(local_max, c_residual[i]);
+src/solvers/xpbd/water.wgsl:157:    if (phase[i] != PHASE_WATER) {
+src/solvers/xpbd/water.wgsl:164:    let lam_i = lambda[i];
+src/solvers/xpbd/water.wgsl:166:    // compute_lambda. f_w≡1 (no absorption) ⇒ identical to before.
+src/solvers/xpbd/water.wgsl:187:                    if (phase[j] != PHASE_WATER) { continue; } // skip grain neighbors
+src/solvers/xpbd/water.wgsl:193:                    let wr = w_poly6(r, h);
+src/solvers/xpbd/water.wgsl:194:                    let ratio = wr / params.s_corr_wq;
+src/solvers/xpbd/water.wgsl:195:                    let scorr = -params.s_corr_k * pow(ratio, params.s_corr_n);
+src/solvers/xpbd/water.wgsl:196:                    let gj = m * fj * spiky_grad(d, h, params.spiky_r_min);
+src/solvers/xpbd/water.wgsl:197:                    sum = sum + (lam_i + lambda[j] + scorr) * gj;
+src/solvers/xpbd/water.wgsl:202:    let pore = 1.0 - min(alpha_s[i], 1.0 - params.min_pore_fraction);
+src/solvers/xpbd/water.wgsl:203:    let inv_rho0 = 1.0 / (params.rest_density * pore);
+src/solvers/xpbd/water.wgsl:204:    dp[i] = vec4<f32>(sum * inv_rho0, 0.0);
+src/solvers/xpbd/water.wgsl:213:    if (phase[i] != PHASE_WATER) {
+src/solvers/xpbd/water.wgsl:222:    // (v_j−v_i) W). Without it, Σ W_poly6 ∝ 1/h³ grows as the resolution refines, so a fixed xsph_c
+src/solvers/xpbd/water.wgsl:244:                    dv = dv + (vel[j].xyz - vi) * (w_poly6(r, h) * v_w);
+src/solvers/xpbd/bed.wgsl:21:    if (phase[i] != PHASE_GRAIN) { return; }
+src/solvers/xpbd/bed.wgsl:49:                    if (phase[j] != PHASE_GRAIN) { continue; } // grain contacts only
+src/solvers/xpbd/bed.wgsl:104:    c_residual[i] = max_pen / d_i;
+src/solvers/xpbd/coupling.wgsl:10://  3. buoyancy / pressure-gradient lift — symmetric gathers over the converged water λ field.
+src/solvers/xpbd/coupling.wgsl:36:                    if (phase[j] != PHASE_GRAIN) { continue; } // solid fraction from grains only
+src/solvers/xpbd/coupling.wgsl:41:                    let w = w_poly6(r, h);
+src/solvers/xpbd/coupling.wgsl:57:    alpha_s[i] = result;
+src/solvers/xpbd/coupling.wgsl:65:    if (ph_i == PHASE_GRAIN) {
+src/solvers/xpbd/coupling.wgsl:66:        a = a + grain_eff_volume(pred[i].w) * w_poly6(0.0, params.coupling_h);
+src/solvers/xpbd/coupling.wgsl:83:    if (ph == PHASE_GRAIN) { return grain_eff_volume(w); }
+src/solvers/xpbd/coupling.wgsl:113:                    if (phase[j] == PHASE_GRAIN) {
+src/solvers/xpbd/coupling.wgsl:114:                        a_scan = a_scan + grain_eff_volume(pred[j].w) * w_poly6(r, params.coupling_h);
+src/solvers/xpbd/coupling.wgsl:118:                        if (ph_i == PHASE_GRAIN) { sum_vw = sum_vw + vel[j].xyz; }
+src/solvers/xpbd/coupling.wgsl:129:        max(alpha_s[i], a_from_neighbors),
+src/solvers/xpbd/coupling.wgsl:139:    if (ph_i == PHASE_GRAIN && n > 0.0) {
+src/solvers/xpbd/coupling.wgsl:166:    if (phase[i] != PHASE_WATER) { return; }
+src/solvers/xpbd/coupling.wgsl:183:                    if (phase[j] != PHASE_GRAIN) { continue; }
+src/solvers/xpbd/coupling.wgsl:186:                    dv = dv + drag_delta_for_pair(i, j, PHASE_WATER);
+src/solvers/xpbd/coupling.wgsl:199:    if (phase[i] != PHASE_GRAIN) { return; }
+src/solvers/xpbd/coupling.wgsl:216:                    if (phase[j] != PHASE_WATER) { continue; }
+src/solvers/xpbd/coupling.wgsl:219:                    dv = dv + drag_delta_for_pair(i, j, PHASE_GRAIN);
+src/solvers/xpbd/coupling.wgsl:229:    return max(-lambda[i], 0.0);
+src/solvers/xpbd/coupling.wgsl:236:    if (phase[i] != PHASE_GRAIN) { return; }
+src/solvers/xpbd/coupling.wgsl:253:                    if (phase[j] != PHASE_WATER) { continue; }
+src/solvers/xpbd/coupling.wgsl:258:                        spiky_grad(d, params.h, params.spiky_r_min);
+src/solvers/xpbd/coupling.wgsl:277:    if (phase[i] != PHASE_WATER) { return; }
+src/solvers/xpbd/coupling.wgsl:295:                    if (phase[j] != PHASE_GRAIN) { continue; }
+src/solvers/xpbd/coupling.wgsl:303:                        pressure * spiky_grad(d, params.h, params.spiky_r_min);
+src/solvers/xpbd/coupling.wgsl:325:        let contact = select(0.0, 0.5 * params.grain_diameter, phase[i] == PHASE_GRAIN);
+src/solvers/xpbd/coupling.wgsl:327:            p = p + (contact - hit.dist) * hit.grad;
+src/solvers/xpbd/fines.wgsl:85:    if (phase[i] != PHASE_GRAIN) { return; }
+src/solvers/xpbd/fines.wgsl:106:                    if (phase[j] != PHASE_WATER) { continue; }
+src/solvers/xpbd/fines.wgsl:137:    if (phase[i] != PHASE_WATER) { return; }
+src/solvers/xpbd/fines.wgsl:157:                    if (phase[j] != PHASE_GRAIN) { continue; }
+src/solvers/xpbd/bed.wgsl:21:    if (phase[i] != PHASE_GRAIN) { return; }
+src/solvers/xpbd/bed.wgsl:49:                    if (phase[j] != PHASE_GRAIN) { continue; } // grain contacts only
+src/solvers/xpbd/bed.wgsl:104:    c_residual[i] = max_pen / d_i;
+src/solvers/xpbd/coupling.wgsl:10://  3. buoyancy / pressure-gradient lift — symmetric gathers over the converged water λ field.
+src/solvers/xpbd/coupling.wgsl:36:                    if (phase[j] != PHASE_GRAIN) { continue; } // solid fraction from grains only
+src/solvers/xpbd/coupling.wgsl:41:                    let w = w_poly6(r, h);
+src/solvers/xpbd/coupling.wgsl:57:    alpha_s[i] = result;
+src/solvers/xpbd/coupling.wgsl:65:    if (ph_i == PHASE_GRAIN) {
+src/solvers/xpbd/coupling.wgsl:66:        a = a + grain_eff_volume(pred[i].w) * w_poly6(0.0, params.coupling_h);
+src/solvers/xpbd/coupling.wgsl:83:    if (ph == PHASE_GRAIN) { return grain_eff_volume(w); }
+src/solvers/xpbd/coupling.wgsl:113:                    if (phase[j] == PHASE_GRAIN) {
+src/solvers/xpbd/coupling.wgsl:114:                        a_scan = a_scan + grain_eff_volume(pred[j].w) * w_poly6(r, params.coupling_h);
+src/solvers/xpbd/coupling.wgsl:118:                        if (ph_i == PHASE_GRAIN) { sum_vw = sum_vw + vel[j].xyz; }
+src/solvers/xpbd/coupling.wgsl:129:        max(alpha_s[i], a_from_neighbors),
+src/solvers/xpbd/coupling.wgsl:139:    if (ph_i == PHASE_GRAIN && n > 0.0) {
+src/solvers/xpbd/coupling.wgsl:166:    if (phase[i] != PHASE_WATER) { return; }
+src/solvers/xpbd/coupling.wgsl:183:                    if (phase[j] != PHASE_GRAIN) { continue; }
+src/solvers/xpbd/coupling.wgsl:186:                    dv = dv + drag_delta_for_pair(i, j, PHASE_WATER);
+src/solvers/xpbd/coupling.wgsl:199:    if (phase[i] != PHASE_GRAIN) { return; }
+src/solvers/xpbd/coupling.wgsl:216:                    if (phase[j] != PHASE_WATER) { continue; }
+src/solvers/xpbd/coupling.wgsl:219:                    dv = dv + drag_delta_for_pair(i, j, PHASE_GRAIN);
+src/solvers/xpbd/coupling.wgsl:229:    return max(-lambda[i], 0.0);
+src/solvers/xpbd/coupling.wgsl:236:    if (phase[i] != PHASE_GRAIN) { return; }
+src/solvers/xpbd/coupling.wgsl:253:                    if (phase[j] != PHASE_WATER) { continue; }
+src/solvers/xpbd/coupling.wgsl:258:                        spiky_grad(d, params.h, params.spiky_r_min);
+src/solvers/xpbd/coupling.wgsl:277:    if (phase[i] != PHASE_WATER) { return; }
+src/solvers/xpbd/coupling.wgsl:295:                    if (phase[j] != PHASE_GRAIN) { continue; }
+src/solvers/xpbd/coupling.wgsl:303:                        pressure * spiky_grad(d, params.h, params.spiky_r_min);
+src/solvers/xpbd/coupling.wgsl:325:        let contact = select(0.0, 0.5 * params.grain_diameter, phase[i] == PHASE_GRAIN);
+src/solvers/xpbd/coupling.wgsl:327:            p = p + (contact - hit.dist) * hit.grad;
+src/solvers/xpbd/common.wgsl:12:const PHASE_WATER: u32 = 0u;
+src/solvers/xpbd/common.wgsl:13:const PHASE_GRAIN: u32 = 1u;
+src/solvers/xpbd/common.wgsl:25:    s_corr_k: f32,
+src/solvers/xpbd/common.wgsl:26:    s_corr_n: f32,
+src/solvers/xpbd/common.wgsl:27:    s_corr_wq: f32,           // W_poly6(Δq, h)
+src/solvers/xpbd/common.wgsl:32:    spiky_r_min: f32,         // ε_r · h
+src/solvers/xpbd/common.wgsl:39:    lambda_noncohesive: u32,
+src/solvers/xpbd/common.wgsl:105:@group(0) @binding(5) var<storage, read_write> lambda: array<f32>;
+src/solvers/xpbd/common.wgsl:107:@group(0) @binding(7) var<storage, read_write> c_residual: array<f32>;
+src/solvers/xpbd/common.wgsl:123:@group(0) @binding(13) var<storage, read_write> alpha_s: array<f32>;
+src/solvers/xpbd/common.wgsl:159:// --- SDF cavity geometry (mirrors utils/sdf.rs; interior positive, gradient toward the cavity) ---
+src/solvers/xpbd/common.wgsl:163:struct SolidHit { dist: f32, grad: vec3<f32>, friction: f32 };
+src/solvers/xpbd/common.wgsl:199:    if (r >= SDF_EPS) { rhat = rel / r; } // axis guard before building the 3D gradient
+src/solvers/xpbd/common.wgsl:227:    let grad = sdf_normalize3(vec3<f32>(n2d.x * rhat.x, n2d.y, n2d.x * rhat.y));
+src/solvers/xpbd/common.wgsl:228:    return SolidHit(dist, grad, prim.friction);
+src/solvers/xpbd/common.wgsl:327:fn w_poly6(r: f32, h: f32) -> f32 {
+src/solvers/xpbd/common.wgsl:334:// True spiky gradient ∇W(d) for d = x_i − x_j (decreases with r ⇒ negative along d), with an
+src/solvers/xpbd/common.wgsl:336:fn spiky_grad(d: vec3<f32>, h: f32, r_min: f32) -> vec3<f32> {
+src/solvers/xpbd/common.wgsl:359:// on two sides). `boundary_psi(d)` is the fraction of the poly6 kernel MASS beyond a plane at
+src/solvers/xpbd/common.wgsl:363:// Exact closed form: ψ(d) = ∫_{z>d} W_poly6 dV = 0.5 − (315/256)·poly(d/h), poly the cap integral.
+src/solvers/xpbd/common.wgsl:387:    if (ph == PHASE_GRAIN) { return grain_eff_mass(w); }
+src/solvers/xpbd/common.wgsl:573:    // cavity gradient. Water projects to the wall *surface* (offset 0, exactly like the box clamp —
+src/solvers/xpbd/common.wgsl:578:    let contact = select(0.0, 0.5 * params.grain_diameter, phase[i] == PHASE_GRAIN);
+src/solvers/xpbd/common.wgsl:586:            proposed = proposed + sdf_mag * hit.grad;
+src/solvers/xpbd/common.wgsl:587:            sdf_n = hit.grad;
+src/solvers/xpbd/common.wgsl:594:    if (phase[i] == PHASE_GRAIN) {
+src/solvers/xpbd/common.wgsl:629:                    newp = newp + (contact - h2.dist) * h2.grad;
+src/solvers/xpbd/common.wgsl:647:    if (phase[i] == PHASE_GRAIN) {
+src/solvers/xpbd/common.wgsl:648:        let pen = c_residual[i]; // final normalized penetration from the last bed_project
+src/solvers/xpbd/common.wgsl:679:                let n = hit.grad; // unit (sdf_normalize3)
+src/solvers/xpbd/common.wgsl:692:                if (phase[i] != PHASE_GRAIN && v.y > 0.0) {
+src/solvers/xpbd/wetting.wgsl:59:                    if (ph_j == PHASE_WATER) {
+src/solvers/xpbd/wetting.wgsl:75:    if (phase[i] != PHASE_WATER) { return; }
+src/solvers/xpbd/wetting.wgsl:97:                    if (phase[j] != PHASE_GRAIN) { continue; }
+src/solvers/xpbd/wetting.wgsl:117:    if (phase[i] != PHASE_GRAIN) { return; }
+src/solvers/xpbd/wetting.wgsl:141:                    if (phase[j] != PHASE_WATER) { continue; }
+src/solvers/xpbd/extraction.wgsl:72:                    if (ph_i == PHASE_GRAIN) { flux_acc = flux_acc + length(vi - vel[j].xyz); }
+src/solvers/xpbd/extraction.wgsl:78:    if (ph_i == PHASE_GRAIN && n > 0u) { flux_g = flux_acc / f32(n); }
+src/solvers/xpbd/extraction.wgsl:86:    if (phase[i] != PHASE_GRAIN) { return; }
+src/solvers/xpbd/extraction.wgsl:108:                    if (phase[j] != PHASE_WATER) { continue; }
+src/solvers/xpbd/extraction.wgsl:132:    if (phase[i] != PHASE_WATER) { return; }
+src/solvers/xpbd/extraction.wgsl:156:                    if (phase[j] != PHASE_GRAIN) { continue; }
+src/solvers/xpbd/extraction.wgsl:182:    return select(cf.y, cf.z, ph == PHASE_GRAIN); // water T at .y, grain T at .z
+src/solvers/xpbd/extraction.wgsl:185:    let cp = select(params.cp_water, params.cp_grain, ph == PHASE_GRAIN);
+src/solvers/xpbd/extraction.wgsl:231:    if (ph_i == PHASE_GRAIN) {
+src/solvers/xpbd/common.wgsl:12:const PHASE_WATER: u32 = 0u;
+src/solvers/xpbd/common.wgsl:13:const PHASE_GRAIN: u32 = 1u;
+src/solvers/xpbd/common.wgsl:25:    s_corr_k: f32,
+src/solvers/xpbd/common.wgsl:26:    s_corr_n: f32,
+src/solvers/xpbd/common.wgsl:27:    s_corr_wq: f32,           // W_poly6(Δq, h)
+src/solvers/xpbd/common.wgsl:32:    spiky_r_min: f32,         // ε_r · h
+src/solvers/xpbd/common.wgsl:39:    lambda_noncohesive: u32,
+src/solvers/xpbd/common.wgsl:105:@group(0) @binding(5) var<storage, read_write> lambda: array<f32>;
+src/solvers/xpbd/common.wgsl:107:@group(0) @binding(7) var<storage, read_write> c_residual: array<f32>;
+src/solvers/xpbd/common.wgsl:123:@group(0) @binding(13) var<storage, read_write> alpha_s: array<f32>;
+src/solvers/xpbd/common.wgsl:159:// --- SDF cavity geometry (mirrors utils/sdf.rs; interior positive, gradient toward the cavity) ---
+src/solvers/xpbd/common.wgsl:163:struct SolidHit { dist: f32, grad: vec3<f32>, friction: f32 };
+src/solvers/xpbd/common.wgsl:199:    if (r >= SDF_EPS) { rhat = rel / r; } // axis guard before building the 3D gradient
+src/solvers/xpbd/common.wgsl:227:    let grad = sdf_normalize3(vec3<f32>(n2d.x * rhat.x, n2d.y, n2d.x * rhat.y));
+src/solvers/xpbd/common.wgsl:228:    return SolidHit(dist, grad, prim.friction);
+src/solvers/xpbd/common.wgsl:327:fn w_poly6(r: f32, h: f32) -> f32 {
+src/solvers/xpbd/common.wgsl:334:// True spiky gradient ∇W(d) for d = x_i − x_j (decreases with r ⇒ negative along d), with an
+src/solvers/xpbd/common.wgsl:336:fn spiky_grad(d: vec3<f32>, h: f32, r_min: f32) -> vec3<f32> {
+src/solvers/xpbd/common.wgsl:359:// on two sides). `boundary_psi(d)` is the fraction of the poly6 kernel MASS beyond a plane at
+src/solvers/xpbd/common.wgsl:363:// Exact closed form: ψ(d) = ∫_{z>d} W_poly6 dV = 0.5 − (315/256)·poly(d/h), poly the cap integral.
+src/solvers/xpbd/common.wgsl:387:    if (ph == PHASE_GRAIN) { return grain_eff_mass(w); }
+src/solvers/xpbd/common.wgsl:573:    // cavity gradient. Water projects to the wall *surface* (offset 0, exactly like the box clamp —
+src/solvers/xpbd/common.wgsl:578:    let contact = select(0.0, 0.5 * params.grain_diameter, phase[i] == PHASE_GRAIN);
+src/solvers/xpbd/common.wgsl:586:            proposed = proposed + sdf_mag * hit.grad;
+src/solvers/xpbd/common.wgsl:587:            sdf_n = hit.grad;
+src/solvers/xpbd/common.wgsl:594:    if (phase[i] == PHASE_GRAIN) {
+src/solvers/xpbd/common.wgsl:629:                    newp = newp + (contact - h2.dist) * h2.grad;
+src/solvers/xpbd/common.wgsl:647:    if (phase[i] == PHASE_GRAIN) {
+src/solvers/xpbd/common.wgsl:648:        let pen = c_residual[i]; // final normalized penetration from the last bed_project
+src/solvers/xpbd/common.wgsl:679:                let n = hit.grad; // unit (sdf_normalize3)
+src/solvers/xpbd/common.wgsl:692:                if (phase[i] != PHASE_GRAIN && v.y > 0.0) {
+src/solvers/xpbd/extraction.wgsl:72:                    if (ph_i == PHASE_GRAIN) { flux_acc = flux_acc + length(vi - vel[j].xyz); }
+src/solvers/xpbd/extraction.wgsl:78:    if (ph_i == PHASE_GRAIN && n > 0u) { flux_g = flux_acc / f32(n); }
+src/solvers/xpbd/extraction.wgsl:86:    if (phase[i] != PHASE_GRAIN) { return; }
+src/solvers/xpbd/extraction.wgsl:108:                    if (phase[j] != PHASE_WATER) { continue; }
+src/solvers/xpbd/extraction.wgsl:132:    if (phase[i] != PHASE_WATER) { return; }
+src/solvers/xpbd/extraction.wgsl:156:                    if (phase[j] != PHASE_GRAIN) { continue; }
+src/solvers/xpbd/extraction.wgsl:182:    return select(cf.y, cf.z, ph == PHASE_GRAIN); // water T at .y, grain T at .z
+src/solvers/xpbd/extraction.wgsl:185:    let cp = select(params.cp_water, params.cp_grain, ph == PHASE_GRAIN);
+src/solvers/xpbd/extraction.wgsl:231:    if (ph_i == PHASE_GRAIN) {
+
+exec
+/bin/zsh -lc 'rg -n "max_storage_buffers_per_shader_stage|required_limits|Limits" src docs README.md' in /Users/cxc/Github/coffee-sim
+ succeeded in 0ms:
+src/utils/gpu.rs:10:/// Targets the WebGPU baseline limits except `max_storage_buffers_per_shader_stage`, which is
+src/utils/gpu.rs:113:                required_limits: wgpu::Limits {
+src/utils/gpu.rs:114:                    max_storage_buffers_per_shader_stage: 16,
+src/utils/gpu.rs:115:                    ..wgpu::Limits::default()
+docs/plans/2026-06-07-001-fix-pbf-wall-pressure-boundary-plan.md:51:- **KTD-3 — The storage-buffer limit is 16, not 8.** `compute_lambda` and `compute_dp` are already at exactly 8 storage buffers (`pred, lambda, c_residual|dp, cell_start, sorted_indices, status, phase, alpha_s`); adding `boundary_grad` makes them 9. The project's real per-stage device limit is **16** (the long-standing "WebGPU baseline = 8, never exceed" assumption was over-conservative for this project's deployment target). The device must request and be granted `max_storage_buffers_per_shader_stage = 16`; 9 sits comfortably inside it. Verify the grant on the headless adapter and confirm in a target browser (no headless WebGPU in CI). Other compute passes already bind `solids` (`buoyancy_grain`, `apply_dp`, `apply_drag_pred`), so the device tolerates solids in compute passes.
+docs/plans/2026-06-07-001-fix-pbf-wall-pressure-boundary-plan.md:110:**Files:** `src/utils/gpu.rs` (device `required_limits`: `max_storage_buffers_per_shader_stage = 16`; remove the stale "do NOT exceed 8" comment + the baseline-only doc note), `src/solvers/xpbd/common.wgsl` (declare the new `boundary_grad: array<vec4<f32>>` binding), `src/solvers/xpbd/mod.rs` (allocate the buffer sized to capacity; add it to the `compute_boundary`, `compute_lambda`, and `compute_dp` bind groups).
+docs/plans/2026-06-07-001-fix-pbf-wall-pressure-boundary-plan.md:112:**Approach:** Switch `required_limits` from `wgpu::Limits::default()` to a limits value that raises `max_storage_buffers_per_shader_stage` to 16 (keep all other limits at the WebGPU baseline). Allocate `boundary_grad` as a `vec4<f32>` per particle (`.xyz` = wall-force gradient; `.w` reserved/zero), sized to the particle-pool capacity like the other per-particle scratch buffers. Declare it at the next free binding in `common.wgsl`. Add it to the three bind groups. `compute_boundary` 5→6 storage buffers; `compute_lambda` 8→9; `compute_dp` 8→9 — all within 16. **Verify** the headless adapter grants the raised limit at device-request time (fail loudly if not). Note the browser-portability requirement (the target browser must grant 16; no headless WebGPU in CI, so this is a manual check at U6).
+docs/plans/2026-06-07-001-fix-pbf-wall-pressure-boundary-plan.md:234:- Raising any device limit other than `max_storage_buffers_per_shader_stage`.
+docs/plans/2026-06-03-001-feat-wetting-cohesion-plan.md:63:  byte-matched Rust↔WGSL; targets `wgpu::Limits::default()`.
+docs/plans/2026-06-06-003-feat-web-ui-port-plan.md:72:- R2. The browser build targets **WebGPU** (not WebGL2), runs against `wgpu::Limits::default()`
+docs/plans/2026-06-06-003-feat-web-ui-port-plan.md:274:    `create_surface(SurfaceTarget::Canvas(canvas))` + `.await`. Keep `wgpu::Limits::default()` (R2);
+docs/plans/2026-06-06-003-feat-web-ui-port-plan.md:288:  - Covers R2. *Limits guard:* a native unit test asserts the shared device descriptor uses
+docs/plans/2026-06-06-003-feat-web-ui-port-plan.md:289:    `Limits::default()` (no raised storage-buffer limit — pins the v1 trap).
+docs/plans/2026-06-06-003-feat-web-ui-port-plan.md:466:  `Limits::default()` on native (over-budget passes fail on the dev machine); the ported `main.js`
+docs/plans/2026-06-06-003-feat-web-ui-port-plan.md:487:WebGPU-browser smoke. Stay within `wgpu::Limits::default()` / 8 storage buffers.
+docs/plans/2026-06-06-003-feat-web-ui-port-plan.md:522:  `Limits::default()`), `docs/ARCHITECTURE.md` §2 (web build deferred but planned), `docs/plans/vis.md`.
+
+codex
+I found the local comments state the SDF distance is positive inside the cavity and `hit.grad` points toward the fluid/cavity, so the sign check is not abstract here. I’m reading the exact kernel formulas now to see whether the proposed gradient matches the code’s `spiky_grad`/lambda convention.
+exec
+/bin/zsh -lc "sed -n '320,380p' src/solvers/xpbd/common.wgsl && sed -n '1,115p' src/solvers/xpbd/water.wgsl && sed -n '153,207p' src/solvers/xpbd/water.wgsl" in /Users/cxc/Github/coffee-sim
+ succeeded in 0ms:
+    let cap = (c_i * c_j / sum) * (t_j - t_i);
+    return clamp(raw, min(cap, 0.0), max(cap, 0.0));
+}
+fn th_ambient(t: f32, t_amb: f32, h_amb: f32, dt: f32) -> f32 {
+    return -clamp(h_amb * dt, 0.0, 1.0) * (t - t_amb);
+}
+
+fn w_poly6(r: f32, h: f32) -> f32 {
+    if (r >= h) { return 0.0; }
+    let t = h * h - r * r;
+    let coeff = 315.0 / (64.0 * PI * pow(h, 9.0));
+    return coeff * t * t * t;
+}
+
+// True spiky gradient ∇W(d) for d = x_i − x_j (decreases with r ⇒ negative along d), with an
+// r→0 safeguard so near-coincident particles still get a finite separation force.
+fn spiky_grad(d: vec3<f32>, h: f32, r_min: f32) -> vec3<f32> {
+    let len = length(d);
+    if (len >= h) { return vec3<f32>(0.0); }
+    var r = len;
+    var dir: vec3<f32>;
+    if (len < r_min) {
+        r = r_min;
+        if (len < 1e-8) {
+            dir = vec3<f32>(1.0, 0.0, 0.0); // deterministic fallback direction
+        } else {
+            dir = d / len;
+        }
+    } else {
+        dir = d / len;
+    }
+    let coeff = 45.0 / (PI * pow(h, 6.0));
+    let t = h - r;
+    return -coeff * t * t * dir;
+}
+
+// Analytic boundary (wall) density compensation — the SPH wall-deficiency fix. A solid wall cuts
+// off the part of a near-wall particle's kernel sphere that lies in the solid, so the fluid-only
+// density sum under-reads even when the fluid is packed (worst at a concave corner, neighbors gone
+// on two sides). `boundary_psi(d)` is the fraction of the poly6 kernel MASS beyond a plane at
+// signed distance d (cavity interior positive): ψ(h)=0, ψ(0)=0.5, ψ(−h)=1. Adding ρ₀·ψ back makes
+// near-wall water read its TRUE density, so the compression-only solve relieves over-packed corners
+// continuously instead of storing the compression and releasing it as a squeeze-out eruption.
+// Exact closed form: ψ(d) = ∫_{z>d} W_poly6 dV = 0.5 − (315/256)·poly(d/h), poly the cap integral.
+// Explicit products (not pow) so a penetrating d<0 (t<0) stays finite — pow(negative,·) is NaN.
+fn boundary_psi(d: f32, h: f32) -> f32 {
+    let t = clamp(d / h, -1.0, 1.0);
+    let t2 = t * t;
+    let t3 = t2 * t;
+    let t5 = t3 * t2;
+    let t7 = t5 * t2;
+    let t9 = t7 * t2;
+    let poly = t - (4.0 / 3.0) * t3 + (6.0 / 5.0) * t5 - (4.0 / 7.0) * t7 + (1.0 / 9.0) * t9;
+    return 0.5 - (315.0 / 256.0) * poly;
+}
+
+// --- Phase-1.4 swelling + effective mass (from the moisture lane: grain pred.w = V_abs, water = f_w).
+// A grain swells by exactly the absorbed volume; its mass gains the absorbed water's mass; a water
+// shrinks proportionally. Dry/full state (V_abs=0, f_w=1) ⇒ the original constants exactly.
+fn grain_eff_volume(v_abs: f32) -> f32 { return params.grain_volume + v_abs; }
+fn grain_eff_diameter(v_abs: f32) -> f32 {
+// Water incompressibility (Position Based Fluids — Macklin & Müller 2013): the constant-density
+// constraint + λ, the s_corr artificial-pressure Δp, the convergence reduction, and XSPH
+// viscosity. Concatenated after `common.wgsl`, which declares Params/Status/bindings + the SPH
+// and grid helpers these kernels use.
+//
+// Every density sum is phase-guarded: a grain neighbor has no fluid density and must not enter
+// the water constraint (and grain particles skip the water solve entirely). For a single-species
+// water scene the guards are pass-throughs, so water behaviour is unchanged.
+
+// Wall density compensation, precomputed into c_residual for compute_lambda to add (see the note
+// there). Its own pass to keep the SDF eval (`solids`) out of the hot density loop; compute_lambda
+// already binds a full set of storage buffers and this cheap pass binds `solids` but few others.
+// Dispatched only when the
+// scene has SDF solids, so AABB-only scenes never run it and c_residual stays the residual buffer.
+@compute @workgroup_size(256)
+fn compute_boundary(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= params.particle_count) { return; }
+    if (status.converged != 0u) { return; }
+    c_residual[i] = 0.0;
+    if (phase[i] != PHASE_WATER) { return; }
+    let f_i = pred[i].w;
+    if (f_i <= params.pbf_eps) { return; }
+    let hit = solid_union(pred[i].xyz, PHASE_WATER);
+    if (hit.dist < params.h) {
+        c_residual[i] = params.rest_density * f_i * boundary_psi(hit.dist, params.h);
+    }
+}
+
+@compute @workgroup_size(256)
+fn compute_lambda(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= params.particle_count) { return; }
+    if (status.converged != 0u) { return; }
+    if (phase[i] != PHASE_WATER) { return; } // grains have no density constraint
+    let h = params.h;
+    let m = params.particle_mass;
+    let xi = pred[i].xyz;
+    // Wetting: water carries a remaining-volume fraction f_w in pred.w. A near-empty particle is
+    // skipped (inert), and every water contributes its f_w-weighted mass — so the density solve
+    // matches the actual fluid at the wet front. f_w≡1 (no absorption) ⇒ identical to before.
+    let f_i = pred[i].w;
+    if (f_i <= params.pbf_eps) {
+        lambda[i] = 0.0;
+        c_residual[i] = 0.0;
+        return;
+    }
+
+    var rho = m * f_i * w_poly6(0.0, h);
+    var sum_g = vec3<f32>(0.0);
+    var sum_g2 = 0.0;
+
+    let base = cell_coord(xi);
+    for (var dz = -1; dz <= 1; dz = dz + 1) {
+        for (var dy = -1; dy <= 1; dy = dy + 1) {
+            for (var dx = -1; dx <= 1; dx = dx + 1) {
+                let nc = base + vec3<i32>(dx, dy, dz);
+                if (nc.x < 0 || nc.y < 0 || nc.z < 0) { continue; }
+                let dims = vec3<i32>(params.grid_dims.xyz);
+                if (nc.x >= dims.x || nc.y >= dims.y || nc.z >= dims.z) { continue; }
+                let cid = cell_id(nc);
+                let lo = cell_start[cid];
+                let hi = cell_start[cid + 1u];
+                for (var s = lo; s < hi; s = s + 1u) {
+                    let j = sorted_indices[s];
+                    if (j == i) { continue; }
+                    if (phase[j] != PHASE_WATER) { continue; } // skip grain neighbors
+                    let fj = pred[j].w;
+                    if (fj <= params.pbf_eps) { continue; } // skip near-empty (absorbed) water
+                    let d = xi - pred[j].xyz;
+                    let r = length(d);
+                    if (r >= h) { continue; }
+                    rho = rho + m * fj * w_poly6(r, h);
+                    let gj = m * fj * spiky_grad(d, h, params.spiky_r_min);
+                    sum_g = sum_g + gj;
+                    sum_g2 = sum_g2 + dot(gj, gj);
+                }
+            }
+        }
+    }
+
+    // Boundary (wall) density compensation: a near-wall particle's kernel is partly cut off by the
+    // solid, so the fluid-only sum above under-reads — strongest at the cup's floor/side corner,
+    // where the deficit hid genuine over-packing and let it accumulate into squeeze-out eruptions.
+    // The cut-off fraction ρ₀·f_i·ψ(d) was precomputed by `compute_boundary` into c_residual (a
+    // scratch handoff — keeping the SDF eval out of compute_lambda's hot density loop, a separate
+    // pass that binds `solids` stages the value here). Overwritten with the real
+    // residual at the end of this kernel. Solid scenes only; AABB-only scenes never dispatch the
+    // boundary pass, so c_residual is untouched and this term is skipped (byte-unchanged).
+    if (params.num_solids > 0u) {
+        rho = rho + c_residual[i];
+    }
+
+    // Pore-modulated rest density: where grains are present the water target is
+    // ρ₀·(1−min(α_s, 1−ε_floor)), so pore water fills only the available pore fraction while a
+    // packed-bed floor prevents over-packing into solid volume.
+    let pore = 1.0 - min(alpha_s[i], 1.0 - params.min_pore_fraction);
+    let inv_rho0 = 1.0 / (params.rest_density * pore);
+    let c = rho * inv_rho0 - 1.0;
+    let denom = (dot(sum_g, sum_g) + sum_g2) * inv_rho0 * inv_rho0 + params.relaxation_eps;
+    var lam = -c / denom;
+    if (params.lambda_noncohesive != 0u && lam > 0.0) {
+        lam = 0.0;
+    }
+    lambda[i] = lam;
+    // Convergence is measured on COMPRESSION only: free-surface particles always have
+    // c ≈ −1 (density deficit), which incompressibility neither can nor should fix, so
+    // including them would prevent early-exit forever. max(0, c) = over-density violation.
+    c_residual[i] = max(0.0, c);
+}
+
+var<workgroup> sdata: array<f32, 256>;
+
+@compute @workgroup_size(256)
+fn residual_reduce(@builtin(local_invocation_id) lid: vec3<u32>) {
+fn compute_dp(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= params.particle_count) { return; }
+    if (status.converged != 0u) { return; }
+    if (phase[i] != PHASE_WATER) {
+        dp[i] = vec4<f32>(0.0);
+        return; // grains are projected by bed_project; water-loop correction is a clean no-op
+    }
+    let h = params.h;
+    let m = params.particle_mass;
+    let xi = pred[i].xyz;
+    let lam_i = lambda[i];
+    // Skip near-empty (absorbed) water; weight neighbor contributions by their f_w (pred.w) to match
+    // compute_lambda. f_w≡1 (no absorption) ⇒ identical to before.
+    if (pred[i].w <= params.pbf_eps) {
+        dp[i] = vec4<f32>(0.0);
+        return;
+    }
+
+    var sum = vec3<f32>(0.0);
+    let base = cell_coord(xi);
+    for (var dz = -1; dz <= 1; dz = dz + 1) {
+        for (var dy = -1; dy <= 1; dy = dy + 1) {
+            for (var dx = -1; dx <= 1; dx = dx + 1) {
+                let nc = base + vec3<i32>(dx, dy, dz);
+                if (nc.x < 0 || nc.y < 0 || nc.z < 0) { continue; }
+                let dims = vec3<i32>(params.grid_dims.xyz);
+                if (nc.x >= dims.x || nc.y >= dims.y || nc.z >= dims.z) { continue; }
+                let cid = cell_id(nc);
+                let lo = cell_start[cid];
+                let hi = cell_start[cid + 1u];
+                for (var s = lo; s < hi; s = s + 1u) {
+                    let j = sorted_indices[s];
+                    if (j == i) { continue; }
+                    if (phase[j] != PHASE_WATER) { continue; } // skip grain neighbors
+                    let fj = pred[j].w;
+                    if (fj <= params.pbf_eps) { continue; } // skip near-empty (absorbed) water
+                    let d = xi - pred[j].xyz;
+                    let r = length(d);
+                    if (r >= h) { continue; }
+                    let wr = w_poly6(r, h);
+                    let ratio = wr / params.s_corr_wq;
+                    let scorr = -params.s_corr_k * pow(ratio, params.s_corr_n);
+                    let gj = m * fj * spiky_grad(d, h, params.spiky_r_min);
+                    sum = sum + (lam_i + lambda[j] + scorr) * gj;
+                }
+            }
+        }
+    }
+    let pore = 1.0 - min(alpha_s[i], 1.0 - params.min_pore_fraction);
+    let inv_rho0 = 1.0 / (params.rest_density * pore);
+    dp[i] = vec4<f32>(sum * inv_rho0, 0.0);
+}
+
+@compute @workgroup_size(256)
+
+exec
+/bin/zsh -lc "sed -n '150,270p' src/solvers/xpbd/common.wgsl && sed -n '560,705p' src/solvers/xpbd/common.wgsl" in /Users/cxc/Github/coffee-sim
+ succeeded in 0ms:
+    flags: u32,         // bit0 = apex_open
+    a: vec4<f32>,       // cone:(apex_y, apex_r, top_y, top_r)  cyl:(floor_y, rim_y, radius, _)
+    b: vec4<f32>,       // cone:(thickness, hole_radius, center_x, center_z)  cyl:(center_x, center_z, _, _)
+    c: vec4<f32>,       // reserved
+};
+@group(0) @binding(19) var<storage, read> solids: array<Primitive>;
+
+const PI: f32 = 3.14159265358979;
+
+// --- SDF cavity geometry (mirrors utils/sdf.rs; interior positive, gradient toward the cavity) ---
+const SDF_EPS: f32 = 1.0e-6;
+const SDF_FREE: f32 = 1.0e30;
+
+struct SolidHit { dist: f32, grad: vec3<f32>, friction: f32 };
+struct SegCP { p: vec2<f32>, interior: bool };
+
+fn sdf_normalize2(v: vec2<f32>) -> vec2<f32> {
+    let len = length(v);
+    if (len > SDF_EPS) { return v / len; }
+    return vec2<f32>(0.0, 0.0);
+}
+fn sdf_normalize3(v: vec3<f32>) -> vec3<f32> {
+    let len = length(v);
+    if (len > SDF_EPS) { return v / len; }
+    return vec3<f32>(0.0, 0.0, 0.0);
+}
+fn sdf_closest_on_segment(p: vec2<f32>, a: vec2<f32>, b: vec2<f32>) -> SegCP {
+    let ab = b - a;
+    let len2 = dot(ab, ab);
+    if (len2 < SDF_EPS) { return SegCP(a, false); }
+    let t = dot(p - a, ab) / len2;
+    let tc = clamp(t, 0.0, 1.0);
+    return SegCP(a + ab * tc, t > SDF_EPS && t < 1.0 - SDF_EPS);
+}
+
+fn cone_cavity(prim: Primitive, p: vec3<f32>) -> SolidHit {
+    let apex_y = prim.a.x;
+    let apex_r = prim.a.y;
+    let top_y = prim.a.z;
+    let top_r = prim.a.w;
+    let thickness = prim.b.x;
+    let hole_radius = prim.b.y;
+    let center = vec2<f32>(prim.b.z, prim.b.w);
+    let apex_open = (prim.flags & 1u) != 0u;
+
+    let rel = vec2<f32>(p.x - center.x, p.z - center.y);
+    let r = length(rel);
+    let y = p.y;
+    var rhat = vec2<f32>(0.0, 0.0);
+    if (r >= SDF_EPS) { rhat = rel / r; } // axis guard before building the 3D gradient
+
+    if (y > top_y) { return SolidHit(SDF_FREE, vec3<f32>(0.0, 1.0, 0.0), prim.friction); }
+    if (apex_open && y < apex_y) { return SolidHit(SDF_FREE, vec3<f32>(0.0, -1.0, 0.0), prim.friction); }
+
+    let inner_apex = max(apex_r - thickness, hole_radius);
+    let inner_top = max(top_r - thickness, hole_radius);
+    let a2 = vec2<f32>(inner_apex, apex_y);
+    let b2 = vec2<f32>(inner_top, top_y);
+    let cp = sdf_closest_on_segment(vec2<f32>(r, y), a2, b2);
+    let d2d = length(vec2<f32>(r, y) - cp.p);
+
+    let height = top_y - apex_y;
+    var t = 0.0;
+    if (height > SDF_EPS) { t = (y - apex_y) / height; }
+    let inner = max(mix(apex_r, top_r, t) - thickness, hole_radius);
+    let inside = (y >= apex_y) && (r <= inner);
+    var dist = -d2d;
+    if (inside) { dist = d2d; }
+
+    let dir = vec2<f32>(r, y) - cp.p;
+    var n2d = vec2<f32>(0.0, 0.0);
+    if (length(dir) > SDF_EPS) {
+        if (inside) { n2d = sdf_normalize2(dir); } else { n2d = sdf_normalize2(-dir); }
+    } else if (cp.interior) {
+        let ab = b2 - a2;
+        n2d = sdf_normalize2(vec2<f32>(-ab.y, ab.x)); // smooth-wall analytic normal (never zero here)
+    }
+    let grad = sdf_normalize3(vec3<f32>(n2d.x * rhat.x, n2d.y, n2d.x * rhat.y));
+    return SolidHit(dist, grad, prim.friction);
+}
+
+fn cyl_cavity(prim: Primitive, p: vec3<f32>) -> SolidHit {
+    let floor_y = prim.a.x;
+    let rim_y = prim.a.y;
+    let radius = prim.a.z;
+    let center = vec2<f32>(prim.b.x, prim.b.y);
+    let rel = vec2<f32>(p.x - center.x, p.z - center.y);
+    let r = length(rel);
+    let y = p.y;
+    if (y > rim_y) { return SolidHit(SDF_FREE, vec3<f32>(0.0, 1.0, 0.0), prim.friction); }
+    let d_side = radius - r;
+    let d_floor = y - floor_y;
+    if (d_side <= d_floor) {
+        var rhat = vec2<f32>(0.0, 0.0);
+        if (r >= SDF_EPS) { rhat = rel / r; }
+        return SolidHit(d_side, sdf_normalize3(vec3<f32>(-rhat.x, 0.0, -rhat.y)), prim.friction);
+    }
+    return SolidHit(d_floor, vec3<f32>(0.0, 1.0, 0.0), prim.friction);
+}
+
+fn solid_cavity(prim: Primitive, p: vec3<f32>) -> SolidHit {
+    if (prim.kind == 0u) { return cone_cavity(prim, p); }
+    return cyl_cavity(prim, p);
+}
+
+// Species-filtered union: the most-penetrated (min signed-distance) solid that blocks `phase`.
+fn solid_union(p: vec3<f32>, phase: u32) -> SolidHit {
+    var best = SolidHit(SDF_FREE, vec3<f32>(0.0, 0.0, 0.0), 0.0);
+    let n = params.num_solids;
+    for (var i = 0u; i < n; i = i + 1u) {
+        let prim = solids[i];
+        if ((prim.species_mask & (1u << phase)) == 0u) { continue; }
+        let hit = solid_cavity(prim, p);
+        if (hit.dist < best.dist) { best = hit; }
+    }
+    return best;
+}
+
+// --- Phase 1.5 chem/thermal state + kinetics (mirrors models/extraction.rs + models/thermal.rs) ---
+// Per-particle vec4: grain (s_f, s_s, T_g, _), water (c, T_w, _, _). `chem` is the live buffer;
+// `chem_frozen` is the per-substep snapshot the dissolution/thermal passes read (so writes to live
+fn apply_dp(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= params.particle_count) { return; }
+    if (status.converged != 0u) { return; }
+    // Cap the per-iteration correction so no single overcorrection can launch a particle.
+    var d = params.position_relaxation * dp[i].xyz;
+    let dl = length(d);
+    if (dl > params.max_correction) {
+        d = d * (params.max_correction / dl);
+    }
+    var proposed = pred[i].xyz + d;
+
+    // Static-solid (SDF) push-out, selective by species: push a penetrating particle out along the
+    // cavity gradient. Water projects to the wall *surface* (offset 0, exactly like the box clamp —
+    // a fluid point; purely dissipative). Grains keep a radius standoff (a solid body rests its
+    // surface on the wall). A positive offset for water re-injects an outward velocity on every fast
+    // impact (a bounce), since the particle is pushed past where it arrived. No-op when num_solids ==
+    // 0, so AABB-only scenes are byte-unchanged; solid_union returns FREE for non-applicable species.
+    let contact = select(0.0, 0.5 * params.grain_diameter, phase[i] == PHASE_GRAIN);
+    var sdf_n = vec3<f32>(0.0, 0.0, 0.0);
+    var sdf_mag = 0.0;
+    var sdf_mu = params.floor_mu;
+    if (params.num_solids > 0u) {
+        let hit = solid_union(proposed, phase[i]);
+        if (hit.dist < contact) {
+            sdf_mag = contact - hit.dist;
+            proposed = proposed + sdf_mag * hit.grad;
+            sdf_n = hit.grad;
+            sdf_mu = hit.friction;
+        }
+    }
+
+    let clamped = clamp(proposed, params.box_min.xyz, params.box_max.xyz);
+
+    if (phase[i] == PHASE_GRAIN) {
+        // The boundary normal response is the box clamp delta and/or the SDF push above. Apply
+        // Coulomb friction along the *dominant* boundary: remove the grain's tangential drift
+        // (relative to its frame-start position) up to mu · |normal correction|, using the solid's
+        // friction when the SDF push dominated, else floor_mu. This is the angle-of-repose mechanism.
+        let push = clamped - proposed;
+        let box_mag = length(push);
+        var newp = clamped;
+        var n = vec3<f32>(0.0, 0.0, 0.0);
+        var nmag = 0.0;
+        var mu = params.floor_mu;
+        if (box_mag >= sdf_mag) {
+            if (box_mag > 1e-6) {
+                n = push / box_mag;
+                nmag = box_mag;
+                mu = params.floor_mu;
+            }
+        } else {
+            n = sdf_n;
+            nmag = sdf_mag;
+            mu = sdf_mu;
+        }
+        if (nmag > 1e-6) {
+            let disp = newp - pos[i].xyz;
+            let tang = disp - dot(disp, n) * n;
+            let tlen = length(tang);
+            if (tlen > 1e-8) {
+                let remove = min(tlen, mu * nmag);
+                newp = newp - (tang / tlen) * remove;
+            }
+            // Post-friction SDF recheck: the tangential slide can re-enter a wall (only the box is
+            // re-clamped below), so re-project out of the solid first, then re-clamp to the box.
+            if (params.num_solids > 0u) {
+                let h2 = solid_union(newp, phase[i]);
+                if (h2.dist < contact) {
+                    newp = newp + (contact - h2.dist) * h2.grad;
+                }
+            }
+            newp = clamp(newp, params.box_min.xyz, params.box_max.xyz);
+        }
+        pred[i] = vec4<f32>(newp, pred[i].w); // preserve the moisture snapshot in pred.w
+    } else {
+        pred[i] = vec4<f32>(clamped, pred[i].w); // preserve the moisture snapshot in pred.w
+    }
+}
+
+@compute @workgroup_size(256)
+fn finalize(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= params.particle_count) { return; }
+    let xi = pred[i].xyz;
+    var v = ((xi - pos[i].xyz) / params.dt) * params.velocity_damping;
+
+    if (phase[i] == PHASE_GRAIN) {
+        let pen = c_residual[i]; // final normalized penetration from the last bed_project
+        // Rolling-resistance proxy: bleed grain kinetic energy so spheres don't roll the pile
+        // shallow — but ONLY while in contact. An airborne grain isn't rolling, so damping its
+        // free-fall would just rob the impact of the energy it needs to flow into a heap.
+        if (pen > 1e-4) {
+            v = v * params.rolling_damping;
+        }
+        // Static-yield regularization (NOT freezing): below a small speed a grain is treated as
+        // at rest. Gravity and the contact solve still run for it every frame, so an unsupported
+        // grain immediately re-accelerates and penetration is never masked — this only removes
+        // the sub-threshold numerical jitter a Jacobi contact pile never fully shakes off. The
+        // wake gate (KTD-9) holds a grain out of the dead-band while the local water flow speed
+        // exceeds wake_threshold, so the pour mobilizes the surface but a still/saturated bed sleeps.
+        if (fluid_impulse[i] <= params.wake_threshold && length(v) < params.grain_sleep_speed) {
+            v = vec3<f32>(0.0);
+        }
+    } else if (params.num_solids > 0u) {
+        // Canonical XPBD static-collision VELOCITY response (Müller et al. 2020). apply_dp already
+        // clamped POSITION out of the wall; here we set the post-collision VELOCITY independently of
+        // that push (the cure for wall "eruption": otherwise v=(pred-pos)/dt folds the outward push
+        // into v and the particle is flung off). One pass over the blocking solids: at a contacted
+        // surface split v, cancel the normal component (restitution 0 — inelastic; NOT a v·n≥0 clamp,
+        // which would permit the eruption) and apply Coulomb friction. A cup's side and floor meet in
+        // a concave corner where the nearest-face normal cancels only one axis, so on a cylinder floor
+        // we additionally zero v.y — both axes handled without a second sweep over `solids`.
+        let contact = 0.25 * params.h;
+        for (var s = 0u; s < params.num_solids; s = s + 1u) {
+            let prim = solids[s];
+            if ((prim.species_mask & (1u << phase[i])) == 0u) { continue; }
+            let hit = solid_cavity(prim, xi);
+            if (hit.dist < contact) {
+                let n = hit.grad; // unit (sdf_normalize3)
+                let vn = dot(v, n);
+                v = v - vn * n; // restitution 0: cancel normal velocity, decoupled from the push
+                let vt = length(v);
+                if (vt > 1e-6) {
+                    let fric = min(hit.friction * abs(vn), vt); // Coulomb: bounded by the normal impulse
+                    v = v - (v / vt) * fric;
+                }
+                // No-upward-slip wall condition for water: the PBF boundary under-density lets a
+                // confined pool over-pressure UP the wall, and Coulomb friction can't hold the slider
+                // (it scales with the ~0 normal velocity), so a thin sheet climbs above the surface.
+                // Cancel the UPWARD wall-tangential velocity; downward drainage is untouched. No-op for
+                // grains (their wall standoff + repose friction already handle this).
+                if (phase[i] != PHASE_GRAIN && v.y > 0.0) {
+                    v.y = 0.0;
+                }
+            }
+            if (prim.kind == 1u
+                && xi.y - prim.a.x < contact
+                && length(vec2<f32>(xi.x - prim.b.x, xi.z - prim.b.y)) < prim.a.z) {
+                v.y = 0.0; // concave corner: the floor axis the side normal can't cancel
+            }
+        }
+    }
+
+    let sp = length(v);
+    if (sp > params.max_speed) {
+
+exec
+/bin/zsh -lc "sed -n '95,135p' src/utils/gpu.rs && sed -n '1685,1735p' src/solvers/xpbd/mod.rs && sed -n '2258,2285p' src/solvers/xpbd/mod.rs" in /Users/cxc/Github/coffee-sim
+ succeeded in 0ms:
+        options: wgpu::RequestAdapterOptions<'_, '_>,
+        allow_timestamp_queries: bool,
+    ) -> Option<Self> {
+        let adapter = instance.request_adapter(&options).await.ok()?;
+        let timestamps_supported =
+            allow_timestamp_queries && adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY);
+        let required_features = if timestamps_supported {
+            wgpu::Features::TIMESTAMP_QUERY
+        } else {
+            wgpu::Features::empty()
+        };
+
+        let (device, queue) = adapter
+            .request_device(&wgpu::DeviceDescriptor {
+                label: Some("coffee-sim device"),
+                required_features,
+                // 16 storage buffers per stage is the real device/browser ceiling for this project's
+                // targets. All other limits stay at the WebGPU baseline for portability.
+                required_limits: wgpu::Limits {
+                    max_storage_buffers_per_shader_stage: 16,
+                    ..wgpu::Limits::default()
+                },
+                memory_hints: wgpu::MemoryHints::Performance,
+                trace: wgpu::Trace::default(),
+                experimental_features: wgpu::ExperimentalFeatures::disabled(),
+            })
+            .await
+            .ok()?;
+
+        Some(Self {
+            instance,
+            adapter,
+            device,
+            queue,
+            timestamps_supported,
+        })
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn js_error(error: impl ToString) -> wasm_bindgen::JsValue {
+                    (20, &chem),
+                    (26, &chem_scratch),
+                    (27, &phase_scratch),
+                ],
+            ),
+            grid_reorder_identity: bg(
+                &pipelines.grid_reorder_identity,
+                &[(0, &params_buf), (9, &sorted_indices)],
+            ),
+            compute_boundary: bg(
+                &pipelines.compute_boundary,
+                &[
+                    (0, &params_buf),
+                    (2, &pred),
+                    (7, &c_residual),
+                    (10, &status),
+                    (11, &phase),
+                    (19, &solids),
+                ],
+            ),
+            compute_lambda: bg(
+                &pipelines.compute_lambda,
+                &[
+                    (0, &params_buf),
+                    (2, &pred),
+                    (5, &lambda),
+                    (7, &c_residual),
+                    (8, &cell_start),
+                    (9, &sorted_indices),
+                    (10, &status),
+                    (11, &phase),
+                    (13, &alpha_s),
+                ],
+            ),
+            residual_reduce: bg(
+                &pipelines.residual_reduce,
+                &[(0, &params_buf), (7, &c_residual), (10, &status)],
+            ),
+            compute_dp: bg(
+                &pipelines.compute_dp,
+                &[
+                    (0, &params_buf),
+                    (2, &pred),
+                    (5, &lambda),
+                    (6, &dp),
+                    (8, &cell_start),
+                    (9, &sorted_indices),
+                    (10, &status),
+                    (11, &phase),
+                    (13, &alpha_s),
+                ],
+                                &b.compute_fractions,
+                                "compute_fractions",
+                                np,
+                            );
+                        }
+                        if self.has_solids {
+                            // Wall density compensation into c_residual (consumed by compute_lambda,
+                            // then overwritten with the convergence residual). Solid scenes only.
+                            pass(
+                                &mut enc,
+                                &p.compute_boundary,
+                                &b.compute_boundary,
+                                "compute_boundary",
+                                np,
+                            );
+                        }
+                        pass(
+                            &mut enc,
+                            &p.compute_lambda,
+                            &b.compute_lambda,
+                            "compute_lambda",
+                            np,
+                        );
+                        pass(&mut enc, &p.compute_dp, &b.compute_dp, "compute_dp", np);
+                        pass(&mut enc, &p.apply_dp, &b.apply_dp, "apply_dp", np);
+                        // Adaptive early-exit only for single-species water (mixed runs fixed iters).
+                        if !mixed {
+                            pass(
+
+codex
+REVISE
+
+The core physics approach is sound, but the plan has a sign-language error that is dangerous enough to revise before implementation.
+
+**Required Findings**
+
+1. **Fix the sign explanation for `g_b`.**
+   The formula is correct:
+   `g_b = rho0 * f_i * psi'(d) * n`, with `n = grad(SDF)` pointing into the fluid and `psi'(d) < 0`.
+
+   But `g_b` itself points **toward the wall**, not away from it. The wall-repulsive correction is `lambda_i * g_b`, because over-density gives `lambda_i < 0`, so `lambda_i * g_b` points **into the fluid**. The plan’s wording that `g_b` is the inward wall-force direction is wrong and could cause an implementer to flip the sign.
+
+2. **Derivative is correct.**
+   For
+   `psi(t) = 0.5 - (315/256) * poly(t)`,
+   `poly'(t) = 1 - 4t^2 + 6t^4 - 4t^6 + t^8 = (1 - t^2)^4`.
+
+   Therefore:
+   `dpsi/dd = -(315/256) * (1 - t^2)^4 / h`.
+
+   Clamping `t` to `[-1, 1]` is consistent with the clamped `boundary_psi`; derivative becomes zero at `|d| >= h`.
+
+3. **`sum_g` yes, `sum_g2` no is correct.**
+   The boundary density depends on `p_i`, so it contributes to the self Jacobian:
+   `∇_{p_i} C_i`.
+
+   The wall is not a DOF, so there is no boundary particle gradient term in the denominator. Do not add a fake `|∇C_b|^2` to `sum_g2`.
+
+4. **`compute_dp` using only `lambda_i * g_b` is correct.**
+   No `lambda_b`: the wall has no constraint multiplier.
+   No `s_corr`: that term is a fluid-fluid artificial pressure/anti-clustering correction, not a wall pressure term.
+
+5. **Route B is reasonable.**
+   Staging `boundary_grad` from `compute_boundary` is the right performance choice here. It avoids re-running `solid_union` in both hot kernels. Moving from 8 to 9 storage buffers is fine under the project’s stated 16-buffer target, but the plan should keep the “grant check” as a hard failure, not a soft assumption.
+
+6. **Add an explicit sign/physics test or diagnostic.**
+   Integration gates are necessary but not sufficient for this kind of sign-sensitive core change. Add a small deterministic probe, even if host-side, that verifies for a particle near a cylinder wall:
+   `dot(boundary_grad, hit.grad) < 0`
+   and, for `lambda_i < 0`,
+   `dot(lambda_i * boundary_grad, hit.grad) > 0`.
+
+7. **Tighten the no-climb gate.**
+   A raw `wall_max_y` can be noisy under an active pour because one splash particle can fail the test. Prefer a sustained/quantile metric: e.g. wall-region 95th/99th percentile height over a steady window, plus a minimum occupancy threshold for detecting a persistent sheet.
+
+8. **Corner stability remains the main risk.**
+   The SDF union gives a nearest-surface normal, so at floor-wall concave corners the density/gradient is only a one-sided approximation, not the true additive occlusion from both planes. The proposed sequencing is sound, but U6 should explicitly include a floor-wall corner fill test and inspect bounded correction magnitudes near the seam.
+
+With those revisions, the plan’s physics is defensible: it completes the existing boundary density term with the matching constraint gradient and applies the correct PBF wall correction.
+tokens used
+43,409
+REVISE
+
+The core physics approach is sound, but the plan has a sign-language error that is dangerous enough to revise before implementation.
+
+**Required Findings**
+
+1. **Fix the sign explanation for `g_b`.**
+   The formula is correct:
+   `g_b = rho0 * f_i * psi'(d) * n`, with `n = grad(SDF)` pointing into the fluid and `psi'(d) < 0`.
+
+   But `g_b` itself points **toward the wall**, not away from it. The wall-repulsive correction is `lambda_i * g_b`, because over-density gives `lambda_i < 0`, so `lambda_i * g_b` points **into the fluid**. The plan’s wording that `g_b` is the inward wall-force direction is wrong and could cause an implementer to flip the sign.
+
+2. **Derivative is correct.**
+   For
+   `psi(t) = 0.5 - (315/256) * poly(t)`,
+   `poly'(t) = 1 - 4t^2 + 6t^4 - 4t^6 + t^8 = (1 - t^2)^4`.
+
+   Therefore:
+   `dpsi/dd = -(315/256) * (1 - t^2)^4 / h`.
+
+   Clamping `t` to `[-1, 1]` is consistent with the clamped `boundary_psi`; derivative becomes zero at `|d| >= h`.
+
+3. **`sum_g` yes, `sum_g2` no is correct.**
+   The boundary density depends on `p_i`, so it contributes to the self Jacobian:
+   `∇_{p_i} C_i`.
+
+   The wall is not a DOF, so there is no boundary particle gradient term in the denominator. Do not add a fake `|∇C_b|^2` to `sum_g2`.
+
+4. **`compute_dp` using only `lambda_i * g_b` is correct.**
+   No `lambda_b`: the wall has no constraint multiplier.
+   No `s_corr`: that term is a fluid-fluid artificial pressure/anti-clustering correction, not a wall pressure term.
+
+5. **Route B is reasonable.**
+   Staging `boundary_grad` from `compute_boundary` is the right performance choice here. It avoids re-running `solid_union` in both hot kernels. Moving from 8 to 9 storage buffers is fine under the project’s stated 16-buffer target, but the plan should keep the “grant check” as a hard failure, not a soft assumption.
+
+6. **Add an explicit sign/physics test or diagnostic.**
+   Integration gates are necessary but not sufficient for this kind of sign-sensitive core change. Add a small deterministic probe, even if host-side, that verifies for a particle near a cylinder wall:
+   `dot(boundary_grad, hit.grad) < 0`
+   and, for `lambda_i < 0`,
+   `dot(lambda_i * boundary_grad, hit.grad) > 0`.
+
+7. **Tighten the no-climb gate.**
+   A raw `wall_max_y` can be noisy under an active pour because one splash particle can fail the test. Prefer a sustained/quantile metric: e.g. wall-region 95th/99th percentile height over a steady window, plus a minimum occupancy threshold for detecting a persistent sheet.
+
+8. **Corner stability remains the main risk.**
+   The SDF union gives a nearest-surface normal, so at floor-wall concave corners the density/gradient is only a one-sided approximation, not the true additive occlusion from both planes. The proposed sequencing is sound, but U6 should explicitly include a floor-wall corner fill test and inspect bounded correction magnitudes near the seam.
+
+With those revisions, the plan’s physics is defensible: it completes the existing boundary density term with the matching constraint gradient and applies the correct PBF wall correction.

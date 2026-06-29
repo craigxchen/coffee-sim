@@ -1,0 +1,336 @@
+You are an expert physics-simulation reviewer (granular media + SPH/PBF fluid coupling, GPU XPBD solvers) reviewing an implementation plan written by Claude Code for a real coffee-sim codebase. Respond with a verdict on the FIRST LINE: **APPROVE**, **REVISE**, or **REJECT**. Then give rigorous, specific findings an implementer can fold back into the plan. Be adversarial about physics correctness, numerical stability, and conservation — this re-grounds the core multi-phase coupling.
+
+Context you can trust (already verified against the code):
+- Solver is XPBD/PBF on GPU (wgpu/WGSL), reduced sim units (gravity [0,-20,0]); NO SI unit system wired. Length ref SIM_UNITS_PER_METER~=27.7 only.
+- Today: water-grain coupling = a soft mass-biased sphere "exclusion" (grain share m_w/(m_w+m_g)~=0.09) + an implicit velocity-blend drag beta=rate*dt/(1+rate*dt)~=5e-4 (drag_gamma=0.02) — grains read frozen. There is an alpha_s solid-fraction field (compute_fractions) and the water density already targets rho0*(1-alpha_s).
+- Hard constraints: 8 storage buffers per shader stage (drag_water/drag_grain/buoyancy_grain/compute_lambda/compute_dp/bed_project already at 8/8); momentum+volume conservation are gated tests; no float atomics (symmetric vel_frozen pair gather); browser/Tint portability.
+- Pour-over is Darcian (Re_p~0.3-12); bed sits ~3-4x minimum fluidization (target: mild surface rearrangement, not full suspension).
+
+Review focus (address each explicitly):
+1. KTD-2: after removing the sphere exclusion, is leaning ENTIRELY on the alpha_s density field (water targets rho0*(1-alpha_s)) sufficient to stop water tunneling/pooling straight through the bed, or is a residual soft constraint / a minimum-porosity floor in the density target needed? What failure modes?
+2. KTD-3: the exponential/implicit Darcy drag dv=(u_f-u_g)(1-e^{-dt/tau_s}) with tau_s=m/(beta*V), beta=150*mu*(1-eps)^2/(eps^3*d^2). Is it correct + stable + strong enough to mobilize the bed, AND does the symmetric vel_frozen + opposite-eff-mass + harmonic-k pair idiom still conserve momentum exactly when the drag coefficient is per-particle (eps_i vs eps_j differ)? How to keep the pair impulse equal-and-opposite with asymmetric per-particle tau?
+3. KTD-5: a coupling kernel h_c (~2-3x grain diameter) wider than water h for a smooth porosity field; cell_size=max(h_c,grain_d) on a single uniform grid. Soundness + perf/neighbor-count implications of the wider gather.
+4. U4 sleep/wake: a strong drag + the static-yield dead-band (grain_sleep_speed=0.2, wake via fluid_impulse>wake_threshold=0.05) + rolling_damping. Will these coexist without freezing the pour zone OR making a saturated bed creep? Is gating sleep on fluid_impulse robust?
+5. KTD-6: reduced-units + calibrate-by-inequality vs needing a real unit system. Is calibrating one free drag scale to land grind-ordered drawdown + surface agitation defensible, or is it under-determined?
+6. 8-buffer budget: drag passes are 8/8; plan precomputes the Darcy coeff into the existing coupling_scale vec2. Is that actually enough, or does the exponential integrator / buoyancy-separate need another lane?
+7. Incremental sequencing safety: kernel -> remove exclusion -> drag -> sleep -> finer water -> verify. Any ordering that lands a broken/unstable intermediate state? Should drag be re-grounded BEFORE removing exclusion?
+
+Also flag anything the plan missed (e.g. xsph fine-resolution eruption, buoyancy/drag double-counting of the pressure gradient, the inverting tunneling test, saturated-tail conservation leaks).
+
+## Plan to Review
+---
+title: "feat: Physically-grounded water↔grain coupling (unresolved SPH-DEM: porosity field + Darcy drag, no fluid-solid collision)"
+status: active
+date: 2026-06-06
+type: feat
+---
+
+# feat: Physically-grounded water↔grain coupling
+
+> Re-ground the water↔coffee-grain mechanical coupling so the pour actually moves the grounds, using the standard **unresolved SPH-DEM** architecture: water and sand *see each other via a porosity field + a relative-velocity drag closure*, never sphere-sphere collision (which causes porous locking). Water is finer than the grains; both phases stay in one unified position-based solver.
+
+## Summary
+
+The bed never moves under the pour because the water↔grain coupling is both miscalibrated and partly wrong in kind. Two mechanisms are at fault: (1) a **soft water↔grain non-penetration "exclusion"** — a partial sphere-sphere contact that is mass-biased so grains barely feel it *and* is exactly the kind of fluid-solid collision that causes **porous locking** (fine fluid wedging in grain voids → bed dilates/locks); and (2) an **implicit drag ~3 orders of magnitude too weak** — the per-substep velocity-blend `β = rate·dt/(1+rate·dt) ≈ 5×10⁻⁴`, far below the grain sleep threshold, so grains read as frozen.
+
+The fix is the textbook **unresolved (semi-resolved) SPH-DEM coupling** (Robinson et al. 2013; Macklin "Unified Particle Physics" 2014): keep PBF for water and rigid XPBD contact for sand-sand, **remove** the water↔grain exclusion, and couple the two phases through (a) the **volumetric solid-fraction field** `α_s` the solver already computes (water density targets `ρ₀·(1−α_s)`, so water packs into pore volume — this carries the "non-penetration" role) and (b) a **physically-grounded Darcy drag with an exponential/implicit integrator** strong enough to both set drainage *and* mobilize the bed surface. Water particles are made genuinely finer than grains, with a **wider coupling kernel** so the porosity/drag field stays smooth.
+
+Coffee pour-over sits at pore Reynolds number ≈ 0.3–12 (Darcian), so the Ergun inertial term is negligible — viscous Darcy drag suffices. At realistic flow the bed is ~3–4× minimum fluidization, so the physical target is **mild grain rearrangement at the pour impingement zone, not a churning bed** — that bounds both the calibration and the verification.
+
+---
+
+## Problem Frame
+
+- **What's wrong:** Water saturates/swells the grounds (the scalar absorption pass works) but the bed shows zero mechanical agitation even at max pour velocity. Diagnosed root causes: the soft water↔grain exclusion (mass-biased, locking-prone) and the ~1000×-too-weak drag (`src/solvers/xpbd/coupling.wgsl`).
+- **Goal:** The pour mechanically and *physically* moves the grounds — water percolates the pore network while exerting real drag that rearranges the surface — without the bed locking, exploding, or unrealistically fluidizing.
+- **Architecture (user-directed, confirmed by literature):** geometric asymmetry. Sand↔sand: rigid XPBD contact at full sand radius. Water↔water: PBF density at the small water radius. Water↔sand: **no sphere collision** — porosity field + relative-velocity drag.
+- **Hard constraints (project doctrine):**
+  - Volume + momentum conservation are **gated invariants**, not diagnostics (`tests/xpbd_coupling.rs`, `tests/xpbd_wetting.rs`); drag must stay a symmetric, equal-and-opposite, dissipative pair impulse (no float atomics — the symmetric `vel_frozen` gather idiom).
+  - **8 storage buffers per shader stage** is a hard WebGPU ceiling (`drag_water`/`drag_grain`/`buoyancy_grain`/`compute_lambda`/`compute_dp`/`bed_project` are already at 8/8). Must stay portable to the browser (wgpu 29 / Tint).
+  - **No SI/real-unit system is wired today** (reduced sim units: gravity `[0,−20,0]`, `SIM_UNITS_PER_METER ≈ 27.7` is a reference value only). Per `KEEP.md §2`, a real-unit conversion is a cross-cutting calibration project (permeability/extraction/thermal timescales all key off the length scale) — **out of scope here**; calibrate by causal-lever inequalities, not tuned absolutes.
+  - **Never `#[ignore]` a test to go green** (`AGENTS.md`): inverting invariants get *rewritten* to the new physics, not deleted.
+
+---
+
+## Requirements
+
+- **R1.** Remove the water↔grain sphere exclusion; the `α_s` porosity field carries the volume coupling (water packs into pores, does not over-compress into grain space, does not catastrophically tunnel or pool through the bed).
+- **R2.** Replace the velocity-blend drag with a **Darcy** relative-velocity drag (viscous term only; Re < ~12) using an **exponential/implicit integrator** (`v_grain⁺ = v_fluid + (v_grain − v_fluid)·e^(−Δt/τ_s)`), momentum-conserving and dissipative, strong enough to (a) set a grind-ordered drawdown and (b) mobilize the bed surface under the pour.
+- **R3.** Couple the porosity field and drag through a **coupling kernel wider than the water PBF kernel** (≈ 2–3× grain diameter) so the void fraction is smooth when water is finer than grains; clamp porosity `ε ≥ ~0.35` to keep the Kozeny–Carman/Darcy coefficient finite.
+- **R4.** Water particles are **finer than grains** (`R_w < R_s`), seeded accordingly, at a modest absolute particle count for this phase (the ~200k perf push is deferred). The grid handles the water-h/grain-diameter disparity.
+- **R5.** The grain **sleep/wake** behavior is reconciled with the now-strong drag: the pour wakes and mobilizes surface grains (via `fluid_impulse`), while a dry or fully-saturated static bed still settles to rest (no creep).
+- **R6.** **Buoyancy stays a separate pressure-gradient term** (not folded into drag); the density-aware "don't launch dense grains" fix remains intact and re-validated after the drag change.
+- **R7.** Conservation gates hold: momentum drift within tolerance, drag never increases kinetic energy, water volume conserved; the suite is green except the documented pre-existing reds. The wetting/extraction/fines scalar layers remain functionally unchanged on top.
+- **R8.** Behavior is verified by **causal-lever inequalities** (not tuned absolutes): coarse grind drains faster than fine; the pour visibly displaces surface grains in the impingement zone; the bed does **not** fully fluidize/suspend; finer resolution does not erupt.
+
+---
+
+## Key Technical Decisions
+
+- **KTD-1 — Unresolved SPH-DEM coupling, not resolved collision.** Water↔grain interaction is a body force from a locally-averaged porosity field + drag closure (the AVNS / Robinson 2013 method), **not** sphere-sphere non-penetration. Hard fluid-solid particle contact at finite resolution causes porous locking, spurious collision-pressure, and bed dilation. This is the architecture the user specified and the literature standard.
+- **KTD-2 — Keep `α_s` as the volume-exclusion channel; delete the exclusion passes.** `compute_fractions` already computes `α_s = Σ_grain V_eff·W` (clamped to `packing_limit`) and the water solve already targets `ρ₀·(1−α_s)`. That density modulation *is* the non-penetration: water can't over-pack where grains are. So `exclude_water`/`exclude_grain` are redundant and harmful — remove them. (Handle the now-uninitialized grain `dp` in the water-loop `apply_dp` — grains must get `dp = 0` there since `compute_dp` skips them and exclusion previously initialized it.)
+- **KTD-3 — Darcy drag, viscous-only, exponential integrator.** Pour-over is Darcian (Re_p ≈ 0.3–12), so drop the Ergun inertial term. Per-grain drag `f = β·V·(u_fluid − u_grain)` with `β = 150·μ·(1−ε)²/(ε³·d²)` (Kozeny–Carman structure — already present as `porosity_drag_factor` ∝ `d⁻²`). Integrate **exponentially** via the stopping time `τ_s = m/(β·V)`: `Δv = (u_fluid − u_grain)·(1 − e^(−Δt/τ_s))`. This is unconditionally stable (the current `β = rate·dt/(1+rate·dt)` is a first-order approximation of the same thing — the bug is the tiny rate, and explicit blending caps strength via `drag_beta_max`). The exponential form lets drag be physically strong without overshoot.
+- **KTD-4 — Preserve the momentum-conserving idiom.** Keep the symmetric pair scale + opposite-effective-mass split + `vel_frozen` snapshot + Jacobi subiters (the no-float-atomics conservation trick). Reuse the harmonic-mean-k pair combiner (`coupling_scale` is already `vec2<f32>`). The drag must remain equal-and-opposite per pair and dissipative in relative velocity (the existing conservation gates enforce this).
+- **KTD-5 — Wide coupling kernel `h_c`, decoupled from water `h`.** Compute `α_s` and the drag porosity over `h_c ≈ 2–3× grain_diameter` (not the water PBF `h`), so a fine water particle averages over enough grains for a smooth field. Set `cell_size = max(h_c, grain_diameter)` so the existing single uniform grid covers the largest query radius. Clamp `ε ∈ [0.35, 0.999]`.
+- **KTD-6 — Stay in reduced sim units; calibrate by inequality.** A genuine SI Darcy coefficient needs a consistent mass/time unit system the solver lacks (cross-cutting — `KEEP.md §2`). Express the Darcy `β`/`τ_s` in reduced units and calibrate the one free scale so the *causal levers* land (grind-ordered drawdown, surface agitation present, no full fluidization), per the repo's "assert laws, not tuned values" doctrine. A real-unit system is an explicit deferred follow-on.
+- **KTD-7 — Buoyancy separate from drag.** Buoyancy stays the pressure-gradient term over the PBF `λ` field (`−V·∇P`, the density-aware `grain_buoyancy_factor`); it is *not* folded into the drag closure (conflating static and dynamic effects makes calibration impossible). Re-validate the "dense grain not launched" behavior after the drag change.
+- **KTD-8 — Water finer than grains is a realism requirement, sequenced last.** `R_w < R_s` improves the look (water threads the bed) and fluid detail, but it stresses CFL/kernel normalization (the XSPH fine-resolution eruption lesson). Land the coupling re-grounding at the current resolution first (where it already fixes "grounds don't move"), then refine water and re-run the spacing-invariance gate. Keep the absolute count modest; defer the 200k perf push.
+
+---
+
+## High-Level Technical Design
+
+**Constraint classes (geometric asymmetry):**
+
+```mermaid
+graph TD
+  subgraph Water phase (fine, R_w)
+    W[water particles] -- PBF density rho0*(1-as) --> W
+  end
+  subgraph Sand phase (coarse, R_s)
+    S[grain particles] -- rigid XPBD contact + friction --> S
+  end
+  W -. "porosity field a_s (kernel h_c)" .-> S
+  S -. "a_s modulates water density target" .-> W
+  W == "Darcy drag (exponential), pressure-gradient buoyancy" ==> S
+  S == "equal+opposite drag/buoyancy impulse" ==> W
+  X[NO water-sand sphere collision]:::x
+  classDef x fill:#511,stroke:#a33,color:#fff
+```
+
+Dotted = volumetric field coupling; double = momentum (drag + buoyancy) coupling; the red node is the removed mechanism.
+
+**Per-substep pass order (current → changed). Bold = changed.**
+
+```
+predict
+water density loop (×water_iters):
+    [regrid + reorder every k]
+    compute_fractions        → a_s over h_c           (KTD-5: wider kernel)
+    compute_boundary (solids)
+    compute_lambda           → uses rho0*(1-a_s)       (unchanged)
+    compute_dp
+    **(REMOVED) exclude_water / exclude_grain**        (KTD-2)
+    apply_dp                 → **grain dp=0 here**     (KTD-2 fix)
+drag subiters (×drag_subiters):
+    compute_coupling_scale   → **Darcy beta / tau_s into coupling_scale** (KTD-3,5)
+    vel→vel_frozen
+    drag_water / drag_grain  → **exponential Δv, momentum-conserving**    (KTD-3,4)
+    apply_drag_pred
+buoyancy:                    → **kept separate, re-validated**            (KTD-7)
+bed contact loop (×bed_iters): bed_project + apply_dp   (unchanged — sand-sand)
+finalize                     → **sleep/wake reconciled with strong drag** (R5)
+xsph (water)                 (watch fine-resolution normalization)
+wetting / extraction / fines (unchanged scalar layers)
+```
+
+**Exponential drag (directional pseudo-code, not spec):**
+
+```
+# per grain i, gathered over water neighbors j within h_c (and mirror on water side)
+eps   = clamp(1 - alpha_s[i], 0.35, 0.999)          # local porosity
+beta  = 150 * mu * (1-eps)^2 / (eps^3 * d^2)         # Darcy/K-C, reduced units
+tau   = m_eff_i / (beta * V_i)                        # stopping time
+alpha = 1 - exp(-dt / tau)                            # exponential factor, in [0,1)
+# symmetric, opposite-mass split over the relative velocity (momentum-conserving):
+dv_i  = alpha * (m_j/(m_i+m_j)) * (vel_frozen[j] - vel_frozen[i])    # summed over j
+```
+
+---
+
+## Implementation Units
+
+### U1. Wide, smooth coupling kernel for the porosity field
+
+**Goal:** Decouple the `α_s`/drag coupling kernel `h_c` from the water PBF `h` so the void fraction is smooth when water is finer than grains; clamp porosity.
+
+**Requirements:** R3.
+
+**Dependencies:** none.
+
+**Files:** `src/solvers/xpbd/coupling.wgsl` (`compute_fractions`, `porosity_drag_factor`), `src/solvers/xpbd/common.wgsl` (Params: add `coupling_h`), `src/solvers/xpbd/mod.rs` (compute `h_c`, `cell_size = max(h_c, grain_diameter)`, write Param), `src/models/mod.rs` (Materials: `coupling_radius` or derive from grain_diameter), `src/utils/config.rs` (if exposed), `tests/xpbd_coupling.rs`.
+
+**Approach:** Add a coupling radius `h_c ≈ 2–3× grain_diameter` used by `compute_fractions` (and the drag porosity) instead of `h`. Ensure the uniform grid `cell_size` covers `max(h_c, grain_diameter, h)`. Clamp `ε = 1−α_s ∈ [0.35, 0.999]` at the point of use. No behavior change for single-resolution scenes where `h_c` ≈ current `h` is unchanged (keep legacy scenes byte-stable if `h_c` defaults to today's value when not finer).
+
+**Patterns to follow:** existing `cell_size = max(h, grain_diameter)` logic in `mod.rs`; the `porosity_drag_factor` clamp.
+
+**Test scenarios:**
+- α_s field is smooth (monotonic, bounded `[0, packing_limit]`) across a seeded bed with water finer than grains — no per-particle spikes (sample variance below a bound vs. the `h_c = h` baseline).
+- ε clamp holds: a densely clustered region yields `ε ≥ 0.35` (drag coefficient stays finite).
+- Single-resolution legacy scene (`dam_through_sand`) α_s byte-unchanged when `h_c` resolves to the prior `h`.
+
+**Verification:** porosity field smooth + bounded with fine water; legacy scenes unaffected.
+
+---
+
+### U2. Remove the water↔grain exclusion; lean on the porosity field
+
+**Goal:** Delete the soft sphere-sphere water↔grain non-penetration; the `α_s` density modulation carries the volume coupling.
+
+**Requirements:** R1.
+
+**Dependencies:** U1.
+
+**Files:** `src/solvers/xpbd/coupling.wgsl` (delete `exclusion_push`, `exclude_water`, `exclude_grain`), `src/solvers/xpbd/mod.rs` (drop the two passes/pipelines/bind groups; ensure the water-loop `apply_dp` sets grain `dp = 0` since `compute_dp` skips grains and exclusion previously initialized it), `src/solvers/xpbd/common.wgsl` / `src/models/mod.rs` / `src/utils/config.rs` (drop `exclusion_relax`, `water_grain_distance` if fully unused), `tests/xpbd_coupling.rs`.
+
+**Approach:** Remove the passes and params. The key correctness check: after removal, no stale/garbage grain `dp` is applied in the water loop (grains must be a clean no-op there; sand-sand contact in the bed loop is the only grain position constraint). Water no longer geometrically bounces off grains — it threads pores via the `ρ₀·(1−α_s)` density target.
+
+**Patterns to follow:** how `compute_dp` already skips grains (`water.wgsl`); the binding/pipeline registration pattern in `mod.rs`.
+
+**Test scenarios:**
+- **Rewrite** `water_threads_the_bed_without_tunneling`: its `min_water_grain > 0.55·d_wg` standoff is inverted by design (water now *permeates between* grains). Replace with the asymmetry invariant: water penetrates the bed (min water-grain distance drops below the old standoff) **and** the bed retains structure (grain top not crushed, `vmax` bounded, no NaN).
+- Water does not free-fall straight through / pool below the bed: with a static grain bed and a water column, water comes to rest *within* the bed pore space (mean water-y stabilizes above the bed floor), driven by the density field alone.
+- Conservation: water volume conserved across the change; no eruption (`vmax` bounded).
+
+**Verification:** water permeates without tunneling-collapse or pass-through; bed structure intact; conservation holds.
+
+---
+
+### U3. Darcy drag with exponential integrator (the momentum coupling)
+
+**Goal:** Replace the weak velocity-blend with a physically-grounded, exponentially-integrated Darcy drag strong enough to set drainage and mobilize the bed surface, momentum-conserving and dissipative.
+
+**Requirements:** R2, R6 (keep buoyancy separate).
+
+**Dependencies:** U1, U2.
+
+**Files:** `src/solvers/xpbd/coupling.wgsl` (`compute_coupling_scale`, `drag_delta_for_pair`, `drag_water`, `drag_grain`), `src/models/permeability.rs` (Darcy `β`/`τ_s` from K-C `k`), `src/utils/config.rs` (a single calibratable drag scale replacing/cleaning `drag_gamma`; revisit `drag_beta_max`), `src/solvers/xpbd/mod.rs` (drag-resolution wiring), `tests/xpbd_coupling.rs`.
+
+**Approach:** In `compute_coupling_scale`, precompute the per-particle Darcy coefficient / stopping-time factor into the existing `coupling_scale` (`vec2`) so the gather pass stays ≤ 8 storage buffers (do **not** add a binding to the already-8/8 drag passes). In `drag_delta_for_pair`, form the exponential factor `α = 1 − e^(−Δt/τ_s)` (symmetric harmonic-mean pairing), apply the opposite-mass split over `(vel_frozen[j] − vel_frozen[i])`. Calibrate the one free scale (KTD-6) so drawdown is grind-ordered and the surface mobilizes. Keep `drag_subiters` Jacobi loop. Buoyancy untouched here.
+
+**Execution note:** Characterize first — capture current grain displacement + water↔grain relative velocity (headless) before changing the drag, so the "now it moves" claim is measured against a real baseline.
+
+**Patterns to follow:** the existing symmetric `drag_delta_for_pair` / `vel_frozen` / harmonic-k combiner; `kozeny_carman` + `drag_rate` in `permeability.rs`.
+
+**Test scenarios:**
+- Momentum conserved: drag pair impulse equal-and-opposite, `Σ m_eff·v` drift within the existing tolerance (`< 2e-4`-class).
+- Dissipative: relative water↔grain velocity is monotonically damped (never flips sign, never increases); kinetic energy non-increasing (`ke⁺ ≤ ke₀ + ε`).
+- Stability at strong coupling: at `Δt/τ_s ≫ 1` (the real regime) the exponential integrator does not overshoot/oscillate (grain velocity stays bounded, no eruption) — contrast an explicit blend which would.
+- **Mobilization (the headline):** under a pour, grains in the impingement zone acquire non-zero displacement over N frames (measured), vs. ≈0 on the pre-change baseline.
+- **Grind ordering preserved:** `coarse_grind_draws_down_faster_than_fine` still passes.
+
+**Verification:** grains demonstrably move under the pour; conservation + dissipation gates hold; grind→drawdown ordering preserved.
+
+---
+
+### U4. Reconcile grain sleep/wake with the strong drag
+
+**Goal:** The pour wakes and mobilizes surface grains while a dry or fully-saturated static bed still settles to rest (no spurious creep).
+
+**Requirements:** R5.
+
+**Dependencies:** U3.
+
+**Files:** `src/solvers/xpbd/common.wgsl` (`finalize` sleep/wake: `grain_sleep_speed`, `wake_threshold`, `rolling_damping`; `fluid_impulse` accumulation), `src/solvers/xpbd/coupling.wgsl` (`fluid_impulse` write in `drag_grain`), `src/utils/config.rs`, `tests/xpbd_bed.rs`, `tests/xpbd_coupling.rs`.
+
+**Approach:** The static-yield dead-band snaps sub-`grain_sleep_speed` grains to rest unless `fluid_impulse > wake_threshold`. With a stronger drag, `fluid_impulse` rises naturally — verify the impingement-zone grains clear `wake_threshold`; retune `wake_threshold`/`grain_sleep_speed` only as needed. Ensure `rolling_damping` (in-contact KE bleed) doesn't fully cancel drag-driven surface motion. Critically: a **dry** bed (water passes off → mixed gates off) must be untouched; a **saturated static** bed (flow stopped) must settle, not creep.
+
+**Patterns to follow:** the existing `fluid_impulse` reset (`predict`) → accumulate (`drag_grain`/`buoyancy_grain`) → consume (`finalize`) chain.
+
+**Test scenarios:**
+- Dry bed unchanged: `bed_settles_into_a_static_heap` (drift/creep bounds, ≥95% static, repose band) still passes.
+- Wet static bed: with pour stopped on a saturated bed, grains settle to rest (no perpetual creep from residual `fluid_impulse`).
+- Active pour: impingement-zone grains stay awake/mobile (do not get re-frozen by the dead-band frame-to-frame).
+
+**Verification:** dry + saturated-static beds settle; active-pour surface mobilizes.
+
+---
+
+### U5. Make water finer than grains (resolution + seeding + eruption guard)
+
+**Goal:** Water particles genuinely finer than grains for realism, at a modest absolute count, without fine-resolution eruption.
+
+**Requirements:** R4.
+
+**Dependencies:** U1, U2, U3, U4.
+
+**Files:** `src/engine/scene.rs` (`v60_pour` water vs grain spacing/seeding), `src/models/mod.rs` (water `particle_spacing` vs `grain_diameter` ratio), `examples/pour.rs` / `examples/pour_render.rs` (driver resolution), `src/utils/config.rs` (substeps/CFL if needed), `tests/xpbd_statics.rs`, `tests/xpbd_coupling.rs`.
+
+**Approach:** Set water spacing `< grain_diameter` (e.g. grain ≈ 2–3× water) at a modest absolute count (defer the 200k push). Confirm `cell_size`/grid (U1) covers the disparity. Watch the XSPH/kernel normalization eruption risk: run the spacing-invariance gate; keep `max_correction_ratio` honest; auto-scale substeps with spacing if CFL demands. Keep the rendered look coherent (renderer already scales grain radius separately).
+
+**Execution note:** Refine resolution incrementally and re-run the spacing-invariance gate at each step — the fine-resolution eruption only appears below a spacing threshold.
+
+**Patterns to follow:** species-aware `seed_block` spacing in `mod.rs`; the `rest_lattice_is_a_quiet_fixed_point_across_resolutions` gate.
+
+**Test scenarios:**
+- Spacing-invariance: rest residual does not grow more than the gate's bound under refinement; no eruption (`vmax` bounded) at the finer water spacing.
+- Percolation + mobilization survive at the finer resolution (U2/U3 invariants re-checked at the new ratio).
+- Visual coherence (non-gated): `SCENE=v60pour` / `pour_render` show fine water threading the coarser bed.
+
+**Verification:** finer water is stable (no eruption), still percolates + mobilizes, and reads as water-in-pores.
+
+---
+
+### U6. Verification suite + headless instrumentation
+
+**Goal:** Lock the new physics with causal-lever gates and instrument the pour so "the grounds move" and "the bed doesn't fluidize" are measured, not asserted by eye.
+
+**Requirements:** R7, R8.
+
+**Dependencies:** U2, U3, U4, U5.
+
+**Files:** `tests/xpbd_coupling.rs` (rewritten + new gates), `tests/xpbd_wetting.rs` (re-validate conservation under the new coupling), `examples/pour.rs` (headless metrics: grain displacement, water↔grain relative velocity, drawdown), optionally `src/solvers/xpbd/mod.rs` diagnostics.
+
+**Approach:** Add headless metrics for grain displacement (impingement zone vs. bulk) and water↔grain relative velocity. Gate the new behavior as inequalities (KTD-6 doctrine):
+
+**Test scenarios:**
+- **Pour agitates the surface:** grain displacement in the pour impingement zone exceeds a small threshold over N frames (the headline fix), and exceeds bulk-bed displacement (localized, as physics predicts).
+- **No full fluidization:** the bed does **not** suspend — most grains stay below a displacement bound and the bed top does not collapse; mean grain-y does not rise to a fluidized profile (per the ~3–4× `u_mf` physics, motion is surface-local).
+- **Grind ordering:** coarse drains faster than fine (kept).
+- **Conservation:** momentum drift bounded, drag KE non-increasing, water volume conserved (incl. a long-run saturated-tail check for any new transfer — guard the one-signed roundoff leak class).
+- **Buoyancy:** dense grains are not launched (the density-aware fix), re-validated post-drag.
+- **Full suite:** green except the 3 documented pre-existing reds.
+
+**Verification:** the inequality gates pass; instrumentation reports show localized surface motion + grind-ordered drainage + conservation.
+
+---
+
+## Scope Boundaries
+
+In scope: the mechanical water↔grain coupling re-grounding (porosity field + Darcy/exponential drag, exclusion removal, finer water, sleep/wake reconciliation, buoyancy separation) and its verification.
+
+### Deferred to Follow-Up Work
+- **Real-unit (SI) system.** A consistent mass/time unit scale so Darcy/Ergun/buoyancy are in physical units — cross-cutting (re-keys permeability, extraction, thermal per `KEEP.md §2`). This plan calibrates in reduced units by inequality.
+- **~200k-particle perf scaling.** Finer water raises the count; pushing to the final target (and the fused-pass / Morton-order levers in `PERF_NOTES.md`) is a separate perf phase. This phase proves the physics at a modest count.
+- **Ergun inertial term / Di Felice high-Re drag.** Negligible at pour-over Re; add only if a high-flow regime is later modeled.
+- **Virtual/added-mass interphase force** (`solver_xpbd.md §3.3`, never built) and the concentration-gradient dispersion force (superseded by the fines scalar model).
+- **Resolved pore-scale collision.** Explicitly rejected (porous locking) — recorded so it isn't re-litigated.
+
+### Non-Goals
+- Changing the PBF water core, the sand-sand contact/friction/repose model, or the wetting/extraction/fines scalar layers (they ride on top, re-validated but not redesigned).
+- Adding water↔grain sphere non-penetration in any form.
+
+---
+
+## Risks & Mitigations
+
+- **Strong drag destabilizes (overshoot/eruption).** Mitigation: the exponential integrator is unconditionally stable by construction (KTD-3); keep the Jacobi `vel_frozen` subiters and `max_correction_ratio`; gate `vmax` and KE-non-increase.
+- **Removing exclusion lets water pass straight through / pool.** Mitigation: the `α_s` density target carries volume exclusion (U2 test: water rests within the pore space); if insufficient, raise the porosity-density coupling before reintroducing any geometric term.
+- **Noisy porosity field with fine water.** Mitigation: the wide coupling kernel `h_c` (KTD-5) + ε clamp; U1 smoothness gate.
+- **Bed creeps / never sleeps under residual drag.** Mitigation: U4 saturated-static settling gate; retune `wake_threshold` rather than disabling the dead-band.
+- **Conservation regressions** (drag symmetry was shared with the removed exclusion). Mitigation: keep the symmetric pair / `vel_frozen` / eff-mass idiom; the existing momentum/KE/volume gates catch drift.
+- **8-buffer ceiling.** Mitigation: precompute the Darcy coefficient into the existing `coupling_scale` `vec2`; add no bindings to the already-8/8 drag passes; never bit-pack two physical quantities into one lane.
+- **Reduced-unit calibration looks arbitrary to review.** Mitigation: calibrate to the physics-derived expectation (≈3–4× `u_mf` → surface-local motion) and assert inequalities; document the physical anchor.
+
+---
+
+## Verification
+
+- `cargo test` — the rewritten + new `tests/xpbd_coupling.rs` gates pass (mobilization, no-fluidization, grind-ordering, conservation, dissipation, buoyancy); `tests/xpbd_bed.rs` (dry + saturated-static settling) and `tests/xpbd_statics.rs` (spacing-invariance) pass; suite green except the 3 documented pre-existing reds.
+- Native visual — `SCENE=v60pour cargo run --release --example water_app`: fine water threads the coarser bed; the pour visibly rearranges the surface at the impingement point; the bed drains and does not churn/suspend.
+- Web — `wasm-pack build --target web --out-dir www/pkg`, hard-refresh: same behavior in-browser (verify Tint compiles the new WGSL; no new console errors; ≤ 8 storage buffers per stage).
+- Process — given the scope, run multiple `/deliberate` (Codex, gpt-5.5 high) rounds on this plan before execution, folding each REVISE.
+
+---
+
+## Sources & Research
+
+External research was load-bearing (it set KTD-1/3/5 and R8's realism bar):
+
+- **Robinson et al. 2013** (arXiv:1301.0752) — SPH-DEM two-way *unresolved* coupling: porosity-field + Di Felice drag; fluid kernel must be coarser than ~2× particle diameter for a valid/smooth field. The architectural basis.
+- **Implicit Incompressible Porous SPH** (arXiv:2504.07739, 2025) — fluid/solid coexist in space; implicit (linear-in-v⁺) porous drag — the XPBD-compatible form.
+- **Macklin et al. 2014, "Unified Particle Physics"** — PBF + rigid coupling; buoyancy emerges from volume-exclusion/pressure, not a separate Archimedes term (informs KTD-7).
+- **Ergun 1952 / Di Felice 1994 / Gidaspow** — drag closures: viscous `150·μ(1−ε)²/(ε³d²)` + inertial `1.75·ρ(1−ε)/(ε³d)`; K-C permeability `k = ε³d²/(180(1−ε)²)`; inertial term negligible at pour-over Re.
+- **Coffee puck permeability** (Royal Society Open Science 2025, DOI 10.1098/rsos.252031) — measured `k ≈ 2.6–35 ×10⁻¹³ m²`, bed Re ≈ 2–12 (Darcian) — anchors the regime.
+- **Fluidization estimate** (this research) — V60 `u_s ≈ 3–4× u_mf` → mild surface rearrangement, not suspension — sets R8's "no full fluidization" bar.
+- Codebase grounding: `src/solvers/xpbd/{coupling,water,bed,common}.wgsl`, `src/solvers/xpbd/mod.rs` step order + 8/8 buffer budget, `src/models/{permeability,mod}.rs`, `tests/xpbd_{coupling,bed,wetting,statics}.rs`; learnings from `solver_xpbd.md`, `KEEP.md`, `AGENTS.md`, prior coupling/wetting/fines plans (reduced-unit doctrine, the β-cap trap, the sleep/wake dead-band, the XSPH eruption lesson, conservation gating).

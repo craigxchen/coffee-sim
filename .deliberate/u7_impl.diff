@@ -1,0 +1,410 @@
+diff --git a/examples/brew.rs b/examples/brew.rs
+new file mode 100644
+index 0000000..454b5df
+--- /dev/null
++++ b/examples/brew.rs
+@@ -0,0 +1,114 @@
++//! V60 brew (headless): the full pour-over with extraction + thermal on. Drives `Scene::v60()`
++//! with the calibrated permeable-bed materials, prints yield / TDS / mean temperature over the
++//! brew, and tracks the solute inventory `Σ(grain s_f+s_s) + Σ(active water c·f_w·V_w)` so the
++//! conservation behavior (and the wetting↔concentration coupling) is visible.
++//!
++//! Run: `cargo run --release --example brew`
++//! Tunables via env: `EXTRACT=<rate>` `ABSORB=<rate>` `STEPS=<n>`.
++
++use coffee_sim::engine::Scene;
++use coffee_sim::models::Materials;
++use coffee_sim::solvers::base::Solver;
++use coffee_sim::solvers::xpbd::XpbdSolver;
++use coffee_sim::utils::config::Config;
++use coffee_sim::utils::gpu::GpuContext;
++use coffee_sim::EmissionInput;
++
++fn env_f32(key: &str, default: f32) -> f32 {
++    std::env::var(key)
++        .ok()
++        .and_then(|v| v.parse().ok())
++        .unwrap_or(default)
++}
++
++/// Solute inventory = grain pools + active-water dissolved solute (the conserved quantity).
++fn inventory(chem: &[[f32; 4]], moisture: &[f32], phase: &[u32], v_w: f32, roundoff: f32) -> f32 {
++    chem.iter()
++        .zip(moisture)
++        .zip(phase)
++        .map(|((c, &m), &ph)| {
++            if ph == 1 {
++                c[0] + c[1]
++            } else if m > roundoff {
++                c[0] * m * v_w
++            } else {
++                0.0
++            }
++        })
++        .sum()
++}
++
++fn main() {
++    let Some(gpu) = GpuContext::new_headless() else {
++        eprintln!("brew: no GPU adapter; cannot run.");
++        return;
++    };
++    // Calibrated permeable V60 bed (SDF phase) + extraction/thermal on.
++    let mats = Materials {
++        particle_spacing: 0.5,
++        support_radius: 1.0,
++        grain_diameter: 1.0,
++        water_grain_distance: 0.35,
++        grain_mass: 10.0,
++        ..Materials::default()
++    };
++    let cfg = Config {
++        absorb_rate: env_f32("ABSORB", 0.5),
++        extract_rate: env_f32("EXTRACT", 1.0),
++        ..Config::default()
++    };
++    let steps: u32 = std::env::var("STEPS")
++        .ok()
++        .and_then(|v| v.parse().ok())
++        .unwrap_or(900);
++
++    let scene = Scene::v60();
++    let mut solver = XpbdSolver::build(&scene, &mats, &cfg, &gpu);
++    let phase = solver.read_phases();
++    let v_w = solver.water_particle_volume();
++    let n_water = phase.iter().filter(|&&p| p == 0).count();
++    let n_grain = phase.iter().filter(|&&p| p == 1).count();
++    let inv0 = inventory(
++        &solver.read_chem(),
++        &solver.read_moisture(),
++        &phase,
++        v_w,
++        cfg.absorb_roundoff,
++    );
++
++    println!(
++        "V60 brew: {n_water} water + {n_grain} grain | absorb={} extract={} | solute0={inv0:.4}",
++        cfg.absorb_rate, cfg.extract_rate
++    );
++    println!(
++        "  (yield = dissolved / total dry mass; absolute-band calibration deferred — see U7 notes)"
++    );
++    // `drift%` is the wetting absorption sink (solute carried into the grounds), not a numerical leak.
++    println!("  step    t(s)   yield%    TDS%   meanT   inventory   drift%");
++    let input = EmissionInput::default();
++    let sample_every = (steps / 15).max(1);
++    for step in 1..=steps {
++        solver.step(1.0 / 60.0, &input);
++        if step % sample_every == 0 || step == steps {
++            solver.sample_diagnostics();
++            let m = solver.metrics();
++            let temp = solver.read_temperature();
++            let mean_t: f32 = temp.iter().sum::<f32>() / temp.len() as f32;
++            let inv = inventory(
++                &solver.read_chem(),
++                &solver.read_moisture(),
++                &phase,
++                v_w,
++                cfg.absorb_roundoff,
++            );
++            let drift = 100.0 * (inv - inv0) / inv0.max(1.0e-9);
++            println!(
++                "  {step:>5}  {:>5.2}  {:>6.2}  {:>6.3}  {:>6.3}  {inv:>9.4}  {drift:>6.2}",
++                step as f32 / 60.0,
++                100.0 * m.extraction_yield,
++                100.0 * m.tds,
++                mean_t,
++            );
++        }
++    }
++}
+diff --git a/src/solvers/xpbd/mod.rs b/src/solvers/xpbd/mod.rs
+index 6c904ed..5141546 100644
+--- a/src/solvers/xpbd/mod.rs
++++ b/src/solvers/xpbd/mod.rs
+@@ -312,12 +312,33 @@ pub struct XpbdSolver {
+     cached_diag: XpbdDiagnostics,
+     cached_passes: Vec<(String, f32)>,
+ 
++    // --- extraction yield/TDS readout (Phase 1.5 U7) ---
++    /// Total dry-coffee dose `grain_mass · n_grain` — the yield denominator (real-coffee convention:
++    /// yield = dissolved solute / total dry mass, so yield ≤ `soluble_fraction`). Set at build.
++    total_dose: f32,
++    /// Catch-cup region (from the scene's cylinder solid) for the TDS readout; `None` ⇒ TDS = 0.
++    cup: Option<CupRegion>,
++    /// Cached yield/TDS, refreshed by `sample_diagnostics` (the stalling cache point) and returned
++    /// by `metrics()` without a GPU sync.
++    cached_yield: f32,
++    cached_tds: f32,
++
+     // retained for reset (exact re-seed of the initial block + phase tags + chem state)
+     initial_positions: Vec<[f32; 4]>,
+     initial_phases: Vec<u32>,
+     initial_chem: Vec<[f32; 4]>,
+ }
+ 
++/// Catch-cup geometry (a cylinder cavity) used to scope the TDS readout to pooled cup water.
++#[derive(Clone, Copy)]
++struct CupRegion {
++    cx: f32,
++    cz: f32,
++    radius: f32,
++    y_min: f32,
++    y_max: f32,
++}
++
+ /// Seed the scene's initial particles on a jittered lattice, one block per region. Returns
+ /// positions and the matching per-particle phase tags (0=water, 1=grain).
+ fn seed_block(scene: &Scene, mats: &Materials, cfg: &Config) -> (Vec<[f32; 4]>, Vec<u32>) {
+@@ -626,11 +647,77 @@ impl XpbdSolver {
+                 self.cached_passes = passes;
+             }
+         }
++
++        self.sample_extraction();
++    }
++
++    /// Refresh the cached yield/TDS from the current chem + positions (a blocking readback, folded
++    /// into `sample_diagnostics`). Yield = dissolved solute / total soluble dose; TDS = cup solute /
++    /// cup water mass, over the catch-cup region. All water volumes scale by the remaining fraction
++    /// `f_w` (deactivated water `f_w ≤ roundoff` is excluded). Phase is the immutable seed tag.
++    fn sample_extraction(&mut self) {
++        if self.total_dose <= 1.0e-9 {
++            return; // no coffee dose (e.g. water-only scene) ⇒ yield/TDS stay 0
++        }
++        let chem = self.read_vec4(self.chem.as_ref());
++        let pos = self.read_vec4(self.pos.as_ref());
++        let v_w = self.params.particle_mass / self.params.rest_density;
++        let rho_w = self.params.rest_density;
++        let mut dissolved = 0.0f32;
++        let mut cup_solute = 0.0f32;
++        let mut cup_water_mass = 0.0f32;
++        for (i, (c, p)) in chem.iter().zip(&pos).enumerate() {
++            if self.initial_phases[i] != 0 {
++                continue; // water only
++            }
++            let f_w = p[3];
++            if f_w <= self.params.absorb_roundoff {
++                continue; // deactivated water carries no solute
++            }
++            let solute = c[0] * f_w * v_w; // c·(f_w·V_w)
++            dissolved += solute;
++            if let Some(cup) = self.cup {
++                let dx = p[0] - cup.cx;
++                let dz = p[2] - cup.cz;
++                if dx * dx + dz * dz < cup.radius * cup.radius
++                    && p[1] >= cup.y_min
++                    && p[1] <= cup.y_max
++                {
++                    cup_solute += solute;
++                    cup_water_mass += f_w * v_w * rho_w; // = f_w · particle_mass
++                }
++            }
++        }
++        self.cached_yield = dissolved / self.total_dose;
++        self.cached_tds = if cup_water_mass > 1.0e-9 {
++            cup_solute / cup_water_mass
++        } else {
++            0.0
++        };
+     }
+ 
+     pub fn diagnostics(&self) -> XpbdDiagnostics {
+         self.cached_diag
+     }
++
++    /// Read back per-particle water concentration `c` (chem `.x`; for a grain `.x` is its fast pool).
++    /// Dev/test/inspection only — stalls the GPU.
++    pub fn read_concentration(&self) -> Vec<f32> {
++        self.read_vec4(self.chem.as_ref())
++            .iter()
++            .map(|c| c[0])
++            .collect()
++    }
++
++    /// Read back per-particle temperature (phase-aware: water `T` is chem `.y`, grain `T` is `.z`).
++    /// Dev/test/inspection only — stalls the GPU.
++    pub fn read_temperature(&self) -> Vec<f32> {
++        self.read_vec4(self.chem.as_ref())
++            .iter()
++            .zip(&self.initial_phases)
++            .map(|(c, &ph)| if ph == 0 { c[1] } else { c[2] })
++            .collect()
++    }
+ }
+ 
+ impl Solver for XpbdSolver {
+@@ -864,6 +951,26 @@ impl Solver for XpbdSolver {
+         // race). Bound only by the chem passes (U5/U6); other kernels never touch it. Seeded per
+         // species: grains carry the soluble dose split into the two pools, water starts at c=0, pour T.
+         let initial_chem = seed_chem(&phases, mats);
++        // Yield denominator: the total dry-coffee dose = grain_mass · n_grain (real-coffee
++        // convention; yield ≤ soluble_fraction). Cup region for TDS: the scene's catch cylinder
++        // (if any), scoping TDS to pooled cup water.
++        let n_grain = phases.iter().filter(|&&ph| ph == 1).count() as f32;
++        let total_dose = mats.grain_mass * n_grain;
++        let cup = scene.solids.iter().find_map(|p| match p.kind {
++            crate::utils::sdf::SolidKind::Cylinder {
++                center,
++                floor_y,
++                rim_y,
++                radius,
++            } => Some(CupRegion {
++                cx: center.x,
++                cz: center.z,
++                radius,
++                y_min: floor_y,
++                y_max: rim_y,
++            }),
++            _ => None,
++        });
+         let chem = Arc::new(
+             device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                 label: Some("xpbd-chem"),
+@@ -1372,6 +1479,10 @@ impl Solver for XpbdSolver {
+             dispatches: 0,
+             cached_diag: XpbdDiagnostics::default(),
+             cached_passes: Vec::new(),
++            total_dose,
++            cup,
++            cached_yield: 0.0,
++            cached_tds: 0.0,
+             initial_positions: positions,
+             initial_phases: phases,
+             initial_chem,
+@@ -1733,6 +1844,8 @@ impl Solver for XpbdSolver {
+         Metrics {
+             particle_count: self.particle_count,
+             iteration_count: self.cached_diag.effective_iters,
++            extraction_yield: self.cached_yield,
++            tds: self.cached_tds,
+             ..Default::default()
+         }
+     }
+diff --git a/tests/xpbd_extraction.rs b/tests/xpbd_extraction.rs
+index baeca9a..bd57d2a 100644
+--- a/tests/xpbd_extraction.rs
++++ b/tests/xpbd_extraction.rs
+@@ -690,3 +690,122 @@ fn cooler_pour_lowers_extraction() {
+         "cooler pour did not lower extraction: hot {hot}, cool {cool}"
+     );
+ }
++
++/// U7: a real V60 brew populates `metrics().extraction_yield`/`tds` (were always 0) with finite,
++/// physical values, and the `c_sat` cap holds in the full mixed solve. (Band calibration is tracked
++/// separately — this only asserts the readout is wired and sane.)
++#[test]
++fn brew_populates_finite_yield_and_tds() {
++    let Some(gpu) = GpuContext::new_headless() else {
++        eprintln!("xpbd_extraction: no GPU adapter; skipping.");
++        return;
++    };
++    // Calibrated permeable V60 bed (SDF phase) + wetting + extraction on.
++    let mats = Materials {
++        particle_spacing: 0.5,
++        support_radius: 1.0,
++        grain_diameter: 1.0,
++        water_grain_distance: 0.35,
++        grain_mass: 10.0,
++        ..Materials::default()
++    };
++    let cfg = Config {
++        absorb_rate: 0.5,
++        extract_rate: 1.0,
++        ..Config::default()
++    };
++    let scene = Scene::v60();
++    let mut solver = XpbdSolver::build(&scene, &mats, &cfg, &gpu);
++    let phase = solver.read_phases();
++    for _ in 0..150 {
++        solver.step(DT, &EmissionInput::default());
++    }
++    solver.sample_diagnostics();
++    let m = solver.metrics();
++
++    assert!(
++        m.extraction_yield.is_finite() && m.extraction_yield > 0.0,
++        "yield not populated: {}",
++        m.extraction_yield
++    );
++    assert!(
++        m.tds.is_finite() && m.tds >= 0.0,
++        "tds not finite: {}",
++        m.tds
++    );
++    // The c_sat cap holds in the full mixed solve (every water concentration ≤ c_sat).
++    let conc = solver.read_concentration();
++    for (c, &ph) in conc.iter().zip(&phase) {
++        if ph == 0 {
++            assert!(
++                *c <= mats.c_sat + 1.0e-4,
++                "water exceeded c_sat in brew: {c} > {}",
++                mats.c_sat
++            );
++        }
++    }
++    // Readout hooks return finite, correctly-sized vectors.
++    let temp = solver.read_temperature();
++    assert_eq!(temp.len(), phase.len());
++    assert!(temp.iter().all(|t| t.is_finite()));
++}
++
++/// Combined path (wetting + extraction co-active): the solute inventory drifts DOWN by a small,
++/// bounded amount — the *physical absorption sink* (water absorbed into grains carries its dissolved
++/// solute into the grounds, which have no dissolved-solute lane; real spent grounds retain TDS).
++/// This is NOT a numerical leak: the dissolution pass conserves exactly in isolation
++/// (`dissolution_conserves_solute_inventory`); the drift appears only because `f_w` changes under
++/// wetting. The decision (reviewed) is to model it as a sink and bound it, not rescale it away.
++#[test]
++fn combined_wetting_extraction_drift_is_a_bounded_sink() {
++    let Some(gpu) = GpuContext::new_headless() else {
++        eprintln!("xpbd_extraction: no GPU adapter; skipping.");
++        return;
++    };
++    let mats = Materials::default();
++    // Both wetting AND extraction on, mechanical solve off, gravity off; water flow for flux.
++    let cfg = Config {
++        max_iters: 0,
++        bed_max_iters: 0,
++        drag_subiters: 0,
++        buoyancy_scale: 0.0,
++        xsph_viscosity_c: 0.0,
++        grain_sleep_speed: 0.0,
++        absorb_rate: 0.5, // wetting ON → f_w changes (the sink mechanism)
++        extract_rate: 1.0,
++        ..Config::default()
++    };
++    let mut solver = XpbdSolver::build(&wet_blob_scene(), &mats, &cfg, &gpu);
++    let phase = solver.read_phases();
++    let v_w = solver.water_particle_volume();
++    seed_water_flow(&solver, &phase, 0.3);
++
++    let initial = solute_inventory(&solver.read_chem(), &solver.read_moisture(), &phase, v_w);
++    for _ in 0..60 {
++        solver.step(DT, &EmissionInput::default());
++    }
++    let chem = solver.read_chem();
++    let moisture = solver.read_moisture();
++    let inv = solute_inventory(&chem, &moisture, &phase, v_w);
++    let drift = (inv - initial) / initial.max(1.0e-9);
++
++    // Down-only (a sink never creates solute) and small/bounded.
++    assert!(
++        drift <= 1.0e-5 && drift > -0.05,
++        "drift not a small sink: {drift} ({initial} -> {inv})"
++    );
++    // Non-vacuous: both wetting (a grain wetted) and extraction (some water gained c) happened.
++    assert!(
++        moisture
++            .iter()
++            .zip(&phase)
++            .any(|(&m, &p)| p == 1 && m > 1.0e-5),
++        "no wetting occurred"
++    );
++    assert!(
++        chem.iter()
++            .zip(&phase)
++            .any(|(c, &p)| p == 0 && c[0] > 1.0e-6),
++        "no extraction occurred"
++    );
++}

@@ -1,0 +1,17 @@
+You are an expert reviewer (GPU physics + numerical methods / MPM + Rust/wgpu) reviewing ROUND 2 of a REQUIREMENTS (brainstorm) document for a two-field grid MPM water solver in a coffee pour-over simulator (Rust + wgpu + WGSL; APIC P2G/G2P, two velocity fields water+solid coupled by Laibe-Price drag, collocated grid, fixed-point i32 accumulation with NO float atomics, under-converged local-Jacobi pressure). This is a separate solver from the repo's XPBD/PBF particle solver.
+
+Respond with a VERDICT on the FIRST LINE: **APPROVE**, **REVISE**, or **REJECT**. Then give specific reasoning. READ-ONLY repo access — actually read the files. This is a requirements/brainstorm doc (the WHAT), not an implementation plan (the HOW): judge problem framing, physical diagnosis, requirement quality/falsifiability, and scope — NOT code-level design, which is deferred to planning.
+
+Read the revised doc: `docs/brainstorms/2026-06-18-twofield-water-splash-dynamics-requirements.md`.
+
+YOUR ROUND-1 verdict was REVISE, with these items. Verify each is now ADEQUATELY addressed (do not re-raise a resolved item; do flag any that are only superficially patched):
+1. R8 overstated — "does not source energy from density relief" was dishonest because production relief already sources some settled liveliness via `pressure.wgsl:482` / `surface.wgsl:175`. Wanted: non-dependence + isolation across relief/default/`dbg.w` modes.
+2. R7 buffer ceiling — must distinguish the hard WebGPU 16-buffer cap from the internal 7-buffer budget, and either allow a budgeted FLIP-history strategy (decode from `grid_fp` or a new `grid_vel_prev`) or constrain the core to pure-APIC gating.
+3. Undercounted clamps — `drag_fold` (`coupling.wgsl:292`) is a THIRD `max_speed` clamp site beyond P2G (`transfers.wgsl:93`) and G2P (`transfers.wgsl:203`).
+4. Clamp relaxation is fixed-point-dangerous — FP headroom is coupled to the cap (`common.wgsl:117`, overflow ≈ 8192/max_speed); wanted cap-hit / FP-saturation gates (probe at `tests/twofield_water.rs:335`), not just "keep a backstop".
+5. Jet sharpening misframed as cheap — the web jet is at `nozzle_radius=0.55`, `max_speed=12` DELIBERATELY (`web.rs:383`/`:412`/`:420`) because a sub-2-cell jet whips/scatters/plunges and triggers air-pocket collapse; wanted a grid-resolvable minimum jet diameter + fixed-flow-vs-fixed-exit-speed clarification.
+6. R10 / R11 gameable — wanted mass-weighted localized post-impact momentum / rebound with low cap-hit rate + conservation/no-popcorn for R10; quantitative tail-KE / max-speed / non-growth / circulation bounds for R11.
+
+Also re-judge the four original focus areas on the REVISED text: (1) is the diagnosis (transfer dissipation vs the grid-resolution floor) correct and is the new go/no-go escalation a sufficient hedge; (2) the two-source/trilemma risk and whether the softened R8 is now honest AND still useful as a gate; (3) constraint feasibility of the state-aware bet under fixed-point / buffer / Tint / 33ms; (4) requirement falsifiability after the R10/R11/R12 tightening.
+
+Flag any NEW issue introduced by the revision, any remaining over-claim, any physics error, and whether the scope cut is sound. Be concrete — name files, functions, params, requirement IDs. End with a bulleted list of specific REVISE items if the verdict is REVISE.

@@ -1,0 +1,1610 @@
+OpenAI Codex v0.137.0
+--------
+workdir: /Users/cxc/Github/coffee-sim
+model: gpt-5.5
+provider: openai
+approval: never
+sandbox: read-only
+reasoning effort: xhigh
+reasoning summaries: none
+session id: 019ee661-19be-7713-a5e9-6b909c9fdd1f
+--------
+user
+You are an expert reviewer (GPU physics + numerical methods / MPM + Rust/wgpu) re-reviewing an IMPLEMENTATION PLAN after a REVISE round. The plan implements the gating PROTOTYPE from an approved requirements doc: a minimal single-phase PB-MPM water solver to measure bounce + ≤33ms@200k before any coffee/water coupling (the "KD8 gate"). Constraints: fixed-point i32 grid (no float atomics), Tint uniformity, ≤9 storage buffers/stage granted, real-time.
+
+Respond with a VERDICT on the FIRST LINE: **APPROVE**, **REVISE**, or **REJECT**. You have READ-ONLY repo access — actually read the revised plan. Judge implementability, sequencing, decision soundness, and whether the go/no-go is now well-grounded. Do not re-litigate the architecture (settled in the requirements doc).
+
+Read the REVISED plan: `docs/plans/2026-06-20-001-feat-pbmpm-prototype-plan.md`.
+
+Your PRIOR round returned REVISE with these items. Verify each was addressed HONESTLY (not just reworded), and flag any over/under-correction:
+1. Make U6's (now U7's) assembled-cost projection a HARD gate: method fixed before measurement; includes second field, drag, lambda ping-pong, bed/plasticity/wetting (or conservative upper bounds), substep multiplier, the contingent coarse pass if triggered, and a buffer ledger vs 9 and 16; projected-assembled ≤33ms is a GO precondition (single-phase pass alone cannot declare GO).
+2. Reword Candidate D as the existing two-field DensU density-target proxy (`dbg.w`, not "compliant density projection" — compliance was tried/dropped); pin `set_density_target_mode_for_test(true)` + `set_density_rate_k_for_test(k)`.
+3. Pin the bounce-comparison physical config (emitter/spacing/cap/geometry/impact window) OUTSIDE the per-solver `src/web.rs::setup_for` defaults (twofield gets a wider nozzle + lower cap), so the PB-MPM/D/xpbd/twofield comparison is apples-to-apples.
+4. Define the PB-MPM `deformation_displacement` D / correction state precisely (storage, lifetime, units, init, update) and reconcile it with the R7 overflow gate — the grid carries only `[mass, mom.xyz]` fixed-point; D is per-particle float.
+5. Choose 3×3×3 vs 4×4×4 transfers explicitly (twofield is 3×3×3 / 27-node quadratic) and correct the perf/atomic-contention assumptions.
+6. Add an emission/water-pool unit before the constraint's visual validation (the jet scene declares a pour; nothing owned emission).
+7. Treat the XPBD cell-order reorder reuse as a ported subsystem with measured cost, not a free P2G fix.
+8. Harden the decision unit: pre-register the rebound/spread threshold, D-delta threshold, cap-hit/no-popcorn/conservation bounds, exact scenes/configs, and make both bounce-vs-D and projected-assembled-cost actual pass/fail inputs.
+
+Verify the key code-grounded claims against the repo: twofield transfer stencil is 3×3×3 (`src/solvers/twofield/transfers.wgsl:118`); the candidate-D setters exist (`src/solvers/twofield/mod.rs:904,913`) and `dbg.w` is the density target not a compliant projection (`src/solvers/twofield/pressure.wgsl`); the emission/water-pool path (`src/solvers/twofield/mod.rs` emit + dormant slots); the 9-buffer grant (`src/utils/gpu.rs:114`); `src/web.rs::setup_for` per-solver nozzle/cap (`:465,:482`).
+
+NOTE the deliberate visual-first posture (KTD3 + Execution notes): Phase A (U1–U5) keeps tests light and defers pinned, falsifiable invariants (perf gate, non-gameable bounce metric + thresholds, assembled-cost gate) to Phase B (U6–U7). Judge whether U6/U7 now provide an adequate falsifiable backstop so the go/no-go is trustworthy — do NOT reflexively demand test-first on exploratory units.
+
+Then judge fresh: faithful PB-MPM port + implementability; does the gate actually retire the assembled-system risk; sequencing/dependencies (U1→{U2,U3}→U4→U5→U6→U7, U8 contingent); constraint/budget feasibility; falsifiability of the decision. If APPROVE, say what makes it ready for /ce-work. If still REVISE, give a SHORT bulleted list of only genuinely-remaining items (no new scope, no re-litigating settled deferrals). Be concrete — name files, U/R/KTD IDs.
+
+codex
+I’ll read the revised plan and spot-check the specific repo claims before judging the gate. I’ll keep this as a review, with the verdict first in the final response.
+exec
+/bin/zsh -lc "sed -n '1,260p' docs/plans/2026-06-20-001-feat-pbmpm-prototype-plan.md" in /Users/cxc/Github/coffee-sim
+ succeeded in 0ms:
+---
+title: "feat: PB-MPM gating prototype — single-phase water bounce + perf go/no-go"
+type: feat
+status: active
+date: 2026-06-20
+origin: docs/brainstorms/2026-06-19-pbmpm-rearchitecture-requirements.md
+---
+
+# PB-MPM gating prototype — single-phase water bounce + perf go/no-go
+
+## Summary
+
+Build a minimal single-phase **PB-MPM** (Position-Based MPM) water solver as a new registered solver, port EA SEED's compliant position-based density constraint, and **measure** whether it (a) visibly bounces/scatters on impact and (b) clears ≤33 ms @ ~200k on the fixed-point i32 grid — *before* any coffee/water coupling is built. The prototype ends in a documented **go/no-go**: a measured bounce delta vs candidate D and a projected *assembled* (two-velocity) frame cost decide whether the full re-architecture proceeds or falls back to candidate D/B.
+
+This is the origin doc's **KD8 gate**. It is an unsettled bet validated by the visual oracle, so the execution posture is **visual-first**: confirm the bounce in the live webapp, then pin invariants.
+
+---
+
+## Problem Frame
+
+The two-field grid solver is the fastest in-repo (25.4 ms @ 207k) and owns the coffee/water coupling, but its water reads mushy and "just pools where it is" — no bounce/scatter. The converged diagnosis (origin Problem Frame): a bounce is a **stiff-incompressibility** response, and two-field's under-converged `∇·v` Jacobi projection is soft *because* it under-converges. PB-MPM replaces that projection with a **compliant position-based density constraint** that gives stable stiff push-back at a few iterations with **no global Poisson** — the bounce-and-speed reconciliation, with XPBD as the in-repo existence proof.
+
+But the assembled two-velocity porous PB-MPM has no shipped reference, `λ`-as-pore-pressure is unproven, and the assembled perf is unknown. Per KD8, the whole effort is **gated on a prototype** that retires the two retirable-by-measurement risks (bounce + frame rate) first. This plan builds and measures that prototype only; the coupling rebuild is deferred to a contingent follow-up plan.
+
+---
+
+## Requirements
+
+### Bounce and realism
+- R1. The single-phase PB-MPM water core visibly **bounces/scatters on impact** in the live webapp (the `high-velocity-jet-impact` and `dam-break-slosh` Debug Scenes), comparable to xpbd/main and clearly livelier than twofield. Primary oracle: the visual comparison render. (origin R1)
+- R3. The bounce is quantified by a **non-gameable** localized, mass-weighted post-impact rebound/spread metric, guarded by a low cap-hit rate (rebound is not a clamp artifact), a no-popcorn check (no single-particle ejecta spikes), and conservation (no injected mass/energy). (origin R1, R4)
+
+### Real-time and budget
+- R2. A **pre-registered perf gate** confirms ≤33 ms @ ~200k for single-phase water on the fixed-point i32 grid: no float atomics, Tint-uniform, each entry point within the 9-storage-buffer grant. (origin R2)
+- R7. **Two overflow/range surfaces are gated, distinguished by type:** (a) the fixed-point i32 **grid accumulation lanes** (mass + momentum, coupled to the velocity cap — the existing two-field headroom math applies; any *new* scattered fixed-point lane PB-MPM adds must extend it); (b) the **per-particle `deformation_displacement` D and position-correction state**, which are *float* (not fixed-point) — gated for range/NaN/blow-up on fast pours, not i32 overflow. The plan must not conflate the two. (origin KD10)
+
+### Decision integrity
+- R4. A **two-velocity cost projection** + a buffer/pass-family ledger projects the *assembled* solver's frame time and buffer budget, so the go/no-go reflects the full system (second velocity field, drag, λ ping-pong, bed/wetting buffers), not single-phase water alone. (origin KD8, KD10)
+- R5. **Candidate D** is measured on the *same pinned* bounce scene/config, so choosing full PB-MPM over D rests on a measured bounce delta, not assumption. The in-repo D proxy is the two-field **DensU density-target** path (`dbg.w` uncapped/two-sided target) — note this is the over-pack relief lever, *not* a true compliant projection (the compliance-diagonal variant was reviewed harmful and dropped, `pressure.wgsl`); the plan measures this proxy and labels it as such. (origin Candidate D)
+- R6. The prototype produces a **documented go/no-go**. On fail, the recorded next step is the fallback ladder: D → B → two-field coupling-only. (origin KD8)
+
+---
+
+## Key Technical Decisions
+
+- KTD1. **Port EA SEED's PB-MPM pipeline shape.** Per substep, repeat `iteration_count`×: `particle_update` (per-particle compliant constraint, writes `deformation_displacement`) → `grid_zero` → `p2g` → `grid_update` (decode + BC) → `g2p` (APIC); then `particle_integrate` once. The grid is rebuilt every iteration — it is a transient transfer medium, no standing pressure field. Liquid constraint: `alpha = 0.5*(1/liquid_density − tr(D) − 1)`, corrected by a compliant `liquid_relaxation·alpha·I` volume term + a `liquid_viscosity·deviatoric(D)` shear term. Rationale: this is the shipped real-time reference; bounce comes from the compliant volume correction, stability from relaxation-damped iterative rebuild — no global solve. (origin KD1)
+- KTD2. **Mirror `src/solvers/twofield/` as the structural template.** Reuse its `Params` Rust↔WGSL mirror + size assert, `FP_SCALE = 2^18` fixed-point `atomic<i32>` grid encoding, WGSL-concatenation module assembly, the `bg()` per-pass bind-group helper, the test/perf harness shapes, and the registry seam. Rationale: proven on-stack conventions; minimizes net-new infrastructure. (origin: migration shape)
+- KTD3. **Visual-first execution posture.** Confirm the bounce in the webapp (Phase A) before pinning invariants; concentrate the pinned perf/bounce/conservation gates in Phase B once the mechanism is settled by measurement. Rationale: the prototype is an unsettled bet — pinning a heavy suite against an approach that may be abandoned for D/B is premature.
+- KTD4. **Pure-local-Jacobi first; coarse-grid pre-pass is contingent.** Build and measure the minimal local-Jacobi PB-MPM core first. The KD2 coarse-grid pressure pre-pass (real global low-frequency work) is added only if measurement shows 3D **bulk compressibility** (the known PBF/PB-MPM low-frequency convergence gap, ~1–5% drift at few iterations) spoils the look. Reference: MGPBD (SIGGRAPH 2025) / a coarse-to-fine V-cycle. Rationale: minimal core first; pay the global-work cost only if the visual needs it. (origin KD2)
+- KTD5. **Plan to the 9-buffer grant.** Keep each entry point within the device's 9 requested storage buffers (`src/utils/gpu.rs`), using the pass-family bind-group split (`docs/issues/003-split-mpm-bind-groups.md`) before any `GpuContext` limit change. If >9 is unavoidable, raise `NEEDED_STORAGE_BUFFERS` and gate on live browser `request_device` verification (the over-report trap is present-code, not a stale note). Rationale: web portability. (origin KD10)
+- KTD6. **Cell-bin particles before P2G — as a ported subsystem with measured cost, not a free fix.** The 3D 3×3×3 (27-node) scatter's atomic contention on clustered cells is the known P2G bottleneck at 200k (`docs/issues/004-reduce-p2g-atomic-contention.md`). The XPBD cell-order reorder (`src/utils/hash.rs`) is *neighbor-gather* machinery, not a drop-in P2G-scatter fix — porting/adapting it for scatter coherence is real work whose cost counts in the U6 budget. Rationale: name it as ported, don't assume the contention is already solved. (origin: perf)
+- KTD7. **Measure candidate D via the existing two-field DensU density-target proxy.** Use `set_density_target_mode_for_test(true)` + `set_density_rate_k_for_test(k)` (`dbg.w` uncapped two-sided density target) on two-field to capture D's bounce metric on the *same pinned scene*, rather than building D fresh. Label it the DensU proxy, not the full compliant Candidate D (compliance was tried and dropped). Rationale: a measured comparison without a rebuild, honestly scoped. (origin Candidate D)
+- KTD8. **The per-particle PB-MPM state is decided up front (KD10).** `deformation_displacement` `D` (a `mat3x3` velocity-gradient×dt accumulation), `deformation_gradient` `F`, `liquid_density`, and the constraint scalars live in the *particle* storage buffer as floats — not on the grid. The grid carries only `[mass, mom.xyz]` as fixed-point `atomic<i32>`. `D` is zeroed at the start of each substep's iteration loop and accumulated across iterations; `F` carries across substeps. Rationale: resolves the grid-vs-particle state ambiguity and tells R7 which surface is fixed-point (grid) vs float (particle). (origin KD10)
+
+---
+
+## High-Level Technical Design
+
+### Per-frame solver pipeline (Phase A core)
+
+```mermaid
+flowchart TB
+  emit[emit pour particles] --> sub{for each substep}
+  sub --> iter{repeat iteration_count}
+  iter --> pu[particle_update<br/>compliant density constraint<br/>writes deformation_displacement D]
+  pu --> gz[grid_zero<br/>clear atomic i32 lanes]
+  gz --> p2g[p2g scatter<br/>fixed-point atomicAdd<br/>mass + momentum]
+  p2g --> gu[grid_update<br/>decode, gravity, collider BC + restitution]
+  gu --> g2p[g2p gather<br/>velocity + APIC B]
+  g2p --> iter
+  iter -->|iterations done| integ[particle_integrate<br/>advect positions]
+  integ --> sub
+  sub -->|substeps done| done[frame complete]
+```
+
+The grid carries only `[mass, mom.x, mom.y, mom.z]` as `atomic<i32>` (stride-4 per node, mirroring two-field's `common.wgsl`). Incompressibility lives entirely in `particle_update` as a per-particle compliant correction to `deformation_displacement` — there is no pressure buffer and no Poisson pass. This is the structural departure from two-field (which has a `node_setup → cell_classify → smooth → residual → coarse → prolong → project` pressure stack).
+
+### The go/no-go gate (Phase B)
+
+```mermaid
+flowchart TB
+  m[measure: visual bounce + bounce metric R3<br/>perf gate R2 + cost projection R4<br/>candidate-D delta R5] --> q1{bounce delta vs D<br/>materially positive?}
+  q1 -->|no| d[GO candidate D<br/>cheaper, no coupling rebuild]
+  q1 -->|yes| q2{projected assembled<br/>frame ≤ 33ms?}
+  q2 -->|no| q3{coarse pre-pass<br/>or scope trim recovers it?}
+  q3 -->|no| fb[NO-GO PB-MPM<br/>fall back: D then B then<br/>two-field coupling-only]
+  q3 -->|yes| go
+  q2 -->|yes| go[GO PB-MPM<br/>proceed to coupling-rebuild follow-up plan]
+```
+
+---
+
+## Output Structure
+
+```text
+src/solvers/pbmpm/
+  mod.rs            # Solver impl, Params mirror + assert, step pipeline, test API
+  common.wgsl       # Params mirror, FP encode/decode, grid bindings, helpers
+  transfers.wgsl    # grid_zero / p2g / grid_update (BC) / g2p
+  constraint.wgsl   # particle_update (compliant density constraint) + particle_integrate
+```
+
+Plus edits to `src/engine/solvers.json`, `src/engine/registry.rs`, `src/solvers/mod.rs`, optionally `src/web.rs` (`setup_for` per-solver config), and new tests under `tests/`.
+
+---
+
+## Implementation Units
+
+Phase A (U1–U5) builds a runnable core verified by the visual oracle. Phase B (U6–U7) pins invariants and produces the decision. U8 is contingent. Per KTD3, Phase A units carry an exploratory execution note and keep coverage to light sanity checks; the enumerated, pinned test scenarios live in Phase B.
+
+### U1. Solver scaffold + registry wiring
+
+- Goal: a new `pbmpm` solver that builds via the registry, appears in the webapp dropdown, and runs an empty/gravity-only step without panicking.
+- Requirements: R2 (substrate)
+- Dependencies: none
+- Files:
+  - Create: `src/solvers/pbmpm/mod.rs`, `src/solvers/pbmpm/common.wgsl`
+  - Modify: `src/engine/solvers.json`, `src/engine/registry.rs`, `src/solvers/mod.rs`
+  - Test: `tests/pbmpm_scaffold.rs`
+- Approach: Add the `pbmpm` catalog row (`solvers.json`), a `SolverId::Pbmpm` variant + `id()`/`all()` arms, and a `build_solver` match arm (`registry.rs`). Implement `trait Solver` (build/reset/step/particles/metrics/profile) mirroring `twofield/mod.rs`'s skeleton: `Params` `#[repr(C)]` + `bytemuck` + a `const _ = assert!(size_of::<Params>() == N)` ABI lock, the `FP_SCALE` constant, the WGSL-concat `build()`, and the `bg()` helper. The particle storage buffer carries the per-particle PB-MPM state per KTD8 (`D`, `F`, `liquid_density`, constraint scalars) from the start so the layout is fixed up front. No physics yet beyond grid clear + gravity advect so the dropdown renders something.
+- Patterns to follow: `src/engine/registry.rs:23-93`, `src/engine/solvers.json`, `src/solvers/twofield/mod.rs:316-363` (Params+assert), `:1793-1832` (WGSL assembly + `bg()`), `tests/twofield_scaffold.rs:34-136`.
+- Execution note: Exploratory. Keep the scaffold test to the structural gate only.
+- Test expectation: structural only — builds via the registry arm, particle count round-trips, determinism (bit-exact re-run), and `MAX_STORAGE_BUFFERS_PER_ENTRY_POINT` within the 9 grant. No behavioral assertions yet.
+- Verification: the solver appears in the `www` dropdown and steps without panic; `tests/pbmpm_scaffold.rs` passes.
+
+### U2. Emission + water-pool activation
+
+- Goal: a pour activates dormant water-pool slots so the `high-velocity-jet-impact` scene (and any pour scene) actually emits water into the new solver.
+- Requirements: R1 (substrate — R1's oracle scene is a pour)
+- Dependencies: U1
+- Files:
+  - Modify: `src/solvers/pbmpm/mod.rs` (the `emit()` path, water-pool layout, `water_count` growth)
+  - Test: covered by U4's visual validation; light count check in `tests/pbmpm_scaffold.rs`
+- Approach: Port two-field's emission model — a pre-allocated water pool with a live range `[0, water_count)` that grows as the pour activates dormant slots (dormant slots parked off-scene, never dispatched), fed by the canonical `EmissionInput`. Mirror the `water_count`/`particle_count` live-set discipline so transfer/constraint passes dispatch only the live range. The `high-velocity-jet-impact` scene (`src/engine/scene.rs:409`) declares the pour this consumes.
+- Patterns to follow: `src/solvers/twofield/mod.rs` emission (`fn emit`, the water-pool/dormant-slot doc at `:21-27`, `:476-481`, `EmissionInput` activation `:558`), `src/engine/scene.rs:409` (the jet scene's pour).
+- Execution note: Exploratory/visual-first.
+- Test expectation: light — `water_count` grows when a pour is active and stays within pool capacity; no per-particle behavioral assertion yet.
+- Verification: in the webapp, selecting `high-velocity-jet-impact` with the pbmpm solver emits a visible water stream.
+
+### U3. APIC fixed-point transfers (grid_zero / p2g / grid_update / g2p)
+
+- Goal: water particles transfer to and from the fixed-point grid each iteration and fall under gravity without exploding.
+- Requirements: R2, R7
+- Dependencies: U1
+- Files:
+  - Create: `src/solvers/pbmpm/transfers.wgsl`
+  - Modify: `src/solvers/pbmpm/mod.rs`, `src/solvers/pbmpm/common.wgsl`
+  - Test: `tests/pbmpm_transfers.rs`
+- Approach: Implement `grid_zero` (clear the `atomic<i32>` `[mass, mom.xyz]` lanes — the grid carries *only* these per KTD8, no displacement lane), `p2g` (**3×3×3 (27-node) quadratic-B-spline** scatter via fixed-point `atomicAdd`, APIC affine momentum — matching the twofield stencil, not a 4³ cubic one), `grid_update` (decode `mom/mass`, apply gravity, write the float grid velocity/displacement locally — not as a fixed-point lane), and `g2p` (gather velocity + reconstruct the APIC `B` matrix, contributing to per-particle `D`). Wire the four passes into the per-substep loop in `step()`. Cell-binning before `p2g` (KTD6) is a *ported/adapted* subsystem — include it only if the visual/perf needs it, and account its cost in U6 (do not assume the XPBD neighbor-gather reorder drops in for scatter for free).
+- Patterns to follow: `src/solvers/twofield/transfers.wgsl:118-120,213-215` (the 3×3×3 P2G/G2P loops), `:172` (quadratic B-spline), `src/solvers/twofield/common.wgsl:81-147` (grid lanes, `fp_encode`/`fp_decode`, overflow-headroom math), EA SEED `particleToGrid`/`gridToParticle`/`gridUpdate`.
+- Execution note: Exploratory/visual-first. Confirm "water falls and pools, no detonation" in the webapp before formalizing. A single light CPU-twin mass/momentum round-trip sanity check is enough here; the full conservation gate is pinned in Phase B (U6).
+- Test expectation: one light sanity check (round-trip preserves total mass and momentum within float round-off on a small fixed scene). Heavier invariants deferred to U6.
+- Verification: in the webapp, water emitted into a box falls and accumulates; velocities stay bounded; the sanity check passes.
+
+### U4. Position-based compliant density constraint (the bounce mechanism)
+
+- Goal: the pool is stiff enough that impacts spike a restoring correction and the water visibly bounces/scatters.
+- Requirements: R1
+- Dependencies: U2, U3
+- Files:
+  - Create: `src/solvers/pbmpm/constraint.wgsl`
+  - Modify: `src/solvers/pbmpm/mod.rs`
+  - Test: `tests/pbmpm_constraint.rs`
+- Approach: Implement `particle_update` — per liquid particle read the per-particle `deformation_displacement` `D` (per KTD8: a float `mat3x3`, zeroed at the start of each substep's iteration loop, accumulated across iterations), compute `alpha = 0.5*(1/liquid_density − tr(D) − 1)`, apply the compliant volume correction `liquid_relaxation·alpha·I` and the viscous `liquid_viscosity·deviatoric(D)` shear term, write `D` back. Run the `particle_update → grid_zero → p2g → grid_update → g2p` bundle `iteration_count` times per substep (the grid rebuilds each iteration so corrections propagate spatially), then `particle_integrate` once. Expose `iteration_count`, `liquid_relaxation`, `liquid_density`, `liquid_viscosity` as `Params`/`Config` lanes for live tuning.
+- Patterns to follow: EA SEED `particleUpdatePBMPM.wgsl` (the `alpha`/relaxation/viscosity formula), `src/solvers/twofield/mod.rs` step-pipeline replay (`:2483-2534`) for looping passes per substep.
+- Execution note: Exploratory/visual-first — this is the crux. Tune `iteration_count`/`liquid_relaxation` live against the `high-velocity-jet-impact` scene; the verification is the visual bounce vs twofield/xpbd, not a unit test. A pure-Rust formula-mirror test (the constraint curve only) may be added once the formula is settled.
+- Test expectation: optional pure-Rust formula mirror (mirror the `alpha`/correction math on the CPU, like `tests/twofield_dissipation.rs`) once tuned. No GPU behavioral gate here; the bounce is pinned quantitatively in U7.
+- Verification: the live `high-velocity-jet-impact` render shows crown/rebound/scatter on the pool surface; the settled pool holds shape (no spontaneous stirring); behavior is qualitatively at xpbd/main level and clearly past twofield.
+
+### U5. Collider boundary conditions + floor/wall restitution
+
+- Goal: water rebounds off the cup floor and walls (not free-slip energy absorption), so the floor bounce reads physically.
+- Requirements: R1
+- Dependencies: U3
+- Files:
+  - Modify: `src/solvers/pbmpm/transfers.wgsl` (the `grid_update` BC block), `src/solvers/pbmpm/common.wgsl` (SDF solid mirror), `src/solvers/pbmpm/mod.rs`
+  - Test: covered by U7's bounce render/metric
+- Approach: In `grid_update`, apply collider BCs against the SDF solid set with a tunable normal restitution (origin notes two-field's free-slip BC kills normal velocity with no rebound). Reuse two-field's `Primitive` SDF mirror + the wall-band query.
+- Patterns to follow: `src/solvers/twofield/common.wgsl:189-198` (`Primitive` mirror + assert), the two-field wall/boundary BC in `coupling.wgsl`/`surface.wgsl`.
+- Execution note: Exploratory/visual-first — tune restitution against the visual; verified jointly with U4 in U7.
+- Test expectation: none directly — exercised by U7's bounce metric and render (a floor-drop scene should show a measurable rebound).
+- Verification: a column dropped onto the bare cup floor visibly rebounds in the webapp; restitution is tunable.
+
+### U6. Perf gate + overflow/range probes
+
+- Goal: pin the real-time gate and both overflow/range surfaces now that the core runs and looks right.
+- Requirements: R2, R7
+- Dependencies: U4, U5
+- Files:
+  - Test: `tests/pbmpm_perf.rs`, `tests/pbmpm_transfers.rs` (overflow/range probes), `examples/pbmpm_scaling.rs` (breakdown printer)
+- Approach: Mirror `tests/twofield_perf.rs` — pre-register constants *before* running (`REALTIME_MS_GATE = 33.0`, a single-phase water-only impact scene composed by box-edge to land ~200k, warmup 50 + median 30 frames, per-frame = `substeps × profile().total_micros()`). Add **two distinct probes per R7**: (a) a fixed-point probe that drives a fast pour and asserts the *grid* momentum lanes stay within `FP_CLAMP` (the twofield headroom math, coupled to the velocity cap; extend that note if PB-MPM adds any new scattered fixed-point lane); (b) a float-range probe that asserts the *per-particle* `deformation_displacement`/position-correction state stays finite and bounded (no NaN/blow-up) on the same fast pour. Add a breakdown example so the dominant pass is named.
+- Patterns to follow: `tests/twofield_perf.rs:39-274` (pre-register + median + no-fallback assert + composition guards), `examples/twofield_scaling.rs`, `src/solvers/twofield/common.wgsl:124-137` (overflow headroom).
+- Execution note: This is the appropriate place for pinned gates — the mechanism is now settled by Phase A's visual confirmation.
+- Test scenarios:
+  - Perf: ~200k single-phase water impact scene runs ≤33 ms median (no-fallback RED on miss, naming the dominant pass). Composition guard: particle count in a pinned band so the gate can't be passed with a cheaper mix.
+  - Linearity: 40k→200k within a pre-registered factor (mirror the twofield linearity gate).
+  - Fixed-point grid lanes: a fast/high-velocity pour keeps the momentum lanes within `FP_CLAMP`; assert no saturation.
+  - Per-particle float state: `D`/position-correction stays finite and within a pinned magnitude bound on the same pour.
+- Verification: `tests/pbmpm_perf.rs` reports a real median; both probes pass; the breakdown example prints the per-pass cost split.
+
+### U7. Pinned comparison harness → bounce metric + candidate-D + assembled-cost gate → go/no-go
+
+- Goal: produce the measured numbers against pre-registered thresholds and the documented decision.
+- Requirements: R3, R4, R5, R6
+- Dependencies: U6
+- Files:
+  - Test: `tests/pbmpm_bounce.rs`
+  - Create: `.deliberate/renders/pbmpm/` capture set (webapp), a go/no-go decision note
+  - Modify: `src/solvers/pbmpm/mod.rs` (test read-back API for the bounce metric)
+- Approach:
+  - **Pinned comparison harness (R5):** define ONE physical test config — emitter position/flow, particle spacing, velocity cap, geometry, and the impact-measurement window — fixed *outside* the per-solver `src/web.rs::setup_for` defaults (which give twofield a wider nozzle + lower cap, `web.rs:465,482`), so PB-MPM, xpbd, twofield, and candidate-D are measured on identical physics. This pinned config is the substrate for every comparison below.
+  - **Bounce metric (R3), thresholds pre-registered before reading results:** a localized, mass-weighted post-impact rebound/spread measure on the pinned scene, with a pre-set rebound/spread threshold, a cap-hit ceiling, a no-popcorn (single-particle ejecta) guard, and a conservation guard so it can't be gamed by noisy motion. Capture for pbmpm, xpbd, twofield.
+  - **Candidate D (R5):** capture the same metric for the two-field **DensU density-target proxy** via `set_density_target_mode_for_test(true)` + `set_density_rate_k_for_test(k)` per KTD7 — labeled as the proxy, not the full compliant D. Record the PB-MPM-vs-D delta with a pre-registered "materially exceeds" threshold.
+  - **Assembled-cost projection (R4) — a HARD gate, method fixed before measurement:** project the *assembled* two-velocity frame cost = single-phase measured cost + conservative upper bounds (or a measured stub) for the second velocity field, the drag pass, the `λ` ping-pong, bed/plasticity, and wetting, × the substep multiplier, + U8 if triggered; plus a buffer/pass-family ledger (each prospective entry point's storage-buffer count vs the 9 grant and 16 cap, with the pass-family split that keeps it ≤9). The decision input is **projected assembled ≤ 33 ms@200k**, not the single-phase number — a single-phase pass alone cannot declare GO.
+  - **Decision (R6):** record GO only if (bounce delta vs D materially positive) AND (projected assembled ≤ 33 ms); otherwise NO-GO with the fallback ladder (D → B → two-field coupling-only) as the recorded next step.
+  - Capture the live `high-velocity-jet-impact` + `dam-break-slosh` comparison renders (pbmpm vs twofield vs xpbd) into `.deliberate/renders/pbmpm/` via the established `agent-browser` CDP method.
+- Patterns to follow: `.deliberate/renders/rewrite/manifest.md` (capture method + naming), `tests/twofield_perf.rs` (pre-registered, no-fallback measurement posture), the two-field `set_density_target_mode_for_test`/`set_density_rate_k_for_test` path (`src/solvers/twofield/mod.rs:904,913`).
+- Execution note: Measurement + decision unit — the thresholds are pinned BEFORE results are read; bounce-vs-D and projected-assembled-cost are both pass/fail decision inputs, not just recorded numbers.
+- Test scenarios:
+  - Bounce metric exceeds its pre-registered threshold and materially exceeds the twofield baseline on the pinned scene; cap-hit below ceiling; no-popcorn holds; mass/energy conserved.
+  - The pbmpm-vs-D delta is computed against its pre-registered threshold (sign + magnitude), labeled as the DensU proxy.
+  - The assembled-cost projection (with its pre-fixed method + bounds) yields a projected frame time, asserted against ≤33 ms as a GO precondition.
+- Verification: the go/no-go note states the bounce delta vs D, the projected assembled frame time + buffer ledger, and the GO/NO-GO with its consequent next step; the comparison renders exist.
+
+### U8. Coarse-grid pressure pre-pass — CONTINGENT (build only if U4/U6 show 3D bulk compressibility)
+
+- Goal: recover global low-frequency incompressibility if pure-local-Jacobi PB-MPM shows visible bulk compression at the prototype's iteration budget.
+- Requirements: R1, R2 (only if triggered)
+- Dependencies: U4, U6 (gated on their measured bulk-compressibility finding)
+- Files:
+  - Modify: `src/solvers/pbmpm/constraint.wgsl` or a new `src/solvers/pbmpm/coarse.wgsl`, `src/solvers/pbmpm/mod.rs`
+- Approach: Add a coarse-level pressure pre-pass (coarse-to-fine V-cycle / MGPBD-style aggregation) that supplies the low-frequency correction the local constraint converges slowly. Implement any per-frame reduction as a **compacted active-cell list folded into existing passes** (atomic-append), never a single-workgroup all-cells reduction (the two-field `bubble_fine` trap that cost ~80% of frame). Re-run U6's perf gate and U7's bounce metric + assembled-cost projection after (the pre-pass cost enters the projection).
+- Patterns to follow: MGPBD (SIGGRAPH 2025, arXiv 2505.13390); two-field's compacted-pocket-list fix (`docs/PERF_NOTES.md:81-96`); `docs/issues/002-pressure-solve-cost.md` (warm-start, residual-adaptive iteration).
+- Execution note: Do not build unless measurement triggers it. Its cost counts against the KD8 budget (real global low-frequency work — KTD4).
+- Test expectation: re-run U6 perf + U7 bounce/cost after building; no new standalone gate.
+- Verification: bulk-compressibility artifact is gone in the webapp AND the perf gate still holds (or the go/no-go records that the coarse pass busts the budget).
+
+---
+
+## Scope Boundaries
+
+In scope: the single-phase PB-MPM water core (emission, transfers, compliant density constraint, BC/restitution), the perf gate + overflow/range probes, the pinned bounce metric, the candidate-D (DensU proxy) comparison, the two-velocity assembled-cost projection + buffer ledger, the comparison renders, and the documented go/no-go. The contingent coarse pre-pass (U8) is in scope only if measurement triggers it.
+
+### Deferred to Follow-Up Work (contingent on a GO)
+- The full coffee/water coupling rebuild — two co-located momentum fields, Laibe-Price drag, the pore-packing mixture (`ρ₀·(1−φ_s)`, saturation), `λ`-as-pore-pressure buoyancy/Terzaghi (origin KD5, still a hypothesis), XPBI bed plasticity/crater, conserved wetting/absorption — and the rest of the validation ladder (origin KD3–KD7, KD9). These are full of open questions this prototype exists to resolve; planning them in detail now would detail work that a no-go abandons.
+
+### Outside this effort's identity
+- The two-field / `main` / XPBD solvers are not modified to become primary; they stay as reference/referee + donors (and two-field's DensU path is *read* for the candidate-D comparison, not changed). No full fine-grid Poisson is introduced.
+
+---
+
+## Risks & Dependencies
+
+- 3D low-frequency incompressibility: pure-local-Jacobi PB-MPM is documented to leave ~1–5% bulk compressibility at few iterations (PBF/PB-MPM inherit Jacobi's slow low-frequency convergence). Mitigation: KTD4 / U8 contingency (coarse V-cycle). This is the single largest realism risk.
+- Assembled-cost blind spot: a single-phase ≤33 ms result does not bound the full two-velocity system. Mitigation: R4 assembled-cost projection is a hard gating deliverable (U7), not an afterthought.
+- Overflow/range on fast pours: two distinct surfaces (R7) — the fixed-point grid momentum lanes (twofield headroom math, velocity-cap-coupled) and the per-particle *float* `D`/position-correction state (NaN/blow-up). Mitigation: R7's two probes (U6).
+- Storage-buffer ceiling: the assembled solver may exceed the 9-buffer grant. Mitigation: KTD5 pass-family split + ledger (U7); browser `request_device` verification before relying on >9.
+- 3D P2G atomic contention at 200k. Mitigation: KTD6 cell-sort before scatter.
+- `λ`-as-pore-pressure (origin KD5) is unproven — but it is *deferred* coupling work, not in this prototype; flagged so the follow-up plan owns the audit.
+
+
+exec
+/bin/zsh -lc "nl -ba src/solvers/twofield/transfers.wgsl | sed -n '100,145p'" in /Users/cxc/Github/coffee-sim
+exec
+/bin/zsh -lc "nl -ba src/solvers/twofield/mod.rs | sed -n '880,930p'" in /Users/cxc/Github/coffee-sim
+ succeeded in 0ms:
+   880	    /// (water path falls back to the global `max_speed`, byte-identical).
+   881	    pub fn set_water_splash_cap_for_test(&mut self, cap: f32) {
+   882	        self.params.flip[3] = cap;
+   883	    }
+   884	
+   885	    /// Toggle the density relief (over-density relief + under-density suction) — dev/test only,
+   886	    /// for the spontaneous-stirring isolation gate. Production keeps relief ON.
+   887	    pub fn set_relief_for_test(&mut self, on: bool) {
+   888	        self.params.dbg[0] = if on { 1.0 } else { 0.0 };
+   889	    }
+   890	
+   891	    /// Select the SDF wall-BC mode (`dbg.y`) — dev/test only. `WALL_BC_SINGLE` (≤ 0.5) is the
+   892	    /// single-normal banded BC; `WALL_BC_MULTI` (> 0.5) is the orthonormal-basis multi-normal
+   893	    /// projector. Production default is `WALL_BC_SINGLE` until U3 flips it post-calibration.
+   894	    pub fn set_wall_bc_mode_for_test(&mut self, mode: f32) {
+   895	        self.params.dbg[1] = mode;
+   896	    }
+   897	
+   898	    /// Select the uncapped two-sided density-target mode (dbg.w) — dev/test only. `false`
+   899	    /// (default) keeps the legacy ∇·v projection + rate-limited (DENSITY_RELAX) two-sided relief,
+   900	    /// byte-identical to pre-fix; `true` drops the rate cap so the density relief drives ρ→ρ₀ at
+   901	    /// full strength (the calibration showed this is the over-pack fix; it is stable because it is
+   902	    /// a bounded restoring target, not the one-sided expansion source that historically detonated).
+   903	    /// Production default flips to `true` in U5.
+   904	    pub fn set_density_target_mode_for_test(&mut self, on: bool) {
+   905	        self.params.dbg[3] = if on { 1.0 } else { 0.0 };
+   906	    }
+   907	
+   908	    /// Set the temper-K rate divisor (dbg.z) for the uncapped density path — dev/test only (the
+   909	    /// temper calibration). The uncapped relief rate is `e/(K·dt)`: K=1 (default, dbg.z=0) is the
+   910	    /// full uncap (crisp but pumps energy on coupled scenes); the legacy cap is K=30 (slow, mushy);
+   911	    /// the calibrated sweet spot is K∈(1,30). Smaller K = stiffer/crisper. Only takes effect on the
+   912	    /// uncapped path (dbg.w on).
+   913	    pub fn set_density_rate_k_for_test(&mut self, k: f32) {
+   914	        self.params.dbg[2] = k.max(0.0);
+   915	    }
+   916	
+   917	    /// Set the U3 pressure-budget knobs (KTD-9 grid points; dev/test only). `coarse_sweeps =
+   918	    /// 0` is the A/B seed-off arm (the whole coarse stage is skipped, the fine sweeps start
+   919	    /// from p = 0); `coarse_sweeps = fine_sweeps = 0` makes the frame U2-equivalent (the
+   920	    /// projection applies a zero pressure field).
+   921	    pub fn set_pressure_budget_for_test(
+   922	        &mut self,
+   923	        coarse_ratio: u32,
+   924	        coarse_sweeps: u32,
+   925	        fine_sweeps: u32,
+   926	    ) {
+   927	        assert!(
+   928	            coarse_ratio >= COARSE_RATIO_DEFAULT,
+   929	            "coarse buffers are sized for ratio {COARSE_RATIO_DEFAULT} (the densest grid point)"
+   930	        );
+
+ succeeded in 0ms:
+   100	    // pore volume falls exactly as water is absorbed — the projection sees the real remaining
+   101	    // fluid. With absorption off f_w ≡ 1 and this is bit-identical to the U2 constant mass.
+   102	    let m = params.particle_mass * clamp(pos[p].w, 0.0, 1.0);
+   103	
+   104	    // Particle-presence census for the surface classification (see cell_cnt in common.wgsl).
+   105	    let ci = clamp(
+   106	        vec3<i32>(floor(xl)),
+   107	        vec3<i32>(0),
+   108	        vec3<i32>(params.grid_dims.xyz) - vec3<i32>(2),
+   109	    );
+   110	    atomicAdd(&cell_cnt[cell_index(ci)], 1u);
+   111	
+   112	    // U3 separate water-splash cap (flip.w): the crown's peak velocity survives a higher cap on
+   113	    // the water path while the solid clamps stay on the global max_speed. Sentinel ≤ 0 ⇒ fall
+   114	    // back to the global max_speed (byte-identical default). The FP momentum-headroom bound in
+   115	    // common.wgsl is re-derived against this cap (∝ 8192/cap).
+   116	    let water_cap = select(params.max_speed, params.flip.w, params.flip.w > 0.0);
+   117	
+   118	    for (var k = 0; k < 3; k = k + 1) {
+   119	        for (var j = 0; j < 3; j = j + 1) {
+   120	            for (var i = 0; i < 3; i = i + 1) {
+   121	                let wijk = w[i].x * w[j].y * w[k].z;
+   122	                let node = base + vec3<i32>(i, j, k);
+   123	                let d = (vec3<f32>(node) - xl) * h; // x_i − x_p (world units)
+   124	                var vaff = v + vec3<f32>(dot(c0, d), dot(c1, d), dot(c2, d));
+   125	                // Clamp the scattered magnitude to the water-splash cap — this is what makes the
+   126	                // FP_SCALE momentum-headroom bound in common.wgsl hold by construction.
+   127	                let s = length(vaff);
+   128	                if (s > water_cap) {
+   129	                    vaff = vaff * (water_cap / s);
+   130	                }
+   131	                let idx = node_index(node) * 4u;
+   132	                atomicAdd(&grid_fp[idx + 0u], fp_encode(m * wijk));
+   133	                atomicAdd(&grid_fp[idx + 1u], fp_encode(m * wijk * vaff.x));
+   134	                atomicAdd(&grid_fp[idx + 2u], fp_encode(m * wijk * vaff.y));
+   135	                atomicAdd(&grid_fp[idx + 3u], fp_encode(m * wijk * vaff.z));
+   136	            }
+   137	        }
+   138	    }
+   139	}
+   140	
+   141	// Convert fixed-point mass/momentum to velocity. Gravity, the U6 drag fold, the grid-node
+   142	// boundary treatment, and the speed-cap backstop all live in drag_fold (coupling.wgsl) —
+   143	// the exponential fold must integrate the gravity source itself and the BCs must follow
+   144	// every velocity update, so this pass is decode-only. Empty nodes get zero velocity.
+   145	@compute @workgroup_size(256)
+
+exec
+/bin/zsh -lc "nl -ba src/utils/gpu.rs | sed -n '100,125p'" in /Users/cxc/Github/coffee-sim
+ succeeded in 0ms:
+   100	        let timestamps_supported =
+   101	            allow_timestamp_queries && adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY);
+   102	        let required_features = if timestamps_supported {
+   103	            wgpu::Features::TIMESTAMP_QUERY
+   104	        } else {
+   105	            wgpu::Features::empty()
+   106	        };
+   107	
+   108	        // The boundary-force density passes (compute_lambda / compute_dp) bind 9 storage buffers per
+   109	        // stage — one above the WebGPU spec baseline of 8. Request EXACTLY that, as a fixed value:
+   110	        // modern browsers grant ≥10 (confirmed via navigator.gpu) and native Metal grants 16+, so 9
+   111	        // is always within range. NOTE: do NOT derive this from `adapter.limits()` — wgpu's web
+   112	        // backend over-reports that field, so requesting it makes request_device fail in the browser
+   113	        // ("Device failed at creation"). All other limits stay at the WebGPU baseline for portability.
+   114	        const NEEDED_STORAGE_BUFFERS: u32 = 9;
+   115	        let (device, queue) = adapter
+   116	            .request_device(&wgpu::DeviceDescriptor {
+   117	                label: Some("coffee-sim device"),
+   118	                required_features,
+   119	                required_limits: wgpu::Limits {
+   120	                    max_storage_buffers_per_shader_stage: NEEDED_STORAGE_BUFFERS,
+   121	                    ..wgpu::Limits::default()
+   122	                },
+   123	                memory_hints: wgpu::MemoryHints::Performance,
+   124	                trace: wgpu::Trace::default(),
+   125	                experimental_features: wgpu::ExperimentalFeatures::disabled(),
+
+codex
+I’ve got the plan text and first spot checks. Next I’m reading the pressure path, emission path, and `web.rs` defaults to confirm the plan’s references line up with current code.
+exec
+/bin/zsh -lc "nl -ba src/solvers/twofield/pressure.wgsl | sed -n '1,260p'" in /Users/cxc/Github/coffee-sim
+ succeeded in 0ms:
+     1	// U3 incompressibility (plan 2026-06-09-001, KTD-2): coarse-grid pressure seed + a fixed
+     2	// budget of fine local damped-Jacobi sweeps — NO converged Poisson solve anywhere.
+     3	//
+     4	// ================================ OPERATOR FAMILY =============================================
+     5	// ONE discretely consistent family on the U2 collocated grid (velocity at nodes):
+     6	//
+     7	//   pressure p     : CELL CENTERS (fine cells = grid_dims − 1 per axis)
+     8	//   divergence D   : corner-trilinear / finite-volume — for cell c with corner nodes n at
+     9	//                    offsets o ∈ {0,1}³ and per-axis signs s(o) = 2o − 1:
+    10	//                        (D u)_c = Σ_n  s(o)·u_n / (4h)
+    11	//                    (the exact derivative of trilinear interpolation at the cell center;
+    12	//                    2nd-order, gated by the MMS sweep). Masked rows: inactive cells ≡ 0.
+    13	//   gradient G     : G = −Dᵀ BY CONSTRUCTION — the same sign function, gathered the other way:
+    14	//                        (G p)_n = −Σ_{adjacent ACTIVE cells c}  s(o(n,c))·p_c / (4h)
+    15	//                    Adjointness identity the gates assert on twins AND GPU readbacks:
+    16	//                        u·(G p) = −(D u)·p          for ALL u, p, on ANY masks.
+    17	//   mass weighting : per-node symmetric constrained inverse-mass matrix
+    18	//                        M̃⁻¹_n = invρ_n·(P_box − n̂ n̂ᵀ),    invρ_n = 1 / max(ρ_n, ρ_floor),
+    19	//                    where ρ_n = node mass / h³, P_box zeroes box-face axes (mutually
+    20	//                    orthogonal), and n̂ is the SDF wall normal orthogonalized against the box
+    21	//                    axes — symmetric PSD, so wall-Neumann rows are part of the operator, not
+    22	//                    bolted on. Massless nodes get M̃⁻¹ = 0 (the projection never moves them).
+    23	//   Laplacian      : EXISTS ONLY AS THE COMPOSITION  A = −D·M̃⁻¹·G,  evaluated inline in the
+    24	//                    Jacobi kernels by literally composing the three loops above. Never a
+    25	//                    hand-written stencil — a hand stencil is exactly how main got A ≠ D·G and
+    26	//                    a divergence floor no iteration could beat.
+    27	//   projection     : v ← v − dt·M̃⁻¹·(G p). The divergence the gates measure afterwards uses
+    28	//                    THE SAME D, so post-projection divergence = dt·(solver residual): an
+    29	//                    operator-inconsistency floor is impossible by construction, and the
+    30	//                    decay gate (tests/twofield_pressure.rs) verifies it empirically.
+    31	//
+    32	// ================================ FREE SURFACE (U3 minimal form) ==============================
+    33	// Ghost-fluid-style fraction weighting, refined (not replaced) by U4's fill-fraction Dirichlet
+    34	// + bubbles. Every cell carries a fill fraction f ∈ [0, 1] from GRID MASS (mean fluid-visible
+    35	// corner-node density vs SURF_FULL_FRAC·ρ_rest, clamped; cells failing the min-corner
+    36	// activity test below are empty, f = 0), and the family is row/column-weighted by F = diag(f):
+    37	//     D_f = F·D,   G_f = −D_fᵀ = −Dᵀ·F,   A = D_f·M̃⁻¹·D_fᵀ   (still symmetric PSD, any f).
+    38	// Interior cells (ρ̄ ≥ SURF_FULL_FRAC·ρ_rest) have f = 1 exactly — the family is UNCHANGED
+    39	// there (the MMS/adjointness/SPD gates pin both regimes; the order-of-accuracy claim is for
+    40	// the f = 1 rows, surface rows are first-order by design until U4). The pressure Dirichlet
+    41	// p = 0 still lives in empty cells, but the constraint rows taper through the partially
+    42	// filled band, so the air-side Dirichlet acts at the mass-weighted surface instead of a
+    43	// staircase one full cell off. The previous mask (all 8 corners above a bare epsilon) had
+    44	// no surface notion at all: it extended FULL-weight rows one cell into the particle-free
+    45	// B-spline smear band — the hovering-lid failure described below — and the settled tank
+    46	// pumped itself apart (the independent volume gates caught exactly this).
+    47	// SURF_* are fixed structural constants of the family (like JACOBI_OMEGA), not gate knobs:
+    48	// SURF_FULL_FRAC = 0.5 puts the f-taper strictly above the mean surface line (a cell cut by
+    49	// a flat surface has ρ̄ ≈ 0.5·ρ_rest), so interior rows can never flicker below f = 1.
+    50	// ACTIVITY is decided by the MINIMUM corner-node density (≥ SURF_MIN_CORNER·ρ_rest), not by
+    51	// the mean fill: the quadratic B-spline smears mass 1.5h past the topmost particles, so the
+    52	// first PARTICLE-FREE cell above a settled surface still measures mean fill f ≈ 0.5 (its
+    53	// bottom corners share the surface nodes' mass) — indistinguishable from a real surface cell
+    54	// by any mean-fill cut. Its far-side corners, however, carry ≤ ~0.05·ρ_rest, while a cell
+    55	// containing real fluid keeps ALL corners ≥ ~0.25·ρ_rest: the min-corner test is the sharp
+    56	// particle-presence discriminator (the U2 "all corners massy" rule with a physical threshold
+    57	// instead of an epsilon). Why smear cells must NOT get pressure rows: their row pins their
+    58	// floored-M̃⁻¹ dust mass against gravity — a hovering pressurized lid (p 1/f-amplified,
+    59	// observed growing 700→4700 over 50 frames) that blocks settling while the bottom's density
+    60	// relief keeps pressurizing; the settled tank pumped itself apart. Below the threshold,
+    61	// smear/droplet cells are ballistic (no row, implicit p = 0) — U2 behavior, confined to
+    62	// near-massless dust. Min-corner ≥ 0.1·ρ_rest also bounds f ≥ 0.2, i.e. the surface-row
+    63	// amplification 1/f ≤ 5.
+    64	// U4 refinement (surface.wgsl): the implicit p = 0 holds only for air OPEN to the boundary;
+    65	// ENCLOSED air (the pour pocket) is flood-fill detected and inserted as constraint rows with
+    66	// fill weight 1, pressure pinned to the shared bubble multiplier λ_b — see the BUBBLE
+    67	// REPRESENTATION header in surface.wgsl. cell_meta.w carries the cell category
+    68	// (CELL_AIR/CELL_POCKET); the pocket pins live in the Jacobi/prolong kernels below.
+    69	//
+    70	// ================================ COARSE SEED ================================================
+    71	// Coarse grid: REDISCRETIZED same family at H = ratio·h (ratio knob {4, 8}; default 4).
+    72	//   Why rediscretized and not Galerkin R·A·P: Galerkin requires materializing an explicit
+    73	//   coarse stencil — reintroducing the hand-assembled-operator failure surface KTD-2 forbids.
+    74	//   Rediscretization reuses this very code path at spacing H (one family, twin-pinned), and
+    75	//   the seed CANNOT ship inconsistency: it only seeds the fine sweeps, the projection applies
+    76	//   only the fine G, and the gate divergence uses only the fine D. The two-grid convergence
+    77	//   gate decides whether the rediscretized coarse operator is consistent ENOUGH to be useful.
+    78	//   Coarse masks: a coarse cell is active iff ANY of its ratio³ children is active (binary —
+    79	//   the fine fraction taper is deliberately NOT rediscretized; see coarse_cell_setup). Coarse
+    80	//   M̃⁻¹: hat-weighted restriction of the fine M̃⁻¹ field (see coarse_node_setup).
+    81	// Transfers: R = masked trilinear-transpose restriction with a FIXED 1/ratio³ volume weight
+    82	//   (no mask renormalization — that is what keeps R = Pᵀ/ratio³ exact), P = the same masked
+    83	//   hat weights gathered the other way. Gate: ⟨R u, v⟩_c = ⟨u, P v⟩_f (volume-weighted).
+    84	// Solve shape per frame (two-grid correction scheme, p₀ = 0 — no warm start):
+    85	//   rhs = (s_target − D v)/dt → PRE-SMOOTH (Nf/2 fine sweeps) → residual r = rhs − A·p →
+    86	//   restrict r → Nc coarse Jacobi sweeps on A_c·e = r_c from 0 → prolongate-and-ADD the
+    87	//   correction → POST-SMOOTH (remaining fine sweeps) → project.
+    88	//   Pre-smoothing + RESIDUAL restriction (not raw-rhs restriction) is load-bearing: the
+    89	//   production rhs is boundary-concentrated (the hydrostatic source is a one-fine-layer spike
+    90	//   at the floor), which a ratio-4 restriction cannot represent consistently — seeding from
+    91	//   the raw rhs measurably overshoots and pumps energy (observed: settled tank erupting).
+    92	//   Pre-smoothing absorbs the spike locally, so the restricted residual is smooth — the
+    93	//   regime where the R/P pair is consistent.
+    94	//
+    95	// Density relief (volume-conservation feedback): the projection constrains the VELOCITY
+    96	// divergence only, so any finite per-frame solve error compacts positions monotonically and
+    97	// the rhs never sees it (a fully-compacted tank measures ZERO divergence — the failure the
+    98	// independent volume gates exist to catch). The rhs therefore carries a one-sided density
+    99	// source — the same projection-RHS plumbing KTD-4 later formalizes as s_net:
+   100	//     rhs_c = (s_target − D v)/dt,  s_target = max(ρ̄_c/ρ_rest − 1, 0)/(DENSITY_RELAX·dt),
+   101	// with ρ̄_c the mean corner-node density: compression is relieved over a few frames; an
+   102	// under-dense (free-surface) cell gets NO suction — surface physics belongs to U4.
+   103	//
+   104	// ================================ MIXTURE FAMILY (U6, KTD-4) ==================================
+   105	// With the U6 solid field present the constraint becomes the mixture continuity
+   106	// ∇·(φ_f·v_f + φ_s·v_s) = s with v_s ≡ 0 (rigid skeleton): the divergence weights each
+   107	// corner-node velocity by that node's φ_f (the nm b.w lane, from node_setup), and the same
+   108	// φ_f scales the node mobility in the operator,
+   109	//     A = −D·Φ·M̃⁻¹·G,   Φ = diag(φ_f per node)   (scalar per node ⇒ A stays symmetric PSD),
+   110	// while the velocity correction applied by `project` is M̃⁻¹·(G p) WITHOUT φ — per KTD-4 the
+   111	// intrinsic-velocity correction is Δv = −(Δt_eff/ρ_w)∇p and φ never scales it. Two more U6
+   112	// ingredients live inside M̃⁻¹ itself (node_setup): the node density is the INTRINSIC water
+   113	// density ρ_n/φ_f (the bulk pore-water density under-states ρ_w by φ_f), and the matrix is
+   114	// scaled by ς = Δt_eff/Δt, the exponential-integrator weight from the drag fold (see
+   115	// coupling.wgsl's header for why the plain-Δt split mis-partitions the hydrostatic load).
+   116	// All three are exact-passthrough at φ_f = 1, ς = 1 (multiplication/division by exactly 1.0
+   117	// is bitwise-identical — the free-water regression gate pins this). cell_classify's density
+   118	// census normalizes by the corner φ_f for the same reason: a saturated pore cell at
+   119	// ρ̄ = φ_f·ρ_rest is FULL, not a surface cell, and must get neither relief nor suction.
+   120	//
+   121	// Damped Jacobi: p ← p + ω·(rhs − A p)/diag(A), ω = JACOBI_OMEGA (fixed algorithmic constant,
+   122	// mirrored in mod.rs for the CPU twins), diag(A)_c = Σ_n s(o)ᵀ·M̃⁻¹_n·s(o) / (16h²).
+   123	//
+   124	// Adaptive-Tait predictor (KTD-2 option): STUBBED OFF — deliberately not implemented in U3.
+   125	// The knob grid pins Tait ∈ {off}; if a later unit shows an iteration-budget win it ships
+   126	// behind an opt-in Config gate, else it is removed (plan: "Deferred to Implementation").
+   127	//
+   128	// Sparsity: over-dispatch + early-out on inactive cells/empty nodes — NEVER indirect dispatch
+   129	// (R8). Tint discipline: no workgroupBarrier anywhere in this family, so the guard returns
+   130	// are uniform-control-flow safe. Storage buffers per entry point ≤ 5 (see mod.rs derivation).
+   131	
+   132	// --- pressure-family bindings (indices continue the global table in common.wgsl) -------------
+   133	// Per-node M̃⁻¹, 2 vec4 per node: [2n] = (xx, xy, xz, yy), [2n+1] = (yz, zz, massy_flag, 0).
+   134	@group(0) @binding(9) var<storage, read_write> nm: array<vec4<f32>>;
+   135	// Per fine cell: (rhs, fill fraction f ∈ [0,1] — 0 = empty/masked, residual/dbg lane, unused).
+   136	@group(0) @binding(10) var<storage, read_write> cell_meta: array<vec4<f32>>;
+   137	// Fine pressure ping-pong. The shader always reads 11 and writes 12; the alternating bind
+   138	// groups swap which buffer sits at which index (pf_a starts as the seed slot).
+   139	@group(0) @binding(11) var<storage, read_write> pf_src: array<f32>;
+   140	@group(0) @binding(12) var<storage, read_write> pf_dst: array<f32>;
+   141	// Coarse mirrors of 9/10/11/12.
+   142	@group(0) @binding(13) var<storage, read_write> nm_c: array<vec4<f32>>;
+   143	@group(0) @binding(14) var<storage, read_write> cmeta: array<vec4<f32>>;
+   144	@group(0) @binding(15) var<storage, read_write> pc_src: array<f32>;
+   145	@group(0) @binding(16) var<storage, read_write> pc_dst: array<f32>;
+   146	
+   147	// Mirrors twofield::JACOBI_OMEGA (see the symbol-bound derivation there: λ_max(diag⁻¹A) = 8/3
+   148	// for this corner family, so ω must be < 0.75; 2/3 is the weighted-Jacobi choice).
+   149	const JACOBI_OMEGA: f32 = 0.6666667;
+   150	// Density-relief time constant in frames (fixed structural constant, like JACOBI_OMEGA —
+   151	// mirrors twofield::DENSITY_RELAX_FRAMES, derivation there: equilibrium compaction drift
+   152	// ≈ residual·N·dt ≈ 1% — inside the ±5% band — while keeping the relief of a seeded
+   153	// over-density gentle, v ~ Δx/τ, instead of detonating it into slosh).
+   154	const DENSITY_RELAX_FRAMES: f32 = 30.0;
+   155	// Uncapped density-target dead-band (dbg.w on): density error |e| below this is treated as zero
+   156	// (no chatter on near-rest cells). Default 0 (no dead-band) until calibration finds a value; like
+   157	// DENSITY_RELAX_FRAMES it is a structural const, not a Params slot.
+   158	const DENSITY_TARGET_DEADBAND: f32 = 0.0;
+   159	// SETTLED-POOL STIRRING — diagnosis (no in-solver fix yet; see twofield_settled.rs).
+   160	// A settled pool slowly churns. Isolation (water tank, settled-tail KE): baseline ~67; relief OFF
+   161	// ~7.6; 32 fine sweeps (vs 8) ~17; pure PIC (kill the affine C) ~1.3. So the mechanism is a limit
+   162	// cycle: the local-Jacobi pressure solve is intentionally UNDER-converged (8+8 sweeps, no global
+   163	// Poisson — the real-time design), leaving a standing density error; the density relief faithfully
+   164	// converts that error into a velocity each frame; the lossless APIC affine field accumulates it (no
+   165	// numerical dissipation); the pool sloshes and re-creates the error. Two clamps were MEASURED and
+   166	// rejected: a global G2P APIC→PIC blend quiets the pool but freezes the deformable-bed crater slump
+   167	// (which rides on the same agitation — even blend 0.02 froze it); a φ_f-gated relief dead-band does
+   168	// not reach the churn (the standing error exceeds a tolerable band). The honest cures all trade a
+   169	// pre-registered gate — more fine sweeps (R9 perf), carrier dissipation (the crater) — so the lever
+   170	// is a product decision, deferred. The relief below stays the original un-banded feedback.
+   171	// Free-surface fill-fraction constants (header: FREE SURFACE; mirrored in twofield/mod.rs).
+   172	const SURF_FULL_FRAC: f32 = 0.5;
+   173	const SURF_MIN_CORNER: f32 = 0.1;
+   174	const NODE_BC_EPS: f32 = 1.0e-4;     // box-face epsilon (matches grid_update)
+   175	const SDF_NORMAL_MIN: f32 = 1.0e-3;  // degenerate orthogonalized-normal guard
+   176	// SDF no-penetration band in cell sizes: a node within WALL_BAND·h on the FLUID side of a wall
+   177	// gets the wall-normal projector (the supporting fluid layer of a non-grid-aligned wall). Mirror
+   178	// of `drag_fold`'s velocity BC band in coupling.wgsl — they MUST match for operator consistency.
+   179	const WALL_BAND: f32 = 1.0;
+   180	// Flood-fill OUTSIDE seed band in cell sizes (surface.wgsl flood_init): an air cell within
+   181	// FLOOD_WALL_BAND·h of an SDF wall is seeded OPEN. Wider than WALL_BAND so the seed reaches the
+   182	// CENTER of a ~1-cell-wide SDF channel (the V60 cone apex hole, radius 0.42 ≈ 1.3 cells) and
+   183	// keeps it conductive — connecting the cup/cone air to the open top. Purely a pocket-detection
+   184	// aid (no operator/BC effect), so it carries no operator-consistency constraint.
+   185	const FLOOD_WALL_BAND: f32 = 2.0;
+   186	
+   187	// SDF wall BC mode (params.dbg.y, plan 2026-06-17-002):
+   188	//   ≤ 0.5  → WALL_BC_SINGLE (default): the single most-penetrated normal (solid_union) banded over
+   189	//            WALL_BAND·h — the original behavior, kept byte-identical here.
+   190	//   > 0.5  → WALL_BC_MULTI: the orthonormal-basis projector P = I − Q·Qᵀ over ALL in-band faces
+   191	//            (build_constraint_basis in common.wgsl), constraining BOTH surfaces at a concave seam
+   192	//            (the cup floor∩wall corner). node_setup builds M̃⁻¹ = invr·P; drag_fold applies
+   193	//            v ← P·v from the SAME basis (lockstep — A = D·M̃⁻¹·G holds).
+   194	fn wall_bc_multi() -> bool { return params.dbg.y > 0.5; }
+   195	
+   196	// --- fine-grid cell helpers --------------------------------------------------------------------
+   197	fn fine_cells() -> vec3<u32> {
+   198	    return params.grid_dims.xyz - vec3<u32>(1u);
+   199	}
+   200	fn num_fine_cells() -> u32 {
+   201	    let c = fine_cells();
+   202	    return c.x * c.y * c.z;
+   203	}
+   204	fn cell_index(c: vec3<i32>) -> u32 {
+   205	    let nc = fine_cells();
+   206	    return u32(c.x) + nc.x * (u32(c.y) + nc.y * u32(c.z));
+   207	}
+   208	fn cell_coords(flat: u32) -> vec3<u32> {
+   209	    let nc = fine_cells();
+   210	    return vec3<u32>(flat % nc.x, (flat / nc.x) % nc.y, flat / (nc.x * nc.y));
+   211	}
+   212	fn cell_in_range(c: vec3<i32>) -> bool {
+   213	    let nc = vec3<i32>(fine_cells());
+   214	    return all(c >= vec3<i32>(0)) && all(c < nc);
+   215	}
+   216	
+   217	// --- coarse-grid helpers (same layout at H = ratio·h, same origin) ------------------------------
+   218	fn coarse_cells() -> vec3<u32> {
+   219	    return params.coarse_dims.xyz;
+   220	}
+   221	fn num_coarse_cells() -> u32 {
+   222	    let c = coarse_cells();
+   223	    return c.x * c.y * c.z;
+   224	}
+   225	fn coarse_nodes() -> vec3<u32> {
+   226	    return params.coarse_dims.xyz + vec3<u32>(1u);
+   227	}
+   228	fn num_coarse_nodes() -> u32 {
+   229	    let n = coarse_nodes();
+   230	    return n.x * n.y * n.z;
+   231	}
+   232	fn ccell_index(c: vec3<i32>) -> u32 {
+   233	    let nc = coarse_cells();
+   234	    return u32(c.x) + nc.x * (u32(c.y) + nc.y * u32(c.z));
+   235	}
+   236	fn ccell_coords(flat: u32) -> vec3<u32> {
+   237	    let nc = coarse_cells();
+   238	    return vec3<u32>(flat % nc.x, (flat / nc.x) % nc.y, flat / (nc.x * nc.y));
+   239	}
+   240	fn ccell_in_range(c: vec3<i32>) -> bool {
+   241	    let nc = vec3<i32>(coarse_cells());
+   242	    return all(c >= vec3<i32>(0)) && all(c < nc);
+   243	}
+   244	fn cnode_index(n: vec3<u32>) -> u32 {
+   245	    let nn = coarse_nodes();
+   246	    return n.x + nn.x * (n.y + nn.y * n.z);
+   247	}
+   248	
+   249	// --- M̃⁻¹ load/apply ----------------------------------------------------------------------------
+   250	struct Minv { a: vec4<f32>, b: vec4<f32> }
+   251	
+   252	fn minv_apply(m: Minv, v: vec3<f32>) -> vec3<f32> {
+   253	    return vec3<f32>(
+   254	        m.a.x * v.x + m.a.y * v.y + m.a.z * v.z,
+   255	        m.a.y * v.x + m.a.w * v.y + m.b.x * v.z,
+   256	        m.a.z * v.x + m.b.x * v.y + m.b.y * v.z,
+   257	    );
+   258	}
+   259	
+   260	// Corner sign vector for offset o ∈ {0,1}³ (the ONE sign function D, G, and diag(A) share).
+
+exec
+/bin/zsh -lc "nl -ba src/solvers/twofield/mod.rs | sed -n '1,90p' && nl -ba src/solvers/twofield/mod.rs | sed -n '450,590p'" in /Users/cxc/Github/coffee-sim
+ succeeded in 0ms:
+     1	//! Two-field grid solver under `SolverId::Twofield` — rung L0 of
+     2	//! `docs/plans/2026-06-09-001-feat-unified-twofield-solver-plan.md`.
+     3	//!
+     4	//! U1 pinned the seam contract (six `Solver` methods, GPU-cached getters), the two-field
+     5	//! particle-range layout (water `[0, w)`, then solids — KTD-1), the canonical `ParticleBuffers`
+     6	//! exposure, and the dispatch/budget bookkeeping.
+     7	//!
+     8	//! U2 adds the APIC water transfers: quadratic B-spline P2G with fixed-point atomics, grid
+     9	//! gravity + boundary conditions, APIC G2P with a per-particle affine C matrix
+    10	//! (`transfers.wgsl`). Per frame: `grid_clear → p2g_water → grid_update → g2p_water`, one
+    11	//! substep (the CFL substep policy is a later-unit decision).
+    12	//!
+    13	//! U3 adds incompressibility (`pressure.wgsl`, KTD-2): a coarse-grid pressure seed plus a
+    14	//! fixed budget of fine damped-Jacobi sweeps on ONE discretely consistent operator family
+    15	//! (pressure at cell centers, corner-trilinear D, G = −Dᵀ by construction, A only ever the
+    16	//! composition −D·M̃⁻¹·G) — no converged Poisson anywhere (R7). The full operator-family and
+    17	//! coarse-seed construction is documented at the top of `pressure.wgsl`; the pre-registered
+    18	//! gates live in `tests/twofield_pressure.rs`. The KTD-2 adaptive-Tait predictor is a STUB
+    19	//! DECISION: deliberately not implemented (knob grid pins Tait ∈ {off}); if a later unit
+    20	//! demonstrates an iteration-budget win it ships behind an opt-in `Config` gate, otherwise it
+    21	//! is removed rather than shipped dormant.
+    22	//!
+    23	//! U4 (the L0 exit) adds pour emission and the pour-cavity machinery (`surface.wgsl`,
+    24	//! KTD-6): `EmissionInput` drives the xpbd-shaped volume-consistent arclength-credit emitter
+    25	//! into a pre-allocated water pool (water live range `[0, water_count)` grows toward
+    26	//! `water_capacity`; solids sit AFTER the full pool so the KTD-1 range layout survives
+    27	//! emission — dormant slots are never dispatched); enclosed air pockets are detected by a
+    28	//! fixed-budget grid flood fill from the open (top) boundary and carried as ONE constraint
+    29	//! bubble: a single Lagrange-multiplier scalar λ_b whose value IS the pocket pressure,
+    30	//! represented identically in the coarse solve and the fine sweeps (see surface.wgsl's
+    31	//! BUBBLE REPRESENTATION header). Gates: `tests/twofield_cavity.rs`.
+    32	//!
+    33	//! U6 (the early-L2 risk spike, run against a RIGID, kinematically frozen skeleton —
+    34	//! KTD-3/KTD-4/KTD-8) adds `coupling.wgsl`: a thin solid-mass P2G (`p2g_solid` scatters the
+    35	//! grain sphere volume π/6·d³ into a one-lane fixed-point field → local φ_s/φ_f per node)
+    36	//! and the forced Laibe-Price exponential drag fold (`drag_fold`, which also owns the grid
+    37	//! forces + BCs so the fold integrates the gravity source exactly). β(φ) mirrors
+    38	//! `models::permeability` (Kozeny-Carman) blended toward a Wen-Yu dilute rate below
+    39	//! φ_s ≈ 0.2 (Huilin-Gidaspow). The projection becomes the MIXTURE family ∇·(φ_f·v_f) = s
+    40	//! (v_s = 0) with the velocity correction Δv = −(Δt_eff/ρ_w)∇p, Δt_eff = (1−e^{−βΔt})/β —
+    41	//! the same integrator weight as the fold, carried as ς inside M̃⁻¹; φ NEVER scales the
+    42	//! correction. Every impulse the frozen skeleton absorbs (drag pair + pressure on the solid
+    43	//! volume) is recorded in the per-node `react` ledger — never discarded. Free water
+    44	//! (φ_f = 1, ς = 1) is exact-zero passthrough, gated bitwise. Gates:
+    45	//! `tests/twofield_coupling.rs`.
+    46	//!
+    47	//! U5 (rung L1, `plasticity.wgsl` + the CPU twin `plasticity.rs`) makes the solid phase a
+    48	//! real elastoplastic granular material behind `Config::solid_dynamics` (default OFF — the
+    49	//! U6 frozen-skeleton semantics are preserved bitwise; the dry-bed L1 scenes opt in): solid
+    50	//! P2G with momentum + APIC + MLS-MPM fused stress force (`p2g_solid_dyn` replaces the
+    51	//! frozen `p2g_solid` 1:1), grid forces + over-packing solids-pressure guard + Coulomb wall
+    52	//! friction (`solid_update`), solid G2P with the deformation-gradient update, one 3×3 SVD
+    53	//! per grain, and the Klar 2016 Drucker-Prager 3-branch return map + compaction-cap tamping
+    54	//! memory (`g2p_solid`). The solid velocity does NOT yet enter the mixture divergence and
+    55	//! the drag fold keeps its frozen-skeleton form — both are U7 scope (the L1 scenes are dry).
+    56	//! Gates: `tests/twofield_bed.rs`.
+    57	
+    58	pub mod plasticity;
+    59	
+    60	use std::sync::Arc;
+    61	
+    62	use bytemuck::{Pod, Zeroable};
+    63	use wgpu::util::DeviceExt;
+    64	
+    65	use crate::emission::EmissionInput;
+    66	use crate::engine::scene::Species;
+    67	use crate::engine::{Metrics, Scene};
+    68	use crate::models::Materials;
+    69	use crate::profiling::Profile;
+    70	use crate::solvers::base::Solver;
+    71	use crate::solvers::pass_recorder::{PassRecorder, TimestampSink};
+    72	use crate::utils::buffers::ParticleBuffers;
+    73	use crate::utils::config::Config;
+    74	use crate::utils::gpu::GpuContext;
+    75	
+    76	const WG: u32 = 256;
+    77	
+    78	/// Y-coordinate at which un-emitted (dormant) water-pool slots are parked: far below any scene so
+    79	/// the renderer culls them (particles.wgsl matches this with `p.y <= -1.0e8`). Activated slots get
+    80	/// a real position from `emit()`. Kept finite (not NaN) so any accidental read stays well-defined.
+    81	const DORMANT_PARK_Y: f32 = -1.0e9;
+    82	
+    83	fn groups(n: u32) -> u32 {
+    84	    n.div_ceil(WG)
+    85	}
+    86	
+    87	/// U2+U3+U4+U6+U5 GPU-budget bookkeeping (R8): the widest entry point's storage-buffer count,
+    88	/// derived by inspection of the bind groups in `build` (the params uniform doesn't count
+    89	/// against the storage limit). Per pass: `grid_clear` 4 (grid_fp, cell_cnt, grid_sfp,
+    90	/// grid_sm), `p2g_water` 5 (pos, vel, cmat, grid_fp, cell_cnt), `p2g_solid` 2 (pos,
+   450	    count: u32,
+   451	}
+   452	
+   453	/// Brew diagnostics sampled from the GPU (dev/test only — the read-back stalls). Mirrors the
+   454	/// xpbd `XpbdDiagnostics` precedent so future suites can port: the values are CPU-resident
+   455	/// after `sample_diagnostics()` and the getters never sync. `drawdown_time` latches the sim
+   456	/// time when the free water ABOVE the bed surface (the pond) first drains away — the
+   457	/// pour-over drawdown event (U8 metric). `evenness`/`extraction_yield`/`tds` are placeholders
+   458	/// (1.0 / 0.0) until the extraction port lands (deferred to follow-up — see the plan's Scope
+   459	/// Boundaries); the slots exist so the seam matches xpbd and the metric surface is wired now.
+   460	#[derive(Clone, Copy, Debug, Default)]
+   461	pub struct TwofieldDiagnostics {
+   462	    /// Live free-water particles above the bed surface (the pond), latest sample.
+   463	    pub free_water_above_bed: u32,
+   464	    /// Sim time (s) when the pond first drained below the drawdown threshold; 0 = not latched.
+   465	    pub drawdown_time: f32,
+   466	    /// Flow-evenness placeholder (1.0 = even) — extraction-gated, deferred.
+   467	    pub evenness: f32,
+   468	    /// Peak per-node grid occupancy proxy (max decoded node mass / rest density), latest sample.
+   469	    pub max_occupancy: f32,
+   470	}
+   471	
+   472	pub struct TwofieldSolver {
+   473	    device: wgpu::Device,
+   474	    queue: wgpu::Queue,
+   475	    params: Params,
+   476	    /// LIVE water count (grows as the pour activates pool slots); the seed value is
+   477	    /// `initial_water`.
+   478	    water_count: u32,
+   479	    /// Allocated water-pool size = seed + dose headroom (KTD-1 layout with emission: water
+   480	    /// pool `[0, water_capacity)`, live `[0, water_count)`, solids
+   481	    /// `[water_capacity, water_capacity + solid_count)` — dormant slots are never dispatched).
+   482	    water_capacity: u32,
+   483	    solid_count: u32,
+   484	    num_nodes: u32,
+   485	    num_cells: u32,
+   486	    /// Pour-emission state (xpbd-shaped volume-consistent emitter).
+   487	    inflow: Inflow,
+   488	
+   489	    // U3 pressure knobs (KTD-9 grid points; sweep counts = dispatch counts, driven in step).
+   490	    coarse_ratio: u32,
+   491	    coarse_sweeps: u32,
+   492	    fine_sweeps: u32,
+   493	    // U4 flood-fill budget = grid Manhattan diameter (scene-derived; see `flood_sweeps_for`).
+   494	    flood_sweeps: u32,
+   495	
+   496	    params_buf: wgpu::Buffer,
+   497	    // Canonical particle state, exposed through `ParticleBuffers`: pos.w carries the moisture
+   498	    // lane (water = remaining fraction, grain = absorbed volume), chem = (c, T, _, _).
+   499	    pos: Arc<wgpu::Buffer>,
+   500	    vel: Arc<wgpu::Buffer>,
+   501	    phase: Arc<wgpu::Buffer>,
+   502	    chem: Arc<wgpu::Buffer>,
+   503	    // Per-particle APIC affine matrix C: 3 vec4 rows per particle (see common.wgsl binding 5).
+   504	    cmat: wgpu::Buffer,
+   505	    // WATER grid field: fixed-point atomic<i32>, 4 lanes per node (mass, mom.xyz).
+   506	    grid_fp: wgpu::Buffer,
+   507	    // Float grid velocity (.xyz) + node mass (.w) after grid_update; post-projection after
+   508	    // the U3 pressure stack. CPU-readable for the divergence/volume gates.
+   509	    grid_vel: wgpu::Buffer,
+   510	    // U6 solid grid field (per-node fixed-point solid volume) + constraint-reaction ledger
+   511	    // (per-node vec4: impulse.xyz, ς) — coupling.wgsl bindings 19/20.
+   512	    grid_sfp: wgpu::Buffer,
+   513	    react: wgpu::Buffer,
+   514	    // U5 dynamic-solid per-particle state (plasticity.wgsl bindings 23/24): deformation
+   515	    // gradient (3 vec4 rows) and (τ, p_c, compaction). The grid_sm/grid_svel node fields
+   516	    // (bindings 21/22) live only inside the bind groups, like the coarse pressure mirrors.
+   517	    fmat: wgpu::Buffer,
+   518	    sstate: wgpu::Buffer,
+   519	    /// `Config::solid_dynamics`: dispatch the U5 dynamic-solid passes instead of the frozen
+   520	    /// U6 skeleton.
+   521	    solid_dynamic: bool,
+   522	    /// `Config::tf_absorb_rate > 0`: dispatch the U9 moisture phase-change absorption passes
+   523	    /// (`p2g_moisture` + `g2p_absorb`). Off (default) ⇒ the passes are CPU-elided, so the
+   524	    /// U2–U6 suites and existing scenes are byte-unchanged.
+   525	    absorb_on: bool,
+   526	    // U3 pressure-family state (layouts documented in pressure.wgsl): per-node M̃⁻¹, per-cell
+   527	    // (rhs, active, dbg) meta, and the fine pressure ping-pong pair. The coarse mirrors live
+   528	    // only inside the bind groups.
+   529	    nm: wgpu::Buffer,
+   530	    cell_meta: wgpu::Buffer,
+   531	    pf_a: wgpu::Buffer,
+   532	    pf_b: wgpu::Buffer,
+   533	    // U4 bubble state: [λ_b, δλ_b] (surface.wgsl binding 17).
+   534	    bubble: wgpu::Buffer,
+   535	    readback: wgpu::Buffer,
+   536	
+   537	    pipelines: Pipelines,
+   538	    ts: Option<Timestamps>,
+   539	
+   540	    // Cached per-frame results returned by the getters (never a GPU sync there).
+   541	    dispatches: u32,
+   542	    cached_passes: Vec<(String, f32)>,
+   543	
+   544	    // U8 metrics/diagnostics surface (CPU-resident; refreshed by `sample_diagnostics`, returned
+   545	    // by `metrics()`/`diagnostics()` without a GPU sync). `sim_time` advances every `step`.
+   546	    sim_time: f32,
+   547	    bed_top_seed: f32,
+   548	    pond_peak: u32,
+   549	    cached_diag: TwofieldDiagnostics,
+   550	
+   551	    // Retained for reset (exact, deterministic re-seed; pool-padded layout).
+   552	    initial_positions: Vec<[f32; 4]>,
+   553	    initial_phases: Vec<u32>,
+   554	    initial_water: u32,
+   555	}
+   556	
+   557	/// Pour-emission state + spout parameters (host-side; mirrors the xpbd `Inflow`). Turns
+   558	/// `EmissionInput` into activated water-pool particles via the volume-consistent
+   559	/// arclength-credit emitter: the volume accumulator (flow/V_w·dt) is the master count budget;
+   560	/// layers release one `particle_spacing` of stream travel apart, each filling a golden-angle
+   561	/// disc, so the inlet packs to the fluid's rest density.
+   562	struct Inflow {
+   563	    // Static (from Config/Materials at build).
+   564	    nozzle_radius: f32,
+   565	    discharge_coeff: f32,
+   566	    spacing: f32,
+   567	    v_w: f32,
+   568	    pour_t: f32,
+   569	    // State.
+   570	    accumulator: f32, // volume budget in particles (carries the sub-particle fraction)
+   571	    axial: f32,       // arclength credit (scene units) toward the next layer
+   572	    last_exit_speed: f32, // drains backlog at the last cadence when flow drops to 0
+   573	    cursor: u64,      // golden-angle determinism across all emitted particles
+   574	    emitted_mass: f32, // running total emitted water mass (conservation accounting)
+   575	}
+   576	
+   577	/// Orthonormal disc basis perpendicular to a (unit) pour direction `dir` (mirrors xpbd).
+   578	fn disc_basis(dir: [f32; 3]) -> ([f32; 3], [f32; 3]) {
+   579	    let cross = |a: [f32; 3], b: [f32; 3]| {
+   580	        [
+   581	            a[1] * b[2] - a[2] * b[1],
+   582	            a[2] * b[0] - a[0] * b[2],
+   583	            a[0] * b[1] - a[1] * b[0],
+   584	        ]
+   585	    };
+   586	    let norm = |v: [f32; 3]| {
+   587	        let l = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt().max(1.0e-9);
+   588	        [v[0] / l, v[1] / l, v[2] / l]
+   589	    };
+   590	    let refv = if dir[1].abs() < 0.9 {
+
+exec
+/bin/zsh -lc "nl -ba src/web.rs | sed -n '430,500p'" in /Users/cxc/Github/coffee-sim
+ succeeded in 0ms:
+   430	        absorb_rate: 0.5,
+   431	        extract_rate: 1.0,
+   432	        nozzle_radius: 0.25,
+   433	        max_speed: 25.0,
+   434	        // Bed permeability: the explicit Darcy drag has a percolation floor of ~g·dt_substep, so at
+   435	        // substeps=1 the bed out-drains the pour and nothing ponds. Halving the substep dt
+   436	        // (substeps=2) plus a stronger drag cap lets a water layer build above the grounds.
+   437	        substeps: 2,
+   438	        drag_beta_max: 0.92,
+   439	        drag_subiters: 6,
+   440	        ..Config::default()
+   441	    };
+   442	    if twofield {
+   443	        // Two-field coupling: a deformable bed (solid_dynamics) that absorbs water (tf_absorb_rate,
+   444	        // feeding swelling + K(φ)), drains through the filter (tf_filter_floor), and gains wet
+   445	        // cohesion (tf_wet_cohesion). Plus the grid-resolvable jet (≈3.4 cells wide) + speed cap so
+   446	        // the thin nozzle doesn't whip/scatter on the grid. The XPBD path never sees these.
+   447	        cfg.solid_dynamics = true;
+   448	        cfg.tf_absorb_rate = 0.15;
+   449	        cfg.tf_wet_cohesion = 4.0;
+   450	        cfg.tf_filter_floor = true;
+   451	        cfg.nozzle_radius = 0.55;
+   452	        cfg.max_speed = 12.0;
+   453	        // U2/U3 surface-weighted dissipation (starting values; tune by eye via the visual oracle
+   454	        // before pinning numeric gates / flipping production defaults): preserve momentum at the
+   455	        // free surface (small c_surface), damp the bulk, merge-discriminator on, raise the water
+   456	        // crown cap above the global 12.
+   457	        cfg.tf_flip_c_surface = 0.1;
+   458	        cfg.tf_flip_density_gate = 0.5;
+   459	        cfg.tf_flip_div_scale = 1.0;
+   460	        cfg.tf_flip_water_splash_cap = 20.0;
+   461	    }
+   462	    (mats, cfg)
+   463	}
+   464	
+   465	/// Materials/config for the V60 water-only family (Water Only + the cup-water / free-jet debug
+   466	/// scenes): the same cone+cup at the bed resolution, no grounds. For twofield, widen the jet +
+   467	/// lower the speed cap so a thin plunging stream stays grid-resolvable (no trapped-air collapse).
+   468	fn v60_water_setup(twofield: bool) -> (Materials, Config) {
+   469	    let r = 0.16_f32;
+   470	    let mats = Materials {
+   471	        particle_spacing: r,
+   472	        support_radius: 2.0 * r,
+   473	        ..Materials::default()
+   474	    };
+   475	    let mut cfg = Config {
+   476	        nozzle_radius: 0.25,
+   477	        max_speed: 25.0,
+   478	        // Less velocity-smoothing at the surface so a pour's impact reads as a visible crown.
+   479	        xsph_viscosity_c: 0.02,
+   480	        ..Config::default()
+   481	    };
+   482	    if twofield {
+   483	        cfg.nozzle_radius = 0.55;
+   484	        cfg.max_speed = 12.0;
+   485	        // U2/U3 surface-weighted dissipation (starting values; tune by eye — see v60_bed_setup).
+   486	        cfg.tf_flip_c_surface = 0.1;
+   487	        cfg.tf_flip_density_gate = 0.5;
+   488	        cfg.tf_flip_div_scale = 1.0;
+   489	        cfg.tf_flip_water_splash_cap = 20.0;
+   490	    }
+   491	    (mats, cfg)
+   492	}
+   493	
+   494	/// Apply the per-material render look (grain radius scale + moisture tint).
+   495	fn configure_renderer(renderer: &mut Renderer, mats: &Materials) {
+   496	    renderer.set_grain_radius_scale(mats.grain_diameter / mats.particle_spacing);
+   497	    let v_cap =
+   498	        mats.r_max * mats.rho_ratio * std::f32::consts::FRAC_PI_6 * mats.grain_diameter.powi(3);
+   499	    renderer.set_moisture_scale(if v_cap > 0.0 { 1.0 / v_cap } else { 0.0 });
+   500	}
+
+exec
+/bin/zsh -lc "rg -n \"dbg\\.w|dbg\\[3\\]|density target|density-target|compliance|lambda|DENSITY\" src/solvers/twofield/pressure.wgsl" in /Users/cxc/Github/coffee-sim
+ succeeded in 0ms:
+100://     rhs_c = (s_target − D v)/dt,  s_target = max(ρ̄_c/ρ_rest − 1, 0)/(DENSITY_RELAX·dt),
+151:// mirrors twofield::DENSITY_RELAX_FRAMES, derivation there: equilibrium compaction drift
+154:const DENSITY_RELAX_FRAMES: f32 = 30.0;
+155:// Uncapped density-target dead-band (dbg.w on): density error |e| below this is treated as zero
+157:// DENSITY_RELAX_FRAMES it is a structural const, not a Params slot.
+158:const DENSITY_TARGET_DEADBAND: f32 = 0.0;
+496:    // DENSITY_RELAX_FRAMES header.)
+497:    // Over-density (+) half of the density source. Legacy (dbg.w ≤ 0.5): rate-limited by
+498:    // DENSITY_RELAX_FRAMES. Uncapped path (dbg.w > 0.5): the full predicted error e at
+499:    // density-error dimension (rate e/dt ⇒ rhs e/dt²), dead-banded by DENSITY_TARGET_DEADBAND —
+501:    // because it is a bounded restoring target (a compliance/αI regularization was tried and
+505:    // Temper-K rate divisor for the uncapped path (dbg.z): legacy uses DENSITY_RELAX_FRAMES (=30,
+511:    if (params.dbg.w > 0.5) {
+512:        s_target = params.dbg.x * max(e_over - DENSITY_TARGET_DEADBAND, 0.0) / (kfac * params.dt);
+514:        s_target = params.dbg.x * max(e_over, 0.0) / (DENSITY_RELAX_FRAMES * params.dt);
+
+exec
+/bin/zsh -lc "sed -n '261,520p' docs/plans/2026-06-20-001-feat-pbmpm-prototype-plan.md" in /Users/cxc/Github/coffee-sim
+exec
+/bin/zsh -lc 'wc -l docs/plans/2026-06-20-001-feat-pbmpm-prototype-plan.md' in /Users/cxc/Github/coffee-sim
+ succeeded in 0ms:
+     278 docs/plans/2026-06-20-001-feat-pbmpm-prototype-plan.md
+
+ succeeded in 0ms:
+---
+
+## Open Questions
+
+- Exact `iteration_count` / `liquid_relaxation` / `liquid_density` that give the best bounce-vs-stability tradeoff within budget — resolved by live tuning in U4.
+- The pre-registered bounce-metric thresholds ("materially exceeds", cap-hit ceiling) — set in U7 before measuring, mirroring the perf gate's pre-register posture.
+- Whether the coarse pre-pass (U8) is needed at all — answered by U4/U6 measurement.
+- The assembled-cost projection method (stubbed second field vs conservative additive bounds) — fixed in U7 before measuring, based on how cheap a credible stub is.
+
+---
+
+## Sources & Research
+
+- Origin: `docs/brainstorms/2026-06-19-pbmpm-rearchitecture-requirements.md` (Codex-approved; KD8 is this plan's mandate).
+- EA SEED PB-MPM — `electronicarts/pbmpm` (WebGPU, `siggraph2024` branch): the per-substep `particle_update → grid_zero → p2g → grid_update → g2p ×iteration_count → integrate` pipeline; the liquid `alpha`/`liquid_relaxation`/`liquid_viscosity` constraint; grid stores only encoded momentum+mass as `atomic<i32>`. Lewin, *A Position Based Material Point Method*, SIGGRAPH 2024 Talks.
+- 3D convergence: PBF (Macklin & Müller 2013) Jacobi low-frequency gap; MGPBD (SIGGRAPH 2025, arXiv 2505.13390) multigrid fix — the U8 reference. WebGPU-Ocean (`matsuoka-601`) ships 3D MLS-MPM at ~300k with fixed-point `atomicAdd` — viability proof at 200k.
+- In-repo: `src/solvers/twofield/` (template — `mod.rs`, `common.wgsl`, `transfers.wgsl`); `src/engine/registry.rs` + `solvers.json` (the 3-edit seam); `tests/twofield_perf.rs` (perf-gate posture); `tests/twofield_scaffold.rs` / `tests/twofield_water.rs` / `tests/twofield_dissipation.rs` (test shapes); `src/utils/gpu.rs:108-122` (the 9-buffer grant + over-report trap); `docs/PERF_NOTES.md` (25.4 ms@207k two-field, ~90 ms@200k xpbd, the `bubble_fine` reduction trap + fix); `docs/issues/003-split-mpm-bind-groups.md`, `docs/issues/004-reduce-p2g-atomic-contention.md`, `docs/issues/002-pressure-solve-cost.md`.
+- XPBI (Yu et al., SIGGRAPH Asia 2024, arXiv 2405.11694) — Klar Drucker-Prager in a position-based loop; deferred bed work, oriented for the follow-up plan only.
+
+exec
+/bin/zsh -lc "rg -n \"for \\(var [ijk] = 0; [ijk] < 3|quadratic|base =|fn bspline|fn weights|3x3x3|4x4x4|cubic\" src/solvers/twofield/transfers.wgsl" in /Users/cxc/Github/coffee-sim
+ succeeded in 0ms:
+94:    var base = vec3<i32>(floor(xl - vec3<f32>(0.5)));
+95:    base = clamp(base, vec3<i32>(0), vec3<i32>(params.grid_dims.xyz) - vec3<i32>(3));
+118:    for (var k = 0; k < 3; k = k + 1) {
+119:        for (var j = 0; j < 3; j = j + 1) {
+120:            for (var i = 0; i < 3; i = i + 1) {
+172:// quadratic B-spline (Jiang et al. APIC) — equivalent to a weight-gradient velocity-derivative
+185:    let open_base = params.coupling.w > 0.5;
+198:    var base = vec3<i32>(floor(xl - vec3<f32>(0.5)));
+199:    base = clamp(base, vec3<i32>(0), vec3<i32>(params.grid_dims.xyz) - vec3<i32>(3));
+213:    for (var k = 0; k < 3; k = k + 1) {
+214:        for (var j = 0; j < 3; j = j + 1) {
+215:            for (var i = 0; i < 3; i = i + 1) {
+
+exec
+/bin/zsh -lc 'rg -n "setup_for|v60_water_setup|v60_bed_setup|twofield|nozzle_radius|max_speed" src/web.rs' in /Users/cxc/Github/coffee-sim
+ succeeded in 0ms:
+84:        let (scene, mats, cfg) = setup_for(scene_kind, solver_id);
+119:                    self.cfg.nozzle_radius,
+218:    /// with the new solver's physics applied (twofield gets its coupling gates — see `setup_for`).
+335:        let (scene, mats, cfg) = setup_for(kind, self.solver_id);
+354:fn setup_for(kind: WebScene, solver_id: SolverId) -> (Scene, Materials, Config) {
+356:    let twofield = solver_id == SolverId::Twofield;
+359:        // All run the calibrated V60-with-bed materials/config; twofield turns on the coupling gates.
+366:            let (mats, mut cfg) = v60_bed_setup(twofield);
+387:            let (mats, cfg) = v60_water_setup(twofield);
+395:            // thick with pores the water threads. For twofield, turn ON the deformable-bed coupling
+403:                max_speed: 25.0,
+407:            if twofield {
+418:/// Calibrated V60 ratios at a browser-friendly spacing. For twofield, turn on the "full coffee"
+420:fn v60_bed_setup(twofield: bool) -> (Materials, Config) {
+432:        nozzle_radius: 0.25,
+433:        max_speed: 25.0,
+442:    if twofield {
+451:        cfg.nozzle_radius = 0.55;
+452:        cfg.max_speed = 12.0;
+466:/// scenes): the same cone+cup at the bed resolution, no grounds. For twofield, widen the jet +
+468:fn v60_water_setup(twofield: bool) -> (Materials, Config) {
+476:        nozzle_radius: 0.25,
+477:        max_speed: 25.0,
+482:    if twofield {
+483:        cfg.nozzle_radius = 0.55;
+484:        cfg.max_speed = 12.0;
+485:        // U2/U3 surface-weighted dissipation (starting values; tune by eye — see v60_bed_setup).
+
+exec
+/bin/zsh -lc "nl -ba docs/plans/2026-06-20-001-feat-pbmpm-prototype-plan.md | sed -n '260,278p'" in /Users/cxc/Github/coffee-sim
+exec
+/bin/zsh -lc "nl -ba docs/plans/2026-06-20-001-feat-pbmpm-prototype-plan.md | sed -n '141,260p'" in /Users/cxc/Github/coffee-sim
+exec
+/bin/zsh -lc "nl -ba docs/plans/2026-06-20-001-feat-pbmpm-prototype-plan.md | sed -n '1,140p'" in /Users/cxc/Github/coffee-sim
+ succeeded in 0ms:
+   260	
+   261	---
+   262	
+   263	## Open Questions
+   264	
+   265	- Exact `iteration_count` / `liquid_relaxation` / `liquid_density` that give the best bounce-vs-stability tradeoff within budget — resolved by live tuning in U4.
+   266	- The pre-registered bounce-metric thresholds ("materially exceeds", cap-hit ceiling) — set in U7 before measuring, mirroring the perf gate's pre-register posture.
+   267	- Whether the coarse pre-pass (U8) is needed at all — answered by U4/U6 measurement.
+   268	- The assembled-cost projection method (stubbed second field vs conservative additive bounds) — fixed in U7 before measuring, based on how cheap a credible stub is.
+   269	
+   270	---
+   271	
+   272	## Sources & Research
+   273	
+   274	- Origin: `docs/brainstorms/2026-06-19-pbmpm-rearchitecture-requirements.md` (Codex-approved; KD8 is this plan's mandate).
+   275	- EA SEED PB-MPM — `electronicarts/pbmpm` (WebGPU, `siggraph2024` branch): the per-substep `particle_update → grid_zero → p2g → grid_update → g2p ×iteration_count → integrate` pipeline; the liquid `alpha`/`liquid_relaxation`/`liquid_viscosity` constraint; grid stores only encoded momentum+mass as `atomic<i32>`. Lewin, *A Position Based Material Point Method*, SIGGRAPH 2024 Talks.
+   276	- 3D convergence: PBF (Macklin & Müller 2013) Jacobi low-frequency gap; MGPBD (SIGGRAPH 2025, arXiv 2505.13390) multigrid fix — the U8 reference. WebGPU-Ocean (`matsuoka-601`) ships 3D MLS-MPM at ~300k with fixed-point `atomicAdd` — viability proof at 200k.
+   277	- In-repo: `src/solvers/twofield/` (template — `mod.rs`, `common.wgsl`, `transfers.wgsl`); `src/engine/registry.rs` + `solvers.json` (the 3-edit seam); `tests/twofield_perf.rs` (perf-gate posture); `tests/twofield_scaffold.rs` / `tests/twofield_water.rs` / `tests/twofield_dissipation.rs` (test shapes); `src/utils/gpu.rs:108-122` (the 9-buffer grant + over-report trap); `docs/PERF_NOTES.md` (25.4 ms@207k two-field, ~90 ms@200k xpbd, the `bubble_fine` reduction trap + fix); `docs/issues/003-split-mpm-bind-groups.md`, `docs/issues/004-reduce-p2g-atomic-contention.md`, `docs/issues/002-pressure-solve-cost.md`.
+   278	- XPBI (Yu et al., SIGGRAPH Asia 2024, arXiv 2405.11694) — Klar Drucker-Prager in a position-based loop; deferred bed work, oriented for the follow-up plan only.
+
+ succeeded in 0ms:
+   141	
+   142	- Goal: water particles transfer to and from the fixed-point grid each iteration and fall under gravity without exploding.
+   143	- Requirements: R2, R7
+   144	- Dependencies: U1
+   145	- Files:
+   146	  - Create: `src/solvers/pbmpm/transfers.wgsl`
+   147	  - Modify: `src/solvers/pbmpm/mod.rs`, `src/solvers/pbmpm/common.wgsl`
+   148	  - Test: `tests/pbmpm_transfers.rs`
+   149	- Approach: Implement `grid_zero` (clear the `atomic<i32>` `[mass, mom.xyz]` lanes — the grid carries *only* these per KTD8, no displacement lane), `p2g` (**3×3×3 (27-node) quadratic-B-spline** scatter via fixed-point `atomicAdd`, APIC affine momentum — matching the twofield stencil, not a 4³ cubic one), `grid_update` (decode `mom/mass`, apply gravity, write the float grid velocity/displacement locally — not as a fixed-point lane), and `g2p` (gather velocity + reconstruct the APIC `B` matrix, contributing to per-particle `D`). Wire the four passes into the per-substep loop in `step()`. Cell-binning before `p2g` (KTD6) is a *ported/adapted* subsystem — include it only if the visual/perf needs it, and account its cost in U6 (do not assume the XPBD neighbor-gather reorder drops in for scatter for free).
+   150	- Patterns to follow: `src/solvers/twofield/transfers.wgsl:118-120,213-215` (the 3×3×3 P2G/G2P loops), `:172` (quadratic B-spline), `src/solvers/twofield/common.wgsl:81-147` (grid lanes, `fp_encode`/`fp_decode`, overflow-headroom math), EA SEED `particleToGrid`/`gridToParticle`/`gridUpdate`.
+   151	- Execution note: Exploratory/visual-first. Confirm "water falls and pools, no detonation" in the webapp before formalizing. A single light CPU-twin mass/momentum round-trip sanity check is enough here; the full conservation gate is pinned in Phase B (U6).
+   152	- Test expectation: one light sanity check (round-trip preserves total mass and momentum within float round-off on a small fixed scene). Heavier invariants deferred to U6.
+   153	- Verification: in the webapp, water emitted into a box falls and accumulates; velocities stay bounded; the sanity check passes.
+   154	
+   155	### U4. Position-based compliant density constraint (the bounce mechanism)
+   156	
+   157	- Goal: the pool is stiff enough that impacts spike a restoring correction and the water visibly bounces/scatters.
+   158	- Requirements: R1
+   159	- Dependencies: U2, U3
+   160	- Files:
+   161	  - Create: `src/solvers/pbmpm/constraint.wgsl`
+   162	  - Modify: `src/solvers/pbmpm/mod.rs`
+   163	  - Test: `tests/pbmpm_constraint.rs`
+   164	- Approach: Implement `particle_update` — per liquid particle read the per-particle `deformation_displacement` `D` (per KTD8: a float `mat3x3`, zeroed at the start of each substep's iteration loop, accumulated across iterations), compute `alpha = 0.5*(1/liquid_density − tr(D) − 1)`, apply the compliant volume correction `liquid_relaxation·alpha·I` and the viscous `liquid_viscosity·deviatoric(D)` shear term, write `D` back. Run the `particle_update → grid_zero → p2g → grid_update → g2p` bundle `iteration_count` times per substep (the grid rebuilds each iteration so corrections propagate spatially), then `particle_integrate` once. Expose `iteration_count`, `liquid_relaxation`, `liquid_density`, `liquid_viscosity` as `Params`/`Config` lanes for live tuning.
+   165	- Patterns to follow: EA SEED `particleUpdatePBMPM.wgsl` (the `alpha`/relaxation/viscosity formula), `src/solvers/twofield/mod.rs` step-pipeline replay (`:2483-2534`) for looping passes per substep.
+   166	- Execution note: Exploratory/visual-first — this is the crux. Tune `iteration_count`/`liquid_relaxation` live against the `high-velocity-jet-impact` scene; the verification is the visual bounce vs twofield/xpbd, not a unit test. A pure-Rust formula-mirror test (the constraint curve only) may be added once the formula is settled.
+   167	- Test expectation: optional pure-Rust formula mirror (mirror the `alpha`/correction math on the CPU, like `tests/twofield_dissipation.rs`) once tuned. No GPU behavioral gate here; the bounce is pinned quantitatively in U7.
+   168	- Verification: the live `high-velocity-jet-impact` render shows crown/rebound/scatter on the pool surface; the settled pool holds shape (no spontaneous stirring); behavior is qualitatively at xpbd/main level and clearly past twofield.
+   169	
+   170	### U5. Collider boundary conditions + floor/wall restitution
+   171	
+   172	- Goal: water rebounds off the cup floor and walls (not free-slip energy absorption), so the floor bounce reads physically.
+   173	- Requirements: R1
+   174	- Dependencies: U3
+   175	- Files:
+   176	  - Modify: `src/solvers/pbmpm/transfers.wgsl` (the `grid_update` BC block), `src/solvers/pbmpm/common.wgsl` (SDF solid mirror), `src/solvers/pbmpm/mod.rs`
+   177	  - Test: covered by U7's bounce render/metric
+   178	- Approach: In `grid_update`, apply collider BCs against the SDF solid set with a tunable normal restitution (origin notes two-field's free-slip BC kills normal velocity with no rebound). Reuse two-field's `Primitive` SDF mirror + the wall-band query.
+   179	- Patterns to follow: `src/solvers/twofield/common.wgsl:189-198` (`Primitive` mirror + assert), the two-field wall/boundary BC in `coupling.wgsl`/`surface.wgsl`.
+   180	- Execution note: Exploratory/visual-first — tune restitution against the visual; verified jointly with U4 in U7.
+   181	- Test expectation: none directly — exercised by U7's bounce metric and render (a floor-drop scene should show a measurable rebound).
+   182	- Verification: a column dropped onto the bare cup floor visibly rebounds in the webapp; restitution is tunable.
+   183	
+   184	### U6. Perf gate + overflow/range probes
+   185	
+   186	- Goal: pin the real-time gate and both overflow/range surfaces now that the core runs and looks right.
+   187	- Requirements: R2, R7
+   188	- Dependencies: U4, U5
+   189	- Files:
+   190	  - Test: `tests/pbmpm_perf.rs`, `tests/pbmpm_transfers.rs` (overflow/range probes), `examples/pbmpm_scaling.rs` (breakdown printer)
+   191	- Approach: Mirror `tests/twofield_perf.rs` — pre-register constants *before* running (`REALTIME_MS_GATE = 33.0`, a single-phase water-only impact scene composed by box-edge to land ~200k, warmup 50 + median 30 frames, per-frame = `substeps × profile().total_micros()`). Add **two distinct probes per R7**: (a) a fixed-point probe that drives a fast pour and asserts the *grid* momentum lanes stay within `FP_CLAMP` (the twofield headroom math, coupled to the velocity cap; extend that note if PB-MPM adds any new scattered fixed-point lane); (b) a float-range probe that asserts the *per-particle* `deformation_displacement`/position-correction state stays finite and bounded (no NaN/blow-up) on the same fast pour. Add a breakdown example so the dominant pass is named.
+   192	- Patterns to follow: `tests/twofield_perf.rs:39-274` (pre-register + median + no-fallback assert + composition guards), `examples/twofield_scaling.rs`, `src/solvers/twofield/common.wgsl:124-137` (overflow headroom).
+   193	- Execution note: This is the appropriate place for pinned gates — the mechanism is now settled by Phase A's visual confirmation.
+   194	- Test scenarios:
+   195	  - Perf: ~200k single-phase water impact scene runs ≤33 ms median (no-fallback RED on miss, naming the dominant pass). Composition guard: particle count in a pinned band so the gate can't be passed with a cheaper mix.
+   196	  - Linearity: 40k→200k within a pre-registered factor (mirror the twofield linearity gate).
+   197	  - Fixed-point grid lanes: a fast/high-velocity pour keeps the momentum lanes within `FP_CLAMP`; assert no saturation.
+   198	  - Per-particle float state: `D`/position-correction stays finite and within a pinned magnitude bound on the same pour.
+   199	- Verification: `tests/pbmpm_perf.rs` reports a real median; both probes pass; the breakdown example prints the per-pass cost split.
+   200	
+   201	### U7. Pinned comparison harness → bounce metric + candidate-D + assembled-cost gate → go/no-go
+   202	
+   203	- Goal: produce the measured numbers against pre-registered thresholds and the documented decision.
+   204	- Requirements: R3, R4, R5, R6
+   205	- Dependencies: U6
+   206	- Files:
+   207	  - Test: `tests/pbmpm_bounce.rs`
+   208	  - Create: `.deliberate/renders/pbmpm/` capture set (webapp), a go/no-go decision note
+   209	  - Modify: `src/solvers/pbmpm/mod.rs` (test read-back API for the bounce metric)
+   210	- Approach:
+   211	  - **Pinned comparison harness (R5):** define ONE physical test config — emitter position/flow, particle spacing, velocity cap, geometry, and the impact-measurement window — fixed *outside* the per-solver `src/web.rs::setup_for` defaults (which give twofield a wider nozzle + lower cap, `web.rs:465,482`), so PB-MPM, xpbd, twofield, and candidate-D are measured on identical physics. This pinned config is the substrate for every comparison below.
+   212	  - **Bounce metric (R3), thresholds pre-registered before reading results:** a localized, mass-weighted post-impact rebound/spread measure on the pinned scene, with a pre-set rebound/spread threshold, a cap-hit ceiling, a no-popcorn (single-particle ejecta) guard, and a conservation guard so it can't be gamed by noisy motion. Capture for pbmpm, xpbd, twofield.
+   213	  - **Candidate D (R5):** capture the same metric for the two-field **DensU density-target proxy** via `set_density_target_mode_for_test(true)` + `set_density_rate_k_for_test(k)` per KTD7 — labeled as the proxy, not the full compliant D. Record the PB-MPM-vs-D delta with a pre-registered "materially exceeds" threshold.
+   214	  - **Assembled-cost projection (R4) — a HARD gate, method fixed before measurement:** project the *assembled* two-velocity frame cost = single-phase measured cost + conservative upper bounds (or a measured stub) for the second velocity field, the drag pass, the `λ` ping-pong, bed/plasticity, and wetting, × the substep multiplier, + U8 if triggered; plus a buffer/pass-family ledger (each prospective entry point's storage-buffer count vs the 9 grant and 16 cap, with the pass-family split that keeps it ≤9). The decision input is **projected assembled ≤ 33 ms@200k**, not the single-phase number — a single-phase pass alone cannot declare GO.
+   215	  - **Decision (R6):** record GO only if (bounce delta vs D materially positive) AND (projected assembled ≤ 33 ms); otherwise NO-GO with the fallback ladder (D → B → two-field coupling-only) as the recorded next step.
+   216	  - Capture the live `high-velocity-jet-impact` + `dam-break-slosh` comparison renders (pbmpm vs twofield vs xpbd) into `.deliberate/renders/pbmpm/` via the established `agent-browser` CDP method.
+   217	- Patterns to follow: `.deliberate/renders/rewrite/manifest.md` (capture method + naming), `tests/twofield_perf.rs` (pre-registered, no-fallback measurement posture), the two-field `set_density_target_mode_for_test`/`set_density_rate_k_for_test` path (`src/solvers/twofield/mod.rs:904,913`).
+   218	- Execution note: Measurement + decision unit — the thresholds are pinned BEFORE results are read; bounce-vs-D and projected-assembled-cost are both pass/fail decision inputs, not just recorded numbers.
+   219	- Test scenarios:
+   220	  - Bounce metric exceeds its pre-registered threshold and materially exceeds the twofield baseline on the pinned scene; cap-hit below ceiling; no-popcorn holds; mass/energy conserved.
+   221	  - The pbmpm-vs-D delta is computed against its pre-registered threshold (sign + magnitude), labeled as the DensU proxy.
+   222	  - The assembled-cost projection (with its pre-fixed method + bounds) yields a projected frame time, asserted against ≤33 ms as a GO precondition.
+   223	- Verification: the go/no-go note states the bounce delta vs D, the projected assembled frame time + buffer ledger, and the GO/NO-GO with its consequent next step; the comparison renders exist.
+   224	
+   225	### U8. Coarse-grid pressure pre-pass — CONTINGENT (build only if U4/U6 show 3D bulk compressibility)
+   226	
+   227	- Goal: recover global low-frequency incompressibility if pure-local-Jacobi PB-MPM shows visible bulk compression at the prototype's iteration budget.
+   228	- Requirements: R1, R2 (only if triggered)
+   229	- Dependencies: U4, U6 (gated on their measured bulk-compressibility finding)
+   230	- Files:
+   231	  - Modify: `src/solvers/pbmpm/constraint.wgsl` or a new `src/solvers/pbmpm/coarse.wgsl`, `src/solvers/pbmpm/mod.rs`
+   232	- Approach: Add a coarse-level pressure pre-pass (coarse-to-fine V-cycle / MGPBD-style aggregation) that supplies the low-frequency correction the local constraint converges slowly. Implement any per-frame reduction as a **compacted active-cell list folded into existing passes** (atomic-append), never a single-workgroup all-cells reduction (the two-field `bubble_fine` trap that cost ~80% of frame). Re-run U6's perf gate and U7's bounce metric + assembled-cost projection after (the pre-pass cost enters the projection).
+   233	- Patterns to follow: MGPBD (SIGGRAPH 2025, arXiv 2505.13390); two-field's compacted-pocket-list fix (`docs/PERF_NOTES.md:81-96`); `docs/issues/002-pressure-solve-cost.md` (warm-start, residual-adaptive iteration).
+   234	- Execution note: Do not build unless measurement triggers it. Its cost counts against the KD8 budget (real global low-frequency work — KTD4).
+   235	- Test expectation: re-run U6 perf + U7 bounce/cost after building; no new standalone gate.
+   236	- Verification: bulk-compressibility artifact is gone in the webapp AND the perf gate still holds (or the go/no-go records that the coarse pass busts the budget).
+   237	
+   238	---
+   239	
+   240	## Scope Boundaries
+   241	
+   242	In scope: the single-phase PB-MPM water core (emission, transfers, compliant density constraint, BC/restitution), the perf gate + overflow/range probes, the pinned bounce metric, the candidate-D (DensU proxy) comparison, the two-velocity assembled-cost projection + buffer ledger, the comparison renders, and the documented go/no-go. The contingent coarse pre-pass (U8) is in scope only if measurement triggers it.
+   243	
+   244	### Deferred to Follow-Up Work (contingent on a GO)
+   245	- The full coffee/water coupling rebuild — two co-located momentum fields, Laibe-Price drag, the pore-packing mixture (`ρ₀·(1−φ_s)`, saturation), `λ`-as-pore-pressure buoyancy/Terzaghi (origin KD5, still a hypothesis), XPBI bed plasticity/crater, conserved wetting/absorption — and the rest of the validation ladder (origin KD3–KD7, KD9). These are full of open questions this prototype exists to resolve; planning them in detail now would detail work that a no-go abandons.
+   246	
+   247	### Outside this effort's identity
+   248	- The two-field / `main` / XPBD solvers are not modified to become primary; they stay as reference/referee + donors (and two-field's DensU path is *read* for the candidate-D comparison, not changed). No full fine-grid Poisson is introduced.
+   249	
+   250	---
+   251	
+   252	## Risks & Dependencies
+   253	
+   254	- 3D low-frequency incompressibility: pure-local-Jacobi PB-MPM is documented to leave ~1–5% bulk compressibility at few iterations (PBF/PB-MPM inherit Jacobi's slow low-frequency convergence). Mitigation: KTD4 / U8 contingency (coarse V-cycle). This is the single largest realism risk.
+   255	- Assembled-cost blind spot: a single-phase ≤33 ms result does not bound the full two-velocity system. Mitigation: R4 assembled-cost projection is a hard gating deliverable (U7), not an afterthought.
+   256	- Overflow/range on fast pours: two distinct surfaces (R7) — the fixed-point grid momentum lanes (twofield headroom math, velocity-cap-coupled) and the per-particle *float* `D`/position-correction state (NaN/blow-up). Mitigation: R7's two probes (U6).
+   257	- Storage-buffer ceiling: the assembled solver may exceed the 9-buffer grant. Mitigation: KTD5 pass-family split + ledger (U7); browser `request_device` verification before relying on >9.
+   258	- 3D P2G atomic contention at 200k. Mitigation: KTD6 cell-sort before scatter.
+   259	- `λ`-as-pore-pressure (origin KD5) is unproven — but it is *deferred* coupling work, not in this prototype; flagged so the follow-up plan owns the audit.
+   260	
+
+ succeeded in 0ms:
+     1	---
+     2	title: "feat: PB-MPM gating prototype — single-phase water bounce + perf go/no-go"
+     3	type: feat
+     4	status: active
+     5	date: 2026-06-20
+     6	origin: docs/brainstorms/2026-06-19-pbmpm-rearchitecture-requirements.md
+     7	---
+     8	
+     9	# PB-MPM gating prototype — single-phase water bounce + perf go/no-go
+    10	
+    11	## Summary
+    12	
+    13	Build a minimal single-phase **PB-MPM** (Position-Based MPM) water solver as a new registered solver, port EA SEED's compliant position-based density constraint, and **measure** whether it (a) visibly bounces/scatters on impact and (b) clears ≤33 ms @ ~200k on the fixed-point i32 grid — *before* any coffee/water coupling is built. The prototype ends in a documented **go/no-go**: a measured bounce delta vs candidate D and a projected *assembled* (two-velocity) frame cost decide whether the full re-architecture proceeds or falls back to candidate D/B.
+    14	
+    15	This is the origin doc's **KD8 gate**. It is an unsettled bet validated by the visual oracle, so the execution posture is **visual-first**: confirm the bounce in the live webapp, then pin invariants.
+    16	
+    17	---
+    18	
+    19	## Problem Frame
+    20	
+    21	The two-field grid solver is the fastest in-repo (25.4 ms @ 207k) and owns the coffee/water coupling, but its water reads mushy and "just pools where it is" — no bounce/scatter. The converged diagnosis (origin Problem Frame): a bounce is a **stiff-incompressibility** response, and two-field's under-converged `∇·v` Jacobi projection is soft *because* it under-converges. PB-MPM replaces that projection with a **compliant position-based density constraint** that gives stable stiff push-back at a few iterations with **no global Poisson** — the bounce-and-speed reconciliation, with XPBD as the in-repo existence proof.
+    22	
+    23	But the assembled two-velocity porous PB-MPM has no shipped reference, `λ`-as-pore-pressure is unproven, and the assembled perf is unknown. Per KD8, the whole effort is **gated on a prototype** that retires the two retirable-by-measurement risks (bounce + frame rate) first. This plan builds and measures that prototype only; the coupling rebuild is deferred to a contingent follow-up plan.
+    24	
+    25	---
+    26	
+    27	## Requirements
+    28	
+    29	### Bounce and realism
+    30	- R1. The single-phase PB-MPM water core visibly **bounces/scatters on impact** in the live webapp (the `high-velocity-jet-impact` and `dam-break-slosh` Debug Scenes), comparable to xpbd/main and clearly livelier than twofield. Primary oracle: the visual comparison render. (origin R1)
+    31	- R3. The bounce is quantified by a **non-gameable** localized, mass-weighted post-impact rebound/spread metric, guarded by a low cap-hit rate (rebound is not a clamp artifact), a no-popcorn check (no single-particle ejecta spikes), and conservation (no injected mass/energy). (origin R1, R4)
+    32	
+    33	### Real-time and budget
+    34	- R2. A **pre-registered perf gate** confirms ≤33 ms @ ~200k for single-phase water on the fixed-point i32 grid: no float atomics, Tint-uniform, each entry point within the 9-storage-buffer grant. (origin R2)
+    35	- R7. **Two overflow/range surfaces are gated, distinguished by type:** (a) the fixed-point i32 **grid accumulation lanes** (mass + momentum, coupled to the velocity cap — the existing two-field headroom math applies; any *new* scattered fixed-point lane PB-MPM adds must extend it); (b) the **per-particle `deformation_displacement` D and position-correction state**, which are *float* (not fixed-point) — gated for range/NaN/blow-up on fast pours, not i32 overflow. The plan must not conflate the two. (origin KD10)
+    36	
+    37	### Decision integrity
+    38	- R4. A **two-velocity cost projection** + a buffer/pass-family ledger projects the *assembled* solver's frame time and buffer budget, so the go/no-go reflects the full system (second velocity field, drag, λ ping-pong, bed/wetting buffers), not single-phase water alone. (origin KD8, KD10)
+    39	- R5. **Candidate D** is measured on the *same pinned* bounce scene/config, so choosing full PB-MPM over D rests on a measured bounce delta, not assumption. The in-repo D proxy is the two-field **DensU density-target** path (`dbg.w` uncapped/two-sided target) — note this is the over-pack relief lever, *not* a true compliant projection (the compliance-diagonal variant was reviewed harmful and dropped, `pressure.wgsl`); the plan measures this proxy and labels it as such. (origin Candidate D)
+    40	- R6. The prototype produces a **documented go/no-go**. On fail, the recorded next step is the fallback ladder: D → B → two-field coupling-only. (origin KD8)
+    41	
+    42	---
+    43	
+    44	## Key Technical Decisions
+    45	
+    46	- KTD1. **Port EA SEED's PB-MPM pipeline shape.** Per substep, repeat `iteration_count`×: `particle_update` (per-particle compliant constraint, writes `deformation_displacement`) → `grid_zero` → `p2g` → `grid_update` (decode + BC) → `g2p` (APIC); then `particle_integrate` once. The grid is rebuilt every iteration — it is a transient transfer medium, no standing pressure field. Liquid constraint: `alpha = 0.5*(1/liquid_density − tr(D) − 1)`, corrected by a compliant `liquid_relaxation·alpha·I` volume term + a `liquid_viscosity·deviatoric(D)` shear term. Rationale: this is the shipped real-time reference; bounce comes from the compliant volume correction, stability from relaxation-damped iterative rebuild — no global solve. (origin KD1)
+    47	- KTD2. **Mirror `src/solvers/twofield/` as the structural template.** Reuse its `Params` Rust↔WGSL mirror + size assert, `FP_SCALE = 2^18` fixed-point `atomic<i32>` grid encoding, WGSL-concatenation module assembly, the `bg()` per-pass bind-group helper, the test/perf harness shapes, and the registry seam. Rationale: proven on-stack conventions; minimizes net-new infrastructure. (origin: migration shape)
+    48	- KTD3. **Visual-first execution posture.** Confirm the bounce in the webapp (Phase A) before pinning invariants; concentrate the pinned perf/bounce/conservation gates in Phase B once the mechanism is settled by measurement. Rationale: the prototype is an unsettled bet — pinning a heavy suite against an approach that may be abandoned for D/B is premature.
+    49	- KTD4. **Pure-local-Jacobi first; coarse-grid pre-pass is contingent.** Build and measure the minimal local-Jacobi PB-MPM core first. The KD2 coarse-grid pressure pre-pass (real global low-frequency work) is added only if measurement shows 3D **bulk compressibility** (the known PBF/PB-MPM low-frequency convergence gap, ~1–5% drift at few iterations) spoils the look. Reference: MGPBD (SIGGRAPH 2025) / a coarse-to-fine V-cycle. Rationale: minimal core first; pay the global-work cost only if the visual needs it. (origin KD2)
+    50	- KTD5. **Plan to the 9-buffer grant.** Keep each entry point within the device's 9 requested storage buffers (`src/utils/gpu.rs`), using the pass-family bind-group split (`docs/issues/003-split-mpm-bind-groups.md`) before any `GpuContext` limit change. If >9 is unavoidable, raise `NEEDED_STORAGE_BUFFERS` and gate on live browser `request_device` verification (the over-report trap is present-code, not a stale note). Rationale: web portability. (origin KD10)
+    51	- KTD6. **Cell-bin particles before P2G — as a ported subsystem with measured cost, not a free fix.** The 3D 3×3×3 (27-node) scatter's atomic contention on clustered cells is the known P2G bottleneck at 200k (`docs/issues/004-reduce-p2g-atomic-contention.md`). The XPBD cell-order reorder (`src/utils/hash.rs`) is *neighbor-gather* machinery, not a drop-in P2G-scatter fix — porting/adapting it for scatter coherence is real work whose cost counts in the U6 budget. Rationale: name it as ported, don't assume the contention is already solved. (origin: perf)
+    52	- KTD7. **Measure candidate D via the existing two-field DensU density-target proxy.** Use `set_density_target_mode_for_test(true)` + `set_density_rate_k_for_test(k)` (`dbg.w` uncapped two-sided density target) on two-field to capture D's bounce metric on the *same pinned scene*, rather than building D fresh. Label it the DensU proxy, not the full compliant Candidate D (compliance was tried and dropped). Rationale: a measured comparison without a rebuild, honestly scoped. (origin Candidate D)
+    53	- KTD8. **The per-particle PB-MPM state is decided up front (KD10).** `deformation_displacement` `D` (a `mat3x3` velocity-gradient×dt accumulation), `deformation_gradient` `F`, `liquid_density`, and the constraint scalars live in the *particle* storage buffer as floats — not on the grid. The grid carries only `[mass, mom.xyz]` as fixed-point `atomic<i32>`. `D` is zeroed at the start of each substep's iteration loop and accumulated across iterations; `F` carries across substeps. Rationale: resolves the grid-vs-particle state ambiguity and tells R7 which surface is fixed-point (grid) vs float (particle). (origin KD10)
+    54	
+    55	---
+    56	
+    57	## High-Level Technical Design
+    58	
+    59	### Per-frame solver pipeline (Phase A core)
+    60	
+    61	```mermaid
+    62	flowchart TB
+    63	  emit[emit pour particles] --> sub{for each substep}
+    64	  sub --> iter{repeat iteration_count}
+    65	  iter --> pu[particle_update<br/>compliant density constraint<br/>writes deformation_displacement D]
+    66	  pu --> gz[grid_zero<br/>clear atomic i32 lanes]
+    67	  gz --> p2g[p2g scatter<br/>fixed-point atomicAdd<br/>mass + momentum]
+    68	  p2g --> gu[grid_update<br/>decode, gravity, collider BC + restitution]
+    69	  gu --> g2p[g2p gather<br/>velocity + APIC B]
+    70	  g2p --> iter
+    71	  iter -->|iterations done| integ[particle_integrate<br/>advect positions]
+    72	  integ --> sub
+    73	  sub -->|substeps done| done[frame complete]
+    74	```
+    75	
+    76	The grid carries only `[mass, mom.x, mom.y, mom.z]` as `atomic<i32>` (stride-4 per node, mirroring two-field's `common.wgsl`). Incompressibility lives entirely in `particle_update` as a per-particle compliant correction to `deformation_displacement` — there is no pressure buffer and no Poisson pass. This is the structural departure from two-field (which has a `node_setup → cell_classify → smooth → residual → coarse → prolong → project` pressure stack).
+    77	
+    78	### The go/no-go gate (Phase B)
+    79	
+    80	```mermaid
+    81	flowchart TB
+    82	  m[measure: visual bounce + bounce metric R3<br/>perf gate R2 + cost projection R4<br/>candidate-D delta R5] --> q1{bounce delta vs D<br/>materially positive?}
+    83	  q1 -->|no| d[GO candidate D<br/>cheaper, no coupling rebuild]
+    84	  q1 -->|yes| q2{projected assembled<br/>frame ≤ 33ms?}
+    85	  q2 -->|no| q3{coarse pre-pass<br/>or scope trim recovers it?}
+    86	  q3 -->|no| fb[NO-GO PB-MPM<br/>fall back: D then B then<br/>two-field coupling-only]
+    87	  q3 -->|yes| go
+    88	  q2 -->|yes| go[GO PB-MPM<br/>proceed to coupling-rebuild follow-up plan]
+    89	```
+    90	
+    91	---
+    92	
+    93	## Output Structure
+    94	
+    95	```text
+    96	src/solvers/pbmpm/
+    97	  mod.rs            # Solver impl, Params mirror + assert, step pipeline, test API
+    98	  common.wgsl       # Params mirror, FP encode/decode, grid bindings, helpers
+    99	  transfers.wgsl    # grid_zero / p2g / grid_update (BC) / g2p
+   100	  constraint.wgsl   # particle_update (compliant density constraint) + particle_integrate
+   101	```
+   102	
+   103	Plus edits to `src/engine/solvers.json`, `src/engine/registry.rs`, `src/solvers/mod.rs`, optionally `src/web.rs` (`setup_for` per-solver config), and new tests under `tests/`.
+   104	
+   105	---
+   106	
+   107	## Implementation Units
+   108	
+   109	Phase A (U1–U5) builds a runnable core verified by the visual oracle. Phase B (U6–U7) pins invariants and produces the decision. U8 is contingent. Per KTD3, Phase A units carry an exploratory execution note and keep coverage to light sanity checks; the enumerated, pinned test scenarios live in Phase B.
+   110	
+   111	### U1. Solver scaffold + registry wiring
+   112	
+   113	- Goal: a new `pbmpm` solver that builds via the registry, appears in the webapp dropdown, and runs an empty/gravity-only step without panicking.
+   114	- Requirements: R2 (substrate)
+   115	- Dependencies: none
+   116	- Files:
+   117	  - Create: `src/solvers/pbmpm/mod.rs`, `src/solvers/pbmpm/common.wgsl`
+   118	  - Modify: `src/engine/solvers.json`, `src/engine/registry.rs`, `src/solvers/mod.rs`
+   119	  - Test: `tests/pbmpm_scaffold.rs`
+   120	- Approach: Add the `pbmpm` catalog row (`solvers.json`), a `SolverId::Pbmpm` variant + `id()`/`all()` arms, and a `build_solver` match arm (`registry.rs`). Implement `trait Solver` (build/reset/step/particles/metrics/profile) mirroring `twofield/mod.rs`'s skeleton: `Params` `#[repr(C)]` + `bytemuck` + a `const _ = assert!(size_of::<Params>() == N)` ABI lock, the `FP_SCALE` constant, the WGSL-concat `build()`, and the `bg()` helper. The particle storage buffer carries the per-particle PB-MPM state per KTD8 (`D`, `F`, `liquid_density`, constraint scalars) from the start so the layout is fixed up front. No physics yet beyond grid clear + gravity advect so the dropdown renders something.
+   121	- Patterns to follow: `src/engine/registry.rs:23-93`, `src/engine/solvers.json`, `src/solvers/twofield/mod.rs:316-363` (Params+assert), `:1793-1832` (WGSL assembly + `bg()`), `tests/twofield_scaffold.rs:34-136`.
+   122	- Execution note: Exploratory. Keep the scaffold test to the structural gate only.
+   123	- Test expectation: structural only — builds via the registry arm, particle count round-trips, determinism (bit-exact re-run), and `MAX_STORAGE_BUFFERS_PER_ENTRY_POINT` within the 9 grant. No behavioral assertions yet.
+   124	- Verification: the solver appears in the `www` dropdown and steps without panic; `tests/pbmpm_scaffold.rs` passes.
+   125	
+   126	### U2. Emission + water-pool activation
+   127	
+   128	- Goal: a pour activates dormant water-pool slots so the `high-velocity-jet-impact` scene (and any pour scene) actually emits water into the new solver.
+   129	- Requirements: R1 (substrate — R1's oracle scene is a pour)
+   130	- Dependencies: U1
+   131	- Files:
+   132	  - Modify: `src/solvers/pbmpm/mod.rs` (the `emit()` path, water-pool layout, `water_count` growth)
+   133	  - Test: covered by U4's visual validation; light count check in `tests/pbmpm_scaffold.rs`
+   134	- Approach: Port two-field's emission model — a pre-allocated water pool with a live range `[0, water_count)` that grows as the pour activates dormant slots (dormant slots parked off-scene, never dispatched), fed by the canonical `EmissionInput`. Mirror the `water_count`/`particle_count` live-set discipline so transfer/constraint passes dispatch only the live range. The `high-velocity-jet-impact` scene (`src/engine/scene.rs:409`) declares the pour this consumes.
+   135	- Patterns to follow: `src/solvers/twofield/mod.rs` emission (`fn emit`, the water-pool/dormant-slot doc at `:21-27`, `:476-481`, `EmissionInput` activation `:558`), `src/engine/scene.rs:409` (the jet scene's pour).
+   136	- Execution note: Exploratory/visual-first.
+   137	- Test expectation: light — `water_count` grows when a pour is active and stays within pool capacity; no per-particle behavioral assertion yet.
+   138	- Verification: in the webapp, selecting `high-velocity-jet-impact` with the pbmpm solver emits a visible water stream.
+   139	
+   140	### U3. APIC fixed-point transfers (grid_zero / p2g / grid_update / g2p)
+
+codex
+The revised plan is consistent with the checked code paths so far: two-field really is using 27-node quadratic transfers, the DensU proxy setters exist, `dbg.w` is the uncapped density target path, and `setup_for` does give twofield different nozzle/cap defaults. I’m doing one last pass for sequencing and decision-gate gaps rather than more code spelunking.
+exec
+/bin/zsh -lc "nl -ba src/engine/scene.rs | sed -n '390,420p'" in /Users/cxc/Github/coffee-sim
+exec
+/bin/zsh -lc "nl -ba src/solvers/twofield/transfers.wgsl | sed -n '168,220p'" in /Users/cxc/Github/coffee-sim
+exec
+/bin/zsh -lc "nl -ba src/solvers/twofield/pressure.wgsl | sed -n '488,520p'" in /Users/cxc/Github/coffee-sim
+ succeeded in 0ms:
+   390	            box_min: [-7.0, -10.0, -7.0],
+   391	            box_max: [7.0, 10.0, 7.0],
+   392	            solids: crate::utils::geometry::v60_dripper(),
+   393	            // Half-cup dam in the -x half, ~2.3 units tall; cup rejection trims it to the cylinder.
+   394	            regions: vec![SeedRegion {
+   395	                min: [-2.85, -7.85, -2.85],
+   396	                max: [-0.2, -5.5, 2.85],
+   397	                species: Species::Water,
+   398	            }],
+   399	        }
+   400	    }
+   401	
+   402	    /// DEBUG (`sparse-free-jet`): a thin, slow pour into the EMPTY cup — a sparse free stream that
+   403	    /// falls and pools. Same dripper as [`Scene::v60_pour_water_only`] (no bed); `web::setup_for` runs
+   404	    /// it with a thin nozzle + low velocity so the stream stays sparse. (main: `debug_sparse_free_jet`.)
+   405	    pub fn debug_sparse_free_jet() -> Self {
+   406	        Self::v60_pour_water_only()
+   407	    }
+   408	
+   409	    /// DEBUG (`high-velocity-jet-impact`): a fast pour plunging onto a shallow seeded pool in the cup —
+   410	    /// the jet-impact / crater case. Reuses the cup pool seed (like [`Scene::v60_cup_static_full`]) AND
+   411	    /// declares a pour so the (fast) emitter drives the impact. No bed.
+   412	    /// (main: `seed_high_velocity_jet_impact_pool` + a high-speed inflow.)
+   413	    pub fn debug_high_velocity_jet_impact() -> Self {
+   414	        Self {
+   415	            dose_g: 0.0,
+   416	            water_ml: 100.0,
+   417	            pour_water_ml: 150.0, // declares a pour so the fast jet emitter runs; headroom for inflow
+   418	            gravity: [0.0, -20.0, 0.0],
+   419	            box_min: [-7.0, -10.0, -7.0],
+   420	            box_max: [7.0, 10.0, 7.0],
+
+ succeeded in 0ms:
+   488	    // The mean corner density rides along in .z for that pass (the residual lane, free until
+   489	    // `residual` runs).
+   490	    // dbg.x gates the relief on/off (1 in production; 0 only in the stirring isolation arm). The
+   491	    // relief is the original un-banded volume-conservation feedback. (A φ_f-gated dead-band — clamp
+   492	    // the relief in open water to break the settled-pool limit cycle — was MEASURED and rejected:
+   493	    // the settled density error the relief tracks exceeds the band, so a 1–2% dead-band does not
+   494	    // reach the churn and a band large enough would tolerate that much permanent compression. The
+   495	    // churn is pressure under-convergence, not a noise ripple a clamp can cut; see the
+   496	    // DENSITY_RELAX_FRAMES header.)
+   497	    // Over-density (+) half of the density source. Legacy (dbg.w ≤ 0.5): rate-limited by
+   498	    // DENSITY_RELAX_FRAMES. Uncapped path (dbg.w > 0.5): the full predicted error e at
+   499	    // density-error dimension (rate e/dt ⇒ rhs e/dt²), dead-banded by DENSITY_TARGET_DEADBAND —
+   500	    // full-strength relief driving ρ→ρ₀. Calibration found this is THE over-pack lever, stable
+   501	    // because it is a bounded restoring target (a compliance/αI regularization was tried and
+   502	    // dropped — it only re-softened the response). Both paths multiply by dbg.x so the
+   503	    // stirring-isolation gate (dbg.x = 0) still zeros the source. The under-density (−) half is
+   504	    // the interior-gated surface.wgsl pass (KTD5).
+   505	    // Temper-K rate divisor for the uncapped path (dbg.z): legacy uses DENSITY_RELAX_FRAMES (=30,
+   506	    // slow → mushy); full uncap = K=1 (crisp but pumps energy on coupled scenes); the calibrated
+   507	    // sweet spot is K∈(1,30). dbg.z default 0 ⇒ K=1 (full uncap). Smaller K = stiffer/crisper.
+   508	    let kfac = max(params.dbg.z, 1.0);
+   509	    let e_over = rho / params.extra.x - 1.0;
+   510	    var s_target: f32;
+   511	    if (params.dbg.w > 0.5) {
+   512	        s_target = params.dbg.x * max(e_over - DENSITY_TARGET_DEADBAND, 0.0) / (kfac * params.dt);
+   513	    } else {
+   514	        s_target = params.dbg.x * max(e_over, 0.0) / (DENSITY_RELAX_FRAMES * params.dt);
+   515	    }
+   516	    cell_meta[c] = vec4<f32>(select(0.0, f * (s_target - div) / params.dt, f > 0.0), f, rho, cat);
+   517	}
+   518	
+   519	// =================================== coarse setup ==============================================
+   520	// Coarse M̃⁻¹ by hat-weighted RESTRICTION of the fine M̃⁻¹ field over the coarse node's
+
+ succeeded in 0ms:
+   168	}
+   169	
+   170	// APIC gather: new particle velocity + new affine C from the grid field, then advection and the
+   171	// particle-resolution boundary backstop. C = B·D⁻¹ with B = Σ w·v_i·dᵀ and D = (h²/4)·I for the
+   172	// quadratic B-spline (Jiang et al. APIC) — equivalent to a weight-gradient velocity-derivative
+   173	// reconstruction, in the cheap D⁻¹ form.
+   174	@compute @workgroup_size(256)
+   175	fn g2p_water(@builtin(global_invocation_id) gid: vec3<u32>) {
+   176	    let p = gid.x;
+   177	    if (p >= params.water_count) {
+   178	        return;
+   179	    }
+   180	    let h = params.grid_origin.w;
+   181	    var x = pos[p].xyz;
+   182	
+   183	    // Open base (U6 drained-flux mode): escaped particles fall ballistically — they no
+   184	    // longer scatter (p2g guard), so gathering from the empty grid would freeze them.
+   185	    let open_base = params.coupling.w > 0.5;
+   186	    if (open_base && x.y < params.box_min.y) {
+   187	        var v = vel[p].xyz + params.gravity.xyz * params.dt;
+   188	        x = x + v * params.dt;
+   189	        pos[p] = vec4<f32>(x, pos[p].w);
+   190	        vel[p] = vec4<f32>(v, vel[p].w);
+   191	        cmat[3u * p + 0u] = vec4<f32>(0.0);
+   192	        cmat[3u * p + 1u] = vec4<f32>(0.0);
+   193	        cmat[3u * p + 2u] = vec4<f32>(0.0);
+   194	        return;
+   195	    }
+   196	
+   197	    let xl = (x - params.grid_origin.xyz) / h;
+   198	    var base = vec3<i32>(floor(xl - vec3<f32>(0.5)));
+   199	    base = clamp(base, vec3<i32>(0), vec3<i32>(params.grid_dims.xyz) - vec3<i32>(3));
+   200	    let fx = xl - vec3<f32>(base);
+   201	    var w = bspline_w(fx);
+   202	    // U2: analytic weight derivative (1/h-scaled below) for the mass-gradient gather. The full
+   203	    // 3D gradient at node (i,j,k) is (dw[i].x·w[j].y·w[k].z, w[i].x·dw[j].y·w[k].z,
+   204	    // w[i].x·w[j].y·dw[k].z)/h. NOT reusable from B (which uses the d-offset form).
+   205	    var dw = bspline_dw(fx);
+   206	
+   207	    var v = vec3<f32>(0.0);
+   208	    var b0 = vec3<f32>(0.0); // rows of B = Σ w·v_i·dᵀ
+   209	    var b1 = vec3<f32>(0.0);
+   210	    var b2 = vec3<f32>(0.0);
+   211	    var m_local = 0.0;             // U2: Σ w·node_mass (local density, grid_vel[].w)
+   212	    var grad_m = vec3<f32>(0.0);   // U2: Σ ∇w·node_mass (mass gradient, world units)
+   213	    for (var k = 0; k < 3; k = k + 1) {
+   214	        for (var j = 0; j < 3; j = j + 1) {
+   215	            for (var i = 0; i < 3; i = i + 1) {
+   216	                let wijk = w[i].x * w[j].y * w[k].z;
+   217	                let node = base + vec3<i32>(i, j, k);
+   218	                let d = (vec3<f32>(node) - xl) * h;
+   219	                let gvel = grid_vel[node_index(node)];
+   220	                let gv = gvel.xyz;
+
+exec
+/bin/zsh -lc "rg -n \"fn emit|EmissionInput|water_count|water_capacity|DORMANT|emit\\(\" src/solvers/twofield/mod.rs" in /Users/cxc/Github/coffee-sim
+ succeeded in 0ms:
+24://! KTD-6): `EmissionInput` drives the xpbd-shaped volume-consistent arclength-credit emitter
+25://! into a pre-allocated water pool (water live range `[0, water_count)` grows toward
+26://! `water_capacity`; solids sit AFTER the full pool so the KTD-1 range layout survives
+65:use crate::emission::EmissionInput;
+80:/// a real position from `emit()`. Kept finite (not NaN) so any accidental read stays well-defined.
+81:const DORMANT_PARK_Y: f32 = -1.0e9;
+331:    water_count: u32,    // particles [0, water_count) are water (KTD-1 range layout)
+332:    solid_count: u32,    // particles [water_count, water_count + solid_count) are solid grains
+333:    particle_count: u32, // = water_count + solid_count (kernel live-set guard)
+478:    water_count: u32,
+480:    /// pool `[0, water_capacity)`, live `[0, water_count)`, solids
+481:    /// `[water_capacity, water_capacity + solid_count)` — dormant slots are never dispatched).
+482:    water_capacity: u32,
+558:/// `EmissionInput` into activated water-pool particles via the volume-consistent
+644:/// (`[0, water_count)`), then all solids. Lattice + seeded jitter per species spacing, with
+648:/// volume (0 = dry). Returns `(positions, phases, water_count)`.
+693:    let water_count = water.len() as u32;
+696:    let mut phase = vec![0u32; water_count as usize];
+698:    (pos, phase, water_count)
+794:        (self.water_count, self.solid_count)
+943:            n <= self.water_capacity,
+945:            self.water_capacity
+947:        self.water_count = n;
+948:        self.params.water_count = n;
+1067:    /// Activate pour-emitted water particles for this frame from `EmissionInput` — the
+1073:    /// and `water_count` grows. No-ops when not pouring and no backlog remains.
+1074:    fn emit(&mut self, input: &EmissionInput, dt: f32) {
+1125:            let avail = self.water_capacity - (self.water_count + new_pos.len() as u32);
+1166:                self.water_capacity
+1177:        let off_v4 = (self.water_count as u64) * 16;
+1186:        self.water_count += emit_n;
+1187:        self.params.water_count = self.water_count;
+1353:        let live = (self.water_count + self.solid_count) as usize;
+1411:        self.water_count + self.solid_count
+1417:        self.water_capacity
+1445:        // KTD-1 range layout survives emission; dormant slots `[water_count, water_capacity)`
+1447:        // a far below-domain sentinel (y = DORMANT_PARK_Y) so the renderer can cull them when the
+1449:        // clump at one point. emit() overwrites the slot's position when it activates it.
+1456:        let water_capacity = water_seed + dose_headroom;
+1457:        let particle_count = water_capacity + solid_count; // pool size (buffers + readbacks)
+1458:                                                           // Sentinel far below the domain (matched by DORMANT_PARK_Y in particles.wgsl's cull).
+1459:        let park = [scene.box_min[0], DORMANT_PARK_Y, scene.box_min[2], 0.0];
+1461:        positions.resize(water_capacity as usize, park);
+1464:        phases.resize(water_capacity as usize, 0);
+1466:        let water_count = water_seed; // live count
+1506:            water_count,
+2257:            water_count,
+2258:            water_capacity,
+2352:        self.water_count = self.initial_water;
+2353:        self.params.water_count = self.initial_water;
+2366:    fn step(&mut self, dt: f32, input: &EmissionInput) {
+2367:        // Pour emission first (grows water_count for this frame); no-op when not pouring.
+2368:        self.emit(input, dt);
+2370:        debug_assert!(self.water_count <= self.water_capacity);
+2412:        let water_groups = groups(self.water_count).max(1);
+2423:        let dry_dynamic = self.solid_dynamic && self.water_count == 0;
+2720:        // Exposure of the pool layout: with no solids the live water range `[0, water_count)`
+2726:            self.water_count
+2748:            particle_count: self.water_count + self.solid_count, // live set
+2772:        let (pos, phase, water_count) =
+2775:        assert!(water_count > 0, "pour_over seeds water");
+2777:            (water_count as usize) < phase.len(),
+2781:            let expect = if (i as u32) < water_count { 0 } else { 1 };
+
+codex
+**APPROVE**
+
+The revised plan is ready for `/ce-work`. It now makes U7 a real KD8 gate: projected assembled cost is a hard GO precondition, includes second field, drag, lambda ping-pong, bed/plasticity/wetting bounds, substep multiplier, U8 cost if triggered, and a buffer ledger against 9/16 buffers ([plan](/Users/cxc/Github/coffee-sim/docs/plans/2026-06-20-001-feat-pbmpm-prototype-plan.md:214)).
+
+Prior REVISE items are honestly addressed:
+- Candidate D is correctly scoped as the two-field DensU density-target proxy, not compliant projection; repo matches `dbg.w` and the setters ([pressure.wgsl](/Users/cxc/Github/coffee-sim/src/solvers/twofield/pressure.wgsl:497), [mod.rs](/Users/cxc/Github/coffee-sim/src/solvers/twofield/mod.rs:904)).
+- The comparison config is pinned outside `web.rs::setup_for`, which matters because twofield really gets wider nozzle/lower cap ([web.rs](/Users/cxc/Github/coffee-sim/src/web.rs:465)).
+- PB-MPM `D` is correctly per-particle float state, distinct from fixed-point grid lanes, with separate U6 probes.
+- Transfer stencil is explicitly 3x3x3 / 27-node quadratic, matching twofield ([transfers.wgsl](/Users/cxc/Github/coffee-sim/src/solvers/twofield/transfers.wgsl:118)).
+- Emission is now a U2 dependency before constraint visual validation; the twofield water-pool/emission pattern exists as cited.
+- XPBD reorder reuse is treated as a ported, measured subsystem, not free P2G magic.
+- U7 makes bounce-vs-D and projected assembled cost pass/fail decision inputs, with cap-hit/no-popcorn/conservation guards.
+
+The sequencing is sound: U1 scaffold, U2 emission, U3 transfers, U4 constraint, U5 BC/restitution, then U6/U7 quantified gates. The visual-first posture is acceptable because Phase B now contains falsifiable, non-gameable backstops for both bounce and assembled-system risk.
+tokens used
+58,662

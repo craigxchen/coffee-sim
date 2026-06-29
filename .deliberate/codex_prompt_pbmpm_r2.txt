@@ -1,0 +1,21 @@
+You are an expert reviewer (GPU physics + numerical methods / MPM + Rust/wgpu) re-reviewing a REQUIREMENTS (brainstorm) document for a coffee pour-over simulator (Rust + wgpu + WGSL) after a REVISE round. The doc proposes re-architecting the realism core from the current two-field grid MPM to a new "two-velocity-field PB-MPM" (Position-Based MPM). Context on the three in-repo solvers and constraints is as before (XPBD/PBF particle, old main MPM, current two-field grid MPM with under-converged local-Jacobi ∇·v projection, fixed-point i32, no float atomics, Tint uniformity, ≤33ms@200k, storage-buffer ceiling).
+
+Respond with a VERDICT on the FIRST LINE: **APPROVE**, **REVISE**, or **REJECT**. You have READ-ONLY repo access — actually read the revised doc. This is a requirements/brainstorm doc (the WHAT/WHICH-ARCHITECTURE), not an implementation plan; judge architectural-decision soundness, physical diagnosis, candidate-evaluation fairness, requirement falsifiability, and scope — not deferred code-level design.
+
+Read the REVISED doc: `docs/brainstorms/2026-06-19-pbmpm-rearchitecture-requirements.md`.
+
+Your PRIOR round returned REVISE with these items. Verify each was addressed HONESTLY (not just reworded), and judge whether any was over- or under-corrected:
+1. Rewrite KD1/KD2 to say PB-MPM improves stable local stiffness, NOT guaranteed globally-stiff incompressibility at few iterations; define the coarse pre-pass as approximate global low-frequency pressure work.
+2. Downgrade KD5 from assertion to hypothesis (λ may be convertible to pore-pressure if validated), with required sign/unit/smoothness/Terzaghi audits.
+3. Correct the XPBD citation: coupling uses pairwise SPH-gradient impulses from `max(-lambda,0)` (coupling.wgsl:228-258), NOT a grid `∇λ` pressure field.
+4. Add candidate D (compliant density projection on the existing two-field operator, preserving the cell-centered `G·p` contract the bed consumes) and justify why full PB-MPM beats it.
+5. Expand KD8 to include a two-velocity cost projection / stub (drag, extra fields, λ ping-pong, bed/wetting buffer budget) — not just single-phase water.
+6. Add a storage-buffer ledger against current granted 9 (gpu.rs:114) and sanctioned 16 (AGENTS.md), plus a GpuContext limit-change gate if relying on >9.
+7. Add fixed-point/displacement headroom gates for PB-MPM position corrections.
+8. Sharpen R1/R3/R4 into non-gameable metrics with conservation, cap-hit, density, settled-tail guards.
+9. Remove/cite the "main Poisson ~70%" number; soften to "pressure-pair loop plausibly dominates."
+10. Remove "publishable core" rhetoric unless validated repo physics is clearly separated from speculative research.
+
+Then judge the doc fresh on the SAME focus areas as before (core diagnosis & the no-full-Poisson claim; λ-as-pore-pressure hypothesis; perf anchor + KD8 gate adequacy; candidate-evaluation fairness incl. the new D; constraint feasibility — buffers/FP; requirement quality R1–R5; scope cut). Verify code claims against the repo (pressure.wgsl, surface.wgsl, xpbd/coupling.wgsl, gpu.rs, common.wgsl, AGENTS.md, PERF_NOTES.md).
+
+Hold the doc to the bar for a REQUIREMENTS artifact handing off to /ce-plan: is the architectural decision now honestly stated (no remaining over-claims), are the risks correctly identified and gated, are the requirements falsifiable, and is the fallback path (D/B) coherent? If APPROVE, say what makes it ready. If still REVISE, give a SHORT bulleted list of only the genuinely-remaining items (do not invent new scope or re-litigate settled deferrals). Be concrete — name files, KD/R IDs.

@@ -1,0 +1,362 @@
+commit e08ee11df02263540108b8f9ac26d54e40a7d1fc
+Author: Craig Xu Chen <craigxchen@gmail.com>
+Date:   Thu Jun 4 22:51:56 2026 -0400
+
+    Add thermal exchange + temperature-gated extraction
+    
+    Phase 1.5 U6: per-particle lumped heat conduction + ambient loss, with the
+    dissolution k_T reading the evolving grain temperature so a cooler pour lowers
+    late extraction.
+    
+    - extraction.wgsl: thermal_exchange gathers neighbors (both species) on the
+      counting-sort grid, reads temperatures from a fresh chem_frozen snapshot, and
+      writes only the T lane of live chem. Capacity-weighted pair heat
+      q_ij = clamp(κ(T_j−T_i)dt, ±reduced-capacity equilibrium) is antisymmetric
+      (q_ji = −q_ij), so Σ C_i·T_i is conserved even for unequal capacities;
+      ΔT_i = Σq/C_i + ambient loss. C = effective_mass·specific_heat (water scales
+      with f_w; wet grain includes absorbed water ρ·V_abs). Phase-aware T lane
+      helpers (grain T at .z, water T at .y).
+    - mod.rs: thermal_exchange pipeline + bind group (6 storage buffers); a second
+      chem→chem_frozen snapshot after the dissolution passes (preserving the
+      post-dissolution c/pools) + the thermal pass, reusing the already-rebuilt grid.
+    - tests: enthalpy-conservation gate with deliberately unequal capacities,
+      relaxation + ambient cooling toward t_amb, cooler-pour-lowers-extraction (R9).
+      dry_grain test narrowed to the solute lanes (thermal legitimately evolves T).
+    
+    Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+
+diff --git a/src/solvers/xpbd/extraction.wgsl b/src/solvers/xpbd/extraction.wgsl
+index c850c6d..35e47dc 100644
+--- a/src/solvers/xpbd/extraction.wgsl
++++ b/src/solvers/xpbd/extraction.wgsl
+@@ -169,3 +169,68 @@ fn dissolve_water(@builtin(global_invocation_id) gid: vec3<u32>) {
+     // headroom cap). T lane preserved.
+     chem[i] = vec4<f32>(cf.x + total / (f_w * v_w), cf.y, cf.z, cf.w);
+ }
++
++// --- Thermal exchange (U6) -------------------------------------------------------------------------
++// Per-particle lumped heat conduction + ambient loss. The temperature lane differs by species
++// (grain T = chem.z, water T = chem.y), so read/write go through phase-aware helpers. Capacity
++// C = effective_mass · specific_heat (water mass scales with f_w; wet-grain mass includes the
++// absorbed water ρ·V_abs). Runs after dissolution on a FRESH chem_frozen snapshot, so it preserves
++// the post-dissolution c/pools (it writes only the T lane). Reads `pos` for moisture/position (same
++// rationale as the dissolution passes); the grid was rebuilt for diss_count and is still valid.
++
++fn th_temp(ph: u32, cf: vec4<f32>) -> f32 {
++    return select(cf.y, cf.z, ph == PHASE_GRAIN); // water T at .y, grain T at .z
++}
++fn th_capacity(ph: u32, w: f32) -> f32 {
++    let cp = select(params.cp_water, params.cp_grain, ph == PHASE_GRAIN);
++    return eff_mass(ph, w) * cp;
++}
++
++@compute @workgroup_size(256)
++fn thermal_exchange(@builtin(global_invocation_id) gid: vec3<u32>) {
++    let i = gid.x;
++    if (i >= params.particle_count) { return; }
++    let ph_i = phase[i];
++    let cf_i = chem_frozen[i];
++    let t_i = th_temp(ph_i, cf_i);
++    let c_i = th_capacity(ph_i, pos[i].w);
++
++    var q_sum = 0.0;
++    let xi = pos[i].xyz;
++    let base = cell_coord(xi);
++    for (var dz = -1; dz <= 1; dz = dz + 1) {
++        for (var dy = -1; dy <= 1; dy = dy + 1) {
++            for (var dx = -1; dx <= 1; dx = dx + 1) {
++                let nc = base + vec3<i32>(dx, dy, dz);
++                if (nc.x < 0 || nc.y < 0 || nc.z < 0) { continue; }
++                let dims = vec3<i32>(params.grid_dims.xyz);
++                if (nc.x >= dims.x || nc.y >= dims.y || nc.z >= dims.z) { continue; }
++                let cid = cell_id(nc);
++                let lo = cell_start[cid];
++                let hi = cell_start[cid + 1u];
++                for (var s = lo; s < hi; s = s + 1u) {
++                    let j = sorted_indices[s];
++                    if (j == i) { continue; }
++                    if (length(xi - pos[j].xyz) >= params.h) { continue; }
++                    let ph_j = phase[j];
++                    let c_j = th_capacity(ph_j, pos[j].w);
++                    if (c_j <= 1e-6) { continue; } // empty neighbor carries no heat
++                    let t_j = th_temp(ph_j, chem_frozen[j]);
++                    // Antisymmetric pair heat (q_ji = −q_ij) → Σ C·T conserved across the pass.
++                    q_sum = q_sum + th_pair_heat(t_i, c_i, t_j, c_j, params.kappa, params.dt);
++                }
++            }
++        }
++    }
++
++    var t_new = t_i;
++    if (c_i > 1e-6) { t_new = t_i + q_sum / c_i; } // zero-capacity particle exchanges nothing
++    t_new = t_new + th_ambient(t_new, params.t_amb, params.h_amb, params.dt);
++
++    // Write only the T lane, preserving the post-dissolution c/pools from the frozen snapshot.
++    if (ph_i == PHASE_GRAIN) {
++        chem[i] = vec4<f32>(cf_i.x, cf_i.y, t_new, cf_i.w);
++    } else {
++        chem[i] = vec4<f32>(cf_i.x, t_new, cf_i.z, cf_i.w);
++    }
++}
+diff --git a/src/solvers/xpbd/mod.rs b/src/solvers/xpbd/mod.rs
+index 01d032c..6c904ed 100644
+--- a/src/solvers/xpbd/mod.rs
++++ b/src/solvers/xpbd/mod.rs
+@@ -205,6 +205,7 @@ struct Pipelines {
+     diss_count: wgpu::ComputePipeline,
+     dissolve_grain: wgpu::ComputePipeline,
+     dissolve_water: wgpu::ComputePipeline,
++    thermal_exchange: wgpu::ComputePipeline,
+     apply_dp: wgpu::ComputePipeline,
+     finalize: wgpu::ComputePipeline,
+     xsph: wgpu::ComputePipeline,
+@@ -235,6 +236,7 @@ struct BindGroups {
+     diss_count: wgpu::BindGroup,
+     dissolve_grain: wgpu::BindGroup,
+     dissolve_water: wgpu::BindGroup,
++    thermal_exchange: wgpu::BindGroup,
+     apply_dp: wgpu::BindGroup,
+     finalize: wgpu::BindGroup,
+     xsph: wgpu::BindGroup,
+@@ -957,6 +959,7 @@ impl Solver for XpbdSolver {
+             diss_count: make("diss_count"),
+             dissolve_grain: make("dissolve_grain"),
+             dissolve_water: make("dissolve_water"),
++            thermal_exchange: make("thermal_exchange"),
+             apply_dp: make("apply_dp"),
+             finalize: make("finalize"),
+             xsph: make("xsph"),
+@@ -1251,6 +1254,18 @@ impl Solver for XpbdSolver {
+                     (22, &chem_frozen),
+                 ],
+             ),
++            thermal_exchange: bg(
++                &pipelines.thermal_exchange,
++                &[
++                    (0, &params_buf),
++                    (1, &pos),
++                    (8, &cell_start),
++                    (9, &sorted_indices),
++                    (11, &phase),
++                    (20, &chem),
++                    (22, &chem_frozen),
++                ],
++            ),
+             apply_dp: bg(
+                 &pipelines.apply_dp,
+                 &[
+@@ -1663,6 +1678,23 @@ impl Solver for XpbdSolver {
+                         "dissolve_water",
+                         np,
+                     );
++                    // Thermal exchange + ambient loss (U6). Re-snapshot the post-dissolution chem so
++                    // the pass preserves the updated c/pools (it writes only the T lane), then run on
++                    // the still-valid grid. T evolved here feeds the NEXT substep's k_T (one-step lag).
++                    enc.copy_buffer_to_buffer(
++                        self.chem.as_ref(),
++                        0,
++                        &self.chem_frozen,
++                        0,
++                        (self.particle_count as u64) * 16,
++                    );
++                    pass(
++                        &mut enc,
++                        &p.thermal_exchange,
++                        &b.thermal_exchange,
++                        "thermal_exchange",
++                        np,
++                    );
+                 }
+             }
+         }
+diff --git a/tests/xpbd_extraction.rs b/tests/xpbd_extraction.rs
+index 4de76c2..baeca9a 100644
+--- a/tests/xpbd_extraction.rs
++++ b/tests/xpbd_extraction.rs
+@@ -219,8 +219,17 @@ fn dry_grain_does_not_extract() {
+         solver.step(DT, &EmissionInput::default());
+     }
+     let after = solver.read_chem();
+-    for (i, (a, b)) in before.iter().zip(&after).enumerate() {
+-        assert_eq!(a, b, "dry grain extracted at particle {i}");
++    // Only the SOLUTE lanes must be frozen (the thermal pass legitimately evolves the T lanes):
++    // grain pools (.x,.y) and water concentration (.x) unchanged.
++    for (i, ((a, b), &ph)) in before.iter().zip(&after).zip(&phase).enumerate() {
++        if ph == 1 {
++            assert_eq!((a[0], a[1]), (b[0], b[1]), "dry grain pools changed at {i}");
++        } else {
++            assert_eq!(
++                a[0], b[0],
++                "water gained concentration from dry grains at {i}"
++            );
++        }
+     }
+ }
+ 
+@@ -518,3 +527,166 @@ fn cpu_gpu_parity_single_pair() {
+         "pair not conserved: grain lost {grain_loss}, water gained {water_gain}"
+     );
+ }
++
++// --- U6: thermal exchange + temperature-gated extraction -----------------------------------------
++
++/// Enthalpy `Σ C_i·T_i` with dry grains (`V_abs=0`) + full water (`f_w=1`): C_water =
++/// particle_mass·cp_water, C_grain = grain_mass·cp_grain.
++fn enthalpy(chem: &[[f32; 4]], phase: &[u32], mats: &Materials) -> f32 {
++    chem.iter()
++        .zip(phase)
++        .map(|(c, &ph)| {
++            if ph == 1 {
++                mats.grain_mass * mats.cp_grain * c[2] // grain T at .z
++            } else {
++                mats.particle_mass * mats.cp_water * c[1] // water T at .y
++            }
++        })
++        .sum()
++}
++
++/// Seed temperatures: water hot, grain cool (dry grains, so dissolution is a no-op and only thermal
++/// exchange acts).
++fn seed_temperatures(solver: &XpbdSolver, phase: &[u32], t_water: f32, t_grain: f32) {
++    let mut chem = solver.read_chem();
++    for (c, &ph) in chem.iter_mut().zip(phase) {
++        if ph == 1 {
++            c[2] = t_grain;
++        } else {
++            c[1] = t_water;
++        }
++    }
++    solver.write_chem_for_test(&chem);
++}
++
++/// THE thermal gate: with deliberately UNEQUAL heat capacities and ambient loss off, total enthalpy
++/// `Σ C_i·T_i` is invariant across exchange (a plain symmetric ΔT would fail this).
++#[test]
++fn thermal_exchange_conserves_enthalpy_with_unequal_capacities() {
++    let Some(gpu) = GpuContext::new_headless() else {
++        eprintln!("xpbd_extraction: no GPU adapter; skipping.");
++        return;
++    };
++    // Deliberately unequal capacities: C_grain = 1.5·2.0 = 3.0 vs C_water = 1.0·1.0 = 1.0. Ambient
++    // OFF (h_amb=0) so the only temperature change is the pairwise (antisymmetric) exchange.
++    let mats = Materials {
++        cp_grain: 2.0,
++        h_amb: 0.0,
++        ..Materials::default()
++    };
++    let mut solver = XpbdSolver::build(&wet_blob_scene(), &mats, &extract_isolation_config(), &gpu);
++    let phase = solver.read_phases();
++    seed_temperatures(&solver, &phase, 1.0, 0.4); // hot water, cool (dry) grains
++
++    let initial = enthalpy(&solver.read_chem(), &phase, &mats);
++    for step in 0..40 {
++        solver.step(DT, &EmissionInput::default());
++        let h = enthalpy(&solver.read_chem(), &phase, &mats);
++        assert!(
++            (h - initial).abs() <= 1.0e-4 * initial.max(1.0),
++            "enthalpy leaked at step {step}: {initial} -> {h}"
++        );
++    }
++
++    // ...and exchange was non-trivial: the hot/cool spread shrank toward equilibrium.
++    let chem = solver.read_chem();
++    let (mut min_t, mut max_t) = (f32::MAX, f32::MIN);
++    for (c, &ph) in chem.iter().zip(&phase) {
++        let t = if ph == 1 { c[2] } else { c[1] };
++        min_t = min_t.min(t);
++        max_t = max_t.max(t);
++    }
++    assert!(
++        max_t - min_t < 0.6 - 0.01,
++        "temperatures did not relax (spread {} ~ initial 0.6)",
++        max_t - min_t
++    );
++}
++
++/// Relaxation + ambient: a hot blob converges toward equilibrium, and ambient loss cools the whole
++/// system toward `t_amb`.
++#[test]
++fn thermal_relaxes_and_ambient_cools_toward_t_amb() {
++    let Some(gpu) = GpuContext::new_headless() else {
++        eprintln!("xpbd_extraction: no GPU adapter; skipping.");
++        return;
++    };
++    // Ambient ON, pulling everything toward t_amb=0.5 from a uniformly hot start.
++    let mats = Materials {
++        h_amb: 0.1,
++        t_amb: 0.5,
++        ..Materials::default()
++    };
++    let mut solver = XpbdSolver::build(&wet_blob_scene(), &mats, &extract_isolation_config(), &gpu);
++    let phase = solver.read_phases();
++    seed_temperatures(&solver, &phase, 1.0, 1.0); // uniformly hot
++
++    let mean_t = |solver: &XpbdSolver| -> f32 {
++        let chem = solver.read_chem();
++        let sum: f32 = chem
++            .iter()
++            .zip(&phase)
++            .map(|(c, &ph)| if ph == 1 { c[2] } else { c[1] })
++            .sum();
++        sum / chem.len() as f32
++    };
++
++    let t0 = mean_t(&solver);
++    for _ in 0..100 {
++        solver.step(DT, &EmissionInput::default());
++    }
++    let t1 = mean_t(&solver);
++
++    // Cooled toward t_amb but not past it.
++    assert!(
++        t1 < t0 - 0.05 && t1 > mats.t_amb - 0.01,
++        "ambient cooling off: {t0} -> {t1} (t_amb {})",
++        mats.t_amb
++    );
++}
++
++/// R9: a cooler pour extracts less. Two brews identical but for `pour_t` → lower yield at lower T
++/// (the dissolution `k_T` Arrhenius reads the grain temperature).
++#[test]
++fn cooler_pour_lowers_extraction() {
++    let Some(gpu) = GpuContext::new_headless() else {
++        eprintln!("xpbd_extraction: no GPU adapter; skipping.");
++        return;
++    };
++    let scene = Scene {
++        gravity: [0.0, 0.0, 0.0],
++        box_min: [0.0, 0.0, 0.0],
++        box_max: [8.0, 8.0, 8.0],
++        regions: vec![
++            point([4.0, 4.0, 4.0], Species::Grain),
++            point([4.5, 4.0, 4.0], Species::Water),
++        ],
++        ..Scene::default()
++    };
++    // Returns total water solute extracted after N steps at pour temperature `pour_t`. Ambient off
++    // so the grain temperature stays at pour_t (water+grain seeded equal ⇒ no internal gradient),
++    // isolating the Arrhenius temperature dependence.
++    let run = |pour_t: f32| -> f32 {
++        let mats = Materials {
++            pour_t,
++            h_amb: 0.0,
++            ..Materials::default()
++        };
++        let v_cap = capacity(&mats);
++        let mut solver = XpbdSolver::build(&scene, &mats, &extract_isolation_config(), &gpu);
++        let phase = solver.read_phases();
++        prewet(&solver, &phase, 0.8, v_cap);
++        seed_water_flow(&solver, &phase, 0.5);
++        for _ in 0..10 {
++            solver.step(DT, &EmissionInput::default());
++        }
++        let v_w = solver.water_particle_volume();
++        solver.read_chem()[1][0] * v_w // water solute (c·V_w, f_w=1)
++    };
++    let hot = run(1.0);
++    let cool = run(0.7);
++    assert!(
++        hot > 1.0e-6 && cool < hot - 1.0e-7,
++        "cooler pour did not lower extraction: hot {hot}, cool {cool}"
++    );
++}

@@ -1,0 +1,2034 @@
+Reading additional input from stdin...
+OpenAI Codex v0.137.0
+--------
+workdir: /Users/cxc/Github/coffee-sim
+model: gpt-5.5
+provider: openai
+approval: never
+sandbox: read-only
+reasoning effort: high
+reasoning summaries: none
+session id: 019e95b2-1ea5-7473-852a-92f62db925d5
+--------
+user
+You are reviewing a GPU physics implementation (Rust + WGSL, wgpu). This is Phase 1.5
+Unit 6: a thermal-exchange pass for a coffee-extraction sim, added after the Unit 5
+dissolution pass. Focus ONLY on the correctness of THIS unit's changes.
+
+Respond with a verdict on the FIRST LINE: APPROVE, REVISE, or REJECT. Then explain.
+Be rigorous about:
+1. ENERGY CONSERVATION with UNEQUAL heat capacities: is the per-pair heat antisymmetric
+   (q_ji = -q_ij) so Σ C_i·T_i is conserved? th_pair_heat clamps raw=κ(T_j−T_i)dt to the
+   reduced-capacity equilibrium cap=(C_i·C_j/(C_i+C_j))(T_j−T_i). Verify q computed by
+   particle i for neighbor j equals minus q computed by j for i, given both read the same
+   frozen temperatures. Any path where a per-particle clamp or skip breaks antisymmetry?
+2. The `c_j <= 1e-6` neighbor skip and the `c_i <= 1e-6` self-gate: are they SYMMETRIC
+   (a zero-capacity particle neither gives nor receives), so no energy is created/lost?
+3. LANE CORRECTNESS: temperature is stored on different lanes by species (grain T = chem.z,
+   water T = chem.y). Does th_temp read and the final write target the correct lane per
+   phase, and does the write preserve the post-dissolution c/pools (chem.x/.y for grain)?
+4. SNAPSHOT/RACE: thermal runs after dissolution with a SECOND chem→chem_frozen copy, then
+   reads chem_frozen and writes live chem. Is the snapshot correctly capturing the
+   post-dissolution state, and is the pass race-free (each particle writes only its slot)?
+5. CAPACITY: C = eff_mass·specific_heat (water = particle_mass·f_w·cp_water; grain =
+   (grain_mass + ρ·V_abs)·cp_grain). Correct? Reads `pos.w` for moisture (post-wetting).
+6. Storage-buffer budget (WebGPU 8/stage) for thermal_exchange.
+
+The diff follows.
+commit e08ee11df02263540108b8f9ac26d54e40a7d1fc
+Author: Craig Xu Chen <craigxchen@gmail.com>
+Date:   Thu Jun 4 22:51:56 2026 -0400
+
+    Add thermal exchange + temperature-gated extraction
+    
+    Phase 1.5 U6: per-particle lumped heat conduction + ambient loss, with the
+    dissolution k_T reading the evolving grain temperature so a cooler pour lowers
+    late extraction.
+    
+    - extraction.wgsl: thermal_exchange gathers neighbors (both species) on the
+      counting-sort grid, reads temperatures from a fresh chem_frozen snapshot, and
+      writes only the T lane of live chem. Capacity-weighted pair heat
+      q_ij = clamp(κ(T_j−T_i)dt, ±reduced-capacity equilibrium) is antisymmetric
+      (q_ji = −q_ij), so Σ C_i·T_i is conserved even for unequal capacities;
+      ΔT_i = Σq/C_i + ambient loss. C = effective_mass·specific_heat (water scales
+      with f_w; wet grain includes absorbed water ρ·V_abs). Phase-aware T lane
+      helpers (grain T at .z, water T at .y).
+    - mod.rs: thermal_exchange pipeline + bind group (6 storage buffers); a second
+      chem→chem_frozen snapshot after the dissolution passes (preserving the
+      post-dissolution c/pools) + the thermal pass, reusing the already-rebuilt grid.
+    - tests: enthalpy-conservation gate with deliberately unequal capacities,
+      relaxation + ambient cooling toward t_amb, cooler-pour-lowers-extraction (R9).
+      dry_grain test narrowed to the solute lanes (thermal legitimately evolves T).
+    
+    Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+
+diff --git a/src/solvers/xpbd/extraction.wgsl b/src/solvers/xpbd/extraction.wgsl
+index c850c6d..35e47dc 100644
+--- a/src/solvers/xpbd/extraction.wgsl
++++ b/src/solvers/xpbd/extraction.wgsl
+@@ -169,3 +169,68 @@ fn dissolve_water(@builtin(global_invocation_id) gid: vec3<u32>) {
+     // headroom cap). T lane preserved.
+     chem[i] = vec4<f32>(cf.x + total / (f_w * v_w), cf.y, cf.z, cf.w);
+ }
++
++// --- Thermal exchange (U6) -------------------------------------------------------------------------
++// Per-particle lumped heat conduction + ambient loss. The temperature lane differs by species
++// (grain T = chem.z, water T = chem.y), so read/write go through phase-aware helpers. Capacity
++// C = effective_mass · specific_heat (water mass scales with f_w; wet-grain mass includes the
++// absorbed water ρ·V_abs). Runs after dissolution on a FRESH chem_frozen snapshot, so it preserves
++// the post-dissolution c/pools (it writes only the T lane). Reads `pos` for moisture/position (same
++// rationale as the dissolution passes); the grid was rebuilt for diss_count and is still valid.
++
++fn th_temp(ph: u32, cf: vec4<f32>) -> f32 {
++    return select(cf.y, cf.z, ph == PHASE_GRAIN); // water T at .y, grain T at .z
++}
++fn th_capacity(ph: u32, w: f32) -> f32 {
++    let cp = select(params.cp_water, params.cp_grain, ph == PHASE_GRAIN);
++    return eff_mass(ph, w) * cp;
++}
++
++@compute @workgroup_size(256)
++fn thermal_exchange(@builtin(global_invocation_id) gid: vec3<u32>) {
++    let i = gid.x;
++    if (i >= params.particle_count) { return; }
++    let ph_i = phase[i];
++    let cf_i = chem_frozen[i];
++    let t_i = th_temp(ph_i, cf_i);
++    let c_i = th_capacity(ph_i, pos[i].w);
++
++    var q_sum = 0.0;
++    let xi = pos[i].xyz;
++    let base = cell_coord(xi);
++    for (var dz = -1; dz <= 1; dz = dz + 1) {
++        for (var dy = -1; dy <= 1; dy = dy + 1) {
++            for (var dx = -1; dx <= 1; dx = dx + 1) {
++                let nc = base + vec3<i32>(dx, dy, dz);
++                if (nc.x < 0 || nc.y < 0 || nc.z < 0) { continue; }
++                let dims = vec3<i32>(params.grid_dims.xyz);
++                if (nc.x >= dims.x || nc.y >= dims.y || nc.z >= dims.z) { continue; }
++                let cid = cell_id(nc);
++                let lo = cell_start[cid];
++                let hi = cell_start[cid + 1u];
++                for (var s = lo; s < hi; s = s + 1u) {
++                    let j = sorted_indices[s];
++                    if (j == i) { continue; }
++                    if (length(xi - pos[j].xyz) >= params.h) { continue; }
++                    let ph_j = phase[j];
++                    let c_j = th_capacity(ph_j, pos[j].w);
++                    if (c_j <= 1e-6) { continue; } // empty neighbor carries no heat
++                    let t_j = th_temp(ph_j, chem_frozen[j]);
++                    // Antisymmetric pair heat (q_ji = −q_ij) → Σ C·T conserved across the pass.
++                    q_sum = q_sum + th_pair_heat(t_i, c_i, t_j, c_j, params.kappa, params.dt);
++                }
++            }
++        }
++    }
++
++    var t_new = t_i;
++    if (c_i > 1e-6) { t_new = t_i + q_sum / c_i; } // zero-capacity particle exchanges nothing
++    t_new = t_new + th_ambient(t_new, params.t_amb, params.h_amb, params.dt);
++
++    // Write only the T lane, preserving the post-dissolution c/pools from the frozen snapshot.
++    if (ph_i == PHASE_GRAIN) {
++        chem[i] = vec4<f32>(cf_i.x, cf_i.y, t_new, cf_i.w);
++    } else {
++        chem[i] = vec4<f32>(cf_i.x, t_new, cf_i.z, cf_i.w);
++    }
++}
+diff --git a/src/solvers/xpbd/mod.rs b/src/solvers/xpbd/mod.rs
+index 01d032c..6c904ed 100644
+--- a/src/solvers/xpbd/mod.rs
++++ b/src/solvers/xpbd/mod.rs
+@@ -205,6 +205,7 @@ struct Pipelines {
+     diss_count: wgpu::ComputePipeline,
+     dissolve_grain: wgpu::ComputePipeline,
+     dissolve_water: wgpu::ComputePipeline,
++    thermal_exchange: wgpu::ComputePipeline,
+     apply_dp: wgpu::ComputePipeline,
+     finalize: wgpu::ComputePipeline,
+     xsph: wgpu::ComputePipeline,
+@@ -235,6 +236,7 @@ struct BindGroups {
+     diss_count: wgpu::BindGroup,
+     dissolve_grain: wgpu::BindGroup,
+     dissolve_water: wgpu::BindGroup,
++    thermal_exchange: wgpu::BindGroup,
+     apply_dp: wgpu::BindGroup,
+     finalize: wgpu::BindGroup,
+     xsph: wgpu::BindGroup,
+@@ -957,6 +959,7 @@ impl Solver for XpbdSolver {
+             diss_count: make("diss_count"),
+             dissolve_grain: make("dissolve_grain"),
+             dissolve_water: make("dissolve_water"),
++            thermal_exchange: make("thermal_exchange"),
+             apply_dp: make("apply_dp"),
+             finalize: make("finalize"),
+             xsph: make("xsph"),
+@@ -1251,6 +1254,18 @@ impl Solver for XpbdSolver {
+                     (22, &chem_frozen),
+                 ],
+             ),
++            thermal_exchange: bg(
++                &pipelines.thermal_exchange,
++                &[
++                    (0, &params_buf),
++                    (1, &pos),
++                    (8, &cell_start),
++                    (9, &sorted_indices),
++                    (11, &phase),
++                    (20, &chem),
++                    (22, &chem_frozen),
++                ],
++            ),
+             apply_dp: bg(
+                 &pipelines.apply_dp,
+                 &[
+@@ -1663,6 +1678,23 @@ impl Solver for XpbdSolver {
+                         "dissolve_water",
+                         np,
+                     );
++                    // Thermal exchange + ambient loss (U6). Re-snapshot the post-dissolution chem so
++                    // the pass preserves the updated c/pools (it writes only the T lane), then run on
++                    // the still-valid grid. T evolved here feeds the NEXT substep's k_T (one-step lag).
++                    enc.copy_buffer_to_buffer(
++                        self.chem.as_ref(),
++                        0,
++                        &self.chem_frozen,
++                        0,
++                        (self.particle_count as u64) * 16,
++                    );
++                    pass(
++                        &mut enc,
++                        &p.thermal_exchange,
++                        &b.thermal_exchange,
++                        "thermal_exchange",
++                        np,
++                    );
+                 }
+             }
+         }
+diff --git a/tests/xpbd_extraction.rs b/tests/xpbd_extraction.rs
+index 4de76c2..baeca9a 100644
+--- a/tests/xpbd_extraction.rs
++++ b/tests/xpbd_extraction.rs
+@@ -219,8 +219,17 @@ fn dry_grain_does_not_extract() {
+         solver.step(DT, &EmissionInput::default());
+     }
+     let after = solver.read_chem();
+-    for (i, (a, b)) in before.iter().zip(&after).enumerate() {
+-        assert_eq!(a, b, "dry grain extracted at particle {i}");
++    // Only the SOLUTE lanes must be frozen (the thermal pass legitimately evolves the T lanes):
++    // grain pools (.x,.y) and water concentration (.x) unchanged.
++    for (i, ((a, b), &ph)) in before.iter().zip(&after).zip(&phase).enumerate() {
++        if ph == 1 {
++            assert_eq!((a[0], a[1]), (b[0], b[1]), "dry grain pools changed at {i}");
++        } else {
++            assert_eq!(
++                a[0], b[0],
++                "water gained concentration from dry grains at {i}"
++            );
++        }
+     }
+ }
+ 
+@@ -518,3 +527,166 @@ fn cpu_gpu_parity_single_pair() {
+         "pair not conserved: grain lost {grain_loss}, water gained {water_gain}"
+     );
+ }
++
++// --- U6: thermal exchange + temperature-gated extraction -----------------------------------------
++
++/// Enthalpy `Σ C_i·T_i` with dry grains (`V_abs=0`) + full water (`f_w=1`): C_water =
++/// particle_mass·cp_water, C_grain = grain_mass·cp_grain.
++fn enthalpy(chem: &[[f32; 4]], phase: &[u32], mats: &Materials) -> f32 {
++    chem.iter()
++        .zip(phase)
++        .map(|(c, &ph)| {
++            if ph == 1 {
++                mats.grain_mass * mats.cp_grain * c[2] // grain T at .z
++            } else {
++                mats.particle_mass * mats.cp_water * c[1] // water T at .y
++            }
++        })
++        .sum()
++}
++
++/// Seed temperatures: water hot, grain cool (dry grains, so dissolution is a no-op and only thermal
++/// exchange acts).
++fn seed_temperatures(solver: &XpbdSolver, phase: &[u32], t_water: f32, t_grain: f32) {
++    let mut chem = solver.read_chem();
++    for (c, &ph) in chem.iter_mut().zip(phase) {
++        if ph == 1 {
++            c[2] = t_grain;
++        } else {
++            c[1] = t_water;
++        }
++    }
++    solver.write_chem_for_test(&chem);
++}
++
++/// THE thermal gate: with deliberately UNEQUAL heat capacities and ambient loss off, total enthalpy
++/// `Σ C_i·T_i` is invariant across exchange (a plain symmetric ΔT would fail this).
++#[test]
++fn thermal_exchange_conserves_enthalpy_with_unequal_capacities() {
++    let Some(gpu) = GpuContext::new_headless() else {
++        eprintln!("xpbd_extraction: no GPU adapter; skipping.");
++        return;
++    };
++    // Deliberately unequal capacities: C_grain = 1.5·2.0 = 3.0 vs C_water = 1.0·1.0 = 1.0. Ambient
++    // OFF (h_amb=0) so the only temperature change is the pairwise (antisymmetric) exchange.
++    let mats = Materials {
++        cp_grain: 2.0,
++        h_amb: 0.0,
++        ..Materials::default()
++    };
++    let mut solver = XpbdSolver::build(&wet_blob_scene(), &mats, &extract_isolation_config(), &gpu);
++    let phase = solver.read_phases();
++    seed_temperatures(&solver, &phase, 1.0, 0.4); // hot water, cool (dry) grains
++
++    let initial = enthalpy(&solver.read_chem(), &phase, &mats);
++    for step in 0..40 {
++        solver.step(DT, &EmissionInput::default());
++        let h = enthalpy(&solver.read_chem(), &phase, &mats);
++        assert!(
++            (h - initial).abs() <= 1.0e-4 * initial.max(1.0),
++            "enthalpy leaked at step {step}: {initial} -> {h}"
++        );
++    }
++
++    // ...and exchange was non-trivial: the hot/cool spread shrank toward equilibrium.
++    let chem = solver.read_chem();
++    let (mut min_t, mut max_t) = (f32::MAX, f32::MIN);
++    for (c, &ph) in chem.iter().zip(&phase) {
++        let t = if ph == 1 { c[2] } else { c[1] };
++        min_t = min_t.min(t);
++        max_t = max_t.max(t);
++    }
++    assert!(
++        max_t - min_t < 0.6 - 0.01,
++        "temperatures did not relax (spread {} ~ initial 0.6)",
++        max_t - min_t
++    );
++}
++
++/// Relaxation + ambient: a hot blob converges toward equilibrium, and ambient loss cools the whole
++/// system toward `t_amb`.
++#[test]
++fn thermal_relaxes_and_ambient_cools_toward_t_amb() {
++    let Some(gpu) = GpuContext::new_headless() else {
++        eprintln!("xpbd_extraction: no GPU adapter; skipping.");
++        return;
++    };
++    // Ambient ON, pulling everything toward t_amb=0.5 from a uniformly hot start.
++    let mats = Materials {
++        h_amb: 0.1,
++        t_amb: 0.5,
++        ..Materials::default()
++    };
++    let mut solver = XpbdSolver::build(&wet_blob_scene(), &mats, &extract_isolation_config(), &gpu);
++    let phase = solver.read_phases();
++    seed_temperatures(&solver, &phase, 1.0, 1.0); // uniformly hot
++
++    let mean_t = |solver: &XpbdSolver| -> f32 {
++        let chem = solver.read_chem();
++        let sum: f32 = chem
++            .iter()
++            .zip(&phase)
++            .map(|(c, &ph)| if ph == 1 { c[2] } else { c[1] })
++            .sum();
++        sum / chem.len() as f32
++    };
++
++    let t0 = mean_t(&solver);
++    for _ in 0..100 {
++        solver.step(DT, &EmissionInput::default());
++    }
++    let t1 = mean_t(&solver);
++
++    // Cooled toward t_amb but not past it.
++    assert!(
++        t1 < t0 - 0.05 && t1 > mats.t_amb - 0.01,
++        "ambient cooling off: {t0} -> {t1} (t_amb {})",
++        mats.t_amb
++    );
++}
++
++/// R9: a cooler pour extracts less. Two brews identical but for `pour_t` → lower yield at lower T
++/// (the dissolution `k_T` Arrhenius reads the grain temperature).
++#[test]
++fn cooler_pour_lowers_extraction() {
++    let Some(gpu) = GpuContext::new_headless() else {
++        eprintln!("xpbd_extraction: no GPU adapter; skipping.");
++        return;
++    };
++    let scene = Scene {
++        gravity: [0.0, 0.0, 0.0],
++        box_min: [0.0, 0.0, 0.0],
++        box_max: [8.0, 8.0, 8.0],
++        regions: vec![
++            point([4.0, 4.0, 4.0], Species::Grain),
++            point([4.5, 4.0, 4.0], Species::Water),
++        ],
++        ..Scene::default()
++    };
++    // Returns total water solute extracted after N steps at pour temperature `pour_t`. Ambient off
++    // so the grain temperature stays at pour_t (water+grain seeded equal ⇒ no internal gradient),
++    // isolating the Arrhenius temperature dependence.
++    let run = |pour_t: f32| -> f32 {
++        let mats = Materials {
++            pour_t,
++            h_amb: 0.0,
++            ..Materials::default()
++        };
++        let v_cap = capacity(&mats);
++        let mut solver = XpbdSolver::build(&scene, &mats, &extract_isolation_config(), &gpu);
++        let phase = solver.read_phases();
++        prewet(&solver, &phase, 0.8, v_cap);
++        seed_water_flow(&solver, &phase, 0.5);
++        for _ in 0..10 {
++            solver.step(DT, &EmissionInput::default());
++        }
++        let v_w = solver.water_particle_volume();
++        solver.read_chem()[1][0] * v_w // water solute (c·V_w, f_w=1)
++    };
++    let hot = run(1.0);
++    let cool = run(0.7);
++    assert!(
++        hot > 1.0e-6 && cool < hot - 1.0e-7,
++        "cooler pour did not lower extraction: hot {hot}, cool {cool}"
++    );
++}
+codex
+I’ll verify this against the surrounding WGSL and pipeline layout so the review is about the implemented behavior, not just the commit message.
+exec
+/bin/zsh -lc "sed -n '1,260p' src/solvers/xpbd/extraction.wgsl" in /Users/cxc/Github/coffee-sim
+ succeeded in 0ms:
+// Extraction (XPBD step 5, Phase 1.5). Concatenated after common/water/bed/coupling/wetting.
+//
+// Wet grains dissolve two-pool solute into overlapping water's concentration `c`, conserving the
+// solute inventory exactly without atomics — the same frozen-snapshot, two-sided, count-normalized
+// allocation as the wetting transfer:
+//
+//   take_gw = min( release_g / N_w ,  max(c_sat − c_w, 0)·(f_w·V_w) / N_g )
+//
+// computed identically in `dissolve_grain` (decrements its pools by Σ_w take, split proportionally
+// across the two pools) and `dissolve_water` (adds Σ_g take to its own `c`). Both read the FROZEN
+// chem snapshot (`chem_frozen`) + the frozen counts/flux (`diss_neighbors`) and write only the live
+// `chem`, so grain-loss == water-gain to float tolerance and there is no read/write race. The grain's
+// `release` is a pure function of its frozen state + per-grain aggregate flux, so the water pass
+// recomputes the same value. The `(1−c/c_sat)` driving force is realized as the water-headroom cap.
+//
+// Runs AFTER wetting/finalize, so it reads `pos` for both position (pos.xyz == pred.xyz post-finalize,
+// matching the rebuilt grid) and the POST-WETTING moisture (pos.w) — the grain's current saturation
+// gates extraction and the water's current volume sizes the headroom. The dissolution passes write
+// only `chem`, so reading `pos` is race-free. (Using `pos` for both also keeps both transfer passes
+// at exactly 8 storage buffers — no room for a separate `pred` binding.)
+//
+// Eligibility (identical on all three passes): opposite species within `h`, and both particles
+// "active" — grain wet (pos.w = V_abs > absorb_roundoff) and water mobile (pos.w = f_w > roundoff).
+// chem lanes: grain (s_f, s_s, T_g, _), water (c, T_w, _, _). moisture lane pos.w as in wetting.
+
+// Per-grain two-pool release this substep (rf, rs, rf+rs), a pure function of the grain's FROZEN
+// state + aggregate flux (so both transfer passes recompute it identically). No driving term here —
+// the (1−c/c_sat) driving force lives in the per-pair water-headroom cap.
+fn diss_release(g: u32) -> vec3<f32> {
+    let cf = chem_frozen[g];        // (s_f, s_s, T_g, _)
+    let flux_g = diss_neighbors[g].y;
+    let sat = clamp(pos[g].w / wet_v_cap(), 0.0, 1.0); // grain moisture saturation (V_abs / V_cap)
+    let kbase = params.extract_rate
+        * ex_arrhenius(cf.z, params.ea_over_r, params.t_ref)
+        * ex_area(params.grain_diameter, params.d_ref)
+        * ex_flux(flux_g, params.u_half)
+        * ex_wet_gate(sat, params.s_on);
+    let rf = ex_release(cf.x, kbase * params.k0_fast, params.dt);
+    let rs = ex_release(cf.y, kbase * params.k0_slow, params.dt);
+    return vec3<f32>(rf, rs, rf + rs);
+}
+
+// Per-particle eligible-opposite-species count + (for grains) the aggregate relative-velocity flux,
+// from the post-wetting positions/moisture + finalized velocity. Both transfer passes read this.
+@compute @workgroup_size(256)
+fn diss_count(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= params.particle_count) { return; }
+    let ph_i = phase[i];
+    let xi = pos[i].xyz;
+    let vi = vel[i].xyz;
+    var n = 0u;
+    var flux_acc = 0.0;
+    let base = cell_coord(xi);
+    for (var dz = -1; dz <= 1; dz = dz + 1) {
+        for (var dy = -1; dy <= 1; dy = dy + 1) {
+            for (var dx = -1; dx <= 1; dx = dx + 1) {
+                let nc = base + vec3<i32>(dx, dy, dz);
+                if (nc.x < 0 || nc.y < 0 || nc.z < 0) { continue; }
+                let dims = vec3<i32>(params.grid_dims.xyz);
+                if (nc.x >= dims.x || nc.y >= dims.y || nc.z >= dims.z) { continue; }
+                let cid = cell_id(nc);
+                let lo = cell_start[cid];
+                let hi = cell_start[cid + 1u];
+                for (var s = lo; s < hi; s = s + 1u) {
+                    let j = sorted_indices[s];
+                    if (j == i) { continue; }
+                    if (phase[j] == ph_i) { continue; } // opposite species only
+                    if (length(xi - pos[j].xyz) >= params.h) { continue; }
+                    if (pos[j].w <= params.absorb_roundoff) { continue; } // inactive neighbor
+                    n = n + 1u;
+                    if (ph_i == PHASE_GRAIN) { flux_acc = flux_acc + length(vi - vel[j].xyz); }
+                }
+            }
+        }
+    }
+    var flux_g = 0.0;
+    if (ph_i == PHASE_GRAIN && n > 0u) { flux_g = flux_acc / f32(n); }
+    diss_neighbors[i] = vec2<f32>(f32(n), flux_g);
+}
+
+@compute @workgroup_size(256)
+fn dissolve_grain(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= params.particle_count) { return; }
+    if (phase[i] != PHASE_GRAIN) { return; }
+    if (pos[i].w <= params.absorb_roundoff) { return; } // dry grain doesn't extract
+    let rel = diss_release(i);
+    let n_w = diss_neighbors[i].x;
+    if (rel.z <= 0.0 || n_w <= 0.0) { return; } // no pools/rate or no eligible water
+
+    let v_w = wet_v_water();
+    let xi = pos[i].xyz;
+    var total = 0.0;
+    let base = cell_coord(xi);
+    for (var dz = -1; dz <= 1; dz = dz + 1) {
+        for (var dy = -1; dy <= 1; dy = dy + 1) {
+            for (var dx = -1; dx <= 1; dx = dx + 1) {
+                let nc = base + vec3<i32>(dx, dy, dz);
+                if (nc.x < 0 || nc.y < 0 || nc.z < 0) { continue; }
+                let dims = vec3<i32>(params.grid_dims.xyz);
+                if (nc.x >= dims.x || nc.y >= dims.y || nc.z >= dims.z) { continue; }
+                let cid = cell_id(nc);
+                let lo = cell_start[cid];
+                let hi = cell_start[cid + 1u];
+                for (var s = lo; s < hi; s = s + 1u) {
+                    let j = sorted_indices[s];
+                    if (phase[j] != PHASE_WATER) { continue; }
+                    if (length(xi - pos[j].xyz) >= params.h) { continue; }
+                    let f_w = pos[j].w;
+                    if (f_w <= params.absorb_roundoff) { continue; }
+                    let n_g = diss_neighbors[j].x;
+                    if (n_g <= 0.0) { continue; }
+                    let headroom = max(params.c_sat - chem_frozen[j].x, 0.0) * (f_w * v_w);
+                    total = total + min(rel.z / n_w, headroom / n_g);
+                }
+            }
+        }
+    }
+    // Deplete the two pools proportionally (Σtake ≤ rel.z ⇒ pools stay ≥ 0). Base off the frozen
+    // snapshot; T lane preserved.
+    let cf = chem_frozen[i];
+    let sf = max(cf.x - total * rel.x / rel.z, 0.0);
+    let ss = max(cf.y - total * rel.y / rel.z, 0.0);
+    chem[i] = vec4<f32>(sf, ss, cf.z, cf.w);
+}
+
+@compute @workgroup_size(256)
+fn dissolve_water(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= params.particle_count) { return; }
+    if (phase[i] != PHASE_WATER) { return; }
+    let f_w = pos[i].w;
+    if (f_w <= params.absorb_roundoff) { return; } // immobile water
+    let n_g = diss_neighbors[i].x;
+    if (n_g <= 0.0) { return; }
+
+    let v_w = wet_v_water();
+    let cf = chem_frozen[i];
+    let headroom = max(params.c_sat - cf.x, 0.0) * (f_w * v_w);
+    let xi = pos[i].xyz;
+    var total = 0.0;
+    let base = cell_coord(xi);
+    for (var dz = -1; dz <= 1; dz = dz + 1) {
+        for (var dy = -1; dy <= 1; dy = dy + 1) {
+            for (var dx = -1; dx <= 1; dx = dx + 1) {
+                let nc = base + vec3<i32>(dx, dy, dz);
+                if (nc.x < 0 || nc.y < 0 || nc.z < 0) { continue; }
+                let dims = vec3<i32>(params.grid_dims.xyz);
+                if (nc.x >= dims.x || nc.y >= dims.y || nc.z >= dims.z) { continue; }
+                let cid = cell_id(nc);
+                let lo = cell_start[cid];
+                let hi = cell_start[cid + 1u];
+                for (var s = lo; s < hi; s = s + 1u) {
+                    let j = sorted_indices[s];
+                    if (phase[j] != PHASE_GRAIN) { continue; }
+                    if (length(xi - pos[j].xyz) >= params.h) { continue; }
+                    if (pos[j].w <= params.absorb_roundoff) { continue; } // dry grain
+                    let rel = diss_release(j);
+                    let n_w = diss_neighbors[j].x;
+                    if (rel.z <= 0.0 || n_w <= 0.0) { continue; }
+                    // Identical take + frozen snapshot as dissolve_grain → grain-loss == water-gain.
+                    total = total + min(rel.z / n_w, headroom / n_g);
+                }
+            }
+        }
+    }
+    // Concentration rises by the dissolved solute over the remaining water volume (≤ c_sat by the
+    // headroom cap). T lane preserved.
+    chem[i] = vec4<f32>(cf.x + total / (f_w * v_w), cf.y, cf.z, cf.w);
+}
+
+// --- Thermal exchange (U6) -------------------------------------------------------------------------
+// Per-particle lumped heat conduction + ambient loss. The temperature lane differs by species
+// (grain T = chem.z, water T = chem.y), so read/write go through phase-aware helpers. Capacity
+// C = effective_mass · specific_heat (water mass scales with f_w; wet-grain mass includes the
+// absorbed water ρ·V_abs). Runs after dissolution on a FRESH chem_frozen snapshot, so it preserves
+// the post-dissolution c/pools (it writes only the T lane). Reads `pos` for moisture/position (same
+// rationale as the dissolution passes); the grid was rebuilt for diss_count and is still valid.
+
+fn th_temp(ph: u32, cf: vec4<f32>) -> f32 {
+    return select(cf.y, cf.z, ph == PHASE_GRAIN); // water T at .y, grain T at .z
+}
+fn th_capacity(ph: u32, w: f32) -> f32 {
+    let cp = select(params.cp_water, params.cp_grain, ph == PHASE_GRAIN);
+    return eff_mass(ph, w) * cp;
+}
+
+@compute @workgroup_size(256)
+fn thermal_exchange(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= params.particle_count) { return; }
+    let ph_i = phase[i];
+    let cf_i = chem_frozen[i];
+    let t_i = th_temp(ph_i, cf_i);
+    let c_i = th_capacity(ph_i, pos[i].w);
+
+    var q_sum = 0.0;
+    let xi = pos[i].xyz;
+    let base = cell_coord(xi);
+    for (var dz = -1; dz <= 1; dz = dz + 1) {
+        for (var dy = -1; dy <= 1; dy = dy + 1) {
+            for (var dx = -1; dx <= 1; dx = dx + 1) {
+                let nc = base + vec3<i32>(dx, dy, dz);
+                if (nc.x < 0 || nc.y < 0 || nc.z < 0) { continue; }
+                let dims = vec3<i32>(params.grid_dims.xyz);
+                if (nc.x >= dims.x || nc.y >= dims.y || nc.z >= dims.z) { continue; }
+                let cid = cell_id(nc);
+                let lo = cell_start[cid];
+                let hi = cell_start[cid + 1u];
+                for (var s = lo; s < hi; s = s + 1u) {
+                    let j = sorted_indices[s];
+                    if (j == i) { continue; }
+                    if (length(xi - pos[j].xyz) >= params.h) { continue; }
+                    let ph_j = phase[j];
+                    let c_j = th_capacity(ph_j, pos[j].w);
+                    if (c_j <= 1e-6) { continue; } // empty neighbor carries no heat
+                    let t_j = th_temp(ph_j, chem_frozen[j]);
+                    // Antisymmetric pair heat (q_ji = −q_ij) → Σ C·T conserved across the pass.
+                    q_sum = q_sum + th_pair_heat(t_i, c_i, t_j, c_j, params.kappa, params.dt);
+                }
+            }
+        }
+    }
+
+    var t_new = t_i;
+    if (c_i > 1e-6) { t_new = t_i + q_sum / c_i; } // zero-capacity particle exchanges nothing
+    t_new = t_new + th_ambient(t_new, params.t_amb, params.h_amb, params.dt);
+
+    // Write only the T lane, preserving the post-dissolution c/pools from the frozen snapshot.
+    if (ph_i == PHASE_GRAIN) {
+        chem[i] = vec4<f32>(cf_i.x, cf_i.y, t_new, cf_i.w);
+    } else {
+        chem[i] = vec4<f32>(cf_i.x, t_new, cf_i.z, cf_i.w);
+    }
+}
+
+exec
+/bin/zsh -lc 'rg -n "th_pair_heat|th_ambient|eff_mass|PHASE_GRAIN|@group|@binding|var<storage|chem_frozen|fn dissolve|thermal_exchange|cp_water|cp_grain|h_amb|t_amb|kappa" src/solvers/xpbd/extraction.wgsl' in /Users/cxc/Github/coffee-sim
+exec
+/bin/zsh -lc "rg -n \"copy_buffer_to_buffer\\(|chem_frozen|diss_count|dissolve_grain|dissolve_water|thermal_exchange|fn bg|BindGroupLayout|binding\\(\" src/solvers/xpbd/mod.rs" in /Users/cxc/Github/coffee-sim
+ succeeded in 0ms:
+11:// chem snapshot (`chem_frozen`) + the frozen counts/flux (`diss_neighbors`) and write only the live
+30:    let cf = chem_frozen[g];        // (s_f, s_s, T_g, _)
+72:                    if (ph_i == PHASE_GRAIN) { flux_acc = flux_acc + length(vi - vel[j].xyz); }
+78:    if (ph_i == PHASE_GRAIN && n > 0u) { flux_g = flux_acc / f32(n); }
+83:fn dissolve_grain(@builtin(global_invocation_id) gid: vec3<u32>) {
+86:    if (phase[i] != PHASE_GRAIN) { return; }
+114:                    let headroom = max(params.c_sat - chem_frozen[j].x, 0.0) * (f_w * v_w);
+122:    let cf = chem_frozen[i];
+129:fn dissolve_water(@builtin(global_invocation_id) gid: vec3<u32>) {
+139:    let cf = chem_frozen[i];
+156:                    if (phase[j] != PHASE_GRAIN) { continue; }
+177:// absorbed water ρ·V_abs). Runs after dissolution on a FRESH chem_frozen snapshot, so it preserves
+182:    return select(cf.y, cf.z, ph == PHASE_GRAIN); // water T at .y, grain T at .z
+185:    let cp = select(params.cp_water, params.cp_grain, ph == PHASE_GRAIN);
+186:    return eff_mass(ph, w) * cp;
+190:fn thermal_exchange(@builtin(global_invocation_id) gid: vec3<u32>) {
+194:    let cf_i = chem_frozen[i];
+218:                    let t_j = th_temp(ph_j, chem_frozen[j]);
+220:                    q_sum = q_sum + th_pair_heat(t_i, c_i, t_j, c_j, params.kappa, params.dt);
+228:    t_new = t_new + th_ambient(t_new, params.t_amb, params.h_amb, params.dt);
+231:    if (ph_i == PHASE_GRAIN) {
+
+ succeeded in 0ms:
+205:    diss_count: wgpu::ComputePipeline,
+206:    dissolve_grain: wgpu::ComputePipeline,
+207:    dissolve_water: wgpu::ComputePipeline,
+208:    thermal_exchange: wgpu::ComputePipeline,
+236:    diss_count: wgpu::BindGroup,
+237:    dissolve_grain: wgpu::BindGroup,
+238:    dissolve_water: wgpu::BindGroup,
+239:    thermal_exchange: wgpu::BindGroup,
+302:    // snapshot copy, re-seeding, and exposure as concentration/temperature; `chem_frozen` (b22) is the
+306:    chem_frozen: wgpu::Buffer,
+433:        enc.copy_buffer_to_buffer(src, 0, &self.pos_readback, 0, size);
+548:        enc.copy_buffer_to_buffer(self.phase.as_ref(), 0, &self.pos_readback, 0, size);
+576:        enc.copy_buffer_to_buffer(
+862:        // readback for yield/TDS + the snapshot copy); `chem_frozen` (binding 22) is the per-substep
+876:        let chem_frozen = Self::storage(
+883:        // water → (N_g, _). Written by diss_count, read by both transfer passes. Bound only by the
+959:            diss_count: make("diss_count"),
+960:            dissolve_grain: make("dissolve_grain"),
+961:            dissolve_water: make("dissolve_water"),
+962:            thermal_exchange: make("thermal_exchange"),
+975:                    resource: buf.as_entire_binding(),
+1219:            diss_count: bg(
+1220:                &pipelines.diss_count,
+1231:            dissolve_grain: bg(
+1232:                &pipelines.dissolve_grain,
+1241:                    (22, &chem_frozen),
+1244:            dissolve_water: bg(
+1245:                &pipelines.dissolve_water,
+1254:                    (22, &chem_frozen),
+1257:            thermal_exchange: bg(
+1258:                &pipelines.thermal_exchange,
+1266:                    (22, &chem_frozen),
+1368:            chem_frozen,
+1515:                        enc.copy_buffer_to_buffer(
+1546:                    enc.copy_buffer_to_buffer(
+1610:                    enc.copy_buffer_to_buffer(
+1659:                    enc.copy_buffer_to_buffer(
+1662:                        &self.chem_frozen,
+1666:                    pass(&mut enc, &p.diss_count, &b.diss_count, "diss_count", np);
+1669:                        &p.dissolve_grain,
+1670:                        &b.dissolve_grain,
+1671:                        "dissolve_grain",
+1676:                        &p.dissolve_water,
+1677:                        &b.dissolve_water,
+1678:                        "dissolve_water",
+1684:                    enc.copy_buffer_to_buffer(
+1687:                        &self.chem_frozen,
+1693:                        &p.thermal_exchange,
+1694:                        &b.thermal_exchange,
+1695:                        "thermal_exchange",
+1705:                enc.copy_buffer_to_buffer(&ts.resolve, 0, &ts.readback, 0, (cursor as u64) * 8);
+
+codex
+The thermal kernel itself is in the expected file; I’m now checking the shared helper math and bind layout, because the main risks here are hidden in `eff_mass`/clamping semantics and pipeline resource counts.
+exec
+/bin/zsh -lc "sed -n '820,910p' src/solvers/xpbd/mod.rs" in /Users/cxc/Github/coffee-sim
+ succeeded in 0ms:
+            &device,
+            "xpbd-coupling-scale",
+            f32s,
+            wgpu::BufferUsages::empty(),
+        );
+        // Per-particle eligible-opposite-species neighbor count for the wetting allocation (u32).
+        let wet_count = Self::storage(&device, "xpbd-wet-count", f32s, wgpu::BufferUsages::empty());
+        // Counting-sort grid: transient per-cell counter, exclusive-prefix-sum offsets (num_cells+1),
+        // and a contiguous particle-index array (num_particles). No fixed buckets / overflow.
+        let cell_count = Self::storage(
+            &device,
+            "xpbd-cellcount",
+            (num_cells as u64) * 4,
+            wgpu::BufferUsages::empty(),
+        );
+        let cell_start = Self::storage(
+            &device,
+            "xpbd-cellstart",
+            (num_cells as u64 + 1) * 4,
+            wgpu::BufferUsages::empty(),
+        );
+        let sorted_indices = Self::storage(
+            &device,
+            "xpbd-sorted",
+            (particle_count.max(1) as u64) * 4,
+            wgpu::BufferUsages::empty(),
+        );
+        // Static SDF geometry (binding 19, read-only). Built-time-immutable; an empty scene gets a
+        // 1-element dummy (params.num_solids = 0 makes the union skip it). Bound only by the
+        // collision passes (added in U5); other kernels never reference it, so their layouts are
+        // unchanged and the 8-storage-buffer budget holds.
+        let mut packed = pack_solids(&scene.solids);
+        if packed.is_empty() {
+            packed.push(Primitive::zeroed());
+        }
+        let solids = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("xpbd-solids"),
+            contents: bytemuck::cast_slice(&packed),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
+        // Per-particle chem/thermal state (Phase 1.5), one vec4 per particle: grain lanes
+        // (s_f, s_s, T_g, _), water lanes (c, T_w, _, _). `chem` is the live buffer (binding 20,
+        // readback for yield/TDS + the snapshot copy); `chem_frozen` (binding 22) is the per-substep
+        // snapshot the dissolution/thermal passes read while writing the live buffer (no read/write
+        // race). Bound only by the chem passes (U5/U6); other kernels never touch it. Seeded per
+        // species: grains carry the soluble dose split into the two pools, water starts at c=0, pour T.
+        let initial_chem = seed_chem(&phases, mats);
+        let chem = Arc::new(
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("xpbd-chem"),
+                contents: bytemuck::cast_slice(&initial_chem),
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_SRC
+                    | wgpu::BufferUsages::COPY_DST,
+            }),
+        );
+        let chem_frozen = Self::storage(
+            &device,
+            "xpbd-chem-frozen",
+            vec4,
+            wgpu::BufferUsages::empty(),
+        );
+        // Per-particle dissolution scratch (binding 21), one vec2<f32> each: grain → (N_w, flux_g),
+        // water → (N_g, _). Written by diss_count, read by both transfer passes. Bound only by the
+        // dissolution passes (U5).
+        let diss_neighbors = Self::storage(
+            &device,
+            "xpbd-diss-neighbors",
+            n * 8,
+            wgpu::BufferUsages::empty(),
+        );
+        let status = Self::storage(
+            &device,
+            "xpbd-status",
+            std::mem::size_of::<StatusRaw>() as u64,
+            wgpu::BufferUsages::COPY_SRC,
+        );
+
+        let status_readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("xpbd-status-readback"),
+            size: std::mem::size_of::<StatusRaw>() as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let pos_readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("xpbd-pos-readback"),
+            size: vec4,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+
+exec
+/bin/zsh -lc "sed -n '930,990p' src/solvers/xpbd/mod.rs && sed -n '1180,1275p' src/solvers/xpbd/mod.rs && sed -n '1648,1700p' src/solvers/xpbd/mod.rs" in /Users/cxc/Github/coffee-sim
+exec
+/bin/zsh -lc "rg -n \"fn th_pair_heat|fn th_ambient|fn eff_mass|PHASE_GRAIN|PHASE_WATER|struct Params|cp_water|cp_grain|kappa|h_amb|t_amb|eff_mass\" src/solvers/xpbd src/models src -g '*.wgsl' -g '*.rs'" in /Users/cxc/Github/coffee-sim
+ succeeded in 0ms:
+                layout: None,
+                module: &shader,
+                entry_point: Some(entry),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            })
+        };
+        let pipelines = Pipelines {
+            predict: make("predict"),
+            grid_clear: make("grid_clear"),
+            grid_count: make("grid_count"),
+            grid_scan: make("grid_scan"),
+            grid_scatter: make("grid_scatter"),
+            compute_lambda: make("compute_lambda"),
+            residual_reduce: make("residual_reduce"),
+            compute_dp: make("compute_dp"),
+            bed_project: make("bed_project"),
+            compute_fractions: make("compute_fractions"),
+            exclude_water: make("exclude_water"),
+            exclude_grain: make("exclude_grain"),
+            compute_coupling_scale: make("compute_coupling_scale"),
+            drag_water: make("drag_water"),
+            drag_grain: make("drag_grain"),
+            buoyancy_grain: make("buoyancy_grain"),
+            buoyancy_water: make("buoyancy_water"),
+            apply_drag_pred: make("apply_drag_pred"),
+            wet_count: make("wet_count"),
+            wet_water: make("wet_water"),
+            wet_grain: make("wet_grain"),
+            diss_count: make("diss_count"),
+            dissolve_grain: make("dissolve_grain"),
+            dissolve_water: make("dissolve_water"),
+            thermal_exchange: make("thermal_exchange"),
+            apply_dp: make("apply_dp"),
+            finalize: make("finalize"),
+            xsph: make("xsph"),
+        };
+
+        // Per-pipeline bind groups providing exactly the bindings each entry point uses.
+        let bg = |pipe: &wgpu::ComputePipeline, entries: &[(u32, &wgpu::Buffer)]| {
+            let layout = pipe.get_bind_group_layout(0);
+            let e: Vec<wgpu::BindGroupEntry> = entries
+                .iter()
+                .map(|(b, buf)| wgpu::BindGroupEntry {
+                    binding: *b,
+                    resource: buf.as_entire_binding(),
+                })
+                .collect();
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &layout,
+                entries: &e,
+            })
+        };
+        let bind_groups = BindGroups {
+            predict: bg(
+                &pipelines.predict,
+                &[
+                    (0, &params_buf),
+                    (1, &pos),
+                    (2, &pred),
+                    (19, &solids),
+                ],
+            ),
+            wet_count: bg(
+                &pipelines.wet_count,
+                &[
+                    (0, &params_buf),
+                    (2, &pred),
+                    (8, &cell_start),
+                    (9, &sorted_indices),
+                    (11, &phase),
+                    (17, &wet_count),
+                ],
+            ),
+            wet_water: bg(
+                &pipelines.wet_water,
+                &[
+                    (0, &params_buf),
+                    (1, &pos),
+                    (2, &pred),
+                    (8, &cell_start),
+                    (9, &sorted_indices),
+                    (11, &phase),
+                    (17, &wet_count),
+                ],
+            ),
+            wet_grain: bg(
+                &pipelines.wet_grain,
+                &[
+                    (0, &params_buf),
+                    (1, &pos),
+                    (2, &pred),
+                    (3, &vel),
+                    (8, &cell_start),
+                    (9, &sorted_indices),
+                    (11, &phase),
+                    (17, &wet_count),
+                ],
+            ),
+            diss_count: bg(
+                &pipelines.diss_count,
+                &[
+                    (0, &params_buf),
+                    (1, &pos),
+                    (3, &vel),
+                    (8, &cell_start),
+                    (9, &sorted_indices),
+                    (11, &phase),
+                    (21, &diss_neighbors),
+                ],
+            ),
+            dissolve_grain: bg(
+                &pipelines.dissolve_grain,
+                &[
+                    (0, &params_buf),
+                    (1, &pos),
+                    (8, &cell_start),
+                    (9, &sorted_indices),
+                    (11, &phase),
+                    (20, &chem),
+                    (21, &diss_neighbors),
+                    (22, &chem_frozen),
+                ],
+            ),
+            dissolve_water: bg(
+                &pipelines.dissolve_water,
+                &[
+                    (0, &params_buf),
+                    (1, &pos),
+                    (8, &cell_start),
+                    (9, &sorted_indices),
+                    (11, &phase),
+                    (20, &chem),
+                    (21, &diss_neighbors),
+                    (22, &chem_frozen),
+                ],
+            ),
+            thermal_exchange: bg(
+                &pipelines.thermal_exchange,
+                &[
+                    (0, &params_buf),
+                    (1, &pos),
+                    (8, &cell_start),
+                    (9, &sorted_indices),
+                    (11, &phase),
+                    (20, &chem),
+                    (22, &chem_frozen),
+                ],
+            ),
+            apply_dp: bg(
+                &pipelines.apply_dp,
+                &[
+                    (0, &params_buf),
+                    (1, &pos),
+                    (2, &pred),
+                    (6, &dp),
+                    pass(&mut enc, &p.grid_scan, &b.grid_scan, "grid_scan", 1);
+                    pass(&mut enc, &p.grid_clear, &b.grid_clear, "grid_clear", nc);
+                    pass(
+                        &mut enc,
+                        &p.grid_scatter,
+                        &b.grid_scatter,
+                        "grid_scatter",
+                        np,
+                    );
+                    // Snapshot the live chem so both transfer passes read a frozen state while
+                    // writing disjoint slots of the live buffer (race-free conservation).
+                    enc.copy_buffer_to_buffer(
+                        self.chem.as_ref(),
+                        0,
+                        &self.chem_frozen,
+                        0,
+                        (self.particle_count as u64) * 16,
+                    );
+                    pass(&mut enc, &p.diss_count, &b.diss_count, "diss_count", np);
+                    pass(
+                        &mut enc,
+                        &p.dissolve_grain,
+                        &b.dissolve_grain,
+                        "dissolve_grain",
+                        np,
+                    );
+                    pass(
+                        &mut enc,
+                        &p.dissolve_water,
+                        &b.dissolve_water,
+                        "dissolve_water",
+                        np,
+                    );
+                    // Thermal exchange + ambient loss (U6). Re-snapshot the post-dissolution chem so
+                    // the pass preserves the updated c/pools (it writes only the T lane), then run on
+                    // the still-valid grid. T evolved here feeds the NEXT substep's k_T (one-step lag).
+                    enc.copy_buffer_to_buffer(
+                        self.chem.as_ref(),
+                        0,
+                        &self.chem_frozen,
+                        0,
+                        (self.particle_count as u64) * 16,
+                    );
+                    pass(
+                        &mut enc,
+                        &p.thermal_exchange,
+                        &b.thermal_exchange,
+                        "thermal_exchange",
+                        np,
+                    );
+                }
+            }
+        }
+
+ succeeded in 0ms:
+src/solvers/xpbd/wetting.wgsl:52:                    if (ph_j == PHASE_WATER) {
+src/solvers/xpbd/wetting.wgsl:68:    if (phase[i] != PHASE_WATER) { return; }
+src/solvers/xpbd/wetting.wgsl:90:                    if (phase[j] != PHASE_GRAIN) { continue; }
+src/solvers/xpbd/wetting.wgsl:110:    if (phase[i] != PHASE_GRAIN) { return; }
+src/solvers/xpbd/wetting.wgsl:134:                    if (phase[j] != PHASE_WATER) { continue; }
+src/models/wetting.rs:51:pub fn grain_eff_mass(m_dry: f32, v_abs: f32, rho_w: f32) -> f32 {
+src/models/wetting.rs:58:pub fn water_eff_mass(particle_mass: f32, f_w: f32) -> f32 {
+src/models/wetting.rs:127:        assert!((grain_eff_mass(m_dry, v_abs, rho_w) - (m_dry + rho_w * v_abs)).abs() < EPS);
+src/models/wetting.rs:129:        assert!((water_eff_mass(1.0, 0.25) - 0.25).abs() < EPS);
+src/models/mod.rs:89:    pub kappa: f32,
+src/models/mod.rs:90:    pub cp_water: f32,
+src/models/mod.rs:91:    pub cp_grain: f32,
+src/models/mod.rs:92:    pub h_amb: f32,
+src/models/mod.rs:93:    pub t_amb: f32,
+src/models/mod.rs:135:            kappa: 2.0,
+src/models/mod.rs:136:            cp_water: 1.0,
+src/models/mod.rs:137:            cp_grain: 1.0,
+src/models/mod.rs:138:            h_amb: 0.02,
+src/models/mod.rs:139:            t_amb: 0.85,
+src/solvers/xpbd/mod.rs:35:struct Params {
+src/solvers/xpbd/mod.rs:98:    kappa: f32,        // thermal conductance (pair heat κ)
+src/solvers/xpbd/mod.rs:99:    cp_water: f32,     // water specific heat (C_water = particle_mass·f_w·cp_water)
+src/solvers/xpbd/mod.rs:100:    cp_grain: f32,     // grain specific heat (C_grain = grain_eff_mass·cp_grain)
+src/solvers/xpbd/mod.rs:101:    h_amb: f32,        // ambient heat-loss rate
+src/solvers/xpbd/mod.rs:102:    t_amb: f32,        // ambient temperature
+src/solvers/xpbd/mod.rs:742:            kappa: mats.kappa,
+src/solvers/xpbd/mod.rs:743:            cp_water: mats.cp_water,
+src/solvers/xpbd/mod.rs:744:            cp_grain: mats.cp_grain,
+src/solvers/xpbd/mod.rs:745:            h_amb: mats.h_amb,
+src/solvers/xpbd/mod.rs:746:            t_amb: mats.t_amb,
+src/models/thermal.rs:20:pub fn pair_heat(t_i: f32, c_i: f32, t_j: f32, c_j: f32, kappa: f32, dt: f32) -> f32 {
+src/models/thermal.rs:25:    let raw = kappa.max(0.0) * (t_j - t_i) * dt.max(0.0);
+src/models/thermal.rs:31:/// Per-step loss toward ambient: `−clamp(h_amb·dt, 0, 1)·(T − T_amb)`. Always cools (or warms) toward
+src/models/thermal.rs:34:pub fn ambient_delta(t: f32, t_amb: f32, h_amb: f32, dt: f32) -> f32 {
+src/models/thermal.rs:35:    -(h_amb * dt).clamp(0.0, 1.0) * (t - t_amb)
+src/models/thermal.rs:91:        let (t_amb, h) = (20.0, 2.0);
+src/models/thermal.rs:93:        let d = ambient_delta(90.0, t_amb, h, 1.0 / 60.0);
+src/models/thermal.rs:94:        assert!(d < 0.0 && 90.0 + d >= t_amb, "cools, no overshoot");
+src/models/thermal.rs:96:        assert_eq!(ambient_delta(t_amb, t_amb, h, 1.0 / 60.0), 0.0);
+src/models/thermal.rs:98:        assert!((90.0 + ambient_delta(90.0, t_amb, h, 1.0e6) - t_amb).abs() < TOL);
+src/solvers/xpbd/extraction.wgsl:72:                    if (ph_i == PHASE_GRAIN) { flux_acc = flux_acc + length(vi - vel[j].xyz); }
+src/solvers/xpbd/extraction.wgsl:78:    if (ph_i == PHASE_GRAIN && n > 0u) { flux_g = flux_acc / f32(n); }
+src/solvers/xpbd/extraction.wgsl:86:    if (phase[i] != PHASE_GRAIN) { return; }
+src/solvers/xpbd/extraction.wgsl:108:                    if (phase[j] != PHASE_WATER) { continue; }
+src/solvers/xpbd/extraction.wgsl:132:    if (phase[i] != PHASE_WATER) { return; }
+src/solvers/xpbd/extraction.wgsl:156:                    if (phase[j] != PHASE_GRAIN) { continue; }
+src/solvers/xpbd/extraction.wgsl:182:    return select(cf.y, cf.z, ph == PHASE_GRAIN); // water T at .y, grain T at .z
+src/solvers/xpbd/extraction.wgsl:185:    let cp = select(params.cp_water, params.cp_grain, ph == PHASE_GRAIN);
+src/solvers/xpbd/extraction.wgsl:186:    return eff_mass(ph, w) * cp;
+src/solvers/xpbd/extraction.wgsl:220:                    q_sum = q_sum + th_pair_heat(t_i, c_i, t_j, c_j, params.kappa, params.dt);
+src/solvers/xpbd/extraction.wgsl:228:    t_new = t_new + th_ambient(t_new, params.t_amb, params.h_amb, params.dt);
+src/solvers/xpbd/extraction.wgsl:231:    if (ph_i == PHASE_GRAIN) {
+src/solvers/xpbd/common.wgsl:12:const PHASE_WATER: u32 = 0u;
+src/solvers/xpbd/common.wgsl:13:const PHASE_GRAIN: u32 = 1u;
+src/solvers/xpbd/common.wgsl:15:struct Params {
+src/solvers/xpbd/common.wgsl:78:    kappa: f32,
+src/solvers/xpbd/common.wgsl:79:    cp_water: f32,
+src/solvers/xpbd/common.wgsl:80:    cp_grain: f32,
+src/solvers/xpbd/common.wgsl:81:    h_amb: f32,
+src/solvers/xpbd/common.wgsl:82:    t_amb: f32,
+src/solvers/xpbd/common.wgsl:301:fn th_pair_heat(t_i: f32, c_i: f32, t_j: f32, c_j: f32, kappa: f32, dt: f32) -> f32 {
+src/solvers/xpbd/common.wgsl:304:    let raw = max(kappa, 0.0) * (t_j - t_i) * max(dt, 0.0);
+src/solvers/xpbd/common.wgsl:308:fn th_ambient(t: f32, t_amb: f32, h_amb: f32, dt: f32) -> f32 {
+src/solvers/xpbd/common.wgsl:309:    return -clamp(h_amb * dt, 0.0, 1.0) * (t - t_amb);
+src/solvers/xpbd/common.wgsl:348:fn grain_eff_mass(v_abs: f32) -> f32 { return params.grain_mass + params.rest_density * v_abs; }
+src/solvers/xpbd/common.wgsl:349:fn water_eff_mass(f_w: f32) -> f32 { return params.particle_mass * f_w; }
+src/solvers/xpbd/common.wgsl:351:fn eff_mass(ph: u32, w: f32) -> f32 {
+src/solvers/xpbd/common.wgsl:352:    if (ph == PHASE_GRAIN) { return grain_eff_mass(w); }
+src/solvers/xpbd/common.wgsl:353:    return water_eff_mass(w);
+src/solvers/xpbd/common.wgsl:362:    let rho_g = grain_eff_mass(v_abs) / max(grain_eff_volume(v_abs), 1.0e-6);
+src/solvers/xpbd/common.wgsl:508:    let contact = select(0.0, 0.5 * params.grain_diameter, phase[i] == PHASE_GRAIN);
+src/solvers/xpbd/common.wgsl:524:    if (phase[i] == PHASE_GRAIN) {
+src/solvers/xpbd/common.wgsl:577:    if (phase[i] == PHASE_GRAIN) {
+src/models/wetting.rs:51:pub fn grain_eff_mass(m_dry: f32, v_abs: f32, rho_w: f32) -> f32 {
+src/models/wetting.rs:58:pub fn water_eff_mass(particle_mass: f32, f_w: f32) -> f32 {
+src/models/wetting.rs:127:        assert!((grain_eff_mass(m_dry, v_abs, rho_w) - (m_dry + rho_w * v_abs)).abs() < EPS);
+src/models/wetting.rs:129:        assert!((water_eff_mass(1.0, 0.25) - 0.25).abs() < EPS);
+src/models/mod.rs:89:    pub kappa: f32,
+src/models/mod.rs:90:    pub cp_water: f32,
+src/models/mod.rs:91:    pub cp_grain: f32,
+src/models/mod.rs:92:    pub h_amb: f32,
+src/models/mod.rs:93:    pub t_amb: f32,
+src/models/mod.rs:135:            kappa: 2.0,
+src/models/mod.rs:136:            cp_water: 1.0,
+src/models/mod.rs:137:            cp_grain: 1.0,
+src/models/mod.rs:138:            h_amb: 0.02,
+src/models/mod.rs:139:            t_amb: 0.85,
+src/solvers/xpbd/coupling.wgsl:39:                    if (phase[j] != PHASE_GRAIN) { continue; } // solid fraction from grains only
+src/solvers/xpbd/coupling.wgsl:74:    if (phase[i] != PHASE_WATER) { return; }
+src/solvers/xpbd/coupling.wgsl:77:    let m_w = water_eff_mass(pred[i].w);
+src/solvers/xpbd/coupling.wgsl:93:                    if (phase[j] != PHASE_GRAIN) { continue; }
+src/solvers/xpbd/coupling.wgsl:94:                    let m_g = grain_eff_mass(pred[j].w);
+src/solvers/xpbd/coupling.wgsl:109:    if (phase[i] != PHASE_GRAIN) { return; }
+src/solvers/xpbd/coupling.wgsl:112:    let m_g = grain_eff_mass(pred[i].w);
+src/solvers/xpbd/coupling.wgsl:128:                    if (phase[j] != PHASE_WATER) { continue; }
+src/solvers/xpbd/coupling.wgsl:131:                    let m_w = water_eff_mass(pred[j].w);
+src/solvers/xpbd/coupling.wgsl:213:    let m_i = eff_mass(self_phase, pred[i].w);
+src/solvers/xpbd/coupling.wgsl:214:    let m_j = eff_mass(phase[j], pred[j].w);
+src/solvers/xpbd/coupling.wgsl:222:    if (phase[i] != PHASE_WATER) { return; }
+src/solvers/xpbd/coupling.wgsl:239:                    if (phase[j] != PHASE_GRAIN) { continue; }
+src/solvers/xpbd/coupling.wgsl:242:                    dv = dv + drag_delta_for_pair(i, j, PHASE_WATER);
+src/solvers/xpbd/coupling.wgsl:256:    if (phase[i] != PHASE_GRAIN) { return; }
+src/solvers/xpbd/coupling.wgsl:273:                    if (phase[j] != PHASE_WATER) { continue; }
+src/solvers/xpbd/coupling.wgsl:276:                    dv = dv + drag_delta_for_pair(i, j, PHASE_GRAIN);
+src/solvers/xpbd/coupling.wgsl:294:    if (phase[i] != PHASE_GRAIN) { return; }
+src/solvers/xpbd/coupling.wgsl:311:                    if (phase[j] != PHASE_WATER) { continue; }
+src/solvers/xpbd/coupling.wgsl:322:    let m_g = grain_eff_mass(pred[i].w); // swelling: heavier wet grain accelerates less
+src/solvers/xpbd/coupling.wgsl:334:    if (phase[i] != PHASE_WATER) { return; }
+src/solvers/xpbd/coupling.wgsl:352:                    if (phase[j] != PHASE_GRAIN) { continue; }
+src/solvers/xpbd/coupling.wgsl:367:    let m_w = max(water_eff_mass(pred[i].w), params.particle_mass * params.pbf_eps);
+src/solvers/xpbd/coupling.wgsl:382:        let contact = select(0.0, 0.5 * params.grain_diameter, phase[i] == PHASE_GRAIN);
+src/solvers/xpbd/bed.wgsl:21:    if (phase[i] != PHASE_GRAIN) { return; }
+src/solvers/xpbd/bed.wgsl:26:    let m_i = grain_eff_mass(v_abs_i);
+src/solvers/xpbd/bed.wgsl:49:                    if (phase[j] != PHASE_GRAIN) { continue; } // grain contacts only
+src/solvers/xpbd/bed.wgsl:56:                    let w_i = grain_eff_mass(pred[j].w) / (m_i + grain_eff_mass(pred[j].w));
+src/models/thermal.rs:20:pub fn pair_heat(t_i: f32, c_i: f32, t_j: f32, c_j: f32, kappa: f32, dt: f32) -> f32 {
+src/models/thermal.rs:25:    let raw = kappa.max(0.0) * (t_j - t_i) * dt.max(0.0);
+src/models/thermal.rs:31:/// Per-step loss toward ambient: `−clamp(h_amb·dt, 0, 1)·(T − T_amb)`. Always cools (or warms) toward
+src/models/thermal.rs:34:pub fn ambient_delta(t: f32, t_amb: f32, h_amb: f32, dt: f32) -> f32 {
+src/models/thermal.rs:35:    -(h_amb * dt).clamp(0.0, 1.0) * (t - t_amb)
+src/models/thermal.rs:91:        let (t_amb, h) = (20.0, 2.0);
+src/models/thermal.rs:93:        let d = ambient_delta(90.0, t_amb, h, 1.0 / 60.0);
+src/models/thermal.rs:94:        assert!(d < 0.0 && 90.0 + d >= t_amb, "cools, no overshoot");
+src/models/thermal.rs:96:        assert_eq!(ambient_delta(t_amb, t_amb, h, 1.0 / 60.0), 0.0);
+src/models/thermal.rs:98:        assert!((90.0 + ambient_delta(90.0, t_amb, h, 1.0e6) - t_amb).abs() < TOL);
+src/solvers/xpbd/water.wgsl:15:    if (phase[i] != PHASE_WATER) { return; } // grains have no density constraint
+src/solvers/xpbd/water.wgsl:47:                    if (phase[j] != PHASE_WATER) { continue; } // skip grain neighbors
+src/solvers/xpbd/water.wgsl:120:    if (phase[i] != PHASE_WATER) { return; } // grains are projected by bed_project
+src/solvers/xpbd/water.wgsl:147:                    if (phase[j] != PHASE_WATER) { continue; } // skip grain neighbors
+src/solvers/xpbd/water.wgsl:173:    if (phase[i] != PHASE_WATER) {
+src/solvers/xpbd/wetting.wgsl:52:                    if (ph_j == PHASE_WATER) {
+src/solvers/xpbd/wetting.wgsl:68:    if (phase[i] != PHASE_WATER) { return; }
+src/solvers/xpbd/wetting.wgsl:90:                    if (phase[j] != PHASE_GRAIN) { continue; }
+src/solvers/xpbd/wetting.wgsl:110:    if (phase[i] != PHASE_GRAIN) { return; }
+src/solvers/xpbd/wetting.wgsl:134:                    if (phase[j] != PHASE_WATER) { continue; }
+src/solvers/xpbd/mod.rs:35:struct Params {
+src/solvers/xpbd/mod.rs:98:    kappa: f32,        // thermal conductance (pair heat κ)
+src/solvers/xpbd/mod.rs:99:    cp_water: f32,     // water specific heat (C_water = particle_mass·f_w·cp_water)
+src/solvers/xpbd/mod.rs:100:    cp_grain: f32,     // grain specific heat (C_grain = grain_eff_mass·cp_grain)
+src/solvers/xpbd/mod.rs:101:    h_amb: f32,        // ambient heat-loss rate
+src/solvers/xpbd/mod.rs:102:    t_amb: f32,        // ambient temperature
+src/solvers/xpbd/mod.rs:742:            kappa: mats.kappa,
+src/solvers/xpbd/mod.rs:743:            cp_water: mats.cp_water,
+src/solvers/xpbd/mod.rs:744:            cp_grain: mats.cp_grain,
+src/solvers/xpbd/mod.rs:745:            h_amb: mats.h_amb,
+src/solvers/xpbd/mod.rs:746:            t_amb: mats.t_amb,
+src/solvers/xpbd/extraction.wgsl:72:                    if (ph_i == PHASE_GRAIN) { flux_acc = flux_acc + length(vi - vel[j].xyz); }
+src/solvers/xpbd/extraction.wgsl:78:    if (ph_i == PHASE_GRAIN && n > 0u) { flux_g = flux_acc / f32(n); }
+src/solvers/xpbd/extraction.wgsl:86:    if (phase[i] != PHASE_GRAIN) { return; }
+src/solvers/xpbd/extraction.wgsl:108:                    if (phase[j] != PHASE_WATER) { continue; }
+src/solvers/xpbd/extraction.wgsl:132:    if (phase[i] != PHASE_WATER) { return; }
+src/solvers/xpbd/extraction.wgsl:156:                    if (phase[j] != PHASE_GRAIN) { continue; }
+src/solvers/xpbd/extraction.wgsl:182:    return select(cf.y, cf.z, ph == PHASE_GRAIN); // water T at .y, grain T at .z
+src/solvers/xpbd/extraction.wgsl:185:    let cp = select(params.cp_water, params.cp_grain, ph == PHASE_GRAIN);
+src/solvers/xpbd/extraction.wgsl:186:    return eff_mass(ph, w) * cp;
+src/solvers/xpbd/extraction.wgsl:220:                    q_sum = q_sum + th_pair_heat(t_i, c_i, t_j, c_j, params.kappa, params.dt);
+src/solvers/xpbd/extraction.wgsl:228:    t_new = t_new + th_ambient(t_new, params.t_amb, params.h_amb, params.dt);
+src/solvers/xpbd/extraction.wgsl:231:    if (ph_i == PHASE_GRAIN) {
+src/ui/particles.wgsl:16:const PHASE_GRAIN: u32 = 1u;
+src/ui/particles.wgsl:35:    let scale = select(1.0, cam.params.z, phases[ii] == PHASE_GRAIN);
+src/ui/particles.wgsl:63:    if (in.phase == PHASE_GRAIN) {
+src/solvers/xpbd/coupling.wgsl:39:                    if (phase[j] != PHASE_GRAIN) { continue; } // solid fraction from grains only
+src/solvers/xpbd/coupling.wgsl:74:    if (phase[i] != PHASE_WATER) { return; }
+src/solvers/xpbd/coupling.wgsl:77:    let m_w = water_eff_mass(pred[i].w);
+src/solvers/xpbd/coupling.wgsl:93:                    if (phase[j] != PHASE_GRAIN) { continue; }
+src/solvers/xpbd/coupling.wgsl:94:                    let m_g = grain_eff_mass(pred[j].w);
+src/solvers/xpbd/coupling.wgsl:109:    if (phase[i] != PHASE_GRAIN) { return; }
+src/solvers/xpbd/coupling.wgsl:112:    let m_g = grain_eff_mass(pred[i].w);
+src/solvers/xpbd/coupling.wgsl:128:                    if (phase[j] != PHASE_WATER) { continue; }
+src/solvers/xpbd/coupling.wgsl:131:                    let m_w = water_eff_mass(pred[j].w);
+src/solvers/xpbd/coupling.wgsl:213:    let m_i = eff_mass(self_phase, pred[i].w);
+src/solvers/xpbd/coupling.wgsl:214:    let m_j = eff_mass(phase[j], pred[j].w);
+src/solvers/xpbd/coupling.wgsl:222:    if (phase[i] != PHASE_WATER) { return; }
+src/solvers/xpbd/coupling.wgsl:239:                    if (phase[j] != PHASE_GRAIN) { continue; }
+src/solvers/xpbd/coupling.wgsl:242:                    dv = dv + drag_delta_for_pair(i, j, PHASE_WATER);
+src/solvers/xpbd/coupling.wgsl:256:    if (phase[i] != PHASE_GRAIN) { return; }
+src/solvers/xpbd/coupling.wgsl:273:                    if (phase[j] != PHASE_WATER) { continue; }
+src/solvers/xpbd/coupling.wgsl:276:                    dv = dv + drag_delta_for_pair(i, j, PHASE_GRAIN);
+src/solvers/xpbd/coupling.wgsl:294:    if (phase[i] != PHASE_GRAIN) { return; }
+src/solvers/xpbd/coupling.wgsl:311:                    if (phase[j] != PHASE_WATER) { continue; }
+src/solvers/xpbd/coupling.wgsl:322:    let m_g = grain_eff_mass(pred[i].w); // swelling: heavier wet grain accelerates less
+src/solvers/xpbd/coupling.wgsl:334:    if (phase[i] != PHASE_WATER) { return; }
+src/solvers/xpbd/coupling.wgsl:352:                    if (phase[j] != PHASE_GRAIN) { continue; }
+src/solvers/xpbd/coupling.wgsl:367:    let m_w = max(water_eff_mass(pred[i].w), params.particle_mass * params.pbf_eps);
+src/solvers/xpbd/coupling.wgsl:382:        let contact = select(0.0, 0.5 * params.grain_diameter, phase[i] == PHASE_GRAIN);
+src/solvers/xpbd/water.wgsl:15:    if (phase[i] != PHASE_WATER) { return; } // grains have no density constraint
+src/solvers/xpbd/water.wgsl:47:                    if (phase[j] != PHASE_WATER) { continue; } // skip grain neighbors
+src/solvers/xpbd/water.wgsl:120:    if (phase[i] != PHASE_WATER) { return; } // grains are projected by bed_project
+src/solvers/xpbd/water.wgsl:147:                    if (phase[j] != PHASE_WATER) { continue; } // skip grain neighbors
+src/solvers/xpbd/water.wgsl:173:    if (phase[i] != PHASE_WATER) {
+src/solvers/xpbd/bed.wgsl:21:    if (phase[i] != PHASE_GRAIN) { return; }
+src/solvers/xpbd/bed.wgsl:26:    let m_i = grain_eff_mass(v_abs_i);
+src/solvers/xpbd/bed.wgsl:49:                    if (phase[j] != PHASE_GRAIN) { continue; } // grain contacts only
+src/solvers/xpbd/bed.wgsl:56:                    let w_i = grain_eff_mass(pred[j].w) / (m_i + grain_eff_mass(pred[j].w));
+src/solvers/xpbd/common.wgsl:12:const PHASE_WATER: u32 = 0u;
+src/solvers/xpbd/common.wgsl:13:const PHASE_GRAIN: u32 = 1u;
+src/solvers/xpbd/common.wgsl:15:struct Params {
+src/solvers/xpbd/common.wgsl:78:    kappa: f32,
+src/solvers/xpbd/common.wgsl:79:    cp_water: f32,
+src/solvers/xpbd/common.wgsl:80:    cp_grain: f32,
+src/solvers/xpbd/common.wgsl:81:    h_amb: f32,
+src/solvers/xpbd/common.wgsl:82:    t_amb: f32,
+src/solvers/xpbd/common.wgsl:301:fn th_pair_heat(t_i: f32, c_i: f32, t_j: f32, c_j: f32, kappa: f32, dt: f32) -> f32 {
+src/solvers/xpbd/common.wgsl:304:    let raw = max(kappa, 0.0) * (t_j - t_i) * max(dt, 0.0);
+src/solvers/xpbd/common.wgsl:308:fn th_ambient(t: f32, t_amb: f32, h_amb: f32, dt: f32) -> f32 {
+src/solvers/xpbd/common.wgsl:309:    return -clamp(h_amb * dt, 0.0, 1.0) * (t - t_amb);
+src/solvers/xpbd/common.wgsl:348:fn grain_eff_mass(v_abs: f32) -> f32 { return params.grain_mass + params.rest_density * v_abs; }
+src/solvers/xpbd/common.wgsl:349:fn water_eff_mass(f_w: f32) -> f32 { return params.particle_mass * f_w; }
+src/solvers/xpbd/common.wgsl:351:fn eff_mass(ph: u32, w: f32) -> f32 {
+src/solvers/xpbd/common.wgsl:352:    if (ph == PHASE_GRAIN) { return grain_eff_mass(w); }
+src/solvers/xpbd/common.wgsl:353:    return water_eff_mass(w);
+src/solvers/xpbd/common.wgsl:362:    let rho_g = grain_eff_mass(v_abs) / max(grain_eff_volume(v_abs), 1.0e-6);
+src/solvers/xpbd/common.wgsl:508:    let contact = select(0.0, 0.5 * params.grain_diameter, phase[i] == PHASE_GRAIN);
+src/solvers/xpbd/common.wgsl:524:    if (phase[i] == PHASE_GRAIN) {
+src/solvers/xpbd/common.wgsl:577:    if (phase[i] == PHASE_GRAIN) {
+
+codex
+I found the kernel uses seven storage bindings, so the resource-budget question looks clean. One possible issue is the exact zero-capacity path; I’m checking whether that can exist for grains or only depleted water.
+exec
+/bin/zsh -lc "sed -n '286,314p' src/solvers/xpbd/common.wgsl" in /Users/cxc/Github/coffee-sim
+exec
+/bin/zsh -lc "sed -n '1,55p' src/models/thermal.rs" in /Users/cxc/Github/coffee-sim
+ succeeded in 0ms:
+    return clamp(u / (u + max(u_half, 1e-6)), 0.0, 1.0);
+}
+fn ex_wet_gate(saturation: f32, s_on: f32) -> f32 {
+    if (s_on <= 1e-6) { return select(0.0, 1.0, saturation > 0.0); }
+    return smoothstep(0.0, s_on, saturation);
+}
+fn ex_driving(c: f32, c_sat: f32) -> f32 {
+    if (c_sat <= 1e-6) { return 0.0; }
+    return clamp(1.0 - c / c_sat, 0.0, 1.0);
+}
+fn ex_release(pool: f32, k_eff: f32, dt: f32) -> f32 {
+    let frac = 1.0 - exp(-max(k_eff, 0.0) * max(dt, 0.0));
+    return clamp(pool * frac, 0.0, max(pool, 0.0));
+}
+// Capacity-weighted pair heat from j into i, symmetrically clamped (antisymmetric → conserves energy).
+fn th_pair_heat(t_i: f32, c_i: f32, t_j: f32, c_j: f32, kappa: f32, dt: f32) -> f32 {
+    let sum = c_i + c_j;
+    if (sum <= 1e-6) { return 0.0; }
+    let raw = max(kappa, 0.0) * (t_j - t_i) * max(dt, 0.0);
+    let cap = (c_i * c_j / sum) * (t_j - t_i);
+    return clamp(raw, min(cap, 0.0), max(cap, 0.0));
+}
+fn th_ambient(t: f32, t_amb: f32, h_amb: f32, dt: f32) -> f32 {
+    return -clamp(h_amb * dt, 0.0, 1.0) * (t - t_amb);
+}
+
+fn w_poly6(r: f32, h: f32) -> f32 {
+    if (r >= h) { return 0.0; }
+    let t = h * h - r * r;
+
+ succeeded in 0ms:
+//! Thermal exchange shared by solvers (CPU reference) — lumped bed↔water heat transfer + ambient loss.
+//!
+//! Water carries temperature `T`; the kinetics are `T`-dependent (`extraction::arrhenius`), so the
+//! natural pour-temperature drop reduces late-brew extraction. Heat exchange is **capacity-weighted**
+//! so it conserves energy for unequal water/grain heat capacities `C = mass · specific_heat`: a pair
+//! exchanges a heat amount `q` (antisymmetric — what one gains the other loses), and each side applies
+//! `ΔT = ±q/C`. A plain symmetric `ΔT = α·(T_j−T_i)` would only conserve energy when `C_i = C_j`.
+//! These pure functions are the CPU mirror of the GPU thermal pass; the GPU per-particle form is
+//! `ΔT_i = (Σ_neighbors q_ij)/C_i + ambient`, with `q_ij = −q_ji` so global enthalpy is conserved.
+
+const EPS: f32 = 1.0e-6;
+
+/// Capacity-weighted heat from neighbor `j` into particle `i` over `dt`: `κ·(T_j − T_i)·dt`, **clamped
+/// symmetrically** so it never overshoots the pair's capacity-weighted equilibrium. The cap is the
+/// reduced heat capacity times the temperature gap, `|q| ≤ (C_i·C_j/(C_i+C_j))·|T_j − T_i|` — exactly
+/// the heat that brings both to equilibrium. Apply as `ΔT_i = q/C_i` (and `ΔT_j = −q/C_j` when `j`
+/// gathers `i`). The function is **antisymmetric**: `pair_heat(j←i) = −pair_heat(i←j)` (the clamp
+/// depends only on the symmetric reduced capacity and `|ΔT|`), so global enthalpy is conserved.
+#[inline]
+pub fn pair_heat(t_i: f32, c_i: f32, t_j: f32, c_j: f32, kappa: f32, dt: f32) -> f32 {
+    let sum = c_i + c_j;
+    if sum <= EPS {
+        return 0.0;
+    }
+    let raw = kappa.max(0.0) * (t_j - t_i) * dt.max(0.0);
+    let cap = (c_i * c_j / sum) * (t_j - t_i); // reduced-capacity equilibrium heat (same sign as raw)
+                                               // raw and cap share the sign of (t_j − t_i); clamp |raw| ≤ |cap| preserving that sign.
+    raw.clamp(cap.min(0.0), cap.max(0.0))
+}
+
+/// Per-step loss toward ambient: `−clamp(h_amb·dt, 0, 1)·(T − T_amb)`. Always cools (or warms) toward
+/// `T_amb`, never overshooting it; zero when already at ambient.
+#[inline]
+pub fn ambient_delta(t: f32, t_amb: f32, h_amb: f32, dt: f32) -> f32 {
+    -(h_amb * dt).clamp(0.0, 1.0) * (t - t_amb)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TOL: f32 = 1.0e-4;
+
+    #[test]
+    fn pair_heat_is_antisymmetric() {
+        let q_ij = pair_heat(20.0, 1.0, 80.0, 3.0, 0.5, 1.0 / 60.0);
+        let q_ji = pair_heat(80.0, 3.0, 20.0, 1.0, 0.5, 1.0 / 60.0);
+        assert!((q_ij + q_ji).abs() < TOL, "antisymmetric: {q_ij} vs {q_ji}");
+        assert!(q_ij > 0.0, "heat flows from the hotter j into i");
+    }
+
+    #[test]
+    fn closed_unequal_capacity_pair_conserves_energy_and_relaxes() {
+        // Unequal capacities; iterate the symmetric pair update many steps.
+        let (mut ti, ci) = (20.0f32, 1.0f32);
+
+exec
+/bin/zsh -lc "sed -n '1,115p' src/solvers/xpbd/common.wgsl" in /Users/cxc/Github/coffee-sim
+ succeeded in 0ms:
+// Shared core for the unified XPBD solver: params/status/bindings, SPH + grid math, and the
+// kernels both species use (predict, grid build, apply_dp, finalize). The water-incompressibility
+// kernels live in `water.wgsl`; the granular-bed kernel in `bed.wgsl`. The three files are
+// concatenated into one shader module at build time (WGSL has no imports), so this file declares
+// everything the others reference.
+//
+// Two species share one particle system + neighbor grid, tagged by `phase`: water solves a
+// density constraint (water.wgsl); grains solve contact + friction + cohesion (bed.wgsl). A
+// scene is single-species for now, so the step loop runs only that species' passes — but the
+// per-particle `phase` guards keep each kernel correct regardless of who calls it.
+
+const PHASE_WATER: u32 = 0u;
+const PHASE_GRAIN: u32 = 1u;
+
+struct Params {
+    box_min: vec4<f32>,
+    box_max: vec4<f32>,
+    gravity: vec4<f32>,
+    grid_origin: vec4<f32>,   // = box_min
+    grid_dims: vec4<u32>,     // nx, ny, nz, num_cells
+    dt: f32,
+    h: f32,
+    rest_density: f32,
+    particle_mass: f32,
+    s_corr_k: f32,
+    s_corr_n: f32,
+    s_corr_wq: f32,           // W_poly6(Δq, h)
+    relaxation_eps: f32,
+    position_relaxation: f32, // ω
+    xsph_c: f32,
+    max_speed: f32,
+    spiky_r_min: f32,         // ε_r · h
+    cell_size: f32,           // = h
+    particle_count: u32,
+    num_solids: u32,          // count of static SDF solids in the `solids` buffer (0 = none)
+    min_iters: u32,
+    max_iters: u32,
+    residual_tolerance: f32,
+    lambda_noncohesive: u32,
+    max_correction: f32,
+    velocity_damping: f32,
+    // --- granular bed (grain phase) ---
+    grain_diameter: f32,      // contact diameter d (separation kicks in below this)
+    friction_mu: f32,         // grain–grain Coulomb coefficient
+    floor_mu: f32,            // grain–boundary (floor/wall) Coulomb coefficient
+    dry_cohesion: f32,        // weak short-range attraction strength (0 = none)
+    cohesion_range: f32,      // cohesion/contact search reach (absolute; d ≤ r < this)
+    rolling_damping: f32,     // grain velocity retained per frame (rolling-resistance proxy)
+    grain_sleep_speed: f32,   // static-yield dead-band: below this a grain is treated as at rest
+    // --- water/bed coupling (mixed scenes) ---
+    grain_mass: f32,
+    grain_volume: f32,        // (π/6)·grain_diameter³ — effective volume for the α_s sum
+    packing_limit: f32,       // α_s clamp (~0.64)
+    exclusion_relax: f32,     // under-relaxation on the A.2 correction
+    drag_gamma: f32,
+    drag_beta_max: f32,
+    buoyancy_scale: f32,
+    wake_threshold: f32,
+    water_grain_distance: f32, // water↔grain exclusion contact (≤ grain spacing lets water thread pores)
+    // --- wetting / cohesion (Phase 1.4) ---
+    r_max: f32,                // moisture ratio at saturation (mass water / mass dry grain)
+    rho_ratio: f32,            // ρ_s/ρ_w — converts absorbed water mass → swelling volume
+    s_peak: f32,               // saturation at the cohesion-curve peak
+    c_max: f32,                // peak wet cohesion strength (0 until calibrated)
+    k_abs: f32,                // absorption rate constant (1/s)
+    absorb_roundoff: f32,      // f_w deactivation floor (exact-conservation; ≪ pbf_eps)
+    pbf_eps: f32,              // PBF skips water with remaining fraction ≤ this
+    // --- extraction + thermal (Phase 1.5) ---
+    extract_rate: f32,         // opt-in gate (0 = off)
+    k0_fast: f32,
+    k0_slow: f32,
+    ea_over_r: f32,
+    t_ref: f32,
+    c_sat: f32,
+    d_ref: f32,
+    u_half: f32,
+    s_on: f32,
+    kappa: f32,
+    cp_water: f32,
+    cp_grain: f32,
+    h_amb: f32,
+    t_amb: f32,
+    _pad_chem0: f32,
+    _pad_chem1: f32,
+};
+
+struct Status {
+    overflow: atomic<u32>,
+    max_occupancy: atomic<u32>,
+    converged: u32,
+    iters_done: u32,
+    effective_iters: u32,
+    residual_bits: u32,
+    _pad0: u32,
+    _pad1: u32,
+};
+
+@group(0) @binding(0) var<uniform> params: Params;
+@group(0) @binding(1) var<storage, read_write> pos: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read_write> pred: array<vec4<f32>>;
+@group(0) @binding(3) var<storage, read_write> vel: array<vec4<f32>>;
+@group(0) @binding(4) var<storage, read_write> vel_smoothed: array<vec4<f32>>;
+@group(0) @binding(5) var<storage, read_write> lambda: array<f32>;
+@group(0) @binding(6) var<storage, read_write> dp: array<vec4<f32>>;
+@group(0) @binding(7) var<storage, read_write> c_residual: array<f32>;
+// Counting-sort spatial hash (no fixed buckets / overflow): cell_start is the exclusive prefix sum
+// of per-cell counts (num_cells+1 entries), and sorted_indices holds particle indices grouped by
+// cell. Gather cell c = sorted_indices[cell_start[c] .. cell_start[c+1]]. cell_count (binding 18) is
+// the transient counter used only while (re)building the grid.
+@group(0) @binding(8) var<storage, read_write> cell_start: array<u32>;
+@group(0) @binding(9) var<storage, read_write> sorted_indices: array<u32>;
+@group(0) @binding(10) var<storage, read_write> status: Status;
+@group(0) @binding(11) var<storage, read_write> phase: array<u32>;
+// Per-grain accumulated normal-correction magnitude this frame (reset in predict). The Coulomb
+// friction budget is μ·normal_impulse — load-scaled and non-zero at static rest, unlike μ·overlap.
+
+exec
+/bin/zsh -lc "sed -n '340,356p' src/solvers/xpbd/common.wgsl" in /Users/cxc/Github/coffee-sim
+ succeeded in 0ms:
+
+// --- Phase-1.4 swelling + effective mass (from the moisture lane: grain pred.w = V_abs, water = f_w).
+// A grain swells by exactly the absorbed volume; its mass gains the absorbed water's mass; a water
+// shrinks proportionally. Dry/full state (V_abs=0, f_w=1) ⇒ the original constants exactly.
+fn grain_eff_volume(v_abs: f32) -> f32 { return params.grain_volume + v_abs; }
+fn grain_eff_diameter(v_abs: f32) -> f32 {
+    return params.grain_diameter * pow(grain_eff_volume(v_abs) / params.grain_volume, 1.0 / 3.0);
+}
+fn grain_eff_mass(v_abs: f32) -> f32 { return params.grain_mass + params.rest_density * v_abs; }
+fn water_eff_mass(f_w: f32) -> f32 { return params.particle_mass * f_w; }
+// Effective mass of a particle from its phase + moisture-lane value `w` (grain V_abs / water f_w).
+fn eff_mass(ph: u32, w: f32) -> f32 {
+    if (ph == PHASE_GRAIN) { return grain_eff_mass(w); }
+    return water_eff_mass(w);
+}
+
+// Density-aware buoyancy scaling: the buoyant acceleration is ∝ ρ_water/ρ_grain, so a grain DENSER
+
+codex
+The pair clamp is mathematically antisymmetric for ordinary positive capacities. I’m checking command ordering now to make sure the second snapshot really occurs after both dissolution dispatches have completed on the GPU timeline.
+exec
+/bin/zsh -lc "sed -n '1588,1702p' src/solvers/xpbd/mod.rs" in /Users/cxc/Github/coffee-sim
+exec
+/bin/zsh -lc 'rg -n "let pass =|fn pass|begin_compute_pass|timestamp|write_timestamp|dispatch_workgroups" src/solvers/xpbd/mod.rs' in /Users/cxc/Github/coffee-sim
+ succeeded in 0ms:
+567:    /// Sample GPU diagnostics (status + per-pass timestamps) into the caches that
+603:        // --- timestamps ---
+1307:        let ts = if gpu.timestamps_supported {
+1313:                label: Some("xpbd-timestamps"),
+1334:                period_ns: queue.get_timestamp_period(),
+1774:    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+1776:        timestamp_writes: tw,
+1780:    pass.dispatch_workgroups(groups, 1, 1);
+
+ succeeded in 0ms:
+                                np,
+                            );
+                        }
+                        pass(&mut enc, &p.bed_project, &b.bed_project, "bed_project", np);
+                        pass(&mut enc, &p.apply_dp, &b.apply_dp, "apply_dp", np);
+                        if !mixed {
+                            pass(
+                                &mut enc,
+                                &p.residual_reduce,
+                                &b.residual_reduce,
+                                "residual_reduce",
+                                1,
+                            );
+                        }
+                    }
+                }
+
+                pass(&mut enc, &p.finalize, &b.finalize, "finalize", np);
+
+                // XSPH viscosity is a fluid term; runs only when water is present.
+                if self.has_water {
+                    pass(&mut enc, &p.xsph, &b.xsph, "xsph", np);
+                    enc.copy_buffer_to_buffer(
+                        &self.vel_smoothed,
+                        0,
+                        &self.vel,
+                        0,
+                        (self.particle_count as u64) * 16,
+                    );
+                }
+
+                // Wetting / absorption (mixed scenes; opt-in via absorb_rate>0). Runs last in the
+                // substep — after finalize/xsph so it reads final positions/velocities and its grain
+                // momentum merge isn't clobbered by the xsph velocity copy. Reads the frozen pred.w
+                // snapshot, writes the new moisture to pos.w; the next predict mirrors it.
+                if mixed && self.params.k_abs > 0.0 {
+                    pass(&mut enc, &p.grid_clear, &b.grid_clear, "grid_clear", nc);
+                    pass(&mut enc, &p.grid_count, &b.grid_count, "grid_count", np);
+                    pass(&mut enc, &p.grid_scan, &b.grid_scan, "grid_scan", 1);
+                    pass(&mut enc, &p.grid_clear, &b.grid_clear, "grid_clear", nc);
+                    pass(
+                        &mut enc,
+                        &p.grid_scatter,
+                        &b.grid_scatter,
+                        "grid_scatter",
+                        np,
+                    );
+                    pass(&mut enc, &p.wet_count, &b.wet_count, "wet_count", np);
+                    pass(&mut enc, &p.wet_water, &b.wet_water, "wet_water", np);
+                    pass(&mut enc, &p.wet_grain, &b.wet_grain, "wet_grain", np);
+                }
+
+                // Extraction / dissolution (mixed scenes; opt-in via extract_rate>0). Wet grains
+                // dissolve two-pool solute into overlapping water's concentration, conserving the
+                // solute inventory exactly. Reads the frozen pred.w moisture (same snapshot wetting
+                // used) + a frozen chem copy; writes only the live chem buffer. Rebuilds the grid
+                // itself so it's independent of the wetting block's gate.
+                if mixed && self.params.extract_rate > 0.0 {
+                    pass(&mut enc, &p.grid_clear, &b.grid_clear, "grid_clear", nc);
+                    pass(&mut enc, &p.grid_count, &b.grid_count, "grid_count", np);
+                    pass(&mut enc, &p.grid_scan, &b.grid_scan, "grid_scan", 1);
+                    pass(&mut enc, &p.grid_clear, &b.grid_clear, "grid_clear", nc);
+                    pass(
+                        &mut enc,
+                        &p.grid_scatter,
+                        &b.grid_scatter,
+                        "grid_scatter",
+                        np,
+                    );
+                    // Snapshot the live chem so both transfer passes read a frozen state while
+                    // writing disjoint slots of the live buffer (race-free conservation).
+                    enc.copy_buffer_to_buffer(
+                        self.chem.as_ref(),
+                        0,
+                        &self.chem_frozen,
+                        0,
+                        (self.particle_count as u64) * 16,
+                    );
+                    pass(&mut enc, &p.diss_count, &b.diss_count, "diss_count", np);
+                    pass(
+                        &mut enc,
+                        &p.dissolve_grain,
+                        &b.dissolve_grain,
+                        "dissolve_grain",
+                        np,
+                    );
+                    pass(
+                        &mut enc,
+                        &p.dissolve_water,
+                        &b.dissolve_water,
+                        "dissolve_water",
+                        np,
+                    );
+                    // Thermal exchange + ambient loss (U6). Re-snapshot the post-dissolution chem so
+                    // the pass preserves the updated c/pools (it writes only the T lane), then run on
+                    // the still-valid grid. T evolved here feeds the NEXT substep's k_T (one-step lag).
+                    enc.copy_buffer_to_buffer(
+                        self.chem.as_ref(),
+                        0,
+                        &self.chem_frozen,
+                        0,
+                        (self.particle_count as u64) * 16,
+                    );
+                    pass(
+                        &mut enc,
+                        &p.thermal_exchange,
+                        &b.thermal_exchange,
+                        "thermal_exchange",
+                        np,
+                    );
+                }
+            }
+        }
+
+        if let Some(ts) = &self.ts {
+
+exec
+/bin/zsh -lc "sed -n '115,150p' src/models/mod.rs && sed -n '720,750p' src/solvers/xpbd/mod.rs" in /Users/cxc/Github/coffee-sim
+ succeeded in 0ms:
+            porosity: 0.40,
+            // Wetting: coffee retains ~1.5× its dry mass; grain density ~1.3× water; cohesion peaks
+            // near 40% saturation. c_max starts at 0 (no wet cohesion until calibrated).
+            r_max: 1.5,
+            rho_ratio: 1.3,
+            s_peak: 0.4,
+            c_max: 0.0,
+            // Extraction/thermal (Phase 1.5) — KEEP.md §1 kinetics + a normalized thermal scale.
+            // These are reference values; calibration to the yield/TDS band is U7. Extraction is
+            // OFF until a scene sets Config.extract_rate > 0, so these defaults don't perturb suites.
+            k0_fast: 0.18,
+            k0_slow: 0.018,
+            ea_over_r: 6.0,
+            t_ref: 1.0,
+            c_sat: 0.08,
+            fast_fraction: 0.30,
+            soluble_fraction: 0.28,
+            d_ref: 1.0,
+            u_half: 1.0,
+            s_on: 0.1,
+            kappa: 2.0,
+            cp_water: 1.0,
+            cp_grain: 1.0,
+            h_amb: 0.02,
+            t_amb: 0.85,
+            pour_t: 1.0,
+        }
+    }
+}
+            drag_gamma: resolved_drag_gamma,
+            drag_beta_max: cfg.drag_beta_max,
+            buoyancy_scale: cfg.buoyancy_scale,
+            wake_threshold: cfg.wake_threshold,
+            water_grain_distance: mats.water_grain_distance,
+            r_max: mats.r_max,
+            rho_ratio: mats.rho_ratio,
+            s_peak: mats.s_peak,
+            c_max: mats.c_max,
+            k_abs: cfg.absorb_rate,
+            absorb_roundoff: cfg.absorb_roundoff,
+            pbf_eps: cfg.pbf_eps,
+            // --- extraction + thermal (Phase 1.5) ---
+            extract_rate: cfg.extract_rate,
+            k0_fast: mats.k0_fast,
+            k0_slow: mats.k0_slow,
+            ea_over_r: mats.ea_over_r,
+            t_ref: mats.t_ref,
+            c_sat: mats.c_sat,
+            d_ref: mats.d_ref,
+            u_half: mats.u_half,
+            s_on: mats.s_on,
+            kappa: mats.kappa,
+            cp_water: mats.cp_water,
+            cp_grain: mats.cp_grain,
+            h_amb: mats.h_amb,
+            t_amb: mats.t_amb,
+            _pad_chem0: 0.0,
+            _pad_chem1: 0.0,
+        };
+
+
+codex
+Command ordering is sequential in the encoder, so the copy-after-dissolution is ordered before thermal. I’m doing one last pass over initialization/test-only helpers to see whether the temperature lanes are consistently seeded and preserved.
+exec
+/bin/zsh -lc "sed -n '1768,1783p' src/solvers/xpbd/mod.rs" in /Users/cxc/Github/coffee-sim
+ succeeded in 0ms:
+                beginning_of_pass_write_index: Some(b),
+                end_of_pass_write_index: Some(e),
+            })
+        }
+        _ => None,
+    };
+    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        label: Some(label),
+        timestamp_writes: tw,
+    });
+    pass.set_pipeline(pipeline);
+    pass.set_bind_group(0, Some(bind_group), &[]);
+    pass.dispatch_workgroups(groups, 1, 1);
+    *dispatches += 1;
+}
+
+
+exec
+/bin/zsh -lc "sed -n '250,315p' src/solvers/xpbd/mod.rs && sed -n '520,590p' src/solvers/xpbd/mod.rs" in /Users/cxc/Github/coffee-sim
+exec
+/bin/zsh -lc "rg -n \"fn seed_chem|seed_chem|write_chem_for_test|read_chem|pour_t|chem\\[|T_g|T_w\" src tests -g '*.rs' -g '*.wgsl'" in /Users/cxc/Github/coffee-sim
+ succeeded in 0ms:
+tests/xpbd_extraction.rs:142:    let initial = solute_inventory(&solver.read_chem(), &moisture, &phase, v_w);
+tests/xpbd_extraction.rs:145:        let inv = solute_inventory(&solver.read_chem(), &solver.read_moisture(), &phase, v_w);
+tests/xpbd_extraction.rs:153:    let chem = solver.read_chem();
+tests/xpbd_extraction.rs:193:    let before = solver.read_chem();
+tests/xpbd_extraction.rs:197:    let after = solver.read_chem();
+tests/xpbd_extraction.rs:217:    let before = solver.read_chem();
+tests/xpbd_extraction.rs:221:    let after = solver.read_chem();
+tests/xpbd_extraction.rs:274:        let chem = solver.read_chem();
+tests/xpbd_extraction.rs:326:    let mut chem = solver.read_chem();
+tests/xpbd_extraction.rs:327:    chem[1] = [mats.c_sat, mats.pour_t, 0.0, 0.0];
+tests/xpbd_extraction.rs:328:    solver.write_chem_for_test(&chem);
+tests/xpbd_extraction.rs:331:    let initial = solute_inventory(&solver.read_chem(), &solver.read_moisture(), &phase, v_w);
+tests/xpbd_extraction.rs:335:    let chem = solver.read_chem();
+tests/xpbd_extraction.rs:340:        chem[1][0] <= mats.c_sat + 1.0e-5,
+tests/xpbd_extraction.rs:342:        chem[1][0]
+tests/xpbd_extraction.rs:346:        chem[2][0] > 1.0e-5,
+tests/xpbd_extraction.rs:348:        chem[2][0]
+tests/xpbd_extraction.rs:382:    let mut chem = solver.read_chem();
+tests/xpbd_extraction.rs:383:    chem[0] = [0.0, 0.0, mats.pour_t, 0.0];
+tests/xpbd_extraction.rs:384:    solver.write_chem_for_test(&chem);
+tests/xpbd_extraction.rs:389:    let chem = solver.read_chem();
+tests/xpbd_extraction.rs:395:        chem[1][0].abs() <= 1.0e-6,
+tests/xpbd_extraction.rs:397:        chem[1][0]
+tests/xpbd_extraction.rs:429:        let c = solver.read_chem();
+tests/xpbd_extraction.rs:484:    let chem = solver.read_chem();
+tests/xpbd_extraction.rs:489:        * extraction::arrhenius(mats.pour_t, mats.ea_over_r, mats.t_ref)
+tests/xpbd_extraction.rs:504:    let gpu_loss_f = s_f - chem[0][0];
+tests/xpbd_extraction.rs:505:    let gpu_loss_s = s_s - chem[0][1];
+tests/xpbd_extraction.rs:516:        rel(chem[1][0], exp_c),
+tests/xpbd_extraction.rs:518:        chem[1][0]
+tests/xpbd_extraction.rs:521:    // Absolute tol clears the f32 cancellation noise of `s_f - chem[0][0]` (two ~0.13 values);
+tests/xpbd_extraction.rs:524:    let water_gain = chem[1][0] * v_w;
+tests/xpbd_extraction.rs:551:    let mut chem = solver.read_chem();
+tests/xpbd_extraction.rs:559:    solver.write_chem_for_test(&chem);
+tests/xpbd_extraction.rs:581:    let initial = enthalpy(&solver.read_chem(), &phase, &mats);
+tests/xpbd_extraction.rs:584:        let h = enthalpy(&solver.read_chem(), &phase, &mats);
+tests/xpbd_extraction.rs:592:    let chem = solver.read_chem();
+tests/xpbd_extraction.rs:625:        let chem = solver.read_chem();
+tests/xpbd_extraction.rs:648:/// R9: a cooler pour extracts less. Two brews identical but for `pour_t` → lower yield at lower T
+tests/xpbd_extraction.rs:666:    // Returns total water solute extracted after N steps at pour temperature `pour_t`. Ambient off
+tests/xpbd_extraction.rs:667:    // so the grain temperature stays at pour_t (water+grain seeded equal ⇒ no internal gradient),
+tests/xpbd_extraction.rs:669:    let run = |pour_t: f32| -> f32 {
+tests/xpbd_extraction.rs:671:            pour_t,
+tests/xpbd_extraction.rs:684:        solver.read_chem()[1][0] * v_w // water solute (c·V_w, f_w=1)
+src/models/mod.rs:94:    pub pour_t: f32,
+src/models/mod.rs:140:            pour_t: 1.0,
+src/solvers/xpbd/mod.rs:378:/// tags: grain = (s_f, s_s, T_g, _) with the soluble dose `soluble_fraction·grain_mass` split into the
+src/solvers/xpbd/mod.rs:379:/// fast/slow pools; water = (c=0, T_w, _, _). Both species start at the pour temperature.
+src/solvers/xpbd/mod.rs:380:fn seed_chem(phases: &[u32], mats: &Materials) -> Vec<[f32; 4]> {
+src/solvers/xpbd/mod.rs:387:                [s_f, s_s, mats.pour_t, 0.0] // grain: two pools + grain temperature
+src/solvers/xpbd/mod.rs:389:                [0.0, mats.pour_t, 0.0, 0.0] // water: concentration 0, water temperature
+src/solvers/xpbd/mod.rs:472:    /// (s_f, s_s, T_g, _), water = (c, T_w, _, _). Used by the extraction tests + yield/TDS readout.
+src/solvers/xpbd/mod.rs:473:    pub fn read_chem(&self) -> Vec<[f32; 4]> {
+src/solvers/xpbd/mod.rs:500:    /// Overwrite the per-particle chem/thermal lanes (dev/test only): grain = (s_f, s_s, T_g, _),
+src/solvers/xpbd/mod.rs:501:    /// water = (c, T_w, _, _). Lets a test pre-seed a saturated water field or a known thermal state.
+src/solvers/xpbd/mod.rs:502:    pub fn write_chem_for_test(&self, chem: &[[f32; 4]]) {
+src/solvers/xpbd/mod.rs:861:        // (s_f, s_s, T_g, _), water lanes (c, T_w, _, _). `chem` is the live buffer (binding 20,
+src/solvers/xpbd/mod.rs:866:        let initial_chem = seed_chem(&phases, mats);
+src/solvers/xpbd/extraction.wgsl:24:// chem lanes: grain (s_f, s_s, T_g, _), water (c, T_w, _, _). moisture lane pos.w as in wetting.
+src/solvers/xpbd/extraction.wgsl:30:    let cf = chem_frozen[g];        // (s_f, s_s, T_g, _)
+src/solvers/xpbd/extraction.wgsl:125:    chem[i] = vec4<f32>(sf, ss, cf.z, cf.w);
+src/solvers/xpbd/extraction.wgsl:170:    chem[i] = vec4<f32>(cf.x + total / (f_w * v_w), cf.y, cf.z, cf.w);
+src/solvers/xpbd/extraction.wgsl:232:        chem[i] = vec4<f32>(cf_i.x, cf_i.y, t_new, cf_i.w);
+src/solvers/xpbd/extraction.wgsl:234:        chem[i] = vec4<f32>(cf_i.x, t_new, cf_i.z, cf_i.w);
+src/solvers/xpbd/common.wgsl:264:// Per-particle vec4: grain (s_f, s_s, T_g, _), water (c, T_w, _, _). `chem` is the live buffer;
+
+ succeeded in 0ms:
+    period_ns: f32,
+    labels: Vec<String>,
+    count: u32,
+}
+
+/// Diagnostics sampled from the GPU (dev/test only; the read-back stalls).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct XpbdDiagnostics {
+    pub overflow: bool,
+    pub max_occupancy: u32,
+    pub effective_iters: u32,
+    /// Final max constraint residual: over-density (water) or normalized penetration (grain).
+    pub residual: f32,
+}
+
+pub struct XpbdSolver {
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    params: Params,
+    particle_count: u32,
+    num_cells: u32,
+    substeps: u32,
+    /// Which species are present (from the scene's seed regions) — selects the per-frame passes.
+    has_water: bool,
+    has_grain: bool,
+    /// Water density-solve iteration cap + grid-rebuild interval.
+    water_iters: u32,
+    water_regrid: u32,
+    /// Bed contact-solve iteration cap + grid-rebuild interval.
+    bed_iters: u32,
+    bed_regrid: u32,
+    /// Jacobi sub-iterations for implicit water↔grain velocity drag (mixed scenes only).
+    drag_subiters: u32,
+
+    // Buffers referenced every frame only through the bind groups (which retain them) are
+    // not held here. We keep the ones we touch directly: params (write), pos/vel (expose +
+    // readback/copy), vel_smoothed (copy src), lambda (test seeding), status (+ readbacks),
+    // phase (expose + re-seed).
+    params_buf: wgpu::Buffer,
+    pos: Arc<wgpu::Buffer>,
+    vel: Arc<wgpu::Buffer>,
+    pred: wgpu::Buffer, // retained for read_pred (test: pred.w mirror survives the frame)
+    vel_smoothed: wgpu::Buffer,
+    vel_frozen: wgpu::Buffer,
+    lambda: wgpu::Buffer,
+    phase: Arc<wgpu::Buffer>,
+    status: wgpu::Buffer,
+    status_readback: wgpu::Buffer,
+    pos_readback: wgpu::Buffer,
+    // The `solids` buffer (binding 19) is not held here: like dp / c_residual it lives only in the
+    // collision bind groups, which keep its GPU resource alive (geometry is static, never re-uploaded).
+    // Phase 1.5 chem/thermal state: `chem` (b20, live) is retained for readback (yield/TDS), the
+    // snapshot copy, re-seeding, and exposure as concentration/temperature; `chem_frozen` (b22) is the
+    // per-substep snapshot the chem passes read.
+    chem: Arc<wgpu::Buffer>,
+    // The per-substep snapshot the dissolution/thermal passes read while writing the live `chem`.
+    chem_frozen: wgpu::Buffer,
+    pipelines: Pipelines,
+    bind_groups: BindGroups,
+    ts: Option<Timestamps>,
+
+    dispatches: u32,
+    cached_diag: XpbdDiagnostics,
+    cached_passes: Vec<(String, f32)>,
+
+    // retained for reset (exact re-seed of the initial block + phase tags + chem state)
+            "moisture seed length must match particle count"
+        );
+        for (p, &m) in pos.iter_mut().zip(moisture) {
+            p[3] = m;
+        }
+        self.queue
+            .write_buffer(self.pos.as_ref(), 0, bytemuck::cast_slice(&pos));
+    }
+
+    /// Overwrite current water Lagrange multipliers (dev/test only).
+    pub fn write_lambdas_for_test(&self, lambdas: &[f32]) {
+        assert_eq!(
+            lambdas.len(),
+            self.particle_count as usize,
+            "lambda seed length must match particle count"
+        );
+        self.queue
+            .write_buffer(&self.lambda, 0, bytemuck::cast_slice(lambdas));
+    }
+
+    /// Read back per-particle phase tags (0=water, 1=grain) (dev/test only — stalls the GPU).
+    pub fn read_phases(&self) -> Vec<u32> {
+        let size = (self.particle_count as u64) * 4;
+        let mut enc = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("phase-readback"),
+            });
+        enc.copy_buffer_to_buffer(self.phase.as_ref(), 0, &self.pos_readback, 0, size);
+        self.queue.submit(Some(enc.finish()));
+        let slice = self.pos_readback.slice(0..size);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        let _ = self.device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        });
+        rx.recv().unwrap().unwrap();
+        let data = slice.get_mapped_range();
+        let out: Vec<u32> = bytemuck::cast_slice(&data).to_vec();
+        drop(data);
+        self.pos_readback.unmap();
+        out
+    }
+
+    /// Sample GPU diagnostics (status + per-pass timestamps) into the caches that
+    /// `metrics()`/`profile()` return. Blocks (dev/test/periodic only).
+    pub fn sample_diagnostics(&mut self) {
+        // --- status ---
+        let mut enc = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("status-readback"),
+            });
+        enc.copy_buffer_to_buffer(
+            &self.status,
+            0,
+            &self.status_readback,
+            0,
+            std::mem::size_of::<StatusRaw>() as u64,
+        );
+        self.queue.submit(Some(enc.finish()));
+        let slice = self.status_readback.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        let _ = self.device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+
+codex
+Temperature lane conventions are consistent in the seeding and read/write helpers: grain `.z`, water `.y`. I have enough context to render the review.
+exec
+/bin/zsh -lc "sed -n '472,508p' src/solvers/xpbd/mod.rs" in /Users/cxc/Github/coffee-sim
+ succeeded in 0ms:
+    /// (s_f, s_s, T_g, _), water = (c, T_w, _, _). Used by the extraction tests + yield/TDS readout.
+    pub fn read_chem(&self) -> Vec<[f32; 4]> {
+        self.read_vec4(self.chem.as_ref())
+    }
+
+    /// Read back the predicted-position buffer (dev/test only — stalls the GPU). `pred.w` mirrors
+    /// the moisture snapshot; a test asserts it survives every `pred` writer through a full step.
+    pub fn read_pred(&self) -> Vec<[f32; 4]> {
+        self.read_vec4(&self.pred)
+    }
+
+    /// Single water-particle volume `V_w = particle_mass / rest_density` (dev/test only). Lets a
+    /// conservation test convert the water moisture lane `f_w` into an absolute volume.
+    pub fn water_particle_volume(&self) -> f32 {
+        self.params.particle_mass / self.params.rest_density
+    }
+
+    /// Overwrite current particle velocities (dev/test only).
+    pub fn write_velocities_for_test(&self, velocities: &[[f32; 4]]) {
+        assert_eq!(
+            velocities.len(),
+            self.particle_count as usize,
+            "velocity seed length must match particle count"
+        );
+        self.queue
+            .write_buffer(&self.vel, 0, bytemuck::cast_slice(velocities));
+    }
+
+    /// Overwrite the per-particle chem/thermal lanes (dev/test only): grain = (s_f, s_s, T_g, _),
+    /// water = (c, T_w, _, _). Lets a test pre-seed a saturated water field or a known thermal state.
+    pub fn write_chem_for_test(&self, chem: &[[f32; 4]]) {
+        assert_eq!(
+            chem.len(),
+            self.particle_count as usize,
+            "chem seed length must match particle count"
+        );
+        self.queue
+
+exec
+/bin/zsh -lc "sed -n '372,392p' src/solvers/xpbd/mod.rs" in /Users/cxc/Github/coffee-sim
+ succeeded in 0ms:
+        }
+    }
+    (pos, phase)
+}
+
+/// Seed the per-particle chem/thermal state (Phase 1.5), one vec4 per particle matching the phase
+/// tags: grain = (s_f, s_s, T_g, _) with the soluble dose `soluble_fraction·grain_mass` split into the
+/// fast/slow pools; water = (c=0, T_w, _, _). Both species start at the pour temperature.
+fn seed_chem(phases: &[u32], mats: &Materials) -> Vec<[f32; 4]> {
+    let extractable = mats.soluble_fraction * mats.grain_mass;
+    let (s_f, s_s) = crate::models::extraction::split(extractable, mats.fast_fraction);
+    phases
+        .iter()
+        .map(|&ph| {
+            if ph == 1 {
+                [s_f, s_s, mats.pour_t, 0.0] // grain: two pools + grain temperature
+            } else {
+                [0.0, mats.pour_t, 0.0, 0.0] // water: concentration 0, water temperature
+            }
+        })
+        .collect()
+
+exec
+/bin/zsh -lc "sed -n '258,272p' src/solvers/xpbd/common.wgsl" in /Users/cxc/Github/coffee-sim
+ succeeded in 0ms:
+        if (hit.dist < best.dist) { best = hit; }
+    }
+    return best;
+}
+
+// --- Phase 1.5 chem/thermal state + kinetics (mirrors models/extraction.rs + models/thermal.rs) ---
+// Per-particle vec4: grain (s_f, s_s, T_g, _), water (c, T_w, _, _). `chem` is the live buffer;
+// `chem_frozen` is the per-substep snapshot the dissolution/thermal passes read (so writes to live
+// `chem` don't race the reads). Referenced only by the chem passes (U5/U6).
+@group(0) @binding(20) var<storage, read_write> chem: array<vec4<f32>>;
+@group(0) @binding(22) var<storage, read> chem_frozen: array<vec4<f32>>;
+// Per-particle dissolution scratch (b21): grain → (N_w eligible-water count, flux_g aggregate relative
+// speed), water → (N_g eligible-grain count, _). Written by diss_count, read by both transfer passes so
+// each recomputes the identical per-grain release/take. Transient within the extraction sub-stage.
+@group(0) @binding(21) var<storage, read_write> diss_neighbors: array<vec2<f32>>;
+
+codex
+APPROVE
+
+No blocking correctness issues found for Unit 6.
+
+Energy exchange is conservative for active particles: `th_pair_heat` negates both `raw` and `cap` when `i/j` are swapped, so the clamp interval is mirrored and `q_ji = -q_ij` with frozen `chem_frozen` temperatures. Thermal reads from `chem_frozen` and writes only `chem[i]`, so there is no read/write race.
+
+The zero-capacity handling is effectively symmetric: neighbors with `c_j <= 1e-6` are skipped, and self particles with `c_i <= 1e-6` do not apply `q_sum / c_i`. Exact zero capacity also makes the pair cap zero. Sub-threshold particles may still compute a discarded `q_sum`, but no pair energy is applied on either side. Ambient can still change their stored temperature, but that is external heat exchange and contributes no enthalpy for zero capacity.
+
+Lane handling is correct: `th_temp` reads water temperature from `chem.y` and grain temperature from `chem.z`; final writes update only `.y` for water or `.z` for grain while preserving post-dissolution solute/pool lanes from the second snapshot.
+
+Snapshot ordering is correct: after `dissolve_grain` and `dissolve_water`, `chem` is copied again into `chem_frozen` before `thermal_exchange`, so thermal preserves the updated dissolution state. The pass writes only its own particle slot.
+
+Capacity matches the stated model: water uses `particle_mass * f_w * cp_water`; grain uses `(grain_mass + rest_density * V_abs) * cp_grain`, reading post-wetting `pos.w`.
+
+Storage-buffer budget is within WebGPU baseline: `thermal_exchange` uses 6 storage buffers plus the uniform params buffer, below the 8 storage-buffer stage limit. I did not run tests in this read-only sandbox.
+tokens used
+89,979
+APPROVE
+
+No blocking correctness issues found for Unit 6.
+
+Energy exchange is conservative for active particles: `th_pair_heat` negates both `raw` and `cap` when `i/j` are swapped, so the clamp interval is mirrored and `q_ji = -q_ij` with frozen `chem_frozen` temperatures. Thermal reads from `chem_frozen` and writes only `chem[i]`, so there is no read/write race.
+
+The zero-capacity handling is effectively symmetric: neighbors with `c_j <= 1e-6` are skipped, and self particles with `c_i <= 1e-6` do not apply `q_sum / c_i`. Exact zero capacity also makes the pair cap zero. Sub-threshold particles may still compute a discarded `q_sum`, but no pair energy is applied on either side. Ambient can still change their stored temperature, but that is external heat exchange and contributes no enthalpy for zero capacity.
+
+Lane handling is correct: `th_temp` reads water temperature from `chem.y` and grain temperature from `chem.z`; final writes update only `.y` for water or `.z` for grain while preserving post-dissolution solute/pool lanes from the second snapshot.
+
+Snapshot ordering is correct: after `dissolve_grain` and `dissolve_water`, `chem` is copied again into `chem_frozen` before `thermal_exchange`, so thermal preserves the updated dissolution state. The pass writes only its own particle slot.
+
+Capacity matches the stated model: water uses `particle_mass * f_w * cp_water`; grain uses `(grain_mass + rest_density * V_abs) * cp_grain`, reading post-wetting `pos.w`.
+
+Storage-buffer budget is within WebGPU baseline: `thermal_exchange` uses 6 storage buffers plus the uniform params buffer, below the 8 storage-buffer stage limit. I did not run tests in this read-only sandbox.

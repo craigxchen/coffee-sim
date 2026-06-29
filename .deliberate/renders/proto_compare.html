@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Prototype vs baseline — twofield ballistic-preserve</title>
+<style>
+ :root{color-scheme:dark}
+ body{background:#0a0a0c;color:#e8e8ea;font:14px/1.5 -apple-system,Segoe UI,Roboto,sans-serif;margin:0;padding:28px 36px 70px}
+ h1{font-size:22px;margin:0 0 4px} .sub{color:#9a9aa2;font-size:13px;margin:0 0 16px}
+ h2{font-size:18px;margin:40px 0 4px;border-top:1px solid #26262c;padding-top:20px}
+ table{border-collapse:collapse;width:100%;margin:12px 0} th,td{border:1px solid #222228;padding:6px;text-align:center;vertical-align:top}
+ th{color:#aeaeb6;font-size:12px;background:#141418}
+ td.row{font-weight:700;width:150px;background:#141418;text-align:left;padding-left:10px}
+ td.row small{display:block;font-weight:400;color:#9a9aa2;font-size:11px;margin-top:3px}
+ img{width:100%;max-width:300px;height:auto;background:#000;border-radius:4px;display:block}
+ .b{color:#f0b35a} .p{color:#5ad17a} .x{color:#7aa2ff}
+ .note{max-width:980px;color:#cfcfd7;font-size:13px;background:#121216;border-left:3px solid #5ad17a;padding:8px 12px;margin:6px 0 0}
+</style></head><body>
+<h1>twofield: <span class="b">baseline (slime)</span> → <span class="p">prototype (ballistic-preserve)</span> → <span class="x">xpbd (target)</span></h1>
+<p class="sub">Prototype = state-dependent ballistic-preserve in g2p_water, keyed on local grid density (PRESERVE_MAX 0.9, dens 0.15→0.55). Stills only — splash dynamics are best judged live.</p>
+<p class="note"><b>Read the cup row (scene 3) first:</b> the prototype pool should be denser/tighter/calmer than baseline (closer to xpbd) — the cup-stir/slime fix. Box &amp; free-stream show liveliness, but motion (splash) needs the live webapp.</p>
+
+<h2>1 · Water in a box (slosh)</h2>
+<table><tr><th></th><th>early</th><th>mid</th><th>settled</th></tr>
+<tr><td class="row b">baseline<small>current twofield</small></td><td><img src="rewrite/BoxSlosh__twofield__t0.png"></td><td><img src="rewrite/BoxSlosh__twofield__t1.png"></td><td><img src="rewrite/BoxSlosh__twofield__t2.png"></td></tr>
+<tr><td class="row p">prototype<small>ballistic-preserve</small></td><td><img src="proto/BoxSlosh__twofield__t0.png"></td><td><img src="proto/BoxSlosh__twofield__t1.png"></td><td><img src="proto/BoxSlosh__twofield__t2.png"></td></tr>
+<tr><td class="row x">xpbd<small>target</small></td><td><img src="rewrite/BoxSlosh__xpbd__t0.png"></td><td><img src="rewrite/BoxSlosh__xpbd__t1.png"></td><td><img src="rewrite/BoxSlosh__xpbd__t2.png"></td></tr></table>
+
+<h2>2 · Water-only emission</h2>
+<table><tr><th></th><th>early</th><th>mid</th><th>settled</th></tr>
+<tr><td class="row b">baseline<small>current twofield</small></td><td><img src="rewrite/WaterOnly__twofield__t0.png"></td><td><img src="rewrite/WaterOnly__twofield__t1.png"></td><td><img src="rewrite/WaterOnly__twofield__t2.png"></td></tr>
+<tr><td class="row p">prototype<small>ballistic-preserve</small></td><td><img src="proto/WaterOnly__twofield__t0.png"></td><td><img src="proto/WaterOnly__twofield__t1.png"></td><td><img src="proto/WaterOnly__twofield__t2.png"></td></tr>
+<tr><td class="row x">xpbd<small>target</small></td><td><img src="rewrite/WaterOnly__xpbd__t0.png"></td><td><img src="rewrite/WaterOnly__xpbd__t1.png"></td><td><img src="rewrite/WaterOnly__xpbd__t2.png"></td></tr></table>
+
+<h2>3 · Cup + slow drip onto a pool <span class="p" style="font-size:13px">(the key scene)</span></h2>
+<table><tr><th></th><th>early</th><th>mid</th><th>late</th></tr>
+<tr><td class="row b">baseline<small>current twofield</small></td><td><img src="rewrite/CupDripOnPool__twofield__t0.png"></td><td><img src="rewrite/CupDripOnPool__twofield__t1.png"></td><td><img src="rewrite/CupDripOnPool__twofield__t2.png"></td></tr>
+<tr><td class="row p">prototype<small>ballistic-preserve</small></td><td><img src="proto/CupDripOnPool__twofield__t0.png"></td><td><img src="proto/CupDripOnPool__twofield__t1.png"></td><td><img src="proto/CupDripOnPool__twofield__t2.png"></td></tr>
+<tr><td class="row x">xpbd<small>target</small></td><td><img src="rewrite/CupDripOnPool__xpbd__t0.png"></td><td><img src="rewrite/CupDripOnPool__xpbd__t1.png"></td><td><img src="rewrite/CupDripOnPool__xpbd__t2.png"></td></tr></table>
+
+<h2>4 · Water / solid (sand wall)</h2>
+<table><tr><th></th><th>early</th><th>mid</th><th>settled</th></tr>
+<tr><td class="row b">baseline<small>current twofield</small></td><td><img src="rewrite/SandWallBox__twofield__t0.png"></td><td><img src="rewrite/SandWallBox__twofield__t1.png"></td><td><img src="rewrite/SandWallBox__twofield__t2.png"></td></tr>
+<tr><td class="row p">prototype<small>ballistic-preserve</small></td><td><img src="proto/SandWallBox__twofield__t0.png"></td><td><img src="proto/SandWallBox__twofield__t1.png"></td><td><img src="proto/SandWallBox__twofield__t2.png"></td></tr>
+<tr><td class="row x">xpbd<small>target</small></td><td><img src="rewrite/SandWallBox__xpbd__t0.png"></td><td><img src="rewrite/SandWallBox__xpbd__t1.png"></td><td><img src="rewrite/SandWallBox__xpbd__t2.png"></td></tr></table>
+</body></html>

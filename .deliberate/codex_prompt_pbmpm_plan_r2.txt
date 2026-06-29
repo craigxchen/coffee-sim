@@ -1,0 +1,21 @@
+You are an expert reviewer (GPU physics + numerical methods / MPM + Rust/wgpu) re-reviewing an IMPLEMENTATION PLAN after a REVISE round. The plan implements the gating PROTOTYPE from an approved requirements doc: a minimal single-phase PB-MPM water solver to measure bounce + ≤33ms@200k before any coffee/water coupling (the "KD8 gate"). Constraints: fixed-point i32 grid (no float atomics), Tint uniformity, ≤9 storage buffers/stage granted, real-time.
+
+Respond with a VERDICT on the FIRST LINE: **APPROVE**, **REVISE**, or **REJECT**. You have READ-ONLY repo access — actually read the revised plan. Judge implementability, sequencing, decision soundness, and whether the go/no-go is now well-grounded. Do not re-litigate the architecture (settled in the requirements doc).
+
+Read the REVISED plan: `docs/plans/2026-06-20-001-feat-pbmpm-prototype-plan.md`.
+
+Your PRIOR round returned REVISE with these items. Verify each was addressed HONESTLY (not just reworded), and flag any over/under-correction:
+1. Make U6's (now U7's) assembled-cost projection a HARD gate: method fixed before measurement; includes second field, drag, lambda ping-pong, bed/plasticity/wetting (or conservative upper bounds), substep multiplier, the contingent coarse pass if triggered, and a buffer ledger vs 9 and 16; projected-assembled ≤33ms is a GO precondition (single-phase pass alone cannot declare GO).
+2. Reword Candidate D as the existing two-field DensU density-target proxy (`dbg.w`, not "compliant density projection" — compliance was tried/dropped); pin `set_density_target_mode_for_test(true)` + `set_density_rate_k_for_test(k)`.
+3. Pin the bounce-comparison physical config (emitter/spacing/cap/geometry/impact window) OUTSIDE the per-solver `src/web.rs::setup_for` defaults (twofield gets a wider nozzle + lower cap), so the PB-MPM/D/xpbd/twofield comparison is apples-to-apples.
+4. Define the PB-MPM `deformation_displacement` D / correction state precisely (storage, lifetime, units, init, update) and reconcile it with the R7 overflow gate — the grid carries only `[mass, mom.xyz]` fixed-point; D is per-particle float.
+5. Choose 3×3×3 vs 4×4×4 transfers explicitly (twofield is 3×3×3 / 27-node quadratic) and correct the perf/atomic-contention assumptions.
+6. Add an emission/water-pool unit before the constraint's visual validation (the jet scene declares a pour; nothing owned emission).
+7. Treat the XPBD cell-order reorder reuse as a ported subsystem with measured cost, not a free P2G fix.
+8. Harden the decision unit: pre-register the rebound/spread threshold, D-delta threshold, cap-hit/no-popcorn/conservation bounds, exact scenes/configs, and make both bounce-vs-D and projected-assembled-cost actual pass/fail inputs.
+
+Verify the key code-grounded claims against the repo: twofield transfer stencil is 3×3×3 (`src/solvers/twofield/transfers.wgsl:118`); the candidate-D setters exist (`src/solvers/twofield/mod.rs:904,913`) and `dbg.w` is the density target not a compliant projection (`src/solvers/twofield/pressure.wgsl`); the emission/water-pool path (`src/solvers/twofield/mod.rs` emit + dormant slots); the 9-buffer grant (`src/utils/gpu.rs:114`); `src/web.rs::setup_for` per-solver nozzle/cap (`:465,:482`).
+
+NOTE the deliberate visual-first posture (KTD3 + Execution notes): Phase A (U1–U5) keeps tests light and defers pinned, falsifiable invariants (perf gate, non-gameable bounce metric + thresholds, assembled-cost gate) to Phase B (U6–U7). Judge whether U6/U7 now provide an adequate falsifiable backstop so the go/no-go is trustworthy — do NOT reflexively demand test-first on exploratory units.
+
+Then judge fresh: faithful PB-MPM port + implementability; does the gate actually retire the assembled-system risk; sequencing/dependencies (U1→{U2,U3}→U4→U5→U6→U7, U8 contingent); constraint/budget feasibility; falsifiability of the decision. If APPROVE, say what makes it ready for /ce-work. If still REVISE, give a SHORT bulleted list of only genuinely-remaining items (no new scope, no re-litigating settled deferrals). Be concrete — name files, U/R/KTD IDs.

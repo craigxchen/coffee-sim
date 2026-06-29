@@ -1,0 +1,14 @@
+You are an expert reviewer (GPU physics + numerical methods / MPM + Rust/wgpu) reviewing ROUND 4 (final) of an IMPLEMENTATION PLAN for the two-field GPU MPM water solver. Narrowed to the transfer/dissipation lever; incompressibility-pressure work DEFERRED (do not penalize).
+
+VERDICT on FIRST LINE: **APPROVE**, **REVISE**, or **REJECT**. READ-ONLY repo — read the files. Judge implementation-readiness, not prose.
+
+Read: docs/plans/2026-06-18-001-feat-twofield-surface-weighted-dissipation-plan.md (origin: docs/brainstorms/2026-06-18-twofield-water-splash-dynamics-requirements.md). Code refs as needed: src/solvers/twofield/transfers.wgsl (g2p_water, B from w/d), coupling.wgsl:292, mod.rs Params + pipeline order, common.wgsl.
+
+YOUR ROUND-3 verdict was REVISE. Verify each is now ADEQUATELY addressed:
+1. Full flip ABI + the merge sentinel: flip=(c_surface,density_gate,div_scale,water_splash_cap); approach_scale/affine-k/W are compile-time consts; `div_scale<=0` disables the ENTIRE merge discriminator (both div and approach terms) = density-only R5 control. (KTD4 + U2 tech design.)
+2. Concrete c(density,merge) curve: merge = clamp(max(-div*div_scale, approach*approach_scale),0,1) guarded on div_scale>0; dens_c = smoothstep(density_gate, density_gate+W, m_local/(8*particle_mass)); c = clamp(max(c_surface, merge, dens_c), c_surface, 1); and the density-only control (merge=0) leaves c=max(c_surface,dens_c) so a sparse drip is preserved → reproduces main's stir. (U2 tech design.)
+3. grad_m: explicit quadratic-B-spline weight derivative (1/h-scaled), NOT reused from B's d-offset; stable normalization n=grad_m/max(length,eps), not normalize(grad_m+eps). (KTD2 + U2.)
+4. Telemetry: CPU-twin re-derivation of c from read-back state (no GPU diag buffer, no new lane/binding, byte-identity preserved). (U1 + U2 R5 scenario.)
+5. Stale comment fixed to 272 after flip. (U1 Files.)
+
+Then judge holistically: is the plan now implementation-ready (an implementer can execute U1→U4 without inventing design)? Any remaining hole, physics error, ABI inconsistency, or unfalsifiable gate? Be concrete (files, U-IDs). End with a bulleted REVISE list if not APPROVE.

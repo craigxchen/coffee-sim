@@ -1,0 +1,24 @@
+You are an expert reviewer (GPU physics + numerical methods + Rust/wgpu) doing ROUND 2 of a plan cross-review for a coffee pour-over simulator (Rust + wgpu + WGSL, single unified XPBD/PBF GPU solver). In round 1 you returned REVISE; the author folded your 8 items into the plan. Your job now: verify the revision actually holds up, catch anything the revision INTRODUCED, and confirm the design is implementable.
+
+Respond with a VERDICT on the FIRST LINE: **APPROVE**, **REVISE**, or **REJECT**. Then give specific reasoning. You have READ-ONLY repo access — actually read the files.
+
+Read, in order:
+1. Your round-1 review: `.deliberate/codex_review.md` (your 8 REVISE items).
+2. The REVISED plan: `docs/plans/2026-06-06-002-feat-fines-migration-channeling-plan.md` (authoritative; supersedes `.deliberate/claude_plan.md`).
+3. The code it edits/reuses: `src/solvers/xpbd/coupling.wgsl` (compute_fractions, porosity_drag_factor, compute_coupling_scale, drag_delta_for_pair, beta_from_rate), `src/solvers/xpbd/wetting.wgsl`, `src/solvers/xpbd/extraction.wgsl`, the chem layout + seed_chem + grid_reorder_b + step() pipeline + the bind-group definitions in `src/solvers/xpbd/mod.rs`, `src/models/mod.rs`, `src/utils/config.rs`, `src/engine/state.rs`.
+
+Verify each folded change specifically:
+
+1. KTD-4 (massless fines). Is "fines carry permeability-relevant volume but no inertial mass" coherent and free of hidden leaks? With no velocity writes, is volume-only conservation truly airtight, and is the "momentum non-perturbation" guard the right claim? Does treating fines as volume-for-permeability but mass-for-nothing create any inconsistency with how grain_eff_volume / alpha_s / packing_limit already work (e.g. does the deviation term double-count or fight the packing clamp)?
+
+2. KTD-7 / U3 (harmonic-mean-k drag combiner). Check the math against the actual code: drag uses coupling_scale[i] = beta_from_rate(rate_i) capped, and drag_delta_for_pair uses min(coupling_scale[i], coupling_scale[j]). The plan says rate ~ 1/k so min(rate) picks the lower-resistance side, and a harmonic mean of k fixes it. Is that transformation correct and does it stay symmetric (momentum-conserving)? Is harmonic-mean-of-k equivalent to a clean operation on the betas, or does it require reworking compute_coupling_scale to expose k per particle? Will gating it to fines_rate>0 actually deliver channeling sharpening, and is "apply generally + re-verify" the safer path? Any blow-up risk near the φ_f clamp?
+
+3. KTD-10 (deactivation/drain). Does capping suspended fines by f_w + forcing deposition as f_w→0 + a measured cup sink actually close the leak in all paths (absorption, PBF f_w deactivation, draining/emission removal)? Any ordering hazard between the wetting block and the fines block within a substep?
+
+4. Buffer counts. Confirm fines_count=6, fines_grain/fines_water=8 (pred, phase, cell_start, sorted_indices, chem_frozen, fines_neighbors, chem, vel), and compute_fractions→6 with chem added, are each ≤ 8 storage buffers against the ACTUAL bind-group patterns in mod.rs. Is reusing the wet_neighbors buffer/binding for fines_neighbors actually safe given WGSL single-binding declarations and the in-substep lifetime?
+
+5. KTD-6 / U5 (evenness). Is the volume-weighted downward-flux definition sound and falsifiable, and are the tests now law/inequality-based (no tuned absolutes)?
+
+6. KTD-9 (Params fines vec4) and KTD-1 (chem.w freeness, reorder). Correct?
+
+Also: is the unit DAG (U1→U2; U3 independent; U4 needs U2+U3; U5 independent; U6 needs U2,U3,U4,U5) sound? Did the revision introduce any contradiction, over-claim, or new gap? Flag any remaining issue. If APPROVE, say what (if anything) to watch during implementation. If REVISE, give a concrete bulleted list.

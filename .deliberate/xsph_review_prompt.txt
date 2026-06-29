@@ -1,0 +1,114 @@
+You are reviewing a focused solver bug fix (Rust + WGSL, PBF water). Verdict on FIRST LINE: APPROVE,
+REVISE, or REJECT, then explain briefly. Maintainer is a physics reviewer.
+
+BUG: the XSPH viscosity kernel (src/solvers/xpbd/water.wgsl, fn xsph) accumulated
+`dv += (vel[j]-vi) * w_poly6(r,h)` — an UNNORMALIZED kernel sum. w_poly6 ∝ 1/h^9, so Σ W_poly6 ∝
+1/h^3, which grows as resolution refines (h = 2*spacing). At fine spacing a fixed xsph_c overshoots
+(xsph_c * Σ W * Δv >> Δv), AMPLIFYING velocity instead of smoothing. xsph runs AFTER finalize's
+max_speed clamp and rewrites vel, so it un-caps the velocity → catastrophic eruption at fine
+resolution (vmax 10^5+, water sprayed everywhere). At the default spacing 1.0 the sum is tame so it
+was never caught.
+
+FIX: standard XSPH normalization — multiply the kernel term by the particle volume V_w = m/ρ0
+(`dv += (vel[j]-vi) * (w_poly6(r,h) * v_w)`), so Σ V_w·W ≈ 1 (dimensionless, resolution-independent)
+and xsph_c behaves consistently at any spacing.
+
+Evaluate:
+1. Is this the correct standard XSPH normalization (m_j/ρ_j ≈ V_w for equal-mass water)? Any sign/
+   factor error?
+2. At the default spacing 1.0 it changes the effective viscosity by the V_w factor — is that a concern?
+   (The full water/dam-break/wetting/coupling/geometry suites still pass unchanged.)
+3. Does it correctly fix the resolution dependence, and is the post-clamp-amplification analysis right
+   (xsph runs after finalize, so an unnormalized overshoot escapes the max_speed cap)?
+4. Any remaining issue (grains skip xsph — fine? the v_w uses params.particle_mass/rest_density —
+   correct for water?).
+5. The regression test asserts vmax ≤ max_speed+1 at fine spacing — adequate?
+
+The diff follows.
+========================================================================
+diff --git a/src/solvers/xpbd/water.wgsl b/src/solvers/xpbd/water.wgsl
+index 5683b3a..9eae83b 100644
+--- a/src/solvers/xpbd/water.wgsl
++++ b/src/solvers/xpbd/water.wgsl
+@@ -178,6 +178,11 @@ fn xsph(@builtin(global_invocation_id) gid: vec3<u32>) {
+     let xi = pos[i].xyz;
+     let vi = vel[i].xyz;
+     var dv = vec3<f32>(0.0);
++    // Per-particle volume V_w = m/ρ₀ normalizes the kernel sum (standard XSPH: Δv = c·Σ (m_j/ρ_j)
++    // (v_j−v_i) W). Without it, Σ W_poly6 ∝ 1/h³ grows as the resolution refines, so a fixed xsph_c
++    // overshoots (amplifies velocity instead of smoothing it) at fine spacing — a resolution-dependent
++    // eruption. With it, Σ V_w·W ≈ 1 (dimensionless), so xsph_c behaves consistently at any spacing.
++    let v_w = params.particle_mass / params.rest_density;
+ 
+     let base = cell_coord(xi);
+     for (var dz = -1; dz <= 1; dz = dz + 1) {
+@@ -196,7 +201,7 @@ fn xsph(@builtin(global_invocation_id) gid: vec3<u32>) {
+                     let d = xi - pos[j].xyz;
+                     let r = length(d);
+                     if (r >= h) { continue; }
+-                    dv = dv + (vel[j].xyz - vi) * w_poly6(r, h);
++                    dv = dv + (vel[j].xyz - vi) * (w_poly6(r, h) * v_w);
+                 }
+             }
+         }
+diff --git a/tests/xpbd_emission.rs b/tests/xpbd_emission.rs
+index 97e7b7f..929eff1 100644
+--- a/tests/xpbd_emission.rs
++++ b/tests/xpbd_emission.rs
+@@ -557,3 +557,56 @@ fn v60_pour_emission_is_deterministic() {
+         "yield not sane across runs: {y1}, {y2}"
+     );
+ }
++
++/// Regression for the XSPH resolution-normalization bug: emitting water at FINE spacing into the full
++/// solve must stay velocity-bounded (≤ max_speed). Before the fix, the unnormalized XSPH sum (∝1/h³)
++/// overshot at fine spacing and amplified velocity post-clamp — vmax exploded to 10^5+ and the inlet
++/// sprayed everywhere. The default-spacing `emission_into_full_solve_does_not_erupt` missed it because
++/// at spacing 1.0 the kernel sum is tame.
++#[test]
++fn fine_resolution_emission_stays_bounded() {
++    let Some(gpu) = GpuContext::new_headless() else {
++        eprintln!("xpbd_emission: no GPU adapter; skipping.");
++        return;
++    };
++    // Fine water (spacing 0.15) — the regime that erupted before the XSPH normalization fix.
++    let s = 0.15;
++    let mats = Materials {
++        particle_spacing: s,
++        support_radius: 2.0 * s,
++        grain_diameter: 2.0 * s,
++        ..Materials::default()
++    };
++    let cfg = Config::default(); // full water solve (incl. XSPH) on
++    let scene = Scene {
++        pour_water_ml: 3000.0,
++        gravity: [0.0, -20.0, 0.0],
++        box_min: [0.0, 0.0, 0.0],
++        box_max: [6.0, 12.0, 6.0],
++        regions: vec![],
++        ..Scene::default()
++    };
++    let mut solver = XpbdSolver::build(&scene, &mats, &cfg, &gpu);
++    for _ in 0..240 {
++        solver.step(DT, &pour([3.0, 10.0, 3.0], 8.0));
++    }
++    assert!(
++        solver.active_count() > 500,
++        "too little emitted ({}) to stress the inlet",
++        solver.active_count()
++    );
++    let pos = solver.read_positions();
++    let vel = solver.read_velocities();
++    assert!(
++        pos.iter().all(|p| p.iter().all(|c| c.is_finite())),
++        "non-finite position at fine resolution (eruption)"
++    );
++    let vmax = vel
++        .iter()
++        .map(|v| (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt())
++        .fold(0.0f32, f32::max);
++    assert!(
++        vmax <= cfg.max_speed + 1.0,
++        "fine-resolution emission velocity blew past max_speed (XSPH normalization regression): vmax {vmax}"
++    );
++}

@@ -1,0 +1,5 @@
+APPROVE
+
+The implementation satisfies the Unit 3 requirements: `sample()` uses inclusive start / exclusive end windows, gaps and empty scripts return dry `(0,0,0)`, totals are computed from window durations, and the basic pattern geometry is correct. `Center`, `Point`, `Ring`, and bounded `Spiral` behavior are covered, and the module is deterministic and pure CPU.
+
+Minor notes only: `total_duration()` returns max `t_end`, not literally the last command’s end if commands are unsorted, but that is probably the more robust behavior. Negative/invalid `t_start > t_end`, negative flow, reversed radii, or out-of-range points are not validated, but there is no panic risk and this low-level recipe layer can reasonably trust constructed scripts. The `freq_hz <= 0` guard is good, and the f32 / rosette-style spiral choice is reasonable and documented.

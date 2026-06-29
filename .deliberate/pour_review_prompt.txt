@@ -1,0 +1,429 @@
+You are reviewing an IMPLEMENTATION PLAN (not code) written by Claude for a Rust + wgpu + WGSL
+real-time coffee-pour-over simulator. Respond with a verdict on the FIRST LINE: APPROVE, REVISE,
+or REJECT. Then explain, rigorously. The maintainer is a physics reviewer who rejects hand-waving.
+
+The plan ports an old (CPU-resident MPM/XPBD) water-emission model onto the current GPU-resident
+XPBD/PBF solver. Key context the plan relies on:
+- The solver is GPU-resident: per-particle state lives in fixed-size storage buffers; kernels guard
+  `if i >= params.particle_count { return }`; passes dispatch over groups(particle_count). WebGPU
+  limits 8 storage buffers per stage. No portable WGSL float atomics.
+- Phase 1.4 wetting: water absorbed into grains (moisture lane pos.w = f_w remaining fraction).
+- Phase 1.5 extraction: dissolution conserves a solute inventory exactly in isolation; a ~1-2%
+  combined-path drift is an accepted physical absorption sink; yield/TDS read from a cup region.
+
+Evaluate especially:
+1. Is the capacity-pool + active-count refactor (KTD-1) sound and genuinely byte-unchanged for
+   non-pour scenes? Any buffer/grid/dispatch sizing it misses (e.g. the counting-sort grid arrays,
+   readback buffers, cell_start sizing)?
+2. Is the PBF-safe staggered-inlet fix (KTD-3, sub-frame y-stagger) actually sufficient to avoid the
+   incompressibility-solve eruption, or are there remaining inlet-density failure modes (e.g. high
+   flow within one frame, the golden-angle disc still being dense, grid-cell overpopulation)?
+3. Conservation under a source (R7): is the accounting correct that emitting c=0 water leaves the
+   solute inventory conserved? Any leak the plan misses?
+4. The drain decision (KTD-4: pool live + cup readout, capacity = full dose). Is sizing capacity to
+   the full dose sound, or will active_count growth break determinism/perf/the grid?
+5. No-silent-drop guarantee (R4) and the accumulator-persistence fix — correct?
+6. Unit breakdown, dependencies, and test-scenario completeness — anything a competent implementer
+   would still have to invent? Any missing failure-path or edge-case tests?
+7. Is anything in the bug audit (Sources & Research) wrong or overstated?
+
+The plan follows.
+
+========================================================================
+---
+title: "feat: Pour emission (continuous water injection + drain readout)"
+status: active
+date: 2026-06-05
+type: feat
+origin: none (scoped from the old MPM/XPBD emission model + the Phase 1.5 deferral)
+---
+
+# feat: Pour emission — continuous water injection
+
+## Summary
+
+Make the XPBD solver consume `EmissionInput` to **inject fresh water particles at the kettle
+over the brew** (at `flow_rate`, from `kettle_pos`), so water passes *through* the grain bed
+continuously and pools as brew in the cup — instead of today's single fixed water column that
+drains once. This is the prerequisite that unblocks real-coffee yield/TDS: a fixed column can only
+strip `c_sat·V_water` (~1% of dose); continuous pour-through extracts cumulatively across many
+water passes.
+
+The design is a **port of the old implementation's emission model** (`crates/sim-wasm/src/engine/
+xpbd/inflow.rs` + `crates/sim-core/src/pour.rs`, in git history), which functioned well, **re-seated
+onto the new GPU-resident solver and with its bugs fixed** (see Sources & Research for the audit).
+The old model was CPU-resident (particle `Vec`s grown by `push`); the new solver has fixed GPU
+buffers, so emission becomes a **pre-allocated capacity pool with a growing active count**, with
+particles activated CPU-side via `queue.write_buffer` into the active range.
+
+Drained/pooled water stays **live** in the cup and yield/TDS is summed over the cup region (reusing
+the Phase-1.5 U7 readout) — no per-frame readback, no atomics, no dropped water. Band calibration is
+**deferred** to a follow-up tuning pass; this plan delivers the mechanism + a believable V60 pour.
+
+---
+
+## Problem Frame
+
+`EmissionInput { kettle_pos, flow_rate, pour_angle, event }` exists (`src/emission/mod.rs`) but the
+solver ignores it (`fn step(&mut self, dt, _input)` at `src/solvers/xpbd/mod.rs`). All GPU buffers
+are sized to a fixed `particle_count` set at build from the seeded lattice, and every pass dispatches
+over `groups(self.particle_count)`. There is no runtime particle injection.
+
+Consequences (measured in Phase 1.5): the V60 brew is a one-shot water column; yield ceilings at
+~4% of soluble (~1% of total dry mass) and cup TDS at ~0.99%, far under the 18–22% / 1.2–1.4% target
+bands — because real yield needs 250 ml flowing *through* 15 g, not a single static charge.
+
+The old MPM/XPBD prototype modeled this correctly (continuous spout inflow + cup drain) and "functioned
+well" per the maintainer, but (a) it was CPU-resident and (b) it carries bugs that are benign in MPM
+but **fatal in the new PBF hard-incompressibility solve** (a flat slab of coincident emitted particles
+erupts). This plan ports the good parts and fixes the bugs.
+
+---
+
+## Requirements
+
+- **R1 — Continuous injection.** Consume `EmissionInput.flow_rate`/`kettle_pos`/`pour_angle` to emit
+  water particles over time at the kettle, at a rate matching the volumetric flow.
+- **R2 — Capacity pool + active count.** Pre-allocate GPU buffers to a `capacity`; grow a runtime
+  `active_count` as particles are emitted; dispatch passes over `active_count`. Non-pour scenes
+  (capacity == seed count) are **byte-for-byte unchanged**.
+- **R3 — PBF-safe inlet.** Emission must not inject a density spike that the incompressibility solve
+  erupts on. Emitted particles are staggered along the pour axis (sub-frame emission time), not
+  coincident in a flat disc. *(Fixes old bug #1.)*
+- **R4 — No silent dose loss.** The fractional-particle accumulator persists across pour pauses;
+  capacity is sized to the recipe's total water dose; pool overflow logs a loud warning and never
+  silently drops water. *(Fixes old bugs #2, #3, #4 — the project rejects silent truncation.)*
+- **R5 — Pour recipe layer.** A time-windowed pour script (flow rate + spatial pattern: center /
+  spiral / ring / point, with bloom / wait / drawdown via command presence) that a driver samples to
+  produce `EmissionInput`. Ports `pour.rs`.
+- **R6 — Pour-through brew.** In the V60 pour scene, water emitted at the kettle threads the bed,
+  drains through the cone apex, and pools in the cup; yield (cup-region readout, U7) rises with
+  continuous pour, materially above the fixed-column ~1%. Deterministic across identical runs.
+- **R7 — Conservation under a source.** Emitted water (seeded `c = 0`, `f_w = 1`, `T = pour_t`) is
+  accounted: total emitted water mass = in-domain water + absorbed-into-grains, to the documented
+  absorption-sink tolerance; the solute inventory `Σ(grain s_f+s_s) + Σ(water c·f_w·V_w)` remains
+  conserved by dissolution (emission adds only `c = 0` water, contributing no solute).
+- **R8 (deferred)** — calibrate `k0`/`extract_rate`/`c_sat`/pour-schedule to the 18–22% / 1.2–1.4%
+  bands. Out of scope here (see Scope Boundaries).
+
+---
+
+## Key Technical Decisions
+
+### KTD-1 — Capacity pool + active count (not buffer reallocation)
+GPU buffers are allocated once to `capacity = seed_count + water_dose_headroom` and never resized;
+the live particle set is `active_count ∈ [seed_count, capacity]`, growing as water is emitted.
+`params.particle_count` is set to `active_count` each frame (the WGSL kernels already guard
+`if i >= particle_count { return }`), and host dispatches use `groups(active_count)`. **Rationale:**
+the solver is GPU-resident with fixed-layout storage buffers and a ~200k perf target; reallocating
+and re-binding buffers per emission is expensive and churns bind groups. A capacity pool with an
+active count is the standard streaming-particle approach and matches the old model's `max_particles`
++ active count. Dormant slots `[active_count, capacity)` are never dispatched, so they need no init.
+**Byte-unchanged guarantee:** a scene with no pour declares `capacity == seed_count`, so
+`active_count` is constant and every existing suite is identical.
+
+### KTD-2 — CPU-side activation via `write_buffer` (not a GPU emission kernel)
+Per-frame emission counts are small (flow_rate · particles_per_volume · dt — a handful). The host
+computes the requested count + positions/velocities and writes them into the active range
+(`pos[active_count..active_count+requested]`, plus `vel`/`chem`/the moisture lane) with
+`queue.write_buffer`, then bumps `active_count`. **Rationale:** matches the old model (CPU `push`),
+needs no new compute pass or storage binding (the 8-buffer budget is tight), keeps the emission
+geometry/recipe logic in testable CPU code, and a few `write_buffer`s of a handful of vec4s per frame
+is negligible. A GPU kernel would only pay off at injection rates far beyond a pour.
+
+### KTD-3 — PBF-safe staggered emission (the critical bug fix)
+The old `emit()` placed every particle in a frame at the same `y` (`origin.y − 0.18`), spread only
+across the x–z disc by a golden-angle pattern. In MPM (grid transfer, weakly compressible) this slab
+was harmless; in the new PBF **hard-incompressibility** solve, N coincident-`y` particles are a local
+density spike that triggers the over-correction eruption the project already fought (`project_coffee_sim_rewrite`
+convergence-order lesson). **Fix:** stagger each emitted particle along the pour axis by its sub-frame
+emission instant — particle `i` of `requested` left the spout at fractional time `i/requested` of the
+frame, so its position is `kettle_pos + dir·exit_speed·(i/requested)·dt` (plus the golden-angle disc
+offset). This spreads the frame's emission into a physically-correct vertical stream segment instead
+of a slab. Keep the deterministic cursor + golden-angle disc (good in the old model).
+
+### KTD-4 — Drain = pool live + cup-region readout (not CPU banking)
+Poured water that reaches the cup stays **live** (it settles and pools); yield/TDS is summed over the
+cup-cylinder region by the existing Phase-1.5 U7 `sample_extraction`. **Rationale:** the old model
+banked drained mass/solute into CPU scalars because it was CPU-resident; on the GPU-resident solver
+that would require a per-frame readback of just-drained particles (a realtime stall) or an
+atomics-free reduction. Pooling live needs neither, reuses code already written, and never drops
+water. **Cost:** `capacity` must hold the full water dose (a bounded, known count from the recipe's
+total ml); pooled cup water is mostly quiescent (cheap under the grain sleep / low-velocity regime).
+
+### KTD-5 — Recipe layer drives `EmissionInput`; the solver owns the inflow accumulator
+`emission/pour.rs` (ported `PourScript`) is sampled by the driver (example/engine) at the brew time
+to produce `EmissionInput`; the solver holds the `InflowState` (fractional accumulator + cursor) and
+turns `EmissionInput` into activated particles in `emit()`. **Rationale:** preserves the solver-agnostic
+seam (`EmissionInput` is the contract; the recipe is solver-independent) and mirrors the old split
+(`pour.rs` recipe vs `inflow.rs` mechanism).
+
+### KTD-6 — Emission seeds the chem/moisture lanes consistently
+Emitted water is written with `phase = 0` (water), moisture lane `pos.w = 1.0` (`f_w = 1`, full),
+and `chem = (0, pour_t, 0, 0)` (`c = 0`, water temperature = pour temperature). **Rationale:** matches
+`seed_chem` for water; emitting at `c = 0` means emission adds no solute, so the U5/U6 conservation
+gates are undisturbed (emission only adds dilution/volume). The old hardcoded `92.0` temperature is
+replaced by `mats.pour_t`.
+
+---
+
+## High-Level Technical Design
+
+Per-frame pour pipeline (driver → solver):
+
+```mermaid
+flowchart LR
+  PS["PourScript.sample(t)\n(emission/pour.rs)"] -->|x,y,flow| DRV["driver maps to\nEmissionInput\n{kettle_pos, flow_rate}"]
+  DRV --> STEP["XpbdSolver::step(dt, input)"]
+  STEP --> EMIT["emit(): InflowState\naccumulator + golden-angle\n+ y-stagger (KTD-3)"]
+  EMIT -->|write_buffer slots\n[active_count .. +req]| POOL[("GPU pool\nactive_count→")]
+  EMIT -->|active_count += req\nparams.particle_count = active_count| SUB["substep loop\n(dispatch over active_count)"]
+  SUB --> DRAIN["water pools in cup\n(stays live)"]
+  DRAIN --> READ["sample_extraction()\ncup-region yield/TDS (U7)"]
+```
+
+Capacity / active-count model (KTD-1):
+
+```
+build:   capacity = seed_count + dose_headroom        # dose_headroom = 0 for non-pour scenes
+         buffers sized to capacity
+         active_count = seed_count                     # bed (+ any initial charge)
+per frame: requested = inflow.emit(input, dt)          # fractional accumulator → integer count
+           requested = min(requested, capacity - active_count)   # clamp + WARN if clamped (R4)
+           write pos/vel/chem/moisture for [active_count, active_count+requested)
+           active_count += requested
+           params.particle_count = active_count        # kernels guard i >= particle_count
+           run substep loop over groups(active_count)
+```
+
+---
+
+## Scope Boundaries
+
+**In scope:** continuous water emission from `EmissionInput`; capacity pool + active count; the
+PBF-safe staggered inlet; the pour recipe layer; a V60 pour scene + example; conservation accounting
+under emission; reuse of the U7 cup yield/TDS readout.
+
+### Deferred to Follow-Up Work
+- **Band calibration (R8)** — tuning `k0`/`extract_rate`/`c_sat`/pour-schedule to 18–22% yield /
+  1.2–1.4% TDS. The mechanism makes the bands *reachable*; hitting them is an empirical pass.
+- **Drain-and-reclaim** — deactivating + slot-reclaiming drained cup water to keep `active_count`
+  bounded below the full dose (only needed if capacity = full dose proves too costly; KTD-4 pools
+  live instead).
+- **CPU drain banking** — exact cup scalars via readback (rejected in KTD-4 for the realtime stall).
+
+### Outside this plan's identity
+- **Bloom CO₂ physics** — the `StartBloom`/`StopBloom` events get a minimal hook (pause/scale flow);
+  real CO₂ outgassing + freshness is Phase 6 (`solver_xpbd.md` step 6).
+- **Recycling/looping brews** — re-emitting drained water (non-physical; re-extraction).
+- **Multi-solver emission** — only the XPBD solver; the `EmissionInput` seam stays solver-agnostic.
+
+---
+
+## Implementation Units
+
+### U1. Capacity pool + active-count refactor
+
+**Goal:** Let the solver hold more particles than it currently simulates — fixed-capacity GPU buffers
+with a runtime `active_count` — without changing behavior for non-pour scenes.
+
+**Requirements:** R2.
+**Dependencies:** none.
+**Files:** `src/solvers/xpbd/mod.rs`, `src/engine/scene.rs` (capacity/dose source),
+`src/utils/config.rs` (if a capacity knob is cleaner there), `tests/xpbd_water.rs` or a new
+`tests/xpbd_emission.rs` (byte-unchanged assertion).
+
+**Approach:** Introduce `capacity` (buffer sizing) distinct from `active_count` (live set). Size all
+per-particle buffers (`pos`, `vel`, `pred`, `vel_smoothed`, `vel_frozen`, `lambda`, `dp`, `c_residual`,
+`normal_impulse`, `alpha_s`, `fluid_impulse`, `coupling_scale`, `wet_count`, `diss_neighbors`, `chem`,
+`chem_frozen`, `phase`, `sorted_indices`, readback buffers) to `capacity`. Replace per-frame
+`self.particle_count` dispatch sizing with `active_count`; set `params.particle_count = active_count`
+before each `write_buffer(params)`. Derive `capacity` at build: `seed_count + dose_headroom`, where
+`dose_headroom` comes from the scene's declared water dose (e.g. `Scene.water_ml` converted via the
+particle volume, or a new explicit `Scene.pour_capacity`/`Config` field) — **0 when the scene has no
+pour**, so `capacity == active_count == seed_count` and the layout/dispatch is identical to today.
+Grid sizing (`num_cells`) is position/box-derived and unaffected; `cell_start` stays `num_cells+1`;
+`sorted_indices` grows to `capacity`. `reset()` restores `active_count = seed_count`.
+
+**Patterns to follow:** the existing buffer-allocation block and `let vec4 = n*16` sizing in
+`XpbdSolver::build`; `seed_block` for the seed count; the `groups(self.particle_count)` dispatch sites
+in `step()`.
+
+**Test scenarios:**
+- Non-pour scene (dam-break, bed-drop, V60 without pour) with `capacity == seed_count`: positions /
+  moisture / chem after N steps are byte-identical to the pre-refactor solver (or: existing
+  `xpbd_water`/`xpbd_bed`/`xpbd_wetting`/`xpbd_coupling`/`xpbd_geometry`/`xpbd_extraction` suites stay
+  green unchanged). Covers R2.
+- A solver built with `capacity > seed_count` but `active_count == seed_count` (no emission yet)
+  produces identical results to `capacity == seed_count` (dormant slots are inert).
+- `reset()` returns `active_count` to `seed_count`.
+
+**Verification:** all existing GPU suites pass unchanged; dormant capacity is provably inert.
+
+### U2. Emission core — `InflowState` + PBF-safe staggered injection
+
+**Goal:** Turn `EmissionInput` into activated water particles each frame, ported from the old
+`inflow.rs` with the density-spike and dose-loss bugs fixed.
+
+**Requirements:** R1, R3, R4, R6 (determinism), R7 (emission side).
+**Dependencies:** U1.
+**Files:** `src/solvers/xpbd/mod.rs` (the `InflowState` + `emit()` + `step()` wiring), possibly a new
+`src/solvers/xpbd/inflow.rs` (host module) for the accumulator/geometry, `tests/xpbd_emission.rs`.
+
+**Approach:** Port `InflowState` (fractional accumulator + `cursor`) as host code. `emit(input, dt)`:
+(1) `accumulator += flow_rate · particles_per_volume · dt`; `requested = floor(accumulator)`;
+`accumulator -= requested` — **do not reset the accumulator when flow is 0** (persist the fraction;
+clear only on `PourEvent::Reset`) [fixes bug #2/#3]. (2) Clamp `requested` to `capacity − active_count`;
+if clamped, `log::warn!` the dropped count (no silent loss) [fixes bug #4]. (3) For each particle,
+compute the golden-angle disc offset (keep the deterministic `cursor`-based spread) AND stagger along
+the pour axis by sub-frame time: `pos = kettle_pos + dir·exit_speed·(i/requested)·dt + disc_offset`,
+where `dir` derives from `pour_angle` (downward by default) [fixes bug #1 / KTD-3]. (4) `write_buffer`
+the new slots: `pos` (with `.w = 1.0` moisture), `vel` (= `dir·exit_speed`), `chem = (0, pour_t, 0, 0)`,
+`phase = 0` [KTD-6]. (5) `active_count += requested`; update `params`. Wire `emit()` into `step()`
+before the substep loop, gated on `flow_rate > 0`. `PourEvent::Reset` re-seeds; `StartBloom`/`StopBloom`
+get a minimal flow-scale hook (stub).
+
+**Execution note:** Add the failing PBF-stability test (emit into a closed box, assert no eruption)
+before wiring `emit()` — it is the load-bearing fix.
+
+**Patterns to follow:** the old `crates/sim-wasm/src/engine/xpbd/inflow.rs` `emit()` (accumulator +
+golden angle); `write_velocities_for_test`/`write_chem_for_test` for the `write_buffer` mechanics;
+`seed_chem` for the water chem lanes.
+
+**Test scenarios:**
+- **Rate fidelity:** emitting at a constant `flow_rate` for T seconds activates
+  `≈ flow_rate · particles_per_volume · T` particles (accumulator carries the fraction; tolerance ±1).
+  Covers R1.
+- **Accumulator persists across pauses:** flow → 0 for several frames then resumes → the sub-particle
+  fraction is not lost (total over a pulse train matches the integral within ±1). Covers R4.
+- **PBF-safe inlet (gate):** continuous emission into a closed box with the full incompressibility
+  solve on → positions stay finite, max speed bounded, no eruption (KE bounded); compare against the
+  un-staggered (slab) emission which should visibly spike. Covers R3.
+- **Capacity clamp warns, never drops silently:** emit past `capacity` → `active_count` saturates at
+  `capacity`, a warning is logged, count is exact. Covers R4.
+- **Seeding correctness:** emitted particles read back with `phase = 0`, `pos.w = 1.0`, `chem.x = 0`,
+  `chem.y = pour_t`. Covers R6/R7.
+- **Determinism:** identical pour inputs → identical activated positions/velocities across two runs.
+
+**Verification:** rate matches flow; no eruption at the inlet under the full solve; no silent drops;
+deterministic.
+
+### U3. Pour recipe layer (`emission/pour.rs`)
+
+**Goal:** A time-windowed pour script + spatial patterns that a driver samples to produce
+`EmissionInput` — ported from the old `pour.rs`.
+
+**Requirements:** R5.
+**Dependencies:** none (pure CPU; usable once U2 consumes `EmissionInput`).
+**Files:** `src/emission/pour.rs` (new), `src/emission/mod.rs` (register), `tests/` inline `#[cfg(test)]`.
+
+**Approach:** Port `PourScript` / `PourCommand` / `PourPattern` (Center / Spiral / Ring / Point) and
+`sample(t) → (x, y, flow_rate)` with bloom / wait / drawdown via command presence (absence ⇒ 0 flow).
+Port the built-in recipes (`classic_spiral`, `center_only`, `pulse_pour`). Optionally fix the
+"spiral-is-a-rosette" issue (radius oscillation locked to the angle frequency) by decoupling the radius
+sweep frequency, or document it as intentional [bug #5]. The driver (U4) maps the normalized `(x, y)`
+to world `kettle_pos` via the bed radius and sets `EmissionInput.flow_rate`.
+
+**Patterns to follow:** the old `crates/sim-core/src/pour.rs` (verbatim structure, minimal changes per
+the project's port-with-minimal-modification convention); `models/*.rs` pure-function + `#[cfg(test)]`
+layout.
+
+**Test scenarios:**
+- `total_water_ml` equals the analytic sum of `flow · duration` across commands.
+- `sample(t)` returns the active command's flow + pattern position; returns `(0,0,0)` in wait/drawdown
+  gaps. Covers R5.
+- Each pattern's geometry: Center is origin; Point is the given coords; Ring stays at the given radius;
+  Spiral stays within `[r_min, r_max]`.
+- Determinism: `sample(t)` is pure (same `t` → same output).
+
+**Verification:** recipe sampling matches the analytic schedule; patterns bounded and correct.
+
+### U4. V60 pour scene + driver + believable-brew gate
+
+**Goal:** Wire the recipe → `EmissionInput` → solver into a runnable V60 pour, and gate the
+pour-through brew (conservation, stability, rising yield).
+
+**Requirements:** R6, R7.
+**Dependencies:** U1, U2, U3.
+**Files:** `src/engine/scene.rs` (`Scene::v60_pour()` — bed seeded, no initial water column, declares
+the water dose for capacity sizing), `examples/brew.rs` (extend) or `examples/pour.rs` (new) for the
+driver loop, `tests/xpbd_emission.rs` (integration gates), reuse `sample_extraction` from U7.
+
+**Approach:** `Scene::v60_pour()` reuses the V60 dripper/cup geometry + the calibrated permeable bed,
+seeds only grains (water arrives via the pour), and declares the total water dose so U1 sizes capacity.
+A driver loop samples a `PourScript` at the brew time → maps `(x,y)` to `kettle_pos` above the bed →
+sets `EmissionInput { kettle_pos, flow_rate, pour_angle }` → `step()`. Print yield/TDS (U7 readout) +
+conservation (emitted mass vs in-domain + absorbed) over the brew. Bloom command pours center first;
+main pour follows; drawdown = no command.
+
+**Test scenarios:**
+- **Pour-through (gate):** over a full pour, water emitted at the kettle reaches the cup (cup-region
+  water mass rises from 0), grains stay trapped, and the run stays finite/stable. Covers R6.
+- **Yield rises with pour (gate):** cumulative pour yields materially above the fixed-column ceiling
+  (~1% of total) and increases over the brew — the qualitative win the mechanism unlocks. Covers R6.
+- **Conservation under a source (gate):** total emitted water mass = in-domain water + absorbed-into-
+  grains, within the documented absorption-sink tolerance; solute inventory conserved (emission adds
+  `c = 0`). Covers R7.
+- **Determinism:** identical pour script → aggregate metrics within tolerance across two runs.
+
+**Verification:** water pours through to the cup; yield rises beyond the fixed-column ceiling;
+conservation holds; stable; example prints a believable brew trace.
+
+---
+
+## Risks & Dependencies
+
+- **Inlet instability (highest risk).** Even with the y-stagger (KTD-3), a high `flow_rate` can pack
+  the inlet. Mitigation: the PBF-safe gate test (U2) runs the full solve; if needed, also cap
+  per-frame `requested` (spreading a burst across frames) and/or widen the disc — flagged for
+  execution-time tuning.
+- **Capacity sizing.** KTD-4 pools live, so `capacity` must hold the full dose; an undersized capacity
+  warns + clamps (R4) rather than corrupting, but the brew would under-deliver. The scene must declare
+  the dose honestly; the example should assert `active_count` never hit `capacity` unexpectedly.
+- **Perf.** Pooling the full dose grows `active_count` toward the perf budget; cup water is quiescent
+  (cheap) but counts toward dispatch. Acceptable for the V60 scale; the ~200k perf pass is deferred.
+- **Conservation tolerance.** The wetting absorption sink (Phase 1.5) already makes the combined-path
+  inventory drift ~1–2%; emission doesn't add solute but the gate must use the same bounded tolerance,
+  not assert zero.
+
+---
+
+## Sources & Research
+
+**Old emission model (git history; the reference the maintainer confirmed "functioned well"):**
+- `crates/sim-wasm/src/engine/xpbd/inflow.rs` (last at commit `6631684`) — `InflowState` fractional
+  accumulator + golden-angle disc emission; consumed in `crates/sim-wasm/src/engine/xpbd/mod.rs`
+  `emit()` (capacity pool + `max_particles` + `dropped`) and `drain_cup()` (cup-floor deactivate +
+  CPU mass/solute banking).
+- `crates/sim-core/src/pour.rs` (pre-deletion `bfe129e^`) — `PourScript` recipe layer + patterns +
+  built-in recipes.
+
+**Bug audit of the old model (carried into requirements as fixes):**
+1. **Pancake emission → density-spike eruption (critical for PBF).** All per-frame particles at the
+   same `y`; harmless in MPM, fatal in PBF. → R3 / KTD-3 (sub-frame y-stagger).
+2. **Accumulator reset on flow-stop** (`accumulator = 0.0` when flow < 1e-6) → lost sub-particle dose
+   per pause. → R4 (persist the fraction).
+3. **Drain never reclaims the slot** (`pos_type[i][3] = 2.0` but stays in the array) → `active_count`
+   only grows → eventual cap + silent drop. → KTD-4 (pool live, size capacity to dose) + R4.
+4. **Silent drop on full pool** (`dropped` tracked but water silently lost). → R4 (loud warn, no drop).
+5. **Hardcoded pour temp `92.0` + y-offset `0.18`** in `emit()`. → KTD-6 (`pour_t`, geometry-derived).
+6. **"Spiral" is a rosette** (radius locked to angle frequency). → U3 (fix or document; cosmetic).
+- **Kept (good):** fractional accumulator, deterministic cursor + golden-angle spread, the `pour.rs`
+  recipe layer.
+
+**New-solver context:** `src/solvers/xpbd/mod.rs` (fixed `particle_count`, `groups(particle_count)`
+dispatch, buffer sizing `n*16`); `src/emission/mod.rs` (`EmissionInput`/`PourEvent` scaffold);
+Phase-1.5 U7 `sample_extraction` cup-region yield/TDS readout (reused for the drain readout);
+`project_coffee_sim_rewrite` memory (the convergence-order eruption lesson that makes KTD-3 load-bearing).
+
+---
+
+## Verification
+
+`cargo build`, `clippy --all-targets -D warnings`, `fmt --check` clean. Existing GPU suites
+(`xpbd_water`/`bed`/`wetting`/`coupling`/`geometry`/`extraction`) green and unchanged (R2 byte-unchanged
+guarantee). New `tests/xpbd_emission.rs`: rate fidelity, accumulator persistence, PBF-safe-inlet gate,
+capacity-clamp-warn, emission seeding, determinism, pour-through, yield-rises, conservation-under-source.
+`cargo run --release --example brew` (or `pour`) drives `Scene::v60_pour()` with a recipe and prints a
+believable brew trace (yield rising above the fixed-column ceiling, water pooling in the cup,
+conservation within the absorption-sink tolerance).

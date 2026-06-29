@@ -1,0 +1,325 @@
+You are reviewing an implementation plan written by Claude Code for a novel real-time multiphase solver. This is ROUND 3. Round 1 returned REVISE (15 findings); round 2 returned REVISE (12 findings); ALL 27 were folded into the plan below. Respond with a verdict on the FIRST LINE: **APPROVE**, **REVISE**, or **REJECT**. Then give numbered, specific findings. Be rigorous but converge: only flag issues that materially affect implementability, physics correctness, or gate falsifiability. Cosmetic or stylistic points do not block approval.
+
+Round-2 findings and how they were folded (verify the folds, do not re-raise):
+1. KTD-4/U6 φ-weighting contradiction → U6 now defers to KTD-4: Δv_k = −(Δt/ρ_k)∇p, φ weights continuity/mass terms only.
+2. Source terms not gated → U9 manufactured source-term test: prescribed local s_f/s_s in a closed bed must produce compensating flux/pressure via the projection RHS, no density drift.
+3. Skempton B meaningless on frozen skeleton → moved to U7 (deformable); U6's undrained gate is now a boundary-reaction load-transfer check.
+4. Frozen-solid buoyancy observable → reaction impulse on the constrained solid = displaced-volume weight; dynamics gated in U7.
+5. L0 operator changes after U4 → U3's assembled-operator/divergence/volume gates re-run after surface Dirichlet + bubble rows are inserted.
+6. Bubble constraint underspecified → pinned as one explicit Lagrange multiplier per pocket (value = pocket pressure), coupled to pocket-boundary faces, represented identically in coarse solve and fine cleanup.
+7. Face-velocity interpolation consistency → U6 checker: velocities feeding D(φv) carry the same drag/pressure/solids-pressure/boundary terms as the momentum update.
+8. Drag-split gate too narrow → U6 reference now subcycles drag AND projection together on a closed variable-φ column with outflow.
+9. Over-packing guard double-counting → guard declared part of effective/contact stress, never in the projection; U7 audit verifies single-counting.
+10. Ladder vs concurrency contradiction → U6 explicitly labeled the one sanctioned early-L2 risk spike with its own knob grid/halt rules; ladder discipline applies to rung gates, not unit start order.
+11. GCI vs fixed Jacobi budget → offline sweep scales fine-sweep budget with resolution; real-time fixed budget gated separately by U3 tolerance.
+12. 200k gate under-constrained → composition pre-registered (~185–190k water + 10–15k solids), grid resolution, substeps, duration fixed before the run.
+
+Round-1 findings (all folded in round 1, spot-check only if something looks off): assembled-operator A=−D·M⁻¹·G gates on masked domains; independent volume gates beside the self-measured divergence gate; two-grid convergence factor; tolerance tied to visible density-band budget + wall-clock cost link; per-phase continuity with s_k sources; explicit momentum equations with skeleton-at-rest invariant; Terzaghi at two drainage lengths + load sharing; drag-fold claim softened to frozen-coefficient exactness + β-variation stress tests; coupled split gate under timestep refinement; stress partition stated once + audited; SVD cost bound + repose confound control; U6 frozen-bed scope caveat; knob grid covers every gate-relevant tunable; per-rung pre-registered dispatch/substep ceilings; per-phase impulse ledger with filter-outflow fluxes.
+
+Known open items tracked elsewhere (do not flag): bubble-pocket detection method; drained-water particle lifecycle; full-brew drawdown gate deferred to follow-up.
+
+Project context: Rust + wgpu 29 + WGSL, WebGPU-portable (storage buffers 9/stage raisable to 16; no float atomics — fixed-point i32; no indirect dispatch). Prior baselines: main's MPM (converged Poisson too slow, divergence-penalty Darcy blocked infiltration, A≠D·G) and the XPBD/PBF rewrite (percolation/wetting/statics green; no impact momentum). Settled user decisions (do not re-litigate): full L0–L3 program in one plan; pure bet, NO fallback architecture; new solver only; ≤33 ms/frame @200k on Apple M5 as the L3 gate; U6 parallel with U5.
+
+The current plan follows below.
+
+----- PLAN -----
+
+---
+title: "feat: Unified two-field multiphase solver (incompressible water + elastoplastic porous bed)"
+status: active
+date: 2026-06-09
+type: feat
+plan_id: 2026-06-09-001
+deepened: 2026-06-09
+related:
+  - docs/plans/solvers.md
+  - docs/plans/solver_mpm.md
+  - docs/plans/2026-06-08-001-feat-water-grain-impact-coupling-plan.md
+---
+
+# feat: Unified two-field multiphase solver (incompressible water + elastoplastic porous bed)
+
+## Summary
+
+Build a new grid-based solver under `src/solvers/` — a two-velocity-field, APIC-transfer, constraint-incompressible multiphase method — that handles all three target interactions in one method: water↔water (incompressible, with impact cavities), granular bed↔itself (Drucker-Prager elastoplasticity, angle of repose, tamping memory), and water↔bed with porosity (Darcy percolation at physical infiltration rates through a deformable, swelling bed, with pour craters). The work is structured as a validation ladder of rungs (L0 water → L1 bed → L2 percolation → L3 full coupling), each rung with quantitative exit gates. This is a pure bet on the novel architecture: a failed gate stops the ladder for redesign — there is no pre-committed fallback path.
+
+---
+
+## Problem Frame
+
+Two complete prior attempts failed in complementary halves, and four independent attacks on the pressure solve failed for the same root cause:
+
+- **main (MPM + global Poisson):** plausible bed deformation, but (a) the pressure solve consumes ~70% of a ~30 ms frame and sparse RBGS (PR #18, 1.93×) is its practical ceiling — Jacobi-CG, adaptive iterations, and indirect dispatch all failed because the real bug is operator inconsistency (compact stride-1 solve vs central stride-2 divergence, A ≠ D·G → a divergence floor no solver beats); (b) water pools above the bed unreasonably long because Darcy resistance is formulated as a divergence penalty in the pressure RHS, which imposes a pressure-jump entry barrier at the bed surface — inconsistent with the correct Stokes–Darcy interface conditions (flux + stress continuity, not pressure continuity); (c) the bed is a fixed scaffold with a scalar porosity — no granular mechanics at all.
+- **rewrite (XPBD/PBF):** percolation, wetting/swelling (volume-conserving), and granular statics all work and are test-gated — but position projection derives velocity *after* the constraint solve, so impact momentum dies in the density projection. Both impact-coupling attempts (water→grain committed-dormant; water↔water reverted in `4dca52f`) confirmed there is no contact-pressure layer to patch. No craters, no cavities, no tamping memory.
+
+No published method covers all three interactions in real time: mixture-MPM (Tampubolon 2017, Gao 2018) is offline and pools on dry beds (drag activates only after interpenetration); Genesis-style couplers average velocities and forbid percolation; GIC (SIGGRAPH Asia 2025) has the right absorption lifecycle but runs on an 80-core CPU. The two-velocity-field + cheap-incompressibility + cavity combination is the open, publishable core.
+
+---
+
+## Requirements
+
+**Interactions**
+
+- R1. Water behaves incompressibly (visual density band per existing water gates) and carries impact momentum: a fast jet into a pool produces a measurable, transiently sustained cavity; a center pour craters a granular bed.
+- R2. The bed is a pressure-dependent elastoplastic granular material: tunable angle of repose reaching ≥30° (coffee band 32–48°), column collapse with plausible runout, static rest without creep, and plastic compaction memory under repeated load (tamping persistently raises packing fraction).
+- R3. Water percolates through the bed as relative two-phase flux: Darcy flux scales with K(φ)·head and grind d², infiltration at the free-water/bed interface proceeds at physical rates (no artificial entry barrier), ponding forms only when pour demand exceeds bed capacity and drains on the calibrated timescale after pouring stops.
+- R4. Wetting is conserved and mechanical: absorbed water volume transfers 1:1 into grain moisture, grains swell (+15–17% diameter at saturation) with effective mass for momentum, and local porosity/permeability evolve with swelling and compaction.
+
+**Conservation and correctness (hard constraints)**
+
+- R5. Volume (water + absorbed + pore) and momentum are conserved within documented float budgets, including the long-run saturated-tail regime; solute/extraction hooks are out of scope but the conservation pattern must not preclude them.
+- R6. Deterministic stepping given state + input + seed; no non-finite state ever; the `Solver` trait getters never stall the GPU.
+
+**Performance and platform**
+
+- R7. The frame contains no converged global Poisson solve. Incompressibility cost is bounded: one coarse-grid solve (≤ ~1/64 of fine cell count) plus a fixed small number of fine local iterations.
+- R8. Dispatches/frame and max-storage-buffers-per-entry-point are first-class budgets, recorded from rung L0 onward via `Solver::profile()`. Each rung also pre-registers a maximum dispatch count and a substep ceiling (with a rough bandwidth estimate) before its implementation starts, so the L3 wall-clock gate cannot be discovered unreachable only after the L1/L2 investment. Sparsity uses over-dispatch + early-out, never `dispatch_workgroups_indirect`.
+- R9. Scaling is ~linear in particle count to 200k (ramped: measured at each rung; 200k is the L3 target, not an L0 gate), and real-time is a gated absolute number, not just structure: ≤33 ms/frame median at 200k particles on the reference device (Apple M5) is the L3 exit gate — a perfectly linear 90 ms/frame solver fails the program. Each earlier rung pre-registers a wall-clock ceiling for its representative scene when its gate tests are written; exceeding a ceiling is a halt condition alongside the physics gates. WGSL compiles unmodified for native + web; WebGPU baseline limits except the storage-buffer request.
+
+**Integration**
+
+- R10. The solver is one complete entry behind the `Solver` trait (`src/solvers/base.rs`): six methods, canonical `ParticleBuffers` layout, `Metrics`/`Profile`, three-edit registration (`src/engine/solvers.json`, `SolverId`, `build_solver`). Existing scenes, `src/models/` physics laws, and the V60 geometry are reused, not duplicated. The XPBD solver and existing tests remain untouched and green.
+
+---
+
+## Key Technical Decisions
+
+- KTD-1 — **Two velocity fields per grid node (water + solid), APIC particle↔grid transfers.** Percolation requires co-located phases at *different* velocities (relative Darcy flux); contact requires momentum exchange on a shared grid. One field per phase satisfies both; velocity-averaging couplers (Genesis) are structurally rejected. APIC (per-particle affine matrix C) is the momentum carrier that makes cavities — its absence is precisely why XPBD craters failed. Per the v1 data-path lesson (`docs/issues/010-separate-water-bed-data-paths.md`), water and solid particles occupy separate buffer ranges with phase-specific dispatches, not a shared branchy buffer.
+- KTD-2 — **Incompressibility = coarse-grid pressure seed + fine local Jacobi cleanup, on one discretely consistent operator family.** The coarse solve (e.g. 1/4³ resolution) kills the low-frequency modes local iteration can't reach (this is the unbuilt PB-MPM 3D-convergence fix — the novel core); a fixed budget of fine Jacobi sweeps kills high-frequency residual. No converged Poisson (main's graveyard), no EOS-only fallback for the shipped path (an adaptive-Tait weak-compressibility predictor, c_s ≈ 10·v_max, is permitted as a pre-projection stabilizer if implementation finds it helps). **Operator consistency is a stated gate, not an aspiration:** divergence, gradient, and both grids' Laplacians come from one MAC-consistent family, the coarse operators are consistent restrictions of the fine ones, and rung L0 must measure the post-projection divergence and show it decays below a pre-registered tolerance as the iteration budget grows — a floor that plateaus above tolerance is the failure, and it is the exact signature that killed main's adaptive-RBGS, so it must be demonstrably absent. Two-field corollary from production Euler-Euler practice (the multiphase Rhie-Chow lesson, Cubero 2007 / Ferreira 2021): whatever velocity feeds the divergence must carry the drag and solids-pressure contributions consistently with the momentum update, or φ_s develops spurious oscillations even when the pressure operators themselves are consistent.
+- KTD-3 — **Darcy drag is a velocity body force folded semi-implicitly into the grid update — never a divergence penalty.** Form: drag rate β(φ) from `src/models/permeability.rs` (Kozeny–Carman), applied per node between the two velocity fields via the analytic exponential (Laibe–Price) update `Δv⁺ = Δv·exp(−β·dt)` — exact for frozen-coefficient linear drag at any stiffness (β refreshes per substep; when β varies in-step through φ, slip, or Re the update is formally first-order, so the honest claim is robust stability at coffee's worst-case density ratio ρ_f/ρ_s ≈ 0.83, not unconditional exactness), momentum-conserving by construction (mass-weighted pair update). Main's divergence-penalty formulation is recorded as a named anti-pattern: it blocks interface entry flux and is the root cause of the stuck water layer. This per-node analytic fold is the same structure production Euler-Euler codes use for stiff interphase drag (Fluent PC-SIMPLE's Partial Elimination Algorithm; MFiX-Exa reports drag iteration counts dropping from 50+ to 3–5 with it) — a 2×2 closed-form inversion, zero global communication. Two production refinements are adopted: (1) **drag-law blending** — Kozeny-Carman/Ergun is the packed-bed law and over-predicts drag in dilute regions (pour entry, splashed grains); blend toward a dilute-suspension law (Wen-Yu form) below φ_s ≈ 0.2 with a smooth transition (the Gidaspow/Huilin-Gidaspow pattern every TFM code ships); (2) if residual added-mass jitter appears despite the exponential fold, the standard stabilizer is a **virtual-mass term** (C_vm ≈ 0.5) added symmetrically to both phases — a named lever, default off.
+- KTD-4 — **Infiltration interface physics: mixture incompressibility + wetting-front suction + phase-change absorption.** (a) Continuity is per-phase volume conservation, `∂φ_k/∂t + ∇·(φ_k·v_k) = s_k`, where the s_k carry the absorption/swelling/compaction exchanges; summing gives the projection constraint `∇·(φ_f·v_f + φ_s·v_s) = s_net`, and the projection RHS carries s_net explicitly rather than assuming zero (s_net = 0 only when the exchanges are volume-balanced, which R4 mandates and the conservation gates verify). The momentum side is pinned as equations, not prose: `φ_k·ρ_k·Dv_k/Dt = −φ_k·∇p + ∇·(φ_k·τ_k) + f_drag,k + φ_k·ρ_k·g` (Gao 2018's locally-averaged form), so the intrinsic-velocity pressure correction is `Δv_k = −(Δt/ρ_k)·∇p` — the φ_k cancels; it does NOT scale the velocity update. Pinned invariants: a skeleton at rest under hydrostatic pressure stays at rest (in the rigid-skeleton regime the solid field is not projected into motion — pressure enters the bed as buoyancy and effective stress, i.e., a reaction); submerged grains feel buoyancy through the momentum equation (not just constitutively); a compacting or swelling skeleton displaces pore water instead of silently creating or destroying volume. (b) A capillary suction body force acts on water at the unsaturated wetting front (Green–Ampt; ψ_f ≈ 50–110 mm physical for ~400 µm media, mapped to reduced units), gated by a hydrophobic→wetted transition so the bloom-phase entry delay falls out naturally. (c) Absorption is a moisture phase-change at contact (GIC-style): grid-projected moisture deficit drives transfer from water particles into per-grain moisture, reusing the existing volume-conserving wetting law (`src/models/wetting.rs`) — absorption starts on contact, not after interpenetration.
+- KTD-5 — **Bed constitutive model: Klar et al. 2016 Drucker-Prager return map** (3-branch, log-strain, one 3×3 SVD per solid particle per substep) with saturation-dependent cohesion from `src/models/cohesion.rs` (Bishop-style effective stress) and a compaction cap surface for tamping memory (plastic volumetric strain persists and feeds packing fraction → permeability). The tensile-apex branch is what lets crater walls stand and then collapse. **Stress partition is stated once and audited:** total stress = effective stress (DP + cap, with the U5 over-packing solids-pressure guard living INSIDE the contact/effective partition) + pore pressure, and the projection pressure IS the pore pressure — no volumetric mode may be resisted twice by contact pressure, cap pressure, solids-pressure guard, and projection pressure stacking up. The U7 stress-partition audit gates this.
+- KTD-6 — **Cavity sustain via constraint bubbles** (Goldade & Batty 2017): free-surface cells are tracked; enclosed air pockets get one aggregate volume constraint each in the pressure solve, so the pour cavity doesn't instantly re-level. Rung L0 ships the free-surface treatment plus at minimum the single-bubble case (the pour cavity is one pocket); generalization to arbitrary pocket counts may defer.
+- KTD-7 — **GPU layout discipline:** P2G scatter uses fixed-point `atomic<i32>` accumulation (KEEP.md §3 pattern, FP_SCALE re-validated against the velocity cap with documented overflow headroom); bind groups are split by pass family (transfers / pressure / plasticity / coupling) per `docs/issues/003-split-mpm-bind-groups.md`; every entry point fits the device's storage-buffer request. **Discrepancy to resolve in U1:** `src/utils/gpu.rs` currently requests exactly 9 storage buffers (`NEEDED_STORAGE_BUFFERS`) while AGENTS.md sanctions 16 — the scaffold unit raises the request only if the two-field grid genuinely needs it and verifies browser grants; grid fields are packed into vec4 lanes first.
+- KTD-8 — **Porosity and permeability are local, evolving fields:** φ_s from solid-phase P2G mass (smooth via the transfer kernel), K(φ) per node via Kozeny–Carman, updated by swelling, plastic compaction, and (later, deferred) fines. A configured global porosity scalar — main's approach — is rejected; measured intra-bed K heterogeneity spans an order of magnitude.
+- KTD-9 — **The validation ladder is the project spine and the execution posture.** Each rung's gate tests are written before that rung's physics (test-first at the gate level, mirroring the analytic-test doctrine: discrete-recurrence references, CPU twins of GPU kernels, set-invariant assertions, headless GPU gating, no `#[ignore]`). A failed gate halts the ladder for redesign — by explicit decision there is no pre-committed fallback architecture. To make the halt implementable rather than a tuning purgatory, each rung declares a knob grid when its gate tests are written, and the grid must enumerate EVERY tunable its gates depend on — for U3: coarse ratio {1/4³, 1/8³} × fine-sweep range × Tait predictor on/off × pressure tolerance; later rungs add timestep/substep cap, suction parameters, drag blend width, solids-pressure stiffness, plastic damping, and boundary/filter coefficients as applicable; exhausting the grid without a pass IS the halt condition, and reaching for any knob outside the grid is a redesign decision, not a retry.
+- KTD-10 — **Exposure:** native examples and the registry first; the web frontend (`src/web.rs` hard-codes `XpbdSolver`) is not generalized in this plan — deferred to follow-up work once L3 passes.
+
+---
+
+## High-Level Technical Design
+
+Per-substep pipeline (the two-field core):
+
+```mermaid
+flowchart TB
+  A[P2G: water particles to grid field W<br/>fixed-point atomics, APIC] --> C
+  B[P2G: solid particles to grid field S<br/>+ stress divergence from DP return map] --> C
+  C[Grid forces: gravity, suction at wetting front] --> D
+  D[Drag fold: Laibe-Price exponential pair update<br/>between fields W and S per node]
+  D --> E[Coarse-grid pressure solve<br/>restricted operators, bubble constraints]
+  E --> F[Fine local Jacobi sweeps + projection<br/>on the mixture divergence, -grad p to both fields]
+  F --> G[G2P: APIC gather per phase<br/>update C matrices, advect]
+  G --> H[Particle ops: plastic return map SVD,<br/>moisture phase-change, swelling]
+```
+
+Validation ladder (rungs = delivery milestones; each gate is a test binary that must be green before the next rung starts):
+
+```mermaid
+flowchart TB
+  L0[L0 water: APIC + coarse-seed incompressibility + cavity<br/>GATES: divergence decays below pre-registered tolerance,<br/>momentum conserved, jet cavity forms, budgets recorded]
+  L1[L1 bed: Klar DP + cap<br/>GATES: repose >= 30 deg tunable, collapse runout,<br/>no static creep, tamping raises packing persistently]
+  L2[L2 percolation, rigid bed first<br/>GATES: Darcy flux scaling, pond forms/drains in band,<br/>volume+momentum conserved incl. swelling, long-run tail]
+  L3[L3 full coupling: deformable saturated bed<br/>GATES: pour craters bed, swelling lifts, combined conservation,<br/>200k scaling probe ~linear]
+  L0 --> L1 --> L2 --> L3
+```
+
+Sequencing note: U6 (L2's rigid-skeleton drag/projection half) is an **early L2 risk spike** that deliberately runs concurrently with rung L1 — it needs only static solid mass on the grid, not plasticity — so a failure in the two-field coupling surfaces before U5's SVD/return-map investment is sunk. This is the one sanctioned exception to strict rung order, and the ladder discipline applies to RUNG GATES, not unit start order: U6 carries its own knob grid and halt rules like any gated unit, and U9's ponding/drain bands remain the actual L2 ladder gate, which still requires both rungs' machinery.
+
+**Calibration targets for L2/L3 gates** (from the brewing literature; map to reduced units via KEEP.md §2, ≈27.7 sim-units/m, 5.20 mL/sim-unit³):
+
+| Quantity | Physical value | Gate use |
+|---|---|---|
+| Bed permeability K | ~1×10⁻¹³ m² coarse grind → ~1×10⁻¹⁴ m² fine | K(φ) inputs; grind sweep ordering |
+| Dry bed porosity | 0.35–0.45 | initial φ field |
+| Pour demand vs bed capacity | ~0.9 mm/s demand vs 0.5–1.5 mm/s capacity (medium grind) | ponding onset condition |
+| Pond behavior, medium grind | 1–3 cm layer; drains 30–60 s after pour stops | drain-timescale band |
+| Swelling | +15–17% diameter; 60–80% complete ≤30 s at brew temp | swelling rate/magnitude |
+| Wetting-front suction ψ_f | 50–110 mm for ~400 µm media | suction force magnitude |
+| Hydrophobic entry delay | contact angle 103–111° dry; seconds-scale bloom barrier | bloom-gate regime test |
+
+---
+
+## Implementation Units
+
+U-IDs are stable identifiers, not an ordering: U9 was split out of U6 during review and belongs to rung L2, so document order follows rung order (U1–U6, U9, then U7–U8). Never renumber existing U-IDs.
+
+### Rung L0 — scaffold and incompressible water with momentum
+
+### U1. Solver scaffold, registration, and budgets
+
+- **Goal:** A buildable, registered, inert two-field solver skeleton that satisfies the seam contract and pins the GPU budgets.
+- **Requirements:** R6, R8, R10
+- **Dependencies:** none
+- **Files:** create `src/solvers/twofield/mod.rs`, `src/solvers/twofield/common.wgsl`, `examples/twofield_phase0.rs`; modify `src/engine/solvers.json`, `src/engine/registry.rs`, `src/solvers/mod.rs`, `src/utils/gpu.rs` (only if the buffer request must rise); test `tests/twofield_scaffold.rs`.
+- **Approach:** Mirror the xpbd module shape: one Pod `Params` byte-mirrored in WGSL with a size assert; auto-layout pipelines via `make`/`bg` closures; stable global binding indices; all passes through a `dispatch_pass`-style helper feeding `Profile`. Separate water/solid particle ranges in the canonical `ParticleBuffers` layout so `ui::Renderer` works unchanged. Resolve the 9-vs-16 storage-buffer discrepancy here: pack grid fields into vec4 lanes first, raise `NEEDED_STORAGE_BUFFERS` only if required, and verify a web build still gets the device.
+- **Patterns to follow:** `src/solvers/xpbd/mod.rs` (Params, pipelines, dispatch_pass, freeze/apply comments); `src/engine/registry.rs` three-edit pattern and its in-module catalog test (auto-extends via `SolverId::all()`); `tests/phase0.rs` runtime solver-switch test.
+- **Test scenarios:** registry row exists for the new `SolverId` (extend the existing registry test's coverage); `build` + one `step` on an empty scene leaves finite state and returns cached metrics without stalling; `Profile.dispatches_per_frame` > 0 and recorded; `particles()` returns the canonical layout with a populated `phase_tag` buffer for a water-only scene (the existing `tests/render_smoke.rs` already validates rendering for any conforming `ParticleBuffers` — no twofield mirror needed).
+- **Verification:** `cargo test` green including existing suites untouched; a minimal `examples/twofield_phase0.rs` (build + one step on an empty scene, assert finite state and `dispatches_per_frame > 0`) runs clean — the existing `phase0_noop` example only exercises the noop solvers and proves nothing here; budget numbers (dispatches, max buffers/entry point) printed in the test log.
+
+### U2. APIC water transfers (P2G/G2P) and grid integration
+
+- **Goal:** Single-phase water moves on the grid with momentum-conserving APIC transfers — the momentum carrier the rewrite lacked.
+- **Requirements:** R1 (momentum half), R5, R6
+- **Dependencies:** U1
+- **Files:** create `src/solvers/twofield/transfers.wgsl`; modify `src/solvers/twofield/mod.rs`, `common.wgsl`; test `tests/twofield_water.rs`.
+- **Approach:** Quadratic B-spline weights (KEEP.md §3 validated math), fixed-point `atomic<i32>` P2G scatter with documented FP_SCALE/velocity-cap headroom, per-particle affine C matrix carried and updated in G2P. Gravity on the grid, plus grid-node solid-boundary treatment against the scene SDF solids (separating/no-penetration condition on grid velocities, mirroring `src/utils/sdf.rs` conventions with a "mirrors utils::sdf" WGSL comment) — boundary handling is scoped work here, not an afterthought. No pressure yet — this unit's water is a momentum-correct splashing dust.
+- **Execution note:** test-first — write the conservation and recurrence gates before the kernels.
+- **Patterns to follow:** `tests/common/mod.rs` `freefall_reference` (discrete recurrence, not textbook form); CPU twins for the weight kernel; set-invariant comparisons (reorder lesson).
+- **Test scenarios:** free-fall matches the solver's own discrete recurrence within a documented float budget; P2G→G2P round trip conserves total mass and linear momentum exactly (fixed-point) for random particle sets; angular-momentum improvement of APIC vs PIC demonstrated on a rotating blob (discrimination gap asserted); fixed-point overflow probe at the velocity cap; particles settle on the container floor without wall penetration (grid boundary-condition gate); no NaNs across 1000 steps of a dam-break-shaped fall.
+- **Verification:** conservation gates green; momentum budget documented in test comments.
+
+### U3. Incompressibility: coarse seed + local Jacobi on consistent operators
+
+- **Goal:** Water is visually incompressible at bounded, Poisson-free cost — and the operator-inconsistency failure mode is demonstrably absent.
+- **Requirements:** R1 (incompressibility half), R7, R8
+- **Dependencies:** U2
+- **Files:** create `src/solvers/twofield/pressure.wgsl`; modify `mod.rs`, `common.wgsl`; test `tests/twofield_pressure.rs`.
+- **Approach:** MAC-consistent divergence/gradient/Laplacian family on the fine grid; coarse grid (ratio an implementation choice, start 1/4³) with operators built as consistent restrictions (Galerkin or rediscretized-with-verification); coarse solve (few cheap sweeps on ≤ ~11k cells), prolongate as pressure seed, then a fixed budget of fine Jacobi sweeps and projection of the porosity-weighted divergence (φ_f = 1 everywhere in this unit). Solid-cell Neumann pressure conditions at walls are part of the MAC-consistent operator family — boundary stencils are inside the consistency requirement, not bolted on. Optional adaptive-Tait predictor behind an opt-in gate defaulting off. Sparse execution via over-dispatch + early-out on empty tiles.
+- **Execution note:** the divergence-floor gate is written first; it is the rung's reason to exist.
+- **Patterns to follow:** residual-adaptive Status-struct pattern from xpbd (GPU-side convergence state, no per-iteration readback); `docs/issues/002-pressure-solve-cost.md` observability recommendations.
+- **Test scenarios:** operator unit gates run BEFORE any fluid test (the production MMS/code-verification pattern, Salari-Knupp): discrete adjointness `u·(Gp) = −(Du)·p` to machine precision for random fields on the staggered layout, the same check for the coarse restriction/prolongation pair, a manufactured-solution order-of-accuracy sweep on D/G/L (observed log-log error slope matches the formal order), and — decisively — the same checks on the ASSEMBLED projection operator `A = −D·M⁻¹·G` exactly as used in the solve (mass/φ weighting, solid masks, boundary rows included), at both fine and coarse-with-transfer levels, on masked domains representative of real scenes (closed tank, sloped wall, V60 cone, partially filled bed) — a self-consistent D/G pair must not be able to pass while the seeded solve injects pressure through a different operator, and boundary-adjacent restriction/prolongation is exactly where multigrid-like schemes break, so box-only tests are insufficient; a two-grid convergence factor measured on known low- and high-frequency modes of those masked domains; then post-projection RMS divergence — measured with the projection's own divergence operator, interior cells only (surface cells are gated in U4) — drops by at least a stated factor (≥2×) per doubling of the fine-sweep budget until it falls below a pre-registered absolute tolerance, where the tolerance is derived from the visible-error budget (the xpbd density-band envelope) and the sweep count needed to reach it must fit the rung's pre-registered wall-clock ceiling (meeting tolerance only at non-real-time sweep counts fails L0 now, not L3 later); because the self-measured divergence gate is gameable, independent volume gates run alongside it: particle-density drift band, tank water-height drift, zero net flux through closed walls, free-surface fill-fraction conservation; a floor that plateaus above tolerance FAILS the gate (monotonic-but-plateauing was exactly main's A≠D·G signature); run on both a static tank and mid-splash dam break; A/B coarse-seed-on vs off shows the seed removes low-frequency residual (tank pressure profile approaches hydrostatic); with the adaptive-Tait predictor enabled, an A/B run must show a measurable fine-iteration-budget reduction at equal divergence tolerance — below threshold the predictor is removed rather than shipped dormant; density band on settled dam break matches the existing xpbd water-gate envelope; cost gate — dispatches/frame within the recorded U1 budget + a stated increment; long-run (≥2000 steps) settled tank stays settled (no pressure-driven creep or popcorn).
+- **Verification:** divergence-floor curve printed and asserted; hydrostatic profile within tolerance; budgets re-recorded.
+
+### U4. Free surface and pour cavity
+
+- **Goal:** A fast jet into a pool digs a visible, transiently sustained cavity — the L0 exit demonstration that this architecture fixes the PBF failure.
+- **Requirements:** R1 (cavity), R5
+- **Dependencies:** U3
+- **Files:** create `src/solvers/twofield/surface.wgsl`; modify `pressure.wgsl`, `mod.rs`; test `tests/twofield_cavity.rs`.
+- **Approach:** Free-surface cell classification (fill fraction from P2G mass) with surface Dirichlet handling in the pressure solve; constraint-bubble volume constraint for the enclosed pour pocket. The bubble constraint's representation is pinned, not hand-waved: one explicit Lagrange-multiplier scalar per pocket (its value IS the pocket pressure), coupled to the pocket-boundary pressure faces, and represented IDENTICALLY in the coarse solve and the fine cleanup — a coarse-only row that the fine Jacobi sweeps relax away is the named failure mode. Pour emission reuses `src/emission/`.
+- **Test scenarios:** jet at pour velocity into a settled pool produces a cavity whose depth exceeds a stated multiple of jet radius and persists ≥ a stated frame count — floors pre-committed BEFORE implementation begins (depth ≥ 1 jet radius; persistence ≥ the gravity re-leveling timescale at pour velocity; both against the documented xpbd baseline of ≈0), with empirical calibration allowed to tighten thresholds above the floors but never loosen below (a gate calibrated to its own output cannot fail, which would make the no-fallback bet's first stopping rule vacuous); cavity collapses and the surface re-levels after the jet stops (no permanent hole); surface particles don't gain energy (no popcorn) over a long run; volume conservation through cavity formation/collapse; the U3 assembled-operator, divergence-decay, and independent volume gates RE-RUN after the surface Dirichlet and bubble rows are inserted — the L0 exit operator is the one with surface handling in it, and U3's certification does not transfer to a materially different operator.
+- **Verification:** cavity metric test green; this is the L0 ladder gate — L1 work does not start until this passes.
+
+### Rung L1 — elastoplastic granular bed
+
+### U5. Solid phase: stress, Drucker-Prager return map, compaction cap
+
+- **Goal:** The bed is a real granular material on the solid velocity field: elastic stress, pressure-dependent yield, plastic compaction memory.
+- **Requirements:** R2, R6
+- **Dependencies:** U2 (transfers generalize to the solid field), U4 (all rung-L0 gates green before L1 begins); independent of U3/U4 internals.
+- **Files:** create `src/solvers/twofield/plasticity.wgsl`; modify `transfers.wgsl` (solid-field P2G with stress divergence), `mod.rs`, `common.wgsl`; test `tests/twofield_bed.rs`.
+- **Approach:** Per-solid-particle deformation gradient F (or elastic strain in log space), 3×3 SVD in WGSL (port a verified branch-free routine; CPU twin mandatory), Klar 3-branch return map (elastic / yield-surface projection / tensile apex), friction angle from `Materials`, cohesion from `src/models/cohesion.rs` as a function of local saturation (dry in this rung), volumetric cap surface whose consolidation pressure ratchets with plastic compaction → packing fraction state per particle. Grid-level over-packing guard (the TFM solids-pressure pattern): φ_s is hard-clipped at the packing limit and a solids-pressure term that diverges as φ_s → φ_max resists further compaction in the two-field update — the particle-level return map alone cannot guarantee this on the grid. The guard enters the solid momentum equation as part of the effective/contact stress per KTD-5's partition — it is NOT a separate volume constraint and never appears in the projection; the U7 stress-partition audit verifies it is counted exactly once. Cost bound: solid counts are ~10–15k grains against 100k+ water, so the SVD/return-map is bounded; demoting it from per-substep to per-frame is a permitted knob ONLY if the repose/collapse gates are shown insensitive to the choice.
+- **Execution note:** characterization-first for the SVD/return-map math — the CPU twin and its unit tests precede the WGSL port.
+- **Patterns to follow:** Klar et al. 2016 / warp-mpm `sand_return_mapping` (external reference, cited in Sources); existing xpbd bed gate structure in `tests/xpbd_bed.rs`.
+- **Test scenarios:** CPU-twin SVD matches a reference decomposition on random matrices including degenerate cases; return map satisfies yield-surface KKT conditions (stress inside surface after return, no spurious plastic flow in elastic regime); single-particle stress cycles show no energy gain; collapsed column forms a heap with repose angle ≥30° at coffee-like friction angle, and repose varies monotonically with friction angle (discrimination) while staying insensitive to grid resolution and wall friction within stated bands (confound control — the heap angle must track the material parameter, not numerics); heap at rest exhibits zero drift over 1200 frames (xpbd no-creep standard); repeated vertical press (tamp probe) increases packing fraction persistently across unload cycles — the plastic-memory gate that neither prior attempt had; a column pressed past the packing limit rejects further compaction (φ_s never exceeds φ_max anywhere — over-packing guard gate).
+- **Verification:** all L1 gates green; repose/collapse metrics recorded.
+
+### Rung L2 — percolation through a (first rigid, then swelling) bed
+
+### U6. Two-field Darcy drag and porosity-weighted incompressibility (rigid skeleton)
+
+- **Goal:** Relative two-phase flux through a static bed obeys Darcy's law with no artificial entry barrier — the formulation half of L2's percolation.
+- **Requirements:** R3 (flux scaling, entry), R5
+- **Dependencies:** U3, plus a thin slice of U2's solid-phase P2G (static seeded grains contributing mass to φ_s only — no stress, no return map). Deliberately NOT dependent on U5: the rigid-skeleton regime needs no plasticity, so the program's second-riskiest novelty (two-field drag + mixture projection) is gated immediately after rung L0, in parallel with U5, before the plasticity investment is sunk. Scope caveat: U6 validates the two-field formulation only in the frozen-bed limit — moving φ_s, compaction-driven pore pressure, and effective-stress feedback are gated in U7, and U6 passing does not certify them.
+- **Files:** create `src/solvers/twofield/coupling.wgsl`; modify `pressure.wgsl` (porosity-weighted divergence), `mod.rs`; test `tests/twofield_coupling.rs`.
+- **Approach:** φ_s per node from solid P2G mass; β(φ) via `src/models/permeability.rs` mirrored in WGSL ("mirrors models::" comment convention); Laibe–Price exponential drag pair update between the two node velocities (mass-weighted, momentum-conserving); the mixture constraint ∇·(φ_f·v_f + φ_s·v_s) = 0 (with v_s = 0 while the skeleton is frozen) replaces plain divergence in the projection, with the intrinsic-velocity correction Δv_k = −(Δt/ρ_k)·∇p exactly per KTD-4 — φ weights the continuity/operator mass terms, never the velocity correction itself. Column-outflow boundary at the container base for the drained-flux tests. The bed is kinematically frozen in this unit (rigid-skeleton regime) so drag and pressure formulation are isolated from plasticity.
+- **Execution note:** test-first; the Darcy-scaling and momentum gates precede the coupling kernels.
+- **Patterns to follow:** `tests/xpbd_coupling.rs` (Darcy drawdown scaling tests).
+- **Test scenarios:** drained flux through a static saturated column scales ∝ K(φ)·head and ∝ d² across a grind sweep (ordering + ratio bands); water entering the bed surface sees no pressure-jump barrier — entry flux matches the head-driven Darcy prediction within a stated band (the anti-divergence-penalty gate); drag pair update conserves combined momentum per node exactly; a settled saturated column stays settled long-run (drag does not pump energy); a submerged dense block in hydrostatic water exerts/receives the correct buoyant reaction — measured as the reaction impulse on the CONSTRAINED (frozen) solid equal to displaced-volume weight, since a frozen body has no dynamics to observe (dynamic buoyant motion is gated in U7); an undrained vertical load on a sealed saturated column transfers fully to pore pressure via the boundary reaction (the quantitative Skempton-B gate lives in U7 — a kinematically frozen skeleton has no volumetric strain path, so B is not meaningful here); the drag↔projection split is gated as a coupled system rather than assumed stable from the fold alone: under timestep refinement, slip-velocity decay matches the analytic exponential within a band with no oscillation growth and no energy increase (the partitioned-coupling gate at ρ_f/ρ_s ≈ 0.83); β-variation stress tests — high slip (nonlinear regime), dry→wet transition, φ near packing — show bounded error against a subcycled reference, where the reference subcycles drag AND projection together on a closed variable-φ two-phase column with outflow (the hard case is the full coupled loop, not drag decay in isolation); face-velocity consistency check — the velocities feeding D(φv) carry the same drag, pressure, solids-pressure, and boundary contributions as the momentum update (the multiphase Rhie-Chow corollary from KTD-2; a manufactured field where omitting any one term produces a detectable spurious φ_s oscillation); the U3 divergence-decay gate re-runs on a variable-φ saturated column against the mixture divergence (operator consistency in the φ<1 regime — the regime the novelty claim lives in); free-water region (φ_f = 1) behavior is byte-identical to U3 results (coupling terms vanish where there is no bed).
+- **Verification:** Darcy-scaling and entry-flux gates green; anti-pattern check — no Darcy term anywhere in the pressure RHS.
+
+### U9. Infiltration interface and conserved wetting: suction, bloom, absorption, swelling
+
+- **Goal:** Infiltration proceeds at physical rates with the two-regime entry behavior, and wetting is volume-conserving with mechanical swelling — completing the L2 rung.
+- **Requirements:** R3 (infiltration rates, ponding), R4, R5
+- **Dependencies:** U6
+- **Files:** modify `src/solvers/twofield/coupling.wgsl`, `transfers.wgsl`, `mod.rs`; test `tests/twofield_infiltration.rs`.
+- **Approach:** Wetting-front suction body force at unsaturated-front nodes (Green–Ampt magnitude from the calibration table, mapped to reduced units), gated by per-grain wetted state (hydrophobic→wetted transition with a time/contact threshold → the bloom delay); GIC-style moisture phase-change using `src/models/wetting.rs` demand curves (volume 1:1 into grain moisture; effective mass and diameter swell per the existing law); swelling and compaction feed the local φ/K fields from U6. Phase-selective boundary at the V60 filter surface: the solid field sees a wall, the water field sees open outflow per the filter SDF species mask — the pond-drain gate cannot pass without it. This is exactly Fluent's porous-jump membrane condition (Δp = (μ/α·v_n + C₂·½ρv_n²)·Δm applied to the water field's normal flux; wall for the solid field), so the filter's flow resistance is a calibrated Darcy+Forchheimer face coefficient, not ad hoc. If the wetting-front suction nonlinearity destabilizes the explicit update at the dry limit, the named remedy is L-scheme stabilization (add L·(s_new − s_old) with L ≥ half the retention curve's Lipschitz constant — unconditionally convergent exactly where Newton-style updates fail).
+- **Execution note:** test-first; the conservation gates precede the interface kernels.
+- **Patterns to follow:** `tests/xpbd_wetting.rs` (volume/momentum conservation incl. effective mass, dense-scene and saturated-tail variants).
+- **Test scenarios:** infiltration into a dry wettable bed starts on contact (no interpenetration delay) and early-time rate exceeds the bare-Darcy rate when suction is enabled (Green–Ampt regime A/B); with the bloom gate enabled, a dry bed shows a seconds-scale entry delay then accelerates (two-regime discrimination); pour at demand > capacity ponds, pond depth stabilizes, and after pour stop the pond drains within the calibrated band (medium-grind scenario mapped to reduced units); total volume (free + absorbed + pore) conserved exactly over the run including a ≥2000-step saturated tail; absorption conserves momentum under the effective-mass convention; a manufactured source-term test pins the s_net plumbing — prescribed local s_f/s_s in a closed saturated bed must produce the compensating pore-water flux and pressure response through the projection RHS with no density drift (total-volume conservation alone cannot catch a projection that ignores the sources); grains swell to the calibrated magnitude and the local K drops accordingly (monotonic gate); water drains through the filter boundary while grains are retained (phase-selective boundary gate).
+- **Verification:** the ponding/drain band test is the L2 ladder gate; conservation gates green.
+
+### Rung L3 — full coupling and scale
+
+### U7. Deformable saturated bed: craters, swelling lift, effective stress
+
+- **Goal:** The headline behavior: a center pour craters the bed, the bed swells and resists realistically, crater walls stand and slump per the DP model.
+- **Requirements:** R1 (bed crater), R2, R3, R4, R5
+- **Dependencies:** U4, U5, U9
+- **Files:** modify `coupling.wgsl`, `plasticity.wgsl`, `mod.rs`; test `tests/twofield_full.rs`; scene additions in `src/engine/scene.rs` only if the existing `v60_pour`/`pour_over` builders need parameters.
+- **Approach:** Release the solid field under saturated conditions: pore pressure feeds effective stress (Bishop saturation weighting) into the return map; wet cohesion from the existing curve; impact momentum arrives through the shared-grid drag/contact path (no pairwise impulse bolt-ons — the named failed approach). Crater metric = center surface depression vs rim, against the swelling baseline.
+- **Test scenarios:** center pour produces a crater whose depth exceeds the swelling lift (signed metric > 0, vs the documented main/xpbd baselines of ≈0); crater walls slump when the jet stops (tensile-apex behavior, no frozen spikes); saturated bed under sustained pour does not fluidize at calibrated drag (skeleton holds, per the xpbd gate); the Terzaghi 1D consolidation benchmark gates the pore-pressure/effective-stress coupling — sudden load on a saturated column, pore-pressure dissipation U(T) matches the analytic series solution within a stated band, run at TWO drainage lengths so the T = c_v·t/H² collapse verifies the scaling rather than one tuned curve, with the load-sharing check that effective stress + pore pressure sum to the applied total load throughout, and the quantitative Skempton-B gate (undrained pore-pressure response ratio ≈ 1 for incompressible constituents) measured here on the DEFORMABLE skeleton — U6's frozen skeleton has no volumetric strain path, so this is the first unit where B is meaningful (the standard geotech u-p validation; note the Vermeer-Verruijt caveat that too-small drainage steps produce spurious pore-pressure oscillation); stress-partition audit — in a static saturated column, total vertical stress equals effective stress + pore pressure within tolerance (no volumetric mode resisted twice across contact, cap, solids-pressure guard, and projection pressure, per KTD-5); per-frame impulse ledger — pressure, drag, gravity, and boundary/filter reaction impulses account for each phase's momentum change separately, with open-boundary (filter outflow) fluxes tracked explicitly; combined long-run conservation (volume incl. swelling, momentum) on the full V60 pour scene; the L2 ponding/drain bands re-run on the deformable bed (swelling and plastic compaction shift the K field the bands were gated under); a reduced divergence-decay check re-runs with the deformable bed; determinism — two seeded runs produce identical metrics.
+- **Verification:** crater gate green on the V60 pour scene; this is the L3 physics gate.
+
+### U8. Performance ramp, metrics, and program close-out
+
+- **Goal:** Demonstrate the perf thesis (no Poisson → headroom) and finish the seam: scaling to 200k, budgets vs xpbd, metrics surface, docs.
+- **Requirements:** R7, R8, R9, R10
+- **Dependencies:** U7
+- **Files:** modify `src/solvers/twofield/mod.rs` (Metrics population, diagnostics surface `read_*`/`sample_diagnostics`), `docs/PERF_NOTES.md`, `docs/ARCHITECTURE.md` (solver section); create `examples/twofield_scaling.rs` (mirror `examples/scaling_probe.rs`); test `tests/twofield_perf.rs` (budget + no-sync smoke — keeps `tests/twofield_scaffold.rs` owned by U1).
+- **Approach:** Scaling probe across 5k→200k on water-only and full scenes; per-pass timestamp breakdown via `profile()`; compare against the xpbd baseline (profiler-as-referee, recorded in PERF_NOTES); populate `Metrics` (drawdown time, evenness placeholders where extraction is deferred); ensure the test readback surface matches the xpbd precedent so future suites can port.
+- **Test scenarios:** µs/Kparticle flat within a stated factor from 40k→200k (linearity gate; the maximum acceptable degradation factor is pre-registered before the 200k run, not derived from it); dispatches/frame within the final recorded budget; full V60 scene at 200k runs ≤33 ms/frame median on the reference device (the R9 real-time gate), with the gate scene's composition pre-registered before the run — particle mix (~185–190k water + 10–15k solids per KTD-5's cost bound), grid resolution, substep count, and scene duration are fixed in the test, so the gate cannot be passed with a conveniently cheap mix; an offline grid-refinement sweep (3 resolutions, 2:1 ratio) with Richardson extrapolation/GCI on one fixed scenario — for this offline study the fine-sweep budget SCALES with grid resolution so iterative error stays subdominant to truncation error (a fixed absolute sweep count would fail the asymptotic-range check for reasons unrelated to spatial discretization; the fixed real-time budget is gated separately by U3's tolerance); extrapolated values become stored regression bands; `metrics()`/`particles()`/`profile()` complete without GPU sync (timing-based smoke); web build compiles (`wasm32` target check).
+- **Verification:** PERF_NOTES updated with the comparison table; all suites green; `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` clean.
+
+---
+
+## Scope Boundaries
+
+**In scope:** everything above — the three interactions, conservation gates, calibration bands, 200k scaling demonstration, registry integration, native-example exposure.
+
+**Deferred to follow-up work:**
+- Extraction/thermal chemistry port onto the new solver (the `src/models/` laws and conservation patterns are designed to receive it).
+- Fines migration/channeling port (transient permeability hooks exist via KTD-8's evolving K field).
+- Web frontend generalization (`src/web.rs` currently hard-codes the XPBD solver; exposing the new solver in the browser UI is its own small plan after L3).
+- Multi-pocket constraint-bubble generalization (R0 ships the single-pocket pour case).
+- Patch of main's divergence-penalty Darcy (explicitly declined — main is superseded by this program).
+- Espresso high-pressure regime; neural correctors; CK-MPM compact-kernel and other perf levers beyond the linearity gate (listed in PERF_NOTES as backlog).
+
+**Outside this project's identity:** replacing or deleting the XPBD solver or main branch (both remain as baselines and referees); LBM or height-field reformulations.
+
+---
+
+## Risks & Dependencies
+
+- **Coarse-seed convergence is the novel bet (highest risk).** The PB-MPM 3D-convergence fix this implements has no published reference implementation. Mitigation: it is the *first* gated unit after transfers (U3), the gate is quantitative (divergence-floor curve), and by explicit decision a gate failure halts for redesign rather than silently shipping a compressible-looking fluid. Watch specifically for coarse/fine operator inconsistency reproducing the A≠D·G floor — the gate is designed to catch exactly this.
+- **Added-mass instability at ρ_f/ρ_s ≈ 0.83.** Explicit drag coupling diverges at near-unity density ratios; the Laibe–Price exponential fold is the mitigation (exact for linear drag at any stiffness). If the drag↔projection Lie split still shows coupling artifacts, the escalation ladder is named and bounded: Strang splitting (drag/2 → project → drag/2, O(dt²) splitting error at ~2× cost), then 2–5 Aitken-relaxed sub-iterations of the pair (the partitioned-FSI standard), then the virtual-mass term from KTD-3 — all short of redesign. Residual risk: nonlinear (Forchheimer) corrections at high flux, deferred unless gates demand them.
+- **Storage-buffer ceiling.** Two grid velocity fields + mass + pressure + divergence + φ + flags is buffer-hungry; the device currently grants 9/stage. Mitigation in U1: vec4 packing first, raise the request second, verify web. If a pass genuinely cannot fit, split it (dispatch budget absorbs it — that's what the budget gate is for).
+- **SVD-per-particle cost in WGSL.** One 3×3 SVD per solid particle per substep is the R1 cost center. Solid counts are small (~12k grains vs 100k+ water), so this is bounded; the scaling probe separates phase costs to verify.
+- **Fixed-point P2G contention/overflow.** Known-hot in dense regions (`docs/issues/004-reduce-p2g-atomic-contention.md`); FP_SCALE headroom is re-validated in U2 and coupled to the velocity cap. Workgroup-local accumulation is the named lever if contention shows up in the per-pass timings.
+- **Calibration-unit mapping.** The physical bands (K, ψ_f, drain times) must be mapped into reduced units (KEEP.md §2) before gates freeze; KEEP warns the length scale is baked into permeability timescales. The mapping is an explicit early task inside U6, not an afterthought.
+- **Dependency:** no new crates anticipated; everything builds on wgpu 29 / existing utils. Any SVD reference implementation is ported, not added as a dependency.
+
+---
+
+## Deferred to Implementation
+
+- Coarse-grid ratio (1/4³ vs 1/8³) and the coarse-solve sweep count — chosen from the U3 divergence-floor measurements.
+- Whether the adaptive-Tait predictor stays (it ships behind an opt-in gate defaulting off; keep only if U3/U4 show it reduces iteration budget).
+- Exact cavity-gate thresholds (depth multiple, persistence frames) — calibrated empirically ABOVE the pre-committed U4 floors, which are fixed before implementation; empirics may only tighten, never loosen.
+- FP_SCALE value after the U2 overflow probe.
+- Whether solid-phase transfers share `transfers.wgsl` or split into a fourth WGSL file — implementer's call per file size.
+- Reduced-unit values for ψ_f, bloom delay, and drain bands — derived in U6 from the calibration table.
+- Config surface naming (flat fields on `Config` vs a solver-scoped sub-struct) — follow whatever keeps existing scenes byte-unchanged.
+
+---
+
+## Sources & Research
+
+**Repo evidence (why this architecture):** the failed-attempts review in this program's history — main's pressure-solve graveyard (sparse RBGS shipped at 1.93×, PR #18; Jacobi-CG branches `warmstart-ref`/`codex/mpm-sparse-pressure` unshipped; indirect dispatch reverted, commit `48470c3`; operator inconsistency finding in `docs/plans/2026-06-07-001-feat-adaptive-rbgs-iterations-plan.md` on main), the XPBD impact failure (`docs/plans/2026-06-08-001-feat-water-grain-impact-coupling-plan.md`, revert `4dca52f`), and the v1 lessons (`KEEP.md`, `docs/issues/002/003/004/010`).
+
+**External methods (load-bearing):**
+- Klar et al. 2016, Drucker-Prager elastoplasticity for sand animation (the return map; reference port: warp-mpm `sand_return_mapping`).
+- Jiang et al., APIC transfers (momentum/angular-momentum carrier).
+- PB-MPM, EA SEED SIGGRAPH 2024 (position-based constraint MPM; its open 3D-convergence gap is what KTD-2's coarse seed fixes) — github.com/electronicarts/pbmpm.
+- Goldade & Batty 2017, Constraint Bubbles (arXiv 1711.11470) — cavity volume constraints.
+- Laibe & Price 2012 (+ 2025 GPU EXP-solver follow-up, arXiv 2509.25347) — analytic exponential drag, exact at any stiffness.
+- Gao et al. 2018 (locally-averaged Navier-Stokes drag/porosity form); Liu et al. 2024 (arXiv 2402.11719) one-domain Darcy-Brinkman MPM — the correct interface formulation (drag as body force, ∇·(φv)=0).
+- Granule-In-Cell, SIGGRAPH Asia 2025 (arXiv 2504.00745) — moisture phase-change absorption lifecycle and capillary cohesion curve.
+- Green-Ampt / Richards infiltration (wetting-front suction; Rawls 1983 parameter tables); Stokes–Darcy interface conditions (Layton et al. 2002) — why divergence-penalty coupling blocks entry flux.
+- Coffee calibration: Corrochano et al. 2015 (measured K 10⁻¹³–10⁻¹⁴ m²); Moroney et al. 2015/2016 (drip extraction timescales); Hargarten 2020 (swelling +15–17% dia, ≤30 s); microCT bed heterogeneity (Sci Rep 2023); Cameron et al. 2020 (fines/clogging regime); roasted-coffee hydrophobicity (contact angle 103–111°).
+- Adaptive Tait speed-of-sound (arXiv 2310.04139) and matsuoka-601 Splash (production WebGPU MLS-MPM) — the validated cheap-incompressibility pattern backing KTD-2's optional predictor.
+
+**Production-solver numerics (COMSOL/ANSYS/MFiX/OpenFOAM pass, 2026-06-09):**
+- ANSYS Fluent PC-SIMPLE / Partial Elimination Algorithm (Theory Guide §23.4.3; Spalding's IPSA lineage) — implicit interphase drag via per-node elimination; validates KTD-3's exponential fold structure. MFiX-Exa reports drag iterations dropping 50+ → 3–5.
+- Fluent KTGF granular closures (Theory Guide §16.5): solids pressure with radial-distribution divergence at φ_max, Schaeffer/Johnson-Jackson frictional stress — the over-packing guard in U5.
+- Drag blending: Gidaspow (Ergun ↔ Wen-Yu switch at φ_s ≈ 0.2), Huilin-Gidaspow smooth transition (OpenFOAM `GidaspowErgunWenYu` source) — KTD-3.
+- Fluent porous-jump membrane BC (UG §7.3.20) — the U9 filter-boundary formula.
+- Consistent multiphase Rhie-Chow (Cubero & Fueyo 2007; Ferreira et al. 2021; arXiv 2405.20629) — drag/solids-pressure terms must enter the face-velocity interpolation consistently with the momentum update; KTD-2 corollary.
+- Virtual-mass stabilization C_vm ≈ 0.5 and two-fluid hyperbolicity (Lhuillier 2013; Drui 2019) — the named added-mass lever in KTD-3/Risks.
+- Lombart et al. 2025 (A&A, GPU exponential multi-fluid drag solver) — confirms the Laibe-Price fold at production GPU scale.
+- Code verification: Salari & Knupp MMS (SAND2000-1444); Roache Richardson extrapolation / GCI (ASME V&V 20 practice) — the U3 operator gates and U8 refinement sweep.
+- Terzaghi u-p consolidation benchmark (Abaqus Benchmarks 1.14.1; Vermeer-Verruijt minimum-Δt criterion) — the U7 pore-pressure gate.
+- L-scheme for Richards-type wetting-front nonlinearity (Pop et al.; arXiv 1507.07837 L-scheme/Newton hybrid) — the U9 dry-limit remedy.
+- Partitioned-coupling stability: Causin/Gerbeau added-mass analysis; Küttler & Wall Aitken Δ² relaxation; IQN-ILS (preCICE) — the Risks escalation ladder.

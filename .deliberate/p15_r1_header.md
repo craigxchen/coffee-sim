@@ -1,0 +1,18 @@
+You are rigorously reviewing an implementation plan for **Phase 1.5 — extraction + thermal** of a Rust + wgpu 29 + WGSL real-time pour-over coffee simulator (`coffee-sim`). It adds two-pool dissolution kinetics, solute transport, and temperature-dependent extraction to an existing two-species XPBD GPU solver.
+
+Respond with a verdict on the FIRST LINE: **APPROVE**, **REVISE**, or **REJECT**. Then explain rigorously and specifically, citing the plan's section/unit IDs (KTD-n, U-n, R-n).
+
+Project-specific facts (verified against the codebase):
+- Two-species XPBD GPU solver: phase 0=water, 1=grain. Counting-sort neighbor grid (count→scan→scatter); particle storage stays in original particle order (the grid produces `sorted_indices` for gathers — it does NOT reorder pos/vel/chem arrays).
+- HARD constraints: max 8 storage buffers PER SHADER STAGE (device pinned to wgpu defaults; raising it forbidden); NO portable WGSL float atomics; `Params` uniform byte-identical Rust(`#[repr(C)]`)↔WGSL, compile-asserted, currently FULL at exactly 256 bytes.
+- Phase 1.4 wetting shipped an atomic-free, two-sided, water-normalized, conservation-EXACT grain↔water transfer (`wet_count` precounts eligible opposite-species neighbors; `wet_water`/`wet_grain` recompute the identical per-pair `take=min(source/N_src, demand/N_sink)` off a FROZEN snapshot and each write only their own slot). This plan reuses that pattern for dissolution.
+- Moisture rides `pos.w` (grain=V_abs, water=f_w); every pos/pred writer preserves `.w`. The new solute `c`/temperature `T` ride a NEW dedicated vec4 storage buffer (binding 20), NOT pos.w.
+- The drag relative velocity (the flux signal `g(|u_rel|)`) is computed inline per-pair in the drag kernels and is NOT stored per-particle anywhere.
+- `Metrics.extraction_yield`/`tds` exist but are always 0 (no code computes them). `ParticleBuffers` reserves `concentration`/`temperature` slots. No GPU scalar-reduction infra exists except a single-workgroup max-reduce.
+- Salvaged constants (KEEP.md §1, re-validate): extractable yield 0.28, fast pool 0.18/s, slow 0.018/s, fast-fraction 0.30, c_sat 0.08. Gate band (§5): yield 18–22%, TDS 1.2–1.4%.
+- The user is a physics reviewer who rejects hand-waving and silent conservation leaks; volume/momentum/solute/energy conservation are HARD gated constraints.
+
+Be especially critical of: (1) the **passive-tracer** stance (KTD-1) — is it physically defensible to dissolve solute from grains into water without changing any mass/momentum? Does solute conservation actually hold if grain mass is unchanged? (2) the **conservation cap** (KTD-2): is `take = min(grain_release/N_w, max(c_sat−c,0)·V_w/N_g)` truly conservation-exact AND non-over-subscribing across many-to-many grain/water overlaps, with N=0 guards? Does it double-count when a grain has multiple waters? (3) the **Lagrangian-advection-is-free** claim (KTD-4) — given the counting-sort grid doesn't reorder particle arrays, is it correct that `c`/`T` in a dedicated buffer need no preservation/advection pass? (4) **thermal energy conservation** (KTD-2/U2/U6): the plan's pairwise `ΔT = clamp(h·dt,0,1)·(T_other−T)` — is symmetric ΔT actually energy-conserving when water and grain have DIFFERENT heat capacities? (5) the **flux recompute** (KTD-3) — does recomputing |u_rel| in the dissolution neighbor loop faithfully reproduce the drag signal, and is it stable? (6) **yield/TDS** semantics (R6/R8): is "total solute = pools + dissolved + drained" right when water is never removed (drained water just pools in the cup, still carrying c)? (7) the 8-buffer budget for the new passes; (8) any missing failure mode, test gap, or unstated assumption.
+
+## Plan to Review
+

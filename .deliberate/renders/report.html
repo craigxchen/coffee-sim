@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Solver water-dynamics comparison — main · xpbd · twofield</title>
+<style>
+  :root { color-scheme: dark; }
+  body { background:#0a0a0c; color:#e8e8ea; font:14px/1.5 -apple-system,Segoe UI,Roboto,sans-serif; margin:0; padding:32px 40px 80px; }
+  h1 { font-size:24px; margin:0 0 4px; }
+  h2 { font-size:19px; margin:48px 0 4px; border-top:1px solid #26262c; padding-top:24px; }
+  .sub { color:#9a9aa2; font-size:13px; margin:0 0 18px; }
+  .lede { max-width:980px; color:#c7c7cf; }
+  .lede b { color:#fff; }
+  code { background:#18181d; padding:1px 5px; border-radius:4px; font-size:12px; color:#d6d6de; }
+  .legend { display:flex; gap:24px; flex-wrap:wrap; margin:16px 0 8px; }
+  .legend div { max-width:300px; font-size:13px; }
+  .legend b { color:#fff; }
+  table { border-collapse:collapse; margin:14px 0 8px; width:100%; }
+  th,td { border:1px solid #222228; padding:6px; text-align:center; vertical-align:top; }
+  th { color:#aeaeb6; font-weight:600; font-size:12px; background:#141418; }
+  td.solver { writing-mode:initial; font-weight:700; color:#fff; width:120px; background:#141418; }
+  td.solver small { display:block; font-weight:400; color:#9a9aa2; font-size:11px; margin-top:3px; }
+  img { width:100%; max-width:320px; height:auto; background:#000; border-radius:4px; display:block; }
+  .obs { max-width:980px; color:#cfcfd7; font-size:13px; background:#121216; border-left:3px solid #3a6df0; padding:8px 12px; margin:8px 0 0; }
+  .miss { color:#666; font-size:11px; padding:40px 0; }
+</style>
+</head>
+<body>
+<h1>Water-dynamics comparison: <span style="color:#7aa2ff">main</span> · <span style="color:#7ad17a">xpbd</span> · <span style="color:#f0b35a">twofield</span></h1>
+<p class="sub">Captured 2026-06-18 · WebGPU canvas via agent-browser · scenes approximately (not pixel-) matched across the two codebases.</p>
+
+<p class="lede">All three water-look failures are <b>one dissipation knob</b> — how much a particle's velocity is pulled toward the local average (PIC / XSPH) vs kept as its own momentum (FLIP / ballistic). On a grid the grid velocity <i>is</i> the local average, so the PIC fraction and XSPH viscosity are the same knob. Each solver keys it differently:</p>
+<div class="legend">
+  <div><b style="color:#7aa2ff">main</b> (old MPM) — low dissipation (ballistic preserve up to 0.95–0.98) keyed on <code>support_ratio</code>. Splashy, but slow sparse drips get near-max preserve <i>in the cup</i> → FLIP energy the projection amplifies → <b>cup stir / blow-up</b>.</div>
+  <div><b style="color:#7ad17a">xpbd</b> (PBF) — tuned <i>local</i> dissipation (XSPH viscosity, lower at the surface) + position-based constraint (no projection feedback). Splashy <b>and</b> stable. The reference.</div>
+  <div><b style="color:#f0b35a">twofield</b> (current) — <i>max</i> dissipation (G2P velocity is pure grid-gather; <code>pic_blend</code> only damps the affine C). Stable but <b>slime / no splash</b>.</div>
+</div>
+
+<p class="obs" style="border-left-color:#d08a3a;background:#1a1510">
+<b>⚠ Cross-codebase caveat.</b> <b style="color:#7aa2ff">main</b> is hardwired to the V60 cone/cup rig — <i>every</i> main frame shows that geometry, never a plain box. So on scenes <b>1 (box slosh)</b> and <b>4 (sand wall)</b> the main row is only a loose <i>water-character</i> reference (geometry differs: main's "slosh" is water in the V60 cup; its "sand wall" is water-over-bed in the cone, and effectively static). main's <b>cup blow-up</b> (which you observed live) did <b>not</b> reproduce in the benchmark center-pour here — water is held in the cone over the grounds rather than accumulating in the cup; capturing it needs a cup-prefill scene main doesn't ship. The fully apples-to-apples comparison is <b>xpbd vs twofield</b> (same harness, all four scenes). main's value here: its free stream + cup pool read as coherent/lively (the "good water" character) even on the rig.</p>
+
+<!-- SCENE TEMPLATE repeated; img paths: rewrite/<Scene>__<solver>__t<N>.png , main/<col>__main__t<N>.png -->
+
+<h2>1 · Water in a box (slosh)</h2>
+<p class="sub">Plain box, a water block released to slosh and settle. Tests free-surface liveliness + stability.</p>
+<table>
+  <tr><th></th><th>early</th><th>mid</th><th>settled</th></tr>
+  <tr><td class="solver">main<small>old MPM</small></td><td><img src="main/box_slosh__main__t0.png"></td><td><img src="main/box_slosh__main__t1.png"></td><td><img src="main/box_slosh__main__t2.png"></td></tr>
+  <tr><td class="solver">xpbd<small>PBF ref</small></td><td><img src="rewrite/BoxSlosh__xpbd__t0.png"></td><td><img src="rewrite/BoxSlosh__xpbd__t1.png"></td><td><img src="rewrite/BoxSlosh__xpbd__t2.png"></td></tr>
+  <tr><td class="solver">twofield<small>current</small></td><td><img src="rewrite/BoxSlosh__twofield__t0.png"></td><td><img src="rewrite/BoxSlosh__twofield__t1.png"></td><td><img src="rewrite/BoxSlosh__twofield__t2.png"></td></tr>
+</table>
+
+<h2>2 · Water-only emission</h2>
+<p class="sub">A free / falling stream and its impact (no grounds). Tests splash on impact + free-water liveliness.</p>
+<table>
+  <tr><th></th><th>early</th><th>mid</th><th>settled</th></tr>
+  <tr><td class="solver">main<small>old MPM</small></td><td><img src="main/water_only__main__t0.png"></td><td><img src="main/water_only__main__t1.png"></td><td><img src="main/water_only__main__t2.png"></td></tr>
+  <tr><td class="solver">xpbd<small>PBF ref</small></td><td><img src="rewrite/WaterOnly__xpbd__t0.png"></td><td><img src="rewrite/WaterOnly__xpbd__t1.png"></td><td><img src="rewrite/WaterOnly__xpbd__t2.png"></td></tr>
+  <tr><td class="solver">twofield<small>current</small></td><td><img src="rewrite/WaterOnly__twofield__t0.png"></td><td><img src="rewrite/WaterOnly__twofield__t1.png"></td><td><img src="rewrite/WaterOnly__twofield__t2.png"></td></tr>
+</table>
+
+<h2>3 · Cup + slow drip onto an existing pool <span style="color:#f0b35a;font-size:13px">(the key scene)</span></h2>
+<p class="sub">A cup pool fed by slow drips. main → cup stir/blow-up; twofield → diffuse/slime; xpbd → calm + tightly packed.</p>
+<table>
+  <tr><th></th><th>early</th><th>mid</th><th>late</th></tr>
+  <tr><td class="solver">main<small>old MPM</small></td><td><img src="main/cup_drip_on_pool__main__t0.png"></td><td><img src="main/cup_drip_on_pool__main__t1.png"></td><td><img src="main/cup_drip_on_pool__main__t2.png"></td></tr>
+  <tr><td class="solver">xpbd<small>PBF ref</small></td><td><img src="rewrite/CupDripOnPool__xpbd__t0.png"></td><td><img src="rewrite/CupDripOnPool__xpbd__t1.png"></td><td><img src="rewrite/CupDripOnPool__xpbd__t2.png"></td></tr>
+  <tr><td class="solver">twofield<small>current</small></td><td><img src="rewrite/CupDripOnPool__twofield__t0.png"></td><td><img src="rewrite/CupDripOnPool__twofield__t1.png"></td><td><img src="rewrite/CupDripOnPool__twofield__t2.png"></td></tr>
+</table>
+
+<h2>4 · Water / solid (sand wall + water)</h2>
+<p class="sub">A grain ("sand") wall with water released against it. Tests water↔solid coupling.</p>
+<table>
+  <tr><th></th><th>early</th><th>mid</th><th>settled</th></tr>
+  <tr><td class="solver">main<small>old MPM</small></td><td><img src="main/sand_wall_box__main__t0.png"></td><td><img src="main/sand_wall_box__main__t1.png"></td><td><img src="main/sand_wall_box__main__t2.png"></td></tr>
+  <tr><td class="solver">xpbd<small>PBF ref</small></td><td><img src="rewrite/SandWallBox__xpbd__t0.png"></td><td><img src="rewrite/SandWallBox__xpbd__t1.png"></td><td><img src="rewrite/SandWallBox__xpbd__t2.png"></td></tr>
+  <tr><td class="solver">twofield<small>current</small></td><td><img src="rewrite/SandWallBox__twofield__t0.png"></td><td><img src="rewrite/SandWallBox__twofield__t1.png"></td><td><img src="rewrite/SandWallBox__twofield__t2.png"></td></tr>
+</table>
+
+</body>
+</html>

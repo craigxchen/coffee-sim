@@ -1,0 +1,331 @@
+You are reviewing the IMPLEMENTATION of Unit 4 (final) of an approved plan (Rust + wgpu coffee sim),
+diff below. Unit 4 = "V60 pour scene + driver + gates": Scene::v60_pour() (bed seeded, no water
+column, declares pour_water_ml so the pool sizes for the dose + water passes run), a headless driver
+example that samples a PourScript -> EmissionInput (maps normalized (x,z) to a world kettle position
+by bed radius, mL/s -> sim-volume/s via /5.20), and integration gates. Verdict on FIRST LINE:
+APPROVE, REVISE, or REJECT, then explain. Maintainer is a physics reviewer.
+
+Context (reviewed decisions, do not relitigate): absolute yield/TDS calibration is DEFERRED, so the
+gates test the MECHANISM (yield rises, pours through to the cup, conserves, capacity honored,
+deterministic emission), not an absolute band. Yield from the GPU mixed solve is chaotic/not bit-exact
+(grid-scatter atomic order), so the determinism gate uses a loose band on yield but exact on the
+CPU-side emitted count.
+
+Check:
+1. Scene::v60_pour() correctness (bed-only regions, pour_water_ml>0 => declares_pour, geometry reused
+   from v60).
+2. The driver mapping: recipe (x,z in [-1,1]) -> kettle world pos via bed radius; mL/s -> sim-vol/s
+   via /5.20 (the KEEP §27 constant, hardcoded in the example). Correct + sane?
+3. The integration gate test: does it actually prove pour-through (cup water via TDS>0), rising yield,
+   water-VOLUME conservation under a source (emitted = in-domain water + absorbed-into-grains), and
+   capacity-honored? Any false-pass (e.g. TDS>0 trivially, or conservation tolerance too loose at 2%)?
+4. The determinism gate: is asserting exact emitted count + loose yield band justified, or does it
+   mask a real bug?
+5. Any issue with using the volume balance (emitted/rho_w == Σwater f_w·V_w + Σgrain V_abs) as the
+   conservation check given the wetting absorption sink is on SOLUTE not water volume?
+6. Anything that breaks existing scenes or the non-pour path.
+
+The diff follows.
+========================================================================
+diff --git a/examples/pour.rs b/examples/pour.rs
+new file mode 100644
+index 0000000..c742aab
+--- /dev/null
++++ b/examples/pour.rs
+@@ -0,0 +1,133 @@
++//! V60 continuous-pour brew (headless): water is injected over the brew from a pour recipe, threads
++//! the grain bed, drains through the cone apex, and pools in the cup — the pour-through path the
++//! fixed-column `brew` example cannot model. Prints yield / TDS / mean temperature, the emitted vs
++//! in-domain+absorbed water balance (conservation under a source), and pool occupancy.
++//!
++//! Run: `cargo run --release --example pour`  (env: `STEPS=`, `FLOW=` mL/s, `EXTRACT=`, `ABSORB=`).
++
++use coffee_sim::emission::pour::{PourCommand, PourPattern, PourScript};
++use coffee_sim::emission::{EmissionInput, PourEvent};
++use coffee_sim::engine::Scene;
++use coffee_sim::models::Materials;
++use coffee_sim::solvers::base::Solver;
++use coffee_sim::solvers::xpbd::XpbdSolver;
++use coffee_sim::utils::config::Config;
++use coffee_sim::utils::gpu::GpuContext;
++
++/// mL per sim-unit³ (KEEP.md §27) — converts a recipe's mL/s into the solver's volumetric flow_rate.
++const ML_PER_SIM_UNIT3: f32 = 5.20;
++
++fn env_f32(key: &str, default: f32) -> f32 {
++    std::env::var(key)
++        .ok()
++        .and_then(|v| v.parse().ok())
++        .unwrap_or(default)
++}
++
++/// Map a recipe sample at time `t` to the solver's per-frame pour input. Normalized `(x,z)` ∈ [-1,1]
++/// scales by the bed radius; flow mL/s converts to sim-volume/s.
++fn pour_input(script: &PourScript, t: f32, bed_radius: f32, kettle_y: f32) -> EmissionInput {
++    let (nx, nz, flow_ml) = script.sample(t);
++    EmissionInput {
++        kettle_pos: [nx * bed_radius, kettle_y, nz * bed_radius],
++        flow_rate: flow_ml / ML_PER_SIM_UNIT3,
++        pour_angle: 0.0,
++        event: PourEvent::None,
++    }
++}
++
++fn main() {
++    let Some(gpu) = GpuContext::new_headless() else {
++        eprintln!("pour: no GPU adapter; cannot run.");
++        return;
++    };
++    let mats = Materials {
++        particle_spacing: 0.5,
++        support_radius: 1.0,
++        grain_diameter: 1.0,
++        water_grain_distance: 0.35,
++        grain_mass: 10.0,
++        ..Materials::default()
++    };
++    let cfg = Config {
++        absorb_rate: env_f32("ABSORB", 0.5),
++        extract_rate: env_f32("EXTRACT", 1.0),
++        ..Config::default()
++    };
++    let steps: u32 = std::env::var("STEPS")
++        .ok()
++        .and_then(|v| v.parse().ok())
++        .unwrap_or(900);
++    let flow = env_f32("FLOW", 8.0);
++
++    // A short pour recipe: bloom at center, then a spiral main pour, then drawdown.
++    let script = PourScript {
++        commands: vec![
++            PourCommand {
++                t_start: 0.0,
++                t_end: 2.0,
++                flow_rate: flow,
++                pattern: PourPattern::Center,
++            },
++            PourCommand {
++                t_start: 3.0,
++                t_end: 10.0,
++                flow_rate: flow,
++                pattern: PourPattern::Spiral {
++                    freq_hz: 0.6,
++                    r_min: 0.1,
++                    r_max: 0.7,
++                },
++            },
++        ],
++    };
++
++    let scene = Scene::v60_pour();
++    let mut solver = XpbdSolver::build(&scene, &mats, &cfg, &gpu);
++    let v_w = solver.water_particle_volume();
++    let rho_w = mats.particle_mass / v_w;
++
++    println!(
++        "V60 pour brew: pool capacity {} | absorb={} extract={} flow={flow} mL/s",
++        solver.pool_capacity(),
++        cfg.absorb_rate,
++        cfg.extract_rate
++    );
++    println!("  step   t(s)  active  yield%   TDS%   meanT  | emitted  inDomain+absorbed  balErr%");
++
++    let dt = 1.0 / 60.0;
++    let sample_every = (steps / 15).max(1);
++    for step in 1..=steps {
++        let t = step as f32 * dt;
++        solver.step(dt, &pour_input(&script, t, 2.0, 2.5));
++        if step % sample_every == 0 || step == steps {
++            solver.sample_diagnostics();
++            let m = solver.metrics();
++            let phase = solver.read_phases();
++            let moisture = solver.read_moisture();
++            let temp = solver.read_temperature();
++            // Water-volume balance: emitted = in-domain water + absorbed-into-grains (conservation).
++            let emitted_vol = solver.total_emitted_water_mass() / rho_w;
++            let mut water_vol = 0.0f32;
++            let mut absorbed_vol = 0.0f32;
++            for (&ph, &mw) in phase.iter().zip(&moisture) {
++                if ph == 0 {
++                    water_vol += mw * v_w; // f_w · V_w
++                } else {
++                    absorbed_vol += mw; // V_abs
++                }
++            }
++            let in_domain = water_vol + absorbed_vol;
++            let bal_err = 100.0 * (in_domain - emitted_vol) / emitted_vol.max(1.0e-9);
++            let mean_t = temp.iter().sum::<f32>() / temp.len().max(1) as f32;
++            println!(
++                "  {step:>5} {:>5.2} {:>6}  {:>5.2}  {:>5.3}  {:>5.3}  | {emitted_vol:>7.3}  {in_domain:>15.3}  {bal_err:>6.2}",
++                t,
++                solver.active_count(),
++                100.0 * m.extraction_yield,
++                100.0 * m.tds,
++                mean_t,
++            );
++        }
++    }
++}
+diff --git a/src/engine/scene.rs b/src/engine/scene.rs
+index c8d4b77..f55cc77 100644
+--- a/src/engine/scene.rs
++++ b/src/engine/scene.rs
+@@ -103,6 +103,28 @@ impl Scene {
+         }
+     }
+ 
++    /// A V60 **pour** brew: the dripper geometry + a seeded coffee bed, with water arriving via a
++    /// continuous pour (no seeded water column). `declares_pour()` is true (`pour_water_ml > 0`), so
++    /// the solver sizes its particle pool with headroom for the dose and runs the water passes; a
++    /// driver feeds `EmissionInput` from a pour recipe. Same bed/geometry as [`Scene::v60`].
++    pub fn v60_pour() -> Self {
++        Self {
++            dose_g: 15.0,
++            water_ml: 0.0,
++            pour_water_ml: 250.0,
++            gravity: [0.0, -20.0, 0.0],
++            box_min: [-7.0, -10.0, -7.0],
++            box_max: [7.0, 10.0, 7.0],
++            solids: crate::utils::geometry::v60_dripper(),
++            // Coffee bed only; water is poured in. Rejection trims it to the filter cavity.
++            regions: vec![SeedRegion {
++                min: [-2.5, -2.8, -2.5],
++                max: [2.5, 0.2, 2.5],
++                species: Species::Grain,
++            }],
++        }
++    }
++
+     /// A dam-break: a tall water column released in a box. The water-core gate scene.
+     pub fn dam_break() -> Self {
+         Self::default()
+diff --git a/tests/xpbd_emission.rs b/tests/xpbd_emission.rs
+index 9525484..b074b69 100644
+--- a/tests/xpbd_emission.rs
++++ b/tests/xpbd_emission.rs
+@@ -428,3 +428,125 @@ fn reset_event_clears_emitter_backlog() {
+         "Reset event should not emit; backlog must be cleared, not drained"
+     );
+ }
++
++// --- U4: V60 pour scene + integration gates ------------------------------------------------------
++
++/// Build the V60 pour brew (calibrated permeable bed + wetting + extraction on).
++fn v60_pour_solver(gpu: &GpuContext) -> XpbdSolver {
++    let mats = Materials {
++        particle_spacing: 0.5,
++        support_radius: 1.0,
++        grain_diameter: 1.0,
++        water_grain_distance: 0.35,
++        grain_mass: 10.0,
++        ..Materials::default()
++    };
++    let cfg = Config {
++        absorb_rate: 0.5,
++        extract_rate: 1.0,
++        ..Config::default()
++    };
++    XpbdSolver::build(&Scene::v60_pour(), &mats, &cfg, gpu)
++}
++
++/// Integration gate: poured water threads the bed and reaches the cup, yield rises over the brew,
++/// the pool capacity is honored, the run stays finite, and water VOLUME is conserved under the source
++/// (emitted = in-domain water + absorbed-into-grains).
++#[test]
++fn v60_pour_through_rises_and_conserves() {
++    let Some(gpu) = GpuContext::new_headless() else {
++        eprintln!("xpbd_emission: no GPU adapter; skipping.");
++        return;
++    };
++    let mut solver = v60_pour_solver(&gpu);
++    let cap = solver.pool_capacity();
++    let v_w = solver.water_particle_volume();
++    let rho_w = 1.0 / v_w; // particle_mass = 1
++    assert!(cap > 0);
++    let kettle = [0.0, 2.5, 0.0];
++    let flow = 8.0;
++
++    let mut yields = Vec::new();
++    for step in 1..=900 {
++        solver.step(DT, &pour(kettle, flow));
++        assert!(
++            solver.active_count() <= cap,
++            "active_count {} exceeded pool capacity {cap}",
++            solver.active_count()
++        );
++        if step % 300 == 0 {
++            solver.sample_diagnostics();
++            yields.push(solver.metrics().extraction_yield);
++        }
++    }
++    solver.sample_diagnostics();
++    let m = solver.metrics();
++
++    // Pour-through: water reached the cup (TDS readout is cup-region only ⇒ nonzero means cup water).
++    assert!(m.tds > 0.0, "no water reached the cup (TDS still 0)");
++    // Yield rose over the brew and is finite/positive (absolute band is deferred calibration).
++    let last_yield = *yields.last().unwrap();
++    assert!(
++        last_yield > yields[0] && last_yield > 0.0,
++        "yield did not rise over the pour: {yields:?}"
++    );
++    // Stability.
++    let pos = solver.read_positions();
++    assert!(
++        pos.iter()
++            .all(|p| p[0].is_finite() && p[1].is_finite() && p[2].is_finite()),
++        "non-finite position during pour brew"
++    );
++    // Water-volume conservation under the source: emitted = in-domain water + absorbed-into-grains.
++    let phase = solver.read_phases();
++    let moisture = solver.read_moisture();
++    let emitted_vol = solver.total_emitted_water_mass() / rho_w;
++    let mut in_domain = 0.0f32;
++    for (&ph, &mw) in phase.iter().zip(&moisture) {
++        in_domain += if ph == 0 { mw * v_w } else { mw }; // water f_w·V_w; grain V_abs
++    }
++    assert!(emitted_vol > 0.0, "nothing emitted");
++    assert!(
++        (in_domain - emitted_vol).abs() <= 0.02 * emitted_vol,
++        "water not conserved under pour: emitted {emitted_vol} vs in-domain {in_domain}"
++    );
++    // Grains stayed trapped in the bed (mean grain y near its seeded band, not drained to the cup).
++    let mean_grain_y: f32 = phase
++        .iter()
++        .zip(&pos)
++        .filter(|(&p, _)| p == 1)
++        .map(|(_, p)| p[1])
++        .sum::<f32>()
++        / phase.iter().filter(|&&p| p == 1).count().max(1) as f32;
++    assert!(
++        mean_grain_y > -3.0,
++        "grains washed out of the bed (mean y {mean_grain_y})"
++    );
++}
++
++/// Determinism: two identical pour brews agree on emitted count and aggregate yield.
++#[test]
++fn v60_pour_is_deterministic() {
++    let Some(gpu) = GpuContext::new_headless() else {
++        eprintln!("xpbd_emission: no GPU adapter; skipping.");
++        return;
++    };
++    let run = || {
++        let mut solver = v60_pour_solver(&gpu);
++        for _ in 0..300 {
++            solver.step(DT, &pour([0.0, 2.5, 0.0], 8.0));
++        }
++        solver.sample_diagnostics();
++        (solver.active_count(), solver.metrics().extraction_yield)
++    };
++    let (n1, y1) = run();
++    let (n2, y2) = run();
++    // Emission is CPU-side (deterministic cursor) ⇒ the emitted count is bit-exact.
++    assert_eq!(n1, n2, "emitted count not deterministic");
++    // Yield comes from the GPU mixed solve, which is chaotic/not bit-exact (grid-scatter atomic order
++    // varies, per project notes) — so aggregate metrics match only to a loose band, not bit-exactly.
++    assert!(
++        (y1 - y2).abs() <= 0.03 * y1.abs().max(1.0e-4),
++        "yield not deterministic within tolerance: {y1} vs {y2}"
++    );
++}

@@ -1,0 +1,954 @@
+commit 07674e916543b863485e19cbda8f58f44da88709
+Author: Craig Xu Chen <craigxchen@gmail.com>
+Date:   Thu Jun 4 22:41:42 2026 -0400
+
+    Add conservative grain→water dissolution pass
+    
+    Phase 1.5 U5: wet grains release two-pool solute into overlapping water's
+    concentration `c`, conserving the solute inventory exactly without atomics —
+    the Phase-1.4 wetting transfer pattern applied to chem.
+    
+    - extraction.wgsl: diss_count (per-particle eligible-opposite count + per-grain
+      aggregate relative-velocity flux), dissolve_grain, dissolve_water. Both
+      transfer passes read a frozen chem snapshot + frozen counts and write disjoint
+      slots of live chem, so grain-loss == water-gain to float tolerance with no
+      read/write race. The two-sided cap
+      take = min(release/N_w, max(c_sat−c,0)·(f_w·V_w)/N_g) unifies conservation,
+      the (1−c/c_sat) driving force (water-headroom cap), and the f_w coupling.
+      Passes read `pos` (post-wetting moisture; pos.xyz==pred.xyz post-finalize),
+      keeping both transfer passes at exactly 8 storage buffers.
+    - mod.rs: diss_neighbors scratch buffer (b21), three pipelines + lean bind
+      groups, chem→chem_frozen snapshot + substep block after wetting gated
+      `mixed && extract_rate>0` (rebuilds its own grid). write_chem_for_test /
+      write_moisture_for_test helpers.
+    - common.wgsl: diss_neighbors binding (b21).
+    - tests/xpbd_extraction.rs: solute-conservation gate (dissolution isolated,
+      constant f_w), opt-in gate, dry-grain gate, c_sat cap, saturated-neighbor,
+      depleted-grain guard, flux monotonicity, CPU/GPU parity.
+    
+    Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+
+diff --git a/src/solvers/xpbd/common.wgsl b/src/solvers/xpbd/common.wgsl
+index d4bc3e4..6e46729 100644
+--- a/src/solvers/xpbd/common.wgsl
++++ b/src/solvers/xpbd/common.wgsl
+@@ -266,6 +266,10 @@ fn solid_union(p: vec3<f32>, phase: u32) -> SolidHit {
+ // `chem` don't race the reads). Referenced only by the chem passes (U5/U6).
+ @group(0) @binding(20) var<storage, read_write> chem: array<vec4<f32>>;
+ @group(0) @binding(22) var<storage, read> chem_frozen: array<vec4<f32>>;
++// Per-particle dissolution scratch (b21): grain → (N_w eligible-water count, flux_g aggregate relative
++// speed), water → (N_g eligible-grain count, _). Written by diss_count, read by both transfer passes so
++// each recomputes the identical per-grain release/take. Transient within the extraction sub-stage.
++@group(0) @binding(21) var<storage, read_write> diss_neighbors: array<vec2<f32>>;
+ 
+ // Normalized Arrhenius (1 at t_ref, exponent-clamped for finiteness).
+ fn ex_arrhenius(t: f32, ea_over_r: f32, t_ref: f32) -> f32 {
+diff --git a/src/solvers/xpbd/extraction.wgsl b/src/solvers/xpbd/extraction.wgsl
+new file mode 100644
+index 0000000..c850c6d
+--- /dev/null
++++ b/src/solvers/xpbd/extraction.wgsl
+@@ -0,0 +1,171 @@
++// Extraction (XPBD step 5, Phase 1.5). Concatenated after common/water/bed/coupling/wetting.
++//
++// Wet grains dissolve two-pool solute into overlapping water's concentration `c`, conserving the
++// solute inventory exactly without atomics — the same frozen-snapshot, two-sided, count-normalized
++// allocation as the wetting transfer:
++//
++//   take_gw = min( release_g / N_w ,  max(c_sat − c_w, 0)·(f_w·V_w) / N_g )
++//
++// computed identically in `dissolve_grain` (decrements its pools by Σ_w take, split proportionally
++// across the two pools) and `dissolve_water` (adds Σ_g take to its own `c`). Both read the FROZEN
++// chem snapshot (`chem_frozen`) + the frozen counts/flux (`diss_neighbors`) and write only the live
++// `chem`, so grain-loss == water-gain to float tolerance and there is no read/write race. The grain's
++// `release` is a pure function of its frozen state + per-grain aggregate flux, so the water pass
++// recomputes the same value. The `(1−c/c_sat)` driving force is realized as the water-headroom cap.
++//
++// Runs AFTER wetting/finalize, so it reads `pos` for both position (pos.xyz == pred.xyz post-finalize,
++// matching the rebuilt grid) and the POST-WETTING moisture (pos.w) — the grain's current saturation
++// gates extraction and the water's current volume sizes the headroom. The dissolution passes write
++// only `chem`, so reading `pos` is race-free. (Using `pos` for both also keeps both transfer passes
++// at exactly 8 storage buffers — no room for a separate `pred` binding.)
++//
++// Eligibility (identical on all three passes): opposite species within `h`, and both particles
++// "active" — grain wet (pos.w = V_abs > absorb_roundoff) and water mobile (pos.w = f_w > roundoff).
++// chem lanes: grain (s_f, s_s, T_g, _), water (c, T_w, _, _). moisture lane pos.w as in wetting.
++
++// Per-grain two-pool release this substep (rf, rs, rf+rs), a pure function of the grain's FROZEN
++// state + aggregate flux (so both transfer passes recompute it identically). No driving term here —
++// the (1−c/c_sat) driving force lives in the per-pair water-headroom cap.
++fn diss_release(g: u32) -> vec3<f32> {
++    let cf = chem_frozen[g];        // (s_f, s_s, T_g, _)
++    let flux_g = diss_neighbors[g].y;
++    let sat = clamp(pos[g].w / wet_v_cap(), 0.0, 1.0); // grain moisture saturation (V_abs / V_cap)
++    let kbase = params.extract_rate
++        * ex_arrhenius(cf.z, params.ea_over_r, params.t_ref)
++        * ex_area(params.grain_diameter, params.d_ref)
++        * ex_flux(flux_g, params.u_half)
++        * ex_wet_gate(sat, params.s_on);
++    let rf = ex_release(cf.x, kbase * params.k0_fast, params.dt);
++    let rs = ex_release(cf.y, kbase * params.k0_slow, params.dt);
++    return vec3<f32>(rf, rs, rf + rs);
++}
++
++// Per-particle eligible-opposite-species count + (for grains) the aggregate relative-velocity flux,
++// from the post-wetting positions/moisture + finalized velocity. Both transfer passes read this.
++@compute @workgroup_size(256)
++fn diss_count(@builtin(global_invocation_id) gid: vec3<u32>) {
++    let i = gid.x;
++    if (i >= params.particle_count) { return; }
++    let ph_i = phase[i];
++    let xi = pos[i].xyz;
++    let vi = vel[i].xyz;
++    var n = 0u;
++    var flux_acc = 0.0;
++    let base = cell_coord(xi);
++    for (var dz = -1; dz <= 1; dz = dz + 1) {
++        for (var dy = -1; dy <= 1; dy = dy + 1) {
++            for (var dx = -1; dx <= 1; dx = dx + 1) {
++                let nc = base + vec3<i32>(dx, dy, dz);
++                if (nc.x < 0 || nc.y < 0 || nc.z < 0) { continue; }
++                let dims = vec3<i32>(params.grid_dims.xyz);
++                if (nc.x >= dims.x || nc.y >= dims.y || nc.z >= dims.z) { continue; }
++                let cid = cell_id(nc);
++                let lo = cell_start[cid];
++                let hi = cell_start[cid + 1u];
++                for (var s = lo; s < hi; s = s + 1u) {
++                    let j = sorted_indices[s];
++                    if (j == i) { continue; }
++                    if (phase[j] == ph_i) { continue; } // opposite species only
++                    if (length(xi - pos[j].xyz) >= params.h) { continue; }
++                    if (pos[j].w <= params.absorb_roundoff) { continue; } // inactive neighbor
++                    n = n + 1u;
++                    if (ph_i == PHASE_GRAIN) { flux_acc = flux_acc + length(vi - vel[j].xyz); }
++                }
++            }
++        }
++    }
++    var flux_g = 0.0;
++    if (ph_i == PHASE_GRAIN && n > 0u) { flux_g = flux_acc / f32(n); }
++    diss_neighbors[i] = vec2<f32>(f32(n), flux_g);
++}
++
++@compute @workgroup_size(256)
++fn dissolve_grain(@builtin(global_invocation_id) gid: vec3<u32>) {
++    let i = gid.x;
++    if (i >= params.particle_count) { return; }
++    if (phase[i] != PHASE_GRAIN) { return; }
++    if (pos[i].w <= params.absorb_roundoff) { return; } // dry grain doesn't extract
++    let rel = diss_release(i);
++    let n_w = diss_neighbors[i].x;
++    if (rel.z <= 0.0 || n_w <= 0.0) { return; } // no pools/rate or no eligible water
++
++    let v_w = wet_v_water();
++    let xi = pos[i].xyz;
++    var total = 0.0;
++    let base = cell_coord(xi);
++    for (var dz = -1; dz <= 1; dz = dz + 1) {
++        for (var dy = -1; dy <= 1; dy = dy + 1) {
++            for (var dx = -1; dx <= 1; dx = dx + 1) {
++                let nc = base + vec3<i32>(dx, dy, dz);
++                if (nc.x < 0 || nc.y < 0 || nc.z < 0) { continue; }
++                let dims = vec3<i32>(params.grid_dims.xyz);
++                if (nc.x >= dims.x || nc.y >= dims.y || nc.z >= dims.z) { continue; }
++                let cid = cell_id(nc);
++                let lo = cell_start[cid];
++                let hi = cell_start[cid + 1u];
++                for (var s = lo; s < hi; s = s + 1u) {
++                    let j = sorted_indices[s];
++                    if (phase[j] != PHASE_WATER) { continue; }
++                    if (length(xi - pos[j].xyz) >= params.h) { continue; }
++                    let f_w = pos[j].w;
++                    if (f_w <= params.absorb_roundoff) { continue; }
++                    let n_g = diss_neighbors[j].x;
++                    if (n_g <= 0.0) { continue; }
++                    let headroom = max(params.c_sat - chem_frozen[j].x, 0.0) * (f_w * v_w);
++                    total = total + min(rel.z / n_w, headroom / n_g);
++                }
++            }
++        }
++    }
++    // Deplete the two pools proportionally (Σtake ≤ rel.z ⇒ pools stay ≥ 0). Base off the frozen
++    // snapshot; T lane preserved.
++    let cf = chem_frozen[i];
++    let sf = max(cf.x - total * rel.x / rel.z, 0.0);
++    let ss = max(cf.y - total * rel.y / rel.z, 0.0);
++    chem[i] = vec4<f32>(sf, ss, cf.z, cf.w);
++}
++
++@compute @workgroup_size(256)
++fn dissolve_water(@builtin(global_invocation_id) gid: vec3<u32>) {
++    let i = gid.x;
++    if (i >= params.particle_count) { return; }
++    if (phase[i] != PHASE_WATER) { return; }
++    let f_w = pos[i].w;
++    if (f_w <= params.absorb_roundoff) { return; } // immobile water
++    let n_g = diss_neighbors[i].x;
++    if (n_g <= 0.0) { return; }
++
++    let v_w = wet_v_water();
++    let cf = chem_frozen[i];
++    let headroom = max(params.c_sat - cf.x, 0.0) * (f_w * v_w);
++    let xi = pos[i].xyz;
++    var total = 0.0;
++    let base = cell_coord(xi);
++    for (var dz = -1; dz <= 1; dz = dz + 1) {
++        for (var dy = -1; dy <= 1; dy = dy + 1) {
++            for (var dx = -1; dx <= 1; dx = dx + 1) {
++                let nc = base + vec3<i32>(dx, dy, dz);
++                if (nc.x < 0 || nc.y < 0 || nc.z < 0) { continue; }
++                let dims = vec3<i32>(params.grid_dims.xyz);
++                if (nc.x >= dims.x || nc.y >= dims.y || nc.z >= dims.z) { continue; }
++                let cid = cell_id(nc);
++                let lo = cell_start[cid];
++                let hi = cell_start[cid + 1u];
++                for (var s = lo; s < hi; s = s + 1u) {
++                    let j = sorted_indices[s];
++                    if (phase[j] != PHASE_GRAIN) { continue; }
++                    if (length(xi - pos[j].xyz) >= params.h) { continue; }
++                    if (pos[j].w <= params.absorb_roundoff) { continue; } // dry grain
++                    let rel = diss_release(j);
++                    let n_w = diss_neighbors[j].x;
++                    if (rel.z <= 0.0 || n_w <= 0.0) { continue; }
++                    // Identical take + frozen snapshot as dissolve_grain → grain-loss == water-gain.
++                    total = total + min(rel.z / n_w, headroom / n_g);
++                }
++            }
++        }
++    }
++    // Concentration rises by the dissolved solute over the remaining water volume (≤ c_sat by the
++    // headroom cap). T lane preserved.
++    chem[i] = vec4<f32>(cf.x + total / (f_w * v_w), cf.y, cf.z, cf.w);
++}
+diff --git a/src/solvers/xpbd/mod.rs b/src/solvers/xpbd/mod.rs
+index 16ff648..01d032c 100644
+--- a/src/solvers/xpbd/mod.rs
++++ b/src/solvers/xpbd/mod.rs
+@@ -202,6 +202,9 @@ struct Pipelines {
+     wet_count: wgpu::ComputePipeline,
+     wet_water: wgpu::ComputePipeline,
+     wet_grain: wgpu::ComputePipeline,
++    diss_count: wgpu::ComputePipeline,
++    dissolve_grain: wgpu::ComputePipeline,
++    dissolve_water: wgpu::ComputePipeline,
+     apply_dp: wgpu::ComputePipeline,
+     finalize: wgpu::ComputePipeline,
+     xsph: wgpu::ComputePipeline,
+@@ -229,6 +232,9 @@ struct BindGroups {
+     wet_count: wgpu::BindGroup,
+     wet_water: wgpu::BindGroup,
+     wet_grain: wgpu::BindGroup,
++    diss_count: wgpu::BindGroup,
++    dissolve_grain: wgpu::BindGroup,
++    dissolve_water: wgpu::BindGroup,
+     apply_dp: wgpu::BindGroup,
+     finalize: wgpu::BindGroup,
+     xsph: wgpu::BindGroup,
+@@ -294,8 +300,7 @@ pub struct XpbdSolver {
+     // snapshot copy, re-seeding, and exposure as concentration/temperature; `chem_frozen` (b22) is the
+     // per-substep snapshot the chem passes read.
+     chem: Arc<wgpu::Buffer>,
+-    // Read by the chem passes' bind groups + the snapshot copy in U5/U6, which removes this allow.
+-    #[allow(dead_code)]
++    // The per-substep snapshot the dissolution/thermal passes read while writing the live `chem`.
+     chem_frozen: wgpu::Buffer,
+     pipelines: Pipelines,
+     bind_groups: BindGroups,
+@@ -490,6 +495,35 @@ impl XpbdSolver {
+             .write_buffer(&self.vel, 0, bytemuck::cast_slice(velocities));
+     }
+ 
++    /// Overwrite the per-particle chem/thermal lanes (dev/test only): grain = (s_f, s_s, T_g, _),
++    /// water = (c, T_w, _, _). Lets a test pre-seed a saturated water field or a known thermal state.
++    pub fn write_chem_for_test(&self, chem: &[[f32; 4]]) {
++        assert_eq!(
++            chem.len(),
++            self.particle_count as usize,
++            "chem seed length must match particle count"
++        );
++        self.queue
++            .write_buffer(self.chem.as_ref(), 0, bytemuck::cast_slice(chem));
++    }
++
++    /// Overwrite the per-particle moisture lane `pos.w` (dev/test only): water `f_w`, grain `V_abs`.
++    /// Lets a test pre-wet grains so the dissolution pass runs with `absorb_rate=0` (constant `f_w`),
++    /// isolating solute conservation from the wetting volume transfer.
++    pub fn write_moisture_for_test(&self, moisture: &[f32]) {
++        let mut pos = self.read_vec4(self.pos.as_ref());
++        assert_eq!(
++            pos.len(),
++            moisture.len(),
++            "moisture seed length must match particle count"
++        );
++        for (p, &m) in pos.iter_mut().zip(moisture) {
++            p[3] = m;
++        }
++        self.queue
++            .write_buffer(self.pos.as_ref(), 0, bytemuck::cast_slice(&pos));
++    }
++
+     /// Overwrite current water Lagrange multipliers (dev/test only).
+     pub fn write_lambdas_for_test(&self, lambdas: &[f32]) {
+         assert_eq!(
+@@ -843,6 +877,15 @@ impl Solver for XpbdSolver {
+             vec4,
+             wgpu::BufferUsages::empty(),
+         );
++        // Per-particle dissolution scratch (binding 21), one vec2<f32> each: grain → (N_w, flux_g),
++        // water → (N_g, _). Written by diss_count, read by both transfer passes. Bound only by the
++        // dissolution passes (U5).
++        let diss_neighbors = Self::storage(
++            &device,
++            "xpbd-diss-neighbors",
++            n * 8,
++            wgpu::BufferUsages::empty(),
++        );
+         let status = Self::storage(
+             &device,
+             "xpbd-status",
+@@ -867,12 +910,13 @@ impl Solver for XpbdSolver {
+         // Params/Status/bindings + shared kernels; `water`/`bed`/`coupling`/`wetting` add the
+         // per-species + interphase solves. Module-scope declarations are order-independent.
+         let shader_src = format!(
+-            "{}\n{}\n{}\n{}\n{}",
++            "{}\n{}\n{}\n{}\n{}\n{}",
+             include_str!("common.wgsl"),
+             include_str!("water.wgsl"),
+             include_str!("bed.wgsl"),
+             include_str!("coupling.wgsl"),
+             include_str!("wetting.wgsl"),
++            include_str!("extraction.wgsl"),
+         );
+         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+             label: Some("xpbd"),
+@@ -910,6 +954,9 @@ impl Solver for XpbdSolver {
+             wet_count: make("wet_count"),
+             wet_water: make("wet_water"),
+             wet_grain: make("wet_grain"),
++            diss_count: make("diss_count"),
++            dissolve_grain: make("dissolve_grain"),
++            dissolve_water: make("dissolve_water"),
+             apply_dp: make("apply_dp"),
+             finalize: make("finalize"),
+             xsph: make("xsph"),
+@@ -1166,6 +1213,44 @@ impl Solver for XpbdSolver {
+                     (17, &wet_count),
+                 ],
+             ),
++            diss_count: bg(
++                &pipelines.diss_count,
++                &[
++                    (0, &params_buf),
++                    (1, &pos),
++                    (3, &vel),
++                    (8, &cell_start),
++                    (9, &sorted_indices),
++                    (11, &phase),
++                    (21, &diss_neighbors),
++                ],
++            ),
++            dissolve_grain: bg(
++                &pipelines.dissolve_grain,
++                &[
++                    (0, &params_buf),
++                    (1, &pos),
++                    (8, &cell_start),
++                    (9, &sorted_indices),
++                    (11, &phase),
++                    (20, &chem),
++                    (21, &diss_neighbors),
++                    (22, &chem_frozen),
++                ],
++            ),
++            dissolve_water: bg(
++                &pipelines.dissolve_water,
++                &[
++                    (0, &params_buf),
++                    (1, &pos),
++                    (8, &cell_start),
++                    (9, &sorted_indices),
++                    (11, &phase),
++                    (20, &chem),
++                    (21, &diss_neighbors),
++                    (22, &chem_frozen),
++                ],
++            ),
+             apply_dp: bg(
+                 &pipelines.apply_dp,
+                 &[
+@@ -1536,6 +1621,49 @@ impl Solver for XpbdSolver {
+                     pass(&mut enc, &p.wet_water, &b.wet_water, "wet_water", np);
+                     pass(&mut enc, &p.wet_grain, &b.wet_grain, "wet_grain", np);
+                 }
++
++                // Extraction / dissolution (mixed scenes; opt-in via extract_rate>0). Wet grains
++                // dissolve two-pool solute into overlapping water's concentration, conserving the
++                // solute inventory exactly. Reads the frozen pred.w moisture (same snapshot wetting
++                // used) + a frozen chem copy; writes only the live chem buffer. Rebuilds the grid
++                // itself so it's independent of the wetting block's gate.
++                if mixed && self.params.extract_rate > 0.0 {
++                    pass(&mut enc, &p.grid_clear, &b.grid_clear, "grid_clear", nc);
++                    pass(&mut enc, &p.grid_count, &b.grid_count, "grid_count", np);
++                    pass(&mut enc, &p.grid_scan, &b.grid_scan, "grid_scan", 1);
++                    pass(&mut enc, &p.grid_clear, &b.grid_clear, "grid_clear", nc);
++                    pass(
++                        &mut enc,
++                        &p.grid_scatter,
++                        &b.grid_scatter,
++                        "grid_scatter",
++                        np,
++                    );
++                    // Snapshot the live chem so both transfer passes read a frozen state while
++                    // writing disjoint slots of the live buffer (race-free conservation).
++                    enc.copy_buffer_to_buffer(
++                        self.chem.as_ref(),
++                        0,
++                        &self.chem_frozen,
++                        0,
++                        (self.particle_count as u64) * 16,
++                    );
++                    pass(&mut enc, &p.diss_count, &b.diss_count, "diss_count", np);
++                    pass(
++                        &mut enc,
++                        &p.dissolve_grain,
++                        &b.dissolve_grain,
++                        "dissolve_grain",
++                        np,
++                    );
++                    pass(
++                        &mut enc,
++                        &p.dissolve_water,
++                        &b.dissolve_water,
++                        "dissolve_water",
++                        np,
++                    );
++                }
+             }
+         }
+ 
+diff --git a/tests/xpbd_extraction.rs b/tests/xpbd_extraction.rs
+new file mode 100644
+index 0000000..4de76c2
+--- /dev/null
++++ b/tests/xpbd_extraction.rs
+@@ -0,0 +1,520 @@
++//! Phase 1.5 dissolution (extraction) invariants (GPU-gated; skips without an adapter).
++//!
++//! The dissolution pass moves two-pool solute from wet grains into overlapping water's
++//! concentration `c`, conserving the *solute inventory* `Σ(grain s_f+s_s) + Σ(water c·f_w·V_w)`
++//! exactly (atomic-free, frozen-snapshot two-sided transfer — the Phase-1.4 wetting pattern). The
++//! `(1−c/c_sat)` driving force is realized as the water-side headroom cap, so no water exceeds
++//! `c_sat` and grains stop releasing into saturated water.
++//!
++//! The conservation gate isolates the dissolution pass: wetting OFF (`absorb_rate=0`) with grains
++//! PRE-WET via `write_moisture_for_test`, so `f_w` is exactly constant and the only buffer the
++//! passes touch is `chem`. (With wetting co-active, the absorbed-water volume transfer carries a
++//! second-order solute coupling the model intentionally neglects — KTD-1 — so it is not part of the
++//! dissolution invariant.) Extraction needs flow: a zero-relative-velocity blob has zero flux and
++//! does not extract, so the tests seed a small water velocity.
++
++use coffee_sim::engine::scene::{SeedRegion, Species};
++use coffee_sim::engine::Scene;
++use coffee_sim::models::extraction;
++use coffee_sim::models::Materials;
++use coffee_sim::solvers::base::Solver;
++use coffee_sim::solvers::xpbd::XpbdSolver;
++use coffee_sim::utils::config::Config;
++use coffee_sim::utils::gpu::GpuContext;
++use coffee_sim::EmissionInput;
++
++const DT: f32 = 1.0 / 60.0;
++
++/// Per-grain water capacity `V_cap = r_max·rho_ratio·(π/6·d³)`.
++fn capacity(mats: &Materials) -> f32 {
++    let v_dry = std::f32::consts::FRAC_PI_6 * mats.grain_diameter.powi(3);
++    mats.r_max * mats.rho_ratio * v_dry
++}
++
++/// A point seed region (one particle) of the given species.
++fn point(p: [f32; 3], species: Species) -> SeedRegion {
++    SeedRegion {
++        min: p,
++        max: p,
++        species,
++    }
++}
++
++/// A compact mixed blob (grain slab overlapping a water slab in `y`), gravity off, so grain↔water
++/// pairs sit within the support radius without any mechanical motion.
++fn wet_blob_scene() -> Scene {
++    Scene {
++        gravity: [0.0, 0.0, 0.0],
++        box_min: [0.0, 0.0, 0.0],
++        box_max: [8.0, 8.0, 8.0],
++        regions: vec![
++            SeedRegion {
++                min: [3.0, 3.0, 3.0],
++                max: [5.0, 4.0, 5.0],
++                species: Species::Grain,
++            },
++            SeedRegion {
++                min: [3.0, 3.5, 3.0],
++                max: [5.0, 4.5, 5.0],
++                species: Species::Water,
++            },
++        ],
++        ..Scene::default()
++    }
++}
++
++/// Config isolating the dissolution pass: every mechanical solve + wetting off, extraction on.
++fn extract_isolation_config() -> Config {
++    Config {
++        max_iters: 0,
++        bed_max_iters: 0,
++        drag_subiters: 0,
++        buoyancy_scale: 0.0,
++        xsph_viscosity_c: 0.0,
++        grain_sleep_speed: 0.0,
++        absorb_rate: 0.0, // wetting off → f_w constant → dissolution conservation is exact
++        extract_rate: 1.0,
++        ..Config::default()
++    }
++}
++
++/// Solute inventory: grain pools `s_f+s_s` (absolute) + water `c·f_w·V_w` (concentration × volume).
++fn solute_inventory(chem: &[[f32; 4]], moisture: &[f32], phase: &[u32], v_w: f32) -> f32 {
++    chem.iter()
++        .zip(moisture)
++        .zip(phase)
++        .map(|((c, &m), &ph)| {
++            if ph == 1 {
++                c[0] + c[1] // grain: two pools
++            } else {
++                c[0] * m * v_w // water: concentration × remaining volume
++            }
++        })
++        .sum()
++}
++
++/// Pre-wet grains to `frac·V_cap` and leave water full (`f_w=1`), so the dissolution pass runs with
++/// a constant moisture field.
++fn prewet(solver: &XpbdSolver, phase: &[u32], frac: f32, v_cap: f32) {
++    let moisture: Vec<f32> = phase
++        .iter()
++        .map(|&ph| if ph == 1 { frac * v_cap } else { 1.0 })
++        .collect();
++    solver.write_moisture_for_test(&moisture);
++}
++
++/// Seed a uniform sideways water velocity (the flow that drives extraction); grains at rest.
++fn seed_water_flow(solver: &XpbdSolver, phase: &[u32], u: f32) {
++    let vel: Vec<[f32; 4]> = phase
++        .iter()
++        .map(|&ph| {
++            if ph == 0 {
++                [u, 0.0, 0.0, 0.0]
++            } else {
++                [0.0; 4]
++            }
++        })
++        .collect();
++    solver.write_velocities_for_test(&vel);
++}
++
++/// THE gate: with the dissolution pass isolated (constant `f_w`), the solute inventory is invariant
++/// to float tolerance every step — grain pool loss equals water concentration gain, no leak.
++#[test]
++fn dissolution_conserves_solute_inventory() {
++    let Some(gpu) = GpuContext::new_headless() else {
++        eprintln!("xpbd_extraction: no GPU adapter; skipping.");
++        return;
++    };
++    let mats = Materials::default();
++    let v_cap = capacity(&mats);
++    let mut solver = XpbdSolver::build(&wet_blob_scene(), &mats, &extract_isolation_config(), &gpu);
++    let phase = solver.read_phases();
++    let v_w = solver.water_particle_volume();
++    assert!(
++        phase.contains(&0) && phase.contains(&1),
++        "scene must be mixed"
++    );
++    prewet(&solver, &phase, 0.6, v_cap);
++    seed_water_flow(&solver, &phase, 0.2);
++
++    let moisture = solver.read_moisture();
++    let initial = solute_inventory(&solver.read_chem(), &moisture, &phase, v_w);
++    for step in 0..15 {
++        solver.step(DT, &EmissionInput::default());
++        let inv = solute_inventory(&solver.read_chem(), &solver.read_moisture(), &phase, v_w);
++        assert!(
++            (inv - initial).abs() <= 1.0e-4 * initial.max(1.0),
++            "solute leaked at step {step}: {initial} -> {inv}"
++        );
++    }
++
++    // ...and extraction was non-trivial: grain pools shrank, some water gained concentration.
++    let chem = solver.read_chem();
++    let grain_pools: f32 = chem
++        .iter()
++        .zip(&phase)
++        .filter(|(_, &p)| p == 1)
++        .map(|(c, _)| c[0] + c[1])
++        .sum();
++    let grain_pools_0: f32 =
++        extraction::split(mats.soluble_fraction * mats.grain_mass, mats.fast_fraction).0
++            + extraction::split(mats.soluble_fraction * mats.grain_mass, mats.fast_fraction).1;
++    let n_grain = phase.iter().filter(|&&p| p == 1).count() as f32;
++    assert!(
++        grain_pools < grain_pools_0 * n_grain - 1.0e-6,
++        "no extraction occurred (test would be vacuous): {grain_pools} vs {}",
++        grain_pools_0 * n_grain
++    );
++    assert!(
++        chem.iter()
++            .zip(&phase)
++            .any(|(c, &p)| p == 0 && c[0] > 1.0e-6),
++        "no water gained concentration"
++    );
++}
++
++/// Opt-in gate (R7): with `extract_rate=0` the chem buffer is byte-unchanged even while wetting runs
++/// (grains wet, but nothing dissolves).
++#[test]
++fn no_extraction_without_opt_in() {
++    let Some(gpu) = GpuContext::new_headless() else {
++        eprintln!("xpbd_extraction: no GPU adapter; skipping.");
++        return;
++    };
++    let mats = Materials::default();
++    // Wetting ON so grains actually wet; extraction OFF (default) so chem must not move.
++    let cfg = Config {
++        absorb_rate: 0.5,
++        extract_rate: 0.0,
++        ..Config::default()
++    };
++    let mut solver = XpbdSolver::build(&wet_blob_scene(), &mats, &cfg, &gpu);
++    let before = solver.read_chem();
++    for _ in 0..30 {
++        solver.step(DT, &EmissionInput::default());
++    }
++    let after = solver.read_chem();
++    for (i, (a, b)) in before.iter().zip(&after).enumerate() {
++        assert_eq!(a, b, "chem drifted at particle {i} with extraction off");
++    }
++}
++
++/// The moisture gate (R1): a dry grain (never wetted) releases nothing and water `c` stays 0.
++#[test]
++fn dry_grain_does_not_extract() {
++    let Some(gpu) = GpuContext::new_headless() else {
++        eprintln!("xpbd_extraction: no GPU adapter; skipping.");
++        return;
++    };
++    let mats = Materials::default();
++    // Extraction ON but wetting OFF and grains seeded dry (V_abs=0) → the wet gate / dry-grain guard
++    // hold, so no pool depletes and no water gains concentration.
++    let cfg = extract_isolation_config();
++    let mut solver = XpbdSolver::build(&wet_blob_scene(), &mats, &cfg, &gpu);
++    let phase = solver.read_phases();
++    seed_water_flow(&solver, &phase, 0.2); // flow present, but grains are dry
++    let before = solver.read_chem();
++    for _ in 0..20 {
++        solver.step(DT, &EmissionInput::default());
++    }
++    let after = solver.read_chem();
++    for (i, (a, b)) in before.iter().zip(&after).enumerate() {
++        assert_eq!(a, b, "dry grain extracted at particle {i}");
++    }
++}
++
++/// Headroom cap (R4): drive extraction hard into a fixed water pool → `c` rises toward but never
++/// past `c_sat`, and no grain pool goes negative.
++#[test]
++fn water_concentration_capped_at_c_sat() {
++    let Some(gpu) = GpuContext::new_headless() else {
++        eprintln!("xpbd_extraction: no GPU adapter; skipping.");
++        return;
++    };
++    let mats = Materials::default();
++    let v_cap = capacity(&mats);
++    // One water surrounded by many grains (lots of solute sources) so it saturates fast.
++    let scene = Scene {
++        gravity: [0.0, 0.0, 0.0],
++        box_min: [0.0, 0.0, 0.0],
++        box_max: [8.0, 8.0, 8.0],
++        regions: vec![
++            point([4.0, 4.0, 4.0], Species::Water),
++            point([3.3, 4.0, 4.0], Species::Grain),
++            point([4.7, 4.0, 4.0], Species::Grain),
++            point([4.0, 4.7, 4.0], Species::Grain),
++            point([4.0, 3.3, 4.0], Species::Grain),
++            point([4.0, 4.0, 4.7], Species::Grain),
++            point([4.0, 4.0, 3.3], Species::Grain),
++        ],
++        ..Scene::default()
++    };
++    let cfg = Config {
++        extract_rate: 5.0, // hard drive
++        ..extract_isolation_config()
++    };
++    let mut solver = XpbdSolver::build(&scene, &mats, &cfg, &gpu);
++    let phase = solver.read_phases();
++    prewet(&solver, &phase, 0.8, v_cap);
++    seed_water_flow(&solver, &phase, 0.5);
++
++    let mut max_c = 0.0f32;
++    for _ in 0..400 {
++        solver.step(DT, &EmissionInput::default());
++        let chem = solver.read_chem();
++        for (c, &p) in chem.iter().zip(&phase) {
++            if p == 0 {
++                max_c = max_c.max(c[0]);
++                assert!(
++                    c[0] <= mats.c_sat + 1.0e-5,
++                    "water exceeded c_sat: {} > {}",
++                    c[0],
++                    mats.c_sat
++                );
++            } else {
++                assert!(
++                    c[0] >= -1.0e-6 && c[1] >= -1.0e-6,
++                    "grain pool went negative"
++                );
++            }
++        }
++    }
++    // The cap is non-trivially exercised (the water actually approached saturation).
++    assert!(
++        max_c > 0.5 * mats.c_sat,
++        "water never approached c_sat ({max_c}); test is vacuous"
++    );
++}
++
++/// Codex R1: a saturated water (`c≈c_sat`) next to an unsaturated one on the same grain — the grain
++/// releases into the unsaturated water only, the saturated one stays at `c_sat`, solute conserved.
++#[test]
++fn saturated_neighbor_blocks_extraction_but_unsaturated_receives() {
++    let Some(gpu) = GpuContext::new_headless() else {
++        eprintln!("xpbd_extraction: no GPU adapter; skipping.");
++        return;
++    };
++    let mats = Materials::default();
++    let v_cap = capacity(&mats);
++    let scene = Scene {
++        gravity: [0.0, 0.0, 0.0],
++        box_min: [0.0, 0.0, 0.0],
++        box_max: [8.0, 8.0, 8.0],
++        regions: vec![
++            point([4.0, 4.0, 4.0], Species::Grain),
++            point([4.5, 4.0, 4.0], Species::Water), // will be pre-saturated
++            point([3.5, 4.0, 4.0], Species::Water), // unsaturated
++        ],
++        ..Scene::default()
++    };
++    let mut solver = XpbdSolver::build(&scene, &mats, &extract_isolation_config(), &gpu);
++    let phase = solver.read_phases();
++    assert_eq!(phase, vec![1, 0, 0]);
++    prewet(&solver, &phase, 0.8, v_cap);
++    seed_water_flow(&solver, &phase, 0.3);
++    // Pre-saturate water[1]; water[2] starts at 0.
++    let mut chem = solver.read_chem();
++    chem[1] = [mats.c_sat, mats.pour_t, 0.0, 0.0];
++    solver.write_chem_for_test(&chem);
++    let v_w = solver.water_particle_volume();
++
++    let initial = solute_inventory(&solver.read_chem(), &solver.read_moisture(), &phase, v_w);
++    for _ in 0..30 {
++        solver.step(DT, &EmissionInput::default());
++    }
++    let chem = solver.read_chem();
++    let inv = solute_inventory(&chem, &solver.read_moisture(), &phase, v_w);
++
++    // Saturated water did not exceed c_sat (headroom 0 → accepts nothing).
++    assert!(
++        chem[1][0] <= mats.c_sat + 1.0e-5,
++        "saturated water exceeded c_sat: {}",
++        chem[1][0]
++    );
++    // Unsaturated water received solute.
++    assert!(
++        chem[2][0] > 1.0e-5,
++        "unsaturated water received nothing: {}",
++        chem[2][0]
++    );
++    // Conserved overall.
++    assert!(
++        (inv - initial).abs() <= 1.0e-4 * initial.max(1.0),
++        "solute leaked with a saturated neighbor: {initial} -> {inv}"
++    );
++}
++
++/// `release_total = 0` guard: a fully-depleted grain (both pools 0) transfers nothing and produces
++/// no NaN; adjacent water `c` stays 0.
++#[test]
++fn depleted_grain_no_transfer_no_nan() {
++    let Some(gpu) = GpuContext::new_headless() else {
++        eprintln!("xpbd_extraction: no GPU adapter; skipping.");
++        return;
++    };
++    let mats = Materials::default();
++    let v_cap = capacity(&mats);
++    let scene = Scene {
++        gravity: [0.0, 0.0, 0.0],
++        box_min: [0.0, 0.0, 0.0],
++        box_max: [8.0, 8.0, 8.0],
++        regions: vec![
++            point([4.0, 4.0, 4.0], Species::Grain),
++            point([4.5, 4.0, 4.0], Species::Water),
++        ],
++        ..Scene::default()
++    };
++    let mut solver = XpbdSolver::build(&scene, &mats, &extract_isolation_config(), &gpu);
++    let phase = solver.read_phases();
++    prewet(&solver, &phase, 0.8, v_cap);
++    seed_water_flow(&solver, &phase, 0.3);
++    // Deplete the grain's pools.
++    let mut chem = solver.read_chem();
++    chem[0] = [0.0, 0.0, mats.pour_t, 0.0];
++    solver.write_chem_for_test(&chem);
++
++    for _ in 0..20 {
++        solver.step(DT, &EmissionInput::default());
++    }
++    let chem = solver.read_chem();
++    assert!(
++        chem.iter().all(|c| c.iter().all(|v| v.is_finite())),
++        "NaN/Inf in chem after depleted-grain run"
++    );
++    assert!(
++        chem[1][0].abs() <= 1.0e-6,
++        "water gained concentration from a depleted grain: {}",
++        chem[1][0]
++    );
++}
++
++/// Flux bridge: higher relative velocity extracts more; zero flow extracts (essentially) nothing.
++#[test]
++fn extraction_increases_with_flux() {
++    let Some(gpu) = GpuContext::new_headless() else {
++        eprintln!("xpbd_extraction: no GPU adapter; skipping.");
++        return;
++    };
++    let mats = Materials::default();
++    let v_cap = capacity(&mats);
++    let scene = Scene {
++        gravity: [0.0, 0.0, 0.0],
++        box_min: [0.0, 0.0, 0.0],
++        box_max: [8.0, 8.0, 8.0],
++        regions: vec![
++            point([4.0, 4.0, 4.0], Species::Grain),
++            point([4.5, 4.0, 4.0], Species::Water),
++        ],
++        ..Scene::default()
++    };
++    // Returns total grain solute remaining after a few steps at relative speed `u`.
++    let run = |u: f32| -> f32 {
++        let mut solver = XpbdSolver::build(&scene, &mats, &extract_isolation_config(), &gpu);
++        let phase = solver.read_phases();
++        prewet(&solver, &phase, 0.8, v_cap);
++        seed_water_flow(&solver, &phase, u);
++        for _ in 0..5 {
++            solver.step(DT, &EmissionInput::default());
++        }
++        let c = solver.read_chem();
++        c[0][0] + c[0][1] // grain pools
++    };
++    let initial = {
++        let (sf, ss) =
++            extraction::split(mats.soluble_fraction * mats.grain_mass, mats.fast_fraction);
++        sf + ss
++    };
++    let still = run(0.0);
++    let slow = run(0.3);
++    let fast = run(1.5);
++
++    // Zero flow → flux gate ≈ 0 → essentially no extraction.
++    assert!(
++        (still - initial).abs() <= 1.0e-5,
++        "zero-flow grain extracted: {still} vs {initial}"
++    );
++    // More flow → more solute released (less remaining in the grain).
++    assert!(
++        fast < slow - 1.0e-6 && slow < initial - 1.0e-6,
++        "extraction not monotone in flux: initial {initial}, slow {slow}, fast {fast}"
++    );
++}
++
++/// CPU/GPU parity: a single grain↔water pair locks the WGSL `diss_release`/`take` to the
++/// `models/extraction.rs` reference functions.
++#[test]
++fn cpu_gpu_parity_single_pair() {
++    let Some(gpu) = GpuContext::new_headless() else {
++        eprintln!("xpbd_extraction: no GPU adapter; skipping.");
++        return;
++    };
++    let mats = Materials::default();
++    let v_cap = capacity(&mats);
++    let scene = Scene {
++        gravity: [0.0, 0.0, 0.0],
++        box_min: [0.0, 0.0, 0.0],
++        box_max: [8.0, 8.0, 8.0],
++        regions: vec![
++            point([4.0, 4.0, 4.0], Species::Grain),
++            point([4.5, 4.0, 4.0], Species::Water),
++        ],
++        ..Scene::default()
++    };
++    let cfg = extract_isolation_config();
++    let mut solver = XpbdSolver::build(&scene, &mats, &cfg, &gpu);
++    let phase = solver.read_phases();
++    assert_eq!(phase, vec![1, 0]);
++    let sat_frac = 0.6;
++    prewet(&solver, &phase, sat_frac, v_cap);
++    let u = 0.5;
++    seed_water_flow(&solver, &phase, u);
++    let v_w = solver.water_particle_volume();
++
++    solver.step(DT, &EmissionInput::default());
++    let chem = solver.read_chem();
++
++    // CPU reference for one step (N_w = N_g = 1, water c=0/f_w=1 ⇒ release-limited).
++    let (s_f, s_s) = extraction::split(mats.soluble_fraction * mats.grain_mass, mats.fast_fraction);
++    let kbase = cfg.extract_rate
++        * extraction::arrhenius(mats.pour_t, mats.ea_over_r, mats.t_ref)
++        * extraction::area_factor(mats.grain_diameter, mats.d_ref)
++        * extraction::flux_factor(u, mats.u_half)
++        * extraction::wet_gate(sat_frac, mats.s_on);
++    let rf = extraction::release(s_f, kbase * mats.k0_fast, DT);
++    let rs = extraction::release(s_s, kbase * mats.k0_slow, DT);
++    let rtot = rf + rs;
++    let headroom = mats.c_sat * v_w; // c=0, f_w=1
++    let total = rtot.min(headroom);
++    let exp_loss_f = total * rf / rtot;
++    let exp_loss_s = total * rs / rtot;
++    let exp_c = total / v_w;
++
++    // Compare the transferred amounts (deltas), not the near-identical pool base values, with an
++    // f32-appropriate relative tolerance (GPU and CPU `exp()` diverge by ~1e-4 relative).
++    let gpu_loss_f = s_f - chem[0][0];
++    let gpu_loss_s = s_s - chem[0][1];
++    let rel = |gpu: f32, cpu: f32| (gpu - cpu).abs() <= 2.0e-3 * cpu.abs() + 1.0e-9;
++    assert!(
++        rel(gpu_loss_f, exp_loss_f),
++        "fast pool transfer parity: gpu {gpu_loss_f} vs cpu {exp_loss_f}"
++    );
++    assert!(
++        rel(gpu_loss_s, exp_loss_s),
++        "slow pool transfer parity: gpu {gpu_loss_s} vs cpu {exp_loss_s}"
++    );
++    assert!(
++        rel(chem[1][0], exp_c),
++        "water concentration parity: gpu {} vs cpu {exp_c}",
++        chem[1][0]
++    );
++    // Pair conservation: grain pool loss == water solute gain (exact frozen-snapshot transfer).
++    // Absolute tol clears the f32 cancellation noise of `s_f - chem[0][0]` (two ~0.13 values);
++    // tight global conservation is the job of `dissolution_conserves_solute_inventory`.
++    let grain_loss = gpu_loss_f + gpu_loss_s;
++    let water_gain = chem[1][0] * v_w;
++    assert!(
++        (grain_loss - water_gain).abs() <= 1.0e-6,
++        "pair not conserved: grain lost {grain_loss}, water gained {water_gain}"
++    );
++}

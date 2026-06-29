@@ -184,6 +184,16 @@ impl CoffeeSimApp {
         self.rebuild(WebScene::WaterOnly);
     }
 
+    /// Load a Debug Scenes catalog entry by its kebab id (matching the `data-debug-scene` buttons /
+    /// `WebScene::from_id`). Unknown ids are ignored. Runs under the active solver, like the main
+    /// scene buttons.
+    #[wasm_bindgen(js_name = loadDebugScene)]
+    pub fn load_debug_scene(&mut self, id: &str) {
+        if let Some(kind) = WebScene::from_id(id) {
+            self.rebuild(kind);
+        }
+    }
+
     // --- solver selection ---
 
     /// Registry solvers as `id|display-name` pairs, newline-separated, for the UI dropdown. The
@@ -343,86 +353,142 @@ impl CoffeeSimApp {
 /// byte-identical to before.
 fn setup_for(kind: WebScene, solver_id: SolverId) -> (Scene, Materials, Config) {
     let scene = kind.build();
+    let twofield = solver_id == SolverId::Twofield;
     match kind {
-        WebScene::CenterPour => {
-            // Calibrated V60 ratios at a browser-friendly spacing (lighter particle count).
-            let r = 0.16_f32;
-            let mats = Materials {
-                particle_spacing: r,
-                support_radius: 2.0 * r,
-                grain_diameter: 2.0 * r,
-                grain_mass: 10.0,
-                ..Materials::default()
-            };
-            let mut cfg = Config {
-                absorb_rate: 0.5,
-                extract_rate: 1.0,
-                nozzle_radius: 0.25,
-                max_speed: 25.0,
-                // Bed permeability: the explicit Darcy drag has a percolation floor of ~g·dt_substep,
-                // so at substeps=1 the bed out-drains the pour and nothing ponds. Halving the substep
-                // dt (substeps=2) plus a stronger drag cap (more sub-iters, higher β_max) cuts the
-                // drainage rate ~2× and lets a water layer build above the grounds. Scoped to the
-                // coffee scene (the only one with a bed); ~2× solve cost on this lighter scene.
-                substeps: 2,
-                drag_beta_max: 0.92,
-                drag_subiters: 6,
-                ..Config::default()
-            };
-            if solver_id == SolverId::Twofield {
-                // Turn ON the two-field coupling so selecting it on the V60 pour visibly runs the
-                // percolation/absorption/cohesion physics (an inert frozen bed otherwise). These are
-                // the canonical "full coffee" gates from `tests/twofield_full.rs`: a deformable bed
-                // (solid_dynamics) that absorbs water (tf_absorb_rate, feeding swelling + K(φ)),
-                // drains through the filter (tf_filter_floor), and gains wet cohesion for steeper
-                // walls (tf_wet_cohesion). The XPBD path never sees these.
-                cfg.solid_dynamics = true;
-                cfg.tf_absorb_rate = 0.15;
-                cfg.tf_wet_cohesion = 4.0;
-                cfg.tf_filter_floor = true;
-                // Stream coherence on a grid solver: the jet must span several cells or the
-                // P2G/G2P + pressure solve on a sub-2-cell column reconstructs noisy, asymmetric
-                // velocities and the thin stream whips/scatters (the dual of XPBD's Lagrangian
-                // strength). At h = 2·spacing = 0.32 a radius-0.25 jet is ~1.5 cells wide; widen
-                // to ~0.55 (diameter ~3.4 cells) so it's grid-resolvable, and lower the velocity
-                // cap so a stray projection correction can't fling it sideways. Twofield-only;
-                // the XPBD path keeps the thin realistic stream it handles fine.
-                cfg.nozzle_radius = 0.55;
-                cfg.max_speed = 12.0;
+        // --- main "Scenes" tab + filter/bed debug scenes (full V60 dripper, bed present) ---
+        // All run the calibrated V60-with-bed materials/config; twofield turns on the coupling gates.
+        WebScene::CenterPour
+        | WebScene::FilterWaterBlock
+        | WebScene::OffCenterFilterWallPour
+        | WebScene::UniformBedSaturation
+        | WebScene::PermeabilityComparison
+        | WebScene::ParticleCapacityStress => {
+            let (mats, mut cfg) = v60_bed_setup(twofield);
+            if matches!(kind, WebScene::PermeabilityComparison) {
+                // Tighter bed → lower permeability: stiffen the Darcy drag so water ponds and drains
+                // slowly (the rewrite analogue of main's finer-grind Kozeny–Carman bed).
+                cfg.drag_scale = 0.55;
+                cfg.drag_beta_max = 0.97;
+                cfg.drag_subiters = 8;
             }
             (scene, mats, cfg)
         }
-        WebScene::WaterOnly => {
-            // Same V60 cone+cup as CenterPour, just no coffee — match its water resolution and pour
-            // nozzle so the stream/drainage look identical, minus the grounds (no absorb/extract).
-            let r = 0.16_f32;
+
+        // --- V60 water-only debug scenes (full dripper, NO bed): pours + still cup-water cases ---
+        WebScene::WaterOnly
+        | WebScene::SeededPaperWallSheet
+        | WebScene::FilterApexDrain
+        | WebScene::CupWallFloorCornerContact
+        | WebScene::AsymmetricCupMoundSettle
+        | WebScene::HydrostaticColumn
+        | WebScene::DamBreakSlosh
+        | WebScene::SparseFreeJet
+        | WebScene::HighVelocityJetImpact => {
+            let (mats, cfg) = v60_water_setup(twofield);
+            (scene, mats, cfg)
+        }
+
+        // --- sand-wall: water/solid coupling in a plain box (new; no main equivalent) ---
+        WebScene::SandWall => {
+            // Box dims are authored at the unit lattice (like dam_through_sand), so keep the default
+            // spacing. Coarse grains (diameter 2× the water pitch) make the wall a few big grains
+            // thick with pores the water threads. For twofield, turn ON the deformable-bed coupling
+            // so the wall is a live skeleton the water percolates through (XPBD ignores these gates).
             let mats = Materials {
-                particle_spacing: r,
-                support_radius: 2.0 * r,
+                grain_diameter: 2.0,
+                grain_mass: 3.0,
                 ..Materials::default()
             };
             let mut cfg = Config {
-                nozzle_radius: 0.25,
                 max_speed: 25.0,
-                // Less velocity-smoothing at the surface so the pour's impact reads as a
-                // visible outward push/crown instead of dissolving into the pool (0.05 default).
                 xsph_viscosity_c: 0.02,
                 ..Config::default()
             };
-            if solver_id == SolverId::Twofield {
-                // The two-field solver is a GRID solver: a sub-2-cell-wide jet (the thin XPBD
-                // nozzle, ~1.5 cells at h = 2·spacing = 0.32) plunging into the cup reconstructs
-                // noisy, asymmetric velocities, whips/scatters, and PLUNGES — trapping a column of
-                // air that the pocket machinery then carries as a crushing bubble that collapses
-                // the pool. Widen the jet to ~3.4 cells (grid-resolvable) and lower the speed cap,
-                // exactly as the CenterPour twofield branch does for the same reason. The XPBD path
-                // keeps the thin realistic stream it handles fine (these are Twofield-only).
-                cfg.nozzle_radius = 0.55;
-                cfg.max_speed = 12.0;
+            if twofield {
+                cfg.solid_dynamics = true;
+                cfg.tf_absorb_rate = 0.15;
+                cfg.tf_wet_cohesion = 4.0;
             }
             (scene, mats, cfg)
         }
     }
+}
+
+/// Materials/config for the V60-with-bed family (Center Pour + the filter/bed debug scenes).
+/// Calibrated V60 ratios at a browser-friendly spacing. For twofield, turn on the "full coffee"
+/// coupling gates + the grid-resolvable jet, exactly as the original CenterPour branch did.
+fn v60_bed_setup(twofield: bool) -> (Materials, Config) {
+    let r = 0.16_f32;
+    let mats = Materials {
+        particle_spacing: r,
+        support_radius: 2.0 * r,
+        grain_diameter: 2.0 * r,
+        grain_mass: 10.0,
+        ..Materials::default()
+    };
+    let mut cfg = Config {
+        absorb_rate: 0.5,
+        extract_rate: 1.0,
+        nozzle_radius: 0.25,
+        max_speed: 25.0,
+        // Bed permeability: the explicit Darcy drag has a percolation floor of ~g·dt_substep, so at
+        // substeps=1 the bed out-drains the pour and nothing ponds. Halving the substep dt
+        // (substeps=2) plus a stronger drag cap lets a water layer build above the grounds.
+        substeps: 2,
+        drag_beta_max: 0.92,
+        drag_subiters: 6,
+        ..Config::default()
+    };
+    if twofield {
+        // Two-field coupling: a deformable bed (solid_dynamics) that absorbs water (tf_absorb_rate,
+        // feeding swelling + K(φ)), drains through the filter (tf_filter_floor), and gains wet
+        // cohesion (tf_wet_cohesion). Plus the grid-resolvable jet (≈3.4 cells wide) + speed cap so
+        // the thin nozzle doesn't whip/scatter on the grid. The XPBD path never sees these.
+        cfg.solid_dynamics = true;
+        cfg.tf_absorb_rate = 0.15;
+        cfg.tf_wet_cohesion = 4.0;
+        cfg.tf_filter_floor = true;
+        cfg.nozzle_radius = 0.55;
+        cfg.max_speed = 12.0;
+        // U2/U3 surface-weighted dissipation (starting values; tune by eye via the visual oracle
+        // before pinning numeric gates / flipping production defaults): preserve momentum at the
+        // free surface (small c_surface), damp the bulk, merge-discriminator on, raise the water
+        // crown cap above the global 12.
+        cfg.tf_flip_c_surface = 0.1;
+        cfg.tf_flip_density_gate = 0.5;
+        cfg.tf_flip_div_scale = 1.0;
+        cfg.tf_flip_water_splash_cap = 20.0;
+    }
+    (mats, cfg)
+}
+
+/// Materials/config for the V60 water-only family (Water Only + the cup-water / free-jet debug
+/// scenes): the same cone+cup at the bed resolution, no grounds. For twofield, widen the jet +
+/// lower the speed cap so a thin plunging stream stays grid-resolvable (no trapped-air collapse).
+fn v60_water_setup(twofield: bool) -> (Materials, Config) {
+    let r = 0.16_f32;
+    let mats = Materials {
+        particle_spacing: r,
+        support_radius: 2.0 * r,
+        ..Materials::default()
+    };
+    let mut cfg = Config {
+        nozzle_radius: 0.25,
+        max_speed: 25.0,
+        // Less velocity-smoothing at the surface so a pour's impact reads as a visible crown.
+        xsph_viscosity_c: 0.02,
+        ..Config::default()
+    };
+    if twofield {
+        cfg.nozzle_radius = 0.55;
+        cfg.max_speed = 12.0;
+        // U2/U3 surface-weighted dissipation (starting values; tune by eye — see v60_bed_setup).
+        cfg.tf_flip_c_surface = 0.1;
+        cfg.tf_flip_density_gate = 0.5;
+        cfg.tf_flip_div_scale = 1.0;
+        cfg.tf_flip_water_splash_cap = 20.0;
+    }
+    (mats, cfg)
 }
 
 /// Apply the per-material render look (grain radius scale + moisture tint).

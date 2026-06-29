@@ -1,0 +1,551 @@
+You are reviewing the IMPLEMENTATION of Unit 2 of an approved plan (Rust + wgpu coffee sim), diff
+below. Unit 2 = "emission core": an InflowState + emit() that turns EmissionInput into activated water
+particles via the plan's volume-consistent arclength-credit emitter. Verdict on FIRST LINE: APPROVE,
+REVISE, or REJECT, then explain. Maintainer is a physics reviewer who rejects hand-waving.
+
+The plan's emitter design (verify the code matches and is correct):
+- Orifice: A_eff = pi*nozzle_radius^2*discharge_coeff; exit_speed = flow_rate / A_eff (flow_rate is
+  sim-volume/s).
+- Volume budget: accumulator += flow_rate/V_w*dt; want = floor(accumulator). Carries the fraction;
+  never reset on zero flow (only on Reset/seed).
+- Arclength credit: axial += exit_speed*dt; release a layer each time axial >= particle_spacing
+  (decrement by spacing), placing the layer at depth = residual axial below the nozzle.
+- Volume-consistent layer count: N_layer = ceil(A_eff*spacing/V_w); throughput
+  (exit_speed/spacing)*N_layer >= flow/V_w so backlog stays sub-layer.
+- Clamp-before-decrement: accumulator -= emitted count (not want); recipe overflow warns+clamps.
+- Backlog drains in drawdown (gate: flow>0 OR accumulator>=1; uses last_exit_speed when flow=0).
+- Emitted particles: phase=0, pos.w=1, chem=(0,pour_t,0,0), vel=dir*exit_speed; disc over
+  r_eff=sqrt(discharge_coeff)*nozzle_radius via golden angle; written into the active pool range,
+  active_count grows, phase_mirror grows, total_emitted_water_mass tracks.
+
+Be rigorous about:
+1. Is the arclength/volume algebra correct and does emitted count actually track flow/V_w*T (no
+   permanent backlog, no over-delivery)? Does the clamp-before-decrement preserve dose?
+2. Layer-depth placement: is `depth = axial after decrement` correct so consecutive layers (within a
+   frame AND across frames) are exactly particle_spacing apart? Any double-count or off-by-one?
+3. Determinism (cursor-based golden angle), and is the disc packing ~rest density (PBF-safe)?
+4. The drawdown backlog drain via last_exit_speed — correct, no infinite loop when flow=0?
+5. The GPU writes: correct offsets (active_count*16 / *4), correct buffers, and active_count grows
+   only after the writes. phase_mirror stays in sync. Any race or stale params?
+6. Does emit() run at the right point in step() (before params.particle_count upload + dispatch)?
+7. Any way a non-pour scene (flow_rate=0 default) is perturbed? (emit must no-op.)
+
+The diff follows.
+========================================================================
+diff --git a/src/solvers/xpbd/mod.rs b/src/solvers/xpbd/mod.rs
+index 97cbf47..9f67e27 100644
+--- a/src/solvers/xpbd/mod.rs
++++ b/src/solvers/xpbd/mod.rs
+@@ -331,6 +331,9 @@ pub struct XpbdSolver {
+     cached_yield: f32,
+     cached_tds: f32,
+ 
++    /// Pour-emission state (water injected over the brew). Inactive when no pour drives it.
++    inflow: Inflow,
++
+     // retained for reset (exact re-seed of the initial block + phase tags + chem state)
+     initial_positions: Vec<[f32; 4]>,
+     initial_phases: Vec<u32>,
+@@ -351,6 +354,49 @@ struct CupRegion {
+     y_max: f32,
+ }
+ 
++/// Pour-emission state + spout parameters (host-side). Turns `EmissionInput` into activated water
++/// particles via the volume-consistent arclength-credit emitter (KTD-3): the volume accumulator is
++/// the master particle-count budget; layers release one `particle_spacing` of stream travel apart
++/// (the axial credit) so the inlet packs to the fluid's rest density (PBF-safe — no spike, no void).
++struct Inflow {
++    // Static (from Config/Materials at build).
++    nozzle_radius: f32,
++    discharge_coeff: f32,
++    spacing: f32,
++    v_w: f32,
++    pour_t: f32,
++    // State.
++    accumulator: f32, // volume budget in particles (carries the sub-particle fraction)
++    axial: f32,       // arclength credit (scene units) toward the next layer
++    last_exit_speed: f32, // drains backlog at the last cadence when flow drops to 0
++    cursor: u64,      // golden-angle determinism across all emitted particles
++    emitted_mass: f32, // running total emitted water mass (conservation accounting, R7)
++}
++
++/// Orthonormal disc basis perpendicular to a (unit) pour direction `dir`.
++fn disc_basis(dir: [f32; 3]) -> ([f32; 3], [f32; 3]) {
++    let cross = |a: [f32; 3], b: [f32; 3]| {
++        [
++            a[1] * b[2] - a[2] * b[1],
++            a[2] * b[0] - a[0] * b[2],
++            a[0] * b[1] - a[1] * b[0],
++        ]
++    };
++    let norm = |v: [f32; 3]| {
++        let l = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt().max(1.0e-9);
++        [v[0] / l, v[1] / l, v[2] / l]
++    };
++    // Reference axis not parallel to dir.
++    let refv = if dir[1].abs() < 0.9 {
++        [0.0, 1.0, 0.0]
++    } else {
++        [1.0, 0.0, 0.0]
++    };
++    let u = norm(cross(dir, refv));
++    let w = cross(dir, u);
++    (u, w)
++}
++
+ /// Seed the scene's initial particles on a jittered lattice, one block per region. Returns
+ /// positions and the matching per-particle phase tags (0=water, 1=grain).
+ fn seed_block(scene: &Scene, mats: &Materials, cfg: &Config) -> (Vec<[f32; 4]>, Vec<u32>) {
+@@ -460,6 +506,12 @@ impl XpbdSolver {
+         // Restore the host phase mirror to the seed baseline.
+         self.phase_mirror.clear();
+         self.phase_mirror.extend_from_slice(&self.initial_phases);
++        // Reset the pour-emission state (the recipe restarts from t=0 on reset).
++        self.inflow.accumulator = 0.0;
++        self.inflow.axial = 0.0;
++        self.inflow.last_exit_speed = 0.0;
++        self.inflow.cursor = 0;
++        self.inflow.emitted_mass = 0.0;
+         // Clear the yield/TDS cache so metrics() reports 0 after a reset (matching the re-zeroed
+         // chem) rather than stale values until the next sample_diagnostics.
+         self.cached_yield = 0.0;
+@@ -739,6 +791,125 @@ impl XpbdSolver {
+         self.has_water
+     }
+ 
++    /// Total water mass emitted by the pour so far (conservation accounting, R7) (dev/test).
++    pub fn total_emitted_water_mass(&self) -> f32 {
++        self.inflow.emitted_mass
++    }
++
++    /// Activate pour-emitted water particles for this frame from `EmissionInput` (KTD-3): a
++    /// volume-consistent arclength-credit emitter. The volume accumulator (flow_rate/V_w·dt) is the
++    /// master count budget; layers release one `particle_spacing` of stream travel apart, each filling
++    /// a golden-angle disc with up to `N_layer = ceil(A_eff·spacing/V_w)` particles, so the inlet packs
++    /// to the fluid's rest density (no PBF spike). Particles are written into the active pool range and
++    /// `active_count` grows. No-ops when not pouring and no backlog remains.
++    fn emit(&mut self, input: &EmissionInput, dt: f32) {
++        let flow = input.flow_rate.max(0.0);
++        // Gate: pour active, or a whole particle of backlog still to drain (R4 — drawdown drain).
++        if flow <= 0.0 && self.inflow.accumulator < 1.0 {
++            return;
++        }
++        let a_eff = std::f32::consts::PI
++            * self.inflow.nozzle_radius
++            * self.inflow.nozzle_radius
++            * self.inflow.discharge_coeff;
++        let a_eff = a_eff.max(1.0e-9);
++        // Orifice relation: exit_speed derived from flow + effective area (KTD-3). While draining a
++        // backlog at zero flow, keep the last cadence so the stream tail stays correctly spaced.
++        let exit_speed = if flow > 0.0 {
++            let es = flow / a_eff;
++            self.inflow.last_exit_speed = es;
++            self.inflow.accumulator += flow / self.inflow.v_w * dt;
++            es
++        } else {
++            self.inflow.last_exit_speed
++        };
++        if exit_speed <= 0.0 {
++            return;
++        }
++        // Volume-consistent layer capacity (ceil ⇒ throughput ≥ flow/V_w, no permanent backlog).
++        let n_layer = ((a_eff * self.inflow.spacing / self.inflow.v_w).ceil() as u32).max(1);
++
++        // Pour direction (downward, tilted by pour_angle toward +x) + a perpendicular disc basis.
++        let a = input.pour_angle;
++        let dir = [a.sin(), -a.cos(), 0.0];
++        let (u, w) = disc_basis(dir);
++        let r_eff = self.inflow.nozzle_radius * self.inflow.discharge_coeff.sqrt();
++        const GOLDEN: f32 = 2.399_963_2;
++
++        self.inflow.axial += exit_speed * dt;
++        let kettle = input.kettle_pos;
++        let mut want = self.inflow.accumulator.floor() as u32;
++        let mut new_pos: Vec<[f32; 4]> = Vec::new();
++        let mut new_vel: Vec<[f32; 4]> = Vec::new();
++        let mut new_chem: Vec<[f32; 4]> = Vec::new();
++        let mut new_phase: Vec<u32> = Vec::new();
++        let mut clamped = false;
++        while self.inflow.axial >= self.inflow.spacing && want > 0 {
++            self.inflow.axial -= self.inflow.spacing;
++            let depth = self.inflow.axial; // residual stream travel below the nozzle ⇒ layer depth
++            let avail = self.capacity - (self.active_count + new_pos.len() as u32);
++            if avail == 0 {
++                clamped = true;
++                break;
++            }
++            let this_layer = n_layer.min(want).min(avail);
++            for i in 0..this_layer {
++                let frac = (i as f32 + 0.5) / n_layer as f32;
++                let r = r_eff * frac.sqrt();
++                let theta = self.inflow.cursor as f32 * GOLDEN;
++                self.inflow.cursor += 1;
++                let (ct, st) = (theta.cos(), theta.sin());
++                let off = [
++                    u[0] * r * ct + w[0] * r * st,
++                    u[1] * r * ct + w[1] * r * st,
++                    u[2] * r * ct + w[2] * r * st,
++                ];
++                new_pos.push([
++                    kettle[0] + dir[0] * depth + off[0],
++                    kettle[1] + dir[1] * depth + off[1],
++                    kettle[2] + dir[2] * depth + off[2],
++                    1.0, // moisture lane f_w = 1 (full water)
++                ]);
++                new_vel.push([
++                    dir[0] * exit_speed,
++                    dir[1] * exit_speed,
++                    dir[2] * exit_speed,
++                    0.0,
++                ]);
++                new_chem.push([0.0, self.inflow.pour_t, 0.0, 0.0]); // c=0, T=pour temperature
++                new_phase.push(0); // water
++            }
++            want -= this_layer;
++        }
++        let emit_n = new_pos.len() as u32;
++        if emit_n == 0 {
++            return;
++        }
++        // Clamp-before-decrement: subtract only what was actually emitted (R4) — unspent budget stays
++        // as backlog rather than being silently burned.
++        self.inflow.accumulator -= emit_n as f32;
++        self.inflow.emitted_mass += emit_n as f32 * self.params.particle_mass;
++        if clamped {
++            eprintln!(
++                "xpbd pour: pool capacity {} reached; emission clamped (a recipe scene must declare \
++                 enough pour_water_ml to size the pool to its dose)",
++                self.capacity
++            );
++        }
++        let off_v4 = (self.active_count as u64) * 16;
++        let off_u32 = (self.active_count as u64) * 4;
++        self.queue
++            .write_buffer(&self.pos, off_v4, bytemuck::cast_slice(&new_pos));
++        self.queue
++            .write_buffer(self.chem.as_ref(), off_v4, bytemuck::cast_slice(&new_chem));
++        self.queue
++            .write_buffer(&self.vel, off_v4, bytemuck::cast_slice(&new_vel));
++        self.queue
++            .write_buffer(&self.phase, off_u32, bytemuck::cast_slice(&new_phase));
++        self.active_count += emit_n;
++        self.phase_mirror.extend_from_slice(&new_phase);
++    }
++
+     /// Read back per-particle water concentration `c` (chem `.x`; for a grain `.x` is its fast pool).
+     /// Dev/test/inspection only — stalls the GPU.
+     pub fn read_concentration(&self) -> Vec<f32> {
+@@ -1534,6 +1705,18 @@ impl Solver for XpbdSolver {
+             cup,
+             cached_yield: 0.0,
+             cached_tds: 0.0,
++            inflow: Inflow {
++                nozzle_radius: cfg.nozzle_radius,
++                discharge_coeff: cfg.discharge_coeff,
++                spacing: s,
++                v_w,
++                pour_t: mats.pour_t,
++                accumulator: 0.0,
++                axial: 0.0,
++                last_exit_speed: 0.0,
++                cursor: 0,
++                emitted_mass: 0.0,
++            },
+             initial_positions: positions,
+             phase_mirror: phases.clone(),
+             initial_phases: phases,
+@@ -1545,12 +1728,15 @@ impl Solver for XpbdSolver {
+         self.seed();
+     }
+ 
+-    fn step(&mut self, dt: f32, _input: &EmissionInput) {
+-        // Pool invariant: the live set never exceeds the allocated capacity (U2's emit() clamps to it).
++    fn step(&mut self, dt: f32, input: &EmissionInput) {
++        // Pour emission first (grows active_count for this frame); no-op when not pouring. Uses the
++        // full frame dt (flow integrated once per frame, then simulated by all substeps).
++        self.emit(input, dt);
++        // Pool invariant: the live set never exceeds the allocated capacity (emit() clamps to it).
+         debug_assert!(self.active_count <= self.capacity);
+         self.params.dt = dt / self.substeps as f32;
+         // The live set the kernels guard against (i >= particle_count returns) — refreshed each frame
+-        // so pour-grown active_count takes effect (U2 wires emission before this upload).
++        // so pour-grown active_count takes effect (emit() above ran first).
+         self.params.particle_count = self.active_count;
+         self.queue
+             .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&self.params));
+diff --git a/src/utils/config.rs b/src/utils/config.rs
+index 4a707d1..d5c56a0 100644
+--- a/src/utils/config.rs
++++ b/src/utils/config.rs
+@@ -94,6 +94,14 @@ pub struct Config {
+     /// Extraction/thermal opt-in gate (step 5). 0 = the extraction + thermal passes don't run, so
+     /// existing scenes are byte-unchanged; a brew scene sets it > 0 to enable dissolution kinetics.
+     pub extract_rate: f32,
++
++    // --- pour emission (spout settings) ---
++    /// Pour spout nozzle radius (scene units). With the discharge coefficient it sets the effective
++    /// flux area `A_eff = π·r²·discharge_coeff`, which fixes the stream's exit speed from the flow
++    /// rate and the emitted-layer particle count (so the inlet packs to the fluid's rest density).
++    pub nozzle_radius: f32,
++    /// Orifice discharge coefficient `∈ (0,1]` (vena-contracta loss). Folded into `A_eff`.
++    pub discharge_coeff: f32,
+ }
+ 
+ impl Default for Config {
+@@ -156,6 +164,9 @@ impl Default for Config {
+             pbf_eps: 0.05,
+             // Extraction/thermal OFF by default (step 5; like absorb_rate): a brew scene opts in.
+             extract_rate: 0.0,
++            // Pour spout: a thin stream by default; a pour scene tunes these to its grind/flow.
++            nozzle_radius: 0.5,
++            discharge_coeff: 1.0,
+         }
+     }
+ }
+diff --git a/tests/xpbd_emission.rs b/tests/xpbd_emission.rs
+index 04a30b9..feddb6c 100644
+--- a/tests/xpbd_emission.rs
++++ b/tests/xpbd_emission.rs
+@@ -6,6 +6,7 @@
+ //! U2, so `active_count` stays at the seed). Pass selection must treat a declared pour as "water
+ //! present" even when only grains are seeded.
+ 
++use coffee_sim::emission::PourEvent;
+ use coffee_sim::engine::scene::{SeedRegion, Species};
+ use coffee_sim::engine::Scene;
+ use coffee_sim::models::Materials;
+@@ -15,6 +16,30 @@ use coffee_sim::utils::config::Config;
+ use coffee_sim::utils::gpu::GpuContext;
+ use coffee_sim::EmissionInput;
+ 
++const DT: f32 = 1.0 / 60.0;
++
++/// A straight-down pour from `kettle` at `flow` (sim-volume/s).
++fn pour(kettle: [f32; 3], flow: f32) -> EmissionInput {
++    EmissionInput {
++        kettle_pos: kettle,
++        flow_rate: flow,
++        pour_angle: 0.0,
++        event: PourEvent::None,
++    }
++}
++
++/// An empty box that opts into a pour (no seeds) — for counting emission in isolation.
++fn empty_pour_scene(pour_ml: f32) -> Scene {
++    Scene {
++        pour_water_ml: pour_ml,
++        gravity: [0.0, 0.0, 0.0],
++        box_min: [0.0, 0.0, 0.0],
++        box_max: [12.0, 12.0, 12.0],
++        regions: vec![],
++        ..Scene::default()
++    }
++}
++
+ /// A mixed water+grain scene (water present, so `has_water` is true regardless of pour).
+ fn mixed_scene() -> Scene {
+     Scene {
+@@ -169,3 +194,203 @@ fn reset_restores_seed_active_count() {
+     solver.reset(&scene);
+     assert_eq!(solver.active_count(), seed);
+ }
++
++// --- U2: emission core ---------------------------------------------------------------------------
++
++/// Rate fidelity + no starvation: over T seconds at constant flow, the emitted particle count tracks
++/// flow/V_w·T (the arclength-credit emitter must NOT starve at realistic — sub-spacing-per-frame —
++/// pour speeds, which the old per-frame floor did).
++#[test]
++fn emission_rate_matches_flow_no_starvation() {
++    let Some(gpu) = GpuContext::new_headless() else {
++        eprintln!("xpbd_emission: no GPU adapter; skipping.");
++        return;
++    };
++    // Solve off so active_count == emitted count (emission is independent of the solve).
++    let cfg = Config {
++        max_iters: 0,
++        ..Config::default()
++    };
++    let mut solver =
++        XpbdSolver::build(&empty_pour_scene(9999.0), &Materials::default(), &cfg, &gpu);
++    let v_w = solver.water_particle_volume();
++    let flow = 5.0;
++    let steps = 120u32; // 2 s
++    for _ in 0..steps {
++        solver.step(DT, &pour([6.0, 11.0, 6.0], flow));
++    }
++    let emitted = solver.active_count();
++    let expected = flow / v_w * (steps as f32 * DT);
++    assert!(
++        emitted > 0,
++        "emitter starved (0 particles) — arclength credit broken"
++    );
++    assert!(
++        (emitted as f32 - expected).abs() <= 0.10 * expected + 8.0,
++        "emitted {emitted} far from expected {expected:.1}"
++    );
++    // Emitted-mass counter tracks the count.
++    let m = solver.total_emitted_water_mass();
++    assert!(
++        (m - emitted as f32 * 1.0).abs() <= 1.0e-3,
++        "emitted-mass {m} != count {emitted} × particle_mass"
++    );
++}
++
++/// A gentle pour (sub-spacing travel per frame) still emits — direct guard against the starvation
++/// failure mode the per-frame floor caused.
++#[test]
++fn gentle_pour_does_not_starve() {
++    let Some(gpu) = GpuContext::new_headless() else {
++        eprintln!("xpbd_emission: no GPU adapter; skipping.");
++        return;
++    };
++    let cfg = Config {
++        max_iters: 0,
++        ..Config::default()
++    };
++    let mut solver =
++        XpbdSolver::build(&empty_pour_scene(9999.0), &Materials::default(), &cfg, &gpu);
++    // Very gentle flow → exit_speed·dt ≪ particle_spacing; the old floor(travel/spacing)=0 would emit 0.
++    for _ in 0..240 {
++        solver.step(DT, &pour([6.0, 11.0, 6.0], 0.4));
++    }
++    assert!(
++        solver.active_count() > 0,
++        "gentle pour starved to 0 particles"
++    );
++}
++
++/// Emitted particles are seeded as full, cold-of-solute water at the pour temperature.
++#[test]
++fn emitted_particles_are_seeded_water() {
++    let Some(gpu) = GpuContext::new_headless() else {
++        eprintln!("xpbd_emission: no GPU adapter; skipping.");
++        return;
++    };
++    let cfg = Config {
++        max_iters: 0,
++        ..Config::default()
++    };
++    let mats = Materials::default();
++    let mut solver = XpbdSolver::build(&empty_pour_scene(9999.0), &mats, &cfg, &gpu);
++    for _ in 0..30 {
++        solver.step(DT, &pour([6.0, 11.0, 6.0], 5.0));
++    }
++    let phase = solver.read_phases();
++    let chem = solver.read_chem();
++    let moisture = solver.read_moisture();
++    assert!(!phase.is_empty(), "no emission");
++    assert_eq!(phase.len(), solver.active_count() as usize);
++    for (i, &ph) in phase.iter().enumerate() {
++        assert_eq!(ph, 0, "emitted particle {i} not water");
++        assert!((moisture[i] - 1.0).abs() <= 1.0e-6, "emitted f_w != 1");
++        assert!(chem[i][0].abs() <= 1.0e-6, "emitted c != 0");
++        assert!(
++            (chem[i][1] - mats.pour_t).abs() <= 1.0e-6,
++            "emitted T != pour_t"
++        );
++    }
++}
++
++/// Determinism: identical pour inputs produce identical emission (count + positions).
++#[test]
++fn emission_is_deterministic() {
++    let Some(gpu) = GpuContext::new_headless() else {
++        eprintln!("xpbd_emission: no GPU adapter; skipping.");
++        return;
++    };
++    let cfg = Config {
++        max_iters: 0,
++        ..Config::default()
++    };
++    let run = || {
++        let mut solver =
++            XpbdSolver::build(&empty_pour_scene(9999.0), &Materials::default(), &cfg, &gpu);
++        for _ in 0..60 {
++            solver.step(DT, &pour([6.0, 11.0, 6.0], 5.0));
++        }
++        (solver.active_count(), solver.read_positions())
++    };
++    let (n1, p1) = run();
++    let (n2, p2) = run();
++    assert_eq!(n1, n2, "emission count not deterministic");
++    for (a, b) in p1.iter().zip(&p2) {
++        assert_eq!(a, b, "emission positions not deterministic");
++    }
++}
++
++/// Capacity clamp: emission never exceeds the allocated pool (active_count saturates at capacity).
++#[test]
++fn emission_clamps_at_capacity() {
++    let Some(gpu) = GpuContext::new_headless() else {
++        eprintln!("xpbd_emission: no GPU adapter; skipping.");
++        return;
++    };
++    let cfg = Config {
++        max_iters: 0,
++        ..Config::default()
++    };
++    // Tiny dose → small capacity; pour far more than it can hold.
++    let mut solver = XpbdSolver::build(&empty_pour_scene(50.0), &Materials::default(), &cfg, &gpu);
++    let cap = solver.pool_capacity();
++    assert!(cap > 0);
++    for _ in 0..600 {
++        solver.step(DT, &pour([6.0, 11.0, 6.0], 20.0));
++        assert!(
++            solver.active_count() <= cap,
++            "active_count {} exceeded capacity {cap}",
++            solver.active_count()
++        );
++    }
++    assert_eq!(
++        solver.active_count(),
++        cap,
++        "pour did not fill the pool to capacity"
++    );
++}
++
++/// PBF-safe inlet: continuous emission into a closed box with the FULL incompressibility solve on
++/// stays finite and bounded — no density-spike eruption (the failure the arclength/rest-density inlet
++/// is designed to prevent).
++#[test]
++fn emission_into_full_solve_does_not_erupt() {
++    let Some(gpu) = GpuContext::new_headless() else {
++        eprintln!("xpbd_emission: no GPU adapter; skipping.");
++        return;
++    };
++    let mats = Materials::default();
++    let cfg = Config::default(); // full water solve on
++    let scene = Scene {
++        pour_water_ml: 4000.0,
++        gravity: [0.0, -20.0, 0.0],
++        box_min: [0.0, 0.0, 0.0],
++        box_max: [12.0, 16.0, 12.0],
++        regions: vec![],
++        ..Scene::default()
++    };
++    let mut solver = XpbdSolver::build(&scene, &mats, &cfg, &gpu);
++    for _ in 0..300 {
++        solver.step(DT, &pour([6.0, 14.0, 6.0], 20.0));
++    }
++    let pos = solver.read_positions();
++    let vel = solver.read_velocities();
++    assert!(
++        solver.active_count() > 50,
++        "too little emitted ({}) to be a meaningful stability test",
++        solver.active_count()
++    );
++    assert!(
++        pos.iter()
++            .all(|p| p[0].is_finite() && p[1].is_finite() && p[2].is_finite()),
++        "non-finite position (inlet eruption)"
++    );
++    let vmax = vel
++        .iter()
++        .map(|v| (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt())
++        .fold(0.0f32, f32::max);
++    assert!(
++        vmax <= cfg.max_speed + 1.0,
++        "velocity blew past the cap (eruption): vmax {vmax}"
++    );
++}

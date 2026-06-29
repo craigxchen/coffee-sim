@@ -1,0 +1,991 @@
+OpenAI Codex v0.137.0
+--------
+workdir: /Users/cxc/Github/coffee-sim
+model: gpt-5.5
+provider: openai
+approval: never
+sandbox: read-only
+reasoning effort: high
+reasoning summaries: none
+session id: 019e98c9-07a7-7582-b3b2-1ce5854e637c
+--------
+user
+You are reviewing a focused solver bug fix (Rust + WGSL, PBF water). Verdict on FIRST LINE: APPROVE,
+REVISE, or REJECT, then explain briefly. Maintainer is a physics reviewer.
+
+BUG: the XSPH viscosity kernel (src/solvers/xpbd/water.wgsl, fn xsph) accumulated
+`dv += (vel[j]-vi) * w_poly6(r,h)` — an UNNORMALIZED kernel sum. w_poly6 ∝ 1/h^9, so Σ W_poly6 ∝
+1/h^3, which grows as resolution refines (h = 2*spacing). At fine spacing a fixed xsph_c overshoots
+(xsph_c * Σ W * Δv >> Δv), AMPLIFYING velocity instead of smoothing. xsph runs AFTER finalize's
+max_speed clamp and rewrites vel, so it un-caps the velocity → catastrophic eruption at fine
+resolution (vmax 10^5+, water sprayed everywhere). At the default spacing 1.0 the sum is tame so it
+was never caught.
+
+FIX: standard XSPH normalization — multiply the kernel term by the particle volume V_w = m/ρ0
+(`dv += (vel[j]-vi) * (w_poly6(r,h) * v_w)`), so Σ V_w·W ≈ 1 (dimensionless, resolution-independent)
+and xsph_c behaves consistently at any spacing.
+
+Evaluate:
+1. Is this the correct standard XSPH normalization (m_j/ρ_j ≈ V_w for equal-mass water)? Any sign/
+   factor error?
+2. At the default spacing 1.0 it changes the effective viscosity by the V_w factor — is that a concern?
+   (The full water/dam-break/wetting/coupling/geometry suites still pass unchanged.)
+3. Does it correctly fix the resolution dependence, and is the post-clamp-amplification analysis right
+   (xsph runs after finalize, so an unnormalized overshoot escapes the max_speed cap)?
+4. Any remaining issue (grains skip xsph — fine? the v_w uses params.particle_mass/rest_density —
+   correct for water?).
+5. The regression test asserts vmax ≤ max_speed+1 at fine spacing — adequate?
+
+The diff follows.
+========================================================================
+diff --git a/src/solvers/xpbd/water.wgsl b/src/solvers/xpbd/water.wgsl
+index 5683b3a..9eae83b 100644
+--- a/src/solvers/xpbd/water.wgsl
++++ b/src/solvers/xpbd/water.wgsl
+@@ -178,6 +178,11 @@ fn xsph(@builtin(global_invocation_id) gid: vec3<u32>) {
+     let xi = pos[i].xyz;
+     let vi = vel[i].xyz;
+     var dv = vec3<f32>(0.0);
++    // Per-particle volume V_w = m/ρ₀ normalizes the kernel sum (standard XSPH: Δv = c·Σ (m_j/ρ_j)
++    // (v_j−v_i) W). Without it, Σ W_poly6 ∝ 1/h³ grows as the resolution refines, so a fixed xsph_c
++    // overshoots (amplifies velocity instead of smoothing it) at fine spacing — a resolution-dependent
++    // eruption. With it, Σ V_w·W ≈ 1 (dimensionless), so xsph_c behaves consistently at any spacing.
++    let v_w = params.particle_mass / params.rest_density;
+ 
+     let base = cell_coord(xi);
+     for (var dz = -1; dz <= 1; dz = dz + 1) {
+@@ -196,7 +201,7 @@ fn xsph(@builtin(global_invocation_id) gid: vec3<u32>) {
+                     let d = xi - pos[j].xyz;
+                     let r = length(d);
+                     if (r >= h) { continue; }
+-                    dv = dv + (vel[j].xyz - vi) * w_poly6(r, h);
++                    dv = dv + (vel[j].xyz - vi) * (w_poly6(r, h) * v_w);
+                 }
+             }
+         }
+diff --git a/tests/xpbd_emission.rs b/tests/xpbd_emission.rs
+index 97e7b7f..929eff1 100644
+--- a/tests/xpbd_emission.rs
++++ b/tests/xpbd_emission.rs
+@@ -557,3 +557,56 @@ fn v60_pour_emission_is_deterministic() {
+         "yield not sane across runs: {y1}, {y2}"
+     );
+ }
++
++/// Regression for the XSPH resolution-normalization bug: emitting water at FINE spacing into the full
++/// solve must stay velocity-bounded (≤ max_speed). Before the fix, the unnormalized XSPH sum (∝1/h³)
++/// overshot at fine spacing and amplified velocity post-clamp — vmax exploded to 10^5+ and the inlet
++/// sprayed everywhere. The default-spacing `emission_into_full_solve_does_not_erupt` missed it because
++/// at spacing 1.0 the kernel sum is tame.
++#[test]
++fn fine_resolution_emission_stays_bounded() {
++    let Some(gpu) = GpuContext::new_headless() else {
++        eprintln!("xpbd_emission: no GPU adapter; skipping.");
++        return;
++    };
++    // Fine water (spacing 0.15) — the regime that erupted before the XSPH normalization fix.
++    let s = 0.15;
++    let mats = Materials {
++        particle_spacing: s,
++        support_radius: 2.0 * s,
++        grain_diameter: 2.0 * s,
++        ..Materials::default()
++    };
++    let cfg = Config::default(); // full water solve (incl. XSPH) on
++    let scene = Scene {
++        pour_water_ml: 3000.0,
++        gravity: [0.0, -20.0, 0.0],
++        box_min: [0.0, 0.0, 0.0],
++        box_max: [6.0, 12.0, 6.0],
++        regions: vec![],
++        ..Scene::default()
++    };
++    let mut solver = XpbdSolver::build(&scene, &mats, &cfg, &gpu);
++    for _ in 0..240 {
++        solver.step(DT, &pour([3.0, 10.0, 3.0], 8.0));
++    }
++    assert!(
++        solver.active_count() > 500,
++        "too little emitted ({}) to stress the inlet",
++        solver.active_count()
++    );
++    let pos = solver.read_positions();
++    let vel = solver.read_velocities();
++    assert!(
++        pos.iter().all(|p| p.iter().all(|c| c.is_finite())),
++        "non-finite position at fine resolution (eruption)"
++    );
++    let vmax = vel
++        .iter()
++        .map(|v| (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt())
++        .fold(0.0f32, f32::max);
++    assert!(
++        vmax <= cfg.max_speed + 1.0,
++        "fine-resolution emission velocity blew past max_speed (XSPH normalization regression): vmax {vmax}"
++    );
++}
+
+codex
+I’ll verify the shader ordering and parameter definitions in the repo before giving a verdict, since the key risk is whether `xsph` really runs after the clamp and whether `particle_mass/rest_density` is the right water volume.
+exec
+/bin/zsh -lc "sed -n '1,260p' src/solvers/xpbd/water.wgsl" in /Users/cxc/Github/coffee-sim
+ succeeded in 0ms:
+// Water incompressibility (Position Based Fluids — Macklin & Müller 2013): the constant-density
+// constraint + λ, the s_corr artificial-pressure Δp, the convergence reduction, and XSPH
+// viscosity. Concatenated after `common.wgsl`, which declares Params/Status/bindings + the SPH
+// and grid helpers these kernels use.
+//
+// Every density sum is phase-guarded: a grain neighbor has no fluid density and must not enter
+// the water constraint (and grain particles skip the water solve entirely). For a single-species
+// water scene the guards are pass-throughs, so water behaviour is unchanged.
+
+@compute @workgroup_size(256)
+fn compute_lambda(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= params.particle_count) { return; }
+    if (status.converged != 0u) { return; }
+    if (phase[i] != PHASE_WATER) { return; } // grains have no density constraint
+    let h = params.h;
+    let m = params.particle_mass;
+    let xi = pred[i].xyz;
+    // Wetting: water carries a remaining-volume fraction f_w in pred.w. A near-empty particle is
+    // skipped (inert), and every water contributes its f_w-weighted mass — so the density solve
+    // matches the actual fluid at the wet front. f_w≡1 (no absorption) ⇒ identical to before.
+    let f_i = pred[i].w;
+    if (f_i <= params.pbf_eps) {
+        lambda[i] = 0.0;
+        c_residual[i] = 0.0;
+        return;
+    }
+
+    var rho = m * f_i * w_poly6(0.0, h);
+    var sum_g = vec3<f32>(0.0);
+    var sum_g2 = 0.0;
+
+    let base = cell_coord(xi);
+    for (var dz = -1; dz <= 1; dz = dz + 1) {
+        for (var dy = -1; dy <= 1; dy = dy + 1) {
+            for (var dx = -1; dx <= 1; dx = dx + 1) {
+                let nc = base + vec3<i32>(dx, dy, dz);
+                if (nc.x < 0 || nc.y < 0 || nc.z < 0) { continue; }
+                let dims = vec3<i32>(params.grid_dims.xyz);
+                if (nc.x >= dims.x || nc.y >= dims.y || nc.z >= dims.z) { continue; }
+                let cid = cell_id(nc);
+                let lo = cell_start[cid];
+                let hi = cell_start[cid + 1u];
+                for (var s = lo; s < hi; s = s + 1u) {
+                    let j = sorted_indices[s];
+                    if (j == i) { continue; }
+                    if (phase[j] != PHASE_WATER) { continue; } // skip grain neighbors
+                    let fj = pred[j].w;
+                    if (fj <= params.pbf_eps) { continue; } // skip near-empty (absorbed) water
+                    let d = xi - pred[j].xyz;
+                    let r = length(d);
+                    if (r >= h) { continue; }
+                    rho = rho + m * fj * w_poly6(r, h);
+                    let gj = m * fj * spiky_grad(d, h, params.spiky_r_min);
+                    sum_g = sum_g + gj;
+                    sum_g2 = sum_g2 + dot(gj, gj);
+                }
+            }
+        }
+    }
+
+    // Pore-modulated rest density: where grains are present the water target is ρ₀·(1−α_s), so
+    // pore water packs to fill only the pore fraction (α_s+α_f=1) instead of full ρ₀ — which would
+    // over-fill and get expelled. α_s=0 (single-species water) → unmodulated ρ₀ (identical).
+    let pore = max(1.0 - alpha_s[i], 0.05);
+    let inv_rho0 = 1.0 / (params.rest_density * pore);
+    let c = rho * inv_rho0 - 1.0;
+    let denom = (dot(sum_g, sum_g) + sum_g2) * inv_rho0 * inv_rho0 + params.relaxation_eps;
+    var lam = -c / denom;
+    if (params.lambda_noncohesive != 0u && lam > 0.0) {
+        lam = 0.0;
+    }
+    lambda[i] = lam;
+    // Convergence is measured on COMPRESSION only: free-surface particles always have
+    // c ≈ −1 (density deficit), which incompressibility neither can nor should fix, so
+    // including them would prevent early-exit forever. max(0, c) = over-density violation.
+    c_residual[i] = max(0.0, c);
+}
+
+var<workgroup> sdata: array<f32, 256>;
+
+@compute @workgroup_size(256)
+fn residual_reduce(@builtin(local_invocation_id) lid: vec3<u32>) {
+    if (status.converged != 0u) { return; }
+    let tid = lid.x;
+    var local_max = 0.0;
+    var i = tid;
+    loop {
+        if (i >= params.particle_count) { break; }
+        local_max = max(local_max, c_residual[i]);
+        i = i + 256u;
+    }
+    sdata[tid] = local_max;
+    workgroupBarrier();
+    var stride = 128u;
+    loop {
+        if (stride == 0u) { break; }
+        if (tid < stride) {
+            sdata[tid] = max(sdata[tid], sdata[tid + stride]);
+        }
+        workgroupBarrier();
+        stride = stride / 2u;
+    }
+    if (tid == 0u) {
+        let gmax = sdata[0];
+        status.residual_bits = bitcast<u32>(gmax);
+        status.iters_done = status.iters_done + 1u;
+        if (status.iters_done >= params.min_iters && gmax < params.residual_tolerance) {
+            status.converged = 1u;
+            status.effective_iters = status.iters_done;
+        }
+    }
+}
+
+@compute @workgroup_size(256)
+fn compute_dp(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= params.particle_count) { return; }
+    if (status.converged != 0u) { return; }
+    if (phase[i] != PHASE_WATER) { return; } // grains are projected by bed_project
+    let h = params.h;
+    let m = params.particle_mass;
+    let xi = pred[i].xyz;
+    let lam_i = lambda[i];
+    // Skip near-empty (absorbed) water; weight neighbor contributions by their f_w (pred.w) to match
+    // compute_lambda. f_w≡1 (no absorption) ⇒ identical to before.
+    if (pred[i].w <= params.pbf_eps) {
+        dp[i] = vec4<f32>(0.0);
+        return;
+    }
+
+    var sum = vec3<f32>(0.0);
+    let base = cell_coord(xi);
+    for (var dz = -1; dz <= 1; dz = dz + 1) {
+        for (var dy = -1; dy <= 1; dy = dy + 1) {
+            for (var dx = -1; dx <= 1; dx = dx + 1) {
+                let nc = base + vec3<i32>(dx, dy, dz);
+                if (nc.x < 0 || nc.y < 0 || nc.z < 0) { continue; }
+                let dims = vec3<i32>(params.grid_dims.xyz);
+                if (nc.x >= dims.x || nc.y >= dims.y || nc.z >= dims.z) { continue; }
+                let cid = cell_id(nc);
+                let lo = cell_start[cid];
+                let hi = cell_start[cid + 1u];
+                for (var s = lo; s < hi; s = s + 1u) {
+                    let j = sorted_indices[s];
+                    if (j == i) { continue; }
+                    if (phase[j] != PHASE_WATER) { continue; } // skip grain neighbors
+                    let fj = pred[j].w;
+                    if (fj <= params.pbf_eps) { continue; } // skip near-empty (absorbed) water
+                    let d = xi - pred[j].xyz;
+                    let r = length(d);
+                    if (r >= h) { continue; }
+                    let wr = w_poly6(r, h);
+                    let ratio = wr / params.s_corr_wq;
+                    let scorr = -params.s_corr_k * pow(ratio, params.s_corr_n);
+                    let gj = m * fj * spiky_grad(d, h, params.spiky_r_min);
+                    sum = sum + (lam_i + lambda[j] + scorr) * gj;
+                }
+            }
+        }
+    }
+    let pore = max(1.0 - alpha_s[i], 0.05);
+    let inv_rho0 = 1.0 / (params.rest_density * pore);
+    dp[i] = vec4<f32>(sum * inv_rho0, 0.0);
+}
+
+@compute @workgroup_size(256)
+fn xsph(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= params.particle_count) { return; }
+    // Viscosity is a fluid term; grains pass through unchanged (so the vel_smoothed→vel copy in a
+    // mixed scene doesn't clobber grain velocities).
+    if (phase[i] != PHASE_WATER) {
+        vel_smoothed[i] = vel[i];
+        return;
+    }
+    let h = params.h;
+    let xi = pos[i].xyz;
+    let vi = vel[i].xyz;
+    var dv = vec3<f32>(0.0);
+    // Per-particle volume V_w = m/ρ₀ normalizes the kernel sum (standard XSPH: Δv = c·Σ (m_j/ρ_j)
+    // (v_j−v_i) W). Without it, Σ W_poly6 ∝ 1/h³ grows as the resolution refines, so a fixed xsph_c
+    // overshoots (amplifies velocity instead of smoothing it) at fine spacing — a resolution-dependent
+    // eruption. With it, Σ V_w·W ≈ 1 (dimensionless), so xsph_c behaves consistently at any spacing.
+    let v_w = params.particle_mass / params.rest_density;
+
+    let base = cell_coord(xi);
+    for (var dz = -1; dz <= 1; dz = dz + 1) {
+        for (var dy = -1; dy <= 1; dy = dy + 1) {
+            for (var dx = -1; dx <= 1; dx = dx + 1) {
+                let nc = base + vec3<i32>(dx, dy, dz);
+                if (nc.x < 0 || nc.y < 0 || nc.z < 0) { continue; }
+                let dims = vec3<i32>(params.grid_dims.xyz);
+                if (nc.x >= dims.x || nc.y >= dims.y || nc.z >= dims.z) { continue; }
+                let cid = cell_id(nc);
+                let lo = cell_start[cid];
+                let hi = cell_start[cid + 1u];
+                for (var s = lo; s < hi; s = s + 1u) {
+                    let j = sorted_indices[s];
+                    if (j == i) { continue; }
+                    let d = xi - pos[j].xyz;
+                    let r = length(d);
+                    if (r >= h) { continue; }
+                    dv = dv + (vel[j].xyz - vi) * (w_poly6(r, h) * v_w);
+                }
+            }
+        }
+    }
+    vel_smoothed[i] = vec4<f32>(vi + params.xsph_c * dv, 0.0);
+}
+
+exec
+/bin/zsh -lc 'rg -n "xsph|finalize|max_speed|particle_mass|rest_density" src/solvers/xpbd src/models src/utils tests/xpbd_emission.rs' in /Users/cxc/Github/coffee-sim
+exec
+/bin/zsh -lc "rg -n \"struct Params|particle_mass|rest_density|WaterParams|XpbdParams|Params\" src/solvers/xpbd src -g '*.rs' -g '*.wgsl'" in /Users/cxc/Github/coffee-sim
+ succeeded in 0ms:
+src/solvers/xpbd/wetting.wgsl:18:fn wet_v_water() -> f32 { return params.particle_mass / params.rest_density; }
+src/solvers/xpbd/wetting.wgsl:144:                    p_abs = p_abs + take * params.rest_density * vel[j].xyz;
+src/solvers/xpbd/wetting.wgsl:150:    let m_old = params.grain_mass + params.rest_density * v_abs;
+src/solvers/xpbd/wetting.wgsl:151:    let dm = params.rest_density * d_v;
+src/solvers/xpbd/mod.rs:38:struct Params {
+src/solvers/xpbd/mod.rs:46:    rest_density: f32,
+src/solvers/xpbd/mod.rs:47:    particle_mass: f32,
+src/solvers/xpbd/mod.rs:102:    cp_water: f32,     // water specific heat (C_water = particle_mass·f_w·cp_water)
+src/solvers/xpbd/mod.rs:110:// Params is uploaded as a uniform and must stay byte-identical to the WGSL `Params`.
+src/solvers/xpbd/mod.rs:111:const _: () = assert!(std::mem::size_of::<Params>() == 320);
+src/solvers/xpbd/mod.rs:271:    params: Params,
+src/solvers/xpbd/mod.rs:579:    /// Single water-particle volume `V_w = particle_mass / rest_density` (dev/test only). Lets a
+src/solvers/xpbd/mod.rs:582:        self.params.particle_mass / self.params.rest_density
+src/solvers/xpbd/mod.rs:739:        let v_w = self.params.particle_mass / self.params.rest_density;
+src/solvers/xpbd/mod.rs:740:        let rho_w = self.params.rest_density;
+src/solvers/xpbd/mod.rs:762:                    cup_water_mass += f_w * v_w * rho_w; // = f_w · particle_mass
+src/solvers/xpbd/mod.rs:911:        self.inflow.emitted_mass += emit_n as f32 * self.params.particle_mass;
+src/solvers/xpbd/mod.rs:952:        let m = mats.particle_mass;
+src/solvers/xpbd/mod.rs:987:        let rest_density = kernels::rest_density(s, h, m);
+src/solvers/xpbd/mod.rs:992:        let v_w = m / rest_density;
+src/solvers/xpbd/mod.rs:1007:        let params = Params {
+src/solvers/xpbd/mod.rs:1015:            rest_density,
+src/solvers/xpbd/mod.rs:1016:            particle_mass: m,
+src/solvers/xpbd/mod.rs:1253:        // Params/Status/bindings + shared kernels; `water`/`bed`/`coupling`/`wetting` add the
+src/models/wetting.rs:58:pub fn water_eff_mass(particle_mass: f32, f_w: f32) -> f32 {
+src/models/wetting.rs:59:    particle_mass * f_w
+src/models/mod.rs:17:/// For the water core only the water discretization params are used. `rest_density` ρ₀ is
+src/models/mod.rs:30:    pub particle_mass: f32,
+src/models/mod.rs:102:            particle_mass: 1.0,
+src/solvers/xpbd/coupling.wgsl:76:    // (V_abs=0, f_w=1) ⇒ the original particle_mass/grain_mass split. w_self computed per neighbor.
+src/solvers/xpbd/coupling.wgsl:367:    let m_w = max(water_eff_mass(pred[i].w), params.particle_mass * params.pbf_eps);
+src/solvers/xpbd/water.wgsl:3:// viscosity. Concatenated after `common.wgsl`, which declares Params/Status/bindings + the SPH
+src/solvers/xpbd/water.wgsl:17:    let m = params.particle_mass;
+src/solvers/xpbd/water.wgsl:66:    let inv_rho0 = 1.0 / (params.rest_density * pore);
+src/solvers/xpbd/water.wgsl:122:    let m = params.particle_mass;
+src/solvers/xpbd/water.wgsl:163:    let inv_rho0 = 1.0 / (params.rest_density * pore);
+src/solvers/xpbd/water.wgsl:185:    let v_w = params.particle_mass / params.rest_density;
+src/solvers/xpbd/common.wgsl:15:struct Params {
+src/solvers/xpbd/common.wgsl:23:    rest_density: f32,
+src/solvers/xpbd/common.wgsl:24:    particle_mass: f32,
+src/solvers/xpbd/common.wgsl:98:@group(0) @binding(0) var<uniform> params: Params;
+src/solvers/xpbd/common.wgsl:348:fn grain_eff_mass(v_abs: f32) -> f32 { return params.grain_mass + params.rest_density * v_abs; }
+src/solvers/xpbd/common.wgsl:349:fn water_eff_mass(f_w: f32) -> f32 { return params.particle_mass * f_w; }
+src/solvers/xpbd/common.wgsl:363:    return clamp(params.rest_density / max(rho_g, 1.0e-6), 0.0, 1.0);
+src/utils/kernels.rs:46:pub fn rest_density(spacing: f32, support_radius: f32, mass: f32) -> f32 {
+src/utils/kernels.rs:90:    fn rest_density_positive_and_increases_with_packing() {
+src/utils/kernels.rs:92:        let dense = rest_density(0.8, 2.0, 1.0);
+src/utils/kernels.rs:93:        let sparse = rest_density(1.2, 2.0, 1.0);
+src/solvers/xpbd/wetting.wgsl:18:fn wet_v_water() -> f32 { return params.particle_mass / params.rest_density; }
+src/solvers/xpbd/wetting.wgsl:144:                    p_abs = p_abs + take * params.rest_density * vel[j].xyz;
+src/solvers/xpbd/wetting.wgsl:150:    let m_old = params.grain_mass + params.rest_density * v_abs;
+src/solvers/xpbd/wetting.wgsl:151:    let dm = params.rest_density * d_v;
+src/solvers/xpbd/mod.rs:38:struct Params {
+src/solvers/xpbd/mod.rs:46:    rest_density: f32,
+src/solvers/xpbd/mod.rs:47:    particle_mass: f32,
+src/solvers/xpbd/mod.rs:102:    cp_water: f32,     // water specific heat (C_water = particle_mass·f_w·cp_water)
+src/solvers/xpbd/mod.rs:110:// Params is uploaded as a uniform and must stay byte-identical to the WGSL `Params`.
+src/solvers/xpbd/mod.rs:111:const _: () = assert!(std::mem::size_of::<Params>() == 320);
+src/solvers/xpbd/mod.rs:271:    params: Params,
+src/solvers/xpbd/mod.rs:579:    /// Single water-particle volume `V_w = particle_mass / rest_density` (dev/test only). Lets a
+src/solvers/xpbd/mod.rs:582:        self.params.particle_mass / self.params.rest_density
+src/solvers/xpbd/mod.rs:739:        let v_w = self.params.particle_mass / self.params.rest_density;
+src/solvers/xpbd/mod.rs:740:        let rho_w = self.params.rest_density;
+src/solvers/xpbd/mod.rs:762:                    cup_water_mass += f_w * v_w * rho_w; // = f_w · particle_mass
+src/solvers/xpbd/mod.rs:911:        self.inflow.emitted_mass += emit_n as f32 * self.params.particle_mass;
+src/solvers/xpbd/mod.rs:952:        let m = mats.particle_mass;
+src/solvers/xpbd/mod.rs:987:        let rest_density = kernels::rest_density(s, h, m);
+src/solvers/xpbd/mod.rs:992:        let v_w = m / rest_density;
+src/solvers/xpbd/mod.rs:1007:        let params = Params {
+src/solvers/xpbd/mod.rs:1015:            rest_density,
+src/solvers/xpbd/mod.rs:1016:            particle_mass: m,
+src/solvers/xpbd/mod.rs:1253:        // Params/Status/bindings + shared kernels; `water`/`bed`/`coupling`/`wetting` add the
+src/solvers/xpbd/coupling.wgsl:76:    // (V_abs=0, f_w=1) ⇒ the original particle_mass/grain_mass split. w_self computed per neighbor.
+src/solvers/xpbd/coupling.wgsl:367:    let m_w = max(water_eff_mass(pred[i].w), params.particle_mass * params.pbf_eps);
+src/solvers/xpbd/water.wgsl:3:// viscosity. Concatenated after `common.wgsl`, which declares Params/Status/bindings + the SPH
+src/solvers/xpbd/water.wgsl:17:    let m = params.particle_mass;
+src/solvers/xpbd/water.wgsl:66:    let inv_rho0 = 1.0 / (params.rest_density * pore);
+src/solvers/xpbd/water.wgsl:122:    let m = params.particle_mass;
+src/solvers/xpbd/water.wgsl:163:    let inv_rho0 = 1.0 / (params.rest_density * pore);
+src/solvers/xpbd/water.wgsl:185:    let v_w = params.particle_mass / params.rest_density;
+src/solvers/xpbd/common.wgsl:15:struct Params {
+src/solvers/xpbd/common.wgsl:23:    rest_density: f32,
+src/solvers/xpbd/common.wgsl:24:    particle_mass: f32,
+src/solvers/xpbd/common.wgsl:98:@group(0) @binding(0) var<uniform> params: Params;
+src/solvers/xpbd/common.wgsl:348:fn grain_eff_mass(v_abs: f32) -> f32 { return params.grain_mass + params.rest_density * v_abs; }
+src/solvers/xpbd/common.wgsl:349:fn water_eff_mass(f_w: f32) -> f32 { return params.particle_mass * f_w; }
+src/solvers/xpbd/common.wgsl:363:    return clamp(params.rest_density / max(rho_g, 1.0e-6), 0.0, 1.0);
+
+ succeeded in 0ms:
+tests/xpbd_emission.rs:236:        "emitted-mass {m} != count {emitted} × particle_mass"
+tests/xpbd_emission.rs:393:        vmax <= cfg.max_speed + 1.0,
+tests/xpbd_emission.rs:464:    let rho_w = 1.0 / v_w; // particle_mass = 1
+tests/xpbd_emission.rs:562:/// solve must stay velocity-bounded (≤ max_speed). Before the fix, the unnormalized XSPH sum (∝1/h³)
+tests/xpbd_emission.rs:609:        vmax <= cfg.max_speed + 1.0,
+tests/xpbd_emission.rs:610:        "fine-resolution emission velocity blew past max_speed (XSPH normalization regression): vmax {vmax}"
+src/utils/config.rs:43:    pub xsph_viscosity_c: f32,
+src/utils/config.rs:49:    /// Velocity clamp `‖v‖ ≤ max_speed` (CFL + anti-blow-up backstop).
+src/utils/config.rs:50:    pub max_speed: f32,
+src/utils/config.rs:133:            xsph_viscosity_c: 0.05,
+src/utils/config.rs:143:            max_speed: 50.0,
+src/utils/kernels.rs:46:pub fn rest_density(spacing: f32, support_radius: f32, mass: f32) -> f32 {
+src/utils/kernels.rs:90:    fn rest_density_positive_and_increases_with_packing() {
+src/utils/kernels.rs:92:        let dense = rest_density(0.8, 2.0, 1.0);
+src/utils/kernels.rs:93:        let sparse = rest_density(1.2, 2.0, 1.0);
+src/models/mod.rs:17:/// For the water core only the water discretization params are used. `rest_density` ρ₀ is
+src/models/mod.rs:30:    pub particle_mass: f32,
+src/models/mod.rs:102:            particle_mass: 1.0,
+src/models/wetting.rs:58:pub fn water_eff_mass(particle_mass: f32, f_w: f32) -> f32 {
+src/models/wetting.rs:59:    particle_mass * f_w
+src/solvers/xpbd/wetting.wgsl:13:// its own slot, so no atomics are needed. Runs after finalize; the next predict mirrors the new pos.w.
+src/solvers/xpbd/wetting.wgsl:18:fn wet_v_water() -> f32 { return params.particle_mass / params.rest_density; }
+src/solvers/xpbd/wetting.wgsl:144:                    p_abs = p_abs + take * params.rest_density * vel[j].xyz;
+src/solvers/xpbd/wetting.wgsl:150:    let m_old = params.grain_mass + params.rest_density * v_abs;
+src/solvers/xpbd/wetting.wgsl:151:    let dm = params.rest_density * d_v;
+src/solvers/xpbd/mod.rs:46:    rest_density: f32,
+src/solvers/xpbd/mod.rs:47:    particle_mass: f32,
+src/solvers/xpbd/mod.rs:53:    xsph_c: f32,
+src/solvers/xpbd/mod.rs:54:    max_speed: f32,
+src/solvers/xpbd/mod.rs:102:    cp_water: f32,     // water specific heat (C_water = particle_mass·f_w·cp_water)
+src/solvers/xpbd/mod.rs:213:    finalize: wgpu::ComputePipeline,
+src/solvers/xpbd/mod.rs:214:    xsph: wgpu::ComputePipeline,
+src/solvers/xpbd/mod.rs:244:    finalize: wgpu::BindGroup,
+src/solvers/xpbd/mod.rs:245:    xsph: wgpu::BindGroup,
+src/solvers/xpbd/mod.rs:579:    /// Single water-particle volume `V_w = particle_mass / rest_density` (dev/test only). Lets a
+src/solvers/xpbd/mod.rs:582:        self.params.particle_mass / self.params.rest_density
+src/solvers/xpbd/mod.rs:739:        let v_w = self.params.particle_mass / self.params.rest_density;
+src/solvers/xpbd/mod.rs:740:        let rho_w = self.params.rest_density;
+src/solvers/xpbd/mod.rs:762:                    cup_water_mass += f_w * v_w * rho_w; // = f_w · particle_mass
+src/solvers/xpbd/mod.rs:911:        self.inflow.emitted_mass += emit_n as f32 * self.params.particle_mass;
+src/solvers/xpbd/mod.rs:952:        let m = mats.particle_mass;
+src/solvers/xpbd/mod.rs:987:        let rest_density = kernels::rest_density(s, h, m);
+src/solvers/xpbd/mod.rs:992:        let v_w = m / rest_density;
+src/solvers/xpbd/mod.rs:1015:            rest_density,
+src/solvers/xpbd/mod.rs:1016:            particle_mass: m,
+src/solvers/xpbd/mod.rs:1022:            xsph_c: cfg.xsph_viscosity_c,
+src/solvers/xpbd/mod.rs:1023:            max_speed: cfg.max_speed,
+src/solvers/xpbd/mod.rs:1305:            finalize: make("finalize"),
+src/solvers/xpbd/mod.rs:1306:            xsph: make("xsph"),
+src/solvers/xpbd/mod.rs:1622:            finalize: bg(
+src/solvers/xpbd/mod.rs:1623:                &pipelines.finalize,
+src/solvers/xpbd/mod.rs:1634:            xsph: bg(
+src/solvers/xpbd/mod.rs:1635:                &pipelines.xsph,
+src/solvers/xpbd/mod.rs:1650:            // (≈4 passes/iter) + coupling/finalize overhead; clamped to the query-set cap.
+src/solvers/xpbd/mod.rs:1972:                pass(&mut enc, &p.finalize, &b.finalize, "finalize", np);
+src/solvers/xpbd/mod.rs:1976:                    pass(&mut enc, &p.xsph, &b.xsph, "xsph", np);
+src/solvers/xpbd/mod.rs:1987:                // substep — after finalize/xsph so it reads final positions/velocities and its grain
+src/solvers/xpbd/mod.rs:1988:                // momentum merge isn't clobbered by the xsph velocity copy. Reads the frozen pred.w
+src/solvers/xpbd/extraction.wgsl:16:// Runs AFTER wetting/finalize, so it reads `pos` for both position (pos.xyz == pred.xyz post-finalize,
+src/solvers/xpbd/extraction.wgsl:44:// from the post-wetting positions/moisture + finalized velocity. Both transfer passes read this.
+src/solvers/xpbd/coupling.wgsl:76:    // (V_abs=0, f_w=1) ⇒ the original particle_mass/grain_mass split. w_self computed per neighbor.
+src/solvers/xpbd/coupling.wgsl:367:    let m_w = max(water_eff_mass(pred[i].w), params.particle_mass * params.pbf_eps);
+src/solvers/xpbd/coupling.wgsl:377:    // Static-solid push-out (push-out + species gate only; friction is owned by apply_dp/finalize, so
+src/solvers/xpbd/water.wgsl:17:    let m = params.particle_mass;
+src/solvers/xpbd/water.wgsl:66:    let inv_rho0 = 1.0 / (params.rest_density * pore);
+src/solvers/xpbd/water.wgsl:122:    let m = params.particle_mass;
+src/solvers/xpbd/water.wgsl:163:    let inv_rho0 = 1.0 / (params.rest_density * pore);
+src/solvers/xpbd/water.wgsl:168:fn xsph(@builtin(global_invocation_id) gid: vec3<u32>) {
+src/solvers/xpbd/water.wgsl:182:    // (v_j−v_i) W). Without it, Σ W_poly6 ∝ 1/h³ grows as the resolution refines, so a fixed xsph_c
+src/solvers/xpbd/water.wgsl:184:    // eruption. With it, Σ V_w·W ≈ 1 (dimensionless), so xsph_c behaves consistently at any spacing.
+src/solvers/xpbd/water.wgsl:185:    let v_w = params.particle_mass / params.rest_density;
+src/solvers/xpbd/water.wgsl:209:    vel_smoothed[i] = vec4<f32>(vi + params.xsph_c * dv, 0.0);
+src/solvers/xpbd/common.wgsl:2:// kernels both species use (predict, grid build, apply_dp, finalize). The water-incompressibility
+src/solvers/xpbd/common.wgsl:23:    rest_density: f32,
+src/solvers/xpbd/common.wgsl:24:    particle_mass: f32,
+src/solvers/xpbd/common.wgsl:30:    xsph_c: f32,
+src/solvers/xpbd/common.wgsl:31:    max_speed: f32,
+src/solvers/xpbd/common.wgsl:123:// under fluid load. Reset in predict, written by drag_grain, read in finalize.
+src/solvers/xpbd/common.wgsl:348:fn grain_eff_mass(v_abs: f32) -> f32 { return params.grain_mass + params.rest_density * v_abs; }
+src/solvers/xpbd/common.wgsl:349:fn water_eff_mass(f_w: f32) -> f32 { return params.particle_mass * f_w; }
+src/solvers/xpbd/common.wgsl:363:    return clamp(params.rest_density / max(rho_g, 1.0e-6), 0.0, 1.0);
+src/solvers/xpbd/common.wgsl:571:fn finalize(@builtin(global_invocation_id) gid: vec3<u32>) {
+src/solvers/xpbd/common.wgsl:595:    if (sp > params.max_speed) {
+src/solvers/xpbd/common.wgsl:596:        v = v * (params.max_speed / sp);
+
+codex
+The local code matches the premise so far: `rest_density` is a discretization-derived water density, and `v_w = particle_mass / rest_density` is already treated as the water particle volume elsewhere. I’m checking the dispatch sequence and copy-back now.
+exec
+/bin/zsh -lc "sed -n '1,80p' src/utils/kernels.rs" in /Users/cxc/Github/coffee-sim
+exec
+/bin/zsh -lc "sed -n '930,1010p' src/solvers/xpbd/mod.rs" in /Users/cxc/Github/coffee-sim
+exec
+/bin/zsh -lc "sed -n '1930,2010p' src/solvers/xpbd/mod.rs" in /Users/cxc/Github/coffee-sim
+ succeeded in 0ms:
+//! SPH smoothing kernels + gradients (CPU reference + tests). The WGSL solver implements
+//! the same functions on the GPU; these mirror them for `ρ₀` computation and unit tests.
+//!
+//! Poly6 for density, spiky gradient for the pressure/correction forces — the standard PBF
+//! pairing (Macklin & Müller 2013). v1's validated weights are recorded in `KEEP.md` §3.
+
+use std::f32::consts::PI;
+
+/// Poly6 smoothing kernel `W(r, h)` for `0 ≤ r ≤ h`, else 0.
+/// `W(r,h) = 315/(64π h⁹) · (h² − r²)³`.
+pub fn w_poly6(r: f32, h: f32) -> f32 {
+    if r >= h || r < 0.0 {
+        return 0.0;
+    }
+    let h2 = h * h;
+    let coeff = 315.0 / (64.0 * PI * h.powi(9));
+    let t = h2 - r * r;
+    coeff * t * t * t
+}
+
+/// Magnitude of the spiky kernel gradient for `0 < r ≤ h`, else 0.
+/// `|∇W(r,h)| = 45/(π h⁶) · (h − r)²`.
+pub fn spiky_grad_mag(r: f32, h: f32) -> f32 {
+    if r >= h || r <= 0.0 {
+        return 0.0;
+    }
+    let coeff = 45.0 / (PI * h.powi(6));
+    let t = h - r;
+    coeff * t * t
+}
+
+/// Spiky kernel gradient vector `∇_i W(x_i − x_j, h)` (points from j toward i).
+/// `d = x_i − x_j`. Returns zero for `r ≥ h` or `r == 0` (degenerate — caller jitters/clamps).
+pub fn spiky_grad(d: [f32; 3], h: f32) -> [f32; 3] {
+    let r = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+    if r >= h || r <= 0.0 {
+        return [0.0, 0.0, 0.0];
+    }
+    let m = spiky_grad_mag(r, h) / r; // includes the 1/r from normalizing d
+    [m * d[0], m * d[1], m * d[2]]
+}
+
+/// Rest density `ρ₀ = Σ_j m · W_poly6(|x_i − x_j|, h)` over a full cubic lattice neighborhood
+/// at `spacing`, evaluated at a lattice site. Deterministic constant used by the density
+/// constraint so a perfectly-packed block reads `C = 0`.
+pub fn rest_density(spacing: f32, support_radius: f32, mass: f32) -> f32 {
+    let h = support_radius;
+    let reach = (h / spacing).ceil() as i32;
+    let mut rho = 0.0;
+    for i in -reach..=reach {
+        for j in -reach..=reach {
+            for k in -reach..=reach {
+                let d = [i as f32 * spacing, j as f32 * spacing, k as f32 * spacing];
+                let r = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+                rho += mass * w_poly6(r, h);
+            }
+        }
+    }
+    rho
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn poly6_shape() {
+        let h = 2.0;
+        assert!(w_poly6(0.0, h) > 0.0);
+        assert_eq!(w_poly6(h, h), 0.0);
+        assert_eq!(w_poly6(h + 0.1, h), 0.0);
+        // Monotonically decreasing on [0, h].
+        assert!(w_poly6(0.3, h) > w_poly6(1.0, h));
+        assert!(w_poly6(1.0, h) > w_poly6(1.9, h));
+    }
+
+    #[test]
+    fn spiky_grad_shape() {
+        let h = 2.0;
+        assert_eq!(spiky_grad_mag(0.0, h), 0.0); // r==0 degenerate → 0 (caller clamps)
+
+ succeeded in 0ms:
+                        &b.buoyancy_water,
+                        "buoyancy_water",
+                        np,
+                    );
+                    pass(
+                        &mut enc,
+                        &p.apply_drag_pred,
+                        &b.apply_drag_pred,
+                        "apply_drag_pred",
+                        np,
+                    );
+                }
+
+                if self.has_grain {
+                    for it in 0..self.bed_iters {
+                        if it % self.bed_regrid == 0 {
+                            pass(&mut enc, &p.grid_clear, &b.grid_clear, "grid_clear", nc);
+                            pass(&mut enc, &p.grid_count, &b.grid_count, "grid_count", np);
+                            pass(&mut enc, &p.grid_scan, &b.grid_scan, "grid_scan", 1);
+                            pass(&mut enc, &p.grid_clear, &b.grid_clear, "grid_clear", nc);
+                            pass(
+                                &mut enc,
+                                &p.grid_scatter,
+                                &b.grid_scatter,
+                                "grid_scatter",
+                                np,
+                            );
+                        }
+                        pass(&mut enc, &p.bed_project, &b.bed_project, "bed_project", np);
+                        pass(&mut enc, &p.apply_dp, &b.apply_dp, "apply_dp", np);
+                        if !mixed {
+                            pass(
+                                &mut enc,
+                                &p.residual_reduce,
+                                &b.residual_reduce,
+                                "residual_reduce",
+                                1,
+                            );
+                        }
+                    }
+                }
+
+                pass(&mut enc, &p.finalize, &b.finalize, "finalize", np);
+
+                // XSPH viscosity is a fluid term; runs only when water is present.
+                if self.has_water {
+                    pass(&mut enc, &p.xsph, &b.xsph, "xsph", np);
+                    enc.copy_buffer_to_buffer(
+                        &self.vel_smoothed,
+                        0,
+                        &self.vel,
+                        0,
+                        (self.active_count as u64) * 16,
+                    );
+                }
+
+                // Wetting / absorption (mixed scenes; opt-in via absorb_rate>0). Runs last in the
+                // substep — after finalize/xsph so it reads final positions/velocities and its grain
+                // momentum merge isn't clobbered by the xsph velocity copy. Reads the frozen pred.w
+                // snapshot, writes the new moisture to pos.w; the next predict mirrors it.
+                if mixed && self.params.k_abs > 0.0 {
+                    pass(&mut enc, &p.grid_clear, &b.grid_clear, "grid_clear", nc);
+                    pass(&mut enc, &p.grid_count, &b.grid_count, "grid_count", np);
+                    pass(&mut enc, &p.grid_scan, &b.grid_scan, "grid_scan", 1);
+                    pass(&mut enc, &p.grid_clear, &b.grid_clear, "grid_clear", nc);
+                    pass(
+                        &mut enc,
+                        &p.grid_scatter,
+                        &b.grid_scatter,
+                        "grid_scatter",
+                        np,
+                    );
+                    pass(&mut enc, &p.wet_count, &b.wet_count, "wet_count", np);
+                    pass(&mut enc, &p.wet_water, &b.wet_water, "wet_water", np);
+                    pass(&mut enc, &p.wet_grain, &b.wet_grain, "wet_grain", np);
+                }
+
+                // Extraction / dissolution (mixed scenes; opt-in via extract_rate>0). Wet grains
+                // dissolve two-pool solute into overlapping water's concentration, conserving the
+                // solute inventory exactly. Reads the frozen pred.w moisture (same snapshot wetting
+                // used) + a frozen chem copy; writes only the live chem buffer. Rebuilds the grid
+
+ succeeded in 0ms:
+            .iter()
+            .map(|c| c[0])
+            .collect()
+    }
+
+    /// Read back per-particle temperature (phase-aware: water `T` is chem `.y`, grain `T` is `.z`).
+    /// Dev/test/inspection only — stalls the GPU.
+    pub fn read_temperature(&self) -> Vec<f32> {
+        self.read_vec4(self.chem.as_ref())
+            .iter()
+            .zip(&self.phase_mirror)
+            .map(|(c, &ph)| if ph == 0 { c[1] } else { c[2] })
+            .collect()
+    }
+}
+
+impl Solver for XpbdSolver {
+    fn build(scene: &Scene, mats: &Materials, cfg: &Config, gpu: &GpuContext) -> Self {
+        let device = gpu.device.clone();
+        let queue = gpu.queue.clone();
+        let s = mats.particle_spacing;
+        let h = mats.support_radius;
+        let m = mats.particle_mass;
+
+        let (positions, phases) = seed_block(scene, mats, cfg);
+        let seed_count = positions.len() as u32;
+
+        // Which species are present drives the per-frame passes. The grain bed solves contacts
+        // (harder to converge than water): its own iteration cap + more frequent grid rebuild.
+        // A declared pour means water WILL be present even if no water region is seeded, so the
+        // water/coupling/wetting/extraction passes must be selected.
+        let has_water =
+            scene.regions.iter().any(|r| r.species == Species::Water) || scene.declares_pour();
+        let has_grain = scene.regions.iter().any(|r| r.species == Species::Grain);
+        let water_iters = cfg.max_iters;
+        let water_regrid = REGRID_INTERVAL;
+        let bed_iters = cfg.bed_max_iters;
+        let bed_regrid = cfg.bed_regrid_interval.max(1);
+        let drag_subiters = cfg.drag_subiters;
+        // The shared `status` residual machinery (single-species early-exit) tracks the sole
+        // species; a mixed scene runs fixed iteration counts (no early-exit), so it doesn't use it.
+        let (param_iters, residual_tolerance) = if has_grain && !has_water {
+            (bed_iters, cfg.bed_residual_tolerance)
+        } else {
+            (water_iters, cfg.residual_tolerance)
+        };
+        let grain_volume = std::f32::consts::FRAC_PI_6 * mats.grain_diameter.powi(3);
+
+        // Grid cell must cover the largest neighbor query: the water support radius h, OR the
+        // grain contact diameter when grains are coarser than the water (so grain neighbors aren't
+        // missed). For single-resolution scenes (grain_diameter ≤ h) this is just h.
+        let cell_size = h.max(mats.grain_diameter);
+        let nx = (((scene.box_max[0] - scene.box_min[0]) / cell_size).ceil() as u32).max(1);
+        let ny = (((scene.box_max[1] - scene.box_min[1]) / cell_size).ceil() as u32).max(1);
+        let nz = (((scene.box_max[2] - scene.box_min[2]) / cell_size).ceil() as u32).max(1);
+        let num_cells = nx * ny * nz;
+
+        let rest_density = kernels::rest_density(s, h, m);
+        // Particle pool: buffers are sized to `capacity` = the seed plus headroom for a declared pour
+        // dose (KTD-7: water_ml / 5.20 ml·unit⁻³ / V_w particles). `active_count` (the live, dispatched
+        // set) starts at the seed and grows as the pour activates dormant slots. Non-pour scenes get
+        // `capacity == active_count == seed_count`, so the layout/dispatch is byte-identical to before.
+        let v_w = m / rest_density;
+        let dose_headroom = if scene.declares_pour() {
+            (scene.pour_water_ml / ML_PER_SIM_UNIT3 / v_w).ceil() as u32
+        } else {
+            0
+        };
+        let capacity = seed_count + dose_headroom;
+        let active_count = seed_count;
+        let dq = cfg.s_corr_dq_ratio * h;
+        let s_corr_wq = kernels::w_poly6(dq, h);
+        // Resolve the user-facing drag scale through Kozeny-Carman once at build time, stored in
+        // `drag_gamma` (live-porosity drag in a later unit makes this per-particle).
+        let permeability = kozeny_carman(mats.grain_diameter, mats.porosity);
+        let resolved_drag_gamma = drag_rate(permeability, cfg.drag_gamma);
+
+        let params = Params {
+            box_min: [scene.box_min[0], scene.box_min[1], scene.box_min[2], 0.0],
+            box_max: [scene.box_max[0], scene.box_max[1], scene.box_max[2], 0.0],
+            gravity: [scene.gravity[0], scene.gravity[1], scene.gravity[2], 0.0],
+
+exec
+/bin/zsh -lc "sed -n '560,620p' src/solvers/xpbd/common.wgsl" in /Users/cxc/Github/coffee-sim
+ succeeded in 0ms:
+                }
+            }
+            newp = clamp(newp, params.box_min.xyz, params.box_max.xyz);
+        }
+        pred[i] = vec4<f32>(newp, pred[i].w); // preserve the moisture snapshot in pred.w
+    } else {
+        pred[i] = vec4<f32>(clamped, pred[i].w); // preserve the moisture snapshot in pred.w
+    }
+}
+
+@compute @workgroup_size(256)
+fn finalize(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= params.particle_count) { return; }
+    let xi = pred[i].xyz;
+    var v = ((xi - pos[i].xyz) / params.dt) * params.velocity_damping;
+
+    if (phase[i] == PHASE_GRAIN) {
+        let pen = c_residual[i]; // final normalized penetration from the last bed_project
+        // Rolling-resistance proxy: bleed grain kinetic energy so spheres don't roll the pile
+        // shallow — but ONLY while in contact. An airborne grain isn't rolling, so damping its
+        // free-fall would just rob the impact of the energy it needs to flow into a heap.
+        if (pen > 1e-4) {
+            v = v * params.rolling_damping;
+        }
+        // Static-yield regularization (NOT freezing): below a small speed a grain is treated as
+        // at rest. Gravity and the contact solve still run for it every frame, so an unsupported
+        // grain immediately re-accelerates and penetration is never masked — this only removes
+        // the sub-threshold numerical jitter a Jacobi contact pile never fully shakes off.
+        if (fluid_impulse[i] <= params.wake_threshold && length(v) < params.grain_sleep_speed) {
+            v = vec3<f32>(0.0);
+        }
+    }
+
+    let sp = length(v);
+    if (sp > params.max_speed) {
+        v = v * (params.max_speed / sp);
+    }
+    vel[i] = vec4<f32>(v, 0.0);
+    pos[i] = vec4<f32>(xi, pos[i].w); // preserve the persistent moisture lane (pos.w)
+}
+
+codex
+One detail worth separating from the main fix: the current `xsph` kernel still includes any neighboring particle in the sum, even though only water particles are written through XSPH. I’m checking whether that is pre-existing behavior or part of the focused change’s risk surface.
+exec
+/bin/zsh -lc "sed -n '360,420p' tests/xpbd_emission.rs" in /Users/cxc/Github/coffee-sim
+exec
+/bin/zsh -lc "sed -n '440,490p' tests/xpbd_emission.rs" in /Users/cxc/Github/coffee-sim
+ succeeded in 0ms:
+        water_grain_distance: 0.35,
+        grain_mass: 10.0,
+        ..Materials::default()
+    };
+    let cfg = Config {
+        absorb_rate: 0.5,
+        extract_rate: 1.0,
+        ..Config::default()
+    };
+    XpbdSolver::build(&Scene::v60_pour(), &mats, &cfg, gpu)
+}
+
+/// Integration gate: poured water threads the bed and reaches the cup, yield rises over the brew,
+/// the pool capacity is honored, the run stays finite, and water VOLUME is conserved under the source
+/// (emitted = in-domain water + absorbed-into-grains).
+#[test]
+fn v60_pour_through_rises_and_conserves() {
+    let Some(gpu) = GpuContext::new_headless() else {
+        eprintln!("xpbd_emission: no GPU adapter; skipping.");
+        return;
+    };
+    let mut solver = v60_pour_solver(&gpu);
+    let cap = solver.pool_capacity();
+    let v_w = solver.water_particle_volume();
+    let rho_w = 1.0 / v_w; // particle_mass = 1
+    assert!(cap > 0);
+    let kettle = [0.0, 2.5, 0.0];
+    let flow = 8.0; // sim-volume/s (raw EmissionInput.flow_rate; the example's mL/s is /5.20 of this)
+
+    let mut yields = Vec::new();
+    for step in 1..=900 {
+        solver.step(DT, &pour(kettle, flow));
+        assert!(
+            solver.active_count() <= cap,
+            "active_count {} exceeded pool capacity {cap}",
+            solver.active_count()
+        );
+        if step % 300 == 0 {
+            solver.sample_diagnostics();
+            yields.push(solver.metrics().extraction_yield);
+        }
+    }
+    solver.sample_diagnostics();
+    let m = solver.metrics();
+
+    // Pour-through: water reached the cup (TDS readout is cup-region only ⇒ nonzero means cup water).
+    assert!(m.tds > 0.0, "no water reached the cup (TDS still 0)");
+    // Yield rose over the brew and is finite/positive (absolute band is deferred calibration).
+    let last_yield = *yields.last().unwrap();
+    assert!(
+        last_yield > yields[0] && last_yield > 0.0,
+
+ succeeded in 0ms:
+        return;
+    };
+    let mats = Materials::default();
+    let cfg = Config::default(); // full water solve on
+    let scene = Scene {
+        pour_water_ml: 4000.0,
+        gravity: [0.0, -20.0, 0.0],
+        box_min: [0.0, 0.0, 0.0],
+        box_max: [12.0, 16.0, 12.0],
+        regions: vec![],
+        ..Scene::default()
+    };
+    let mut solver = XpbdSolver::build(&scene, &mats, &cfg, &gpu);
+    for _ in 0..300 {
+        solver.step(DT, &pour([6.0, 14.0, 6.0], 20.0));
+    }
+    let pos = solver.read_positions();
+    let vel = solver.read_velocities();
+    assert!(
+        solver.active_count() > 50,
+        "too little emitted ({}) to be a meaningful stability test",
+        solver.active_count()
+    );
+    assert!(
+        pos.iter()
+            .all(|p| p[0].is_finite() && p[1].is_finite() && p[2].is_finite()),
+        "non-finite position (inlet eruption)"
+    );
+    let vmax = vel
+        .iter()
+        .map(|v| (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt())
+        .fold(0.0f32, f32::max);
+    assert!(
+        vmax <= cfg.max_speed + 1.0,
+        "velocity blew past the cap (eruption): vmax {vmax}"
+    );
+}
+
+/// A `PourEvent::Reset` clears the emitter's backlog/credit so a stale accumulator can't drain after
+/// a reset (the emitter contract; full sim restart is `reset()`).
+#[test]
+fn reset_event_clears_emitter_backlog() {
+    let Some(gpu) = GpuContext::new_headless() else {
+        eprintln!("xpbd_emission: no GPU adapter; skipping.");
+        return;
+    };
+    let cfg = Config {
+        max_iters: 0,
+        ..Config::default()
+    };
+    let mut solver =
+        XpbdSolver::build(&empty_pour_scene(9999.0), &Materials::default(), &cfg, &gpu);
+    // Pour briefly to build some emitter state.
+    for _ in 0..20 {
+        solver.step(DT, &pour([6.0, 11.0, 6.0], 5.0));
+    }
+    let after_pour = solver.active_count();
+    // A Reset event with zero flow clears the backlog and emits nothing further.
+    let reset_input = EmissionInput {
+        kettle_pos: [6.0, 11.0, 6.0],
+        flow_rate: 0.0,
+
+codex
+The neighbor-phase behavior is pre-existing in this diff, while the new test is a water-only emitter case. For the core bug being reviewed, I only need one numeric check now: how large the volume factor is at the default and fine spacings.
+exec
+/bin/zsh -lc "python3 -c 'import math
+for s in [1.0,0.15]:
+ h=2*s; m=1.0; reach=math.ceil(h/s)
+ def W(r,h):
+  return 0.0 if r>=h or r<0 else 315/(64*math.pi*h**9)*(h*h-r*r)**3
+ rho=0.0
+ for i in range(-reach,reach+1):
+  for j in range(-reach,reach+1):
+   for k in range(-reach,reach+1):
+    r=math.sqrt((i*s)**2+(j*s)**2+(k*s)**2)
+    rho += m*W(r,h)
+ print(s, h, rho, m/rho, rho/m - W(0,h), W(0,h))'" in /Users/cxc/Github/coffee-sim
+ succeeded in 0ms:
+python3: warning: confstr() failed with code 5: couldn't get path of DARWIN_USER_TEMP_DIR; using /tmp instead
+python3: error: couldn't create cache file '/tmp/xcrun_db-fmv88Vac' (errno=Operation not permitted)
+1.0 2.0 1.0097751668946853 0.9903194619800897 0.8139399830120797 0.1958351838826056
+0.15 0.3 299.19264204286975 0.003342328184182802 241.16740237394956 58.025239668920186
+
+codex
+APPROVE
+
+No blocking physics issue. The normalization is the standard XSPH term: `Σ (m_j / ρ_j) (v_j - v_i) W_ij`. For equal-mass, full-volume water particles, `params.particle_mass / params.rest_density` is the right `V_w`. The sign is correct: it moves `v_i` toward neighbor velocities. No missing `dt` factor for this PBF-style XSPH form.
+
+At default spacing this is not a concern. With the repo’s `rest_density(spacing=1, h=2, m=1)`, `V_w` is about `0.99`, so the effective viscosity barely changes. At spacing `0.15`, `V_w` is about `0.00334`, which cancels the `1/h^3` kernel-sum growth and brings the neighbor sum back to order one.
+
+The post-clamp analysis is also right. `finalize` clamps `vel`, then `xsph` writes `vel_smoothed`, and the buffer copy overwrites `vel` with no second clamp. So an unnormalized XSPH overshoot can escape `max_speed`.
+
+Remaining caveat, not a blocker for this focused fix: `xsph` skips grains as the target particle, but water still sums over all neighboring particles, including grains, because there is no `phase[j] == PHASE_WATER` guard in the neighbor loop. That is pre-existing, and mixed suites passing makes it acceptable here, but strict fluid-only XSPH would eventually guard water neighbors and possibly weight partial water neighbors by `pred[j].w`.
+
+The regression test is adequate for this bug: it exercises fine spacing through the full solve and checks the observable failure mode, post-XSPH `vmax` exceeding the clamp. A GPU-skipped test is consistent with the surrounding suite, though it means non-GPU CI will not catch this specific regression.
+tokens used
+31,969
+APPROVE
+
+No blocking physics issue. The normalization is the standard XSPH term: `Σ (m_j / ρ_j) (v_j - v_i) W_ij`. For equal-mass, full-volume water particles, `params.particle_mass / params.rest_density` is the right `V_w`. The sign is correct: it moves `v_i` toward neighbor velocities. No missing `dt` factor for this PBF-style XSPH form.
+
+At default spacing this is not a concern. With the repo’s `rest_density(spacing=1, h=2, m=1)`, `V_w` is about `0.99`, so the effective viscosity barely changes. At spacing `0.15`, `V_w` is about `0.00334`, which cancels the `1/h^3` kernel-sum growth and brings the neighbor sum back to order one.
+
+The post-clamp analysis is also right. `finalize` clamps `vel`, then `xsph` writes `vel_smoothed`, and the buffer copy overwrites `vel` with no second clamp. So an unnormalized XSPH overshoot can escape `max_speed`.
+
+Remaining caveat, not a blocker for this focused fix: `xsph` skips grains as the target particle, but water still sums over all neighboring particles, including grains, because there is no `phase[j] == PHASE_WATER` guard in the neighbor loop. That is pre-existing, and mixed suites passing makes it acceptable here, but strict fluid-only XSPH would eventually guard water neighbors and possibly weight partial water neighbors by `pred[j].w`.
+
+The regression test is adequate for this bug: it exercises fine spacing through the full solve and checks the observable failure mode, post-XSPH `vmax` exceeding the clamp. A GPU-skipped test is consistent with the surrounding suite, though it means non-GPU CI will not catch this specific regression.

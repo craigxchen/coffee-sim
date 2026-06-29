@@ -576,7 +576,11 @@ fn temper_k_sweep_settled_agitation() {
         let (mean, peak) = tail_stats(&ke, tail_start);
         let maxv = mv.iter().cloned().fold(0.0, f64::max);
         let pp = mean / nw;
-        let verdict = if pp < 0.05 && maxv < 5.0 { "QUIET ✓" } else { "agitated" };
+        let verdict = if pp < 0.05 && maxv < 5.0 {
+            "QUIET ✓"
+        } else {
+            "agitated"
+        };
         println!(
             "  [{label:<18}] per-particle KE {pp:7.4}  max|v| {maxv:6.2}  (peak/mean {:.1}x)  {verdict}",
             peak / mean.max(1e-9)
