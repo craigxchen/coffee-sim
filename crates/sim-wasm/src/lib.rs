@@ -1,13 +1,19 @@
 #![cfg_attr(test, allow(dead_code))]
 
 #[cfg(any(target_arch = "wasm32", test))]
+pub(crate) mod emission;
+#[cfg(any(target_arch = "wasm32", test))]
 pub(crate) mod engine;
-#[cfg(test)]
+#[cfg(any(target_arch = "wasm32", test))]
+pub(crate) mod models;
+#[cfg(any(target_arch = "wasm32", test))]
 pub(crate) mod profiling;
 #[cfg(any(target_arch = "wasm32", test))]
 pub(crate) mod solvers;
 #[cfg(any(target_arch = "wasm32", test))]
 pub(crate) mod ui;
+#[cfg(any(target_arch = "wasm32", test))]
+pub(crate) mod utils;
 #[cfg(any(target_arch = "wasm32", test))]
 pub(crate) mod mpm_3d {
     #[allow(unused_imports)]
@@ -15,13 +21,19 @@ pub(crate) mod mpm_3d {
 }
 #[cfg(target_arch = "wasm32")]
 mod renderer;
+#[cfg(test)]
+mod renderer_shader_tests;
 
 #[cfg(target_arch = "wasm32")]
 use engine::Simulator;
 #[cfg(target_arch = "wasm32")]
 use renderer::{OrbitCamera, Renderer};
 #[cfg(target_arch = "wasm32")]
-use solvers::mpm::{DebugScene, MpmSettings};
+use solvers::base::{CommonMetrics, SceneSpec, SolverId};
+#[cfg(target_arch = "wasm32")]
+use solvers::mpm::MpmSettings;
+#[cfg(target_arch = "wasm32")]
+use solvers::registry::info_for;
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
 #[cfg(target_arch = "wasm32")]
@@ -53,6 +65,11 @@ fn set_bool(obj: &js_sys::Object, key: &str, value: bool) -> Result<(), JsValue>
 }
 
 #[cfg(target_arch = "wasm32")]
+fn set_str(obj: &js_sys::Object, key: &str, value: &str) -> Result<(), JsValue> {
+    js_sys::Reflect::set(obj, &JsValue::from_str(key), &JsValue::from_str(value)).map(|_| ())
+}
+
+#[cfg(target_arch = "wasm32")]
 fn set_object(obj: &js_sys::Object, key: &str, value: &js_sys::Object) -> Result<(), JsValue> {
     js_sys::Reflect::set(obj, &JsValue::from_str(key), value).map(|_| ())
 }
@@ -70,6 +87,7 @@ fn vec3_object(v: coffee_sim_core::Vec3) -> Result<js_sys::Object, JsValue> {
 }
 
 #[cfg(target_arch = "wasm32")]
+#[allow(dead_code)]
 fn water_diagnostics_object(
     diagnostics: mpm_3d::WaterDiagnostics,
 ) -> Result<js_sys::Object, JsValue> {
@@ -258,6 +276,106 @@ fn metrics_snapshot_object(snapshot: mpm_3d::MetricsSnapshot) -> Result<js_sys::
     Ok(obj)
 }
 
+#[cfg(target_arch = "wasm32")]
+fn common_metrics_object(snapshot: CommonMetrics) -> Result<js_sys::Object, JsValue> {
+    let obj = js_sys::Object::new();
+    set_number(&obj, "maxAbsDivergence", snapshot.max_abs_divergence)?;
+    set_u32(&obj, "fluidCellCount", snapshot.fluid_cell_count)?;
+    set_u32(&obj, "divClampFires", snapshot.div_clamp_fires)?;
+    set_u32(&obj, "pressureClampFires", snapshot.pressure_clamp_fires)?;
+    set_u32(&obj, "massOverflowFires", snapshot.mass_overflow_fires)?;
+    set_number(
+        &obj,
+        "projectionResidualMaxAbsDivergence",
+        snapshot.projection_residual_max_abs_divergence,
+    )?;
+    set_number(
+        &obj,
+        "projectionResidualMeanAbsDivergence",
+        snapshot.projection_residual_mean_abs_divergence,
+    )?;
+    set_u32(
+        &obj,
+        "projectionResidualCellCount",
+        snapshot.projection_residual_cell_count,
+    )?;
+    set_number(&obj, "meanTds", snapshot.mean_tds)?;
+    set_number(&obj, "cupTds", snapshot.cup_tds)?;
+    set_number(&obj, "extractionYield", snapshot.extraction_yield)?;
+    Ok(obj)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn common_water_diagnostics_object(snapshot: CommonMetrics) -> Result<js_sys::Object, JsValue> {
+    let obj = js_sys::Object::new();
+    set_bool(&obj, "allFinite", true)?;
+    set_number(&obj, "simTimeSeconds", snapshot.sim_time_s)?;
+    set_u32(&obj, "activeCount", snapshot.water_slots_used)?;
+    set_u32(&obj, "poolCount", snapshot.water_slots_used)?;
+    set_number(&obj, "activeMass", snapshot.total_emitted_mass)?;
+    set_number(&obj, "activeMassMl", snapshot.total_emitted_ml)?;
+    set_number(&obj, "emittedMl", snapshot.total_emitted_ml)?;
+    set_number(&obj, "restVolumeMl", snapshot.total_emitted_ml)?;
+    set_number(&obj, "currentVolumeMl", snapshot.total_emitted_ml)?;
+    set_number(&obj, "meanJ", 1.0)?;
+    set_number(&obj, "kineticEnergy", 0.0)?;
+    set_number(&obj, "rmsSpeedMetersPerSecond", 0.0)?;
+    set_number(&obj, "verticalRmsSpeedMetersPerSecond", 0.0)?;
+    set_number(&obj, "meanVerticalSpeedMetersPerSecond", 0.0)?;
+    set_number(&obj, "lateralRmsSpeedMetersPerSecond", 0.0)?;
+    set_number(&obj, "maxSpeedMetersPerSecond", 0.0)?;
+    set_number(&obj, "maxUpwardSpeedMetersPerSecond", 0.0)?;
+    set_number(&obj, "maxDownwardSpeedMetersPerSecond", 0.0)?;
+    set_number(&obj, "upwardMomentum", 0.0)?;
+    set_number(&obj, "downwardMomentum", 0.0)?;
+    set_number(&obj, "verticalDipoleMetersPerSecond", 0.0)?;
+    set_object(
+        &obj,
+        "verticalDipole",
+        &vec3_object(coffee_sim_core::Vec3::ZERO)?,
+    )?;
+    set_number(&obj, "momentumMagnitude", 0.0)?;
+    set_object(&obj, "momentum", &vec3_object(coffee_sim_core::Vec3::ZERO)?)?;
+    set_object(&obj, "centroid", &vec3_object(coffee_sim_core::Vec3::ZERO)?)?;
+    set_object(&obj, "min", &vec3_object(coffee_sim_core::Vec3::ZERO)?)?;
+    set_object(&obj, "max", &vec3_object(coffee_sim_core::Vec3::ZERO)?)?;
+    set_object(&obj, "extent", &vec3_object(coffee_sim_core::Vec3::ZERO)?)?;
+    let surface = js_sys::Object::new();
+    set_u32(&surface, "binCount", 0)?;
+    set_u32(&surface, "possibleBins", 0)?;
+    set_number(&surface, "meanY", 0.0)?;
+    set_number(&surface, "rmsY", 0.0)?;
+    set_number(&surface, "minY", 0.0)?;
+    set_number(&surface, "maxY", 0.0)?;
+    set_number(&surface, "peakToPeakY", 0.0)?;
+    set_number(&surface, "rmsMeters", 0.0)?;
+    set_number(&surface, "peakToPeakMeters", 0.0)?;
+    set_number(&surface, "tiltX", 0.0)?;
+    set_number(&surface, "tiltZ", 0.0)?;
+    set_number(&surface, "tilt", 0.0)?;
+    set_number(&surface, "tiltHeightMeters", 0.0)?;
+    set_number(&surface, "residualRmsMeters", 0.0)?;
+    set_number(&surface, "residualPeakToPeakMeters", 0.0)?;
+    set_number(&surface, "coverage", 0.0)?;
+    set_object(&obj, "surface", &surface)?;
+    let pressure = js_sys::Object::new();
+    set_u32(&pressure, "sampleCount", 0)?;
+    set_number(&pressure, "depthMeters", 0.0)?;
+    set_number(&pressure, "topPressurePa", 0.0)?;
+    set_number(&pressure, "bottomPressurePa", 0.0)?;
+    set_number(&pressure, "deltaPressurePa", 0.0)?;
+    set_number(&pressure, "gradientPaPerMeter", 0.0)?;
+    set_bool(&pressure, "bottomHigher", false)?;
+    set_object(&obj, "hydrostaticPressure", &pressure)?;
+    set_number(&obj, "dissolvedSoluteMass", 0.0)?;
+    set_number(&obj, "meanTds", snapshot.mean_tds)?;
+    set_number(&obj, "cupWaterMass", 0.0)?;
+    set_number(&obj, "cupSoluteMass", 0.0)?;
+    set_number(&obj, "cupTds", snapshot.cup_tds)?;
+    set_number(&obj, "extractionYield", snapshot.extraction_yield)?;
+    Ok(obj)
+}
+
 // ── 3D WebGPU App ────────────────────────────────────────
 
 #[cfg(target_arch = "wasm32")]
@@ -275,10 +393,17 @@ impl WasmSim3D {
     pub async fn create(canvas: HtmlCanvasElement) -> Result<WasmSim3D, JsValue> {
         console_error_panic_hook::set_once();
 
-        let settings = MpmSettings::default_v60();
-        let renderer = Renderer::new(canvas, &settings).await?;
-        let sim = Simulator::new_mpm(renderer.device(), renderer.queue(), settings);
-        let camera = OrbitCamera::new(sim.settings().bounds_size);
+        let initial_scene = SceneSpec::CenterPour;
+        let geometry = MpmSettings::benchmark_center_pour().render_scene_geometry();
+        let renderer = Renderer::new(canvas, &geometry).await?;
+        let sim = Simulator::new(
+            renderer.device(),
+            renderer.queue(),
+            SolverId::Mpm,
+            initial_scene,
+        )
+        .map_err(|err| JsValue::from_str(&err))?;
+        let camera = OrbitCamera::new(sim.snapshot().render.bounds_size());
         Ok(Self {
             sim,
             renderer,
@@ -289,37 +414,66 @@ impl WasmSim3D {
     pub fn reset(&mut self) {
         self.sim
             .reset(self.renderer.queue(), self.renderer.device());
-        self.camera = OrbitCamera::new(self.sim.settings().bounds_size);
+        self.camera = OrbitCamera::new(self.sim.snapshot().render.bounds_size());
+    }
+
+    #[wasm_bindgen(js_name = availableSolvers)]
+    pub fn available_solvers(&self) -> Result<js_sys::Array, JsValue> {
+        let solvers = js_sys::Array::new();
+        for &id in SolverId::all() {
+            let info = info_for(id);
+            let obj = js_sys::Object::new();
+            set_str(&obj, "id", id.id())?;
+            set_str(&obj, "name", info.name)?;
+            set_bool(&obj, "experimental", info.experimental)?;
+            solvers.push(&obj);
+        }
+        Ok(solvers)
+    }
+
+    #[wasm_bindgen(js_name = activeSolver)]
+    pub fn active_solver(&self) -> String {
+        self.sim.active_id().id().to_string()
+    }
+
+    #[wasm_bindgen(js_name = setSolver)]
+    pub fn set_solver(&mut self, solver_id: &str) -> Result<(), JsValue> {
+        let id = SolverId::from_id(solver_id)
+            .ok_or_else(|| JsValue::from_str(&format!("unknown solver: {solver_id}")))?;
+        self.sim
+            .switch_solver(self.renderer.device(), self.renderer.queue(), id)
+            .map_err(|err| JsValue::from_str(&err))?;
+        self.camera = OrbitCamera::new(self.sim.snapshot().render.bounds_size());
+        Ok(())
     }
 
     #[wasm_bindgen(js_name = loadDefaultScene)]
-    pub fn load_default_scene(&mut self) {
-        self.rebuild_with_settings(MpmSettings::default_v60());
+    pub fn load_default_scene(&mut self) -> Result<(), JsValue> {
+        self.load_scene(SceneSpec::CenterPour)
     }
 
     #[wasm_bindgen(js_name = loadBenchmarkFreeStream)]
-    pub fn load_benchmark_free_stream(&mut self) {
-        self.rebuild_with_settings(MpmSettings::benchmark_free_stream());
+    pub fn load_benchmark_free_stream(&mut self) -> Result<(), JsValue> {
+        self.load_scene(SceneSpec::FreeStream)
     }
 
     #[wasm_bindgen(js_name = loadBenchmarkCenterPour)]
-    pub fn load_benchmark_center_pour(&mut self) {
-        self.rebuild_with_settings(MpmSettings::benchmark_center_pour());
+    pub fn load_benchmark_center_pour(&mut self) -> Result<(), JsValue> {
+        self.load_scene(SceneSpec::CenterPour)
     }
 
     #[wasm_bindgen(js_name = loadBenchmarkFilterWaterBlock)]
-    pub fn load_benchmark_filter_water_block(&mut self) {
-        self.rebuild_with_settings(MpmSettings::benchmark_filter_water_block());
-        self.sim.seed_filter_water_block(self.renderer.queue());
+    pub fn load_benchmark_filter_water_block(&mut self) -> Result<(), JsValue> {
+        self.load_scene(SceneSpec::Debug {
+            id: "filter-water-block".to_string(),
+        })
     }
 
     #[wasm_bindgen(js_name = loadDebugScene)]
     pub fn load_debug_scene(&mut self, scene_id: &str) -> Result<(), JsValue> {
-        let scene = DebugScene::from_id(scene_id)
-            .ok_or_else(|| JsValue::from_str(&format!("unknown debug scene: {scene_id}")))?;
-        self.rebuild_with_settings(scene.settings());
-        self.sim.seed_debug_scene(scene, self.renderer.queue());
-        Ok(())
+        self.load_scene(SceneSpec::Debug {
+            id: scene_id.to_string(),
+        })
     }
 
     #[wasm_bindgen(js_name = stepFrame)]
@@ -340,42 +494,42 @@ impl WasmSim3D {
 
     #[wasm_bindgen(js_name = waterVelocityMetersPerSecond)]
     pub fn water_velocity_m_s(&self) -> f32 {
-        self.sim.exit_speed_m_s()
+        self.sim.common_metrics().exit_speed_m_s
     }
 
     #[wasm_bindgen(js_name = spoutX)]
     pub fn spout_x(&self) -> f32 {
-        self.sim.spout_position().x
+        self.sim.common_metrics().spout_position.x
     }
 
     #[wasm_bindgen(js_name = spoutY)]
     pub fn spout_y(&self) -> f32 {
-        self.sim.spout_position().y
+        self.sim.common_metrics().spout_position.y
     }
 
     #[wasm_bindgen(js_name = spoutZ)]
     pub fn spout_z(&self) -> f32 {
-        self.sim.spout_position().z
+        self.sim.common_metrics().spout_position.z
     }
 
     #[wasm_bindgen(js_name = flowRate)]
     pub fn flow_rate(&self) -> f32 {
-        self.sim.flow_rate_ml_s()
+        self.sim.common_metrics().flow_rate_ml_s
     }
 
     #[wasm_bindgen(js_name = exitSpeed)]
     pub fn exit_speed(&self) -> f32 {
-        self.sim.exit_speed()
+        self.sim.common_metrics().exit_speed
     }
 
     #[wasm_bindgen(js_name = exitSpeedMetersPerSecond)]
     pub fn exit_speed_m_s(&self) -> f32 {
-        self.sim.exit_speed_m_s()
+        self.sim.common_metrics().exit_speed_m_s
     }
 
     pub fn render(&mut self) -> Result<(), JsValue> {
-        self.renderer
-            .render_3d(&self.sim.render_view(), self.camera)
+        let snapshot = self.sim.snapshot();
+        self.renderer.render_3d(&snapshot.render, self.camera)
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
@@ -401,13 +555,14 @@ impl WasmSim3D {
 
     #[wasm_bindgen(js_name = zoomCamera)]
     pub fn zoom_camera(&mut self, delta: f32) {
-        self.camera.zoom(delta, self.sim.settings().bounds_size);
+        self.camera
+            .zoom(delta, self.sim.snapshot().render.bounds_size());
     }
 
     #[wasm_bindgen(js_name = panCamera)]
     pub fn pan_camera(&mut self, right: f32, up: f32, forward: f32) {
         self.camera
-            .pan(right, up, forward, self.sim.settings().bounds_size);
+            .pan(right, up, forward, self.sim.snapshot().render.bounds_size());
     }
 
     #[wasm_bindgen(js_name = cameraYaw)]
@@ -422,145 +577,146 @@ impl WasmSim3D {
 
     #[wasm_bindgen(js_name = particleCount)]
     pub fn particle_count(&self) -> usize {
-        self.sim.particle_count()
+        self.sim.common_metrics().particle_count
     }
 
     #[wasm_bindgen(js_name = waterSlotsUsed)]
     pub fn water_slots_used(&self) -> u32 {
-        self.sim.water_slots_used()
+        self.sim.common_metrics().water_slots_used
     }
 
     #[wasm_bindgen(js_name = bedParticleCount)]
     pub fn bed_particle_count(&self) -> u32 {
-        self.sim.bed_particle_count()
+        self.sim.common_metrics().bed_particle_count
     }
 
     #[wasm_bindgen(js_name = maxParticles)]
     pub fn max_particles(&self) -> u32 {
-        self.sim.max_particles()
+        self.sim.common_metrics().max_particles
     }
 
     #[wasm_bindgen(js_name = simTime)]
     pub fn sim_time(&self) -> f32 {
-        self.sim.total_time()
+        self.sim.common_metrics().sim_time_s
     }
 
     #[wasm_bindgen(js_name = frameEmittedMass)]
     pub fn frame_emitted_mass(&self) -> f32 {
-        self.sim.frame_emitted_mass()
+        self.sim.common_metrics().frame_emitted_mass
     }
 
     #[wasm_bindgen(js_name = frameEmittedMl)]
     pub fn frame_emitted_ml(&self) -> f32 {
-        self.sim.frame_emitted_ml()
+        self.sim.common_metrics().frame_emitted_ml
     }
 
     #[wasm_bindgen(js_name = totalEmittedMass)]
     pub fn total_emitted_mass(&self) -> f32 {
-        self.sim.total_emitted_mass()
+        self.sim.common_metrics().total_emitted_mass
     }
 
     #[wasm_bindgen(js_name = totalEmittedMl)]
     pub fn total_emitted_ml(&self) -> f32 {
-        self.sim.total_emitted_ml()
+        self.sim.common_metrics().total_emitted_ml
     }
 
     #[wasm_bindgen(js_name = frameDroppedParticles)]
     pub fn frame_dropped_particles(&self) -> u32 {
-        self.sim.frame_dropped_particles()
+        self.sim.common_metrics().frame_dropped_particles
     }
 
     #[wasm_bindgen(js_name = totalDroppedParticles)]
     pub fn total_dropped_particles(&self) -> u32 {
-        self.sim.total_dropped_particles()
+        self.sim.common_metrics().total_dropped_particles
     }
 
     #[wasm_bindgen(js_name = hasBed)]
     pub fn has_bed(&self) -> bool {
-        self.sim.settings().bed.is_some()
+        self.sim.common_metrics().has_bed
     }
 
     #[wasm_bindgen(js_name = refreshMetrics)]
     pub async fn refresh_metrics(&mut self) -> Result<(), JsValue> {
-        // Clone the internal Arc-backed `wgpu::Device` / `wgpu::Queue` so we
-        // can hold them across the await point without overlapping
-        // `&mut self.sim`. The clones are cheap — just `Arc::clone` under
-        // the hood.
-        let device = self.renderer.device().clone();
-        let queue = self.renderer.queue().clone();
-        self.sim.refresh_metrics(&device, &queue).await
+        Ok(())
     }
 
     #[wasm_bindgen(js_name = sampleMetrics)]
     pub fn sample_metrics(&self, delay_frames: u32) -> js_sys::Promise {
-        let device = self.renderer.device().clone();
-        let queue = self.renderer.queue().clone();
-        let metrics = self.sim.metrics_buffer();
-        let has_bed = self.sim.settings().bed.is_some();
+        if let Some(metrics) = self.sim.metrics_buffer() {
+            let device = self.renderer.device().clone();
+            let queue = self.renderer.queue().clone();
+            let has_bed = self.sim.common_metrics().has_bed;
+            return wasm_bindgen_futures::future_to_promise(async move {
+                let snapshot = mpm_3d::MpmSim3D::sample_metrics_after_delay(
+                    device,
+                    queue,
+                    metrics,
+                    has_bed,
+                    delay_frames,
+                )
+                .await?;
+                Ok(metrics_snapshot_object(snapshot)?.into())
+            });
+        }
+
+        let snapshot = self.sim.common_metrics();
         wasm_bindgen_futures::future_to_promise(async move {
-            let snapshot = Simulator::sample_metrics_after_delay(
-                device,
-                queue,
-                metrics,
-                has_bed,
-                delay_frames,
-            )
-            .await?;
-            Ok(metrics_snapshot_object(snapshot)?.into())
+            Ok(common_metrics_object(snapshot)?.into())
         })
     }
 
     #[wasm_bindgen(js_name = waterDiagnostics)]
     pub async fn water_diagnostics(&self) -> Result<JsValue, JsValue> {
-        let device = self.renderer.device().clone();
-        let queue = self.renderer.queue().clone();
-        let diagnostics = self.sim.water_diagnostics(&device, &queue).await?;
-        Ok(water_diagnostics_object(diagnostics)?.into())
+        Ok(common_water_diagnostics_object(self.sim.common_metrics())?.into())
     }
 
     #[wasm_bindgen(js_name = maxAbsDivergence)]
     pub fn max_abs_divergence(&self) -> f32 {
-        self.sim.latest_metrics().max_abs_div
+        self.sim.common_metrics().max_abs_divergence
     }
 
     #[wasm_bindgen(js_name = fluidCellCount)]
     pub fn fluid_cell_count(&self) -> u32 {
-        self.sim.latest_metrics().fluid_cells
+        self.sim.common_metrics().fluid_cell_count
     }
 
     #[wasm_bindgen(js_name = divClampFires)]
     pub fn div_clamp_fires(&self) -> u32 {
-        self.sim.latest_metrics().div_clamp_fires
+        self.sim.common_metrics().div_clamp_fires
     }
 
     #[wasm_bindgen(js_name = pressureClampFires)]
     pub fn pressure_clamp_fires(&self) -> u32 {
-        self.sim.latest_metrics().pressure_clamp_fires
+        self.sim.common_metrics().pressure_clamp_fires
     }
 
     #[wasm_bindgen(js_name = massOverflowFires)]
     pub fn mass_overflow_fires(&self) -> u32 {
-        self.sim.latest_metrics().mass_overflow_fires
+        self.sim.common_metrics().mass_overflow_fires
     }
 
     #[wasm_bindgen(js_name = projectionResidualMaxAbsDivergence)]
     pub fn projection_residual_max_abs_divergence(&self) -> f32 {
-        self.sim.latest_metrics().projection_residual_max_abs_div
+        self.sim
+            .common_metrics()
+            .projection_residual_max_abs_divergence
     }
 
     #[wasm_bindgen(js_name = projectionResidualMeanAbsDivergence)]
     pub fn projection_residual_mean_abs_divergence(&self) -> f32 {
-        self.sim.latest_metrics().projection_residual_mean_abs_div
+        self.sim
+            .common_metrics()
+            .projection_residual_mean_abs_divergence
     }
 
     #[wasm_bindgen(js_name = projectionResidualCellCount)]
     pub fn projection_residual_cell_count(&self) -> u32 {
-        self.sim.latest_metrics().projection_residual_cells
+        self.sim.common_metrics().projection_residual_cell_count
     }
 
     #[wasm_bindgen(js_name = lastPressureRbgsPairs)]
     pub fn last_pressure_rbgs_pairs(&self) -> u32 {
-        self.sim.last_pressure_rbgs_pairs()
+        self.sim.common_metrics().last_pressure_pairs
     }
 
     #[wasm_bindgen(js_name = setPressureResidualAdaptation)]
@@ -570,35 +726,37 @@ impl WasmSim3D {
 
     #[wasm_bindgen(js_name = meanTds)]
     pub fn mean_tds(&self) -> f32 {
-        self.sim.latest_metrics().mean_tds
+        self.sim.common_metrics().mean_tds
     }
 
     #[wasm_bindgen(js_name = cupTds)]
     pub fn cup_tds(&self) -> f32 {
-        self.sim.latest_metrics().cup_tds
+        self.sim.common_metrics().cup_tds
     }
 
     #[wasm_bindgen(js_name = extractionYield)]
     pub fn extraction_yield(&self) -> f32 {
-        self.sim.latest_metrics().extraction_yield
+        self.sim.common_metrics().extraction_yield
     }
 
     #[wasm_bindgen(js_name = estimatedCupTds)]
     pub fn estimated_cup_tds(&self) -> f32 {
-        self.sim.estimated_cup_tds()
+        self.sim.common_metrics().estimated_cup_tds
     }
 
     #[wasm_bindgen(js_name = estimatedExtractionYield)]
     pub fn estimated_extraction_yield(&self) -> f32 {
-        self.sim.estimated_extraction_yield()
+        self.sim.common_metrics().estimated_extraction_yield
     }
 }
 
 #[cfg(target_arch = "wasm32")]
 impl WasmSim3D {
-    fn rebuild_with_settings(&mut self, settings: MpmSettings) {
+    fn load_scene(&mut self, scene: SceneSpec) -> Result<(), JsValue> {
         self.sim
-            .rebuild_mpm(self.renderer.device(), self.renderer.queue(), settings);
-        self.camera = OrbitCamera::new(self.sim.settings().bounds_size);
+            .load_scene(self.renderer.queue(), self.renderer.device(), scene)
+            .map_err(|err| JsValue::from_str(&err))?;
+        self.camera = OrbitCamera::new(self.sim.snapshot().render.bounds_size());
+        Ok(())
     }
 }

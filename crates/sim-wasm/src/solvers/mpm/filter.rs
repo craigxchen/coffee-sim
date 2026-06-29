@@ -1,6 +1,6 @@
 use coffee_sim_core::Vec3;
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct FilterConfig {
     pub center: Vec3,
     pub top_y: f32,

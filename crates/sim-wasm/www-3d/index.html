@@ -4,15 +4,15 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Coffee Sim | 3D Pourover</title>
-    <link rel="stylesheet" href="./styles.css?v=webgpu-preflight-1" />
+    <link rel="stylesheet" href="./styles.css?v=solver-select-fit-1" />
   </head>
   <body>
     <main class="layout">
       <section class="sidebar">
-        <p class="eyebrow">Coffee Sim / MPM</p>
+        <p id="solver-eyebrow" class="eyebrow">Coffee Sim / MPM</p>
         <h1>V60 Pourover</h1>
         <p class="lede">
-          GPU MPM fluid simulation with a V60 cone boundary and porous coffee bed.
+          GPU fluid simulation with a V60 cone boundary and porous coffee bed.
           Drag to orbit, scroll to zoom, and adjust water velocity to change the stream.
         </p>
         <div class="controls">
@@ -305,6 +305,6 @@
         ></div>
       </div>
     </aside>
-    <script type="module" src="./main.js?v=perf-improvements-1"></script>
+    <script type="module" src="./main.js?v=particle-size-2"></script>
   </body>
 </html>
