@@ -15,6 +15,7 @@ Repository-wide instructions for coding agents.
 
 ## Working Rules
 
+- **PHYSICS FREEZE (2026-07-02) on the imported solver copies** (`src/solvers/xpbd/`, `src/solvers/twofield/`, `src/solvers/pbmpm/`): these are imports of the rewrite lineage (`feat/pbmpm-prototype` tree), which remains the source of truth for solver physics until the PB-MPM Phase B go/no-go decision lands and the winning cores + test ladder are ported here in one pass. Until then this tree accepts framework/evals/registry work only — no solver-physics commits. Rationale: the rewrite tree carries the full 28-file physics test ladder; this tree has only `evals.rs`, so physics edits here have no gates to trip and double the eventual port cost.
 - Prefer the smallest correct change over broad refactors.
 - Keep physics fixes structural; avoid tuning-only patches for fundamental issues.
 - Do not edit generated artifacts unless the task specifically requires it.
