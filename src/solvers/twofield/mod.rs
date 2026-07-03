@@ -2218,8 +2218,17 @@ impl Solver for TwofieldSolver {
         };
 
         let ts = if gpu.timestamps_supported {
-            // 71 passes per frame at the U6 defaults (2 queries each); headroom for U5+.
-            let capacity = 192u32;
+            // One substep's dispatches, 2 queries each. The flood budget is scene-derived (grid
+            // Manhattan diameter), so a fixed capacity silently truncates the profile on larger
+            // grids: the old fixed 192 covered 96 dispatches, but the gate scene runs 155
+            // passes/substep — every pass after the flood stack (pocket_mark, the sweeps,
+            // project, the G2Ps) vanished from profile() and the perf gate undercounted the
+            // frame. Derive from the same budget formula the dispatch gates pin, plus the
+            // dynamic/absorption increments and slack for test-raised sweep budgets.
+            let capacity = 2 * (dispatches_per_frame_for(dims)
+                + U5_PLASTICITY_DISPATCHES
+                + U9_INFILTRATION_DISPATCHES)
+                + 64;
             let qset = device.create_query_set(&wgpu::QuerySetDescriptor {
                 label: Some("twofield-timestamps"),
                 ty: wgpu::QueryType::Timestamp,
