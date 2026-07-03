@@ -37,11 +37,15 @@
 // (pre-enclosure — e.g. the jet annulus connects the cavity to outside air) there are no
 // pocket cells, the aggregated diagonal is 0, and λ_b is pinned inactive (p = 0 air).
 //
-// Tint discipline: bubble_fine/bubble_coarse run as ONE workgroup with a uniform trip count
-// (now over the COMPACTED pocket list, not all cells — U8 R9 fix) and predicated bodies, so
-// every workgroupBarrier() is in uniform control flow. All other passes use guard returns with
-// no barriers. Over-dispatch + early-out only (R8). Storage buffers per entry point ≤ 7 (see
-// MAX_STORAGE_BUFFERS_PER_ENTRY_POINT in mod.rs).
+// Tint discipline: the bubble reductions run with a uniform trip count (over the COMPACTED
+// pocket list, not all cells — U8 R9 fix) and predicated bodies, so every workgroupBarrier()
+// is in uniform control flow. bubble_fine is a MULTI-workgroup partial-sum pass (each
+// workgroup reduces its interleaved share of the list and writes one partial triple);
+// bubble_fine_solve combines the partials and solves the row — the dispatch boundary is the
+// cross-workgroup sync a single dispatch cannot have. bubble_coarse keeps the one-workgroup
+// fused form (the coarse list is ~1/4³ the cells; measured < 5% of the frame). All other
+// passes use guard returns with no barriers. Over-dispatch + early-out only (R8). Storage
+// buffers per entry point ≤ 7 (see MAX_STORAGE_BUFFERS_PER_ENTRY_POINT in mod.rs).
 
 // --- bindings (continue the global table; 17 is the bubble state) -----------------------------
 // bubble[0] = λ_b (fine-level pocket pressure), bubble[1] = δλ_b (coarse correction).
@@ -55,6 +59,18 @@
 // over the SAME cells — only the iteration set is compacted, λ_b is unchanged).
 @group(0) @binding(26) var<storage, read_write> pocket_f: array<atomic<u32>>;
 @group(0) @binding(27) var<storage, read_write> pocket_c: array<atomic<u32>>;
+
+// Per-workgroup partial sums of the bubble_fine reduction: workgroup w writes
+// (Σ rhs, Σ (A p̃), Σ (A·1_pocket)) to slots [3w, 3w+2]; bubble_fine_solve combines them.
+// Every one of the BUBBLE_FINE_WGS workgroups writes its triple unconditionally each run
+// (zeros when its share of the list is empty), so the buffer never needs clearing.
+@group(0) @binding(28) var<storage, read_write> bubble_part: array<f32>;
+
+// Workgroup count of the bubble_fine partial-sum dispatch (mirrored in mod.rs — the dispatch
+// size and the bubble_part sizing): enough workgroups to spread the reduction across the GPU's
+// cores; the typical pocket is a few hundred to a few thousand cells, so the interleaved
+// mapping below keeps every workgroup populated from count ≥ BUBBLE_FINE_WGS.
+const BUBBLE_FINE_WGS: u32 = 64u;
 
 // cell_meta.w / cmeta.w categories (CELL_AIR is only ever set on fine cells).
 const CELL_AIR: f32 = 1.0;
@@ -244,23 +260,31 @@ fn pocket_mark(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 
 // =================================== bubble row relaxation =====================================
-// Shared single-workgroup reduction shape for both levels: each thread grid-strides the cell
-// range accumulating the pocket row sums (Σ rhs, Σ (A p̃)_c, Σ (A·1_pocket)_c), tree-reduce,
-// thread 0 solves the single-unknown row exactly. Runs BEFORE each Jacobi sweep, so the sweep
-// writes the fresh multiplier into the pocket slots (the Dirichlet copy).
+// Shared reduction shape for both levels: threads stride the compacted pocket list accumulating
+// the pocket row sums (Σ rhs, Σ (A p̃)_c, Σ (A·1_pocket)_c), tree-reduce, then the single-unknown
+// row is solved exactly. Runs BEFORE each Jacobi sweep, so the sweep writes the fresh multiplier
+// into the pocket slots (the Dirichlet copy). The FINE level splits the work across
+// BUBBLE_FINE_WGS workgroups (partial sums here, combine + solve in bubble_fine_solve — the pass
+// boundary is the required cross-workgroup sync); the coarse level keeps the fused
+// one-workgroup form.
 var<workgroup> red_rhs: array<f32, 256>;
 var<workgroup> red_ap: array<f32, 256>;
 var<workgroup> red_diag: array<f32, 256>;
 
 @compute @workgroup_size(256)
-fn bubble_fine(@builtin(local_invocation_id) lid: vec3<u32>) {
+fn bubble_fine(
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(workgroup_id) wg: vec3<u32>,
+) {
     let t = lid.x;
+    let w = wg.x;
     // No open-cavity early-out here: a storage-buffer-gated `return` BEFORE a workgroupBarrier()
     // is a Tint uniformity violation (Tint treats every read_write storage load as non-uniform,
     // regardless of the value being equal across threads — native naga tolerates it, the browser
     // rejects it and fails the whole module). The no-pocket case is already handled for free:
-    // when no pocket exists `pocket_f[0]` is 0, so `trips` is 0, the reduction sums zeros, and the
-    // thread-0 solve's `red_diag > 1e-12` guard yields λ_b = 0 — identical to the old early-out.
+    // when no pocket exists `pocket_f[0]` is 0, so `trips` is 0, the reduction sums zeros, and
+    // bubble_fine_solve's `red_diag > 1e-12` guard yields λ_b = 0 — identical to the old
+    // early-out.
     // U8 R9: stride the COMPACTED pocket list (a few hundred entries) not all ~76k fine cells.
     // `count` is uniform across the workgroup (single atomic load, no in-flight append —
     // pocket_mark finished last frame-pass), so the trip count stays uniform and every
@@ -270,9 +294,13 @@ fn bubble_fine(@builtin(local_invocation_id) lid: vec3<u32>) {
     var s_rhs = 0.0;
     var s_ap = 0.0;
     var s_diag = 0.0;
-    let trips = (count + 255u) / 256u; // uniform trip count (barrier discipline)
+    let span = 256u * BUBBLE_FINE_WGS;
+    let trips = (count + span - 1u) / span; // uniform trip count (barrier discipline)
     for (var it = 0u; it < trips; it = it + 1u) {
-        let li = it * 256u + t;
+        // Workgroup-INTERLEAVED element mapping (w + t·WGS, not w·256 + t): a few-hundred-cell
+        // pocket spreads across all BUBBLE_FINE_WGS workgroups (GPU cores) instead of packing
+        // into the first one or two.
+        let li = it * span + t * BUBBLE_FINE_WGS + w;
         if (li < count) {
             let c = atomicLoad(&pocket_f[li + 1u]);
             let cc = vec3<i32>(cell_coords(c));
@@ -337,11 +365,42 @@ fn bubble_fine(@builtin(local_invocation_id) lid: vec3<u32>) {
         off = off / 2u;
     }
     if (t == 0u) {
+        bubble_part[3u * w + 0u] = red_rhs[0];
+        bubble_part[3u * w + 1u] = red_ap[0];
+        bubble_part[3u * w + 2u] = red_diag[0];
+    }
+}
+
+// =================================== bubble_fine_solve =========================================
+// Combine the BUBBLE_FINE_WGS partial triples and solve the aggregated row exactly — the
+// thread-0 logic of the old single-workgroup bubble_fine, unchanged (the only difference is the
+// summation grouping: per-workgroup partials first, float-associativity level).
+@compute @workgroup_size(BUBBLE_FINE_WGS)
+fn bubble_fine_solve(@builtin(local_invocation_id) lid: vec3<u32>) {
+    let t = lid.x;
+    red_rhs[t] = bubble_part[3u * t + 0u];
+    red_ap[t] = bubble_part[3u * t + 1u];
+    red_diag[t] = bubble_part[3u * t + 2u];
+    workgroupBarrier();
+    var off = BUBBLE_FINE_WGS / 2u;
+    loop {
+        if (t < off) {
+            red_rhs[t] = red_rhs[t] + red_rhs[t + off];
+            red_ap[t] = red_ap[t] + red_ap[t + off];
+            red_diag[t] = red_diag[t] + red_diag[t + off];
+        }
+        workgroupBarrier();
+        if (off == 1u) {
+            break;
+        }
+        off = off / 2u;
+    }
+    if (t == 0u) {
         // Sub-resolution release (header: MIN_POCKET_FINE_CELLS): a pocket too small to be a
         // resolved incompressible bubble is open air — λ = 0, present-flag cleared (so the next
         // frame's bubble solves early-out and pocket_present() reads false). Guards the residual
         // V60-cone draining-film entrainment without touching the large pour cavity.
-        if (count < MIN_POCKET_FINE_CELLS) {
+        if (atomicLoad(&pocket_f[0]) < MIN_POCKET_FINE_CELLS) {
             bubble[0] = 0.0;
             bubble[1] = 0.0;
             bubble[2] = 0.0;
