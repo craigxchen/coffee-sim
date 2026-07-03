@@ -200,6 +200,25 @@ pub struct Config {
     /// off-switch); `0.95` (default) = splashy but still damped. The constraint iteration loop stays
     /// pure-PIC regardless — this blends ONLY the final output velocity in `particle_integrate`.
     pub pbmpm_flip_fraction: f32,
+    /// PB-MPM U8 coarse pressure pre-pass strength κ: the fraction of the coarse-grid density
+    /// error the pre-pass targets per substep (the Poisson rhs is κ·e/dt). TWO-SIDED and
+    /// self-limiting (the kick shrinks as the error drains) — not a one-sided stiffened relief.
+    /// `0.0` disables the pass entirely (dispatches skipped; byte-identical off-switch).
+    ///
+    /// DEFAULT OFF (0.0) — measured 2026-07-03 (tests/pbmpm_transfers.rs drift gate + buy-back
+    /// sweep, tests/solver_physics.rs bounce): (a) the +11% drift that triggered U8 was a METRIC
+    /// artifact of the multiplicative liquidDensity memory — the instantaneous interior grid
+    /// density sits within ±3% of rest at the frozen iteration_count 16 without the pass, at
+    /// both 11- and 28-layer depths; (b) at κ=0.1/cap 0.5 the pass damps the U7 impact crown by
+    /// ~75% (R 0.00106 → 0.00026) — it counter-kicks the impact-zone expansion that IS the
+    /// splash; (c) it buys back no constraint iterations (at 8/4 iters it makes density WORSE).
+    /// Calibrated opt-in (κ≈0.1, cap 0.5) for deep-fill/low-iteration regimes if the assembled
+    /// solver ever measures a real low-frequency deficit; κ≥0.3 or cap≥2 detonates (churn).
+    pub pbmpm_coarse_strength: f32,
+    /// PB-MPM U8 kick cap: max |Δv| (velocity units) the coarse apply pass may inject per
+    /// substep. The stability backstop for large accumulated errors — a big error drains over
+    /// many frames at the cap instead of detonating in one (the twofield stiffening lesson).
+    pub pbmpm_coarse_kick_cap: f32,
 }
 
 impl Default for Config {
@@ -307,6 +326,8 @@ impl Default for Config {
             // SPLASH knob: a high FLIP fraction so the impact-generated crown velocity survives the
             // g2p transfer (pure APIC smooths it away). 0.0 = pure APIC (the clean off-switch).
             pbmpm_flip_fraction: 0.95,
+            pbmpm_coarse_strength: 0.0,
+            pbmpm_coarse_kick_cap: 0.5,
         }
     }
 }

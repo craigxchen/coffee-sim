@@ -41,6 +41,13 @@ struct Params {
     iter_pad: vec4<u32>,    // .x = iteration_count; .y = num_solids (SDF BC count, 0 = none);
                             // .z = restitution f32 bits (U5, bitcast<f32>); .w = flip_fraction f32
                             // bits (SPLASH knob, bitcast<f32>)
+    // U8 coarse-grid pressure pre-pass (coarse.wgsl). Coarse cell = COARSE_FACTOR fine nodes per
+    // axis; the CPU derives the dims and the interior rest mass (see mod.rs coarse_spec_for).
+    coarse_dims: vec4<u32>, // cx, cy, cz, num_ccells (= cx·cy·cz)
+    coarse: vec4<f32>,      // .x = strength κ (0 = pass disabled, CPU skips the dispatches);
+                            // .y = interior rest mass per coarse cell (surface classifier);
+                            // .z = coarse cell size H (= COARSE_FACTOR · h);
+                            // .w = kick cap (max |Δv| the apply pass may inject, velocity units)
 };
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -109,6 +116,19 @@ struct Primitive {
 // is applied ONCE per substep so the incompressibility solve stays pure-PIC.
 @group(0) @binding(10) var<storage, read_write> grid_vel_old: array<vec4<f32>>;
 @group(0) @binding(11) var<storage, read> vel_prev: array<vec4<f32>>;
+// U8 coarse-grid pressure pre-pass state (coarse.wgsl; only bound by the coarse passes).
+// `coarse_fp`: one fixed-point mass lane per coarse cell (restriction target — same FP_SCALE
+// encoding as grid_fp; headroom: ≤ 64 fine nodes × ~8m ≈ 512m ≪ the 2^13 ceiling).
+// `coarse_list`: [0] = count, [1..] = compacted ACTIVE coarse-cell ids, atomic-appended on
+// first-touch during restriction (capacity = num_ccells, so it can never overflow). Every list
+// consumer over-dispatches to capacity and early-outs past the count — never indirect dispatch.
+// `coarse_src`: .x = rhs (κ·e/dt density-error source), .y = kind (0 = air/surface → Dirichlet
+// φ = 0; 1 = interior fluid row). `coarse_phi_a/b`: damped-Jacobi ping-pong potential.
+@group(0) @binding(12) var<storage, read_write> coarse_fp: array<atomic<i32>>;
+@group(0) @binding(13) var<storage, read_write> coarse_list: array<atomic<u32>>;
+@group(0) @binding(14) var<storage, read_write> coarse_src: array<vec2<f32>>;
+@group(0) @binding(15) var<storage, read_write> coarse_phi_a: array<f32>;
+@group(0) @binding(16) var<storage, read_write> coarse_phi_b: array<f32>;
 
 // --- fixed-point encoding (KEEP.md §3 pattern; mirrors twofield's FP_SCALE) ------------------
 //
