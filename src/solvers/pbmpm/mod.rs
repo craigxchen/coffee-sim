@@ -26,8 +26,9 @@ use crate::emission::EmissionInput;
 use crate::engine::scene::Species;
 use crate::engine::{Metrics, Scene};
 use crate::models::Materials;
-use crate::profiling::{Profile, Profiler};
+use crate::profiling::Profile;
 use crate::solvers::base::Solver;
+use crate::solvers::pass_recorder::{PassRecorder, TimestampSink};
 use crate::utils::buffers::ParticleBuffers;
 use crate::utils::config::Config;
 use crate::utils::gpu::GpuContext;
@@ -88,10 +89,18 @@ pub const CELL_SIZE_FACTOR: f32 = 2.0;
 /// Dispatches per substep (U4 structure + SPLASH snapshot): `deform_clear` once, then the SPLASH
 /// FLIP snapshot `grid_clear → p2g → grid_decode_old` (3 passes), then the iteration loop runs
 /// `iteration_count` × the 5-pass bundle `particle_update → grid_clear → p2g → grid_update → g2p`,
-/// then `particle_integrate` once, i.e. `4 + 1 + 5·iteration_count + 1` = `6 + 5·iteration_count` per
+/// then `particle_integrate` once, i.e. `1 + 3 + 5·iteration_count + 1` = `5 + 5·iteration_count` per
 /// substep. One substep per frame for now (a CFL substep policy is a later decision). The profiler
 /// reports the real per-frame dispatch count.
 pub const DISPATCHES_PER_SUBSTEP_BUNDLE: u32 = 5;
+
+/// The recorded dispatch formula (see `DISPATCHES_PER_SUBSTEP_BUNDLE` docs): `5 +
+/// 5·iteration_count` per frame at one substep/frame (1 deform_clear + 3 snapshot passes +
+/// the iteration bundles + 1 particle_integrate). The U6 dispatch-budget gate pins
+/// `profile().dispatches_per_frame` to exactly this.
+pub fn dispatches_per_frame_for(iterations: u32) -> u32 {
+    5 + DISPATCHES_PER_SUBSTEP_BUNDLE * iterations.max(1)
+}
 
 /// Uniform parameters, byte-mirrored by the WGSL `Params` in `common.wgsl`.
 #[repr(C)]
@@ -359,13 +368,29 @@ pub struct PbmpmSolver {
     readback: wgpu::Buffer,
 
     pipelines: Pipelines,
-    profiler: Profiler,
+    // Per-pass timestamp wiring (native profiling only; `None` on the web / no TIMESTAMP_QUERY).
+    // Mirrors twofield: step() records per-pass timestamps, `sample_diagnostics()` decodes them
+    // into `cached_passes`, and `profile()` returns the cache (never a GPU sync).
+    ts: Option<Timestamps>,
+    dispatches: u32,
+    cached_passes: Vec<(String, f32)>,
 
     // Retained for reset (exact, deterministic re-seed).
     initial_positions: Vec<[f32; 4]>,
     initial_phases: Vec<u32>,
     // Live water count at the seed (the count `reset()` returns to before any pour activates slots).
     initial_water: u32,
+}
+
+/// Per-pass timestamp query wiring (native profiling only). Mirrors twofield's `Timestamps`.
+struct Timestamps {
+    qset: wgpu::QuerySet,
+    capacity: u32,
+    resolve: wgpu::Buffer,
+    readback: wgpu::Buffer,
+    period_ns: f32,
+    labels: Vec<String>,
+    count: u32,
 }
 
 struct Pipelines {
@@ -481,6 +506,54 @@ impl PbmpmSolver {
     pub fn read_grid_velocities(&self) -> Vec<[f32; 4]> {
         let bytes = (self.num_nodes as u64) * 16;
         bytemuck::cast_slice(&self.read_bytes(&self.grid_vel, bytes)).to_vec()
+    }
+
+    /// Read back the per-particle deformation displacement `D` rows (3 vec4 rows per particle,
+    /// dev/test only — stalls). The U6 float-range probe reads this: `D` is the float state
+    /// surface that can blow up without ever touching the fixed-point grid lanes.
+    pub fn read_deform_disp_rows(&self) -> Vec<[f32; 4]> {
+        let bytes = (self.water_capacity as u64) * 48;
+        bytemuck::cast_slice(&self.read_bytes(&self.deform_disp, bytes)).to_vec()
+    }
+
+    /// Read back the per-particle deformation gradient `F` rows (3 vec4 rows per particle,
+    /// dev/test only — stalls). Row 0's `.x` lane carries the per-particle `liquidDensity`
+    /// (the running ∏(tr(D)+1) volume product, `constraint.wgsl`) — the U6 bulk-density drift
+    /// measurement reads it directly.
+    pub fn read_deform_grad_rows(&self) -> Vec<[f32; 4]> {
+        let bytes = (self.water_capacity as u64) * 48;
+        bytemuck::cast_slice(&self.read_bytes(&self.deform_grad, bytes)).to_vec()
+    }
+
+    /// Sample per-pass GPU timestamps into the cache that `profile()` returns. Blocks
+    /// (dev/test/periodic only) — the explicit cache point, so the getters never stall.
+    /// Mirrors twofield's `sample_diagnostics` so perf harnesses drive both identically.
+    pub fn sample_diagnostics(&mut self) {
+        if let Some(ts) = &self.ts {
+            if ts.count >= 2 {
+                let size = (ts.count as u64) * 8;
+                let slice = ts.readback.slice(0..size);
+                let (tx, rx) = std::sync::mpsc::channel();
+                slice.map_async(wgpu::MapMode::Read, move |r| {
+                    let _ = tx.send(r);
+                });
+                let _ = self.device.poll(wgpu::PollType::Wait {
+                    submission_index: None,
+                    timeout: None,
+                });
+                rx.recv().unwrap().unwrap();
+                let times: Vec<u64> = bytemuck::cast_slice(&slice.get_mapped_range()).to_vec();
+                ts.readback.unmap();
+                let mut passes = Vec::new();
+                for (idx, label) in ts.labels.iter().enumerate() {
+                    let b = times[idx * 2];
+                    let e = times[idx * 2 + 1];
+                    let us = (e.saturating_sub(b)) as f32 * ts.period_ns / 1000.0;
+                    passes.push((label.clone(), us));
+                }
+                self.cached_passes = passes;
+            }
+        }
     }
 
     /// Overwrite particle velocities (dev/test only). Length must equal the particle count.
@@ -835,7 +908,9 @@ impl Solver for PbmpmSolver {
         });
         let readback = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("pbmpm-readback"),
-            size: vec4.max(grid_fp.size()),
+            // Must cover the widest dev/test read: the 3-vec4-row deform buffers (48 B/particle),
+            // not just the vec4 particle lanes or the grid.
+            size: (vec4 * 3).max(grid_fp.size()),
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -984,6 +1059,40 @@ impl Solver for PbmpmSolver {
             }
         };
 
+        let ts = if gpu.timestamps_supported {
+            // 5 + 5·iteration_count dispatches per frame (2 queries each); 384 queries cover
+            // iteration counts up to 37 — headroom over the frozen default (16) and the sweeps.
+            let capacity = 384u32;
+            let qset = device.create_query_set(&wgpu::QuerySetDescriptor {
+                label: Some("pbmpm-timestamps"),
+                ty: wgpu::QueryType::Timestamp,
+                count: capacity,
+            });
+            let resolve = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("pbmpm-ts-resolve"),
+                size: (capacity as u64) * 8,
+                usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+            let ts_readback = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("pbmpm-ts-readback"),
+                size: (capacity as u64) * 8,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            Some(Timestamps {
+                qset,
+                capacity,
+                resolve,
+                readback: ts_readback,
+                period_ns: queue.get_timestamp_period(),
+                labels: Vec::new(),
+                count: 0,
+            })
+        } else {
+            None
+        };
+
         Self {
             device,
             queue,
@@ -1014,7 +1123,9 @@ impl Solver for PbmpmSolver {
             vel_prev,
             readback,
             pipelines,
-            profiler: Profiler::new(gpu.timestamps_supported),
+            ts,
+            dispatches: 0,
+            cached_passes: Vec::new(),
             initial_positions: positions,
             initial_phases: phases,
             initial_water: water_seed,
@@ -1060,7 +1171,6 @@ impl Solver for PbmpmSolver {
         self.emit(input, dt);
         debug_assert!(self.water_count <= self.water_capacity);
 
-        self.profiler.begin_frame();
         // One substep per frame for now; the iteration_count loop runs WITHIN the substep (below).
         // A CFL substep policy is a later decision (twofield also runs one substep in its U2 form).
         self.params.dt = dt;
@@ -1103,60 +1213,89 @@ impl Solver for PbmpmSolver {
         // early-out, never indirect dispatch). Fixed-point P2G is order-independent and the host-side
         // loop count is uniform, so the structure is deterministic (Tint-safe: no in-shader
         // barriers/loops over the iterations).
+        //
+        // Dispatches go through the shared PassRecorder: with timestamps (native profiling) each
+        // dispatch gets its own timestamped pass (all of them — one substep per frame, so the
+        // whole frame IS the substep the perf gate sums); without timestamps the frame collapses
+        // into one batched compute pass (the web path, identical work).
         let node_groups = groups(self.num_nodes).max(1);
         let water_groups = groups(self.water_count).max(1);
         let iterations = self.params.iter_pad[0].max(1);
-        {
-            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("pbmpm-frame"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.pipelines.deform_clear.0);
-            pass.set_bind_group(0, Some(&self.pipelines.deform_clear.1), &[]);
-            pass.dispatch_workgroups(water_groups, 1, 1);
-            self.profiler.record_dispatch();
-            // FLIP snapshot (b): clear the grid, scatter the substep-start velocity (D = 0 now), decode
-            // it to the PRE-FORCE pure-transfer velocity (no gravity/BC) into grid_vel_old.
-            pass.set_pipeline(&self.pipelines.grid_clear.0);
-            pass.set_bind_group(0, Some(&self.pipelines.grid_clear.1), &[]);
-            pass.dispatch_workgroups(node_groups, 1, 1);
-            self.profiler.record_dispatch();
-            pass.set_pipeline(&self.pipelines.p2g.0);
-            pass.set_bind_group(0, Some(&self.pipelines.p2g.1), &[]);
-            pass.dispatch_workgroups(water_groups, 1, 1);
-            self.profiler.record_dispatch();
-            pass.set_pipeline(&self.pipelines.grid_decode_old.0);
-            pass.set_bind_group(0, Some(&self.pipelines.grid_decode_old.1), &[]);
-            pass.dispatch_workgroups(node_groups, 1, 1);
-            self.profiler.record_dispatch();
-            for _ in 0..iterations {
-                pass.set_pipeline(&self.pipelines.particle_update.0);
-                pass.set_bind_group(0, Some(&self.pipelines.particle_update.1), &[]);
-                pass.dispatch_workgroups(water_groups, 1, 1);
-                self.profiler.record_dispatch();
-                pass.set_pipeline(&self.pipelines.grid_clear.0);
-                pass.set_bind_group(0, Some(&self.pipelines.grid_clear.1), &[]);
-                pass.dispatch_workgroups(node_groups, 1, 1);
-                self.profiler.record_dispatch();
-                pass.set_pipeline(&self.pipelines.p2g.0);
-                pass.set_bind_group(0, Some(&self.pipelines.p2g.1), &[]);
-                pass.dispatch_workgroups(water_groups, 1, 1);
-                self.profiler.record_dispatch();
-                pass.set_pipeline(&self.pipelines.grid_update.0);
-                pass.set_bind_group(0, Some(&self.pipelines.grid_update.1), &[]);
-                pass.dispatch_workgroups(node_groups, 1, 1);
-                self.profiler.record_dispatch();
-                pass.set_pipeline(&self.pipelines.g2p.0);
-                pass.set_bind_group(0, Some(&self.pipelines.g2p.1), &[]);
-                pass.dispatch_workgroups(water_groups, 1, 1);
-                self.profiler.record_dispatch();
+        let sink = self.ts.as_ref().map(|t| TimestampSink {
+            qset: &t.qset,
+            capacity: t.capacity,
+        });
+        let mut rec = PassRecorder::new(sink);
+        let p = &self.pipelines;
+        rec.dispatch(
+            &mut enc,
+            &p.deform_clear.0,
+            &p.deform_clear.1,
+            "deform_clear",
+            water_groups,
+        );
+        // FLIP snapshot (b): clear the grid, scatter the substep-start velocity (D = 0 now), decode
+        // it to the PRE-FORCE pure-transfer velocity (no gravity/BC) into grid_vel_old.
+        rec.dispatch(
+            &mut enc,
+            &p.grid_clear.0,
+            &p.grid_clear.1,
+            "grid_clear",
+            node_groups,
+        );
+        rec.dispatch(&mut enc, &p.p2g.0, &p.p2g.1, "p2g", water_groups);
+        rec.dispatch(
+            &mut enc,
+            &p.grid_decode_old.0,
+            &p.grid_decode_old.1,
+            "grid_decode_old",
+            node_groups,
+        );
+        for _ in 0..iterations {
+            rec.dispatch(
+                &mut enc,
+                &p.particle_update.0,
+                &p.particle_update.1,
+                "particle_update",
+                water_groups,
+            );
+            rec.dispatch(
+                &mut enc,
+                &p.grid_clear.0,
+                &p.grid_clear.1,
+                "grid_clear",
+                node_groups,
+            );
+            rec.dispatch(&mut enc, &p.p2g.0, &p.p2g.1, "p2g", water_groups);
+            rec.dispatch(
+                &mut enc,
+                &p.grid_update.0,
+                &p.grid_update.1,
+                "grid_update",
+                node_groups,
+            );
+            rec.dispatch(&mut enc, &p.g2p.0, &p.g2p.1, "g2p", water_groups);
+        }
+        rec.dispatch(
+            &mut enc,
+            &p.particle_integrate.0,
+            &p.particle_integrate.1,
+            "particle_integrate",
+            water_groups,
+        );
+        let (dispatches, cursor, labels) = rec.finish();
+        if let Some(ts) = &self.ts {
+            if cursor >= 2 {
+                enc.resolve_query_set(&ts.qset, 0..cursor, &ts.resolve, 0);
+                enc.copy_buffer_to_buffer(&ts.resolve, 0, &ts.readback, 0, (cursor as u64) * 8);
             }
-            pass.set_pipeline(&self.pipelines.particle_integrate.0);
-            pass.set_bind_group(0, Some(&self.pipelines.particle_integrate.1), &[]);
-            pass.dispatch_workgroups(water_groups, 1, 1);
-            self.profiler.record_dispatch();
         }
         self.queue.submit(Some(enc.finish()));
+        self.dispatches = dispatches;
+        if let Some(ts) = self.ts.as_mut() {
+            ts.labels = labels;
+            ts.count = cursor;
+        }
     }
 
     fn particles(&self) -> ParticleBuffers {
@@ -1179,6 +1318,9 @@ impl Solver for PbmpmSolver {
     }
 
     fn profile(&self) -> Profile {
-        self.profiler.snapshot()
+        Profile {
+            passes: self.cached_passes.clone(),
+            dispatches_per_frame: self.dispatches,
+        }
     }
 }
