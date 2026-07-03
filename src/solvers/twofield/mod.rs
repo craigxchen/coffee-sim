@@ -75,6 +75,10 @@ use crate::utils::gpu::GpuContext;
 
 const WG: u32 = 256;
 
+/// Workgroup count of the multi-workgroup `bubble_fine` partial-sum reduction (mirrors
+/// `BUBBLE_FINE_WGS` in surface.wgsl — the dispatch size and the `bubble_part` sizing).
+const BUBBLE_FINE_WGS: u32 = 64;
+
 /// Y-coordinate at which un-emitted (dormant) water-pool slots are parked: far below any scene so
 /// the renderer culls them (particles.wgsl matches this with `p.y <= -1.0e8`). Activated slots get
 /// a real position from `emit()`. Kept finite (not NaN) so any accidental read stays well-defined.
@@ -102,8 +106,9 @@ fn groups(n: u32) -> u32 {
 /// plus pocket_f/pocket_c counter resets; `solids` for the wall-adjacent OUTSIDE seed),
 /// `flood_sweep` 3, `pocket_mark` 7 (grid_vel, cell_meta,
 /// pf×2, bubble, nm, pocket_f — U8 compacted-list append), `bubble_fine` 5 (nm, cell_meta, pf,
-/// bubble, pocket_f), `bubble_coarse` 6 (nm_c, cmeta, pc, bubble, pocket_f, pocket_c — pocket_f
-/// for the shared sub-resolution release size gate); U5 plasticity family —
+/// pocket_f, bubble_part — the multi-workgroup partial sums), `bubble_fine_solve` 3 (bubble,
+/// pocket_f, bubble_part), `bubble_coarse` 6 (nm_c, cmeta, pc, bubble, pocket_f, pocket_c —
+/// pocket_f for the shared sub-resolution release size gate); U5 plasticity family —
 /// `p2g_solid_dyn` 6 (pos, vel, cmat, grid_sfp, grid_sm, sstate), `solid_update` 4
 /// (grid_sm, grid_svel, grid_sfp, solids), `g2p_solid` 7 (pos, vel, cmat, solids,
 /// grid_svel, fmat, sstate) — ties cell_classify; U9 absorption family — `grid_clear` now 5
@@ -210,12 +215,14 @@ pub fn flood_sweeps_for(dims: [u32; 3]) -> u32 {
 }
 
 /// U4 dispatch increment for a grid of `dims`: flood_init + flood sweeps + pocket_mark, plus
-/// one single-workgroup bubble-row solve preceding EVERY fine and coarse Jacobi sweep (the
-/// KTD-6 identical-representation requirement — the multiplier relaxes WITH the smoother at
-/// both levels, so neither level can erode the constraint). Scene-derived through the flood
-/// budget (see `flood_sweeps_for`).
+/// a bubble-row solve preceding EVERY fine and coarse Jacobi sweep (the KTD-6
+/// identical-representation requirement — the multiplier relaxes WITH the smoother at both
+/// levels, so neither level can erode the constraint). The FINE solve is two dispatches
+/// (multi-workgroup partial sums + the tiny combine/solve — the pass boundary is the
+/// cross-workgroup sync); the coarse solve stays one fused single-workgroup pass.
+/// Scene-derived through the flood budget (see `flood_sweeps_for`).
 pub fn u4_surface_dispatches_for(dims: [u32; 3]) -> u32 {
-    2 + flood_sweeps_for(dims) + FINE_SWEEPS_DEFAULT + COARSE_SWEEPS_DEFAULT
+    2 + flood_sweeps_for(dims) + 2 * FINE_SWEEPS_DEFAULT + COARSE_SWEEPS_DEFAULT
 }
 
 /// U6 dispatch increment: the thin solid-mass P2G (`p2g_solid`) + the drag fold
@@ -628,12 +635,14 @@ struct Pipelines {
     jacobi_fine: (wgpu::ComputePipeline, [wgpu::BindGroup; 2]),
     project: (wgpu::ComputePipeline, [wgpu::BindGroup; 2]),
     // U4 surface family: flood fill (label ping-pong in the pressure slots), pocket marking,
-    // and the single-workgroup bubble-row solves at each level (parity variants like the
-    // sweeps they precede).
+    // and the bubble-row solves at each level (parity variants like the sweeps they precede).
+    // The fine solve is the multi-workgroup partial pass + the tiny combine/solve pass; the
+    // coarse solve stays single-workgroup fused.
     flood_init: (wgpu::ComputePipeline, wgpu::BindGroup),
     flood_sweep: (wgpu::ComputePipeline, [wgpu::BindGroup; 2]),
     pocket_mark: (wgpu::ComputePipeline, wgpu::BindGroup),
     bubble_fine: (wgpu::ComputePipeline, [wgpu::BindGroup; 2]),
+    bubble_fine_solve: (wgpu::ComputePipeline, wgpu::BindGroup),
     bubble_coarse: (wgpu::ComputePipeline, [wgpu::BindGroup; 2]),
     // Test-only operator taps (never dispatched in step; zero budget impact).
     dbg_div: (wgpu::ComputePipeline, wgpu::BindGroup),
@@ -1766,6 +1775,15 @@ impl Solver for TwofieldSolver {
             ((num_ccells as u64) + 1) * 4,
             wgpu::BufferUsages::empty(),
         );
+        // Per-workgroup partial sums (rhs, Ap, diag) of the multi-workgroup bubble_fine
+        // reduction; bubble_fine_solve combines them (binding 28). Every workgroup writes its
+        // triple unconditionally each run, so it never needs clearing.
+        let bubble_part = Self::storage(
+            &device,
+            "twofield-bubble-part",
+            (3 * BUBBLE_FINE_WGS as u64) * 4,
+            wgpu::BufferUsages::empty(),
+        );
         let solids_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("twofield-solids"),
             contents: bytemuck::cast_slice(&packed),
@@ -2149,12 +2167,17 @@ impl Solver for TwofieldSolver {
                         (9, &nm),
                         (10, &cell_meta),
                         (11, pf),
-                        (17, &bubble),
                         (26, &pocket_f),
+                        (28, &bubble_part),
                     ],
                 )
             };
             let bubble_fine_binds = [bf(&pf_a), bf(&pf_b)];
+            let bubble_fine_solve = make("bubble_fine_solve");
+            let bubble_fine_solve_bind = bg(
+                &bubble_fine_solve,
+                &[(17, &bubble), (26, &pocket_f), (28, &bubble_part)],
+            );
             let bubble_coarse = make("bubble_coarse");
             let bc = |pc: &wgpu::Buffer| {
                 bg(
@@ -2211,6 +2234,7 @@ impl Solver for TwofieldSolver {
                 flood_sweep: (flood_sweep, flood_sweep_binds),
                 pocket_mark: (pocket_mark, pocket_mark_bind),
                 bubble_fine: (bubble_fine, bubble_fine_binds),
+                bubble_fine_solve: (bubble_fine_solve, bubble_fine_solve_bind),
                 bubble_coarse: (bubble_coarse, bubble_coarse_binds),
                 dbg_div: (dbg_div, dbg_div_bind),
                 dbg_grad: (dbg_grad, dbg_grad_bind),
@@ -2225,9 +2249,10 @@ impl Solver for TwofieldSolver {
             // project, the G2Ps) vanished from profile() and the perf gate undercounted the
             // frame. Derive from the same budget formula the dispatch gates pin, plus the
             // dynamic/absorption increments and slack for test-raised sweep budgets.
-            let capacity = 2 * (dispatches_per_frame_for(dims)
-                + U5_PLASTICITY_DISPATCHES
-                + U9_INFILTRATION_DISPATCHES)
+            let capacity = 2
+                * (dispatches_per_frame_for(dims)
+                    + U5_PLASTICITY_DISPATCHES
+                    + U9_INFILTRATION_DISPATCHES)
                 + 64;
             let qset = device.create_query_set(&wgpu::QuerySetDescriptor {
                 label: Some("twofield-timestamps"),
@@ -2611,15 +2636,25 @@ impl Solver for TwofieldSolver {
             &self.pipelines.pocket_mark.1,
             cell_groups,
         ));
-        // Every Jacobi sweep is preceded by the single-workgroup bubble-row solve at its own
-        // level (KTD-6 identical representation): the sweep then writes the fresh multiplier
-        // into the pocket slots while relaxing the fluid rows against the previous one.
+        // Every Jacobi sweep is preceded by the bubble-row solve at its own level (KTD-6
+        // identical representation): the sweep then writes the fresh multiplier into the pocket
+        // slots while relaxing the fluid rows against the previous one. The fine solve is two
+        // dispatches — the multi-workgroup partial-sum reduction over the compacted pocket list
+        // (BUBBLE_FINE_WGS workgroups, so the dominant armed-pocket cost spreads across GPU
+        // cores) and the tiny combine/solve pass (the dispatch boundary is the cross-workgroup
+        // sync).
         let push_sweeps = |seq: &mut Vec<_>, n: u32, par: &mut usize| {
             for _ in 0..n {
                 seq.push((
                     "bubble_fine",
                     &self.pipelines.bubble_fine.0,
                     &self.pipelines.bubble_fine.1[*par],
+                    BUBBLE_FINE_WGS,
+                ));
+                seq.push((
+                    "bubble_fine_solve",
+                    &self.pipelines.bubble_fine_solve.0,
+                    &self.pipelines.bubble_fine_solve.1,
                     1,
                 ));
                 seq.push((

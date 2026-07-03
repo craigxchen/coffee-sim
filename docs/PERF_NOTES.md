@@ -100,6 +100,50 @@ Further wins if ever needed: a multi-workgroup partial-sum reduction (the list-s
 single-workgroup form is the simplest sufficient fix and was chosen for that reason), or warm-
 starting λ_b. These are CK-MPM / kernel-fusion backlog territory; the gate is met without them.
 
+## Corrections to the above (measured 2026-07-02, Apple M5)
+
+**The profile was silently truncated after the flood-budget fix.** The Manhattan-diameter flood
+budget (the V60 WaterOnly-collapse fix, post-R9) grew the per-substep dispatch count past the
+fixed 192-query timestamp capacity (96 dispatches): at the gate scene (155 passes/substep) every
+pass after the flood stack — pocket_mark, `bubble_fine`, ALL `jacobi_fine` sweeps, the coarse
+stack, project, the G2Ps — vanished from `profile()`, and the perf gate undercounted the frame
+(it reported ~10.2 ms median, counting only ~60 % of the passes). Capacity is now scene-derived
+from the dispatch-budget formula. The FULLY-timestamped gate scene measures **28.9 ms/frame
+median — still PASS** vs the 33 ms R9 gate, with the honest breakdown: `jacobi_fine` 29.7 %,
+`flood_sweep` 25.6 % (the Manhattan budget is ~106 sweeps/substep on this grid, up from the
+fixed 24 the table above was measured at), `p2g_water` 7.3 %, `bubble_fine` 6.6 %, `g2p_water`
+6.5 %. So the per-pass shares table above is superseded: the flood fix both inflated
+`flood_sweep` and (by correctly labeling previously-misread air OPEN) shrank the typical pocket,
+so `bubble_fine` is data-dependent — modest on the gate scene, dominant when a real enclosed
+cavity arms (a full-cross-section slab over trapped air measured `bubble_fine` at **56 % of the
+frame**).
+
+**Multi-workgroup `bubble_fine` reduction (the 2b lever, now pulled).** The compacted-list
+reduction was still ONE workgroup (one GPU core) per run, 8×/substep = 56×/frame. It is now
+split: `bubble_fine` computes per-workgroup partial sums (64 workgroups, workgroup-interleaved
+over the pocket list so small pockets still spread across cores) and a tiny `bubble_fine_solve`
+pass combines the 64 partial triples and solves the row — the pass boundary is the
+cross-workgroup sync a single dispatch cannot have (device-scope acquire/release does not exist
+in WGSL; a last-workgroup atomic-fold is formally unordered). Same λ_b math, same cells, same
+operator — only the summation grouping shifts (float-associativity level; suite re-verified
+green). Armed-pocket slab bench (~48k particles, ~3.5k-cell pocket): `bubble_fine` **4527 →
+~800 µs/frame** (partial + solve, ~5.7×), frame median **7.3 → ~5.3 ms**. Gate scene: median
+**28.9 → 26.5 ms** (breakdown below). Dispatches grow by one tiny solve pass per fine sweep
+(+8/substep, budget formula updated).
+
+**λ_b warm start: assessed and REJECTED (mathematically inert here).** The bubble row is a
+single unknown solved EXACTLY before every sweep: λ ← λ_old + (Σrhs − Σ(A p̃))/diag with the
+pocket slots of p̃ pinned to λ_old by the previous sweep, so Σ(A p̃) = Σ(A p_fluid) + λ_old·diag
+and the λ_old terms cancel — the post-solve λ is INDEPENDENT of the starting value. Carrying λ_b
+across substeps/frames saves no work (the reduction still runs before every sweep, and it must —
+p_fluid changes every sweep); skipping re-solves would break the KTD-6 identical-representation
+doctrine, not just shift float error. The only warm start that could help is the fluid pressure
+field itself (lever 3), out of scope here.
+
+**Next headroom, in order:** `jacobi_fine` (~30 %) and `flood_sweep` (~26 %, scene-derived sweep
+count — a hierarchical/jump-flood label propagation would cut the O(diameter) sweeps to
+O(log diameter), at the cost of new machinery), then `p2g_water`/`g2p_water`.
+
 Offline grid-refinement (GCI, reduced 3×2:1 with budget-scaled fine sweeps) on a settled
 hydrostatic column converges cleanly: water-COM height 8.42 → 8.73 → 8.90 su, **observed order
 p ≈ 0.82**, Richardson-extrapolated 9.12 su, GCI(fine) 3.2 % — the truncation-error study is in
