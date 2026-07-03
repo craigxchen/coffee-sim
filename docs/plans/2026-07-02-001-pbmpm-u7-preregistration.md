@@ -46,7 +46,10 @@ Guards (a metric sample is VALID only if all three hold on its frame):
 1. **Cap-hit ceiling**: fraction of live particles with speed ≥ 0.95·max_speed must be < 2%
    (else the number measures the cap, not the mechanism).
 2. **No-popcorn**: the ejecta set must contain ≥ 0.2% of live particles (≥ ~10 at 4.8k), AND
-   the single largest per-particle contribution to `R` must be ≤ 5% of `R`.
+   the single largest per-particle contribution to `R` must be ≤ 20% of `R`.
+   *(Amended 2026-07-02 BEFORE the first run: the original 5% share cap was structurally
+   impossible at the 10-particle floor — a uniform 10-particle crown is 10%/particle. 20% =
+   "no single particle dominates" while remaining satisfiable at the floor.)*
 3. **Conservation**: live count unchanged by the metric window except emitter activations;
    total KE after the burst window ≤ KE at burst end (no energy manufactured post-forcing).
 
