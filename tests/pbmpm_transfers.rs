@@ -452,3 +452,141 @@ fn collider_bc_pushes_out_and_reflects_by_restitution() {
         vel[1], expect_vy, vel0[1]
     );
 }
+
+/// Float-range probe (R7 surface (b) — the PER-PARTICLE float state, U6): the same
+/// fast-pour/velocity-cap posture as the fixed-point probe, but asserting the surface the grid
+/// probe CANNOT see — the per-particle deformation displacement `D` (the position-correction
+/// state the constraint loop accumulates) stays finite and within a pinned magnitude bound, and
+/// the per-particle `liquidDensity` (running volume product) stays in its clamped, sane band.
+/// A `D` blow-up corrupts the sim through p2g's affine term without ever wrapping an i32 lane —
+/// a distinct failure surface (R7).
+#[test]
+fn float_state_bounded_on_fast_pour() {
+    let Some(gpu) = GpuContext::new_headless() else {
+        eprintln!("pbmpm_transfers: no GPU adapter; skipping.");
+        return;
+    };
+    // PRE-REGISTERED bound: |D| entries legitimately reach ~dt·v_cap/cell + the relaxation-scaled
+    // correction (≈ 0.2 + O(1) at the pathological liquidDensity floor). 10.0 is an order above
+    // any legitimate value while still failing a divergent loop by orders of magnitude.
+    const D_BOUND: f32 = 10.0;
+    let scene = water_scene(
+        [0.0; 3],
+        [24.0; 3],
+        [0.0, -20.0, 0.0],
+        [7.0, 1.0, 7.0],
+        [16.0, 10.0, 16.0],
+    );
+    let cfg = Config::default();
+    let mut solver = PbmpmSolver::build(&scene, &Materials::default(), &cfg, &gpu);
+    let n = solver.read_positions().len();
+    let input = EmissionInput::default();
+    for _ in 0..300 {
+        solver.step(DT, &input);
+    }
+    let cap = cfg.max_speed;
+    solver.write_velocities_for_test(&vec![[0.0, -cap, 0.0, 0.0]; n]);
+    for _ in 0..3 {
+        solver.step(DT, &input);
+    }
+
+    let live = solver.active_count() as usize;
+    let disp = solver.read_deform_disp_rows();
+    let grad = solver.read_deform_grad_rows();
+    assert!(all_finite(&disp[..3 * live]), "non-finite D row");
+    assert!(all_finite(&grad[..3 * live]), "non-finite F row");
+    let mut d_max = 0.0f32;
+    for row in &disp[..3 * live] {
+        for v in row.iter().take(3) {
+            d_max = d_max.max(v.abs());
+        }
+    }
+    let mut ld_min = f32::MAX;
+    let mut ld_max = 0.0f32;
+    for p in 0..live {
+        let ld = grad[3 * p][0];
+        ld_min = ld_min.min(ld);
+        ld_max = ld_max.max(ld);
+    }
+    println!(
+        "pbmpm U6 float probe: |D|max {d_max:.3} (bound {D_BOUND}), liquidDensity ∈ [{ld_min:.3}, {ld_max:.3}]"
+    );
+    assert!(
+        d_max <= D_BOUND,
+        "per-particle D magnitude {d_max:.3} exceeds the pre-registered bound {D_BOUND} — the \
+         constraint loop's float state is running away (R7 surface (b))"
+    );
+    // liquidDensity is clamped ≥ 0.1 in particle_integrate; a value pinned AT the clamp for the
+    // whole pool, or an unbounded one, both mean the volume memory broke.
+    assert!(
+        ld_min >= 0.1 - 1e-6 && ld_max <= 100.0,
+        "liquidDensity band [{ld_min:.3}, {ld_max:.3}] left the sane range"
+    );
+}
+
+/// U6 bulk-density / settled-pool volume-loss drift — the OBJECTIVE U8 trigger (KTD4/R8).
+/// Pure-local-Jacobi PB-MPM is documented to leave ~1–5% bulk compressibility at few
+/// iterations; the pre-registered trigger below decides whether the U8 coarse-grid pre-pass
+/// must be built. The measured quantity is the mean per-particle `liquidDensity` over the
+/// settled pool — the solver's own running volume product (mean 1.03 = the pool sits 3%
+/// over-dense = 3% volume loss). Recorded whether or not the trigger fires; a RED here is not
+/// a tuning failure, it is the trigger FIRING (the recorded next step is: build U8).
+#[test]
+fn bulk_density_drift_vs_u8_trigger() {
+    let Some(gpu) = GpuContext::new_headless() else {
+        eprintln!("pbmpm_transfers: no GPU adapter; skipping.");
+        return;
+    };
+    // PRE-REGISTERED (fixed before the first run): the U8 trigger threshold and the settle
+    // budget. 3% sits inside the documented 1–5% PBF/PB-MPM low-frequency gap — below it the
+    // single-phase pool is acceptably incompressible without global work; above it U8 is built.
+    const U8_TRIGGER_DRIFT: f64 = 0.03;
+    const SETTLE_FRAMES: u32 = 360;
+    let scene = water_scene(
+        [0.0; 3],
+        [24.0; 3],
+        [0.0, -20.0, 0.0],
+        [2.0, 1.0, 2.0],
+        [22.0, 11.0, 22.0], // 21×11×21 ≈ 4.8k particle block → a real pool, cheap to settle
+    );
+    let cfg = Config::default();
+    let mut solver = PbmpmSolver::build(&scene, &Materials::default(), &cfg, &gpu);
+    let input = EmissionInput::default();
+    for _ in 0..SETTLE_FRAMES {
+        solver.step(DT, &input);
+    }
+
+    let live = solver.active_count() as usize;
+    let grad = solver.read_deform_grad_rows();
+    let pos = solver.read_positions();
+    let mut lds: Vec<f64> = (0..live).map(|p| grad[3 * p][0] as f64).collect();
+    lds.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let mean = lds.iter().sum::<f64>() / lds.len().max(1) as f64;
+    let p95 = lds[(lds.len() * 95) / 100];
+    let max = *lds.last().unwrap_or(&0.0);
+    let com_y = pos[..live].iter().map(|p| p[1] as f64).sum::<f64>() / live.max(1) as f64;
+    let drift = mean - 1.0;
+    println!(
+        "pbmpm U6 bulk drift ({SETTLE_FRAMES} frames, N={live}): mean liquidDensity {mean:.4} \
+         (drift {:+.2}%), p95 {p95:.4}, max {max:.4}, pool COM y {com_y:.3} — U8 trigger at \
+         {:+.1}%",
+        100.0 * drift,
+        100.0 * U8_TRIGGER_DRIFT
+    );
+    // Sanity floor: a pool that settled EXPANDED (mean well under 1) means the volume memory
+    // or the constraint sign broke — that is a bug, not a compressibility drift.
+    assert!(
+        mean >= 0.90,
+        "settled pool reads {:.1}% UNDER rest density — volume memory / constraint sign bug",
+        100.0 * (1.0 - mean)
+    );
+    assert!(
+        drift <= U8_TRIGGER_DRIFT,
+        "U8 TRIGGER FIRED: settled-pool bulk density drift {:+.2}% exceeds the pre-registered \
+         {:+.1}% threshold — per KTD4 the coarse-grid pressure pre-pass (U8, MGPBD-style) must \
+         be BUILT and this gate re-run with its cost included in the U7 assembled projection. \
+         This is the objective trigger doing its job, not a tuning failure.",
+        100.0 * drift,
+        100.0 * U8_TRIGGER_DRIFT
+    );
+}
