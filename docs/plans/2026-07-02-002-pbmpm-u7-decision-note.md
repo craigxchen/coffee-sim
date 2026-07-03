@@ -37,17 +37,31 @@ preregistration: 2026-07-02-001-pbmpm-u7-preregistration.md (committed before an
   pinned config; its jet at nozzle 0.25 may be too thin to crown its SPH pool. Reference-only
   arm; does not bear on the decision.
 
-### 2. Bulk-density drift (from U6) — MEASURED, U8 TRIGGER FIRED
+### 2. Bulk-density drift (from U6) — TRIGGER RETRACTED (metric artifact); U8 built anyway
 
-`tests/pbmpm_transfers.rs::bulk_density_drift_vs_u8_trigger` (RED by design until U8 exists):
-settled-pool mean per-particle liquidDensity **1.111 (+11.1%)** vs the pre-registered **+3%**
-trigger; p95 2.65, max 31.3, pool COM y 5.32 at 360 frames, N=4851.
+**SUPERSEDED 2026-07-03.** The original measurement — settled-pool mean per-particle
+liquidDensity **1.111 (+11.1%)** vs the **+3%** trigger — fired on an ARTIFACT of the
+observable, not on physical compression. The liquidDensity memory is a multiplicative running
+product ∏(tr(D)+1); its mean inflates with accumulated random-walk variance (measured
+distribution: median **0.88**, mean 1.11, lognormal tail p95 2.6 / max 32). The corrected
+physical observable — the INSTANTANEOUS interior grid density
+(`read_fine_interior_density`) — reads **−2.9%** (11-layer pool) and **−0.4%** (28-layer pool)
+with NO coarse pass at the frozen iteration_count 16: in-band all along, at both depths.
+Geometry cross-check (pool COM vs rest height with spreading) agrees.
 
-Consequence (KTD4): the coarse-grid pre-pass (U8, MGPBD-style) **must be built** on a GO —
-and its placeholder cost (0.5×G) in the projection below is a known-needed pass, not
-insurance. The +11.1% mean (vs the documented 1–5% PBF gap) plus the 31× max tail says the
-low-frequency deficit is worse than literature-typical at this iteration count, and a subset
-of particles carries extreme compression memory — U8's job description exactly.
+U8 was built regardless (owner instruction, and the trade was worth measuring):
+compacted-active-cell-list coarse Poisson + capped trilinear velocity kick
+(`src/solvers/pbmpm/coarse.wgsl`), stable and gate-green at κ=0.1/cap 0.5, cost ~0.9 ms at
+200k. Measured trades: it damps the U7 crown ~75% (it counter-kicks the impact-zone expansion
+that IS the splash), and it buys back no constraint iterations (at 8/4 iters density gets
+WORSE — the weakened fine constraint cannot absorb the kick's high-frequency residual).
+**Default OFF** (`pbmpm_coarse_strength = 0.0`); retained as calibrated opt-in for deep-fill /
+low-iteration regimes if the assembled solver ever measures a real low-frequency deficit.
+
+Residual solver-health flag (real, but not a U8 matter): the liquidDensity memory variable
+itself is noisy (median drifts to 0.65 with tails to ~300 on deep pools) — the fine
+constraint reads it per particle, so a renormalization/clamp of the memory toward grid density
+is a candidate fine-constraint refinement for the coupling-rebuild phase.
 
 ### 3. Assembled-cost projection — MEASURED, FAILS under the pinned floors
 
@@ -116,7 +130,10 @@ measured value. Re-baselining the floors after measurement requires an explicit 
 
 ## Consequences either way
 
-- U8 (coarse-grid pre-pass) is required work: the +11.1% drift stands regardless of the ruling.
+- ~~U8 (coarse-grid pre-pass) is required work: the +11.1% drift stands regardless of the
+  ruling.~~ **Superseded (see §2): the trigger was a metric artifact. U8 is BUILT, gate-green,
+  and DEFAULT OFF** — its 0.5×G placeholder can be dropped from (or kept as slack in) the
+  assembled projection, and the "build U8 first" GO precondition is already satisfied.
 - The shared harnesses (`tests/solver_perf.rs`, `tests/solver_physics.rs`) are now the
   KTD10 regression surface for whichever path proceeds — twofield/xpbd enter by match arm.
 
