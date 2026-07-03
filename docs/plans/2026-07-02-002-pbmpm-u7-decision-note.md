@@ -1,7 +1,7 @@
 ---
 title: "U7 go/no-go decision note — PB-MPM gating prototype"
-status: DRAFT — bounce + drift measured; assembled-cost projection pending the uncontended-GPU
-  timing run (this line is replaced by the verdict when it lands)
+status: MEASURED — formal verdict NO-GO under the pinned floors; HALT-FOR-OWNER-RULING on the
+  floor-structure re-baseline (see §Verdict)
 parent: 2026-06-20-001-feat-pbmpm-prototype-plan.md (U7, R6)
 preregistration: 2026-07-02-001-pbmpm-u7-preregistration.md (committed before any number below)
 ---
@@ -49,11 +49,34 @@ insurance. The +11.1% mean (vs the documented 1–5% PBF gap) plus the 31× max 
 low-frequency deficit is worse than literature-typical at this iteration count, and a subset
 of particles carries extreme compression memory — U8's job description exactly.
 
-### 3. Assembled-cost projection — PENDING (hard gate)
+### 3. Assembled-cost projection — MEASURED, FAILS under the pinned floors
 
-Waiting on the uncontended-GPU U6 timing run (`tests/solver_perf.rs`). Method and floors are
-pinned in the pre-registration doc; the projection will be computed as
-`2 × [C_single + 1.0·T + 0.5·G + 0.5·G + 0.2·T + 0.1·T + 0.5·G]` from the measured breakdown.
+U6 timing run (uncontended Apple M5, release, 2026-07-02, `tests/solver_perf.rs`, all 3 gates
+GREEN):
+
+- **Single-phase 200k gate: median 18.827 ms @ N=190,874, frozen iteration_count 16 — PASS**
+  (98.6 µs/Kpart; 14 ms under the 33 ms gate).
+- Linearity 40k→200k: 59.3 → 116.7 µs/Kpart = 1.97× ≤ 2.5× — PASS.
+- Dispatch budget: 85 = 5 + 5·16 exact — PASS.
+- Breakdown (µs/frame): p2g 7176 (37.9%), g2p 5131 (27.1%), particle_update 4866 (25.7%),
+  grid_clear 727, particle_integrate 531, grid_update 305, deform_clear 182, grid_decode_old 17.
+  → `T` (transfer family) = 13,355 µs; `G` (node-grid passes) = 1,048 µs.
+
+Pinned projection: `M_sub × [C_single + 1.0·T + 0.5·G + 0.5·G + 0.2·T + 0.1·T + 0.5·G]`
+= `2 × [18.83 + 13.36 + 0.52 + 0.52 + 2.67 + 1.34 + 0.52] ms` = `2 × 37.76` = **75.5 ms**.
+**75.5 > 33 → the hard gate FAILS as pre-registered.** (Even at M_sub = 1 it is 37.8 > 33.)
+
+**Floor-structure critique (recorded, not applied):** the binding floor `C_2nd = 1.0×T`
+charges the second (solid) velocity field the full ITERATED water transfer cost — but `T` is
+dominated by the ×16 constraint-loop reruns, and in the actual assembled design (mirroring
+twofield) the solid field transfers ONCE per substep at ~10–20% particle count and does NOT
+run the density-constraint iteration. That is a category error in the floor's structure, not
+mere conservatism, and it is identifiable a priori (the argument uses no measured number —
+only the pass structure). A structurally-corrected conservative projection: one solid
+transfer pair per substep at full count ≈ (p2g+g2p)/16 + G/17 ≈ 0.8 ms →
+`M_sub × [18.83 + 0.8 + 0.52 + 0.52 + 2.67 + 1.34 + 0.52]` = **25.2 ms at M_sub = 1 (PASS)**
+/ **50.4 ms at M_sub = 2 (FAIL)** — the substep multiplier becomes the swing variable
+(position-based solids target 1 substep; the ×2 was budgeted for impact robustness).
 
 ### 4. Buffer / pass-family ledger — STATIC, WITHIN BUDGET
 
@@ -72,9 +95,30 @@ Prospective assembled entry points (current single-phase counts + the floors' ad
 
 ## Verdict
 
-**PENDING** — two of three decision inputs measured and passing; the assembled-cost hard gate
-outstanding. On `projected ≤ 33 ms` → **GO** (coupling rebuild follow-up plan, with U8 built
-first). On a miss → **NO-GO**, fallback ladder D → B → two-field coupling-only.
+Formal verdict under the pinned pre-registration: **NO-GO** — bounce PASS (decisively:
+pbmpm crowns, twofield/DensU/xpbd cannot), beats-best-D PASS, assembled-cost **FAIL**
+(75.5 ms projected vs 33). Per KTD9 the floors are NOT softened after reading the numbers.
+
+**HALT-FOR-OWNER-RULING** (mirroring the twofield R9 halt precedent): the failing input is
+the projection's floor STRUCTURE, not the solver's measured cost — single-phase runs 18.8 ms
+with 14 ms of headroom, and the floor that kills the projection (`C_2nd = 1.0×T`) charges the
+solid minority the iterated-water cost, a category error arguable without reference to any
+measured value. Re-baselining the floors after measurement requires an explicit owner ruling
+(this note is the record). The two candidate rulings:
+
+1. **Uphold NO-GO** → fallback ladder engages: D (density-target in twofield) → B → two-field
+   coupling-only. Note candidate D's proxy just measured ZERO crown at every K — the ladder's
+   first rung has direct evidence against its headline weakness.
+2. **Re-baseline the projection** (recorded as such): structurally-corrected floors give
+   25.2 ms at 1 substep (PASS with 7.8 ms headroom) — GO conditional on (a) building U8 first
+   (the trigger fired; its 0.5×G placeholder is charged), (b) the assembled solver holding
+   1 substep/frame, re-gated by the same shared harness at first assembled milestone.
+
+## Consequences either way
+
+- U8 (coarse-grid pre-pass) is required work: the +11.1% drift stands regardless of the ruling.
+- The shared harnesses (`tests/solver_perf.rs`, `tests/solver_physics.rs`) are now the
+  KTD10 regression surface for whichever path proceeds — twofield/xpbd enter by match arm.
 
 ## Follow-ups recorded
 
