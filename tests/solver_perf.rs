@@ -320,7 +320,10 @@ fn pbmpm_dispatch_budget_matches_recorded_formula() {
     };
     let mut solver = gate_setup(SolverId::Pbmpm, EDGE_40K, &gpu);
     solver.step(DT, &EmissionInput::default());
-    let expected = dispatches_per_frame_for(FROZEN_ITERATION_COUNT);
+    let expected = dispatches_per_frame_for(
+        FROZEN_ITERATION_COUNT,
+        Config::default().pbmpm_coarse_strength > 0.0,
+    );
     let got = solver.profile().dispatches_per_frame;
     println!("U6 pbmpm dispatch budget: {got} dispatches/frame (expected {expected})");
     assert_eq!(

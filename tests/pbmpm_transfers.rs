@@ -524,69 +524,141 @@ fn float_state_bounded_on_fast_pour() {
     );
 }
 
-/// U6 bulk-density / settled-pool volume-loss drift — the OBJECTIVE U8 trigger (KTD4/R8).
-/// Pure-local-Jacobi PB-MPM is documented to leave ~1–5% bulk compressibility at few
-/// iterations; the pre-registered trigger below decides whether the U8 coarse-grid pre-pass
-/// must be built. The measured quantity is the mean per-particle `liquidDensity` over the
-/// settled pool — the solver's own running volume product (mean 1.03 = the pool sits 3%
-/// over-dense = 3% volume loss). Recorded whether or not the trigger fires; a RED here is not
-/// a tuning failure, it is the trigger FIRING (the recorded next step is: build U8).
+/// One settle run for the U8 drift gate: settle a pool of `depth` seeded layers, return
+/// `(instantaneous interior density error, interior node count, memory stats [mean, p50, p95, max])`.
+fn settle_and_measure(
+    gpu: &GpuContext,
+    coarse_strength: Option<f32>,
+    settle_frames: u32,
+    depth: f32,
+) -> (f64, u32, [f64; 4]) {
+    settle_and_measure_at(gpu, coarse_strength, settle_frames, depth, None)
+}
+
+fn settle_and_measure_at(
+    gpu: &GpuContext,
+    coarse_strength: Option<f32>,
+    settle_frames: u32,
+    depth: f32,
+    iterations: Option<u32>,
+) -> (f64, u32, [f64; 4]) {
+    let scene = water_scene(
+        [0.0; 3],
+        [24.0, (depth + 14.0).max(24.0), 24.0],
+        [0.0, -20.0, 0.0],
+        [2.0, 1.0, 2.0],
+        [22.0, depth, 22.0], // 21×depth×21 block → a real pool, cheap to settle
+    );
+    let cfg = Config::default();
+    let mut solver = PbmpmSolver::build(&scene, &Materials::default(), &cfg, gpu);
+    if let Some(s) = coarse_strength {
+        solver.set_coarse_strength_for_test(s);
+    }
+    if let Some(it) = iterations {
+        solver.set_iteration_count_for_test(it);
+    }
+    let input = EmissionInput::default();
+    for _ in 0..settle_frames {
+        solver.step(DT, &input);
+    }
+    // Instantaneous PHYSICAL bulk density from the fine grid mass (0.75 = interior nodes only).
+    let (inst_e, interior) = solver.read_fine_interior_density(0.75);
+    let live = solver.active_count() as usize;
+    let grad = solver.read_deform_grad_rows();
+    let mut lds: Vec<f64> = (0..live).map(|p| grad[3 * p][0] as f64).collect();
+    lds.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let mean = lds.iter().sum::<f64>() / lds.len().max(1) as f64;
+    let p50 = lds[lds.len() / 2];
+    let p95 = lds[(lds.len() * 95) / 100];
+    let max = *lds.last().unwrap_or(&0.0);
+    (inst_e, interior, [mean, p50, p95, max])
+}
+
+/// U6/U8 bulk-density / settled-pool volume-loss drift — the OBJECTIVE U8 trigger (KTD4/R8),
+/// re-gated with the U8 coarse pre-pass built.
+///
+/// METRIC CORRECTION (recorded; same class as the settle-harness mean→max correction): the
+/// original observable was the MEAN per-particle `liquidDensity`. That variable is a
+/// multiplicative running product ∏(tr(D)+1) over every substep, so its mean inflates with
+/// accumulated random-walk variance (a lognormal tail: p95 ~2.6, max ~32 while the MEDIAN sits
+/// at rest) — it measures memory noise, not pool volume. The corrected observable is the
+/// INSTANTANEOUS interior grid density (`read_fine_interior_density`), the physical volume-loss
+/// measure. Both are printed; the baseline (coarse-off) arm is measured alongside so the
+/// pass's effect is an A/B on the same build, and the memory stats stay recorded for
+/// continuity with the original trigger measurement.
 #[test]
 fn bulk_density_drift_vs_u8_trigger() {
     let Some(gpu) = GpuContext::new_headless() else {
         eprintln!("pbmpm_transfers: no GPU adapter; skipping.");
         return;
     };
-    // PRE-REGISTERED (fixed before the first run): the U8 trigger threshold and the settle
-    // budget. 3% sits inside the documented 1–5% PBF/PB-MPM low-frequency gap — below it the
-    // single-phase pool is acceptably incompressible without global work; above it U8 is built.
+    // PRE-REGISTERED threshold and settle budget (unchanged from the original trigger): 3%
+    // sits inside the documented 1–5% PBF/PB-MPM low-frequency gap. Two depths: the original
+    // shallow pool (11 layers) and a DEEP pool (28 layers) — the pure-local constraint's
+    // low-frequency deficit grows with pool depth, so the deep arm is where the coarse pass
+    // has to earn its keep (the cup-fill regime of the assembled solver).
     const U8_TRIGGER_DRIFT: f64 = 0.03;
     const SETTLE_FRAMES: u32 = 360;
-    let scene = water_scene(
-        [0.0; 3],
-        [24.0; 3],
-        [0.0, -20.0, 0.0],
-        [2.0, 1.0, 2.0],
-        [22.0, 11.0, 22.0], // 21×11×21 ≈ 4.8k particle block → a real pool, cheap to settle
-    );
-    let cfg = Config::default();
-    let mut solver = PbmpmSolver::build(&scene, &Materials::default(), &cfg, &gpu);
-    let input = EmissionInput::default();
-    for _ in 0..SETTLE_FRAMES {
-        solver.step(DT, &input);
-    }
 
-    let live = solver.active_count() as usize;
-    let grad = solver.read_deform_grad_rows();
-    let pos = solver.read_positions();
-    let mut lds: Vec<f64> = (0..live).map(|p| grad[3 * p][0] as f64).collect();
-    lds.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let mean = lds.iter().sum::<f64>() / lds.len().max(1) as f64;
-    let p95 = lds[(lds.len() * 95) / 100];
-    let max = *lds.last().unwrap_or(&0.0);
-    let com_y = pos[..live].iter().map(|p| p[1] as f64).sum::<f64>() / live.max(1) as f64;
-    let drift = mean - 1.0;
-    println!(
-        "pbmpm U6 bulk drift ({SETTLE_FRAMES} frames, N={live}): mean liquidDensity {mean:.4} \
-         (drift {:+.2}%), p95 {p95:.4}, max {max:.4}, pool COM y {com_y:.3} — U8 trigger at \
-         {:+.1}%",
-        100.0 * drift,
-        100.0 * U8_TRIGGER_DRIFT
-    );
-    // Sanity floor: a pool that settled EXPANDED (mean well under 1) means the volume memory
-    // or the constraint sign broke — that is a bug, not a compressibility drift.
-    assert!(
-        mean >= 0.90,
-        "settled pool reads {:.1}% UNDER rest density — volume memory / constraint sign bug",
-        100.0 * (1.0 - mean)
-    );
-    assert!(
-        drift <= U8_TRIGGER_DRIFT,
-        "U8 TRIGGER FIRED: settled-pool bulk density drift {:+.2}% exceeds the pre-registered \
-         {:+.1}% threshold — per KTD4 the coarse-grid pressure pre-pass (U8, MGPBD-style) must \
-         be BUILT and this gate re-run with its cost included in the U7 assembled projection. \
-         This is the objective trigger doing its job, not a tuning failure.",
-        100.0 * drift,
-        100.0 * U8_TRIGGER_DRIFT
-    );
+    for (label, depth) in [("shallow(11)", 11.0f32), ("deep(28)", 28.0f32)] {
+        let (e_off, n_off, m_off) = settle_and_measure(&gpu, Some(0.0), SETTLE_FRAMES, depth);
+        let (e_on, n_on, m_on) = settle_and_measure(&gpu, Some(0.1), SETTLE_FRAMES, depth); // U8 armed
+        println!(
+            "pbmpm U8 drift {label} ({SETTLE_FRAMES} frames): interior grid density error \
+             OFF {:+.2}% ({n_off} nodes) → ON {:+.2}% ({n_on} nodes) — trigger ±{:.1}%",
+            100.0 * e_off,
+            100.0 * e_on,
+            100.0 * U8_TRIGGER_DRIFT
+        );
+        println!(
+            "  liquidDensity memory [mean, p50, p95, max]: OFF [{:.4}, {:.4}, {:.4}, {:.2}] → \
+             ON [{:.4}, {:.4}, {:.4}, {:.2}] (recorded; noisy multiplicative integral, not the gate)",
+            m_off[0], m_off[1], m_off[2], m_off[3], m_on[0], m_on[1], m_on[2], m_on[3]
+        );
+        // The pass must not make the physical observable worse (magnitude toward zero; ties
+        // within float noise allowed on an already-in-band pool).
+        assert!(
+            e_on.abs() <= e_off.abs() + 0.005,
+            "{label}: U8 coarse pass worsened the interior density error \
+             (OFF {:+.2}% vs ON {:+.2}%)",
+            100.0 * e_off,
+            100.0 * e_on
+        );
+        assert!(
+            e_on.abs() <= U8_TRIGGER_DRIFT,
+            "{label} U8 GATE RED: settled-pool interior density error {:+.2}% (coarse pass ON) \
+             exceeds the pre-registered ±{:.1}% band — the coarse pre-pass as built does not \
+             drain the low-frequency error; strengthen it (sweeps/strength/cap) or extend it \
+             (V-cycle), and do NOT loosen the threshold.",
+            100.0 * e_on,
+            100.0 * U8_TRIGGER_DRIFT
+        );
+    }
+}
+
+/// ON-DEMAND diagnostic (not a gate): can the U8 coarse pass BUY BACK constraint iterations?
+/// The iterated transfer loop is ~90% of the frame (p2g/g2p/particle_update × iteration_count),
+/// so if the coarse low-frequency solve holds settled density at a lower iteration count, U8
+/// converts directly into frame time. Sweeps iterations × {coarse OFF, ON} on the deep pool and
+/// prints the interior density error table. Run:
+/// `cargo test --test pbmpm_transfers coarse_pass_iteration_buyback -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn coarse_pass_iteration_buyback_sweep() {
+    let Some(gpu) = GpuContext::new_headless() else {
+        eprintln!("pbmpm_transfers: no GPU adapter; skipping.");
+        return;
+    };
+    println!("pbmpm U8 iteration buy-back (deep pool 28 layers, 360 frames):");
+    println!("{:>6} {:>12} {:>12}", "iters", "OFF e%", "ON e%");
+    for iters in [16u32, 8, 4, 2] {
+        let (e_off, _, _) = settle_and_measure_at(&gpu, Some(0.0), 360, 28.0, Some(iters));
+        let (e_on, _, _) = settle_and_measure_at(&gpu, Some(0.1), 360, 28.0, Some(iters));
+        println!(
+            "{:>6} {:>11.2}% {:>11.2}%",
+            iters,
+            100.0 * e_off,
+            100.0 * e_on
+        );
+    }
 }

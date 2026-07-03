@@ -94,12 +94,34 @@ pub const CELL_SIZE_FACTOR: f32 = 2.0;
 /// reports the real per-frame dispatch count.
 pub const DISPATCHES_PER_SUBSTEP_BUNDLE: u32 = 5;
 
+/// Fine nodes per coarse cell per axis (U8 coarse pressure pre-pass; mirrors `COARSE_FACTOR`
+/// in coarse.wgsl). Coarse cell size H = COARSE_FACTOR·h; a full interior coarse cell holds
+/// COARSE_FACTOR³ fine nodes.
+pub const COARSE_FACTOR: u32 = 4;
+
+/// Plain-Jacobi sweep count of the U8 coarse solve. EVEN by contract: the ping-pong ends with
+/// the final potential back in `coarse_phi_a`, which is the buffer `coarse_apply` binds. The
+/// active pool region is a handful of coarse cells across, so 16 sweeps propagate the
+/// low-frequency correction wall-to-wall with margin (each sweep reaches one more cell).
+pub const COARSE_SWEEPS: u32 = 16;
+
+/// U8 dispatch increment when the coarse pre-pass is enabled (`pbmpm_coarse_strength > 0`):
+/// clear + restrict + source + the sweeps + apply, once per substep.
+pub fn coarse_dispatches() -> u32 {
+    3 + COARSE_SWEEPS + 1
+}
+
 /// The recorded dispatch formula (see `DISPATCHES_PER_SUBSTEP_BUNDLE` docs): `5 +
 /// 5·iteration_count` per frame at one substep/frame (1 deform_clear + 3 snapshot passes +
-/// the iteration bundles + 1 particle_integrate). The U6 dispatch-budget gate pins
-/// `profile().dispatches_per_frame` to exactly this.
-pub fn dispatches_per_frame_for(iterations: u32) -> u32 {
-    5 + DISPATCHES_PER_SUBSTEP_BUNDLE * iterations.max(1)
+/// the iteration bundles + 1 particle_integrate), plus the U8 coarse family when enabled.
+/// The U6 dispatch-budget gate pins `profile().dispatches_per_frame` to exactly this.
+pub fn dispatches_per_frame_for(iterations: u32, coarse_enabled: bool) -> u32 {
+    let coarse = if coarse_enabled {
+        coarse_dispatches()
+    } else {
+        0
+    };
+    5 + DISPATCHES_PER_SUBSTEP_BUNDLE * iterations.max(1) + coarse
 }
 
 /// Uniform parameters, byte-mirrored by the WGSL `Params` in `common.wgsl`.
@@ -127,10 +149,14 @@ struct Params {
     // Packed as one vec4 so the WGSL vec4<u32> alignment matches Rust's `[u32; 4]` exactly (a bare
     // u32 followed by a vec3 pad disagrees: WGSL aligns the vec3 to 16, Rust does not).
     iter_pad: [u32; 4],
+    // U8 coarse pressure pre-pass (coarse.wgsl): dims (cx, cy, cz, num_ccells) and
+    // (strength κ, interior rest mass per coarse cell, coarse cell size H, kick cap).
+    coarse_dims: [u32; 4],
+    coarse: [f32; 4],
 }
 
 // Params is uploaded as a uniform and must stay byte-identical to the WGSL `Params`.
-const _: () = assert!(std::mem::size_of::<Params>() == 128);
+const _: () = assert!(std::mem::size_of::<Params>() == 160);
 
 /// GPU record for one static SDF solid — byte-identical to the WGSL `Primitive` (64 bytes,
 /// vec4-aligned; mirrors twofield's `Primitive` packing of `utils::sdf` primitives, U5). Cone
@@ -402,6 +428,14 @@ struct Pipelines {
     grid_update: (wgpu::ComputePipeline, wgpu::BindGroup),
     g2p: (wgpu::ComputePipeline, wgpu::BindGroup),
     particle_integrate: (wgpu::ComputePipeline, wgpu::BindGroup),
+    // U8 coarse pressure family (coarse.wgsl). coarse_jacobi carries the two ping-pong bind
+    // groups ([0] reads phi_a → writes phi_b, [1] the swap); COARSE_SWEEPS is even so the final
+    // potential lands in phi_a, the buffer coarse_apply binds.
+    coarse_clear: (wgpu::ComputePipeline, wgpu::BindGroup),
+    coarse_restrict: (wgpu::ComputePipeline, wgpu::BindGroup),
+    coarse_source: (wgpu::ComputePipeline, wgpu::BindGroup),
+    coarse_jacobi: (wgpu::ComputePipeline, [wgpu::BindGroup; 2]),
+    coarse_apply: (wgpu::ComputePipeline, wgpu::BindGroup),
 }
 
 impl PbmpmSolver {
@@ -499,6 +533,30 @@ impl PbmpmSolver {
         let bytes = (self.num_nodes as u64) * 16;
         let raw: Vec<i32> = bytemuck::cast_slice(&self.read_bytes(&self.grid_fp, bytes)).to_vec();
         raw.iter().map(|&c| (c as i64).abs()).max().unwrap_or(0)
+    }
+
+    /// Instantaneous bulk density of the pool INTERIOR from the fine grid mass field
+    /// (dev/test only — stalls): mean of `node_mass / rest_node_mass − 1` over nodes carrying
+    /// at least `interior_frac` of the rest loading (excludes surface/air nodes). This is the
+    /// PHYSICAL volume-loss observable — unlike the per-particle `liquidDensity` memory, it
+    /// carries no multiplicative random-walk noise (the memory is a ∏(tr(D)+1) integral whose
+    /// MEAN inflates with accumulated variance even at rest; see the U8 drift-gate notes).
+    /// Returns `(mean_error, interior_node_count)`.
+    pub fn read_fine_interior_density(&self, interior_frac: f32) -> (f64, u32) {
+        let bytes = (self.num_nodes as u64) * 16;
+        let raw: Vec<i32> = bytemuck::cast_slice(&self.read_bytes(&self.grid_fp, bytes)).to_vec();
+        let spacing_ratio = self.params.grid_origin[3] / self.inflow.spacing;
+        let rest_node = (self.params.particle_mass * spacing_ratio.powi(3)) as f64;
+        let mut sum = 0.0f64;
+        let mut count = 0u32;
+        for node in raw.chunks_exact(4) {
+            let mass = node[0] as f64 / FP_SCALE;
+            if mass >= interior_frac as f64 * rest_node {
+                sum += mass / rest_node - 1.0;
+                count += 1;
+            }
+        }
+        (if count > 0 { sum / count as f64 } else { 0.0 }, count)
     }
 
     /// Read back the decoded float grid velocity (.xyz) + node mass (.w) after `grid_update`
@@ -616,6 +674,12 @@ impl PbmpmSolver {
     /// grid-velocity change). Clamped to `[0, 1]`. Stored as f32 bits in `iter_pad.w`.
     pub fn set_flip_fraction_for_test(&mut self, flip_fraction: f32) {
         self.params.iter_pad[3] = flip_fraction.clamp(0.0, 1.0).to_bits();
+    }
+
+    /// Set the U8 coarse pre-pass strength κ — dev/test only. `0.0` disables the pass entirely
+    /// (its dispatches are skipped; the byte-identical off-switch the A/B tests key on).
+    pub fn set_coarse_strength_for_test(&mut self, strength: f32) {
+        self.params.coarse[0] = strength.max(0.0);
     }
 
     /// Live water count currently simulated.
@@ -794,6 +858,14 @@ impl Solver for PbmpmSolver {
 
         let (origin, cell, dims) = grid_spec_for(scene, mats);
         let num_nodes = dims[0] * dims[1] * dims[2];
+        // U8 coarse grid: COARSE_FACTOR fine nodes per coarse cell per axis, rounded up so the
+        // last partial cells still cover the node grid.
+        let cdims = [
+            dims[0].div_ceil(COARSE_FACTOR),
+            dims[1].div_ceil(COARSE_FACTOR),
+            dims[2].div_ceil(COARSE_FACTOR),
+        ];
+        let num_ccells = cdims[0] * cdims[1] * cdims[2];
 
         let params = Params {
             box_min: [scene.box_min[0], scene.box_min[1], scene.box_min[2], 0.0],
@@ -815,6 +887,17 @@ impl Solver for PbmpmSolver {
                 scene.solids.len() as u32,
                 cfg.pbmpm_restitution.to_bits(),
                 cfg.pbmpm_flip_fraction.clamp(0.0, 1.0).to_bits(),
+            ],
+            coarse_dims: [cdims[0], cdims[1], cdims[2], num_ccells],
+            coarse: [
+                cfg.pbmpm_coarse_strength.max(0.0),
+                // Interior rest mass per FULL coarse cell: rest node mass m·(h/spacing)³ times
+                // COARSE_FACTOR³ nodes. The 0.5× surface classifier in coarse_source keys on it.
+                mats.particle_mass
+                    * (cell / mats.particle_spacing).powi(3)
+                    * (COARSE_FACTOR.pow(3) as f32),
+                cell * COARSE_FACTOR as f32,
+                cfg.pbmpm_coarse_kick_cap.max(0.0),
             ],
         };
         let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -891,6 +974,40 @@ impl Solver for PbmpmSolver {
             vec4,
             wgpu::BufferUsages::COPY_SRC,
         );
+        // U8 coarse pressure state: fixed-point mass, the compacted active-cell list
+        // ([0] = count + capacity entries — capacity == num_ccells so the atomic append can
+        // never overflow), the (rhs, kind) source, and the Jacobi ping-pong potentials.
+        let ncc = num_ccells.max(1) as u64;
+        let coarse_fp = Self::storage(
+            &device,
+            "pbmpm-coarse-fp",
+            ncc * 4,
+            wgpu::BufferUsages::empty(),
+        );
+        let coarse_list = Self::storage(
+            &device,
+            "pbmpm-coarse-list",
+            (1 + ncc) * 4,
+            wgpu::BufferUsages::empty(),
+        );
+        let coarse_src = Self::storage(
+            &device,
+            "pbmpm-coarse-src",
+            ncc * 8,
+            wgpu::BufferUsages::empty(),
+        );
+        let coarse_phi_a = Self::storage(
+            &device,
+            "pbmpm-coarse-phi-a",
+            ncc * 4,
+            wgpu::BufferUsages::empty(),
+        );
+        let coarse_phi_b = Self::storage(
+            &device,
+            "pbmpm-coarse-phi-b",
+            ncc * 4,
+            wgpu::BufferUsages::empty(),
+        );
         // Static SDF solids the water collides with (U5). An empty scene still needs a non-empty
         // binding, so push one zeroed primitive; `num_solids = 0` (in Params) makes every BC loop
         // skip it. The packed `Primitive`s mirror twofield/utils::sdf (interior-positive cavities).
@@ -933,10 +1050,11 @@ impl Solver for PbmpmSolver {
         // constraint.wgsl adds the U4 particle_update (compliant density constraint) + the moved-out
         // particle_integrate (advect).
         let shader_src = format!(
-            "{}\n{}\n{}",
+            "{}\n{}\n{}\n{}",
             include_str!("common.wgsl"),
             include_str!("transfers.wgsl"),
             include_str!("constraint.wgsl"),
+            include_str!("coarse.wgsl"),
         );
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("pbmpm"),
@@ -1047,6 +1165,64 @@ impl Solver for PbmpmSolver {
                     (11, &vel_prev),
                 ],
             );
+            // U8 coarse pressure family. coarse_jacobi ping-pongs the phi buffers at the
+            // BIND-GROUP level: variant [0] reads binding 15 = phi_a / writes 16 = phi_b,
+            // variant [1] the swap. COARSE_SWEEPS is even, so the final potential lands in the
+            // real phi_a buffer — which is what coarse_apply binds at 15.
+            let coarse_clear = make("coarse_clear");
+            let coarse_clear_bind = bg(
+                &coarse_clear,
+                &[
+                    (0, &params_buf),
+                    (12, &coarse_fp),
+                    (13, &coarse_list),
+                    (14, &coarse_src),
+                    (15, &coarse_phi_a),
+                    (16, &coarse_phi_b),
+                ],
+            );
+            let coarse_restrict = make("coarse_restrict");
+            let coarse_restrict_bind = bg(
+                &coarse_restrict,
+                &[
+                    (0, &params_buf),
+                    (7, &grid_fp),
+                    (12, &coarse_fp),
+                    (13, &coarse_list),
+                ],
+            );
+            let coarse_source = make("coarse_source");
+            let coarse_source_bind = bg(
+                &coarse_source,
+                &[
+                    (0, &params_buf),
+                    (12, &coarse_fp),
+                    (13, &coarse_list),
+                    (14, &coarse_src),
+                ],
+            );
+            let coarse_jacobi = make("coarse_jacobi");
+            let cj = |src: &wgpu::Buffer, dst: &wgpu::Buffer| {
+                bg(
+                    &coarse_jacobi,
+                    &[
+                        (0, &params_buf),
+                        (13, &coarse_list),
+                        (14, &coarse_src),
+                        (15, src),
+                        (16, dst),
+                    ],
+                )
+            };
+            let coarse_jacobi_binds = [
+                cj(&coarse_phi_a, &coarse_phi_b),
+                cj(&coarse_phi_b, &coarse_phi_a),
+            ];
+            let coarse_apply = make("coarse_apply");
+            let coarse_apply_bind = bg(
+                &coarse_apply,
+                &[(0, &params_buf), (1, &pos), (2, &vel), (15, &coarse_phi_a)],
+            );
             Pipelines {
                 deform_clear: (deform_clear, deform_clear_bind),
                 particle_update: (particle_update, particle_update_bind),
@@ -1056,6 +1232,11 @@ impl Solver for PbmpmSolver {
                 grid_update: (grid_update, grid_update_bind),
                 g2p: (g2p, g2p_bind),
                 particle_integrate: (particle_integrate, particle_integrate_bind),
+                coarse_clear: (coarse_clear, coarse_clear_bind),
+                coarse_restrict: (coarse_restrict, coarse_restrict_bind),
+                coarse_source: (coarse_source, coarse_source_bind),
+                coarse_jacobi: (coarse_jacobi, coarse_jacobi_binds),
+                coarse_apply: (coarse_apply, coarse_apply_bind),
             }
         };
 
@@ -1251,6 +1432,50 @@ impl Solver for PbmpmSolver {
             "grid_decode_old",
             node_groups,
         );
+        // U8 coarse pressure pre-pass (once per substep, before the constraint loop): restrict
+        // the snapshot mass to the coarse grid + compacted active list, solve the low-frequency
+        // Poisson over the list, kick the particle velocities with +∇φ. Skipped entirely at
+        // strength 0 — the byte-identical off-switch (no dispatches, no cost).
+        if self.params.coarse[0] > 0.0 {
+            let ccell_groups = groups(self.params.coarse_dims[3]).max(1);
+            rec.dispatch(
+                &mut enc,
+                &p.coarse_clear.0,
+                &p.coarse_clear.1,
+                "coarse_clear",
+                ccell_groups,
+            );
+            rec.dispatch(
+                &mut enc,
+                &p.coarse_restrict.0,
+                &p.coarse_restrict.1,
+                "coarse_restrict",
+                node_groups,
+            );
+            rec.dispatch(
+                &mut enc,
+                &p.coarse_source.0,
+                &p.coarse_source.1,
+                "coarse_source",
+                ccell_groups,
+            );
+            for s in 0..COARSE_SWEEPS {
+                rec.dispatch(
+                    &mut enc,
+                    &p.coarse_jacobi.0,
+                    &p.coarse_jacobi.1[(s % 2) as usize],
+                    "coarse_jacobi",
+                    ccell_groups,
+                );
+            }
+            rec.dispatch(
+                &mut enc,
+                &p.coarse_apply.0,
+                &p.coarse_apply.1,
+                "coarse_apply",
+                water_groups,
+            );
+        }
         for _ in 0..iterations {
             rec.dispatch(
                 &mut enc,

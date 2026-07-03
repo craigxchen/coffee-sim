@@ -283,7 +283,11 @@ fn u7_pinned_bounce_comparison() {
         s.set_density_target_mode_for_test(true);
         s.set_density_rate_k_for_test(k);
         let r = run_arm(&format!("twofield DensU K={k}"), Arm::Twofield(s));
-        if best_densu.as_ref().map(|b| r.rebound > b.rebound).unwrap_or(true) {
+        if best_densu
+            .as_ref()
+            .map(|b| r.rebound > b.rebound)
+            .unwrap_or(true)
+        {
             best_densu = Some(r);
         }
     }
