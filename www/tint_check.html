@@ -1,0 +1,24 @@
+<!doctype html><title>tint check</title><body><pre id="out">running…</pre><script type="module">
+const out = document.getElementById('out');
+const log = (s) => { out.textContent += "\n" + s; };
+try {
+  const src = await (await fetch('tint_check_pbmpm.wgsl')).text();
+  const adapter = await navigator.gpu.requestAdapter();
+  const device = await adapter.requestDevice();
+  device.pushErrorScope('validation');
+  const mod = device.createShaderModule({ code: src });
+  const info = await mod.getCompilationInfo();
+  const err = await device.popErrorScope();
+  out.textContent = "MESSAGES: " + info.messages.length;
+  for (const m of info.messages) log(`${m.type} L${m.lineNum}:${m.linePos} ${m.message}`);
+  if (err) log("VALIDATION ERROR: " + err.message);
+  const entries = ["deform_clear","grid_clear","p2g","grid_update","grid_decode_old","g2p","particle_update","particle_integrate","coarse_clear","coarse_restrict","coarse_source","coarse_jacobi","coarse_apply"];
+  for (const e of entries) {
+    device.pushErrorScope('validation');
+    device.createComputePipeline({ layout: "auto", compute: { module: mod, entryPoint: e } });
+    const pe = await device.popErrorScope();
+    log(`pipeline ${e}: ${pe ? "FAIL " + pe.message.slice(0,300) : "ok"}`);
+  }
+  log("DONE");
+} catch (e) { log("THROW: " + e); }
+</script></body>
