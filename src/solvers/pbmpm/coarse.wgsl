@@ -80,7 +80,7 @@ fn coarse_restrict(@builtin(global_invocation_id) gid: vec3<u32>) {
     let old = atomicAdd(&coarse_fp[cc], counts);
     if (old == 0) {
         let slot = atomicAdd(&coarse_list[0], 1u);
-        coarse_list[1u + slot] = cc;
+        atomicStore(&coarse_list[1u + slot], cc);
     }
 }
 
@@ -93,7 +93,7 @@ fn coarse_source(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (i >= atomicLoad(&coarse_list[0])) {
         return;
     }
-    let c = coarse_list[1u + i];
+    let c = atomicLoad(&coarse_list[1u + i]);
     let mass = fp_decode(atomicLoad(&coarse_fp[c]));
     let rest = params.coarse.y;
     if (mass < 0.5 * rest) {
@@ -114,29 +114,30 @@ fn coarse_jacobi(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (i >= atomicLoad(&coarse_list[0])) {
         return;
     }
-    let c = coarse_list[1u + i];
+    let c = atomicLoad(&coarse_list[1u + i]);
     let sk = coarse_src[c];
     if (sk.y < 0.5) {
         coarse_phi_b[c] = 0.0; // Dirichlet surface row: keep both parities pinned
         return;
     }
-    let cc = vec3<i32>(ccell_coords(c));
-    let dims = vec3<i32>(params.coarse_dims.xyz);
+    // 6-neighbor sum, UNROLLED with static component accesses only — Tint rejects dynamic
+    // indexing of a `let` vector value (`dims[a]`), which native naga tolerates: the recurring
+    // browser-only trap (see the module-header discipline note). Out-of-grid = domain wall:
+    // Neumann mirror (adds φ_self). In-grid neighbor reads its potential; air/surface cells
+    // hold φ = 0 (cleared + never written) = the Dirichlet free-surface contribution.
+    let cc = ccell_coords(c);
+    let dims = params.coarse_dims;
+    let stride_x = 1u;
+    let stride_y = dims.x;
+    let stride_z = dims.x * dims.y;
     let self_phi = coarse_phi_a[c];
     var sum = 0.0;
-    for (var a = 0; a < 3; a = a + 1) {
-        for (var s = -1; s <= 1; s = s + 2) {
-            var nb = cc;
-            nb[a] = nb[a] + s;
-            if (nb[a] < 0 || nb[a] >= dims[a]) {
-                sum = sum + self_phi; // out-of-grid = domain wall: Neumann mirror
-            } else {
-                // In-grid neighbor: active interior reads its potential; air/surface cells hold
-                // φ = 0 (cleared + never written) = the Dirichlet free-surface contribution.
-                sum = sum + coarse_phi_a[ccell_index(vec3<u32>(nb))];
-            }
-        }
-    }
+    if (cc.x > 0u) { sum = sum + coarse_phi_a[c - stride_x]; } else { sum = sum + self_phi; }
+    if (cc.x + 1u < dims.x) { sum = sum + coarse_phi_a[c + stride_x]; } else { sum = sum + self_phi; }
+    if (cc.y > 0u) { sum = sum + coarse_phi_a[c - stride_y]; } else { sum = sum + self_phi; }
+    if (cc.y + 1u < dims.y) { sum = sum + coarse_phi_a[c + stride_y]; } else { sum = sum + self_phi; }
+    if (cc.z > 0u) { sum = sum + coarse_phi_a[c - stride_z]; } else { sum = sum + self_phi; }
+    if (cc.z + 1u < dims.z) { sum = sum + coarse_phi_a[c + stride_z]; } else { sum = sum + self_phi; }
     let hh = params.coarse.z * params.coarse.z;
     coarse_phi_b[c] = (sum - hh * sk.x) / 6.0;
 }
