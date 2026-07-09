@@ -225,6 +225,18 @@ impl SeamSolver {
         self.absorbed_total
     }
 
+    /// Resolve both inners' per-pass timestamps into their profile caches (blocking;
+    /// dev/test only — the perf harness calls this once per measured frame).
+    pub fn sample_diagnostics(&mut self) {
+        self.water.sample_diagnostics();
+        self.bed.sample_diagnostics();
+    }
+
+    /// The bed inner's substep count at `dt` (its timestamp sum covers ONE substep).
+    pub fn bed_substeps_for_dt(&self, dt: f32) -> u32 {
+        self.bed.substeps_for_dt(dt)
+    }
+
     /// The scaffold invariant: the twofield inner must never hold live water — one stray
     /// particle re-enables its full water pipeline (the count-keyed cost cliff).
     pub fn bed_water_count(&self) -> u32 {
@@ -269,6 +281,22 @@ impl SeamSolver {
     pub fn read_render_phases_for_test(&self) -> Vec<u32> {
         let bytes = self.exposed_count as u64 * U32S;
         bytemuck::cast_slice(&self.read_render_bytes(&self.render_phase, bytes)).to_vec()
+    }
+
+    /// Read back the reaction ledger's summed impulse (lanes 0–2, decoded from
+    /// SEAM_IMPULSE_SCALE; dev/test only — stalls). In absorb mode the ledger survives to
+    /// end-of-frame, so reading right after step() sees the frame's full accumulation.
+    pub fn read_reaction_for_test(&self) -> [f64; 3] {
+        let bytes = self.reaction.size();
+        let raw: Vec<i32> =
+            bytemuck::cast_slice(&self.read_render_bytes(&self.reaction, bytes)).to_vec();
+        let mut imp = [0f64; 3];
+        for node in raw.chunks_exact(4) {
+            for (l, slot) in imp.iter_mut().enumerate() {
+                *slot += node[l] as f64;
+            }
+        }
+        imp.map(|v| v / crate::solvers::pbmpm::SEAM_IMPULSE_SCALE as f64)
     }
 
     /// Read back the merged render positions (dev/test only — stalls the GPU).
