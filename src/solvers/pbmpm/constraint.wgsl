@@ -141,13 +141,127 @@ fn particle_integrate(@builtin(global_invocation_id) gid: vec3<u32>) {
     let flip_fraction = bitcast<f32>(params.iter_pad.w);
     let v_flip = vel_prev[p].xyz + (v_pic - gathered_old);
     var v = mix(v_pic, v_flip, flip_fraction);
+
+    // Seam interface dissipation (U2, docs/plans/2026-07-09-002): inside the seam's bed band
+    // the FLIP memory leaks THROUGH the grid BC — grid_update filters v_pic, but
+    // flip_fraction (0.95) of the particle's OWN velocity survives the blend, and that
+    // retained downward drift random-walks water through the bed (measured: the 1500-frame
+    // saturated-tail leak, ~18% below the bed and reaching the floor). Water inside the bed
+    // band is forced to pure PIC — the project's single dissipation knob keyed at the
+    // interface (the twofield crater PIC-blend precedent) — so a bed-band particle adopts
+    // the BC-filtered grid velocity and the creep dies. Open water (φ_s ≈ 0) is untouched:
+    // the crown keeps its FLIP. params.seam.x = 0 (native pbmpm) skips everything.
+    if (params.seam.x > 0.0) {
+        var occ = 0.0;
+        let obase = vec3<i32>(floor(xl));
+        let ofr = xl - vec3<f32>(obase);
+        for (var k = 0; k < 2; k = k + 1) {
+            for (var j = 0; j < 2; j = j + 1) {
+                for (var i = 0; i < 2; i = i + 1) {
+                    let node = obase + vec3<i32>(i, j, k);
+                    // x/z go through the lateral wall clamp (seam_occ_index); only y can
+                    // fall outside the field.
+                    if (node.y < 0 || node.y >= i32(params.grid_dims.y)) {
+                        continue;
+                    }
+                    let wx = select(1.0 - ofr.x, ofr.x, i == 1);
+                    let wy = select(1.0 - ofr.y, ofr.y, j == 1);
+                    let wz = select(1.0 - ofr.z, ofr.z, k == 1);
+                    occ = occ + wx * wy * wz
+                        * fp_decode(atomicLoad(&bed_occupancy[seam_occ_index(node) * 4u]));
+                }
+            }
+        }
+        if (occ / (h * h * h) > params.seam.y) {
+            v = v_pic;
+        }
+    }
+
     // Velocity cap (anti-blow-up): FLIP can amplify the kept change, so clamp the blended result.
     let s = length(v);
     if (s > params.max_speed) {
         v = v * (params.max_speed / s);
     }
 
+    let x_start = x;
     x = x + v * params.dt;
+
+    // Seam bed no-entry backstop (U2 — the particle-resolution twin of grid_update's bed BC,
+    // exactly the collider's two-level pattern: "the grid node BC bounds penetration only at
+    // node resolution h, so a particle between a constrained node and a live one creeps
+    // through"). Measured: with the grid BC + PIC override alone, the g2p stencil still mixes
+    // in downward velocities from above-surface nodes and water random-walks through the bed
+    // (~19% below bed over 1500 frames). Rule: a particle whose NEW position sits in a
+    // SATURATED bed band (φ_s over threshold AND s at the wet_sat_cutoff ratio — a saturated
+    // bed accepts no entry flux) may not increase its bed depth: the into-bed component of
+    // this substep's displacement is removed (tangential sliding preserved), and the into-bed
+    // velocity is zeroed. Below saturation, entry is allowed — infiltration (U4) consumes it.
+    if (params.seam.x > 0.0) {
+        let xg = (x - params.grid_origin.xyz) / h;
+        let bbase = vec3<i32>(floor(xg));
+        let bf = xg - vec3<f32>(bbase);
+        var b_eff = 0.0;
+        var b_abs = 0.0;
+        var b_cap = 0.0;
+        for (var k = 0; k < 2; k = k + 1) {
+            for (var j = 0; j < 2; j = j + 1) {
+                for (var i = 0; i < 2; i = i + 1) {
+                    let node = bbase + vec3<i32>(i, j, k);
+                    // x/z go through the lateral wall clamp (seam_occ_index); only y can
+                    // fall outside the field.
+                    if (node.y < 0 || node.y >= i32(params.grid_dims.y)) {
+                        continue;
+                    }
+                    let wx = select(1.0 - bf.x, bf.x, i == 1);
+                    let wy = select(1.0 - bf.y, bf.y, j == 1);
+                    let wz = select(1.0 - bf.z, bf.z, k == 1);
+                    let wt = wx * wy * wz;
+                    let ni = seam_occ_index(node) * 4u;
+                    b_eff = b_eff + wt * fp_decode(atomicLoad(&bed_occupancy[ni + 0u]));
+                    b_abs = b_abs + wt * fp_decode(atomicLoad(&bed_occupancy[ni + 1u]));
+                    b_cap = b_cap + wt * fp_decode(atomicLoad(&bed_occupancy[ni + 2u]));
+                }
+            }
+        }
+        let phi_new = b_eff / (h * h * h);
+        var s_new = 0.0;
+        if (b_cap > 0.0) {
+            s_new = clamp(b_abs / b_cap, 0.0, 1.0);
+        }
+        if (phi_new > params.seam.y && s_new >= params.seam.z) {
+            // Into-bed normal from the nearest node's occupancy gradient (central difference,
+            // edge-guarded); degenerate gradient (deep interior) falls back to straight down.
+            let nn = clamp(
+                vec3<i32>(round(xg)),
+                vec3<i32>(1),
+                vec3<i32>(params.grid_dims.xyz) - vec3<i32>(2),
+            );
+            var grad = vec3<f32>(
+                fp_decode(atomicLoad(&bed_occupancy[seam_occ_index(nn + vec3<i32>(1, 0, 0)) * 4u]))
+                    - fp_decode(atomicLoad(&bed_occupancy[seam_occ_index(nn - vec3<i32>(1, 0, 0)) * 4u])),
+                fp_decode(atomicLoad(&bed_occupancy[seam_occ_index(nn + vec3<i32>(0, 1, 0)) * 4u]))
+                    - fp_decode(atomicLoad(&bed_occupancy[seam_occ_index(nn - vec3<i32>(0, 1, 0)) * 4u])),
+                fp_decode(atomicLoad(&bed_occupancy[seam_occ_index(nn + vec3<i32>(0, 0, 1)) * 4u]))
+                    - fp_decode(atomicLoad(&bed_occupancy[seam_occ_index(nn - vec3<i32>(0, 0, 1)) * 4u])),
+            );
+            var n_into = vec3<f32>(0.0, -1.0, 0.0);
+            let glen = length(grad);
+            // Physical degeneracy epsilon — see grid_update's bed BC: a machine epsilon turns
+            // fixed-point occupancy noise into junk normals in the bed interior.
+            if (glen > 0.05 * h * h * h) {
+                n_into = grad / glen;
+            }
+            let dxv = x - x_start;
+            let dn = dot(dxv, n_into);
+            if (dn > 0.0) {
+                x = x - dn * n_into;
+            }
+            let vn_bed = dot(v, n_into);
+            if (vn_bed > 0.0) {
+                v = v - vn_bed * n_into;
+            }
+        }
+    }
 
     // Box clamp (outer backstop): only the into-wall component is removed (separating, free slip).
     if (x.x < params.box_min.x) { x.x = params.box_min.x; if (v.x < 0.0) { v.x = 0.0; } }

@@ -56,15 +56,18 @@ fn groups(n: u32) -> u32 {
 ///                          U6 per-particle liquidDensity lane (deform_grad[3p+0].x);
 ///   `p2g`                4 (pos, vel, deform_disp, grid_fp) — reads pos/vel/deform_disp, scatters;
 ///   `grid_decode_old`    2 (grid_fp, grid_vel_old) — SPLASH FLIP snapshot decode (no gravity/BC);
-///   `grid_update`        3 (grid_fp, grid_vel, solids) — U5 adds the collider node BC;
+///   `grid_update`        5 (grid_fp, grid_vel, solids, bed_occupancy, seam_reaction) — U5 adds
+///                          the collider node BC; the seam bed BC adds the two seam lanes
+///                          (1-element dummies when `pbmpm_seam_bed` is off);
 ///   `g2p`                4 (pos, vel, deform_disp, grid_vel);
-///   `particle_integrate` 7 (pos, vel, deform_disp, deform_grad, solids, grid_vel_old, vel_prev) —
-///                          the SPLASH FLIP blend (gather grid_vel_old + read vel_prev) + advect once
-///                          + the U5 SDF push-out/restitution + the U6 per-particle liquidDensity
-///                          accumulation (reads the converged D, read-writes the deform_grad lane).
-/// Widest = `particle_integrate` at 7 storage buffers (SPLASH added `grid_vel_old` + `vel_prev`).
-/// Well within the 9 grant the device requests (`src/utils/gpu.rs::NEEDED_STORAGE_BUFFERS`).
-pub const MAX_STORAGE_BUFFERS_PER_ENTRY_POINT: u32 = 7;
+///   `particle_integrate` 8 (pos, vel, deform_disp, deform_grad, solids, grid_vel_old, vel_prev,
+///                          bed_occupancy) — the SPLASH FLIP blend (gather grid_vel_old + read
+///                          vel_prev) + advect once + the U5 SDF push-out/restitution + the U6
+///                          per-particle liquidDensity accumulation + the seam bed-band PIC
+///                          override (reads bed_occupancy; dummy when the seam BC is off).
+/// Widest = `particle_integrate` at 8 storage buffers.
+/// Within the 9 grant the device requests (`src/utils/gpu.rs::NEEDED_STORAGE_BUFFERS`).
+pub const MAX_STORAGE_BUFFERS_PER_ENTRY_POINT: u32 = 8;
 
 /// Fixed-point scale for the grid atomics — mirrors `FP_SCALE` in `common.wgsl` (2^18,
 /// KEEP.md §3). Coupled to `Config::max_speed` (the overflow-headroom derivation lives next to
@@ -111,6 +114,19 @@ pub fn coarse_dispatches() -> u32 {
     3 + COARSE_SWEEPS + 1
 }
 
+/// Seam bed BC thresholds (U2, docs/plans/2026-07-09-002): the minimum node solid fraction
+/// that counts as "in the bed" (below it the BC is inert — open water), and the saturation
+/// ratio treated as fully saturated → full entry block (mirrors the wetting contract's
+/// `wet_sat_cutoff = V_cap·(1 − absorb_roundoff)` at the default roundoff 1e-3).
+pub const SEAM_PHI_MIN: f32 = 0.15;
+pub const SEAM_SAT_FULL: f32 = 0.999;
+/// Fixed-point scale of the `seam_reaction` impulse lanes. Deliberately COARSER than
+/// FP_SCALE (2^18): the ledger accumulates up to iteration_count node-mass × velocity
+/// impulses per frame, which would overflow the 2^13 value ceiling at 2^18; at 2^12 the
+/// worst case (16 × ~30 mass × 50 cap) sits ~20× under i32 range. Telemetry only — R2
+/// gates on measured momentum deltas, and the U3 headroom probe gates this scale.
+pub const SEAM_IMPULSE_SCALE: f32 = 4096.0;
+
 /// The recorded dispatch formula (see `DISPATCHES_PER_SUBSTEP_BUNDLE` docs): `5 +
 /// 5·iteration_count` per frame at one substep/frame (1 deform_clear + 3 snapshot passes +
 /// the iteration bundles + 1 particle_integrate), plus the U8 coarse family when enabled.
@@ -153,10 +169,14 @@ struct Params {
     // (strength κ, interior rest mass per coarse cell, coarse cell size H, kick cap).
     coarse_dims: [u32; 4],
     coarse: [f32; 4],
+    // Seam-blend bed BC (docs/plans/2026-07-09-002 U2): .x = enabled (1.0/0.0), .y = minimum
+    // node solid fraction that counts as "in the bed", .z = saturation ratio treated as fully
+    // saturated (full block; mirrors wet_sat_cutoff's 1 − absorb_roundoff), .w = reserved.
+    seam: [f32; 4],
 }
 
 // Params is uploaded as a uniform and must stay byte-identical to the WGSL `Params`.
-const _: () = assert!(std::mem::size_of::<Params>() == 160);
+const _: () = assert!(std::mem::size_of::<Params>() == 176);
 
 /// GPU record for one static SDF solid — byte-identical to the WGSL `Primitive` (64 bytes,
 /// vec4-aligned; mirrors twofield's `Primitive` packing of `utils::sdf` primitives, U5). Cone
@@ -391,6 +411,11 @@ pub struct PbmpmSolver {
     vel_prev: wgpu::Buffer,
     // (Static SDF solids the water collides with (U5) are created in build() and retained by the
     // collider-pass bind groups — like twofield's `solids_buf`, not stored on the struct.)
+    // Seam-blend bed coupling (U2): the bed-occupancy field the seam's scatter pass writes and
+    // grid_update reads, and the reaction impulse ledger the bed BC accumulates. Real-sized only
+    // when `pbmpm_seam_bed` is on; 1-element dummies otherwise (the WGSL branch is params-dead).
+    bed_occupancy: Arc<wgpu::Buffer>,
+    seam_reaction: Arc<wgpu::Buffer>,
     readback: wgpu::Buffer,
 
     pipelines: Pipelines,
@@ -683,6 +708,16 @@ impl PbmpmSolver {
     }
 
     /// Live water count currently simulated.
+    /// The seam-blend coupling buffers `(bed_occupancy, seam_reaction)` — 4 fixed-point
+    /// lanes per node each when `pbmpm_seam_bed` is on, 1-element dummies otherwise. The
+    /// seam's scatter pass writes bed_occupancy; its hook consumes/zeroes seam_reaction.
+    pub fn seam_buffers(&self) -> (Arc<wgpu::Buffer>, Arc<wgpu::Buffer>) {
+        (
+            Arc::clone(&self.bed_occupancy),
+            Arc::clone(&self.seam_reaction),
+        )
+    }
+
     pub fn active_count(&self) -> u32 {
         self.water_count
     }
@@ -899,6 +934,12 @@ impl Solver for PbmpmSolver {
                 cell * COARSE_FACTOR as f32,
                 cfg.pbmpm_coarse_kick_cap.max(0.0),
             ],
+            seam: [
+                if cfg.pbmpm_seam_bed { 1.0 } else { 0.0 },
+                SEAM_PHI_MIN,
+                SEAM_SAT_FULL,
+                0.0,
+            ],
         };
         let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("pbmpm-params"),
@@ -945,6 +986,26 @@ impl Solver for PbmpmSolver {
             n * 48,
             wgpu::BufferUsages::COPY_SRC,
         );
+        // Seam-blend bed coupling lanes (U2): 4 fixed-point lanes per node each —
+        // bed_occupancy [V_eff, V_abs, V_cap, unused] (seam-scattered, read here);
+        // seam_reaction [impulse.xyz, unused] (accumulated here, consumed by the seam).
+        let seam_nodes = if cfg.pbmpm_seam_bed {
+            num_nodes as u64
+        } else {
+            1
+        };
+        let bed_occupancy = Arc::new(Self::storage(
+            &device,
+            "pbmpm-seam-bed-occupancy",
+            seam_nodes * 16,
+            wgpu::BufferUsages::COPY_SRC,
+        ));
+        let seam_reaction = Arc::new(Self::storage(
+            &device,
+            "pbmpm-seam-reaction",
+            seam_nodes * 16,
+            wgpu::BufferUsages::COPY_SRC,
+        ));
         // KTD8 grid field: 4 fixed-point lanes per node [mass, mom.xyz].
         let grid_fp = Self::storage(
             &device,
@@ -1121,8 +1182,8 @@ impl Solver for PbmpmSolver {
                 &grid_decode_old,
                 &[(0, &params_buf), (7, &grid_fp), (10, &grid_vel_old)],
             );
-            // grid_update: grid_fp (decode), grid_vel (write), solids (read SDF BC). 3 storage
-            // buffers (U5 adds the collider node BC).
+            // grid_update: grid_fp (decode), grid_vel (write), solids (read SDF BC), plus the
+            // seam bed lanes (U2 — dummies when the seam BC is off). 5 storage buffers.
             let grid_update = make("grid_update");
             let grid_update_bind = bg(
                 &grid_update,
@@ -1131,6 +1192,8 @@ impl Solver for PbmpmSolver {
                     (7, &grid_fp),
                     (8, &grid_vel),
                     (9, &solids),
+                    (17, &bed_occupancy),
+                    (18, &seam_reaction),
                 ],
             );
             // g2p: pos (read), vel (write), deform_disp (write D), grid_vel (gather). 4 storage
@@ -1163,6 +1226,7 @@ impl Solver for PbmpmSolver {
                     (9, &solids),
                     (10, &grid_vel_old),
                     (11, &vel_prev),
+                    (17, &bed_occupancy),
                 ],
             );
             // U8 coarse pressure family. coarse_jacobi ping-pongs the phi buffers at the
@@ -1302,6 +1366,8 @@ impl Solver for PbmpmSolver {
             grid_fp,
             grid_vel,
             vel_prev,
+            bed_occupancy,
+            seam_reaction,
             readback,
             pipelines,
             ts,

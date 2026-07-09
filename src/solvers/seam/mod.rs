@@ -18,6 +18,9 @@
 
 use std::sync::Arc;
 
+use bytemuck::{Pod, Zeroable};
+use wgpu::util::DeviceExt;
+
 use crate::emission::EmissionInput;
 use crate::engine::scene::Species;
 use crate::engine::{Metrics, Scene};
@@ -34,6 +37,20 @@ use crate::utils::gpu::GpuContext;
 const VEC4: u64 = 16;
 /// Bytes per canonical u32 particle lane (phase).
 const U32S: u64 = 4;
+/// Seam GPU passes per frame when a bed is present (clear + scatter; the U3 hook adds more).
+const SEAM_PASSES: u32 = 2;
+const WG: u32 = 256;
+
+/// Rust mirror of `seam.wgsl`'s `SeamParams` (byte-identical).
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct SeamParams {
+    grid_origin: [f32; 4], // .xyz = node (0,0,0) world position; .w = cell size h
+    grid_dims: [u32; 4],   // nx, ny, nz, num_nodes
+    solid: [u32; 4],       // .x = solid range start in bed_pos, .y = count
+    wet: [f32; 4],         // .x = V_dry, .y = V_cap
+}
+const _: () = assert!(std::mem::size_of::<SeamParams>() == 64);
 
 pub struct SeamSolver {
     water: PbmpmSolver,
@@ -60,6 +77,14 @@ pub struct SeamSolver {
     render_phase: Arc<wgpu::Buffer>,
     render_chem: Arc<wgpu::Buffer>,
     exposed_count: u32,
+
+    // Seam bed-field passes (U2): clear + trilinear scatter of the bed solver's grains into
+    // pbmpm's `bed_occupancy` (KTD2 — cleared every frame; the scatter reads the bed's
+    // PERSISTENT grain buffer, never its per-substep scratch).
+    seam_clear: (wgpu::ComputePipeline, wgpu::BindGroup),
+    seam_scatter: (wgpu::ComputePipeline, wgpu::BindGroup),
+    num_nodes: u32,
+    seam_dispatches: u32,
 
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -118,6 +143,13 @@ impl SeamSolver {
         }
         self.queue.submit(Some(enc.finish()));
         self.exposed_count = (wc + sc) as u32;
+    }
+
+    /// Pre-saturate the bed (docs/plans/2026-07-09-002 U2): grain V_abs = sat_frac·V_cap on
+    /// both the live buffer and the cached seed, so `reset()` replays the wet bed. Part of
+    /// the pre-registered scene setup for every M0 arm; call before stepping.
+    pub fn prewet_bed(&mut self, sat_frac: f32) {
+        self.bed.prewet_grains(sat_frac);
     }
 
     /// Read-only handle on the water (pbmpm) inner, for gates and diagnostics.
@@ -199,18 +231,93 @@ impl Solver for SeamSolver {
         let bed_scene = Self::split_bed_scene(scene);
 
         // The bed inner runs its deformable dynamics unconditionally (the dry-dynamic
-        // elision requires it); everything else in cfg passes through.
+        // elision requires it); the water inner arms the bed BC + reaction lanes. Everything
+        // else in cfg passes through.
         let mut bed_cfg = cfg.clone();
         bed_cfg.solid_dynamics = true;
+        let mut water_cfg = cfg.clone();
+        water_cfg.pbmpm_seam_bed = true;
 
-        let water = PbmpmSolver::build(&water_scene, mats, cfg, gpu);
+        let water = PbmpmSolver::build(&water_scene, mats, &water_cfg, gpu);
         let bed = TwofieldSolver::build(&bed_scene, mats, &bed_cfg, gpu);
+
+        // KTD1: co-registration holds by construction (one shared scene-bounds + Materials
+        // pair, verbatim-mirrored grid derivations) — a future caller diverging the inputs
+        // must fail loudly, not resample silently.
+        assert_eq!(
+            water.grid_spec(),
+            bed.grid_spec(),
+            "seam inner grids must be co-registered (same origin, cell size, dims)"
+        );
 
         let solid_count = bed.active_count(); // bed scene seeds no water, so live == solids
         let bed_solid_offset = bed.water_pool_capacity();
         let capacity = (water.capacity() + solid_count) as u64;
 
         let device = gpu.device.clone();
+
+        // Seam bed-field passes (U2). The scatter binds the bed's persistent grain positions
+        // and pbmpm's bed_occupancy lanes; params are static in M0 (grains neither emit nor
+        // die, the grid is fixed at build).
+        let (origin, h, dims) = water.grid_spec();
+        let num_nodes = dims[0] * dims[1] * dims[2];
+        let v_dry = std::f32::consts::FRAC_PI_6 * mats.grain_diameter.powi(3);
+        let v_cap = crate::models::wetting::capacity(v_dry, mats.r_max, mats.rho_ratio);
+        let seam_params = SeamParams {
+            grid_origin: [origin[0], origin[1], origin[2], h],
+            grid_dims: [dims[0], dims[1], dims[2], num_nodes],
+            solid: [bed_solid_offset, solid_count, 0, 0],
+            wet: [v_dry, v_cap, 0.0, 0.0],
+        };
+        let seam_params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("seam-params"),
+            contents: bytemuck::bytes_of(&seam_params),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("seam"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("seam.wgsl").into()),
+        });
+        let make = |entry: &str| {
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(entry),
+                layout: None,
+                module: &shader,
+                entry_point: Some(entry),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            })
+        };
+        let bg = |pipe: &wgpu::ComputePipeline, entries: &[(u32, &wgpu::Buffer)]| {
+            let layout = pipe.get_bind_group_layout(0);
+            let e: Vec<wgpu::BindGroupEntry> = entries
+                .iter()
+                .map(|(b, buf)| wgpu::BindGroupEntry {
+                    binding: *b,
+                    resource: buf.as_entire_binding(),
+                })
+                .collect();
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &layout,
+                entries: &e,
+            })
+        };
+        let (bed_occupancy, _reaction) = water.seam_buffers();
+        let bed_pos = bed
+            .particles()
+            .position
+            .expect("twofield always exposes a position buffer");
+        let seam_clear_pipe = make("seam_clear_bed");
+        let seam_clear_bind = bg(
+            &seam_clear_pipe,
+            &[(0, &seam_params_buf), (2, &bed_occupancy)],
+        );
+        let seam_scatter_pipe = make("seam_scatter_bed");
+        let seam_scatter_bind = bg(
+            &seam_scatter_pipe,
+            &[(0, &seam_params_buf), (1, &bed_pos), (2, &bed_occupancy)],
+        );
         let render_pos = Self::render_buffer(&device, "seam-render-pos", capacity * VEC4);
         let render_vel = Self::render_buffer(&device, "seam-render-vel", capacity * VEC4);
         let render_phase = Self::render_buffer(&device, "seam-render-phase", capacity * U32S);
@@ -228,6 +335,10 @@ impl Solver for SeamSolver {
             render_phase,
             render_chem,
             exposed_count: 0,
+            seam_clear: (seam_clear_pipe, seam_clear_bind),
+            seam_scatter: (seam_scatter_pipe, seam_scatter_bind),
+            num_nodes,
+            seam_dispatches: 0,
             device,
             queue: gpu.queue.clone(),
         };
@@ -244,6 +355,32 @@ impl Solver for SeamSolver {
     }
 
     fn step(&mut self, dt: f32, input: &EmissionInput) {
+        // KTD2 frame order: refresh the bed-occupancy field (clear, then trilinear scatter
+        // of the bed's persistent grain positions) BEFORE the water step, so pbmpm's bed BC
+        // sees this frame's bed. Skipped without a bed — water-only scenes stay pure pbmpm.
+        self.seam_dispatches = 0;
+        if self.solid_count > 0 {
+            let mut enc = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("seam-bed-field"),
+                });
+            {
+                let mut cpass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("seam-bed-field"),
+                    timestamp_writes: None,
+                });
+                cpass.set_pipeline(&self.seam_clear.0);
+                cpass.set_bind_group(0, &self.seam_clear.1, &[]);
+                cpass.dispatch_workgroups(self.num_nodes.div_ceil(WG).max(1), 1, 1);
+                cpass.set_pipeline(&self.seam_scatter.0);
+                cpass.set_bind_group(0, &self.seam_scatter.1, &[]);
+                cpass.dispatch_workgroups(self.solid_count.div_ceil(WG).max(1), 1, 1);
+            }
+            self.queue.submit(Some(enc.finish()));
+            self.seam_dispatches = SEAM_PASSES;
+        }
+
         // The pour goes through pbmpm only. The bed inner gets a zeroed flow (its emit()
         // runs unconditionally at step() top) with the discrete event forwarded so a
         // Reset never leaves a stale emitter backlog on either side.
@@ -291,7 +428,9 @@ impl Solver for SeamSolver {
         passes.extend(b.passes.into_iter().map(|(l, us)| (format!("bed/{l}"), us)));
         Profile {
             passes,
-            dispatches_per_frame: w.dispatches_per_frame + b.dispatches_per_frame,
+            dispatches_per_frame: w.dispatches_per_frame
+                + b.dispatches_per_frame
+                + self.seam_dispatches,
         }
     }
 }

@@ -219,6 +219,12 @@ pub struct Config {
     /// substep. The stability backstop for large accumulated errors — a big error drains over
     /// many frames at the cap instead of detonating in one (the twofield stiffening lesson).
     pub pbmpm_coarse_kick_cap: f32,
+    /// Seam-blend bed BC (docs/plans/2026-07-09-002; only meaningful on the seam's pbmpm
+    /// inner): when true, `grid_update` applies the porous-bed boundary from the
+    /// seam-scattered `bed_occupancy` field and accumulates the removed momentum into
+    /// `seam_reaction`. False (the default) keeps native pbmpm byte-identical — the seam
+    /// buffers are 1-element dummies and the WGSL branch is parameter-dead.
+    pub pbmpm_seam_bed: bool,
 }
 
 impl Default for Config {
@@ -328,6 +334,7 @@ impl Default for Config {
             pbmpm_flip_fraction: 0.95,
             pbmpm_coarse_strength: 0.0,
             pbmpm_coarse_kick_cap: 0.5,
+            pbmpm_seam_bed: false,
         }
     }
 }

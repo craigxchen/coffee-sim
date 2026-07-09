@@ -478,6 +478,39 @@ impl Scene {
         }
     }
 
+    /// DEBUG (`seam-static-column`, NEW): the seam-blend M0 static-seam viability scene
+    /// (docs/plans/2026-07-09-002 R1) — a flat grain-bed slab on the box floor with a standing
+    /// water column seeded directly on its surface. No pour, no vessel SDF: the seam's porous
+    /// bed BC is the ONLY thing holding the column up, so a fall-through is unmissable. Water
+    /// regions go to the seam's pbmpm inner, the grain slab to its twofield inner; the bed is
+    /// pre-saturated by the harness (`SeamSolver::prewet_bed`), not by the scene.
+    pub fn debug_seam_static_column() -> Self {
+        Self {
+            dose_g: 0.0,
+            water_ml: 0.0,
+            pour_water_ml: 0.0,
+            gravity: [0.0, -20.0, 0.0],
+            box_min: [-7.0, -10.0, -7.0],
+            box_max: [7.0, 10.0, 7.0],
+            solids: vec![],
+            regions: vec![
+                // Bed slab across the whole floor, 2 units deep — the column cannot reach the
+                // floor except through the bed.
+                SeedRegion {
+                    min: [-7.0, -10.0, -7.0],
+                    max: [7.0, -8.0, 7.0],
+                    species: Species::Grain,
+                },
+                // Standing column, seeded resting on the bed surface.
+                SeedRegion {
+                    min: [-2.0, -8.0, -2.0],
+                    max: [2.0, -4.0, 2.0],
+                    species: Species::Water,
+                },
+            ],
+        }
+    }
+
     /// DEBUG (`sand-wall`, NEW — no `main` equivalent): a plain box with a vertical wall of GRAINS on
     /// one side and a block of water on the other, released to surge into/through the wall. Tests
     /// water/solid coupling (percolation + the wall eroding/holding). Reuses the
