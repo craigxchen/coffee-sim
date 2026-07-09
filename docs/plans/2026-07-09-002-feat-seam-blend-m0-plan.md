@@ -199,7 +199,11 @@ path — `TwofieldSolver::prewet_grains(sat_frac)` writes grain V_abs = sat_frac
 (wet_sat_cutoff-aware so sat_frac = 1.0 really zeroes demand), exposed through
 `SeamSolver::prewet_bed(sat_frac)`; the written volume enters the combined accounting's
 t0 snapshot (pre-wet volume is initial in-domain inventory, not emitted volume) and the
-call is part of the pre-registered scene setup for every R1–R3 arm.
+call is part of the pre-registered scene setup for every R1–R3 arm. **Reset-stable by
+construction** (review r3.1): prewet mutates BOTH the live pos buffer AND the solver's
+cached `initial_positions` seed, so `reset()` replays the wet bed — a reset would
+otherwise silently dry the M0 scene and invalidate R1/R3/t0 accounting (the web UI calls
+reset directly). Gated: prewet → step → reset → per-grain saturation preserved exactly.
 **Oracle first:** column visibly stands in the browser. **Then gates:** R1 quantified
 (no fall-through, interface density band, tail KE); tint_check green (R6).
 
