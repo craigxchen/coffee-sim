@@ -72,6 +72,9 @@ pub enum WebScene {
     ParticleCapacityStress,
     /// `sand-wall` (NEW) — a grain wall on one side, a water block released against it.
     SandWall,
+    /// `seam-static-column` (NEW) — the seam-blend M0 scene: a standing water column on a
+    /// flat grain bed, no pour (docs/plans/2026-07-09-002).
+    SeamStaticColumn,
 }
 
 impl WebScene {
@@ -94,6 +97,7 @@ impl WebScene {
             "permeability-comparison" => Some(Self::PermeabilityComparison),
             "particle-capacity-stress" => Some(Self::ParticleCapacityStress),
             "sand-wall" => Some(Self::SandWall),
+            "seam-static-column" => Some(Self::SeamStaticColumn),
             _ => None,
         }
     }
@@ -117,6 +121,7 @@ impl WebScene {
             Self::PermeabilityComparison => Scene::debug_permeability_comparison(),
             Self::ParticleCapacityStress => Scene::debug_particle_capacity_stress(),
             Self::SandWall => Scene::sand_wall(),
+            Self::SeamStaticColumn => Scene::debug_seam_static_column(),
         }
     }
 
@@ -211,6 +216,7 @@ mod tests {
         ("permeability-comparison", WebScene::PermeabilityComparison),
         ("particle-capacity-stress", WebScene::ParticleCapacityStress),
         ("sand-wall", WebScene::SandWall),
+        ("seam-static-column", WebScene::SeamStaticColumn),
     ];
 
     #[test]

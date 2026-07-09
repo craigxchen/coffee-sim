@@ -48,6 +48,10 @@ struct Params {
                             // .y = interior rest mass per coarse cell (surface classifier);
                             // .z = coarse cell size H (= COARSE_FACTOR · h);
                             // .w = kick cap (max |Δv| the apply pass may inject, velocity units)
+    seam: vec4<f32>,        // Seam-blend bed BC (U2, docs/plans/2026-07-09-002): .x = enabled
+                            // (1.0/0.0), .y = min node solid fraction counting as "in the bed",
+                            // .z = saturation ratio treated as fully saturated (full block),
+                            // .w = reserved
 };
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -129,6 +133,35 @@ struct Primitive {
 @group(0) @binding(14) var<storage, read_write> coarse_src: array<vec2<f32>>;
 @group(0) @binding(15) var<storage, read_write> coarse_phi_a: array<f32>;
 @group(0) @binding(16) var<storage, read_write> coarse_phi_b: array<f32>;
+// Seam-blend bed coupling (U2; only bound by grid_update, only live when params.seam.x > 0).
+// `bed_occupancy`: 4 fixed-point (FP_SCALE) lanes per node [solid volume V_eff, absorbed
+// V_abs, capacity V_cap, unused], scattered per frame by the SEAM's scatter pass over the bed
+// solver's grain particles — pbmpm only READS it (atomicLoad; atomics require read_write).
+// `seam_reaction`: the impulse ledger the bed BC accumulates, at its OWN coarser scale
+// SEAM_IMPULSE_SCALE = 2^12 (up to iteration_count node-mass × velocity impulses per frame
+// would overflow the 2^13 value ceiling at FP_SCALE = 2^18). Consumed by the seam's twofield
+// hook (U3); telemetry only — the R2 third-law gate measures momentum deltas directly.
+@group(0) @binding(17) var<storage, read_write> bed_occupancy: array<atomic<i32>>;
+@group(0) @binding(18) var<storage, read_write> seam_reaction: array<atomic<i32>>;
+
+const SEAM_IMPULSE_SCALE: f32 = 4096.0;
+
+// Occupancy-sampling index with the LATERAL wall clamp (x/z only, never y). The scatter
+// kernel has no grains outside the walls to complete its support, so wall node columns read
+// artificially low φ_s — a low-occupancy chute water measurably slides down (the M0 wall
+// leak). Sampling is clamped ≥2 node columns in from the lateral faces: a wall-hugging
+// particle reads the interior column's bed field (the bed material does reach the wall);
+// the y axis stays exact so the bed SURFACE is never distorted.
+fn seam_occ_index(node: vec3<i32>) -> u32 {
+    let hix = max(i32(params.grid_dims.x) - 3, 0);
+    let hiz = max(i32(params.grid_dims.z) - 3, 0);
+    let c = vec3<i32>(
+        clamp(node.x, min(2, hix), hix),
+        node.y,
+        clamp(node.z, min(2, hiz), hiz),
+    );
+    return node_index(c);
+}
 
 // --- fixed-point encoding (KEEP.md §3 pattern; mirrors twofield's FP_SCALE) ------------------
 //

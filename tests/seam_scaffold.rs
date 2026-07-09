@@ -172,7 +172,11 @@ fn pour_keeps_bed_water_at_zero_and_dispatches_split() {
     let total = seam.profile().dispatches_per_frame;
     let water = seam.water_solver().profile().dispatches_per_frame;
     let bed = seam.bed_solver().profile().dispatches_per_frame;
-    assert_eq!(total, water + bed, "seam dispatches = sum of the inners");
+    assert_eq!(
+        total,
+        water + bed + 2,
+        "seam dispatches = inners + the 2 bed-field passes (clear + scatter)"
+    );
     assert_eq!(
         water,
         5 + 5 * cfg.pbmpm_iteration_count,
@@ -183,6 +187,42 @@ fn pour_keeps_bed_water_at_zero_and_dispatches_split() {
         4 * seam.bed_solver().substeps_for_dt(DT),
         "twofield inner stays on the 4-pass dry-dynamic path"
     );
+}
+
+/// Review r3.1 gate: prewet writes the cached seed too, so `reset()` replays the WET bed
+/// (a reset would otherwise silently dry the M0 scene — the web UI calls reset directly).
+#[test]
+fn prewet_survives_reset() {
+    let Some(gpu) = GpuContext::new_headless() else {
+        eprintln!("seam_scaffold: no GPU adapter; skipping.");
+        return;
+    };
+    let scene = Scene::debug_seam_static_column();
+    let mats = Materials::default();
+    let mut seam = SeamSolver::build(&scene, &mats, &Config::default(), &gpu);
+    let v_cap = 1.5 * 1.3 * std::f32::consts::FRAC_PI_6 * mats.grain_diameter.powi(3);
+
+    seam.prewet_bed(1.0);
+    for _ in 0..3 {
+        seam.step(DT, &EmissionInput::default());
+    }
+    seam.reset(&scene);
+
+    // One snapshot, phase paired with moisture (the multiset discipline).
+    let pos = seam.bed_solver().read_positions();
+    let phases = seam.bed_solver().read_phases();
+    let mut grains = 0;
+    for (p, &ph) in pos.iter().zip(&phases) {
+        if ph == 1 {
+            grains += 1;
+            assert!(
+                (p[3] - v_cap).abs() < 1e-6,
+                "grain V_abs after reset = {} (expected V_cap = {v_cap})",
+                p[3]
+            );
+        }
+    }
+    assert_eq!(grains, seam.solid_count() as usize, "every grain checked");
 }
 
 /// KTD6: the merged canonical buffers expose water live prefix + solid range only —

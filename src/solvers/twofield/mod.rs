@@ -1187,6 +1187,28 @@ impl TwofieldSolver {
         self.params.water_count = self.water_count;
     }
 
+    /// Pre-saturate the bed: write grain V_abs = sat_frac·V_cap into every grain's moisture
+    /// lane (pos.w) — in BOTH the live buffer and the cached `initial_positions` seed, so
+    /// `reset()` replays the wet bed rather than silently drying it (the web UI calls reset
+    /// directly — docs/plans/2026-07-09-002 U2, review r3.1). sat_frac 1.0 writes exactly
+    /// V_cap ≥ wet_sat_cutoff, so absorption demand is zero (the saturated contract).
+    ///
+    /// Call before stepping: the live write replays the (mutated) seed positions for the
+    /// solid range, so grains must not have moved yet.
+    pub fn prewet_grains(&mut self, sat_frac: f32) {
+        let v_abs = self.params.wet0[1] * sat_frac.clamp(0.0, 1.0);
+        let start = self.water_capacity as usize;
+        let end = start + self.solid_count as usize;
+        for p in &mut self.initial_positions[start..end] {
+            p[3] = v_abs;
+        }
+        self.queue.write_buffer(
+            &self.pos,
+            (start * 16) as u64,
+            bytemuck::cast_slice(&self.initial_positions[start..end]),
+        );
+    }
+
     /// Overwrite particle positions (dev/test only; the .w lane carries moisture).
     pub fn write_positions_for_test(&self, positions: &[[f32; 4]]) {
         assert_eq!(

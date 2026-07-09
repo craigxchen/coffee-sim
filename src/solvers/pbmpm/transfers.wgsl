@@ -137,6 +137,67 @@ fn grid_update(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
 
+    // Seam bed BC (U2, docs/plans/2026-07-09-002): a mass-carrying node inside the seam's
+    // scattered bed (node solid fraction above params.seam.y) has its INTO-BED velocity
+    // component removed, scaled by node saturation — a fully saturated bed (s ≥ params.seam.z,
+    // the wet_sat_cutoff contract) accepts NO entry flux; below that the linear-in-s ramp is
+    // the M0 placeholder (the true Darcy β(φ_s, s) is M1 scope). The into-bed normal is the
+    // occupancy gradient (central difference, edge-guarded), falling back to straight down
+    // where the gradient degenerates (deep interior). Runs every iteration so the constraint
+    // loop sees the bed as a boundary, exactly like the collider BC above. The removed
+    // momentum accumulates into `seam_reaction` (SEAM_IMPULSE_SCALE ledger — telemetry for
+    // the seam's bed hook; the R2 third-law gate measures momentum deltas directly).
+    if (params.seam.x > 0.0 && mass > 0.0) {
+        let cell_vol = h * h * h;
+        // All occupancy reads go through seam_occ_index (the lateral wall clamp — see
+        // common.wgsl): wall node columns otherwise read a kernel-deficit φ_s and become
+        // the chute water slides down.
+        let nodev = vec3<i32>(i32(nx), i32(ny), i32(nz));
+        let ni = seam_occ_index(nodev) * 4u;
+        let occ = fp_decode(atomicLoad(&bed_occupancy[ni + 0u]));
+        let phi_s = occ / cell_vol;
+        if (phi_s > params.seam.y) {
+            let vabs = fp_decode(atomicLoad(&bed_occupancy[ni + 1u]));
+            let vcap = fp_decode(atomicLoad(&bed_occupancy[ni + 2u]));
+            var s = 0.0;
+            if (vcap > 0.0) {
+                s = clamp(vabs / vcap, 0.0, 1.0);
+            }
+            var beta = s;
+            if (s >= params.seam.z) {
+                beta = 1.0;
+            }
+            var grad = vec3<f32>(0.0);
+            grad.x = fp_decode(atomicLoad(&bed_occupancy[seam_occ_index(nodev + vec3<i32>(1, 0, 0)) * 4u]))
+                - fp_decode(atomicLoad(&bed_occupancy[seam_occ_index(nodev - vec3<i32>(1, 0, 0)) * 4u]));
+            if (ny > 0u && ny + 1u < params.grid_dims.y) {
+                grad.y = fp_decode(atomicLoad(&bed_occupancy[seam_occ_index(nodev + vec3<i32>(0, 1, 0)) * 4u]))
+                    - fp_decode(atomicLoad(&bed_occupancy[seam_occ_index(nodev - vec3<i32>(0, 1, 0)) * 4u]));
+            }
+            grad.z = fp_decode(atomicLoad(&bed_occupancy[seam_occ_index(nodev + vec3<i32>(0, 0, 1)) * 4u]))
+                - fp_decode(atomicLoad(&bed_occupancy[seam_occ_index(nodev - vec3<i32>(0, 0, 1)) * 4u]));
+            var n_into = vec3<f32>(0.0, -1.0, 0.0);
+            let glen = length(grad);
+            // Degeneracy epsilon is PHYSICAL (5% of a cell volume), not machine-small: the
+            // fixed-point occupancy lanes carry ~4e-6 truncation noise per frame, and a
+            // machine epsilon here turns interior nodes' noise into junk normals — the BC
+            // then blocks a random direction and water walks through (the measured interior
+            // leak). A real surface gradient is ~φ·h³ ≈ 10⁻²; interior noise is 10⁻⁶.
+            if (glen > 0.05 * cell_vol) {
+                n_into = grad / glen;
+            }
+            let vn_bed = dot(v, n_into);
+            if (vn_bed > 0.0) {
+                let dv = beta * vn_bed * n_into;
+                v = v - dv;
+                let imp = dv * mass * SEAM_IMPULSE_SCALE;
+                atomicAdd(&seam_reaction[n * 4u + 0u], i32(imp.x));
+                atomicAdd(&seam_reaction[n * 4u + 1u], i32(imp.y));
+                atomicAdd(&seam_reaction[n * 4u + 2u], i32(imp.z));
+            }
+        }
+    }
+
     grid_vel[n] = vec4<f32>(v, mass);
 }
 
