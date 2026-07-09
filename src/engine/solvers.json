@@ -28,5 +28,11 @@
     "paradigm": "Hybrid",
     "owns_grid": true,
     "stability": { "CflLimited": { "c": 0.5 } }
+  },
+  "seam": {
+    "name": "Seam blend (PB-MPM water + two-field bed)",
+    "paradigm": "Hybrid",
+    "owns_grid": true,
+    "stability": { "CflLimited": { "c": 0.5 } }
   }
 }
