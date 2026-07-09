@@ -56,11 +56,15 @@ fn main() {
         support_radius: 2.0 * s,
         grain_diameter: 2.0 * s,
         grain_mass: 10.0,
+        c_max: env_f32("CMAX", 0.3),
+        fines_fraction: env_f32("FINES", 0.05),
         ..Materials::default()
     };
     let cfg = Config {
         absorb_rate: 0.5,
         extract_rate: 1.0,
+        impact_scale: env_f32("IMPACT", 4.0),
+        fines_rate: env_f32("FINES_RATE", 0.5),
         // Nozzle radius 0.25 (default 0.5): each emitted layer is a disc of this radius, so 0.5 gave a
         // 1.0-wide descending CURTAIN. 0.25 makes it a tight straight-down column ("funnel down").
         nozzle_radius: 0.25,

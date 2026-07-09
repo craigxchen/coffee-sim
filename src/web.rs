@@ -347,10 +347,9 @@ impl CoffeeSimApp {
 /// Scene + calibrated materials/config for each web scene. Center Pour mirrors the native viewer's
 /// `v60pour` setup at a browser-friendly resolution; Water Only is the default dam.
 ///
-/// `solver_id` lets the coffee scene turn on the two-field coupling gates when the two-field solver
-/// is active. Those `tf_*`/`solid_dynamics` flags are opt-in (default OFF) and the XPBD solver
-/// ignores them, so they are applied only for `SolverId::Twofield` — keeping the XPBD path's config
-/// byte-identical to before.
+/// `solver_id` lets the coffee scene turn on each solver's coffee-specific gates. Two-field needs
+/// its `tf_*`/`solid_dynamics` flags; XPBD uses the shared wet-cohesion/fines state plus its local
+/// dynamic-pressure impact pass. The non-coffee debug scenes keep the lighter water-only presets.
 fn setup_for(kind: WebScene, solver_id: SolverId) -> (Scene, Materials, Config) {
     let scene = kind.build();
     let twofield = solver_id == SolverId::Twofield;
@@ -419,7 +418,7 @@ fn setup_for(kind: WebScene, solver_id: SolverId) -> (Scene, Materials, Config) 
 /// coupling gates + the grid-resolvable jet, exactly as the original CenterPour branch did.
 fn v60_bed_setup(twofield: bool) -> (Materials, Config) {
     let r = 0.16_f32;
-    let mats = Materials {
+    let mut mats = Materials {
         particle_spacing: r,
         support_radius: 2.0 * r,
         grain_diameter: 2.0 * r,
@@ -439,6 +438,19 @@ fn v60_bed_setup(twofield: bool) -> (Materials, Config) {
         drag_subiters: 6,
         ..Config::default()
     };
+    if !twofield {
+        // XPBD coffee gates, calibrated as a conservative first pass:
+        // - impact_scale=4 gives a visibly stronger center impulse without the high-scale churn
+        //   seen in the slow calibration sweep (`tests/xpbd_impact.rs`).
+        // - c_max=0.3 is the existing wet-bed cohesion scale used by the coupling render path:
+        //   enough capillary strength to hold a damp bed, below the clumping regime.
+        // - a small mobile-fines inventory gives the channeling diagnostic something physical to
+        //   amplify; it is not a paper-filter clogging claim.
+        cfg.impact_scale = 4.0;
+        cfg.fines_rate = 0.5;
+        mats.c_max = 0.3;
+        mats.fines_fraction = 0.05;
+    }
     if twofield {
         // Two-field coupling: a deformable bed (solid_dynamics) that absorbs water (tf_absorb_rate,
         // feeding swelling + K(φ)), drains through the filter (tf_filter_floor), and gains wet

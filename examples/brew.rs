@@ -50,11 +50,14 @@ fn main() {
         grain_diameter: 1.0,
         min_pore_fraction: 0.35,
         grain_mass: 10.0,
+        c_max: env_f32("CMAX", 0.3),
+        fines_fraction: env_f32("FINES", 0.05),
         ..Materials::default()
     };
     let cfg = Config {
         absorb_rate: env_f32("ABSORB", 0.5),
         extract_rate: env_f32("EXTRACT", 1.0),
+        fines_rate: env_f32("FINES_RATE", 0.5),
         ..Config::default()
     };
     let steps: u32 = std::env::var("STEPS")

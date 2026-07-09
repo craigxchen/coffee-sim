@@ -10,6 +10,7 @@ use coffee_sim::utils::gpu::GpuContext;
 use coffee_sim::EmissionInput;
 
 const DT: f32 = 1.0 / 60.0;
+const XPBD_COFFEE_IMPACT_PRESET: f32 = 4.0;
 
 fn pour(kettle: [f32; 3], flow: f32) -> EmissionInput {
     EmissionInput {
@@ -41,8 +42,68 @@ fn coffee_mats() -> Materials {
         support_radius: 2.0 * r,
         grain_diameter: 2.0 * r,
         grain_mass: 10.0,
+        c_max: 0.3,
+        fines_fraction: 0.05,
         ..Materials::default()
     }
+}
+
+fn center_grain_mean_vy(solver: &XpbdSolver) -> f32 {
+    let pos = solver.read_positions();
+    let vel = solver.read_velocities();
+    let phase = solver.read_phases();
+    let (mut sum, mut count) = (0.0f64, 0u32);
+    for ((p, v), &ph) in pos.iter().zip(&vel).zip(&phase) {
+        let rr = (p[0] * p[0] + p[2] * p[2]).sqrt();
+        if ph == 1 && rr < 0.6 {
+            sum += v[1] as f64;
+            count += 1;
+        }
+    }
+    assert!(count > 0, "test setup: no center grains found");
+    (sum / count as f64) as f32
+}
+
+fn min_center_grain_vy_for(gpu: &GpuContext, impact_scale: f32) -> f32 {
+    let mats = coffee_mats();
+    let mut cfg = web_coffee_cfg(impact_scale);
+    cfg.fines_rate = 0.5;
+    let mut solver = XpbdSolver::build(&Scene::v60_pour(), &mats, &cfg, gpu);
+    for _ in 0..40 {
+        solver.step(DT, &pour([0.0, 2.5, 0.0], 0.0));
+    }
+    let mut min_vy = f32::INFINITY;
+    for step in 0..120 {
+        solver.step(DT, &pour([0.0, 2.5, 0.0], 3.26));
+        if step % 5 == 0 {
+            min_vy = min_vy.min(center_grain_mean_vy(&solver));
+        }
+    }
+    assert!(min_vy.is_finite(), "center-grain impulse is non-finite");
+    min_vy
+}
+
+#[test]
+fn coffee_impact_preset_center_impulse_characterization() {
+    let Some(gpu) = GpuContext::new_headless() else {
+        eprintln!("xpbd_impact: no GPU adapter; skipping.");
+        return;
+    };
+    let baseline = min_center_grain_vy_for(&gpu, 0.0);
+    let preset = min_center_grain_vy_for(&gpu, XPBD_COFFEE_IMPACT_PRESET);
+    eprintln!(
+        "XPBD coffee impact preset: center grain min vy baseline={baseline:.4}, preset={preset:.4}"
+    );
+    assert!(
+        baseline.is_finite(),
+        "baseline center impulse is non-finite"
+    );
+    assert!(preset.is_finite(), "preset center impulse is non-finite");
+    assert!(
+        baseline.abs() < 25.0 && preset.abs() < 25.0,
+        "center impulse should remain below the velocity cap: baseline {baseline:.4}, preset \
+         {preset:.4}"
+    );
 }
 
 // 85th-percentile grain-surface height in a radial ring [lo,hi).
