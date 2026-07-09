@@ -84,10 +84,28 @@ pub struct SeamSolver {
     seam_clear: (wgpu::ComputePipeline, wgpu::BindGroup),
     seam_scatter: (wgpu::ComputePipeline, wgpu::BindGroup),
     /// pbmpm's reaction ledger (U3): accumulated by the bed BC across the water step,
-    /// consumed by the bed inner's `seam_inject` each substep, zeroed here after the frame.
+    /// consumed by the bed inner's `seam_inject` each substep. Zeroed at the START of each
+    /// frame (after U4's credit pass has read its consumed lane), not at the end.
     reaction: Arc<wgpu::Buffer>,
     num_nodes: u32,
     seam_dispatches: u32,
+
+    // U4 absorption handoff (gated on cfg.tf_absorb_rate > 0). The mark list produced at
+    // frame N's end is applied as ONE transaction at frame N+1's start: host removal from
+    // pbmpm, GPU credit to grains, then the ledger zeroes (KTD5).
+    absorb_on: bool,
+    seam_params_buf: wgpu::Buffer,
+    seam_demand: (wgpu::ComputePipeline, wgpu::BindGroup),
+    seam_mark: (wgpu::ComputePipeline, wgpu::BindGroup),
+    seam_credit: (wgpu::ComputePipeline, wgpu::BindGroup),
+    marks: wgpu::Buffer,
+    marks_staging: wgpu::Buffer,
+    pending: Option<std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>>,
+    /// V_w = spacing³ (the whole-particle handoff quantum) and particle mass, for the books.
+    v_w: f32,
+    particle_mass: f32,
+    /// Cumulative absorbed volume the seam has handed across (diagnostics).
+    absorbed_total: f32,
 
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -124,9 +142,6 @@ impl SeamSolver {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("seam-render-merge"),
             });
-        // U3: the bed inner consumed the reaction ledger this frame (merge runs after
-        // bed.step()); zero it so next frame's BC accumulates fresh.
-        enc.clear_buffer(&self.reaction, 0, None);
         let wp = self.water.particles();
         let bp = self.bed.particles();
         let lanes: [(&Option<Arc<wgpu::Buffer>>, &Option<Arc<wgpu::Buffer>>, &Arc<wgpu::Buffer>, u64); 4] = [
@@ -176,6 +191,32 @@ impl SeamSolver {
     /// Bed grains (fixed at build).
     pub fn solid_count(&self) -> u32 {
         self.solid_count
+    }
+
+    /// Combined water books (single frame-boundary snapshot, KTD5): returns
+    /// `(emitted_vol, in_domain_vol)` in sim-units³, where in_domain = pbmpm live water
+    /// (f_w ≡ 1, V_w = spacing³ each) + Σ grain V_abs (incl. prewet inventory — gates
+    /// compare deltas against their t0 snapshot). Marked-but-unapplied particles are still
+    /// live and count on the water side; credit lands in the same transaction as removal,
+    /// so nothing is ever double-counted at a frame boundary. Dev/test — stalls on readback.
+    pub fn water_books(&self) -> (f32, f32) {
+        let emitted_vol =
+            self.water.total_emitted_water_mass() / self.particle_mass * self.v_w;
+        let live_vol = self.water.active_count() as f32 * self.v_w;
+        let pos = self.bed.read_positions();
+        let phases = self.bed.read_phases();
+        let mut absorbed = 0.0f64;
+        for (p, &ph) in pos.iter().zip(&phases) {
+            if ph == 1 {
+                absorbed += p[3].max(0.0) as f64;
+            }
+        }
+        (emitted_vol, live_vol + absorbed as f32)
+    }
+
+    /// Cumulative volume the seam has handed from water particles to grain absorption.
+    pub fn absorbed_total(&self) -> f32 {
+        self.absorbed_total
     }
 
     /// The scaffold invariant: the twofield inner must never hold live water — one stray
@@ -269,16 +310,22 @@ impl Solver for SeamSolver {
         let num_nodes = dims[0] * dims[1] * dims[2];
         let v_dry = std::f32::consts::FRAC_PI_6 * mats.grain_diameter.powi(3);
         let v_cap = crate::models::wetting::capacity(v_dry, mats.r_max, mats.rho_ratio);
+        let v_w = mats.particle_spacing.powi(3);
+        // U4 constants: whole-particle quantum, the absorption rate factor at the pinned
+        // frame dt (1/60 — prereg), and the saturated-tail demand cutoff.
+        let quantum_fp = (v_w as f64 * 262144.0) as u32;
+        let absorb_factor = 1.0 - (-cfg.tf_absorb_rate * (1.0 / 60.0)).exp();
+        let cutoff = v_cap * (1.0 - cfg.absorb_roundoff);
         let seam_params = SeamParams {
             grid_origin: [origin[0], origin[1], origin[2], h],
             grid_dims: [dims[0], dims[1], dims[2], num_nodes],
-            solid: [bed_solid_offset, solid_count, 0, 0],
-            wet: [v_dry, v_cap, 0.0, 0.0],
+            solid: [bed_solid_offset, solid_count, 0, quantum_fp],
+            wet: [v_dry, v_cap, absorb_factor, cutoff],
         };
         let seam_params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("seam-params"),
             contents: bytemuck::bytes_of(&seam_params),
-            usage: wgpu::BufferUsages::UNIFORM,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("seam"),
@@ -327,6 +374,66 @@ impl Solver for SeamSolver {
             &seam_scatter_pipe,
             &[(0, &seam_params_buf), (1, &bed_pos), (2, &bed_occupancy)],
         );
+        // U4 absorption passes + mark list (count slot + MARK_CAP entries; must match
+        // seam.wgsl's MARK_CAP).
+        const MARK_CAP: u64 = 2048;
+        let marks = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("seam-marks"),
+            size: (1 + MARK_CAP) * 4,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let marks_staging = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("seam-marks-staging"),
+            size: (1 + MARK_CAP) * 4,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        // The persistent per-node demand bank (see seam.wgsl binding 6). Never cleared.
+        let seam_bank = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("seam-bank"),
+            size: (num_nodes as u64 * 4).max(4),
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        let water_pos = water
+            .particles()
+            .position
+            .expect("pbmpm always exposes a position buffer");
+        let seam_demand_pipe = make("seam_demand");
+        let seam_demand_bind = bg(
+            &seam_demand_pipe,
+            &[
+                (0, &seam_params_buf),
+                (1, &bed_pos),
+                (2, &bed_occupancy),
+                (6, &seam_bank),
+            ],
+        );
+        let seam_mark_pipe = make("seam_mark");
+        let seam_mark_bind = bg(
+            &seam_mark_pipe,
+            &[
+                (0, &seam_params_buf),
+                (2, &bed_occupancy),
+                (3, &reaction),
+                (4, &marks),
+                (5, &water_pos),
+                (6, &seam_bank),
+            ],
+        );
+        let seam_credit_pipe = make("seam_credit");
+        let seam_credit_bind = bg(
+            &seam_credit_pipe,
+            &[
+                (0, &seam_params_buf),
+                (1, &bed_pos),
+                (2, &bed_occupancy),
+                (3, &reaction),
+            ],
+        );
         let render_pos = Self::render_buffer(&device, "seam-render-pos", capacity * VEC4);
         let render_vel = Self::render_buffer(&device, "seam-render-vel", capacity * VEC4);
         let render_phase = Self::render_buffer(&device, "seam-render-phase", capacity * U32S);
@@ -349,6 +456,17 @@ impl Solver for SeamSolver {
             reaction,
             num_nodes,
             seam_dispatches: 0,
+            absorb_on: cfg.tf_absorb_rate > 0.0,
+            seam_params_buf,
+            seam_demand: (seam_demand_pipe, seam_demand_bind),
+            seam_mark: (seam_mark_pipe, seam_mark_bind),
+            seam_credit: (seam_credit_pipe, seam_credit_bind),
+            marks,
+            marks_staging,
+            pending: None,
+            v_w,
+            particle_mass: mats.particle_mass,
+            absorbed_total: 0.0,
             device,
             queue: gpu.queue.clone(),
         };
@@ -365,10 +483,62 @@ impl Solver for SeamSolver {
     }
 
     fn step(&mut self, dt: f32, input: &EmissionInput) {
-        // KTD2 frame order: refresh the bed-occupancy field (clear, then trilinear scatter
-        // of the bed's persistent grain positions) BEFORE the water step, so pbmpm's bed BC
-        // sees this frame's bed. Skipped without a bed — water-only scenes stay pure pbmpm.
         self.seam_dispatches = 0;
+
+        // (1) U4: apply the pending absorption transaction from frame N−1 as ONE unit
+        // (KTD5): host removal of the marked pbmpm particles, GPU credit of the consumed
+        // volume to grains (reads the reaction ledger's consumed lane + last frame's
+        // remaining demand — both still intact), THEN zero the reaction ledger. Without a
+        // pending transaction the ledger is zeroed here too (frame-start, post-consumption).
+        if let Some(rx) = self.pending.take() {
+            let _ = self.device.poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: None,
+            });
+            rx.recv()
+                .expect("seam marks map_async dropped")
+                .expect("seam marks map failed");
+            let (count, indices) = {
+                let view = self.marks_staging.slice(..).get_mapped_range();
+                let words: &[u32] = bytemuck::cast_slice(&view);
+                let count = words[0].min(words.len() as u32 - 1);
+                (count, words[1..1 + count as usize].to_vec())
+            };
+            self.marks_staging.unmap();
+            if count > 0 {
+                self.water.remove_water_for_seam(&indices);
+                self.absorbed_total += count as f32 * self.v_w;
+            }
+            let mut enc = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("seam-credit"),
+                });
+            {
+                let mut cpass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("seam-credit"),
+                    timestamp_writes: None,
+                });
+                cpass.set_pipeline(&self.seam_credit.0);
+                cpass.set_bind_group(0, &self.seam_credit.1, &[]);
+                cpass.dispatch_workgroups(self.solid_count.div_ceil(WG).max(1), 1, 1);
+            }
+            enc.clear_buffer(&self.reaction, 0, None);
+            self.queue.submit(Some(enc.finish()));
+            self.seam_dispatches += 1;
+        } else if self.solid_count > 0 {
+            let mut enc = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("seam-zero-reaction"),
+                });
+            enc.clear_buffer(&self.reaction, 0, None);
+            self.queue.submit(Some(enc.finish()));
+        }
+
+        // (2) KTD2: refresh the bed-occupancy field (clear, then B-spline scatter of the
+        // bed's persistent grain positions) BEFORE the water step, so pbmpm's bed BC sees
+        // this frame's bed. Skipped without a bed — water-only scenes stay pure pbmpm.
         if self.solid_count > 0 {
             let mut enc = self
                 .device
@@ -388,7 +558,7 @@ impl Solver for SeamSolver {
                 cpass.dispatch_workgroups(self.solid_count.div_ceil(WG).max(1), 1, 1);
             }
             self.queue.submit(Some(enc.finish()));
-            self.seam_dispatches = SEAM_PASSES;
+            self.seam_dispatches += SEAM_PASSES;
         }
 
         // The pour goes through pbmpm only. The bed inner gets a zeroed flow (its emit()
@@ -400,6 +570,44 @@ impl Solver for SeamSolver {
             ..EmissionInput::default()
         };
         self.bed.step(dt, &bed_input);
+
+        // (4) U4: sense absorption for NEXT frame — scatter per-node demand, let bed-contact
+        // water consume whole quanta, and start the async mark readback (applied at the next
+        // frame's start; 1-frame latency by design).
+        if self.absorb_on && self.solid_count > 0 && self.water.active_count() > 0 {
+            self.queue.write_buffer(
+                &self.seam_params_buf,
+                40, // SeamParams.solid.z — the live water count
+                bytemuck::bytes_of(&self.water.active_count()),
+            );
+            let mut enc = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("seam-absorb-sense"),
+                });
+            enc.clear_buffer(&self.marks, 0, Some(4)); // zero the count slot
+            {
+                let mut cpass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("seam-absorb-sense"),
+                    timestamp_writes: None,
+                });
+                cpass.set_pipeline(&self.seam_demand.0);
+                cpass.set_bind_group(0, &self.seam_demand.1, &[]);
+                cpass.dispatch_workgroups(self.solid_count.div_ceil(WG).max(1), 1, 1);
+                cpass.set_pipeline(&self.seam_mark.0);
+                cpass.set_bind_group(0, &self.seam_mark.1, &[]);
+                cpass.dispatch_workgroups(self.water.active_count().div_ceil(WG).max(1), 1, 1);
+            }
+            enc.copy_buffer_to_buffer(&self.marks, 0, &self.marks_staging, 0, self.marks.size());
+            self.queue.submit(Some(enc.finish()));
+            self.seam_dispatches += 2;
+            let (tx, rx) = std::sync::mpsc::channel();
+            self.marks_staging.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+                let _ = tx.send(r);
+            });
+            self.pending = Some(rx);
+        }
+
         self.merge_render_buffers();
     }
 

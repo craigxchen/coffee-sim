@@ -725,6 +725,64 @@ impl PbmpmSolver {
         self.inflow.emitted_mass
     }
 
+    /// Remove marked live water particles (the seam's absorption handoff, docs/plans/
+    /// 2026-07-09-002 U4): swap-with-last over the FULL live per-particle state set —
+    /// pos, vel, phase, chem, deform_disp (3 rows), deform_grad (3 rows), vel_prev — a
+    /// partial swap silently corrupts the survivor (review r1.2). The swap plan is built
+    /// host-side (marks deduped, sorted descending, tail-collision-safe) and executed as
+    /// GPU buffer copies; the live count then drops. Freed tail slots keep stale data —
+    /// every kernel guards `p >= water_count`, and emit() overwrites on reuse.
+    pub fn remove_water_for_seam(&mut self, marked: &[u32]) {
+        let mut marks: Vec<u32> = marked
+            .iter()
+            .copied()
+            .filter(|&m| m < self.water_count)
+            .collect();
+        marks.sort_unstable();
+        marks.dedup();
+        if marks.is_empty() {
+            return;
+        }
+        let mut enc = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("pbmpm-seam-remove"),
+            });
+        // WebGPU forbids same-buffer copies: bounce each lane through a scratch buffer
+        // (copies within one encoder execute in submission order, so serial reuse is safe).
+        let scratch = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("pbmpm-seam-remove-scratch"),
+            size: 48,
+            usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut new_count = self.water_count;
+        // Descending: each removal's swap source is the current last live slot, which can
+        // never itself be a not-yet-processed mark (those are all smaller indices).
+        for &m in marks.iter().rev() {
+            new_count -= 1;
+            if m != new_count {
+                let (dst, src) = (m as u64, new_count as u64);
+                let lanes: [(&wgpu::Buffer, u64); 7] = [
+                    (&self.pos, 16),
+                    (&self.vel, 16),
+                    (&self.chem, 16),
+                    (&self.vel_prev, 16),
+                    (&self.phase, 4),
+                    (&self.deform_disp, 48),
+                    (&self.deform_grad, 48),
+                ];
+                for (buf, stride) in lanes {
+                    enc.copy_buffer_to_buffer(buf, src * stride, &scratch, 0, stride);
+                    enc.copy_buffer_to_buffer(&scratch, 0, buf, dst * stride, stride);
+                }
+            }
+        }
+        self.queue.submit(Some(enc.finish()));
+        self.water_count = new_count;
+        self.params.water_count = new_count;
+    }
+
     pub fn active_count(&self) -> u32 {
         self.water_count
     }
