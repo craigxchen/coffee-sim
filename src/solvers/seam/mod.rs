@@ -142,6 +142,12 @@ impl SeamSolver {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("seam-render-merge"),
             });
+        // U3 ledger hygiene, absorb-off mode: zero at frame END (post-consumption; lane 3 is
+        // unused). In absorb mode the zero happens at frame START instead, after the credit
+        // pass reads lane 3 (KTD5) — see step().
+        if !self.absorb_on {
+            enc.clear_buffer(&self.reaction, 0, None);
+        }
         let wp = self.water.particles();
         let bp = self.bed.particles();
         let lanes: [(&Option<Arc<wgpu::Buffer>>, &Option<Arc<wgpu::Buffer>>, &Arc<wgpu::Buffer>, u64); 4] = [
@@ -526,7 +532,9 @@ impl Solver for SeamSolver {
             enc.clear_buffer(&self.reaction, 0, None);
             self.queue.submit(Some(enc.finish()));
             self.seam_dispatches += 1;
-        } else if self.solid_count > 0 {
+        } else if self.absorb_on && self.solid_count > 0 {
+            // Absorb mode, no pending transaction yet (first frames): clear at frame start —
+            // lane 3 must otherwise survive frame N's end for the N+1 credit pass.
             let mut enc = self
                 .device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
