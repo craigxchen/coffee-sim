@@ -232,6 +232,34 @@ isolation does not certify the seam — (c) is the actual multi-solver coupling 
 Also: balErr printout works in a seam `examples/` driver; multiset discipline in every new
 test (the seam's own removal permutes pbmpm's live range).
 
+#### U4 implementation design (settled during build)
+
+- **Demand** (`seam_demand`, over grains, end of frame N after both inner steps): node-lane
+  demand via the B-spline scatter into bed_occupancy lane 3 (cleared per frame by
+  seam_clear_bed): demand_g = (V_cap − V_abs)·(1 − e^{−tf_absorb_rate·dt}), floored to 0 at
+  wet_sat_cutoff. dt is pinned 1/60 (prereg); the factor rides SeamParams.wet.z, cutoff .w.
+- **Mark** (`seam_mark`, over pbmpm live water, same encoder): a bed-contact particle
+  (φ_s > SEAM_PHI_MIN at its position) tries to consume ONE quantum (V_w = spacing³, FP)
+  from its nearest node's demand lane via atomicSub-with-undo; on success appends its index
+  to the mark list (atomic count, capacity-capped with undo on overflow) and adds the
+  quantum to seam_reaction lane 3 (the consumed-per-node ledger). Sub-quantum node demand
+  is discarded at frame end — demand is a rate, it regenerates; granularity ≤ 1 quantum
+  per node per frame.
+- **Apply** (frame N+1 start, the one-transaction): (1) host removal from the mapped mark
+  list — swap-with-last over the FULL live state set (pos, vel, phase, chem, deform_disp,
+  deform_grad, vel_prev) via GPU buffer copies planned host-side (marks sorted descending,
+  tail-collision-safe), then water_count decrement; (2) `seam_credit` (over grains): grain
+  V_abs += Σ_nodes w·consumed_n·(demand_g·w / (remaining_n + consumed_n)) — demand
+  recomputed deterministically (V_abs unchanged since frame N), initial demand
+  reconstructed as remaining (bed_occupancy lane 3) + consumed (reaction lane 3), so the
+  credited total equals the consumed total EXACTLY by construction; (3) zero the reaction
+  ledger (moved from frame end to post-credit). Then the normal frame proceeds
+  (clear+scatter → water → bed).
+- **Books**: `SeamSolver::water_books()` returns (emitted_vol, in_domain_vol) with
+  in_domain = pbmpm live·V_w + Σ grain V_abs, read at frame boundaries only —
+  marked-but-unapplied particles are still live (water side), credit lands in the same
+  transaction as removal.
+
 ### U5 — Pre-registration (before any quantified run)
 `docs/plans/2026-07-09-003-seam-m0-preregistration.md`, committed **before** the U2–U4
 quantified gates are first measured (the U7 precedent — review r1.4): the exact M0 scene
