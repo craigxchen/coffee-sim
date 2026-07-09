@@ -274,6 +274,33 @@ fn coulomb(v: vec3<f32>, nrm: vec3<f32>, mu_b: f32) -> vec3<f32> {
     return out;
 }
 
+// =================================== seam_inject ================================================
+// Seam-blend reaction hook (docs/plans/2026-07-09-002 U3): add the water solver's accumulated
+// bed-BC reaction impulses into the solid grid momentum. PLACEMENT IS LOAD-BEARING (review
+// r1.3): grid_clear zeroes grid_sm EVERY substep, so this pass must dispatch inside the
+// DRY-dynamic branch, after grid_clear + p2g_solid_dyn and before solid_update — landing it
+// anywhere else silently injects nothing. The ledger is divided across the frame's substeps
+// (seam_uni.x carries the scale conversion AND the 1/substeps), so the frame total is exactly
+// one ledger. Momentum lands only on nodes carrying solid mass this substep — a massless node
+// would drop it in solid_update's decode; the R2 third-law gate measures any residual loss.
+@compute @workgroup_size(256)
+fn seam_inject(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let n = gid.x;
+    if (n >= params.grid_dims.w) {
+        return;
+    }
+    let mc = atomicLoad(&grid_sm[n * 4u + 0u]);
+    if (mc <= 0) {
+        return;
+    }
+    for (var l = 0u; l < 3u; l = l + 1u) {
+        let imp = atomicLoad(&seam_reaction_in[n * 4u + l]);
+        if (imp != 0) {
+            atomicAdd(&grid_sm[n * 4u + 1u + l], i32(round(f32(imp) * seam_uni.x)));
+        }
+    }
+}
+
 // =================================== p2g_solid_dyn =============================================
 // Solid P2G, dynamic mode: grain sphere volume into grid_sfp (byte-identical arithmetic to the
 // frozen p2g_solid) + mass/momentum with APIC and the fused MLS-MPM stress force into grid_sm.

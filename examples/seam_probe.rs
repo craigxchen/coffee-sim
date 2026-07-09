@@ -52,7 +52,7 @@ fn main() {
         seam.water_count(),
         seam.solid_count()
     );
-    println!("frame   minY    meanY   maxY    KE/n      belowBed%  bedWater");
+    println!("frame   minY    meanY   maxY    KE/n      belowBed%  bedWater  grainTop  grainSpd");
     let mut snapshots: Vec<(u32, Vec<[f32; 4]>)> = Vec::new();
     for frame in 0..frames {
         seam.step(DT, &EmissionInput::default());
@@ -84,12 +84,31 @@ fn main() {
                     bins[(((y + 10.0) * 4.0) as usize).min(11)] += 1;
                 }
             }
+            // Bed state: p95 grain-top height (the CURRENT material surface — the bed may
+            // legitimately compact under the delivered column weight) + mean grain speed
+            // (static-bed check under load).
+            let bpos = seam.bed_solver().read_positions();
+            let bvel = seam.bed_solver().read_velocities();
+            let bph = seam.bed_solver().read_phases();
+            let mut tops: Vec<f32> = Vec::new();
+            let (mut bspd, mut bn) = (0.0f64, 0u32);
+            for ((p, v), &ph) in bpos.iter().zip(&bvel).zip(&bph) {
+                if ph == 1 {
+                    tops.push(p[1]);
+                    bspd += ((v[0] * v[0] + v[1] * v[1] + v[2] * v[2]) as f64).sqrt();
+                    bn += 1;
+                }
+            }
+            tops.sort_by(f32::total_cmp);
+            let grain_top =
+                tops[((tops.len() as f32 * 0.95) as usize).min(tops.len().saturating_sub(1))];
             println!(
-                "{frame:>5} {min_y:7.3} {:8.3} {max_y:7.3} {:9.4} {:9.2} {:>8}  |{}",
+                "{frame:>5} {min_y:7.3} {:8.3} {max_y:7.3} {:9.4} {:9.2} {:>8} {grain_top:9.3} {:9.4}  |{}",
                 sum_y / live.max(1) as f64,
                 ke / live.max(1) as f64,
                 100.0 * below as f32 / live.max(1) as f32,
                 seam.bed_water_count(),
+                bspd / bn.max(1) as f64,
                 bins.map(|b| format!("{b:>5}")).join("")
             );
         }

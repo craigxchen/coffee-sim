@@ -121,6 +121,14 @@ struct Params {
 // ≪ the 2^13 fixed-point ceiling.
 @group(0) @binding(25) var<storage, read_write> grid_moist: array<atomic<i32>>;
 
+// Seam-blend reaction hook (docs/plans/2026-07-09-002 U3; only bound by `seam_inject`, only
+// dispatched when a seam attaches its ledger). `seam_reaction_in` is the WATER solver's
+// per-node bed-BC impulse ledger (pbmpm binding 18; SEAM_IMPULSE_SCALE = 2^12 fixed point —
+// a coarser scale than FP_SCALE, see pbmpm common.wgsl). `seam_uni.x` = the pre-computed
+// conversion (FP_SCALE / SEAM_IMPULSE_SCALE) / substeps, refreshed by the host each frame.
+@group(0) @binding(28) var<storage, read_write> seam_reaction_in: array<atomic<i32>>;
+@group(0) @binding(29) var<uniform> seam_uni: vec4<f32>;
+
 // --- fixed-point encoding (KEEP.md §3 pattern, headroom re-validated for U2) -----------------
 //
 // FP_SCALE = 2^18. i32 range is ±2^31, so an encoded node lane overflows at |value| ≥ 2^13 = 8192.
