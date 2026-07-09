@@ -81,6 +81,13 @@ compose with no dormant leaks; prewet survives reset; hook placement (known impu
 predicted response; zeroed ledger stops); saturated bed = zero transfer over 1500 frames
 with exact books; combined arm = 1280/2197 particles handed across with books drift ≤ 0.07%.
 
+## Regression
+
+Full `cargo test --release --tests` (2026-07-09, same session): **green, zero failures**
+across every binary — all pre-existing suites (xpbd/twofield/pbmpm families, wetting +
+saturated-tail conservation, physics/perf harnesses) plus the new seam gates. The seam
+program introduced no regressions.
+
 ## Visual oracle
 
 `examples/seam_render.rs` frames 0/60/200/600/1200 (/tmp/seam-m0/): the column stands,
