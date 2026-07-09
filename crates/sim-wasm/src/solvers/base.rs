@@ -13,6 +13,7 @@ pub(crate) enum SolverId {
     Mpm,
     Xpbd,
     Twofield,
+    Pbmpm,
 }
 
 impl SolverId {
@@ -21,11 +22,12 @@ impl SolverId {
             Self::Mpm => "mpm",
             Self::Xpbd => "xpbd",
             Self::Twofield => "twofield",
+            Self::Pbmpm => "pbmpm",
         }
     }
 
     pub(crate) fn all() -> &'static [Self] {
-        &[Self::Mpm, Self::Xpbd, Self::Twofield]
+        &[Self::Mpm, Self::Xpbd, Self::Twofield, Self::Pbmpm]
     }
 
     pub(crate) fn from_id(id: &str) -> Option<Self> {
@@ -33,6 +35,7 @@ impl SolverId {
             "mpm" => Some(Self::Mpm),
             "xpbd" => Some(Self::Xpbd),
             "twofield" => Some(Self::Twofield),
+            "pbmpm" => Some(Self::Pbmpm),
             _ => None,
         }
     }

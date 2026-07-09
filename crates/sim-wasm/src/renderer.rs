@@ -662,7 +662,7 @@ impl Renderer {
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("coffee-sim device"),
                 required_features: wgpu::Features::empty(),
-                required_limits: crate::solvers::mpm::required_limits(),
+                required_limits: crate::solvers::registry::required_limits(),
                 memory_hints: wgpu::MemoryHints::Performance,
                 trace: wgpu::Trace::default(),
                 experimental_features: wgpu::ExperimentalFeatures::disabled(),

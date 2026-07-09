@@ -1,9 +1,10 @@
 //! Solver-agnostic physical-realism evals.
 //!
-//! These tests deliberately run through the modular `FrameSolver` seam. They
-//! sample only shared metrics and render-facing particle buffers, so adding a
-//! solver should mean registering it and letting these evals exercise it without
-//! adding a solver-specific test path here.
+//! The contract here is intentionally the same one the browser uses: build a
+//! registered solver, step frames through `FrameSolver`, then inspect only
+//! shared metrics and render-facing particle sources. No concrete solver type,
+//! downcast, shader-private buffer, or solver-specific scene setup is allowed in
+//! this module. A new solver should enter these evals by registering itself.
 
 use std::sync::mpsc;
 
@@ -11,195 +12,343 @@ use bytemuck::cast_slice;
 use coffee_sim_core::Vec3;
 
 use crate::solvers::base::{CommonMetrics, FrameContext, FrameSolver, SceneSpec, SolverId};
-use crate::solvers::registry::build_solver;
-use crate::ui::ParticleRenderSource;
+use crate::solvers::registry::{build_solver, required_limits};
+use crate::ui::{ParticleRenderSource, RenderView};
 
-const DT: f32 = 1.0 / 60.0;
-const ACTIVE_PARK_Y: f32 = -1.0e5;
-const MIN_FALL_DELTA: f32 = 0.01;
+const FRAME_DT: f32 = 1.0 / 60.0;
+const PARKED_PARTICLE_Y: f32 = -1.0e5;
+const MIN_FREE_STREAM_FALL: f32 = 0.01;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EvalScenario {
+    CenterPour,
+    FreeStream,
+}
+
+impl EvalScenario {
+    const ALL: [Self; 2] = [Self::CenterPour, Self::FreeStream];
+
+    fn scene_spec(self) -> SceneSpec {
+        match self {
+            Self::CenterPour => SceneSpec::CenterPour,
+            Self::FreeStream => SceneSpec::FreeStream,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::CenterPour => "center-pour",
+            Self::FreeStream => "free-stream",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SolverCase {
+    solver: SolverId,
+    scenario: EvalScenario,
+}
+
+impl SolverCase {
+    fn all() -> Vec<Self> {
+        SolverId::all()
+            .iter()
+            .copied()
+            .flat_map(|solver| {
+                EvalScenario::ALL
+                    .iter()
+                    .copied()
+                    .map(move |scenario| Self { solver, scenario })
+            })
+            .collect()
+    }
+
+    fn label(self) -> String {
+        format!("{}::{}", self.solver.id(), self.scenario.label())
+    }
+}
+
+struct EvalDevice {
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+}
+
+impl EvalDevice {
+    fn new() -> Option<Self> {
+        if std::env::var_os("COFFEE_SIM_SKIP_GPU_TESTS").is_some() {
+            return None;
+        }
+
+        let instance = wgpu::Instance::default();
+        let adapter =
+            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
+                .ok()?;
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("coffee-sim solver-agnostic eval device"),
+            required_features: wgpu::Features::empty(),
+            required_limits: required_limits(),
+            memory_hints: wgpu::MemoryHints::Performance,
+            trace: wgpu::Trace::default(),
+            experimental_features: wgpu::ExperimentalFeatures::disabled(),
+        }))
+        .ok()?;
+
+        Some(Self { device, queue })
+    }
+
+    fn read_buffer(&self, source: &wgpu::Buffer, bytes: u64) -> Vec<u8> {
+        let bytes = bytes.max(4);
+        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("solver eval readback"),
+            size: bytes,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("solver eval readback"),
+            });
+        encoder.copy_buffer_to_buffer(source, 0, &staging, 0, bytes);
+        self.queue.submit(Some(encoder.finish()));
+
+        let slice = staging.slice(..);
+        let (tx, rx) = mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            tx.send(result).expect("eval readback callback");
+        });
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        rx.recv()
+            .expect("eval readback recv")
+            .expect("eval readback map");
+
+        let data = slice.get_mapped_range().to_vec();
+        staging.unmap();
+        data
+    }
+
+    fn read_vec4_f32(&self, buffer: &wgpu::Buffer, count: usize) -> Vec<[f32; 4]> {
+        let bytes = (count * 4 * std::mem::size_of::<f32>()) as u64;
+        let data = self.read_buffer(buffer, bytes);
+        cast_slice::<u8, f32>(&data)
+            .chunks_exact(4)
+            .map(|lane| [lane[0], lane[1], lane[2], lane[3]])
+            .collect()
+    }
+
+    fn read_u32(&self, buffer: &wgpu::Buffer, count: usize) -> Vec<u32> {
+        let bytes = (count * std::mem::size_of::<u32>()) as u64;
+        let data = self.read_buffer(buffer, bytes);
+        cast_slice::<u8, u32>(&data).to_vec()
+    }
+}
+
+struct SolverRun<'a> {
+    case: SolverCase,
+    solver: Box<dyn FrameSolver + 'a>,
+}
+
+impl<'a> SolverRun<'a> {
+    fn build(eval: &EvalDevice, case: SolverCase) -> Self {
+        let solver = build_solver(
+            case.solver,
+            &eval.device,
+            &eval.queue,
+            &case.scenario.scene_spec(),
+        )
+        .unwrap_or_else(|err| panic!("{} failed to build: {err}", case.label()));
+        Self { case, solver }
+    }
+
+    fn label(&self) -> String {
+        self.case.label()
+    }
+
+    fn set_flow_speed_m_s(&mut self, speed: f32) {
+        self.solver.set_water_velocity_m_s(speed);
+    }
+
+    fn step(&mut self, eval: &EvalDevice, frames: u32) -> CommonMetrics {
+        let mut metrics = self.solver.snapshot().metrics;
+        for _ in 0..frames {
+            metrics = self.solver.step_frame(FrameContext {
+                device: &eval.device,
+                queue: &eval.queue,
+                dt: FRAME_DT,
+            });
+        }
+        metrics
+    }
+
+    fn metrics(&self) -> CommonMetrics {
+        self.solver.snapshot().metrics
+    }
+
+    fn particle_cloud(&self, eval: &EvalDevice) -> ParticleCloud {
+        let snapshot = self.solver.snapshot();
+        ParticleCloud::from_render_view(eval, &snapshot.render)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ParticlePhase {
+    Water,
+    Solid,
+}
 
 #[derive(Clone, Copy, Debug)]
 struct ParticleSample {
-    pos: Vec3,
-    vel: Vec3,
-    phase: u32,
+    position: Vec3,
+    velocity: Vec3,
+    phase: ParticlePhase,
 }
 
-#[derive(Clone, Debug)]
-struct EvalCase {
-    solver: SolverId,
-    scene: SceneSpec,
-}
-
-impl EvalCase {
-    fn label(&self) -> String {
-        format!("{}::{:?}", self.solver.id(), self.scene)
+impl ParticleSample {
+    fn is_finite(self) -> bool {
+        vec3_is_finite(self.position) && vec3_is_finite(self.velocity)
     }
 }
 
-fn request_adapter() -> Option<wgpu::Adapter> {
-    if std::env::var_os("COFFEE_SIM_SKIP_GPU_TESTS").is_some() {
-        return None;
+#[derive(Debug)]
+struct ParticleCloud {
+    bounds_size: Vec3,
+    render_radius: f32,
+    samples: Vec<ParticleSample>,
+}
+
+impl ParticleCloud {
+    fn from_render_view(eval: &EvalDevice, view: &RenderView<'_>) -> Self {
+        let samples = match view.particle_source() {
+            ParticleRenderSource::Packed { render_buffer } => {
+                Self::read_packed_render_particles(eval, render_buffer, view.particle_count())
+            }
+            ParticleRenderSource::Canonical {
+                positions,
+                velocities,
+                phases,
+            } => Self::read_canonical_particles(
+                eval,
+                positions,
+                velocities,
+                phases,
+                view.particle_count(),
+            ),
+        };
+
+        Self {
+            bounds_size: view.bounds_size(),
+            render_radius: view.render_radius(),
+            samples,
+        }
     }
 
-    let instance = wgpu::Instance::default();
-    pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).ok()
+    fn read_packed_render_particles(
+        eval: &EvalDevice,
+        render_buffer: &wgpu::Buffer,
+        count: usize,
+    ) -> Vec<ParticleSample> {
+        let bytes = (count * 8 * std::mem::size_of::<f32>()) as u64;
+        let data = eval.read_buffer(render_buffer, bytes);
+        cast_slice::<u8, f32>(&data)
+            .chunks_exact(8)
+            .filter_map(|p| {
+                let position = Vec3::new(p[0], p[1], p[2]);
+                let color_t = p[3];
+                let radius = p[4];
+                if position.y <= PARKED_PARTICLE_Y || radius <= 0.0 || color_t <= -900.0 {
+                    return None;
+                }
+                Some(ParticleSample {
+                    position,
+                    velocity: Vec3::ZERO,
+                    phase: if color_t >= 0.0 {
+                        ParticlePhase::Water
+                    } else {
+                        ParticlePhase::Solid
+                    },
+                })
+            })
+            .collect()
+    }
+
+    fn read_canonical_particles(
+        eval: &EvalDevice,
+        positions: &wgpu::Buffer,
+        velocities: &wgpu::Buffer,
+        phases: &wgpu::Buffer,
+        count: usize,
+    ) -> Vec<ParticleSample> {
+        let positions = eval.read_vec4_f32(positions, count);
+        let velocities = eval.read_vec4_f32(velocities, count);
+        let phases = eval.read_u32(phases, count);
+
+        positions
+            .iter()
+            .zip(&velocities)
+            .zip(&phases)
+            .filter_map(|((pos, vel), phase)| {
+                let position = Vec3::new(pos[0], pos[1], pos[2]);
+                if position.y <= PARKED_PARTICLE_Y {
+                    return None;
+                }
+                Some(ParticleSample {
+                    position,
+                    velocity: Vec3::new(vel[0], vel[1], vel[2]),
+                    phase: if *phase == 0 {
+                        ParticlePhase::Water
+                    } else {
+                        ParticlePhase::Solid
+                    },
+                })
+            })
+            .collect()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.samples.is_empty()
+    }
+
+    fn water_centroid_y(&self) -> Option<f32> {
+        let mut sum = 0.0;
+        let mut count = 0u32;
+        for sample in self
+            .samples
+            .iter()
+            .filter(|sample| sample.phase == ParticlePhase::Water)
+        {
+            sum += sample.position.y;
+            count += 1;
+        }
+        (count > 0).then_some(sum / count as f32)
+    }
 }
 
-fn create_eval_device() -> Option<(wgpu::Device, wgpu::Queue)> {
-    let adapter = request_adapter()?;
-    pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-        label: Some("coffee-sim solver-agnostic eval device"),
-        required_features: wgpu::Features::empty(),
-        required_limits: crate::solvers::mpm::required_limits(),
-        memory_hints: wgpu::MemoryHints::Performance,
-        trace: wgpu::Trace::default(),
-        experimental_features: wgpu::ExperimentalFeatures::disabled(),
-    }))
-    .ok()
+fn with_eval_device(run: impl FnOnce(&EvalDevice)) {
+    let Some(eval) = EvalDevice::new() else {
+        eprintln!("no GPU adapter available; skipping solver-agnostic physical realism eval");
+        return;
+    };
+    run(&eval);
 }
 
-fn eval_cases() -> Vec<EvalCase> {
+fn all_registered_cases(eval: &EvalDevice) -> impl Iterator<Item = SolverRun<'_>> {
+    SolverCase::all()
+        .into_iter()
+        .map(|case| SolverRun::build(eval, case))
+}
+
+fn all_registered_solver_runs(
+    eval: &EvalDevice,
+    scenario: EvalScenario,
+) -> impl Iterator<Item = SolverRun<'_>> {
     SolverId::all()
         .iter()
         .copied()
-        .flat_map(|solver| {
-            [
-                EvalCase {
-                    solver,
-                    scene: SceneSpec::CenterPour,
-                },
-                EvalCase {
-                    solver,
-                    scene: SceneSpec::FreeStream,
-                },
-            ]
-        })
-        .collect()
+        .map(move |solver| SolverRun::build(eval, SolverCase { solver, scenario }))
 }
 
-fn build_case(device: &wgpu::Device, queue: &wgpu::Queue, case: &EvalCase) -> Box<dyn FrameSolver> {
-    build_solver(case.solver, device, queue, &case.scene)
-        .unwrap_or_else(|err| panic!("{} failed to build: {err}", case.label()))
-}
-
-fn step_frames(
-    solver: &mut dyn FrameSolver,
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    frames: u32,
-) -> CommonMetrics {
-    let mut metrics = solver.snapshot().metrics;
-    for _ in 0..frames {
-        metrics = solver.step_frame(FrameContext {
-            device,
-            queue,
-            dt: DT,
-        });
-    }
-    metrics
-}
-
-fn read_buffer(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    source: &wgpu::Buffer,
-    bytes: u64,
-) -> Vec<u8> {
-    let bytes = bytes.max(4);
-    let staging = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("solver eval readback"),
-        size: bytes,
-        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-        mapped_at_creation: false,
-    });
-
-    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-        label: Some("solver eval readback"),
-    });
-    encoder.copy_buffer_to_buffer(source, 0, &staging, 0, bytes);
-    queue.submit(Some(encoder.finish()));
-
-    let slice = staging.slice(..);
-    let (tx, rx) = mpsc::channel();
-    slice.map_async(wgpu::MapMode::Read, move |result| {
-        tx.send(result).expect("eval readback callback");
-    });
-    let _ = device.poll(wgpu::PollType::wait_indefinitely());
-    rx.recv()
-        .expect("eval readback recv")
-        .expect("eval readback map");
-
-    let data = slice.get_mapped_range().to_vec();
-    staging.unmap();
-    data
-}
-
-fn sample_particles(
-    solver: &dyn FrameSolver,
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-) -> Vec<ParticleSample> {
-    let snapshot = solver.snapshot();
-    let count = snapshot.render.particle_count();
-    if count == 0 {
-        return Vec::new();
-    }
-
-    match snapshot.render.particle_source() {
-        ParticleRenderSource::Packed { render_buffer } => {
-            let bytes = (count * 8 * std::mem::size_of::<f32>()) as u64;
-            let data = read_buffer(device, queue, render_buffer, bytes);
-            let floats = cast_slice::<u8, f32>(&data);
-            floats
-                .chunks_exact(8)
-                .filter_map(|p| {
-                    let pos = Vec3::new(p[0], p[1], p[2]);
-                    let color_t = p[3];
-                    let radius = p[4];
-                    if pos.y <= ACTIVE_PARK_Y || radius <= 0.0 || color_t <= -900.0 {
-                        return None;
-                    }
-                    Some(ParticleSample {
-                        pos,
-                        vel: Vec3::ZERO,
-                        phase: if color_t >= 0.0 { 0 } else { 1 },
-                    })
-                })
-                .collect()
-        }
-        ParticleRenderSource::Canonical {
-            positions,
-            velocities,
-            phases,
-        } => {
-            let vec4_bytes = (count * 4 * std::mem::size_of::<f32>()) as u64;
-            let phase_bytes = (count * std::mem::size_of::<u32>()) as u64;
-            let pos_data = read_buffer(device, queue, positions, vec4_bytes);
-            let vel_data = read_buffer(device, queue, velocities, vec4_bytes);
-            let phase_data = read_buffer(device, queue, phases, phase_bytes);
-            let pos = cast_slice::<u8, f32>(&pos_data);
-            let vel = cast_slice::<u8, f32>(&vel_data);
-            let phase = cast_slice::<u8, u32>(&phase_data);
-
-            (0..count)
-                .filter_map(|i| {
-                    let p = Vec3::new(pos[i * 4], pos[i * 4 + 1], pos[i * 4 + 2]);
-                    if p.y <= ACTIVE_PARK_Y {
-                        return None;
-                    }
-                    Some(ParticleSample {
-                        pos: p,
-                        vel: Vec3::new(vel[i * 4], vel[i * 4 + 1], vel[i * 4 + 2]),
-                        phase: phase[i],
-                    })
-                })
-                .collect()
-        }
-    }
-}
-
-fn assert_metrics_are_plausible(label: &str, metrics: CommonMetrics) {
+fn assert_metrics_are_physically_plausible(label: &str, metrics: CommonMetrics) {
     assert!(
         metrics.particle_count > 0,
         "{label}: solver reported no particles: {metrics:?}",
@@ -233,31 +382,33 @@ fn assert_metrics_are_plausible(label: &str, metrics: CommonMetrics) {
     );
 }
 
-fn assert_samples_are_finite_and_bounded(
-    label: &str,
-    samples: &[ParticleSample],
-    bounds_size: Vec3,
-) {
+fn assert_cloud_is_finite_and_inside_scene(label: &str, cloud: &ParticleCloud) {
     assert!(
-        !samples.is_empty(),
+        cloud.render_radius.is_finite() && cloud.render_radius > 0.0,
+        "{label}: render radius was invalid: {}",
+        cloud.render_radius,
+    );
+    assert!(
+        !cloud.is_empty(),
         "{label}: no active particle samples were available",
     );
-    let half = bounds_size * 0.5;
+
+    let half = cloud.bounds_size * 0.5;
     let margin = Vec3::new(2.5, 3.5, 2.5);
-    for (i, sample) in samples.iter().enumerate() {
+    for (i, sample) in cloud.samples.iter().enumerate() {
         assert!(
-            vec3_is_finite(sample.pos) && vec3_is_finite(sample.vel),
+            sample.is_finite(),
             "{label}: sample {i} had non-finite state: {sample:?}",
         );
         assert!(
-            sample.pos.x >= -half.x - margin.x
-                && sample.pos.x <= half.x + margin.x
-                && sample.pos.y >= -half.y - margin.y
-                && sample.pos.y <= half.y + margin.y
-                && sample.pos.z >= -half.z - margin.z
-                && sample.pos.z <= half.z + margin.z,
+            sample.position.x >= -half.x - margin.x
+                && sample.position.x <= half.x + margin.x
+                && sample.position.y >= -half.y - margin.y
+                && sample.position.y <= half.y + margin.y
+                && sample.position.z >= -half.z - margin.z
+                && sample.position.z <= half.z + margin.z,
             "{label}: sample {i} escaped scene bounds {:?} with margin {:?}: {sample:?}",
-            bounds_size,
+            cloud.bounds_size,
             margin,
         );
     }
@@ -267,112 +418,75 @@ fn vec3_is_finite(v: Vec3) -> bool {
     v.x.is_finite() && v.y.is_finite() && v.z.is_finite()
 }
 
-fn water_centroid_y(samples: &[ParticleSample]) -> Option<f32> {
-    let mut sum = 0.0;
-    let mut count = 0u32;
-    for sample in samples.iter().filter(|sample| sample.phase == 0) {
-        sum += sample.pos.y;
-        count += 1;
-    }
-    (count > 0).then_some(sum / count as f32)
+#[test]
+fn eval_all_solvers_keep_physical_state_finite_bounded_and_within_capacity() {
+    with_eval_device(|eval| {
+        for mut run in all_registered_cases(eval) {
+            run.set_flow_speed_m_s(0.12);
+            let metrics = run.step(eval, 4);
+            let cloud = run.particle_cloud(eval);
+            let label = run.label();
+
+            assert_metrics_are_physically_plausible(&label, metrics);
+            assert_cloud_is_finite_and_inside_scene(&label, &cloud);
+        }
+    });
 }
 
 #[test]
-fn eval_physical_state_is_finite_bounded_and_within_capacity() {
-    let Some((device, queue)) = create_eval_device() else {
-        eprintln!("no GPU adapter available; skipping solver-agnostic physical state eval");
-        return;
-    };
+fn eval_center_pour_water_accounting_is_monotone_and_capacity_bounded() {
+    with_eval_device(|eval| {
+        for mut run in all_registered_solver_runs(eval, EvalScenario::CenterPour) {
+            run.set_flow_speed_m_s(0.16);
+            let before = run.metrics();
+            let after = run.step(eval, 8);
+            let label = run.label();
 
-    for case in eval_cases() {
-        let label = case.label();
-        let mut solver = build_case(&device, &queue, &case);
-        solver.set_water_velocity_m_s(0.12);
-        let metrics = step_frames(solver.as_mut(), &device, &queue, 4);
-        let snapshot = solver.snapshot();
-        assert_metrics_are_plausible(&label, metrics);
-        assert!(
-            snapshot.render.render_radius().is_finite() && snapshot.render.render_radius() > 0.0,
-            "{label}: invalid render radius {}",
-            snapshot.render.render_radius(),
-        );
-        let samples = sample_particles(solver.as_ref(), &device, &queue);
-        assert_samples_are_finite_and_bounded(&label, &samples, snapshot.render.bounds_size());
-    }
+            assert_metrics_are_physically_plausible(&label, after);
+            assert!(
+                after.total_emitted_mass + 1.0e-5 >= before.total_emitted_mass,
+                "{label}: total emitted mass regressed: before={before:?} after={after:?}",
+            );
+            assert!(
+                after.total_emitted_ml + 1.0e-4 >= before.total_emitted_ml,
+                "{label}: total emitted mL regressed: before={before:?} after={after:?}",
+            );
+            assert!(
+                after.flow_rate_ml_s >= 0.0 && after.exit_speed_m_s >= 0.0,
+                "{label}: negative flow/speed after pour: {after:?}",
+            );
+            assert!(
+                after.max_particles == 0 || after.particle_count <= after.max_particles as usize,
+                "{label}: center pour overflowed capacity: {after:?}",
+            );
+        }
+    });
 }
 
 #[test]
-fn eval_center_pour_emits_water_monotonically_without_overflowing_capacity() {
-    let Some((device, queue)) = create_eval_device() else {
-        eprintln!("no GPU adapter available; skipping solver-agnostic emission eval");
-        return;
-    };
+fn eval_free_stream_water_falls_after_inflow_stops() {
+    with_eval_device(|eval| {
+        for mut run in all_registered_solver_runs(eval, EvalScenario::FreeStream) {
+            run.set_flow_speed_m_s(0.18);
+            run.step(eval, 8);
+            run.set_flow_speed_m_s(0.0);
 
-    for &solver_id in SolverId::all() {
-        let case = EvalCase {
-            solver: solver_id,
-            scene: SceneSpec::CenterPour,
-        };
-        let label = case.label();
-        let mut solver = build_case(&device, &queue, &case);
-        solver.set_water_velocity_m_s(0.16);
+            let label = run.label();
+            let early = run.particle_cloud(eval);
+            let Some(early_y) = early.water_centroid_y() else {
+                panic!("{label}: no water samples after warmup");
+            };
 
-        let before = solver.snapshot().metrics;
-        let after = step_frames(solver.as_mut(), &device, &queue, 8);
+            run.step(eval, 10);
+            let late = run.particle_cloud(eval);
+            let Some(late_y) = late.water_centroid_y() else {
+                panic!("{label}: no water samples after falling interval");
+            };
 
-        assert_metrics_are_plausible(&label, after);
-        assert!(
-            after.total_emitted_mass + 1.0e-5 >= before.total_emitted_mass,
-            "{label}: total emitted mass regressed: before={before:?} after={after:?}",
-        );
-        assert!(
-            after.total_emitted_ml + 1.0e-4 >= before.total_emitted_ml,
-            "{label}: total emitted mL regressed: before={before:?} after={after:?}",
-        );
-        assert!(
-            after.flow_rate_ml_s >= 0.0 && after.exit_speed_m_s >= 0.0,
-            "{label}: negative flow/speed after pour: {after:?}",
-        );
-        assert!(
-            after.max_particles == 0 || after.particle_count <= after.max_particles as usize,
-            "{label}: center pour overflowed capacity: {after:?}",
-        );
-    }
-}
-
-#[test]
-fn eval_free_stream_falls_after_inflow_stops() {
-    let Some((device, queue)) = create_eval_device() else {
-        eprintln!("no GPU adapter available; skipping solver-agnostic gravity eval");
-        return;
-    };
-
-    for &solver_id in SolverId::all() {
-        let case = EvalCase {
-            solver: solver_id,
-            scene: SceneSpec::FreeStream,
-        };
-        let label = case.label();
-        let mut solver = build_case(&device, &queue, &case);
-
-        solver.set_water_velocity_m_s(0.18);
-        step_frames(solver.as_mut(), &device, &queue, 8);
-        solver.set_water_velocity_m_s(0.0);
-
-        let early = sample_particles(solver.as_ref(), &device, &queue);
-        let Some(early_y) = water_centroid_y(&early) else {
-            panic!("{label}: no water samples after warmup");
-        };
-
-        step_frames(solver.as_mut(), &device, &queue, 10);
-        let late = sample_particles(solver.as_ref(), &device, &queue);
-        let Some(late_y) = water_centroid_y(&late) else {
-            panic!("{label}: no water samples after falling interval");
-        };
-
-        assert!(
-            late_y < early_y - MIN_FALL_DELTA,
-            "{label}: free-stream water did not fall after inflow stopped: early_y={early_y:.4} late_y={late_y:.4}",
-        );
-    }
+            assert!(
+                late_y < early_y - MIN_FREE_STREAM_FALL,
+                "{label}: free-stream water did not fall after inflow stopped: early_y={early_y:.4} late_y={late_y:.4}",
+            );
+        }
+    });
 }

@@ -289,15 +289,10 @@ fn drag_fold(@builtin(global_invocation_id) gid: vec3<u32>) {
         let cb = build_constraint_basis(box_mask, faces);
         v = cbasis_project_vec(cb, v);
     }
-    // Speed-cap backstop (couples to the FP headroom math in common.wgsl). U3: this is the WATER
-    // grid (writes grid_vel) and runs BEFORE project/g2p, so it must use the separate splash cap
-    // (flip.w) — clipping the water grid at the global 12/max_speed here would defeat the crown.
-    // Sentinel ≤ 0 ⇒ global max_speed (byte-identical default). The solid grid clamp lives in
-    // solid_update (plasticity.wgsl) and stays on the global max_speed — grain dynamics unperturbed.
-    let water_cap = select(params.max_speed, params.flip.w, params.flip.w > 0.0);
+    // Speed-cap backstop (couples to the FP headroom math in common.wgsl).
     let s = length(v);
-    if (s > water_cap) {
-        v = v * (water_cap / s);
+    if (s > params.max_speed) {
+        v = v * (params.max_speed / s);
     }
     grid_vel[n] = vec4<f32>(v, mass);
     react[n] = vec4<f32>(imp, sig);

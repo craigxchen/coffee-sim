@@ -1,6 +1,8 @@
 pub(crate) mod base;
 pub(crate) mod mpm;
 pub(crate) mod pass_recorder;
+pub(crate) mod pbmpm;
+pub(crate) mod pbmpm_runtime;
 pub(crate) mod registry;
 pub(crate) mod twofield;
 pub(crate) mod twofield_runtime;

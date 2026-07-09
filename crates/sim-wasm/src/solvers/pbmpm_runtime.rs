@@ -1,12 +1,11 @@
 use crate::emission::{EmissionInput, PourEvent};
-use crate::engine::scene::Species;
 use crate::engine::Scene;
 use crate::models::Materials;
 use crate::solvers::base::{
     CommonMetrics, FrameContext, FrameSnapshot, FrameSolver, ResetContext, SceneSpec,
     Solver as RewriteSolver,
 };
-use crate::solvers::twofield::TwofieldSolver;
+use crate::solvers::pbmpm::PbmpmSolver;
 use crate::ui::{RenderMaterial, RenderView, STANDARD_WATER_RENDER_RADIUS};
 use crate::utils::buffers::ParticleBuffers;
 use crate::utils::config::Config;
@@ -18,8 +17,8 @@ const SIM_UNITS_PER_METER: f32 = 27.7;
 const DEFAULT_WATER_VELOCITY_M_S: f32 = 0.12;
 const DEFAULT_SPOUT_UI: [f32; 3] = [0.0, 2.5, 0.0];
 
-pub(crate) struct TwofieldFrameSolver {
-    core: TwofieldSolver,
+pub(crate) struct PbmpmFrameSolver {
+    core: PbmpmSolver,
     scene_spec: SceneSpec,
     scene: Scene,
     materials: Materials,
@@ -28,9 +27,11 @@ pub(crate) struct TwofieldFrameSolver {
     water_velocity_m_s: f32,
     spout_ui: [f32; 3],
     sim_time_s: f32,
+    total_emitted_mass: f32,
+    frame_emitted_mass: f32,
 }
 
-impl TwofieldFrameSolver {
+impl PbmpmFrameSolver {
     pub(crate) fn new(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
@@ -38,7 +39,7 @@ impl TwofieldFrameSolver {
     ) -> Result<Self, String> {
         let (scene, materials, config) = setup_for_scene_spec(scene_spec)?;
         let gpu = GpuContext::from_device_queue(device, queue);
-        let core = <TwofieldSolver as RewriteSolver>::build(&scene, &materials, &config, &gpu);
+        let core = <PbmpmSolver as RewriteSolver>::build(&scene, &materials, &config, &gpu);
         let particles = RewriteSolver::particles(&core);
         Ok(Self {
             core,
@@ -50,6 +51,8 @@ impl TwofieldFrameSolver {
             water_velocity_m_s: DEFAULT_WATER_VELOCITY_M_S,
             spout_ui: DEFAULT_SPOUT_UI,
             sim_time_s: 0.0,
+            total_emitted_mass: 0.0,
+            frame_emitted_mass: 0.0,
         })
     }
 
@@ -58,7 +61,7 @@ impl TwofieldFrameSolver {
     }
 
     fn emission_input(&self) -> EmissionInput {
-        if !twofield_scene_accepts_pour(&self.scene_spec) {
+        if !pbmpm_scene_accepts_pour(&self.scene_spec) {
             return EmissionInput::default();
         }
         EmissionInput {
@@ -75,14 +78,8 @@ impl TwofieldFrameSolver {
 
     fn common_metrics(&self) -> CommonMetrics {
         let rewrite_metrics = RewriteSolver::metrics(&self.core);
-        let diagnostics = self.core.diagnostics();
-        let (water_count, solid_count) = self.core.phase_counts();
-        let has_bed = self
-            .scene
-            .regions
-            .iter()
-            .any(|region| region.species == Species::Grain);
-        let flow_rate = if twofield_scene_accepts_pour(&self.scene_spec) {
+        let profile = RewriteSolver::profile(&self.core);
+        let flow_rate = if pbmpm_scene_accepts_pour(&self.scene_spec) {
             flow_rate_for_velocity(
                 self.water_velocity_m_s,
                 self.config.nozzle_radius,
@@ -91,27 +88,22 @@ impl TwofieldFrameSolver {
         } else {
             0.0
         };
-        let emitted_mass = self.core.total_emitted_water_mass();
         CommonMetrics {
             particle_count: rewrite_metrics.particle_count as usize,
-            water_slots_used: water_count,
-            bed_particle_count: solid_count,
-            max_particles: self.core.water_pool_capacity() + solid_count,
+            water_slots_used: self.core.active_count(),
+            bed_particle_count: 0,
+            max_particles: self.core.capacity(),
             sim_time_s: self.sim_time_s,
-            total_emitted_mass: emitted_mass,
-            total_emitted_ml: emitted_mass * ML_PER_SIM_UNIT3,
+            frame_emitted_mass: self.frame_emitted_mass,
+            frame_emitted_ml: self.frame_emitted_mass * ML_PER_SIM_UNIT3,
+            total_emitted_mass: self.total_emitted_mass,
+            total_emitted_ml: self.total_emitted_mass * ML_PER_SIM_UNIT3,
             flow_rate_ml_s: flow_rate * ML_PER_SIM_UNIT3,
             exit_speed: self.water_velocity_m_s * SIM_UNITS_PER_METER,
             exit_speed_m_s: self.water_velocity_m_s,
             spout_position: Vec3::new(self.spout_ui[0], self.spout_ui[1], self.spout_ui[2]),
-            has_bed,
-            last_pressure_pairs: rewrite_metrics.iteration_count,
-            fluid_cell_count: diagnostics.free_water_above_bed,
-            mean_tds: rewrite_metrics.tds,
-            cup_tds: rewrite_metrics.tds,
-            extraction_yield: rewrite_metrics.extraction_yield,
-            estimated_cup_tds: rewrite_metrics.tds,
-            estimated_extraction_yield: rewrite_metrics.extraction_yield,
+            has_bed: false,
+            last_pressure_pairs: profile.dispatches_per_frame,
             ..CommonMetrics::default()
         }
     }
@@ -126,22 +118,17 @@ impl TwofieldFrameSolver {
             .particles
             .position
             .as_deref()
-            .expect("rewrite two-field exposes positions");
+            .expect("PB-MPM exposes positions");
         let velocities = self
             .particles
             .velocity
             .as_deref()
-            .expect("rewrite two-field exposes velocities");
+            .expect("PB-MPM exposes velocities");
         let phases = self
             .particles
             .phase_tag
             .as_deref()
-            .expect("rewrite two-field exposes phase tags");
-        let v_cap = self.materials.r_max
-            * self.materials.rho_ratio
-            * std::f32::consts::FRAC_PI_6
-            * self.materials.grain_diameter.powi(3);
-        let moisture_inv_cap = if v_cap > 0.0 { 1.0 / v_cap } else { 0.0 };
+            .expect("PB-MPM exposes phase tags");
         RenderView::new_canonical(
             bounds,
             STANDARD_WATER_RENDER_RADIUS,
@@ -149,15 +136,17 @@ impl TwofieldFrameSolver {
             positions,
             velocities,
             phases,
-            RenderMaterial::standard_coffee_particles(moisture_inv_cap),
+            RenderMaterial::default(),
         )
     }
 }
 
-impl FrameSolver for TwofieldFrameSolver {
+impl FrameSolver for PbmpmFrameSolver {
     fn reset(&mut self, _ctx: ResetContext<'_>) -> CommonMetrics {
         RewriteSolver::reset(&mut self.core, &self.scene);
         self.sim_time_s = 0.0;
+        self.total_emitted_mass = 0.0;
+        self.frame_emitted_mass = 0.0;
         self.refresh_particles();
         self.common_metrics()
     }
@@ -172,8 +161,13 @@ impl FrameSolver for TwofieldFrameSolver {
     }
 
     fn step_frame(&mut self, ctx: FrameContext<'_>) -> CommonMetrics {
+        let before = self.core.active_count();
         let input = self.emission_input();
         RewriteSolver::step(&mut self.core, ctx.dt, &input);
+        let after = self.core.active_count();
+        self.frame_emitted_mass =
+            after.saturating_sub(before) as f32 * self.materials.particle_mass;
+        self.total_emitted_mass += self.frame_emitted_mass;
         self.sim_time_s += ctx.dt;
         self.refresh_particles();
         self.common_metrics()
@@ -199,26 +193,15 @@ fn setup_for_scene_spec(scene_spec: &SceneSpec) -> Result<(Scene, Materials, Con
     match scene_spec {
         SceneSpec::CenterPour => {
             let r = 0.16_f32;
-            let scene = Scene::v60_pour();
+            let scene = Scene::v60_pour_water_only();
             let materials = Materials {
                 particle_spacing: r,
                 support_radius: 2.0 * r,
-                grain_diameter: 2.0 * r,
-                grain_mass: 10.0,
                 ..Materials::default()
             };
             let config = Config {
-                absorb_rate: 0.5,
-                extract_rate: 1.0,
                 nozzle_radius: 0.55,
-                max_speed: 12.0,
-                substeps: 2,
-                drag_beta_max: 0.92,
-                drag_subiters: 6,
-                solid_dynamics: true,
-                tf_absorb_rate: 0.15,
-                tf_wet_cohesion: 4.0,
-                tf_filter_floor: true,
+                max_speed: 25.0,
                 ..Config::default()
             };
             Ok((scene, materials, config))
@@ -233,17 +216,16 @@ fn setup_for_scene_spec(scene_spec: &SceneSpec) -> Result<(Scene, Materials, Con
             };
             let config = Config {
                 nozzle_radius: 0.55,
-                max_speed: 12.0,
-                xsph_viscosity_c: 0.02,
+                max_speed: 25.0,
                 ..Config::default()
             };
             Ok((scene, materials, config))
         }
-        SceneSpec::Debug { id } => Err(format!("Two-field does not support MPM debug scene: {id}")),
+        SceneSpec::Debug { id } => Err(format!("PB-MPM does not support MPM debug scene: {id}")),
     }
 }
 
-fn twofield_scene_accepts_pour(scene_spec: &SceneSpec) -> bool {
+fn pbmpm_scene_accepts_pour(scene_spec: &SceneSpec) -> bool {
     matches!(scene_spec, SceneSpec::CenterPour | SceneSpec::FreeStream)
 }
 
@@ -256,15 +238,12 @@ fn flow_rate_for_velocity(speed_m_s: f32, nozzle_radius: f32, discharge_coeff: f
 mod tests {
     #[test]
     fn shader_parses_with_naga() {
-        let shader_src = format!(
-            "{}\n{}\n{}\n{}\n{}\n{}",
-            include_str!("twofield/common.wgsl"),
-            include_str!("twofield/transfers.wgsl"),
-            include_str!("twofield/pressure.wgsl"),
-            include_str!("twofield/surface.wgsl"),
-            include_str!("twofield/coupling.wgsl"),
-            include_str!("twofield/plasticity.wgsl"),
+        let source = format!(
+            "{}\n{}\n{}",
+            include_str!("pbmpm/common.wgsl"),
+            include_str!("pbmpm/transfers.wgsl"),
+            include_str!("pbmpm/constraint.wgsl"),
         );
-        naga::front::wgsl::parse_str(&shader_src).expect("two-field WGSL should parse");
+        naga::front::wgsl::parse_str(&source).expect("PB-MPM shader parses");
     }
 }
