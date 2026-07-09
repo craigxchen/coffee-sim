@@ -83,6 +83,9 @@ pub struct SeamSolver {
     // PERSISTENT grain buffer, never its per-substep scratch).
     seam_clear: (wgpu::ComputePipeline, wgpu::BindGroup),
     seam_scatter: (wgpu::ComputePipeline, wgpu::BindGroup),
+    /// pbmpm's reaction ledger (U3): accumulated by the bed BC across the water step,
+    /// consumed by the bed inner's `seam_inject` each substep, zeroed here after the frame.
+    reaction: Arc<wgpu::Buffer>,
     num_nodes: u32,
     seam_dispatches: u32,
 
@@ -121,6 +124,9 @@ impl SeamSolver {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("seam-render-merge"),
             });
+        // U3: the bed inner consumed the reaction ledger this frame (merge runs after
+        // bed.step()); zero it so next frame's BC accumulates fresh.
+        enc.clear_buffer(&self.reaction, 0, None);
         let wp = self.water.particles();
         let bp = self.bed.particles();
         let lanes: [(&Option<Arc<wgpu::Buffer>>, &Option<Arc<wgpu::Buffer>>, &Arc<wgpu::Buffer>, u64); 4] = [
@@ -239,7 +245,7 @@ impl Solver for SeamSolver {
         water_cfg.pbmpm_seam_bed = true;
 
         let water = PbmpmSolver::build(&water_scene, mats, &water_cfg, gpu);
-        let bed = TwofieldSolver::build(&bed_scene, mats, &bed_cfg, gpu);
+        let mut bed = TwofieldSolver::build(&bed_scene, mats, &bed_cfg, gpu);
 
         // KTD1: co-registration holds by construction (one shared scene-bounds + Materials
         // pair, verbatim-mirrored grid derivations) — a future caller diverging the inputs
@@ -303,7 +309,10 @@ impl Solver for SeamSolver {
                 entries: &e,
             })
         };
-        let (bed_occupancy, _reaction) = water.seam_buffers();
+        let (bed_occupancy, reaction) = water.seam_buffers();
+        // U3: the bed inner consumes the water inner's reaction ledger inside its dry-branch
+        // substep loop (one full ledger per frame); the seam zeroes it after each frame.
+        bed.attach_seam_reaction(&reaction);
         let bed_pos = bed
             .particles()
             .position
@@ -337,6 +346,7 @@ impl Solver for SeamSolver {
             exposed_count: 0,
             seam_clear: (seam_clear_pipe, seam_clear_bind),
             seam_scatter: (seam_scatter_pipe, seam_scatter_bind),
+            reaction,
             num_nodes,
             seam_dispatches: 0,
             device,

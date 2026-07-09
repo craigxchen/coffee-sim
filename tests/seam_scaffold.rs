@@ -184,8 +184,66 @@ fn pour_keeps_bed_water_at_zero_and_dispatches_split() {
     );
     assert_eq!(
         bed,
-        4 * seam.bed_solver().substeps_for_dt(DT),
-        "twofield inner stays on the 4-pass dry-dynamic path"
+        5 * seam.bed_solver().substeps_for_dt(DT),
+        "twofield inner runs the 5-pass armed dry-dynamic path (4 + seam_inject)"
+    );
+}
+
+/// U3 hook-placement gate (review r1.3): a known impulse written into the reaction ledger
+/// moves the bed — proving `seam_inject` dispatches INSIDE the dry-dynamic substep loop
+/// after that branch's grid_clear (anywhere else it would be erased and the bed would stay
+/// static). The zero-ledger arm doubles as the hook's byte-inertness check.
+#[test]
+fn seam_inject_placement_moves_the_bed() {
+    let Some(gpu) = GpuContext::new_headless() else {
+        eprintln!("seam_scaffold: no GPU adapter; skipping.");
+        return;
+    };
+    let scene = Scene::debug_seam_static_column();
+    let mats = Materials::default();
+    let mut seam = SeamSolver::build(&scene, &mats, &Config::default(), &gpu);
+    seam.prewet_bed(1.0);
+
+    // Settle briefly, then measure the bed's response to a large upward ledger impulse.
+    for _ in 0..5 {
+        seam.step(DT, &EmissionInput::default());
+    }
+    let mean_vy = |seam: &SeamSolver| {
+        let vel = seam.bed_solver().read_velocities();
+        let phases = seam.bed_solver().read_phases();
+        let (mut sum, mut n) = (0.0f64, 0u32);
+        for (v, &ph) in vel.iter().zip(&phases) {
+            if ph == 1 {
+                sum += v[1] as f64;
+                n += 1;
+            }
+        }
+        (sum / n.max(1) as f64) as f32
+    };
+    let before = mean_vy(&seam);
+
+    // +y impulse on every node (the mass guard drops massless ones): per-node value 200 at
+    // SEAM_IMPULSE_SCALE. The seam zeroes the ledger after the frame, so this acts ONCE.
+    let (_occ, reaction) = seam.water_solver().seam_buffers();
+    let nodes = (reaction.size() / 16) as usize;
+    let mut data = vec![0i32; nodes * 4];
+    for n in 0..nodes {
+        data[n * 4 + 1] = (200.0 * coffee_sim::solvers::pbmpm::SEAM_IMPULSE_SCALE) as i32;
+    }
+    gpu.queue.write_buffer(&reaction, 0, bytemuck::cast_slice(&data));
+    seam.step(DT, &EmissionInput::default());
+    let kicked = mean_vy(&seam);
+    assert!(
+        kicked > before + 0.05,
+        "an upward ledger impulse must move the bed (before {before}, after {kicked})"
+    );
+
+    // Ledger was zeroed by the seam after consumption: the next frame injects nothing new.
+    seam.step(DT, &EmissionInput::default());
+    let after = mean_vy(&seam);
+    assert!(
+        after < kicked,
+        "the zeroed ledger must not keep accelerating the bed (kicked {kicked}, next {after})"
     );
 }
 

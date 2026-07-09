@@ -511,9 +511,15 @@ pub struct TwofieldSolver {
     // (per-node vec4: impulse.xyz, ς) — coupling.wgsl bindings 19/20.
     grid_sfp: wgpu::Buffer,
     react: wgpu::Buffer,
+    // Seam-blend reaction hook (docs/plans/2026-07-09-002 U3): grid_sm is retained so
+    // `attach_seam_reaction` can rebind `seam_inject` to a real ledger; seam_uni carries the
+    // per-frame (FP_SCALE / SEAM_IMPULSE_SCALE) / substeps conversion. Unarmed by default.
+    grid_sm: wgpu::Buffer,
+    seam_uni_buf: wgpu::Buffer,
+    seam_armed: bool,
     // U5 dynamic-solid per-particle state (plasticity.wgsl bindings 23/24): deformation
-    // gradient (3 vec4 rows) and (τ, p_c, compaction). The grid_sm/grid_svel node fields
-    // (bindings 21/22) live only inside the bind groups, like the coarse pressure mirrors.
+    // gradient (3 vec4 rows) and (τ, p_c, compaction). The grid_svel node field
+    // (binding 22) lives only inside the bind groups, like the coarse pressure mirrors.
     fmat: wgpu::Buffer,
     sstate: wgpu::Buffer,
     /// `Config::solid_dynamics`: dispatch the U5 dynamic-solid passes instead of the frozen
@@ -612,6 +618,9 @@ struct Pipelines {
     p2g_solid_dyn: (wgpu::ComputePipeline, wgpu::BindGroup),
     solid_update: (wgpu::ComputePipeline, wgpu::BindGroup),
     g2p_solid: (wgpu::ComputePipeline, wgpu::BindGroup),
+    // Seam-blend reaction hook (U3): built with a dummy ledger, rebound + armed by
+    // `attach_seam_reaction`; dispatched only in the dry-dynamic branch when armed.
+    seam_inject: (wgpu::ComputePipeline, wgpu::BindGroup),
     grid_update: (wgpu::ComputePipeline, wgpu::BindGroup),
     g2p_water: (wgpu::ComputePipeline, wgpu::BindGroup),
     // U3 pressure family. The Jacobi sweeps ping-pong the pressure pair by swapping which
@@ -1228,6 +1237,39 @@ impl TwofieldSolver {
             .write_buffer(&self.grid_vel, 0, bytemuck::cast_slice(v));
     }
 
+    /// Attach the seam-blend water solver's per-node reaction ledger (docs/plans/
+    /// 2026-07-09-002 U3): rebind `seam_inject` to the real buffer and arm its dry-branch
+    /// dispatch. The ledger's impulses (pbmpm SEAM_IMPULSE_SCALE fixed point) are added into
+    /// grid_sm each substep at (FP_SCALE / SEAM_IMPULSE_SCALE) / substeps, so exactly one
+    /// full ledger lands per frame. The caller (the seam) zeroes the ledger after the frame.
+    pub fn attach_seam_reaction(&mut self, ledger: &wgpu::Buffer) {
+        let layout = self.pipelines.seam_inject.0.get_bind_group_layout(0);
+        self.pipelines.seam_inject.1 =
+            self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("seam_inject"),
+                layout: &layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.params_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 21,
+                        resource: self.grid_sm.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 28,
+                        resource: ledger.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 29,
+                        resource: self.seam_uni_buf.as_entire_binding(),
+                    },
+                ],
+            });
+        self.seam_armed = true;
+    }
+
     /// Overwrite the fine pressure field (slot pf_a, which `dbg_grad` reads; dev/test only).
     pub fn write_pressure_for_test(&self, p: &[f32]) {
         assert_eq!(p.len(), self.num_cells as usize, "one f32 per fine cell");
@@ -1679,6 +1721,16 @@ impl Solver for TwofieldSolver {
             grid_bytes,
             wgpu::BufferUsages::empty(),
         );
+        // Seam-blend hook buffers (U3): a 16-byte dummy ledger (rebound to the real one by
+        // attach_seam_reaction) and the per-frame scale uniform.
+        let seam_dummy = Self::storage(&device, "tf-seam-dummy", 16, wgpu::BufferUsages::empty());
+        let seam_uni_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("tf-seam-uni"),
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         let grid_svel = Self::storage(
             &device,
             "twofield-grid-svel",
@@ -1917,6 +1969,19 @@ impl Solver for TwofieldSolver {
                     (22, &grid_svel),
                     (23, &fmat),
                     (24, &sstate),
+                ],
+            );
+            // Seam-blend reaction hook (U3): pipeline built up front with the DUMMY ledger +
+            // idle uniform created alongside grid_sm; `attach_seam_reaction` rebinds the real
+            // buffer and arms the dry-branch dispatch. Unarmed twofield never dispatches it.
+            let seam_inject = make("seam_inject");
+            let seam_inject_bind = bg(
+                &seam_inject,
+                &[
+                    (0, &params_buf),
+                    (21, &grid_sm),
+                    (28, &seam_dummy),
+                    (29, &seam_uni_buf),
                 ],
             );
             let drag_fold = make("drag_fold");
@@ -2217,6 +2282,7 @@ impl Solver for TwofieldSolver {
                 g2p_absorb: (g2p_absorb, g2p_absorb_bind),
                 p2g_solid_dyn: (p2g_solid_dyn, p2g_solid_dyn_bind),
                 solid_update: (solid_update, solid_update_bind),
+                seam_inject: (seam_inject, seam_inject_bind),
                 g2p_solid: (g2p_solid, g2p_solid_bind),
                 grid_update: (grid_update, grid_update_bind),
                 g2p_water: (g2p, g2p_bind),
@@ -2307,6 +2373,9 @@ impl Solver for TwofieldSolver {
             grid_vel,
             grid_sfp,
             react: react_buf,
+            grid_sm,
+            seam_uni_buf,
+            seam_armed: false,
             fmat,
             sstate,
             solid_dynamic: cfg.solid_dynamics,
@@ -2444,7 +2513,7 @@ impl Solver for TwofieldSolver {
         // Dry dynamic mode (U5_DRY_DISPATCHES): no live water → only the solid passes run.
         let dry_dynamic = self.solid_dynamic && self.water_count == 0;
         if dry_dynamic {
-            let seq: [(&str, &wgpu::ComputePipeline, &wgpu::BindGroup, u32); 4] = [
+            let mut seq: Vec<(&str, &wgpu::ComputePipeline, &wgpu::BindGroup, u32)> = vec![
                 (
                     "grid_clear",
                     &self.pipelines.grid_clear.0,
@@ -2470,6 +2539,29 @@ impl Solver for TwofieldSolver {
                     solid_groups,
                 ),
             ];
+            // Seam hook (U3): dispatched AFTER grid_clear (which zeroes grid_sm every
+            // substep) + p2g_solid_dyn and BEFORE solid_update — the placement is pinned by
+            // review r1.3 and the dispatch-formula gate (4 → 5 dry passes/substep armed).
+            // The per-frame uniform carries (FP_SCALE / SEAM_IMPULSE_SCALE) / substeps so one
+            // full ledger lands per frame.
+            if self.seam_armed {
+                let scale = ((FP_SCALE / crate::solvers::pbmpm::SEAM_IMPULSE_SCALE as f64)
+                    / substeps as f64) as f32;
+                self.queue.write_buffer(
+                    &self.seam_uni_buf,
+                    0,
+                    bytemuck::cast_slice(&[scale, 0.0, 0.0, 0.0]),
+                );
+                seq.insert(
+                    2,
+                    (
+                        "seam_inject",
+                        &self.pipelines.seam_inject.0,
+                        &self.pipelines.seam_inject.1,
+                        node_groups,
+                    ),
+                );
+            }
             for ss in 0..substeps {
                 // Timestamp substep 0 only (fixed query-set capacity; the perf test reads ONE
                 // substep's sum). Remaining substeps batch into one pass.
