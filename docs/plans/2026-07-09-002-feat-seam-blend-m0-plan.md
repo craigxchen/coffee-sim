@@ -118,9 +118,12 @@ one seam. Recon (4-reader fan-out, 2026-07-09) established the load-bearing fact
   fields on the shared grid: `bed_occupancy` (φ_s + saturation, scattered per frame by a
   seam pass over twofield's *persistent* grain pos buffer) and `seam_reaction` (fixed-point
   atomic momentum, accumulated by the pbmpm-side BC, consumed by the twofield-side hook,
-  zeroed after consumption). Frame order: seam_scatter_bed → pbmpm.step (BC reads
-  bed_occupancy, accumulates seam_reaction) → twofield.step (hook injects
-  seam_reaction/substeps into grid_sm each substep) → seam_zero_reaction.
+  zeroed after consumption). **Both fields have an explicit clear rule counted in the seam
+  pass budget** (review r2.2): `seam_clear_bed` zeroes bed_occupancy immediately before
+  each scatter (an accumulated-occupancy leak is silent otherwise), and seam_zero_reaction
+  zeroes the reaction after consumption. Frame order: seam_clear_bed → seam_scatter_bed →
+  pbmpm.step (BC reads bed_occupancy, accumulates seam_reaction) → twofield.step (hook
+  injects seam_reaction/substeps into grid_sm each substep) → seam_zero_reaction.
 - **KTD3 — The bed BC lives inside pbmpm's grid_update, params-gated.** The no-entry
   condition must hold *inside* the ×16 constraint loop (a pre-loop kick would let water
   seep during the solve; the SDF wall BC at `transfers.wgsl:123-138` is the exact
@@ -185,11 +188,18 @@ frames of pouring scene; dispatch count = 85 + 4·substeps + copies (pinned form
 **measured coexistence overhead ≤ 2.0 ms** (R5, the first viability number).
 
 ### U2 — Bed field + porous BC: the column stands
-`seam_scatter_bed` pass (grain pos → bed_occupancy φ_s + saturation); pbmpm grid_update
-bed-BC extension per KTD3 (params-gated, off ⇒ byte-identical — pinned by re-running a
-pbmpm-solo scene through the seam water-only path); Seam appears in the web dropdown
-(free via `SolverId::all()`); the M0 scene (`Scene`: saturated grain bed region + water
-column region above it, no pour) added to the Debug Scenes.
+`seam_clear_bed` + `seam_scatter_bed` passes (grain pos → bed_occupancy φ_s + saturation,
+cleared every frame per KTD2); pbmpm grid_update bed-BC extension per KTD3 (params-gated,
+off ⇒ byte-identical — pinned by re-running a pbmpm-solo scene through the seam water-only
+path); Seam appears in the web dropdown (free via `SolverId::all()`); the M0 scene
+(`Scene`: grain bed region + water column region above it, no pour) added to the Debug
+Scenes. **Bed-saturation initialization** (review r2.1): grains seed dry (pos.w = 0) and
+`SeedRegion` carries no moisture, so the saturated/half-saturated M0 arms need an explicit
+path — `TwofieldSolver::prewet_grains(sat_frac)` writes grain V_abs = sat_frac·V_cap
+(wet_sat_cutoff-aware so sat_frac = 1.0 really zeroes demand), exposed through
+`SeamSolver::prewet_bed(sat_frac)`; the written volume enters the combined accounting's
+t0 snapshot (pre-wet volume is initial in-domain inventory, not emitted volume) and the
+call is part of the pre-registered scene setup for every R1–R3 arm.
 **Oracle first:** column visibly stands in the browser. **Then gates:** R1 quantified
 (no fall-through, interface density band, tail KE); tint_check green (R6).
 
