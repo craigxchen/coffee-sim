@@ -68,13 +68,20 @@ one seam. Recon (4-reader fan-out, 2026-07-09) established the load-bearing fact
 - **R1 — The column stands.** A standing water column over a fully saturated bed reaches a
   static equilibrium in the live webapp: no fall-through, no ring/cram at the interface, no
   seam popcorn. Primary oracle: visual, on the Seam entry in the web dropdown. Quantified:
-  min live-water y ≥ bed_top − h; interface-band interior grid density within ±3%
-  (pbmpm's `read_fine_interior_density` evaluated over the band above bed_top); settled
-  tail KE bounded (no spontaneous stirring).
-- **R2 — Third-law seam.** The momentum the seam BC removes from water equals the momentum
-  injected into the bed, exactly (fixed-point tolerance), every frame:
-  |Δp_water_seam + Δp_bed_injected| ≤ tol. The bed under a uniform column stays static
-  (no creep, no detonation — the twofield static-bed gates re-run under load).
+  min live-water y ≥ bed_top − h; a **seam-band density probe** — nodes restricted to
+  y ∈ [bed_top, bed_top + 4h] with a minimum-occupancy filter, reporting mean AND p99 —
+  holds band mean within ±3% and p99 within a pre-registered bound (the existing
+  `read_fine_interior_density` global mean is gameable: it can pass while a seam ring/cram
+  exists — review r1.5); settled tail KE bounded (no spontaneous stirring).
+- **R2 — Third-law seam, gated on MEASURED momentum deltas.** Δp_water is the actual
+  post-`particle_integrate` water momentum change attributable to the seam (seam-on minus
+  seam-off over the same frame from identical state, or a velocity-readback reduction);
+  Δp_bed is the actual post-`g2p_solid` bed momentum change; |Δp_water + Δp_bed| ≤
+  pre-registered tolerance. The `seam_reaction` ledger is mechanism telemetry, NOT the
+  gate's ground truth — the per-iteration loop ledger can double-count node-level removals
+  under the FLIP blend (0.95) and still self-balance against the injection ledger
+  (review r1.1). The bed under a uniform column stays static (no creep, no detonation —
+  the twofield static-bed gates re-run under load).
 - **R3 — Exact combined conservation.** One single-snapshot accounting API spans both
   solvers: emitted (pbmpm source) == pbmpm free water Σ f_w·V_w + twofield pore/grain books
   (Σ V_abs), with an in-flight handoff counted exactly once. Gates: saturated bed 2000-step
@@ -124,21 +131,31 @@ one seam. Recon (4-reader fan-out, 2026-07-09) established the load-bearing fact
   wet_sat_cutoff contract); below cutoff, a smooth β ramp placeholder exists but M0
   calibrates only the saturated limit. The true Darcy β(φ_s, s) is M1 scope.
 - **KTD4 — Reaction is measured, not derived.** Per-iteration BC removals are accumulated
-  as impulses (Δv × node mass, fixed-point). Whether the ×16-iteration sum equals the
-  frame's true water momentum change is *not assumed* — it is R2's gate, measured with the
-  FLIP blend active. The twofield hook injects into `grid_sm` (not grid_svel) between
-  p2g_solid_dyn and solid_update, divided by the substep count — inheriting the
-  mass-weighted decode, over-packing guard, and Coulomb wall BC for free.
-- **KTD5 — Whole-particle infiltration, host-mediated removal, GPU crediting.**
+  as impulses (Δv × node mass, fixed-point) — but this ledger is telemetry only; R2 gates
+  on directly measured water/bed momentum deltas (review r1.1). The twofield hook injects
+  into `grid_sm` (not grid_svel), divided by the substep count — inheriting the
+  mass-weighted decode, over-packing guard, and Coulomb wall BC for free. **Placement is
+  pinned to the DRY-dynamic branch** (`twofield/mod.rs:2422-2475`), after that branch's
+  grid_clear (which zeroes grid_sm every substep — a hook before it is erased) and before
+  solid_update; landing the hook only in the full water path would never inject in M0
+  (review r1.3). Pinned by the dispatch formula: 4 → 5 dry passes/substep when armed.
+- **KTD5 — Whole-particle infiltration as a one-transaction handoff state machine.**
   Demand comes from the twofield formula ((V_cap − V_abs)·(1 − e^{−k·dt}), floored to 0 at
   wet_sat_cutoff) evaluated by a seam pass; candidate pbmpm particles in bed contact are
   marked against an atomic demand budget in whole-particle quanta (ΔV = spacing³ exactly —
-  f_w ≡ 1.0 in pbmpm); the marked list reads back async (1-frame latency is physically
-  fine); the host removes via swap-with-last-live + water_count decrement; crediting to
-  grain V_abs happens GPU-side from the same marked buffer (single source of truth ⇒
-  loser and gainer read one T — the exact-ledger construction twofield's own absorb uses).
-  pbmpm's emit() gains the one-line emitted_mass accounting (the twofield
-  `mod.rs:1176` pattern) so the pour.rs balErr convention spans the composition.
+  f_w ≡ 1.0 in pbmpm). **The mark list produced in frame N is applied exactly once, at the
+  start of frame N+1, as a single transaction** (review r1.2): host removal AND the GPU
+  grain-credit pass are encoded/applied before frame N+1's `water.step()` submits its first
+  p2g — so a credited particle can never scatter mass again, and no frame ever has the
+  same volume live on both sides. Marked-but-unapplied particles are counted on the WATER
+  side; the combined accounting snapshot is only taken at frame boundaries, after the
+  transaction. Host removal swap-with-last covers **the full live per-particle state set**:
+  pos, vel, phase, chem, deform_disp (3 rows), deform_grad (3 rows), and vel_prev — a
+  partial swap silently corrupts the survivor (review r1.2). Crediting reads the same
+  marked buffer (single source of truth ⇒ loser and gainer read one T — the exact-ledger
+  construction twofield's own absorb uses). pbmpm's emit() gains the one-line emitted_mass
+  accounting (the twofield `mod.rs:1176` pattern) so the pour.rs balErr convention spans
+  the composition.
 - **KTD6 — Render/metrics/profile merge.** Seam-owned canonical ParticleBuffers filled by
   per-frame `copy_buffer_to_buffer` of each inner's *live ranges only* (pbmpm
   [0, water_count); twofield solids [water_capacity, +solid_count)) — dormant parked slots
@@ -179,20 +196,42 @@ column region above it, no pour) added to the Debug Scenes.
 ### U3 — Reaction: the bed feels the column
 seam_reaction accumulation in the BC; twofield dry-path injection hook (one optional pass,
 buffer-handle gated, /substeps); seam_zero_reaction.
-**Gates:** R2 third-law pairing (pre-registered tolerance form before first measurement);
-bed static under uniform column (twofield static gates re-run under load); hook with zero
-buffer ⇒ twofield byte-identical; reaction fixed-point headroom probe (16 iters × node
-mass × vel_cap vs i32 range — the new overflow surface named by the pbmpm plan's R7(a)).
+**Gates:** R2 measured momentum-delta pairing (seam-on vs seam-off arms, pre-registered
+tolerance form before first measurement; the ledger is telemetry); **hook-placement gate**:
+dry dispatch formula 4 → 5 passes/substep when armed, and a known injected test impulse
+moves the bed COM velocity by the predicted amount (proves the hook sits after grid_clear
+inside the dry branch); bed static under uniform column (twofield static gates re-run under
+load); hook with zero buffer ⇒ twofield byte-identical; reaction fixed-point headroom probe
+(16 iters × node mass × vel_cap vs i32 range — the new overflow surface named by the pbmpm
+plan's R7(a)).
 
 ### U4 — Infiltration handoff + the combined ledger
 KTD5 end-to-end: demand pass, marking, async readback, host removal, GPU crediting,
 pbmpm emitted_mass, single-snapshot combined accounting accessor on SeamSolver.
-**Gates:** R3 both regimes (saturated 2000-step zero-transfer tail; unsaturated non-vacuous
-exact transfer with ≤ 1-quantum residual); balErr printout works in a seam `examples/`
-driver; multiset discipline in every new test.
+**Gates:** R3 in **three** regimes (review r1.6): (a) saturated 2000-step zero-transfer
+tail; (b) unsaturated non-vacuous exact transfer with ≤ 1-quantum in-flight residual;
+(c) **the combined arm — a pond over a half-saturated bed**, where support (R1), reaction
+(R2), and whole-particle handoff (R3) operate *simultaneously*: the column stands while
+transfer proceeds, conservation holds exactly through active transfer, and the run
+transitions into the saturated regime and stays conserved. Passing (a) and (b) in
+isolation does not certify the seam — (c) is the actual multi-solver coupling question.
+Also: balErr printout works in a seam `examples/` driver; multiset discipline in every new
+test (the seam's own removal permutes pbmpm's live range).
 
-### U5 — M0 decision note
-`docs/plans/2026-07-09-003-seam-m0-decision-note.md`: the R5 numbers (coexistence
+### U5 — Pre-registration (before any quantified run)
+`docs/plans/2026-07-09-003-seam-m0-preregistration.md`, committed **before** the U2–U4
+quantified gates are first measured (the U7 precedent — review r1.4): the exact M0 scene
+(box, bed region extents, column layers, spacing r = 0.16, expected particle counts),
+frozen config asserts (iteration_count 16, flip_fraction 0.95, solid_dynamics true, seam
+knobs), measurement protocol (50 warmup / 30 measure frames, median, namespaced-pass
+aggregation, twofield-substep multiplication), and every numeric bar: R5's coexistence ≤
+2.0 ms / seam physics ≤ 1.5 ms / total ≤ 22.5 ms, R1's band-mean ±3% + p99 bound + tail-KE
+tolerance, R2's pairing tolerance form, R3's drift and residual bounds. U1's structural
+gates (byte-identity, water_count == 0, dispatch formulas) may land before this doc; every
+*measured* verdict input lands after it.
+
+### U6 — M0 decision note
+`docs/plans/2026-07-09-004-seam-m0-decision-note.md`: the R5 numbers (coexistence
 overhead, seam physics cost, total @ 191k+15k), R1–R3 gate outcomes, interface artifact
 assessment (visual), the viability verdict for multi-solver composition, and go/no-go for
 M1 (dynamic seam: jet-impact impulse channel, crater under pour, drainage re-emission,
@@ -226,7 +265,7 @@ Darcy β). Written against the pre-registered bars, no post-hoc softening (KTD9 
   grid_svel kick — is the P_sp/Coulomb inheritance worth the substep-division bookkeeping?
 - Grain-crediting shape: per-node share distribution (reusing the g2p_absorb math shape)
   vs per-marked-particle nearest-grain — which keeps the exact-ledger construction simpler?
-- Does the M0 scene need a *pond-on-unsaturated-bed* third arm (transfer + support
-  simultaneously) or do the two R3 regimes cover it?
+- ~~Does the M0 scene need a *pond-on-unsaturated-bed* third arm?~~ RESOLVED (review
+  r1.6): yes — it is the required combined-regime gate R3(c).
 - bed_occupancy refresh cadence: per frame (chosen) vs every k frames for a static bed —
   premature optimization at 15k grains?
