@@ -339,6 +339,7 @@ struct Inflow {
     axial: f32,       // arclength credit (scene units) toward the next layer
     last_exit_speed: f32, // drains backlog at the last cadence when flow drops to 0
     cursor: u64,      // golden-angle determinism across all emitted particles
+    emitted_mass: f32, // conservation accounting: emit_n × particle_mass (twofield convention)
 }
 
 /// Orthonormal disc basis perpendicular to a (unit) pour direction `dir` (mirrors twofield).
@@ -718,6 +719,12 @@ impl PbmpmSolver {
         )
     }
 
+    /// Total water mass emitted by the pour so far (conservation accounting; the
+    /// twofield/xpbd convention — emit_n × particle_mass per emission).
+    pub fn total_emitted_water_mass(&self) -> f32 {
+        self.inflow.emitted_mass
+    }
+
     pub fn active_count(&self) -> u32 {
         self.water_count
     }
@@ -856,6 +863,7 @@ impl PbmpmSolver {
             off_f,
             bytemuck::cast_slice(&identity_rows(emit_n)),
         );
+        self.inflow.emitted_mass += emit_n as f32 * self.params.particle_mass;
         self.water_count += emit_n;
         self.params.water_count = self.water_count;
     }
@@ -1354,6 +1362,7 @@ impl Solver for PbmpmSolver {
                 axial: 0.0,
                 last_exit_speed: 0.0,
                 cursor: 0,
+                emitted_mass: 0.0,
             },
             num_nodes,
             params_buf,
@@ -1409,6 +1418,7 @@ impl Solver for PbmpmSolver {
         self.inflow.axial = 0.0;
         self.inflow.last_exit_speed = 0.0;
         self.inflow.cursor = 0;
+        self.inflow.emitted_mass = 0.0;
     }
 
     fn step(&mut self, dt: f32, input: &EmissionInput) {
