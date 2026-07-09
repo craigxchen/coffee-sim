@@ -6,13 +6,11 @@
 // each pipeline's auto layout (`layout: None`) keeps only the bindings its entry point
 // actually uses, but an index never means two different buffers.
 //
-// Storage-buffer budget (KTD-7): the widest entry point binds 7 storage buffers
-// (MAX_STORAGE_BUFFERS_PER_ENTRY_POINT in mod.rs — g2p_solid / cell_classify; see the per-pass
-// derivation there); the device requests 9 per stage (src/utils/gpu.rs NEEDED_STORAGE_BUFFERS),
-// both within the 16 hardware cap. U1 adds NO binding (the flip knob is a Params lane, and
-// g2p_water reads only the already-bound vel/grid_vel). Grid mass+momentum share ONE
-// array<atomic<i32>> with stride 4 (mass, mom.xyz) rather than four arrays — one binding, one
-// clear pass, contiguous per-node lanes.
+// Storage-buffer budget (KTD-7): the device requests 9 storage buffers per stage
+// (src/utils/gpu.rs NEEDED_STORAGE_BUFFERS) and U2 does NOT raise it — the widest entry point
+// (g2p_water) binds 5 (see MAX_STORAGE_BUFFERS_PER_ENTRY_POINT in mod.rs for the per-pass
+// derivation). Grid mass+momentum share ONE array<atomic<i32>> with stride 4 (mass, mom.xyz)
+// rather than four arrays — one binding, one clear pass, contiguous per-node lanes.
 //
 // Tint discipline: any workgroupBarrier() must be reachable from uniform control flow — no
 // early returns before a barrier (clamp indices and predicate the work instead). No pass in
@@ -21,7 +19,7 @@
 const PHASE_WATER: u32 = 0u;
 const PHASE_SOLID: u32 = 1u;
 
-// Byte-identical to the Rust `Params` (272 bytes after the U1 `flip` vec4; vec4-aligned tail).
+// Byte-identical to the Rust `Params` (160 bytes; vec4-aligned tail).
 struct Params {
     box_min: vec4<f32>,     // simulation domain (w unused)
     box_max: vec4<f32>,     // (w unused)
@@ -61,11 +59,6 @@ struct Params {
                      //  density-target mode (≤ 0.5 → legacy rate-limited two-sided relief, default
                      //  & byte-identical; > 0.5 → relief uncapped to full strength, driving ρ→ρ₀
                      //  — the over-pack fix; see cell_classify in pressure.wgsl / surface.wgsl).
-    flip: vec4<f32>, // U1 surface-weighted dissipation knob (g2p_water, transfers.wgsl):
-                     //  (c_surface, density_gate, div_scale, water_splash_cap). DISABLED default —
-                     //  c_surface = 1.0 ⇒ v = v_grid = pure-PIC; div_scale ≤ 0 ⇒ merge discriminator
-                     //  off; water_splash_cap ≤ 0 ⇒ fall back to the global max_speed. The U2 curve
-                     //  reads these; plumbed-but-unused in U1 (default path stays pure-PIC).
 };
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -156,21 +149,6 @@ fn bspline_w(fx: vec3<f32>) -> array<vec3<f32>, 3> {
     w[1] = 0.75 - (fx - 1.0) * (fx - 1.0);
     w[2] = 0.5 * (fx - 0.5) * (fx - 0.5);
     return w;
-}
-
-// Analytic d/dfx of bspline_w (per axis), so ∂w/∂x = dw/h (the 1/h chain-rule scale is applied
-// by the caller). Used by g2p_water's mass-gradient gather (U2 surface-weighted dissipation):
-// ∇w_3d = (dw.x·w.y·w.z, w.x·dw.y·w.z, w.x·w.y·dw.z)/h. NOT reusable from APIC's B (which uses the
-// d-offset form, not ∇w) — a few extra ALU ops, no new binding.
-//   d/dfx [0.5·(1.5−fx)²] = −(1.5 − fx)
-//   d/dfx [0.75 − (fx−1)²] = −2·(fx − 1)
-//   d/dfx [0.5·(fx−0.5)²]  =  (fx − 0.5)
-fn bspline_dw(fx: vec3<f32>) -> array<vec3<f32>, 3> {
-    var dw: array<vec3<f32>, 3>;
-    dw[0] = -(1.5 - fx);
-    dw[1] = -2.0 * (fx - 1.0);
-    dw[2] = fx - 0.5;
-    return dw;
 }
 
 // --- grid indexing -----------------------------------------------------------------------------

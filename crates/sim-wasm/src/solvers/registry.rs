@@ -1,5 +1,6 @@
 use super::base::{FrameSolver, Paradigm, SceneSpec, SolverId, SolverInfo, Stability};
 use super::mpm::MpmSim3D;
+use super::pbmpm_runtime::PbmpmFrameSolver;
 use super::twofield_runtime::TwofieldFrameSolver;
 use super::xpbd_runtime::XpbdFrameSolver;
 
@@ -30,12 +31,29 @@ const TWOFIELD_INFO: SolverInfo = SolverInfo {
     experimental: true,
 };
 
+const PBMPM_INFO: SolverInfo = SolverInfo {
+    id: SolverId::Pbmpm,
+    name: "PB-MPM",
+    paradigm: Paradigm::Hybrid,
+    owns_grid: true,
+    stability: Stability::CflLimited { c: 0.5 },
+    experimental: true,
+};
+
 pub(crate) fn info_for(id: SolverId) -> SolverInfo {
     match id {
         SolverId::Mpm => MPM_INFO,
         SolverId::Xpbd => XPBD_INFO,
         SolverId::Twofield => TWOFIELD_INFO,
+        SolverId::Pbmpm => PBMPM_INFO,
     }
+}
+
+pub(crate) fn required_limits() -> wgpu::Limits {
+    // MPM currently has the highest baseline WebGPU bind-count requirement
+    // among registered browser solvers. Keep device creation routed through
+    // the registry so future solvers can raise shared requirements here.
+    super::mpm::required_limits()
 }
 
 pub(crate) fn build_solver(
@@ -63,6 +81,7 @@ pub(crate) fn build_solver(
         }
         SolverId::Xpbd => Ok(Box::new(XpbdFrameSolver::new(device, queue, scene)?)),
         SolverId::Twofield => Ok(Box::new(TwofieldFrameSolver::new(device, queue, scene)?)),
+        SolverId::Pbmpm => Ok(Box::new(PbmpmFrameSolver::new(device, queue, scene)?)),
     }
 }
 
@@ -86,7 +105,7 @@ mod tests {
         pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("coffee-sim registry seam test device"),
             required_features: wgpu::Features::empty(),
-            required_limits: super::super::mpm::required_limits(),
+            required_limits: super::required_limits(),
             memory_hints: wgpu::MemoryHints::Performance,
             trace: wgpu::Trace::default(),
             experimental_features: wgpu::ExperimentalFeatures::disabled(),
@@ -163,7 +182,7 @@ mod tests {
         .expect("build MPM debug scene");
         assert_eq!(sim.active_id(), SolverId::Mpm);
 
-        for &id in &[SolverId::Xpbd, SolverId::Twofield] {
+        for &id in &[SolverId::Xpbd, SolverId::Twofield, SolverId::Pbmpm] {
             sim.switch_solver(&device, &queue, id)
                 .expect("switch falls back from MPM debug scene");
             assert_eq!(sim.active_id(), id);

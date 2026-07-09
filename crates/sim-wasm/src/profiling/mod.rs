@@ -16,6 +16,48 @@ impl Profile {
     }
 }
 
+pub(crate) struct Profiler {
+    timestamps_supported: bool,
+    dispatches: u32,
+    passes: Vec<(String, f32)>,
+}
+
+impl Profiler {
+    pub(crate) fn new(timestamps_supported: bool) -> Self {
+        Self {
+            timestamps_supported,
+            dispatches: 0,
+            passes: Vec::new(),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn timestamps_supported(&self) -> bool {
+        self.timestamps_supported
+    }
+
+    pub(crate) fn begin_frame(&mut self) {
+        self.dispatches = 0;
+        self.passes.clear();
+    }
+
+    pub(crate) fn record_dispatch(&mut self) {
+        self.dispatches += 1;
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn record_pass(&mut self, label: impl Into<String>, micros: f32) {
+        self.passes.push((label.into(), micros));
+    }
+
+    pub(crate) fn snapshot(&self) -> Profile {
+        Profile {
+            passes: self.passes.clone(),
+            dispatches_per_frame: self.dispatches,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SolverSpec {
     Mpm,

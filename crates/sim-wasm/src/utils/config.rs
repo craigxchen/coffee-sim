@@ -152,23 +152,19 @@ pub struct Config {
     /// full saturation. Coffee-plausible ≈ 0.4. Unused when `tf_wet_cohesion = 0`.
     pub tf_cohesion_speak: f32,
 
-    // --- twofield U1/U2 surface-weighted velocity-averaging dissipation (g2p_water; default
-    // DISABLED so the off-path is byte-identical to the pure-PIC baseline) ---
-    /// Surface (near-air) smoothing strength `c` for the velocity-averaging dissipation:
-    /// `v = mix(v_own, v_grid, c)`. The bulk uses `c → 1` (full average = calm pool); the free
-    /// surface uses `c → tf_flip_c_surface` (small = momentum-preserving = splash). The sentinel
-    /// `1.0` ⇒ `v = v_grid` everywhere = the pure-PIC baseline (DISABLED).
-    pub tf_flip_c_surface: f32,
-    /// Local-density gate (in units of a rest-packed cell ≈ `8·particle_mass`) above which the
-    /// bulk dissipation term ramps in. Unused while the knob is disabled.
-    pub tf_flip_density_gate: f32,
-    /// Merge-discriminator scale (the compressive-`div` / relative-approach term). `≤ 0` ⇒ the
-    /// entire merge discriminator is OFF (the density-only negative control); the sentinel `0.0`
-    /// is the disabled default.
-    pub tf_flip_div_scale: f32,
-    /// Separate water/splash velocity cap (the U3 splash-path clamp). `≤ 0` ⇒ fall back to the
-    /// global `max_speed` (byte-identical); the sentinel `0.0` is the disabled default.
-    pub tf_flip_water_splash_cap: f32,
+    // --- PB-MPM liquid density constraint (only read by `SolverId::Pbmpm`) ---
+    /// Number of PB-MPM constraint/transfer iterations per frame.
+    pub pbmpm_iteration_count: u32,
+    /// Rest liquid density target for the PB-MPM compliant density constraint.
+    pub pbmpm_liquid_density: f32,
+    /// Relaxation for the PB-MPM liquid volume correction.
+    pub pbmpm_liquid_relaxation: f32,
+    /// Deviatoric/shear damping weight for PB-MPM water.
+    pub pbmpm_liquid_viscosity: f32,
+    /// Collider normal-velocity restitution for PB-MPM water.
+    pub pbmpm_restitution: f32,
+    /// Final-velocity FLIP blend fraction for PB-MPM splash preservation.
+    pub pbmpm_flip_fraction: f32,
 }
 
 impl Default for Config {
@@ -254,14 +250,12 @@ impl Default for Config {
             // U5 bed + the U2–U6 suites are byte-unchanged. A saturated brew bed opts in.
             tf_wet_cohesion: 0.0,
             tf_cohesion_speak: 0.4,
-            // U1/U2 surface-weighted dissipation: DISABLED by default so g2p_water stays pure-PIC
-            // and every existing twofield gate is byte-unchanged. c_surface = 1.0 ⇒ v = v_grid
-            // (pure-PIC); div_scale = 0 ⇒ merge discriminator off; water_splash_cap = 0 ⇒ global
-            // max_speed. density_gate is unused while disabled.
-            tf_flip_c_surface: 1.0,
-            tf_flip_density_gate: 0.5,
-            tf_flip_div_scale: 0.0,
-            tf_flip_water_splash_cap: 0.0,
+            pbmpm_iteration_count: 16,
+            pbmpm_liquid_density: 1.0,
+            pbmpm_liquid_relaxation: 0.7,
+            pbmpm_liquid_viscosity: 0.01,
+            pbmpm_restitution: 0.4,
+            pbmpm_flip_fraction: 0.95,
         }
     }
 }
