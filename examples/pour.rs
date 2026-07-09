@@ -47,11 +47,15 @@ fn main() {
         grain_diameter: 1.0,
         min_pore_fraction: 0.35,
         grain_mass: 10.0,
+        c_max: env_f32("CMAX", 0.3),
+        fines_fraction: env_f32("FINES", 0.05),
         ..Materials::default()
     };
     let cfg = Config {
         absorb_rate: env_f32("ABSORB", 0.5),
         extract_rate: env_f32("EXTRACT", 1.0),
+        impact_scale: env_f32("IMPACT", 4.0),
+        fines_rate: env_f32("FINES_RATE", 0.5),
         ..Config::default()
     };
     let steps: u32 = std::env::var("STEPS")
@@ -88,10 +92,12 @@ fn main() {
     let rho_w = mats.particle_mass / v_w;
 
     println!(
-        "V60 pour brew: pool capacity {} | absorb={} extract={} flow={flow} mL/s",
+        "V60 pour brew: pool capacity {} | absorb={} extract={} impact={} fines_rate={} flow={flow} mL/s",
         solver.pool_capacity(),
         cfg.absorb_rate,
-        cfg.extract_rate
+        cfg.extract_rate,
+        cfg.impact_scale,
+        cfg.fines_rate
     );
     println!("  step   t(s)  active  yield%   TDS%   meanT  | emitted  inDomain+absorbed  balErr%");
 
