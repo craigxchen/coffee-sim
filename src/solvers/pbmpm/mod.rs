@@ -585,6 +585,43 @@ impl PbmpmSolver {
         (if count > 0 { sum / count as f64 } else { 0.0 }, count)
     }
 
+    /// Seam-band density stats (R1, docs/plans/2026-07-09-002): interior-node density
+    /// deviation over nodes restricted to world-y ∈ [y_min, y_max] — `(mean, p99, count)`
+    /// of (mass/rest − 1) with the same interior-occupancy filter as
+    /// `read_fine_interior_density`. The global mean is gameable (review r1.5: a seam
+    /// ring/cram can hide in it); the band + p99 cannot. Dev/test only — stalls.
+    pub fn read_band_density_stats(
+        &self,
+        y_min: f32,
+        y_max: f32,
+        interior_frac: f32,
+    ) -> (f64, f64, u32) {
+        let bytes = (self.num_nodes as u64) * 16;
+        let raw: Vec<i32> = bytemuck::cast_slice(&self.read_bytes(&self.grid_fp, bytes)).to_vec();
+        let spacing_ratio = self.params.grid_origin[3] / self.inflow.spacing;
+        let rest_node = (self.params.particle_mass * spacing_ratio.powi(3)) as f64;
+        let (nx, ny) = (self.params.grid_dims[0], self.params.grid_dims[1]);
+        let (oy, h) = (self.params.grid_origin[1], self.params.grid_origin[3]);
+        let mut devs: Vec<f64> = Vec::new();
+        for (n, node) in raw.chunks_exact(4).enumerate() {
+            let wy = oy + ((n as u32 / nx) % ny) as f32 * h;
+            if wy < y_min || wy > y_max {
+                continue;
+            }
+            let mass = node[0] as f64 / FP_SCALE;
+            if mass >= interior_frac as f64 * rest_node {
+                devs.push(mass / rest_node - 1.0);
+            }
+        }
+        if devs.is_empty() {
+            return (0.0, 0.0, 0);
+        }
+        devs.sort_by(f64::total_cmp);
+        let mean = devs.iter().sum::<f64>() / devs.len() as f64;
+        let p99 = devs[((devs.len() as f64 * 0.99) as usize).min(devs.len() - 1)];
+        (mean, p99, devs.len() as u32)
+    }
+
     /// Read back the decoded float grid velocity (.xyz) + node mass (.w) after `grid_update`
     /// (dev/test only — stalls). Valid until the next frame's `grid_update` overwrites it.
     pub fn read_grid_velocities(&self) -> Vec<[f32; 4]> {
