@@ -94,6 +94,22 @@ program introduced no regressions.
 spreads, and settles into a pond nested in the swollen bed; grains wet-darken; no
 fall-through, detonation, or wall leak.
 
+## Post-verdict correction from live use (2026-07-10)
+
+Owner testing on Center Pour (dry bed) exposed that the recorded M0 placeholder β = s gives
+an UNSATURATED bed zero entry resistance — water free-falls through, reading as "no
+coupling". Corrected (still ahead of M1's calibrated Darcy): the BC is now a
+**percolation-speed cap** — into-bed velocity is capped at v_perc = `pbmpm_seam_perc_vmax`
+·(1−s) (default 1.2 su/s, an UNCALIBRATED demo-scale placeholder), with the excess momentum
+ledgered to the bed. Saturated ⇒ cap 0, identical to the verdict's full block: the
+saturated-arm gates re-ran bit-comparable and green. A second latent defect surfaced by the
+now-faster transfer: the credit pass's V_cap clamp DISCARDED over-capacity shares (~1% of
+transferred volume) — removed; a grain may momentarily sit above V_cap, at which point every
+consumer already treats it as saturated. Combined-arm re-run: the pond now drains to bed
+saturation (2149/2197 particles handed across) with books drift 0.002%. All seam + verdict
+gates green; wasm rebuilt and browser-verified (stream decelerates at the bed, spreads,
+percolates through, drips to the cup).
+
 ## What M0 taught (binding on M1 and on any future field-coupled seam)
 
 1. Grid velocity BCs cannot hold FLIP particles — pair them with an interface PIC band and

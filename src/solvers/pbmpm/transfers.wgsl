@@ -163,9 +163,16 @@ fn grid_update(@builtin(global_invocation_id) gid: vec3<u32>) {
             if (vcap > 0.0) {
                 s = clamp(vabs / vcap, 0.0, 1.0);
             }
-            var beta = s;
+            // Percolation-speed cap (the corrected M0 placeholder; true Darcy K(φ_s, s) is
+            // M1): into-bed velocity is capped at v_perc = vmax·(1−s). Saturated (s ≥
+            // cutoff) ⇒ cap 0 — identical to the original full block, so every saturated
+            // M0 gate is unchanged. Dry/partial ⇒ water ENTERS at percolation speed while
+            // the EXCESS momentum is removed and ledgered — the stream decelerates at the
+            // bed and the bed feels the impact, instead of the old β=s fraction ramp that
+            // gave a dry bed zero resistance (measured: Center Pour fell straight through).
+            var v_perc = params.seam.w * (1.0 - s);
             if (s >= params.seam.z) {
-                beta = 1.0;
+                v_perc = 0.0;
             }
             var grad = vec3<f32>(0.0);
             grad.x = fp_decode(atomicLoad(&bed_occupancy[seam_occ_index(nodev + vec3<i32>(1, 0, 0)) * 4u]))
@@ -187,8 +194,8 @@ fn grid_update(@builtin(global_invocation_id) gid: vec3<u32>) {
                 n_into = grad / glen;
             }
             let vn_bed = dot(v, n_into);
-            if (vn_bed > 0.0) {
-                let dv = beta * vn_bed * n_into;
+            if (vn_bed > v_perc) {
+                let dv = (vn_bed - v_perc) * n_into;
                 v = v - dv;
                 let imp = dv * mass * SEAM_IMPULSE_SCALE;
                 atomicAdd(&seam_reaction[n * 4u + 0u], i32(imp.x));

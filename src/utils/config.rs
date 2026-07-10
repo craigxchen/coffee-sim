@@ -231,6 +231,11 @@ pub struct Config {
     /// Read only by the seam; scene setups (web) use it where the test harness calls
     /// `prewet_bed` directly.
     pub tf_prewet_sat: f32,
+    /// Seam-blend dry-bed percolation speed cap (scene units/s): the maximum into-bed
+    /// water speed through an UNSATURATED bed (v_perc = this·(1−s); saturated ⇒ 0 = full
+    /// block). The corrected M0 placeholder for the M1 Darcy K(φ_s, s) — sets how fast a
+    /// pour seeps through a dry bed instead of free-falling through it.
+    pub pbmpm_seam_perc_vmax: f32,
 }
 
 impl Default for Config {
@@ -342,6 +347,7 @@ impl Default for Config {
             pbmpm_coarse_kick_cap: 0.5,
             pbmpm_seam_bed: false,
             tf_prewet_sat: 0.0,
+            pbmpm_seam_perc_vmax: 1.2,
         }
     }
 }
