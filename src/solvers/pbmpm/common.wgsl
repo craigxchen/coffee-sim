@@ -51,7 +51,7 @@ struct Params {
     seam: vec4<f32>,        // Seam-blend bed BC (U2, docs/plans/2026-07-09-002): .x = enabled
                             // (1.0/0.0), .y = min node solid fraction counting as "in the bed",
                             // .z = saturation ratio treated as fully saturated (full block),
-                            // .w = reserved
+                            // .w = dry-bed percolation speed cap (v_perc = .w·(1−s))
 };
 
 @group(0) @binding(0) var<uniform> params: Params;

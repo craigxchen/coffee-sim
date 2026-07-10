@@ -1041,7 +1041,7 @@ impl Solver for PbmpmSolver {
                 if cfg.pbmpm_seam_bed { 1.0 } else { 0.0 },
                 SEAM_PHI_MIN,
                 SEAM_SAT_FULL,
-                0.0,
+                cfg.pbmpm_seam_perc_vmax.max(0.0),
             ],
         };
         let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {

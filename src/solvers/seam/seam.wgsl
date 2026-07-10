@@ -265,7 +265,13 @@ fn seam_credit(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
     if (gained > 0.0) {
-        bed_pos[pi].w = min(v_abs + gained / FP_SCALE, params.wet.y);
+        // NO V_cap clamp: a bank release near saturation can credit a grain slightly past
+        // capacity, and clamping DISCARDS that volume — a measured ~1% loss of the
+        // transferred total. Conservation is the hard gate; a grain a hair above V_cap is
+        // already saturated to every consumer (demand floors to 0, s clamps to 1, the
+        // cutoff test uses ≥), so it simply stops participating and the overshoot is
+        // bounded by one transaction's share.
+        bed_pos[pi].w = v_abs + gained / FP_SCALE;
     }
 }
 
