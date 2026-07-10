@@ -225,6 +225,12 @@ pub struct Config {
     /// `seam_reaction`. False (the default) keeps native pbmpm byte-identical — the seam
     /// buffers are 1-element dummies and the WGSL branch is parameter-dead.
     pub pbmpm_seam_bed: bool,
+    /// Seam-blend bed pre-saturation fraction ∈ [0, 1] (docs/plans/2026-07-09-002 U2):
+    /// when > 0, `SeamSolver::build` prewets its bed inner to this fraction of V_cap
+    /// (reset-stable — the cached seed is mutated too). 0.0 (default) seeds the bed dry.
+    /// Read only by the seam; scene setups (web) use it where the test harness calls
+    /// `prewet_bed` directly.
+    pub tf_prewet_sat: f32,
 }
 
 impl Default for Config {
@@ -335,6 +341,7 @@ impl Default for Config {
             pbmpm_coarse_strength: 0.0,
             pbmpm_coarse_kick_cap: 0.5,
             pbmpm_seam_bed: false,
+            tf_prewet_sat: 0.0,
         }
     }
 }
