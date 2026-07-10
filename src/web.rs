@@ -410,6 +410,30 @@ fn setup_for(kind: WebScene, solver_id: SolverId) -> (Scene, Materials, Config) 
             }
             (scene, mats, cfg)
         }
+
+        // --- seam-static-column: the seam-blend M0 viability scene (docs/plans/2026-07-09-002).
+        // Exactly the verified native-probe configuration (spacing 0.32, saturated bed): the
+        // column stands on the bed via the seam's porous BC. Best viewed with the "Seam blend"
+        // solver; other solvers run it as a plain water-block-on-grains scene and ignore the
+        // prewet knob (twofield gets its deformable bed so the grains are at least live).
+        WebScene::SeamStaticColumn => {
+            let s = 0.32;
+            let mats = Materials {
+                particle_spacing: s,
+                support_radius: 2.0 * s,
+                grain_diameter: 2.0 * s,
+                grain_mass: 10.0,
+                ..Materials::default()
+            };
+            let mut cfg = Config {
+                tf_prewet_sat: 1.0,
+                ..Config::default()
+            };
+            if twofield {
+                cfg.solid_dynamics = true;
+            }
+            (scene, mats, cfg)
+        }
     }
 }
 

@@ -504,6 +504,9 @@ impl Solver for SeamSolver {
             device,
             queue: gpu.queue.clone(),
         };
+        if cfg.tf_prewet_sat > 0.0 {
+            seam.prewet_bed(cfg.tf_prewet_sat);
+        }
         seam.merge_render_buffers();
         seam
     }
