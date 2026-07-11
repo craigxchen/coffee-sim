@@ -1935,6 +1935,7 @@ function loadMpmV2ObservationScene(sceneId) {
     currentSceneId = "mpm-v2-uniform-bed-saturation";
     currentSceneMode = "MPM v2 Uniform Bed Saturation";
   }
+  setSceneTab("main");
   fixedStepSeconds = 1 / 60;
   lastFrameTime = 0;
   simulationAccumulatorSeconds = 0;
@@ -2221,6 +2222,7 @@ async function restoreObservationUiState(saved, savedCalibration, touchedCalibra
   }
   currentSceneId = saved.sceneId;
   currentSceneMode = saved.sceneMode;
+  setSceneTab(saved.sceneId.startsWith("debug:") ? "debug" : "main");
   fixedStepSeconds = saved.fixedStepSeconds;
   app.setWaterVelocityMetersPerSecond(saved.waterVelocityMetersPerSecond);
   app.setSpoutPosition(saved.spout.x, saved.spout.y, saved.spout.z);
