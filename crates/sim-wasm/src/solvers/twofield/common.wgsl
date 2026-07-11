@@ -7,8 +7,9 @@
 // actually uses, but an index never means two different buffers.
 //
 // Storage-buffer budget (KTD-7): the widest entry point binds 8 storage buffers
-// (MAX_STORAGE_BUFFERS_PER_ENTRY_POINT in mod.rs — cell_classify / pocket_mark; see the per-pass
-// derivation there); shared required limits request 10 per stage
+// (MAX_STORAGE_BUFFERS_PER_ENTRY_POINT in mod.rs — cell_classify / pocket_mark; active tiled
+// relaxation adds one scheduler binding but remains below them; see the per-pass derivation
+// there); shared required limits request 10 per stage
 // (`solvers/mpm/mod.rs::required_limits`), both within the 16 target cap. U1 adds NO binding (the flip knob is a Params lane, and
 // g2p_water reads only the already-bound vel/grid_vel). Grid mass+momentum share ONE
 // array<atomic<i32>> with stride 4 (mass, mom.xyz) rather than four arrays — one binding, one

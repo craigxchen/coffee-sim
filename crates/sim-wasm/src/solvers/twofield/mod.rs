@@ -83,8 +83,34 @@ const DIAGNOSTICS_READBACK_SLOTS: usize = 2;
 /// a real position from `emit()`. Kept finite (not NaN) so any accidental read stays well-defined.
 const DORMANT_PARK_Y: f32 = -1.0e9;
 
+/// Fine-cell tile shape shared with `active_tiles.wgsl`. One 256-thread workgroup processes
+/// exactly two lanes per cell tile (512 cells total).
+const ACTIVE_TILE_EDGE: u32 = 8;
+const ACTIVE_TILE_HEADER_WORDS: u32 = 2;
+const ACTIVE_TILE_WORDS_PER_TILE: u32 = 4;
+const ACTIVE_WATER_COUNT_OFFSET: u64 = 0;
+const ACTIVE_SOLID_COUNT_OFFSET: u64 = 4;
+const ACTIVE_WATER_INDIRECT_OFFSET: u64 = 0;
+const ACTIVE_SOLID_INDIRECT_OFFSET: u64 = 16;
+// Internal sequence sentinels. WebGPU's per-dimension workgroup ceiling is far below these, so
+// they cannot alias a legal direct dispatch size; the actual counts stay in the GPU args buffer.
+const ACTIVE_WATER_INDIRECT: u32 = u32::MAX;
+const ACTIVE_SOLID_INDIRECT: u32 = u32::MAX - 1;
+
 fn groups(n: u32) -> u32 {
     n.div_ceil(WG)
+}
+
+fn active_tile_dims_for_grid(node_dims: [u32; 3]) -> [u32; 3] {
+    node_dims.map(|nodes| (nodes - 1).div_ceil(ACTIVE_TILE_EDGE))
+}
+
+fn active_tile_count_for_grid(node_dims: [u32; 3]) -> u32 {
+    active_tile_dims_for_grid(node_dims).into_iter().product()
+}
+
+fn active_tiling_enabled(implicit_solid: bool, all_gas_atmospheric: bool) -> bool {
+    implicit_solid && all_gas_atmospheric
 }
 
 /// U2+U3+U4+U6+U5 GPU-budget bookkeeping (R8): the widest entry point's storage-buffer count,
@@ -114,7 +140,8 @@ fn groups(n: u32) -> u32 {
 /// (pos, vel, chem, grid_moist), `g2p_absorb` 4 (pos, vel, chem, grid_moist); chemistry/thermal
 /// scatter binds 6 and gather binds 7 around the 11-lane chemistry ledger; the semi-implicit
 /// family's widest pass is `p2g_solid_macro` at 8 (pos, vel, chem, cmat, grid_sfp, grid_sm,
-/// sstate, grid_scomp), while its scalar Jacobi binds 4. The occasional compact diagnostics pass
+/// sstate, grid_scomp), while its tiled scalar Jacobi binds 5. The active-tile marker binds 3
+/// (pos, chem, scheduler). The occasional compact diagnostics pass
 /// binds 6 storage buffers (pos, chem, grid_vel, cell_cnt, filter_state, output). All remain at or
 /// below the cap; re-derive when passes are added. Shared required limits request 10 storage
 /// buffers per stage (see `solvers/mpm/mod.rs::required_limits`), within the WebGPU-target cap.
@@ -1003,6 +1030,13 @@ pub struct TwofieldSolver {
     grid_scomp: wgpu::Buffer,
     // Persistent paper reservoir (binding 30), intentionally not part of per-frame grid clear.
     filter_state: wgpu::Buffer,
+    // Phase-1 sparse relaxation scheduler (binding 33) and its separate INDIRECT-only argument
+    // records. Enabled only for the semi-implicit + explicitly vented production path; every
+    // setup/clear/node/coarse pass remains dense.
+    active_tiles: wgpu::Buffer,
+    active_tile_indirect: wgpu::Buffer,
+    active_tile_count: u32,
+    active_tiling: bool,
     // Compact periodic observability path. `diagnostics_gpu` is reduced on the GPU; two tiny
     // staging slots are mapped asynchronously and never waited on by the frame loop.
     diagnostics_gpu: wgpu::Buffer,
@@ -1125,6 +1159,7 @@ fn disc_basis(dir: [f32; 3]) -> ([f32; 3], [f32; 3]) {
 }
 
 struct Pipelines {
+    active_tile_mark: (wgpu::ComputePipeline, wgpu::BindGroup),
     grid_clear: (wgpu::ComputePipeline, wgpu::BindGroup),
     p2g_water: (wgpu::ComputePipeline, wgpu::BindGroup),
     // U6 coupling family: solid-mass P2G + the exponential drag fold (which owns the grid
@@ -1156,6 +1191,7 @@ struct Pipelines {
     compaction_node_setup: (wgpu::ComputePipeline, wgpu::BindGroup),
     compaction_cell_setup: (wgpu::ComputePipeline, wgpu::BindGroup),
     compaction_jacobi: (wgpu::ComputePipeline, [wgpu::BindGroup; 2]),
+    compaction_jacobi_tiled: (wgpu::ComputePipeline, [wgpu::BindGroup; 2]),
     compaction_project: (wgpu::ComputePipeline, wgpu::BindGroup),
     compaction_state_gather: (wgpu::ComputePipeline, wgpu::BindGroup),
     grid_update: (wgpu::ComputePipeline, wgpu::BindGroup),
@@ -1166,12 +1202,15 @@ struct Pipelines {
     node_setup: (wgpu::ComputePipeline, wgpu::BindGroup),
     cell_classify: (wgpu::ComputePipeline, wgpu::BindGroup),
     residual: (wgpu::ComputePipeline, [wgpu::BindGroup; 2]),
+    residual_tiled: (wgpu::ComputePipeline, [wgpu::BindGroup; 2]),
     coarse_node_setup: (wgpu::ComputePipeline, wgpu::BindGroup),
     coarse_cell_setup: (wgpu::ComputePipeline, wgpu::BindGroup),
     jacobi_coarse: (wgpu::ComputePipeline, [wgpu::BindGroup; 2]),
     // prolong_add variants indexed [current-p parity][coarse-final parity].
     prolong_add: (wgpu::ComputePipeline, [[wgpu::BindGroup; 2]; 2]),
+    prolong_add_tiled: (wgpu::ComputePipeline, [[wgpu::BindGroup; 2]; 2]),
     jacobi_fine: (wgpu::ComputePipeline, [wgpu::BindGroup; 2]),
+    jacobi_fine_tiled: (wgpu::ComputePipeline, [wgpu::BindGroup; 2]),
     project: (wgpu::ComputePipeline, [wgpu::BindGroup; 2]),
     // U4 surface family: flood fill (label ping-pong in the pressure slots), pocket marking,
     // and the single-workgroup bubble-row solves at each level (parity variants like the
@@ -1597,6 +1636,13 @@ impl TwofieldSolver {
     pub fn read_filter_state(&self) -> [u32; 5] {
         let raw: Vec<u32> = bytemuck::cast_slice(&self.read_bytes(&self.filter_state, 20)).to_vec();
         [raw[0], raw[1], raw[2], raw[3], raw[4]]
+    }
+
+    /// Blocking dev/profile readback of the current compact water/solid relaxation tile counts.
+    /// Production frame execution never calls this; the scheduler remains fully GPU-driven.
+    pub fn read_active_tile_counts(&self) -> [u32; 2] {
+        let raw: Vec<u32> = bytemuck::cast_slice(&self.read_bytes(&self.active_tiles, 8)).to_vec();
+        [raw[0], raw[1]]
     }
 
     /// Read back the interphase drag state, one vec4 per node: .xyz = the water-to-solid
@@ -2452,6 +2498,7 @@ impl Solver for TwofieldSolver {
         let (origin, cell, dims) = grid_spec_for(scene, mats);
         let num_nodes = dims[0] * dims[1] * dims[2];
         let num_cells = (dims[0] - 1) * (dims[1] - 1) * (dims[2] - 1);
+        let active_tile_count = active_tile_count_for_grid(dims);
         // Coarse buffers are sized once for the densest knob-grid ratio (4 → most coarse
         // cells); the ratio-8 grid point uses a prefix of them.
         let cdims = coarse_dims_for(dims, COARSE_RATIO_DEFAULT);
@@ -2739,6 +2786,20 @@ impl Solver for TwofieldSolver {
             5 * 4,
             wgpu::BufferUsages::COPY_SRC,
         );
+        let active_tiles = Self::storage(
+            &device,
+            "twofield-active-tiles",
+            u64::from(ACTIVE_TILE_HEADER_WORDS + ACTIVE_TILE_WORDS_PER_TILE * active_tile_count)
+                * 4,
+            wgpu::BufferUsages::COPY_SRC,
+        );
+        // Two independently addressable [x, y, z, padding] records. Only x is copied from the
+        // GPU scheduler each frame; y/z remain one, and the padding keeps offsets 16-byte aligned.
+        let active_tile_indirect = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("twofield-active-tile-indirect"),
+            contents: bytemuck::cast_slice(&[[0u32, 1, 1, 0], [0u32, 1, 1, 0]]),
+            usage: wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_DST,
+        });
         let diagnostics_gpu = Self::storage(
             &device,
             "twofield-diagnostics-output",
@@ -2947,10 +3008,11 @@ impl Solver for TwofieldSolver {
         // 22–24; grid_sm at 21 lives in common so grid_clear can zero it). `diagnostics` adds the
         // compact periodic reduction at bindings 31–32.
         let shader_src = format!(
-            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
             include_str!("common.wgsl"),
             include_str!("transfers.wgsl"),
             include_str!("pressure.wgsl"),
+            include_str!("active_tiles.wgsl"),
             include_str!("surface.wgsl"),
             include_str!("coupling.wgsl"),
             include_str!("plasticity.wgsl"),
@@ -2989,6 +3051,11 @@ impl Solver for TwofieldSolver {
             })
         };
         let pipelines = {
+            let active_tile_mark = make("active_tile_mark");
+            let active_tile_mark_bind = bg(
+                &active_tile_mark,
+                &[(0, &params_buf), (1, &pos), (4, &chem), (33, &active_tiles)],
+            );
             let grid_clear = make("grid_clear");
             let grid_clear_bind = bg(
                 &grid_clear,
@@ -3189,6 +3256,31 @@ impl Solver for TwofieldSolver {
                         (10, &cell_meta),
                         (11, &pf_b),
                         (12, &pf_a),
+                    ],
+                ),
+            ];
+            let compaction_jacobi_tiled = make("compaction_jacobi_tiled");
+            let compaction_jacobi_tiled_binds = [
+                bg(
+                    &compaction_jacobi_tiled,
+                    &[
+                        (0, &params_buf),
+                        (9, &nm),
+                        (10, &cell_meta),
+                        (11, &pf_a),
+                        (12, &pf_b),
+                        (33, &active_tiles),
+                    ],
+                ),
+                bg(
+                    &compaction_jacobi_tiled,
+                    &[
+                        (0, &params_buf),
+                        (9, &nm),
+                        (10, &cell_meta),
+                        (11, &pf_b),
+                        (12, &pf_a),
+                        (33, &active_tiles),
                     ],
                 ),
             ];
@@ -3404,6 +3496,29 @@ impl Solver for TwofieldSolver {
                     &[(0, &params_buf), (9, &nm), (10, &cell_meta), (11, &pf_b)],
                 ),
             ];
+            let residual_tiled = make("residual_tiled");
+            let residual_tiled_binds = [
+                bg(
+                    &residual_tiled,
+                    &[
+                        (0, &params_buf),
+                        (9, &nm),
+                        (10, &cell_meta),
+                        (11, &pf_a),
+                        (33, &active_tiles),
+                    ],
+                ),
+                bg(
+                    &residual_tiled,
+                    &[
+                        (0, &params_buf),
+                        (9, &nm),
+                        (10, &cell_meta),
+                        (11, &pf_b),
+                        (33, &active_tiles),
+                    ],
+                ),
+            ];
             // prolong_add reads the current pressure (11) + the coarse final-parity buffer
             // (15) and writes the corrected pressure (12) — variants [p parity][pc parity].
             let prolong_add = make("prolong_add");
@@ -3424,6 +3539,26 @@ impl Solver for TwofieldSolver {
             let prolong_add_binds = [
                 [pa(&pf_a, &pf_b, &pc_a), pa(&pf_a, &pf_b, &pc_b)],
                 [pa(&pf_b, &pf_a, &pc_a), pa(&pf_b, &pf_a, &pc_b)],
+            ];
+            let prolong_add_tiled = make("prolong_add_tiled");
+            let pa_tiled = |src: &wgpu::Buffer, dst: &wgpu::Buffer, pc: &wgpu::Buffer| {
+                bg(
+                    &prolong_add_tiled,
+                    &[
+                        (0, &params_buf),
+                        (10, &cell_meta),
+                        (14, &cmeta),
+                        (15, pc),
+                        (11, src),
+                        (12, dst),
+                        (17, &bubble),
+                        (33, &active_tiles),
+                    ],
+                )
+            };
+            let prolong_add_tiled_binds = [
+                [pa_tiled(&pf_a, &pf_b, &pc_a), pa_tiled(&pf_a, &pf_b, &pc_b)],
+                [pa_tiled(&pf_b, &pf_a, &pc_a), pa_tiled(&pf_b, &pf_a, &pc_b)],
             ];
             let jacobi_fine = make("jacobi_fine");
             let jacobi_fine_binds = [
@@ -3447,6 +3582,33 @@ impl Solver for TwofieldSolver {
                         (11, &pf_b),
                         (12, &pf_a),
                         (17, &bubble),
+                    ],
+                ),
+            ];
+            let jacobi_fine_tiled = make("jacobi_fine_tiled");
+            let jacobi_fine_tiled_binds = [
+                bg(
+                    &jacobi_fine_tiled,
+                    &[
+                        (0, &params_buf),
+                        (9, &nm),
+                        (10, &cell_meta),
+                        (11, &pf_a),
+                        (12, &pf_b),
+                        (17, &bubble),
+                        (33, &active_tiles),
+                    ],
+                ),
+                bg(
+                    &jacobi_fine_tiled,
+                    &[
+                        (0, &params_buf),
+                        (9, &nm),
+                        (10, &cell_meta),
+                        (11, &pf_b),
+                        (12, &pf_a),
+                        (17, &bubble),
+                        (33, &active_tiles),
                     ],
                 ),
             ];
@@ -3581,6 +3743,7 @@ impl Solver for TwofieldSolver {
                 ],
             );
             Pipelines {
+                active_tile_mark: (active_tile_mark, active_tile_mark_bind),
                 grid_clear: (grid_clear, grid_clear_bind),
                 p2g_water: (p2g, p2g_bind),
                 p2g_solid: (p2g_solid, p2g_solid_bind),
@@ -3604,6 +3767,7 @@ impl Solver for TwofieldSolver {
                 compaction_node_setup: (compaction_node_setup, compaction_node_setup_bind),
                 compaction_cell_setup: (compaction_cell_setup, compaction_cell_setup_bind),
                 compaction_jacobi: (compaction_jacobi, compaction_jacobi_binds),
+                compaction_jacobi_tiled: (compaction_jacobi_tiled, compaction_jacobi_tiled_binds),
                 compaction_project: (compaction_project, compaction_project_bind),
                 compaction_state_gather: (compaction_state_gather, compaction_state_gather_bind),
                 grid_update: (grid_update, grid_update_bind),
@@ -3611,11 +3775,14 @@ impl Solver for TwofieldSolver {
                 node_setup: (node_setup, node_setup_bind),
                 cell_classify: (cell_classify, cell_classify_bind),
                 residual: (residual, residual_binds),
+                residual_tiled: (residual_tiled, residual_tiled_binds),
                 coarse_node_setup: (coarse_node_setup, coarse_node_setup_bind),
                 coarse_cell_setup: (coarse_cell_setup, coarse_cell_setup_bind),
                 jacobi_coarse: (jacobi_coarse, jacobi_coarse_binds),
                 prolong_add: (prolong_add, prolong_add_binds),
+                prolong_add_tiled: (prolong_add_tiled, prolong_add_tiled_binds),
                 jacobi_fine: (jacobi_fine, jacobi_fine_binds),
+                jacobi_fine_tiled: (jacobi_fine_tiled, jacobi_fine_tiled_binds),
                 project: (project, project_binds),
                 flood_init: (flood_init, flood_init_bind),
                 flood_sweep: (flood_sweep, flood_sweep_binds),
@@ -3711,6 +3878,10 @@ impl Solver for TwofieldSolver {
             grid_sfp,
             grid_scomp,
             filter_state,
+            active_tiles,
+            active_tile_indirect,
+            active_tile_count,
+            active_tiling: active_tiling_enabled(implicit_solid, cfg.tf_all_gas_atmospheric),
             diagnostics_gpu,
             diagnostics_config,
             diagnostics_readbacks,
@@ -3890,8 +4061,9 @@ impl Solver for TwofieldSolver {
         // per-pass timestamped passes for substep 0, then batches the rest; without timestamps
         // (web / no TIMESTAMP_QUERY) the whole frame collapses into ONE compute pass — Dawn
         // inserts the storage-buffer barriers between dependent dispatches automatically, so the
-        // result is identical (proven by tests/batch_pass_equivalence.rs). Only the per-pass
-        // begin/end CPU overhead is dropped.
+        // result is identical (proven by tests/batch_pass_equivalence.rs). Active tiling inserts
+        // one required pass boundary for the GPU counter -> indirect-argument copies; all work on
+        // either side is still maximally batched.
         let sink = self.ts.as_ref().map(|t| TimestampSink {
             qset: &t.qset,
             capacity: t.capacity,
@@ -3899,9 +4071,9 @@ impl Solver for TwofieldSolver {
         let mut rec = PassRecorder::new(sink);
 
         // The U2 transfer pipeline + U3 pressure stack, one substep per frame. Passes dispatch
-        // at least one workgroup so the dispatch/profiling path is real even on an empty scene
-        // (threads early-out on the live-set / mask guards — over-dispatch + early-out, never
-        // indirect dispatch, R8).
+        // at least one workgroup so the dispatch/profiling path is real even on an empty scene.
+        // Dense setup/coarse/fallback stages early-out on live-set/mask guards; only the guarded
+        // repeated fine-grid relaxation stages use GPU-produced indirect tile counts.
         let node_groups = groups(self.num_nodes).max(1);
         let water_groups = groups(self.water_count).max(1);
         let solid_groups = groups(self.solid_count).max(1);
@@ -3912,6 +4084,37 @@ impl Solver for TwofieldSolver {
         let cd = self.params.coarse_dims;
         let ccell_groups = groups(cd[0] * cd[1] * cd[2]).max(1);
         let cnode_groups = groups((cd[0] + 1) * (cd[1] + 1) * (cd[2] + 1)).max(1);
+
+        if self.active_tiling {
+            // The marker must finish before its counters become indirect arguments. Keep the
+            // scheduler STORAGE-writable and the argument records INDIRECT-only: clear and mark
+            // in the first compute pass, end it, then copy just each counter's x word. All later
+            // dense and indirect work remains in this encoder and the frame still submits once.
+            rec.flush();
+            enc.clear_buffer(&self.active_tiles, 0, None);
+            rec.dispatch(
+                &mut enc,
+                &self.pipelines.active_tile_mark.0,
+                &self.pipelines.active_tile_mark.1,
+                "active_tile_mark",
+                part_groups,
+            );
+            rec.flush();
+            enc.copy_buffer_to_buffer(
+                &self.active_tiles,
+                ACTIVE_WATER_COUNT_OFFSET,
+                &self.active_tile_indirect,
+                ACTIVE_WATER_INDIRECT_OFFSET,
+                4,
+            );
+            enc.copy_buffer_to_buffer(
+                &self.active_tiles,
+                ACTIVE_SOLID_COUNT_OFFSET,
+                &self.active_tile_indirect,
+                ACTIVE_SOLID_INDIRECT_OFFSET,
+                4,
+            );
+        }
 
         // Dry dynamic mode (U5_DRY_DISPATCHES): no live water → only the solid passes run.
         let dry_dynamic = self.solid_dynamic && !self.implicit_solid && self.water_count == 0;
@@ -4098,11 +4301,20 @@ impl Solver for TwofieldSolver {
                 ),
             ]);
             for sweep in 0..COMPACTION_SWEEPS {
+                let family = if self.active_tiling {
+                    &self.pipelines.compaction_jacobi_tiled
+                } else {
+                    &self.pipelines.compaction_jacobi
+                };
                 seq.push((
                     "compaction_jacobi",
-                    &self.pipelines.compaction_jacobi.0,
-                    &self.pipelines.compaction_jacobi.1[(sweep % 2) as usize],
-                    cell_groups,
+                    &family.0,
+                    &family.1[(sweep % 2) as usize],
+                    if self.active_tiling {
+                        ACTIVE_SOLID_INDIRECT
+                    } else {
+                        cell_groups
+                    },
                 ));
             }
             debug_assert!(COMPACTION_SWEEPS.is_multiple_of(2));
@@ -4230,22 +4442,40 @@ impl Solver for TwofieldSolver {
                         1,
                     ));
                 }
+                let family = if self.active_tiling {
+                    &self.pipelines.jacobi_fine_tiled
+                } else {
+                    &self.pipelines.jacobi_fine
+                };
                 seq.push((
                     "jacobi_fine",
-                    &self.pipelines.jacobi_fine.0,
-                    &self.pipelines.jacobi_fine.1[*par],
-                    cell_groups,
+                    &family.0,
+                    &family.1[*par],
+                    if self.active_tiling {
+                        ACTIVE_WATER_INDIRECT
+                    } else {
+                        cell_groups
+                    },
                 ));
                 *par ^= 1;
             }
         };
         push_sweeps(&mut seq, pre, &mut par);
         if self.coarse_sweeps > 0 {
+            let residual_family = if self.active_tiling {
+                &self.pipelines.residual_tiled
+            } else {
+                &self.pipelines.residual
+            };
             seq.push((
                 "residual",
-                &self.pipelines.residual.0,
-                &self.pipelines.residual.1[par],
-                cell_groups,
+                &residual_family.0,
+                &residual_family.1[par],
+                if self.active_tiling {
+                    ACTIVE_WATER_INDIRECT
+                } else {
+                    cell_groups
+                },
             ));
             seq.push((
                 "coarse_node_setup",
@@ -4276,11 +4506,20 @@ impl Solver for TwofieldSolver {
                 ));
             }
             let pc_par = (self.coarse_sweeps % 2) as usize;
+            let prolong_family = if self.active_tiling {
+                &self.pipelines.prolong_add_tiled
+            } else {
+                &self.pipelines.prolong_add
+            };
             seq.push((
                 "prolong_add",
-                &self.pipelines.prolong_add.0,
-                &self.pipelines.prolong_add.1[par][pc_par],
-                cell_groups,
+                &prolong_family.0,
+                &prolong_family.1[par][pc_par],
+                if self.active_tiling {
+                    ACTIVE_WATER_INDIRECT
+                } else {
+                    cell_groups
+                },
             ));
             par ^= 1;
         }
@@ -4349,7 +4588,23 @@ impl Solver for TwofieldSolver {
                 rec.disable_timestamps();
             }
             for &(label, pipe, bind, g) in &seq {
-                rec.dispatch(&mut enc, pipe, bind, label, g);
+                let indirect_offset = match g {
+                    ACTIVE_WATER_INDIRECT => Some(ACTIVE_WATER_INDIRECT_OFFSET),
+                    ACTIVE_SOLID_INDIRECT => Some(ACTIVE_SOLID_INDIRECT_OFFSET),
+                    _ => None,
+                };
+                if let Some(offset) = indirect_offset {
+                    rec.dispatch_indirect(
+                        &mut enc,
+                        pipe,
+                        bind,
+                        label,
+                        &self.active_tile_indirect,
+                        offset,
+                    );
+                } else {
+                    rec.dispatch(&mut enc, pipe, bind, label, g);
+                }
             }
         }
         if diagnostics_slot.is_some() {
@@ -4481,6 +4736,65 @@ mod seed_tests {
         );
     }
 
+    #[test]
+    fn active_tile_boxes_cover_every_contract_cell_at_grid_boundaries() {
+        use std::collections::BTreeSet;
+
+        assert!(!active_tiling_enabled(false, false));
+        assert!(!active_tiling_enabled(false, true));
+        assert!(!active_tiling_enabled(true, false));
+        assert!(active_tiling_enabled(true, true));
+
+        let node_dims = [19u32, 18, 17];
+        let cell_dims = node_dims.map(|extent| extent - 1);
+        let tile_dims = active_tile_dims_for_grid(node_dims);
+        assert_eq!(
+            active_tile_count_for_grid(node_dims),
+            tile_dims.into_iter().product::<u32>()
+        );
+
+        let tile_id = |cell: [u32; 3]| {
+            let tile = cell.map(|coordinate| coordinate / ACTIVE_TILE_EDGE);
+            tile[0] + tile_dims[0] * (tile[1] + tile_dims[1] * tile[2])
+        };
+        let marked_for_box = |lo: [i32; 3], hi: [i32; 3]| {
+            let mut marked = BTreeSet::new();
+            let lo: [i32; 3] =
+                std::array::from_fn(|axis| lo[axis].clamp(0, cell_dims[axis] as i32 - 1));
+            let hi: [i32; 3] =
+                std::array::from_fn(|axis| hi[axis].clamp(0, cell_dims[axis] as i32 - 1));
+            for z in (lo[2] as u32 / ACTIVE_TILE_EDGE)..=(hi[2] as u32 / ACTIVE_TILE_EDGE) {
+                for y in (lo[1] as u32 / ACTIVE_TILE_EDGE)..=(hi[1] as u32 / ACTIVE_TILE_EDGE) {
+                    for x in (lo[0] as u32 / ACTIVE_TILE_EDGE)..=(hi[0] as u32 / ACTIVE_TILE_EDGE) {
+                        marked.insert(x + tile_dims[0] * (y + tile_dims[1] * z));
+                    }
+                }
+            }
+            (lo, hi, marked)
+        };
+
+        // Covers low/high clamps, partial edge tiles, the water +/-1 operator halo, and a
+        // representative solid support expanded past more than one tile boundary.
+        for (lo, hi) in [
+            ([-1, -1, -1], [1, 1, 1]),
+            ([6, 7, 7], [9, 10, 10]),
+            ([14, 13, 12], [20, 20, 20]),
+            ([-4, 2, 3], [17, 15, 14]),
+        ] {
+            let (clamped_lo, clamped_hi, marked) = marked_for_box(lo, hi);
+            for z in clamped_lo[2] as u32..=clamped_hi[2] as u32 {
+                for y in clamped_lo[1] as u32..=clamped_hi[1] as u32 {
+                    for x in clamped_lo[0] as u32..=clamped_hi[0] as u32 {
+                        assert!(marked.contains(&tile_id([x, y, z])));
+                    }
+                }
+            }
+            assert!(marked
+                .iter()
+                .all(|&tile| tile < active_tile_count_for_grid(node_dims)));
+        }
+    }
+
     fn create_test_device() -> Option<(wgpu::Device, wgpu::Queue)> {
         if std::env::var_os("COFFEE_SIM_SKIP_GPU_TESTS").is_some() {
             return None;
@@ -4498,6 +4812,102 @@ mod seed_tests {
             experimental_features: wgpu::ExperimentalFeatures::disabled(),
         }))
         .ok()
+    }
+
+    #[test]
+    fn tiled_relaxation_matches_dense_relaxation_on_the_gpu() {
+        let Some((device, queue)) = create_test_device() else {
+            eprintln!("no GPU adapter available; skipping active-tile equivalence test");
+            return;
+        };
+        let scene = Scene {
+            gravity: [0.0, -9.0, 0.0],
+            box_min: [-2.0; 3],
+            box_max: [2.0; 3],
+            regions: vec![
+                crate::engine::scene::SeedRegion {
+                    min: [-0.5, 0.5, -0.5],
+                    max: [0.5, 1.0, 0.5],
+                    species: Species::Water,
+                },
+                crate::engine::scene::SeedRegion {
+                    min: [-0.75, -0.75, -0.75],
+                    max: [0.75, 0.25, 0.75],
+                    species: Species::Grain,
+                },
+            ],
+            ..Scene::default()
+        };
+        let materials = Materials {
+            particle_spacing: 0.5,
+            support_radius: 1.0,
+            grain_diameter: 0.5,
+            ..Materials::default()
+        };
+        let config = Config {
+            seed_jitter: 0.0,
+            max_speed: 4.0,
+            tf_all_gas_atmospheric: true,
+            solid_dynamics: true,
+            tf_compaction_tangent: 8.0,
+            tf_numerical_shear_modulus: 0.0,
+            ..Config::default()
+        };
+        let gpu = GpuContext::from_device_queue(&device, &queue);
+        let mut tiled = TwofieldSolver::build(&scene, &materials, &config, &gpu);
+        let mut dense = TwofieldSolver::build(&scene, &materials, &config, &gpu);
+        assert!(tiled.active_tiling);
+        dense.active_tiling = false;
+
+        tiled.step(1.0 / 120.0, &EmissionInput::default());
+        dense.step(1.0 / 120.0, &EmissionInput::default());
+        assert_eq!(
+            tiled.dispatches,
+            dense.dispatches + 1,
+            "indirect relaxation dispatches stay individually counted; only the marker is new"
+        );
+        let counts = tiled.read_active_tile_counts();
+        assert!(counts[0] > 0 && counts[0] <= tiled.active_tile_count);
+        assert!(counts[1] > 0 && counts[1] <= tiled.active_tile_count);
+
+        let assert_close = |name: &str, left: &[f32], right: &[f32]| {
+            assert_eq!(left.len(), right.len(), "{name} length");
+            for (index, (&a, &b)) in left.iter().zip(right).enumerate() {
+                let tolerance = 32.0 * f32::EPSILON * (1.0 + a.abs().max(b.abs()));
+                assert!(
+                    (a - b).abs() <= tolerance,
+                    "{name}[{index}] differs: tiled={a:?}, dense={b:?}, tolerance={tolerance:?}"
+                );
+            }
+        };
+        let flatten4 =
+            |values: Vec<[f32; 4]>| bytemuck::cast_slice::<[f32; 4], f32>(&values).to_vec();
+        assert_close(
+            "positions",
+            &flatten4(tiled.read_positions()),
+            &flatten4(dense.read_positions()),
+        );
+        assert_close(
+            "velocities",
+            &flatten4(tiled.read_velocities()),
+            &flatten4(dense.read_velocities()),
+        );
+        assert_close(
+            "grid velocities",
+            &flatten4(tiled.read_grid_velocities()),
+            &flatten4(dense.read_grid_velocities()),
+        );
+        assert_close(
+            "cell metadata",
+            &flatten4(tiled.read_cell_meta()),
+            &flatten4(dense.read_cell_meta()),
+        );
+        assert_close("pressure", &tiled.read_pressure(), &dense.read_pressure());
+        assert_close(
+            "solid state",
+            &flatten4(tiled.read_solid_state()),
+            &flatten4(dense.read_solid_state()),
+        );
     }
 
     #[test]

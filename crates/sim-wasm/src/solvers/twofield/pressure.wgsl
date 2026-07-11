@@ -127,9 +127,12 @@
 // The knob grid pins Tait ∈ {off}; if a later unit shows an iteration-budget win it ships
 // behind an opt-in Config gate, else it is removed (plan: "Deferred to Implementation").
 //
-// Sparsity: over-dispatch + early-out on inactive cells/empty nodes — NEVER indirect dispatch
-// (R8). Tint discipline: no workgroupBarrier anywhere in this family, so the guard returns
-// are uniform-control-flow safe. Storage buffers per entry point ≤ 8 (see mod.rs derivation).
+// Sparsity: setup/node/coarse passes retain dense over-dispatch + early-out. On the guarded
+// semi-implicit, explicitly vented production path, only repeated fine-grid relaxation uses the
+// particle-derived indirect tile lists in active_tiles.wgsl; the dense entry points remain the
+// exact fallback and equivalence oracle. Tint discipline: no workgroupBarrier anywhere in this
+// family, so the guard returns are uniform-control-flow safe. Storage buffers per entry point ≤ 8
+// (see mod.rs derivation).
 
 // --- pressure-family bindings (indices continue the global table in common.wgsl) -------------
 // Per-node M̃⁻¹, 2 vec4 per node: [2n] = (xx, xy, xz, yy), [2n+1] = (yz, zz, massy_flag, 0).
@@ -777,9 +780,7 @@ fn coarse_cell_setup(@builtin(global_invocation_id) gid: vec3<u32>) {
 // =================================== residual ==================================================
 // r = rhs − A·p into cell_meta.z (the field the coarse stage restricts). Same composition
 // loops as jacobi_fine, no update — the restricted field and the smoother share one operator.
-@compute @workgroup_size(256)
-fn residual(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let c = gid.x;
+fn residual_cell(c: u32) {
     if (c >= num_fine_cells()) {
         return;
     }
@@ -826,13 +827,32 @@ fn residual(@builtin(global_invocation_id) gid: vec3<u32>) {
     cell_meta[c] = cm;
 }
 
+@compute @workgroup_size(256)
+fn residual(@builtin(global_invocation_id) gid: vec3<u32>) {
+    residual_cell(gid.x);
+}
+
+@compute @workgroup_size(256)
+fn residual_tiled(
+    @builtin(workgroup_id) workgroup: vec3<u32>,
+    @builtin(local_invocation_index) lane: u32,
+) {
+    let tile = active_tile_list_value(workgroup.x, false);
+    let cell0 = active_tile_cell(tile, lane);
+    if (cell_in_range(cell0)) {
+        residual_cell(cell_index(cell0));
+    }
+    let cell1 = active_tile_cell(tile, lane + 256u);
+    if (cell_in_range(cell1)) {
+        residual_cell(cell_index(cell1));
+    }
+}
+
 // =================================== Jacobi sweeps =============================================
 // One damped Jacobi sweep on the FINE grid. A p is evaluated as the literal composition
 // D(M̃⁻¹(G p)): for each corner node, gather (G p) from its 8 adjacent active cells, apply
 // M̃⁻¹, and accumulate the divergence sign — never a pre-derived stencil.
-@compute @workgroup_size(256)
-fn jacobi_fine(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let c = gid.x;
+fn jacobi_fine_cell(c: u32) {
     if (c >= num_fine_cells()) {
         return;
     }
@@ -892,6 +912,27 @@ fn jacobi_fine(@builtin(global_invocation_id) gid: vec3<u32>) {
         pf_dst[c] = pf_src[c] + JACOBI_OMEGA * (cm.x - ap) / diag;
     } else {
         pf_dst[c] = 0.0;
+    }
+}
+
+@compute @workgroup_size(256)
+fn jacobi_fine(@builtin(global_invocation_id) gid: vec3<u32>) {
+    jacobi_fine_cell(gid.x);
+}
+
+@compute @workgroup_size(256)
+fn jacobi_fine_tiled(
+    @builtin(workgroup_id) workgroup: vec3<u32>,
+    @builtin(local_invocation_index) lane: u32,
+) {
+    let tile = active_tile_list_value(workgroup.x, false);
+    let cell0 = active_tile_cell(tile, lane);
+    if (cell_in_range(cell0)) {
+        jacobi_fine_cell(cell_index(cell0));
+    }
+    let cell1 = active_tile_cell(tile, lane + 256u);
+    if (cell_in_range(cell1)) {
+        jacobi_fine_cell(cell_index(cell1));
     }
 }
 
@@ -964,9 +1005,7 @@ fn jacobi_coarse(@builtin(global_invocation_id) gid: vec3<u32>) {
 // P: masked trilinear prolongation of the coarse CORRECTION, added to the current pressure
 // (reads binding 11, writes binding 12 — parity-flips like a sweep). Transpose pair of the
 // restriction by shared hat_w.
-@compute @workgroup_size(256)
-fn prolong_add(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let c = gid.x;
+fn prolong_add_cell(c: u32) {
     if (c >= num_fine_cells()) {
         return;
     }
@@ -1005,6 +1044,27 @@ fn prolong_add(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
     pf_dst[c] = pf_src[c] + sum;
+}
+
+@compute @workgroup_size(256)
+fn prolong_add(@builtin(global_invocation_id) gid: vec3<u32>) {
+    prolong_add_cell(gid.x);
+}
+
+@compute @workgroup_size(256)
+fn prolong_add_tiled(
+    @builtin(workgroup_id) workgroup: vec3<u32>,
+    @builtin(local_invocation_index) lane: u32,
+) {
+    let tile = active_tile_list_value(workgroup.x, false);
+    let cell0 = active_tile_cell(tile, lane);
+    if (cell_in_range(cell0)) {
+        prolong_add_cell(cell_index(cell0));
+    }
+    let cell1 = active_tile_cell(tile, lane + 256u);
+    if (cell_in_range(cell1)) {
+        prolong_add_cell(cell_index(cell1));
+    }
 }
 
 // =================================== project ===================================================

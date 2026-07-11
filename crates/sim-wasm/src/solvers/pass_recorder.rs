@@ -117,6 +117,62 @@ impl<'a> PassRecorder<'a> {
         }
     }
 
+    /// Record one indirect compute dispatch. Bookkeeping and timestamp behavior intentionally
+    /// match [`Self::dispatch`]: this is one logical dispatch even though its workgroup count is
+    /// produced on the GPU. The argument buffer must contain WebGPU's three-u32 dispatch record
+    /// at `offset`; callers are responsible for ending any producer pass before copying/writing
+    /// that record.
+    pub fn dispatch_indirect(
+        &mut self,
+        enc: &mut wgpu::CommandEncoder,
+        pipeline: &wgpu::ComputePipeline,
+        bind_group: &wgpu::BindGroup,
+        label: &str,
+        indirect_buffer: &wgpu::Buffer,
+        offset: u64,
+    ) {
+        self.dispatches += 1;
+        match &self.ts {
+            Some(sink) => {
+                let tw = if self.cursor + 1 < sink.capacity {
+                    let b = self.cursor;
+                    let e = self.cursor + 1;
+                    self.cursor += 2;
+                    self.labels.push(label.to_string());
+                    Some(wgpu::ComputePassTimestampWrites {
+                        query_set: sink.qset,
+                        beginning_of_pass_write_index: Some(b),
+                        end_of_pass_write_index: Some(e),
+                    })
+                } else {
+                    None
+                };
+                let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some(label),
+                    timestamp_writes: tw,
+                });
+                pass.set_pipeline(pipeline);
+                pass.set_bind_group(0, Some(bind_group), &[]);
+                pass.dispatch_workgroups_indirect(indirect_buffer, offset);
+            }
+            None => {
+                if self.open.is_none() {
+                    let pass = enc
+                        .begin_compute_pass(&wgpu::ComputePassDescriptor {
+                            label: Some("batched-compute"),
+                            timestamp_writes: None,
+                        })
+                        .forget_lifetime();
+                    self.open = Some(pass);
+                }
+                let pass = self.open.as_mut().expect("pass just opened");
+                pass.set_pipeline(pipeline);
+                pass.set_bind_group(0, Some(bind_group), &[]);
+                pass.dispatch_workgroups_indirect(indirect_buffer, offset);
+            }
+        }
+    }
+
     /// Close any open batched pass so the encoder is free for a direct op
     /// (`copy_buffer_to_buffer`, `resolve_query_set`). No-op in timestamp mode (passes are
     /// already closed per-dispatch) and when no pass is open.
