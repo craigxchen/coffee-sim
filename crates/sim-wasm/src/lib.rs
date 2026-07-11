@@ -472,6 +472,49 @@ fn attach_common_diagnostics(obj: &js_sys::Object, snapshot: CommonMetrics) -> R
     )?;
     set_object(obj, "inventory", &inventory)?;
 
+    let retention = js_sys::Object::new();
+    set_number(
+        &retention,
+        "targetWholeBedCarrierMassGrams",
+        snapshot.retention_target_carrier_mass_g,
+    )?;
+    set_number(
+        &retention,
+        "boundCapacityCarrierMassGrams",
+        snapshot.retention_bound_capacity_mass_g,
+    )?;
+    set_number(
+        &retention,
+        "capillaryTargetCarrierMassGrams",
+        snapshot.retention_capillary_target_mass_g,
+    )?;
+    set_number(
+        &retention,
+        "availablePoreVolumeMl",
+        snapshot.retention_available_pore_volume_ml,
+    )?;
+    set_number(
+        &retention,
+        "capillaryAllocatedCarrierMassGrams",
+        snapshot.retention_capillary_carrier_mass_g,
+    )?;
+    set_number(
+        &retention,
+        "unmetCarrierMassGrams",
+        snapshot.retention_unmet_carrier_mass_g,
+    )?;
+    set_number(
+        &retention,
+        "residualPoreSaturation",
+        snapshot.residual_pore_saturation,
+    )?;
+    set_bool(
+        &retention,
+        "targetAttainable",
+        snapshot.retention_target_attainable,
+    )?;
+    set_object(obj, "retention", &retention)?;
+
     let filter = js_sys::Object::new();
     set_number(&filter, "occupiedMl", snapshot.filter_occupied_ml)?;
     set_number(&filter, "capacityMl", snapshot.filter_capacity_ml)?;
@@ -802,6 +845,15 @@ impl WasmSim3D {
     pub fn load_mpm_v2_late_brew_benchmark(&mut self) -> Result<(), JsValue> {
         self.load_scene(SceneSpec::Debug {
             id: "mpm-v2-late-brew-benchmark".to_string(),
+        })
+    }
+
+    /// Hidden deterministic saturated-bed scene used by the browser calibration observation
+    /// harness. It avoids replaying a full pour for each permeability/extraction comparison.
+    #[wasm_bindgen(js_name = loadMpmV2CalibrationDrainage)]
+    pub fn load_mpm_v2_calibration_drainage(&mut self) -> Result<(), JsValue> {
+        self.load_scene(SceneSpec::Debug {
+            id: crate::solvers::twofield_runtime::MPM_V2_CALIBRATION_DRAINAGE_SCENE_ID.to_string(),
         })
     }
 

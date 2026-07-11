@@ -4,7 +4,9 @@ use crate::solvers::base::{
     FrameSolver, ResetContext, SceneSpec, SolverId,
 };
 use crate::solvers::registry::build_solver_with_mpm_v2_calibration;
-use crate::solvers::twofield_runtime::MPM_V2_LATE_BREW_BENCHMARK_SCENE_ID;
+use crate::solvers::twofield_runtime::{
+    MPM_V2_CALIBRATION_DRAINAGE_SCENE_ID, MPM_V2_LATE_BREW_BENCHMARK_SCENE_ID,
+};
 
 #[derive(Clone, Debug, Default)]
 struct CalibrationState {
@@ -40,11 +42,20 @@ pub(crate) struct Simulator {
 fn scene_for_solver(scene: &SceneSpec, id: SolverId) -> SceneSpec {
     match scene {
         SceneSpec::Debug { id: debug_id }
-            if id == SolverId::MpmV2 && debug_id == MPM_V2_LATE_BREW_BENCHMARK_SCENE_ID =>
+            if id == SolverId::MpmV2
+                && matches!(
+                    debug_id.as_str(),
+                    MPM_V2_LATE_BREW_BENCHMARK_SCENE_ID | MPM_V2_CALIBRATION_DRAINAGE_SCENE_ID
+                ) =>
         {
             scene.clone()
         }
-        SceneSpec::Debug { id: debug_id } if debug_id == MPM_V2_LATE_BREW_BENCHMARK_SCENE_ID => {
+        SceneSpec::Debug { id: debug_id }
+            if matches!(
+                debug_id.as_str(),
+                MPM_V2_LATE_BREW_BENCHMARK_SCENE_ID | MPM_V2_CALIBRATION_DRAINAGE_SCENE_ID
+            ) =>
+        {
             SceneSpec::CenterPour
         }
         SceneSpec::Debug { .. } if id == SolverId::Mpm => scene.clone(),
@@ -226,6 +237,15 @@ mod tests {
         );
         assert_eq!(
             scene_for_solver(&benchmark, SolverId::Mpm),
+            SceneSpec::CenterPour
+        );
+
+        let calibration = SceneSpec::Debug {
+            id: MPM_V2_CALIBRATION_DRAINAGE_SCENE_ID.to_string(),
+        };
+        assert_eq!(scene_for_solver(&calibration, SolverId::MpmV2), calibration);
+        assert_eq!(
+            scene_for_solver(&calibration, SolverId::Xpbd),
             SceneSpec::CenterPour
         );
     }

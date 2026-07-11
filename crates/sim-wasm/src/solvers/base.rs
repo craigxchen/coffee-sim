@@ -164,6 +164,16 @@ pub(crate) struct CommonMetrics {
     pub(crate) carrier_mass_residual_g: f32,
     pub(crate) solute_mass_residual_g: f32,
     pub(crate) mechanical_mass_residual_g: f32,
+    /// Build-time whole-bed retention ledger. These are water-mass equivalents of the solver's
+    /// reduced-volume allocation; filter-paper water is reported separately below.
+    pub(crate) retention_target_carrier_mass_g: f32,
+    pub(crate) retention_bound_capacity_mass_g: f32,
+    pub(crate) retention_capillary_target_mass_g: f32,
+    pub(crate) retention_available_pore_volume_ml: f32,
+    pub(crate) retention_capillary_carrier_mass_g: f32,
+    pub(crate) retention_unmet_carrier_mass_g: f32,
+    pub(crate) residual_pore_saturation: f32,
+    pub(crate) retention_target_attainable: bool,
     pub(crate) filter_occupied_ml: f32,
     pub(crate) filter_capacity_ml: f32,
     pub(crate) filter_saturation: f32,

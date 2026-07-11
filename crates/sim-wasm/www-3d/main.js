@@ -1481,6 +1481,7 @@ function publishDebugHooks() {
     stepFramesForEvaluation,
     sampleRealism: captureRealismSample,
     runRealismEvaluation,
+    runMpmV2CalibrationObservations,
     benchmarkWebGpu: runWebGpuBenchmark,
   };
   document.addEventListener("coffee-sim-run-realism-evaluation", (event) => {
@@ -1772,6 +1773,774 @@ function assessRealismSamples(samples) {
   };
 }
 
+const MPM_V2_OBSERVATION_CONTRACT = "mpm-v2-calibration-observations-v1";
+const MPM_V2_OBSERVATION_DRY_COFFEE_GRAMS = 15.0;
+const RETENTION_PRIOR_GRAMS_PER_GRAM = 2.1;
+const SWELLING_LITERATURE_ENVELOPE_FRACTION = [0.0, 0.15];
+// Compact MPM-v2 diagnostics are dispatched every 0.25 simulated seconds. The extra 0.05 s
+// allows normal frame quantization but is still strict enough to reject a missed readback cycle.
+const MPM_V2_DIAGNOSTICS_FRESHNESS_SECONDS = 0.30;
+// Numerical ledger gates scale with the conserved inventory. They do not encode coffee behavior.
+const WEBGPU_LEDGER_RELATIVE_TOLERANCE = 1e-4;
+const WEBGPU_LEDGER_ABSOLUTE_TOLERANCE_GRAMS = 1e-3;
+
+function calibrationValuesObject() {
+  return Object.fromEntries(
+    Array.from(app.calibrationValues()).map(({ id, value }) => [id, value]),
+  );
+}
+
+function calibrationSchemaMap() {
+  return new Map(Array.from(app.calibrationSchema()).map((entry) => [entry.id, entry]));
+}
+
+function observationDiagnosticsRejection(diagnostics, freshnessSeconds) {
+  if (!diagnostics?.diagnosticsSupported) return "diagnostics-unsupported";
+  if (!diagnostics.diagnosticsValid) return "diagnostics-invalid";
+  if (diagnostics.diagnosticsPending) return "diagnostics-pending";
+  if (!diagnostics.allFinite) return "non-finite-state";
+  const age = diagnostics.diagnosticsSampleAgeSeconds;
+  if (!Number.isFinite(age)) return "diagnostics-age-non-finite";
+  if (age > freshnessSeconds) return "diagnostics-stale";
+  return null;
+}
+
+/**
+ * Drain the compact diagnostic readback ring without ever treating a stale cache entry as data.
+ * A zero-dt step polls completed mappings without advancing simulated time. Two iterations are
+ * commonly required: one to submit the current snapshot and one to apply its mapped result.
+ */
+async function readFreshMpmV2Diagnostics({
+  maxAttempts = 8,
+  freshnessSeconds = MPM_V2_DIAGNOSTICS_FRESHNESS_SECONDS,
+} = {}) {
+  let lastDiagnostics = null;
+  let rejectionReason = "diagnostics-unavailable";
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    await app.waitForGpu();
+    await nextAnimationFrame();
+    app.stepFrame(0);
+    await app.waitForGpu();
+    await nextAnimationFrame();
+    lastDiagnostics = await app.waterDiagnostics();
+    rejectionReason = observationDiagnosticsRejection(lastDiagnostics, freshnessSeconds);
+    if (!rejectionReason) {
+      return {
+        accepted: true,
+        attempts: attempt,
+        freshnessSeconds,
+        diagnostics: lastDiagnostics,
+      };
+    }
+  }
+  return {
+    accepted: false,
+    attempts: maxAttempts,
+    freshnessSeconds,
+    rejectionReason,
+    rejectedDiagnostics: lastDiagnostics,
+  };
+}
+
+async function captureMpmV2ObservationSample(label, scenarioId, options) {
+  app.render();
+  const diagnosticRead = await readFreshMpmV2Diagnostics(options);
+  const sample = {
+    label,
+    scenarioId,
+    simTimeSeconds: app.simTime(),
+    emittedWaterMl: app.totalEmittedMl(),
+    flowRateMlPerSecond: app.flowRate(),
+    waterVelocityMetersPerSecond: app.waterVelocityMetersPerSecond(),
+    waterSamples: app.waterSlotsUsed(),
+    solidSamples: app.bedParticleCount(),
+    diagnosticsStatus: {
+      accepted: diagnosticRead.accepted,
+      attempts: diagnosticRead.attempts,
+      freshnessSeconds: diagnosticRead.freshnessSeconds,
+      rejectionReason: diagnosticRead.rejectionReason ?? null,
+    },
+    diagnostics: diagnosticRead.accepted ? diagnosticRead.diagnostics : null,
+    rejectedDiagnostics: diagnosticRead.accepted
+      ? null
+      : diagnosticRead.rejectedDiagnostics,
+  };
+  options.onSample?.({ scenarioId, sample });
+  return sample;
+}
+
+async function advanceMpmV2ObservationFrames(frameCount, secondsPerFrame = 1 / 60) {
+  const count = Math.max(0, Math.floor(frameCount));
+  for (let frame = 0; frame < count; frame += 1) {
+    app.stepFrame(secondsPerFrame);
+    if ((frame + 1) % 60 === 0) {
+      await app.waitForGpu();
+      await nextAnimationFrame();
+    }
+  }
+}
+
+function lastAcceptedObservationSample(samples) {
+  return [...samples].reverse().find((sample) => sample.diagnostics) ?? null;
+}
+
+function observedNumericOrdering(values, comparator) {
+  if (!values.every(Number.isFinite)) return null;
+  return values.slice(1).every((value, index) => comparator(values[index], value));
+}
+
+function observedNumericDifference(a, b) {
+  return Number.isFinite(a) && Number.isFinite(b) ? a - b : null;
+}
+
+function deriveDrawdownObservation(samples) {
+  const usable = samples.filter((sample) => sample.diagnostics);
+  if (usable.length === 0) {
+    return { peakPondCarrierMassGrams: null, drawdownTimeSeconds: null };
+  }
+  let peakIndex = 0;
+  for (let index = 1; index < usable.length; index += 1) {
+    if (
+      usable[index].diagnostics.inventory.pondCarrierMassGrams
+      > usable[peakIndex].diagnostics.inventory.pondCarrierMassGrams
+    ) {
+      peakIndex = index;
+    }
+  }
+  const peak = usable[peakIndex].diagnostics.inventory.pondCarrierMassGrams;
+  const threshold = 0.10 * peak;
+  const drawdown = peak > 0
+    ? usable.slice(peakIndex + 1).find(
+      (sample) => sample.diagnostics.inventory.pondCarrierMassGrams <= threshold,
+    )
+    : null;
+  return {
+    peakPondCarrierMassGrams: peak,
+    tenPercentThresholdGrams: threshold,
+    peakTimeSeconds: usable[peakIndex].simTimeSeconds,
+    drawdownTimeSeconds: drawdown?.simTimeSeconds ?? null,
+    drawdownElapsedFromPeakSeconds: drawdown
+      ? drawdown.simTimeSeconds - usable[peakIndex].simTimeSeconds
+      : null,
+  };
+}
+
+function loadMpmV2ObservationScene(sceneId) {
+  if (sceneId === "center-pour") {
+    app.loadBenchmarkCenterPour();
+    currentSceneId = "center-pour";
+    currentSceneMode = "Center Pour";
+  } else {
+    app.loadMpmV2CalibrationDrainage();
+    currentSceneId = "mpm-v2-uniform-bed-saturation";
+    currentSceneMode = "MPM v2 Uniform Bed Saturation";
+  }
+  fixedStepSeconds = 1 / 60;
+  lastFrameTime = 0;
+  simulationAccumulatorSeconds = 0;
+  syncControlDefaultsFromSim();
+  applySceneControls();
+  resetTimeseries();
+}
+
+async function runTimedMpmV2Probe({
+  scenarioId,
+  durationSeconds,
+  sampleEverySeconds,
+  diagnosticOptions,
+}) {
+  loadMpmV2ObservationScene("uniform-bed-saturation");
+  setEvaluationWaterVelocity(0);
+  const samples = [
+    await captureMpmV2ObservationSample("initial", scenarioId, diagnosticOptions),
+  ];
+  const totalFrames = Math.max(0, Math.round(durationSeconds * 60));
+  const sampleFrames = Math.max(1, Math.round(sampleEverySeconds * 60));
+  let advancedFrames = 0;
+  while (advancedFrames < totalFrames) {
+    const nextFrames = Math.min(sampleFrames, totalFrames - advancedFrames);
+    await advanceMpmV2ObservationFrames(nextFrames);
+    advancedFrames += nextFrames;
+    samples.push(await captureMpmV2ObservationSample(
+      `t-${(advancedFrames / 60).toFixed(2)}s`,
+      scenarioId,
+      diagnosticOptions,
+    ));
+  }
+  const initial = samples.find((sample) => sample.diagnostics);
+  const final = lastAcceptedObservationSample(samples);
+  return {
+    scenarioId,
+    durationSeconds: totalFrames / 60,
+    sampleEverySeconds,
+    samples,
+    derived: {
+      ...deriveDrawdownObservation(samples),
+      initialCupCarrierMassGrams:
+        initial?.diagnostics.inventory.cupCarrierMassGrams ?? null,
+      finalCupCarrierMassGrams:
+        final?.diagnostics.inventory.cupCarrierMassGrams ?? null,
+      cupCarrierGainGrams: initial && final
+        ? final.diagnostics.inventory.cupCarrierMassGrams
+          - initial.diagnostics.inventory.cupCarrierMassGrams
+        : null,
+      finalPondCarrierMassGrams:
+        final?.diagnostics.inventory.pondCarrierMassGrams ?? null,
+      finalDissolvedSoluteMassGrams:
+        final?.diagnostics.inventory.dissolvedSoluteMassGrams ?? null,
+      finalCupSoluteMassGrams:
+        final?.diagnostics.inventory.cupSoluteMassGrams ?? null,
+      finalCupTds: final?.diagnostics.cupTds ?? null,
+      finalExtractionYield: final?.diagnostics.extractionYield ?? null,
+    },
+  };
+}
+
+async function runFullDoseMpmV2Observation(options) {
+  const {
+    targetWaterMl,
+    pourSpeedMetersPerSecond,
+    pourSampleEverySeconds,
+    maxPourSeconds,
+    drainSampleEverySeconds,
+    minDrainSeconds,
+    maxDrainSeconds,
+  } = options;
+  const diagnosticOptions = options.diagnosticOptions;
+  const scenarioId = "full-15g-250ml-center-pour";
+  loadMpmV2ObservationScene("center-pour");
+  setEvaluationWaterVelocity(pourSpeedMetersPerSecond);
+  const samples = [
+    await captureMpmV2ObservationSample("initial", scenarioId, diagnosticOptions),
+  ];
+  const pourIntervalFrames = Math.max(1, Math.round(pourSampleEverySeconds * 60));
+  const maxPourFrames = Math.max(1, Math.round(maxPourSeconds * 60));
+  let pourFrames = 0;
+  let stagnantSamples = 0;
+  let priorEmittedMl = app.totalEmittedMl();
+  let deliveryStopReason = "target-reached";
+  while (app.totalEmittedMl() < targetWaterMl && pourFrames < maxPourFrames) {
+    const nextFrames = Math.min(pourIntervalFrames, maxPourFrames - pourFrames);
+    await advanceMpmV2ObservationFrames(nextFrames);
+    pourFrames += nextFrames;
+    const sample = await captureMpmV2ObservationSample(
+      `pour-${(pourFrames / 60).toFixed(2)}s`,
+      scenarioId,
+      diagnosticOptions,
+    );
+    samples.push(sample);
+    const emittedMl = app.totalEmittedMl();
+    stagnantSamples = emittedMl <= priorEmittedMl + 1e-6 ? stagnantSamples + 1 : 0;
+    priorEmittedMl = emittedMl;
+    if (stagnantSamples >= 3) {
+      deliveryStopReason = "emission-plateau";
+      break;
+    }
+  }
+  if (app.totalEmittedMl() < targetWaterMl && deliveryStopReason === "target-reached") {
+    deliveryStopReason = "max-pour-time";
+  }
+
+  setEvaluationWaterVelocity(0);
+  samples.push(await captureMpmV2ObservationSample(
+    "pour-off",
+    scenarioId,
+    diagnosticOptions,
+  ));
+  const drainIntervalFrames = Math.max(1, Math.round(drainSampleEverySeconds * 60));
+  const maxDrainFrames = Math.max(0, Math.round(maxDrainSeconds * 60));
+  const minDrainFrames = Math.max(0, Math.round(minDrainSeconds * 60));
+  let drainFrames = 0;
+  let belowDrawdownSamples = 0;
+  let drainStopReason = "max-drain-time";
+  while (drainFrames < maxDrainFrames) {
+    const nextFrames = Math.min(drainIntervalFrames, maxDrainFrames - drainFrames);
+    await advanceMpmV2ObservationFrames(nextFrames);
+    drainFrames += nextFrames;
+    samples.push(await captureMpmV2ObservationSample(
+      `drain-${(drainFrames / 60).toFixed(2)}s`,
+      scenarioId,
+      diagnosticOptions,
+    ));
+    const drawdown = deriveDrawdownObservation(samples);
+    const last = lastAcceptedObservationSample(samples);
+    const belowThreshold = drawdown.peakPondCarrierMassGrams > 0
+      && last
+      && last.diagnostics.inventory.pondCarrierMassGrams
+        <= drawdown.tenPercentThresholdGrams;
+    belowDrawdownSamples = belowThreshold ? belowDrawdownSamples + 1 : 0;
+    if (drainFrames >= minDrainFrames && belowDrawdownSamples >= 2) {
+      drainStopReason = "pond-below-ten-percent-of-peak";
+      break;
+    }
+  }
+  const final = lastAcceptedObservationSample(samples);
+  return {
+    scenarioId,
+    recipe: {
+      dryCoffeeMassGrams: MPM_V2_OBSERVATION_DRY_COFFEE_GRAMS,
+      requestedWaterMl: targetWaterMl,
+      pourSpeedMetersPerSecond,
+    },
+    deliveredWaterMl: app.totalEmittedMl(),
+    pourDurationSeconds: pourFrames / 60,
+    drainDurationSeconds: drainFrames / 60,
+    deliveryStopReason,
+    drainStopReason,
+    samples,
+    derived: {
+      ...deriveDrawdownObservation(samples),
+      finalCupCarrierMassGrams:
+        final?.diagnostics.inventory.cupCarrierMassGrams ?? null,
+      finalPondCarrierMassGrams:
+        final?.diagnostics.inventory.pondCarrierMassGrams ?? null,
+      finalCarrierMassResidualGrams:
+        final?.diagnostics.inventory.carrierMassResidualGrams ?? null,
+      finalSoluteMassResidualGrams:
+        final?.diagnostics.inventory.soluteMassResidualGrams ?? null,
+      finalMechanicalMassResidualGrams:
+        final?.diagnostics.inventory.mechanicalMassResidualGrams ?? null,
+      finalNonfiniteParticleCount:
+        final?.diagnostics.nonfiniteParticleCount ?? null,
+      finalNonfiniteGridNodeCount:
+        final?.diagnostics.nonfiniteGridNodeCount ?? null,
+    },
+  };
+}
+
+function applyObservationCalibration(id, value, touchedCalibration, applications) {
+  const result = app.setCalibrationValue(id, value);
+  touchedCalibration.add(id);
+  const applied = calibrationValuesObject()[id];
+  applications.push({ id, requested: value, applied, ...result });
+  return applied;
+}
+
+function clampCalibrationProbeValue(schema, id, value) {
+  const descriptor = schema.get(id);
+  if (!descriptor) throw new Error(`Missing calibration descriptor: ${id}`);
+  return clamp(value, descriptor.min, descriptor.max);
+}
+
+function deriveRetentionComparison(fullDose) {
+  const final = lastAcceptedObservationSample(fullDose.samples);
+  if (!final) return { available: false, reason: "no-accepted-diagnostics" };
+  const { retention, inventory } = final.diagnostics;
+  const ledgerComponents = {
+    boundCapacityCarrierMassGrams: retention.boundCapacityCarrierMassGrams,
+    capillaryAllocatedCarrierMassGrams: retention.capillaryAllocatedCarrierMassGrams,
+    unmetCarrierMassGrams: retention.unmetCarrierMassGrams,
+  };
+  const accountedTarget = Object.values(ledgerComponents).reduce((sum, value) => sum + value, 0);
+  const broadPriorMass = RETENTION_PRIOR_GRAMS_PER_GRAM
+    * MPM_V2_OBSERVATION_DRY_COFFEE_GRAMS;
+  return {
+    available: true,
+    interpretation: "build-time whole-bed allocation; paper is a separate measured inventory",
+    broadPrior: {
+      gramsWaterPerGramDryCoffee: RETENTION_PRIOR_GRAMS_PER_GRAM,
+      carrierMassGramsForRecipe: broadPriorMass,
+      use: "comparison only, not an equality target",
+    },
+    configuredWholeBedTargetCarrierMassGrams: retention.targetWholeBedCarrierMassGrams,
+    configuredWholeBedTargetGramsPerGram:
+      retention.targetWholeBedCarrierMassGrams / MPM_V2_OBSERVATION_DRY_COFFEE_GRAMS,
+    ledgerComponents,
+    ledgerAccountedTargetCarrierMassGrams: accountedTarget,
+    ledgerClosureResidualGrams: accountedTarget - retention.targetWholeBedCarrierMassGrams,
+    targetAttainable: retention.targetAttainable,
+    residualPoreSaturation: retention.residualPoreSaturation,
+    measuredAtFinalSample: {
+      boundCarrierMassGrams: inventory.boundCarrierMassGrams,
+      paperCarrierMassGrams: inventory.paperCarrierMassGrams,
+      note: "capillary allocation is a constitutive ledger, not a separately tagged live phase",
+    },
+  };
+}
+
+function deriveSwellingComparison(fullDose, selectedMaximumFraction) {
+  const final = lastAcceptedObservationSample(fullDose.samples);
+  const measuredRatio = final?.diagnostics.meanDiameterRatio ?? null;
+  const measuredFraction = measuredRatio === null ? null : measuredRatio - 1;
+  return {
+    selectedMaximumDiameterSwellingFraction: selectedMaximumFraction,
+    measuredMeanBoundSaturation: final?.diagnostics.meanBoundSaturation ?? null,
+    measuredMeanDiameterRatio: measuredRatio,
+    measuredMeanDiameterSwellingFraction: measuredFraction,
+    saturationWeightedRatioFromSelectedSlider: final
+      ? 1 + final.diagnostics.meanBoundSaturation * selectedMaximumFraction
+      : null,
+    literatureDiameterSwellingEnvelopeFraction: SWELLING_LITERATURE_ENVELOPE_FRACTION,
+    measuredWithinLiteratureEnvelope: measuredFraction === null
+      ? null
+      : measuredFraction >= SWELLING_LITERATURE_ENVELOPE_FRACTION[0]
+        && measuredFraction <= SWELLING_LITERATURE_ENVELOPE_FRACTION[1],
+    interpretation: "observation only; the literature envelope is not a calibration assertion",
+  };
+}
+
+function captureObservationUiState() {
+  return {
+    solverId: activeSolverId,
+    sceneId: currentSceneId,
+    sceneMode: currentSceneMode,
+    paused,
+    fixedStepSeconds,
+    waterVelocityMetersPerSecond: app.waterVelocityMetersPerSecond(),
+    spout: { x: app.spoutX(), y: app.spoutY(), z: app.spoutZ() },
+  };
+}
+
+async function restoreObservationUiState(saved, savedCalibration, touchedCalibration) {
+  await app.waitForGpu();
+  let calibrationRestored = false;
+  if (savedCalibration) {
+    if (app.activeSolver() !== CALIBRATION_SOLVER_ID) app.setSolver(CALIBRATION_SOLVER_ID);
+    for (const id of touchedCalibration) {
+      if (savedCalibration[id] === undefined) continue;
+      const current = calibrationValuesObject()[id];
+      if (current !== savedCalibration[id]) app.setCalibrationValue(id, savedCalibration[id]);
+    }
+    calibrationRestored = [...touchedCalibration].every(
+      (id) => savedCalibration[id] === undefined
+        || calibrationValuesObject()[id] === savedCalibration[id],
+    );
+  }
+  if (app.activeSolver() !== saved.solverId) app.setSolver(saved.solverId);
+  activeSolverId = app.activeSolver();
+  if (saved.sceneId === "free-stream") {
+    app.loadBenchmarkFreeStream();
+  } else if (saved.sceneId === "mpm-v2-late-brew-benchmark") {
+    app.loadMpmV2LateBrewBenchmark();
+  } else if (saved.sceneId === "mpm-v2-uniform-bed-saturation") {
+    app.loadMpmV2CalibrationDrainage();
+  } else if (saved.sceneId.startsWith("debug:") && saved.solverId === "mpm") {
+    app.loadDebugScene(saved.sceneId.slice("debug:".length));
+  } else {
+    app.loadBenchmarkCenterPour();
+  }
+  currentSceneId = saved.sceneId;
+  currentSceneMode = saved.sceneMode;
+  fixedStepSeconds = saved.fixedStepSeconds;
+  app.setWaterVelocityMetersPerSecond(saved.waterVelocityMetersPerSecond);
+  app.setSpoutPosition(saved.spout.x, saved.spout.y, saved.spout.z);
+  syncControlDefaultsFromSim();
+  setPaused(saved.paused);
+  lastFrameTime = 0;
+  simulationAccumulatorSeconds = 0;
+  resetTimeseries();
+  syncSolverSelect();
+  syncUi();
+  return {
+    solverRestored: app.activeSolver() === saved.solverId,
+    sceneSelectionRestored: currentSceneId === saved.sceneId,
+    calibrationRestored,
+    priorSimulationProgressRestored: false,
+    note: "The selected scene and controls are restored by reloading; GPU particle history cannot be snapshotted.",
+  };
+}
+
+/**
+ * Reproducible MPM-v2 brewing observations for interactive calibration. The return value contains
+ * raw time series and directional comparisons only; uncertain coffee priors never become pass/fail
+ * gates. The currently selected calibration is the comparison baseline and is restored afterward.
+ */
+async function runMpmV2CalibrationObservations(options = {}) {
+  if (evaluationActive) {
+    throw new Error("A realism evaluation, calibration observation, or benchmark is already running");
+  }
+  const settings = {
+    targetWaterMl: options.targetWaterMl ?? 250,
+    pourSpeedMetersPerSecond: options.pourSpeedMetersPerSecond ?? 0.60,
+    pourSampleEverySeconds: options.pourSampleEverySeconds ?? 2,
+    maxPourSeconds: options.maxPourSeconds ?? 45,
+    drainSampleEverySeconds: options.drainSampleEverySeconds ?? 2,
+    minDrainSeconds: options.minDrainSeconds ?? 8,
+    maxDrainSeconds: options.maxDrainSeconds ?? 60,
+    permeabilityProbeSeconds: options.permeabilityProbeSeconds ?? 12,
+    extractionProbeSeconds: options.extractionProbeSeconds ?? 12,
+    probeSampleEverySeconds: options.probeSampleEverySeconds ?? 1,
+    permeabilityDeltaLog10: options.permeabilityDeltaLog10 ?? 1,
+    extractionLowScale: options.extractionLowScale ?? 0.1,
+    diagnosticOptions: {
+      maxAttempts: options.diagnosticMaxAttempts ?? 8,
+      freshnessSeconds:
+        options.diagnosticFreshnessSeconds ?? MPM_V2_DIAGNOSTICS_FRESHNESS_SECONDS,
+      onSample: options.onSample ?? null,
+    },
+  };
+  for (const [name, value] of Object.entries(settings)) {
+    if (name === "diagnosticOptions") continue;
+    if (!Number.isFinite(value) || value < 0) throw new Error(`${name} must be non-negative`);
+  }
+  if (!Number.isInteger(settings.diagnosticOptions.maxAttempts)
+      || settings.diagnosticOptions.maxAttempts <= 0) {
+    throw new Error("diagnosticMaxAttempts must be a positive integer");
+  }
+  if (!Number.isFinite(settings.diagnosticOptions.freshnessSeconds)
+      || settings.diagnosticOptions.freshnessSeconds < 0) {
+    throw new Error("diagnosticFreshnessSeconds must be non-negative");
+  }
+
+  const savedUi = captureObservationUiState();
+  const touchedCalibration = new Set();
+  const calibrationApplications = [];
+  let savedCalibration = null;
+  let result = null;
+  evaluationActive = true;
+  clearCalibrationApplyTimers();
+  try {
+    setPaused(true);
+    heldKeys.clear();
+    dragging = false;
+    spoutPlaneDragging = false;
+    if (activeSolverId !== CALIBRATION_SOLVER_ID) {
+      app.setSolver(CALIBRATION_SOLVER_ID);
+      activeSolverId = app.activeSolver();
+    }
+    savedCalibration = calibrationValuesObject();
+    const schema = calibrationSchemaMap();
+
+    const fullDose = await runFullDoseMpmV2Observation(settings);
+
+    const permeabilityId = "log10_permeability_m2";
+    const selectedPermeability = savedCalibration[permeabilityId];
+    const permeabilityValues = {
+      low: clampCalibrationProbeValue(
+        schema,
+        permeabilityId,
+        selectedPermeability - settings.permeabilityDeltaLog10,
+      ),
+      default: selectedPermeability,
+      high: clampCalibrationProbeValue(
+        schema,
+        permeabilityId,
+        selectedPermeability + settings.permeabilityDeltaLog10,
+      ),
+    };
+    const permeability = [];
+    for (const [variant, value] of Object.entries(permeabilityValues)) {
+      const applied = applyObservationCalibration(
+        permeabilityId,
+        value,
+        touchedCalibration,
+        calibrationApplications,
+      );
+      const probe = await runTimedMpmV2Probe({
+        scenarioId: `permeability-${variant}`,
+        durationSeconds: settings.permeabilityProbeSeconds,
+        sampleEverySeconds: settings.probeSampleEverySeconds,
+        diagnosticOptions: settings.diagnosticOptions,
+      });
+      permeability.push({
+        variant,
+        profileSource: variant === "default"
+          ? "saved UI calibration (not a factory reset)"
+          : "one-decade comparison around saved UI calibration",
+        log10PermeabilityM2: applied,
+        ...probe,
+      });
+    }
+
+    applyObservationCalibration(
+      permeabilityId,
+      selectedPermeability,
+      touchedCalibration,
+      calibrationApplications,
+    );
+    const extractionIds = ["extraction_fast_rate_per_s", "extraction_slow_rate_per_s"];
+    const extraction = [];
+    for (const variant of ["low", "default"]) {
+      const rates = {};
+      for (const id of extractionIds) {
+        const requested = variant === "low"
+          ? savedCalibration[id] * settings.extractionLowScale
+          : savedCalibration[id];
+        rates[id] = applyObservationCalibration(
+          id,
+          clampCalibrationProbeValue(schema, id, requested),
+          touchedCalibration,
+          calibrationApplications,
+        );
+      }
+      const probe = await runTimedMpmV2Probe({
+        scenarioId: `extraction-${variant}`,
+        durationSeconds: settings.extractionProbeSeconds,
+        sampleEverySeconds: settings.probeSampleEverySeconds,
+        diagnosticOptions: settings.diagnosticOptions,
+      });
+      extraction.push({
+        variant,
+        profileSource: variant === "default"
+          ? "saved UI calibration (not a factory reset)"
+          : "scaled comparison against saved UI calibration",
+        ratesPerSecond: rates,
+        ...probe,
+      });
+    }
+
+    const permeabilityByVariant = Object.fromEntries(
+      permeability.map((probe) => [probe.variant, probe]),
+    );
+    const extractionByVariant = Object.fromEntries(
+      extraction.map((probe) => [probe.variant, probe]),
+    );
+    result = {
+      contract: MPM_V2_OBSERVATION_CONTRACT,
+      interpretation: "raw observations and directional comparisons; no calibration pass/fail",
+      settings: {
+        ...settings,
+        diagnosticOptions: {
+          maxAttempts: settings.diagnosticOptions.maxAttempts,
+          freshnessSeconds: settings.diagnosticOptions.freshnessSeconds,
+        },
+      },
+      savedCalibration,
+      calibrationApplications,
+      scenarios: { fullDose, permeability, extraction },
+      comparisons: {
+        retention: deriveRetentionComparison(fullDose),
+        swelling: deriveSwellingComparison(
+          fullDose,
+          savedCalibration.max_diameter_swelling_fraction,
+        ),
+        permeability: {
+          expectedDirection: "higher permeability should drain more water and leave less ponding",
+          lowToDefaultToHighLog10M2: permeability.map(
+            ({ variant, log10PermeabilityM2 }) => ({ variant, log10PermeabilityM2 }),
+          ),
+          finalPondCarrierMassGrams: permeability.map(
+            ({ variant, derived }) => ({ variant, value: derived.finalPondCarrierMassGrams }),
+          ),
+          cupCarrierGainGrams: permeability.map(
+            ({ variant, derived }) => ({ variant, value: derived.cupCarrierGainGrams }),
+          ),
+          observedFinalPondOrdering: observedNumericOrdering(
+            [
+              permeabilityByVariant.low.derived.finalPondCarrierMassGrams,
+              permeabilityByVariant.default.derived.finalPondCarrierMassGrams,
+              permeabilityByVariant.high.derived.finalPondCarrierMassGrams,
+            ],
+            (lowerPermeability, higherPermeability) =>
+              lowerPermeability >= higherPermeability,
+          ),
+          observedCupGainOrdering: observedNumericOrdering(
+            [
+              permeabilityByVariant.low.derived.cupCarrierGainGrams,
+              permeabilityByVariant.default.derived.cupCarrierGainGrams,
+              permeabilityByVariant.high.derived.cupCarrierGainGrams,
+            ],
+            (lowerPermeability, higherPermeability) =>
+              lowerPermeability <= higherPermeability,
+          ),
+        },
+        extraction: {
+          expectedDirection: "saved extraction rates should dissolve more solute than 0.1× rates",
+          low: extractionByVariant.low.derived,
+          default: extractionByVariant.default.derived,
+          dissolvedSoluteDifferenceGrams: observedNumericDifference(
+            extractionByVariant.default.derived.finalDissolvedSoluteMassGrams,
+            extractionByVariant.low.derived.finalDissolvedSoluteMassGrams,
+          ),
+          cupTdsDifference: observedNumericDifference(
+            extractionByVariant.default.derived.finalCupTds,
+            extractionByVariant.low.derived.finalCupTds,
+          ),
+        },
+      },
+    };
+    console.info("Coffee sim MPM-v2 calibration observations", result);
+    return result;
+  } finally {
+    let restoration;
+    try {
+      restoration = await restoreObservationUiState(
+        savedUi,
+        savedCalibration,
+        touchedCalibration,
+      );
+    } finally {
+      evaluationActive = false;
+      lastFrameTime = 0;
+      simulationAccumulatorSeconds = 0;
+      syncUi();
+    }
+    if (result) result.restoration = restoration;
+  }
+}
+
+function assessWebGpuBenchmarkDiagnostics(diagnosticRead) {
+  if (!diagnosticRead.accepted) {
+    return {
+      accepted: false,
+      rejectionReasons: [diagnosticRead.rejectionReason ?? "diagnostics-unavailable"],
+      numericalChecks: null,
+    };
+  }
+  const diagnostics = diagnosticRead.diagnostics;
+  const { inventory, filter } = diagnostics;
+  const checks = [];
+  const checkResidual = (name, residual, scale) => {
+    const tolerance = Math.max(
+      WEBGPU_LEDGER_ABSOLUTE_TOLERANCE_GRAMS,
+      WEBGPU_LEDGER_RELATIVE_TOLERANCE * Math.max(Math.abs(scale), 1),
+    );
+    const accepted = Number.isFinite(residual) && Math.abs(residual) <= tolerance;
+    checks.push({ name, residualGrams: residual, scaleGrams: scale, toleranceGrams: tolerance, accepted });
+    return accepted;
+  };
+  const rejectionReasons = [];
+  if (diagnostics.nonfiniteParticleCount !== 0) {
+    rejectionReasons.push(`nonfinite-particles:${diagnostics.nonfiniteParticleCount}`);
+  }
+  if (diagnostics.nonfiniteGridNodeCount !== 0) {
+    rejectionReasons.push(`nonfinite-grid-nodes:${diagnostics.nonfiniteGridNodeCount}`);
+  }
+  if (filter.errors !== 0) rejectionReasons.push(`filter-errors:${filter.errors}`);
+  if (filter.parcelCountResidual !== 0) {
+    rejectionReasons.push(`filter-parcel-count-residual:${filter.parcelCountResidual}`);
+  }
+  const filterVolumeToleranceMl = 1e-5 * Math.max(filter.capacityMl, 1);
+  if (!Number.isFinite(filter.volumeResidualMl)
+      || Math.abs(filter.volumeResidualMl) > filterVolumeToleranceMl) {
+    rejectionReasons.push(`filter-volume-residual-ml:${filter.volumeResidualMl}`);
+  }
+  if (!checkResidual(
+    "carrier",
+    inventory.carrierMassResidualGrams,
+    inventory.expectedCarrierMassGrams,
+  )) {
+    rejectionReasons.push(`carrier-mass-residual-g:${inventory.carrierMassResidualGrams}`);
+  }
+  if (!checkResidual(
+    "solute",
+    inventory.soluteMassResidualGrams,
+    inventory.expectedSoluteMassGrams,
+  )) {
+    rejectionReasons.push(`solute-mass-residual-g:${inventory.soluteMassResidualGrams}`);
+  }
+  const mechanicalScale = Math.abs(inventory.expectedCarrierMassGrams)
+    + Math.abs(inventory.expectedSoluteMassGrams)
+    + Math.abs(inventory.grainMassGrams);
+  if (!checkResidual(
+    "mechanical",
+    inventory.mechanicalMassResidualGrams,
+    mechanicalScale,
+  )) {
+    rejectionReasons.push(`mechanical-mass-residual-g:${inventory.mechanicalMassResidualGrams}`);
+  }
+  return {
+    accepted: rejectionReasons.length === 0,
+    rejectionReasons,
+    numericalChecks: {
+      relativeTolerance: WEBGPU_LEDGER_RELATIVE_TOLERANCE,
+      absoluteToleranceGrams: WEBGPU_LEDGER_ABSOLUTE_TOLERANCE_GRAMS,
+      residuals: checks,
+      filterVolumeResidualToleranceMl: filterVolumeToleranceMl,
+    },
+  };
+}
+
 function quantile(sortedValues, probability) {
   if (sortedValues.length === 0) return 0;
   const index = (sortedValues.length - 1) * probability;
@@ -1866,9 +2635,21 @@ async function runWebGpuBenchmark(options = {}) {
     const measuredDisplayFrames = batchCount * displayFramesPerBatch;
     const simulatedSeconds = measuredDisplayFrames * 2 / 60;
     const realTimeFactor = simulatedSeconds / (measuredWallMilliseconds / 1000);
+    // This compact-cache freshness poll is deliberately after the final measured batch. It may
+    // submit zero-dt diagnostic work, but cannot improve or contaminate the timings above.
+    const diagnosticRead = await readFreshMpmV2Diagnostics();
+    const diagnosticAssessment = assessWebGpuBenchmarkDiagnostics(diagnosticRead);
+    const timingPassed = medianMs <= 33.3 && realTimeFactor >= 1.0;
+    const rejectionReasons = [];
+    if (medianMs > 33.3) rejectionReasons.push(`median-frame-ms:${medianMs}`);
+    if (realTimeFactor < 1.0) rejectionReasons.push(`real-time-factor:${realTimeFactor}`);
+    rejectionReasons.push(...diagnosticAssessment.rejectionReasons);
     const result = {
       contract: "mpm-v2-webgpu-30fps-v1",
-      passed: medianMs <= 33.3 && realTimeFactor >= 1.0,
+      passed: timingPassed && diagnosticAssessment.accepted,
+      timingPassed,
+      diagnosticsPassed: diagnosticAssessment.accepted,
+      rejectionReasons,
       medianMs,
       p95Ms,
       p99Ms,
@@ -1882,6 +2663,17 @@ async function runWebGpuBenchmark(options = {}) {
       resolution: { width, height, dpr: 1 },
       waterSamples,
       solidSamples,
+      diagnosticRead: {
+        accepted: diagnosticRead.accepted,
+        attempts: diagnosticRead.attempts,
+        freshnessSeconds: diagnosticRead.freshnessSeconds,
+        rejectionReason: diagnosticRead.rejectionReason ?? null,
+      },
+      diagnosticAssessment,
+      finalDiagnostics: diagnosticRead.accepted ? diagnosticRead.diagnostics : null,
+      rejectedDiagnostics: diagnosticRead.accepted
+        ? null
+        : diagnosticRead.rejectedDiagnostics,
       userAgent: navigator.userAgent,
     };
     console.info("Coffee sim WebGPU benchmark", result);

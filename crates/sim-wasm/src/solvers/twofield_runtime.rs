@@ -32,6 +32,7 @@ const EXTRACTION_FLOW_HALF_SPEED_M_S: f64 = 0.01;
 const DEFAULT_SPOUT_UI: [f32; 3] = [0.0, 2.5, 0.0];
 
 pub(crate) const MPM_V2_LATE_BREW_BENCHMARK_SCENE_ID: &str = "mpm-v2-late-brew-benchmark";
+pub(crate) const MPM_V2_CALIBRATION_DRAINAGE_SCENE_ID: &str = "mpm-v2-uniform-bed-saturation";
 
 fn unit_scale() -> SiUnitScale {
     SiUnitScale::reference()
@@ -252,6 +253,12 @@ impl MpmV2FrameSolver {
             .map(|scales| (1_000.0 * scales.mass_kg_per_unit()) as f32)
             .unwrap_or(0.0);
         let mass_g = |mass: f32| mass * grams_per_reduced_mass;
+        let carrier_mass_g_from_volume = |volume: f32| {
+            mass_g(
+                volume * self.materials.particle_mass
+                    / self.materials.particle_spacing.powi(3).max(1.0e-9),
+            )
+        };
         let carrier_ml = |mass: f32| {
             if self.materials.particle_mass <= 0.0 {
                 0.0
@@ -328,6 +335,26 @@ impl MpmV2FrameSolver {
             carrier_mass_residual_g: mass_g(diagnostics.carrier_mass_residual),
             solute_mass_residual_g: mass_g(diagnostics.solute_mass_residual),
             mechanical_mass_residual_g: mass_g(diagnostics.mechanical_mass_residual),
+            retention_target_carrier_mass_g: carrier_mass_g_from_volume(
+                diagnostics.retention_target_volume,
+            ),
+            retention_bound_capacity_mass_g: carrier_mass_g_from_volume(
+                diagnostics.retention_bound_capacity_volume,
+            ),
+            retention_capillary_target_mass_g: carrier_mass_g_from_volume(
+                diagnostics.retention_capillary_target_volume,
+            ),
+            retention_available_pore_volume_ml: volume_ml(
+                diagnostics.retention_available_pore_volume,
+            ),
+            retention_capillary_carrier_mass_g: carrier_mass_g_from_volume(
+                diagnostics.retention_capillary_volume,
+            ),
+            retention_unmet_carrier_mass_g: carrier_mass_g_from_volume(
+                diagnostics.retention_unmet_volume,
+            ),
+            residual_pore_saturation: diagnostics.residual_pore_saturation,
+            retention_target_attainable: diagnostics.retention_target_attainable,
             filter_occupied_ml: volume_ml(diagnostics.filter_occupied_volume),
             filter_capacity_ml: volume_ml(diagnostics.filter_capacity_volume),
             filter_saturation: diagnostics.filter_saturation,
@@ -638,6 +665,11 @@ fn setup_for_scene_spec(
             let recipe_water_ml = scene.water_ml;
             setup_production_bed_scene(scene, recipe_water_ml, calibration)
         }
+        SceneSpec::Debug { id } if id == MPM_V2_CALIBRATION_DRAINAGE_SCENE_ID => {
+            let scene = Scene::debug_uniform_bed_saturation();
+            let recipe_water_ml = scene.water_ml;
+            setup_production_bed_scene(scene, recipe_water_ml, calibration)
+        }
         SceneSpec::Debug { id } => Err(format!("MPM v2 does not support MPM debug scene: {id}")),
     }
 }
@@ -658,10 +690,11 @@ mod tests {
     #[test]
     fn shader_parses_with_naga() {
         let shader_src = format!(
-            "{}\n{}\n{}\n{}\n{}\n{}\n{}",
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
             include_str!("twofield/common.wgsl"),
             include_str!("twofield/transfers.wgsl"),
             include_str!("twofield/pressure.wgsl"),
+            include_str!("twofield/active_tiles.wgsl"),
             include_str!("twofield/surface.wgsl"),
             include_str!("twofield/coupling.wgsl"),
             include_str!("twofield/plasticity.wgsl"),
@@ -745,6 +778,24 @@ mod tests {
             solids == PRODUCTION_SOLID_SAMPLE_BUDGET,
             "late-brew bed workload must exactly match its declared solid budget; got {solids}"
         );
+    }
+
+    #[test]
+    fn calibration_drainage_scene_routes_a_seeded_bed_without_enabling_the_emitter() {
+        let spec = SceneSpec::Debug {
+            id: MPM_V2_CALIBRATION_DRAINAGE_SCENE_ID.to_string(),
+        };
+        let (scene, _, _) = setup_for_scene_spec(&spec, &CalibrationProfile::default()).unwrap();
+        assert!(!twofield_scene_accepts_pour(&spec));
+        assert_eq!(scene.pour_water_ml, 0.0);
+        assert!(scene
+            .regions
+            .iter()
+            .any(|region| region.species == Species::Water));
+        assert!(scene
+            .regions
+            .iter()
+            .any(|region| region.species == Species::Grain));
     }
 
     #[test]
