@@ -45,6 +45,9 @@ pub(crate) struct RenderSceneGeometry {
 pub(crate) struct RenderMaterial {
     pub(crate) grain_radius_scale: f32,
     pub(crate) moisture_inv_cap: f32,
+    /// Relative grain-diameter increase at full bound-water saturation. This changes only the
+    /// visual material-point radius; the solver independently owns structural volume.
+    pub(crate) max_diameter_swelling: f32,
 }
 
 impl Default for RenderMaterial {
@@ -52,6 +55,7 @@ impl Default for RenderMaterial {
         Self {
             grain_radius_scale: 1.0,
             moisture_inv_cap: 0.0,
+            max_diameter_swelling: 0.0,
         }
     }
 }
@@ -61,7 +65,13 @@ impl RenderMaterial {
         Self {
             grain_radius_scale: STANDARD_GRAIN_RENDER_RADIUS / STANDARD_WATER_RENDER_RADIUS,
             moisture_inv_cap,
+            max_diameter_swelling: 0.0,
         }
+    }
+
+    pub(crate) fn with_max_diameter_swelling(mut self, fraction: f32) -> Self {
+        self.max_diameter_swelling = fraction.max(0.0);
+        self
     }
 }
 
@@ -185,6 +195,10 @@ impl<'a> RenderView<'a> {
 
     pub(crate) fn moisture_inv_cap(&self) -> f32 {
         self.material.moisture_inv_cap
+    }
+
+    pub(crate) fn max_diameter_swelling(&self) -> f32 {
+        self.material.max_diameter_swelling
     }
 
     pub(crate) fn particle_count(&self) -> usize {

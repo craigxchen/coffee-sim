@@ -154,8 +154,8 @@ pub struct Config {
     pub tf_filter_floor: bool,
     /// Whole-bed retained-water calibration target in g water / g dry coffee. A positive value
     /// lets a recipe-aware solver derive residual pore saturation after subtracting bound-water
-    /// capacity; filter inventory remains separate until explicit filter state exists. Zero
-    /// disables the target without inventing a default.
+    /// capacity. Paper storage is an independently measured brewer inventory and is never
+    /// subtracted from this bed target. Zero disables the target without inventing a default.
     pub tf_retention_target_g_per_g: f32,
     /// Positive Corey exponent for capillary relative permeability on effective saturation.
     pub tf_capillary_exponent: f32,
@@ -164,8 +164,18 @@ pub struct Config {
     pub tf_capillary_mobility_floor: f32,
     /// Filter-paper intrinsic permeability in m². Zero disables porous-paper resistance.
     pub tf_filter_permeability_m2: f32,
+    /// Reference kinematic viscosity in m²/s, frozen for one pressure solve. Production derives
+    /// this from the calibrated inlet temperature.
+    pub tf_filter_kinematic_viscosity_m2_s: f32,
+    /// Reference liquid density in kg/m³ used only to convert the storage-capacity slider.
+    pub tf_filter_water_density_kg_m3: f32,
     /// Finite filter-paper water capacity in grams. Overflow remains free water.
     pub tf_filter_capacity_g: f32,
+    /// Physical filter-paper thickness in metres. Independent of reservoir capacity and the
+    /// coarse SDF shell used to retain grounds.
+    pub tf_filter_thickness_m: f32,
+    /// Open-pore fraction of filter paper, strictly between zero and one when enabled.
+    pub tf_filter_porosity: f32,
 
     // --- MPM-v2 physical granular response (stress values are reduced at the Rust/WGSL seam) ---
     /// Maximum tangent of the bounded packing-pressure law, in reduced stress units. Physical
@@ -298,7 +308,11 @@ impl Default for Config {
             tf_capillary_exponent: 3.0,
             tf_capillary_mobility_floor: 1.0,
             tf_filter_permeability_m2: 0.0,
+            tf_filter_kinematic_viscosity_m2_s: 1.004e-6,
+            tf_filter_water_density_kg_m3: 998.2,
             tf_filter_capacity_g: 0.0,
+            tf_filter_thickness_m: 0.0,
+            tf_filter_porosity: 0.3,
             tf_compaction_tangent: 0.0,
             tf_initial_consolidation_pressure: 0.0,
             tf_numerical_shear_modulus: 0.0,

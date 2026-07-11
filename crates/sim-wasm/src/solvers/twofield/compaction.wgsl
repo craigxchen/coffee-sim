@@ -159,7 +159,7 @@ fn p2g_solid_macro(@builtin(global_invocation_id) gid: vec3<u32>) {
     let c0 = cmat[3u * p + 0u].xyz;
     let c1 = cmat[3u * p + 1u].xyz;
     let c2 = cmat[3u * p + 2u].xyz;
-    let mass = grain_effective_mass(pos[p].w);
+    let mass = grain_effective_mass(p);
     let volume = grain_structural_volume(pos[p].w);
     let ep = max(sstate[2u * i + 1u].w, 0.0);
     let xl = (x - params.grid_origin.xyz) / h;
@@ -207,7 +207,7 @@ fn p2g_solid_shear(@builtin(global_invocation_id) gid: vec3<u32>) {
     let t0 = vec3<f32>(sa.x, sa.y, sa.z);
     let t1 = vec3<f32>(sa.y, sa.w, sb.x);
     let t2 = vec3<f32>(sa.z, sb.x, -sa.x - sa.w);
-    let mass = grain_effective_mass(pos[p].w);
+    let mass = grain_effective_mass(p);
     // The calibrated shear modulus is an effective bed stress per represented BULK volume.
     // coupling.z is the quadrature-weighted dry structural volume; dividing by the declared
     // reference solid fraction recovers the corresponding dry bulk control volume. It must not
@@ -405,12 +405,33 @@ fn g2p_solid_velocity_only(@builtin(global_invocation_id) gid: vec3<u32>) {
     let p = params.particle_count - params.solid_count + i;
     let gathered = gather_solid_velocity(pos[p].xyz);
     var v = gathered.v;
+    var c0 = gathered.c0;
+    var c1 = gathered.c1;
+    var c2 = gathered.c2;
+    // The macro grid predates this step's dissolution. Apply the signed mass/momentum transfer
+    // produced by chemistry, then consume and clear the transient bridge lanes. As in the legacy
+    // path, mass loss may not amplify the gathered affine field.
+    let delta_mass = vel[p].w;
+    let delta_momentum = vec3<f32>(
+        cmat[3u * p + 0u].w,
+        cmat[3u * p + 1u].w,
+        cmat[3u * p + 2u].w,
+    );
+    let new_mass = grain_effective_mass(p);
+    let old_mass = max(new_mass - delta_mass, 0.0);
+    if (new_mass > params.extra.z) {
+        v = (old_mass * v + delta_momentum) / new_mass;
+        let affine_mass_fraction = clamp(old_mass / new_mass, 0.0, 1.0);
+        c0 *= affine_mass_fraction;
+        c1 *= affine_mass_fraction;
+        c2 *= affine_mass_fraction;
+    }
     let speed = length(v);
     if (speed > params.max_speed) { v *= params.max_speed / speed; }
-    vel[p] = vec4<f32>(v, vel[p].w);
-    cmat[3u * p + 0u] = vec4<f32>(gathered.c0, 0.0);
-    cmat[3u * p + 1u] = vec4<f32>(gathered.c1, 0.0);
-    cmat[3u * p + 2u] = vec4<f32>(gathered.c2, 0.0);
+    vel[p] = vec4<f32>(v, 0.0);
+    cmat[3u * p + 0u] = vec4<f32>(c0, 0.0);
+    cmat[3u * p + 1u] = vec4<f32>(c1, 0.0);
+    cmat[3u * p + 2u] = vec4<f32>(c2, 0.0);
 }
 
 @compute @workgroup_size(256)

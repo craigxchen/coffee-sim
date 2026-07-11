@@ -1938,6 +1938,7 @@ impl MpmSim3D {
             extraction_yield: metrics.extraction_yield,
             estimated_cup_tds: self.estimated_cup_tds(),
             estimated_extraction_yield: self.estimated_extraction_yield(),
+            ..CommonMetrics::default()
         }
     }
 

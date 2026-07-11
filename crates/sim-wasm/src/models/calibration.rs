@@ -9,7 +9,7 @@ use std::fmt;
 
 use serde::Serialize;
 
-pub const CALIBRATION_SCHEMA_VERSION: u32 = 3;
+pub const CALIBRATION_SCHEMA_VERSION: u32 = 4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CalibrationControl {
@@ -37,10 +37,12 @@ pub enum CalibrationControl {
     CapillaryMobilityFloor,
     Log10FilterPaperPermeability,
     FilterWaterCapacity,
+    FilterPaperThickness,
+    FilterPaperPorosity,
 }
 
 impl CalibrationControl {
-    pub const ALL: [Self; 24] = [
+    pub const ALL: [Self; 26] = [
         Self::BedRetention,
         Self::BoundWaterCapacity,
         Self::MaxDiameterSwelling,
@@ -65,6 +67,8 @@ impl CalibrationControl {
         Self::CapillaryMobilityFloor,
         Self::Log10FilterPaperPermeability,
         Self::FilterWaterCapacity,
+        Self::FilterPaperThickness,
+        Self::FilterPaperPorosity,
     ];
 
     pub fn from_id(id: &str) -> Option<Self> {
@@ -101,7 +105,7 @@ impl ControlMetadata {
     }
 }
 
-pub const CALIBRATION_SCHEMA: [ControlMetadata; 24] = [
+pub const CALIBRATION_SCHEMA: [ControlMetadata; 26] = [
     ControlMetadata {
         control: CalibrationControl::BedRetention,
         id: "bed_retention_g_per_g",
@@ -366,6 +370,28 @@ pub const CALIBRATION_SCHEMA: [ControlMetadata; 24] = [
         logarithmic: false,
         requires_rebuild: true,
     },
+    ControlMetadata {
+        control: CalibrationControl::FilterPaperThickness,
+        id: "filter_paper_thickness_mm",
+        label: "Filter-paper thickness",
+        units: "mm",
+        min: 0.05,
+        max: 1.0,
+        step: 0.01,
+        logarithmic: false,
+        requires_rebuild: true,
+    },
+    ControlMetadata {
+        control: CalibrationControl::FilterPaperPorosity,
+        id: "filter_paper_porosity_fraction",
+        label: "Filter-paper porosity",
+        units: "fraction",
+        min: 0.05,
+        max: 0.95,
+        step: 0.01,
+        logarithmic: false,
+        requires_rebuild: true,
+    },
 ];
 
 pub fn calibration_schema() -> &'static [ControlMetadata] {
@@ -399,6 +425,8 @@ pub struct CalibrationProfile {
     capillary_mobility_floor_fraction: f32,
     log10_filter_paper_permeability_m2: f32,
     filter_water_capacity_g: f32,
+    filter_paper_thickness_mm: f32,
+    filter_paper_porosity_fraction: f32,
 }
 
 impl Default for CalibrationProfile {
@@ -445,6 +473,8 @@ impl Default for CalibrationProfile {
             capillary_mobility_floor_fraction: 0.01,
             log10_filter_paper_permeability_m2: -13.0,
             filter_water_capacity_g: 1.5,
+            filter_paper_thickness_mm: 0.20,
+            filter_paper_porosity_fraction: 0.30,
         }
     }
 }
@@ -611,6 +641,8 @@ impl CalibrationProfile {
                 self.log10_filter_paper_permeability_m2
             }
             CalibrationControl::FilterWaterCapacity => self.filter_water_capacity_g,
+            CalibrationControl::FilterPaperThickness => self.filter_paper_thickness_mm,
+            CalibrationControl::FilterPaperPorosity => self.filter_paper_porosity_fraction,
         }
     }
 
@@ -658,6 +690,12 @@ impl CalibrationProfile {
                 self.log10_filter_paper_permeability_m2 = value;
             }
             CalibrationControl::FilterWaterCapacity => self.filter_water_capacity_g = value,
+            CalibrationControl::FilterPaperThickness => {
+                self.filter_paper_thickness_mm = value;
+            }
+            CalibrationControl::FilterPaperPorosity => {
+                self.filter_paper_porosity_fraction = value;
+            }
         }
     }
 
@@ -773,6 +811,18 @@ impl CalibrationProfile {
         self.filter_water_capacity_g
     }
 
+    pub fn filter_paper_thickness_mm(&self) -> f32 {
+        self.filter_paper_thickness_mm
+    }
+
+    pub fn filter_paper_thickness_m(&self) -> f32 {
+        self.filter_paper_thickness_mm * 1.0e-3
+    }
+
+    pub fn filter_paper_porosity_fraction(&self) -> f32 {
+        self.filter_paper_porosity_fraction
+    }
+
     pub fn retained_water_g(&self, dry_coffee_g: f32) -> f32 {
         self.bed_retention_g_per_g * dry_coffee_g.max(0.0)
     }
@@ -862,6 +912,8 @@ mod tests {
             CalibrationControl::CapillaryMobilityFloor,
             CalibrationControl::Log10FilterPaperPermeability,
             CalibrationControl::FilterWaterCapacity,
+            CalibrationControl::FilterPaperThickness,
+            CalibrationControl::FilterPaperPorosity,
             CalibrationControl::BedCompactionTangent,
             CalibrationControl::InitialConsolidationPressure,
             CalibrationControl::NumericalShearModulus,
@@ -1009,5 +1061,23 @@ mod tests {
             .set(CalibrationControl::FilterWaterCapacity, 5.0)
             .unwrap();
         assert!(profile.filter_water_capacity_g() > low_capacity);
+
+        profile
+            .set(CalibrationControl::FilterPaperThickness, 0.1)
+            .unwrap();
+        let thin_paper_m = profile.filter_paper_thickness_m();
+        profile
+            .set(CalibrationControl::FilterPaperThickness, 0.8)
+            .unwrap();
+        assert!(profile.filter_paper_thickness_m() > thin_paper_m);
+
+        profile
+            .set(CalibrationControl::FilterPaperPorosity, 0.15)
+            .unwrap();
+        let low_paper_porosity = profile.filter_paper_porosity_fraction();
+        profile
+            .set(CalibrationControl::FilterPaperPorosity, 0.85)
+            .unwrap();
+        assert!(profile.filter_paper_porosity_fraction() > low_paper_porosity);
     }
 }

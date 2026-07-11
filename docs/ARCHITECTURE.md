@@ -1,195 +1,176 @@
-# MPM Architecture
+# Solver architecture
 
 ## Overview
 
-The active simulator is the WebGPU MPM stack in
-[`crates/sim-wasm/src/solvers/mpm`](../crates/sim-wasm/src/solvers/mpm).
-The browser app is a WASM wrapper around `engine::Simulator`, which currently
-selects the MPM solver by default.
+`coffee-sim` is a Rust/WebAssembly/WebGPU application. The browser owns interaction and rendering;
+physics state remains solver-owned GPU state behind `engine::Simulator` and the `FrameSolver` seam.
 
-High-level ownership:
-- `sim-core`: shared math/types used by the browser simulation
-- `sim-wasm/src/lib.rs`: WASM-facing API and scene loaders
-- `sim-wasm/src/engine`: active solver orchestration
-- `sim-wasm/src/solvers`: solver trait, registry, and solver implementations
-- `sim-wasm/src/ui`: shared render-facing view types
-- `sim-wasm/src/profiling`: solver-neutral profiler selection helpers
-- `sim-wasm/src/renderer.rs`: render pipeline and camera controls
-- `sim-wasm/src/solvers/mpm/*`: MPM simulation state, passes, scene setup, tests
-- `sim-wasm/www-3d/*`: browser UI and scene controls
-- `sim-wasm/www-3d/demo/*`: small baseline demo shell kept beside the primary app
-- `sim-wasm/www-3d/pkg/*`: generated `wasm-pack` browser package
+The registry exposes three complete solvers:
 
-## Authoritative State
+- `mpm`: the legacy, currently non-experimental MPM implementation under `solvers/mpm`. It stays
+  available as a visual and regression comparison.
+- `mpm-v2`: the replacement two-field MPM implementation under `solvers/twofield`, adapted to the
+  browser seam by `twofield_runtime.rs`. It is the calibration and performance target.
+- `xpbd`: an experimental position-based water baseline. It is useful for isolating rendering,
+  emission, and water-only behavior, not as the coffee-bed reference model.
 
-Simulation truth lives in the GPU simulation state, not the renderer.
+`origin/main` remains the authoritative integration base. MPM v2 must earn promotion through the
+conservation, stability, qualitative-calibration, and browser-throughput gates documented in
+`docs/plans/2026-07-11-mpm-v2-implementation.md`.
 
-Authoritative runtime state:
-- water and bed particles: `particles`
-- affine/APIC state: `affine`
-- grid accumulators and velocities: `grid`, `grid_vel`
-- bed auxiliary state: `bed_extract`, `bed_lookup`, `bed_delta`
-- static field state: SDF texture, cached SDF classification texture
-- static filter support geometry: CPU `filter_mesh` render vertices
+## Ownership and one-way data flow
 
-Rendering is downstream of that state via `render_data`.
+High-level ownership is:
 
-## Pass Order
+- `sim-core`: shared math and render-facing types;
+- `sim-wasm/src/engine`: solver selection, scene routing, saved MPM-v2 calibration state, and frame
+  orchestration;
+- `sim-wasm/src/solvers`: complete solver implementations and the common solver seams;
+- `sim-wasm/src/models`: solver-neutral constitutive equations and calibration schema;
+- `sim-wasm/src/emission`: independently testable water/coffee emission;
+- `sim-wasm/src/ui` and `renderer.rs`: downstream consumers of canonical particle buffers;
+- `sim-wasm/www-3d`: browser controls, diagnostics presentation, and scripted evaluation hooks.
 
-Each frame is orchestrated by [`MpmSim3D::step_frame`](../crates/sim-wasm/src/solvers/mpm/mod.rs),
-driven through `engine::Simulator`.
+The UI may select a solver, scene, and calibration profile. It must not synthesize velocities,
+retention, extraction, temperature, or other physical truth. Rendering consumes a `RenderView`;
+diagnostics consume cached solver reductions.
 
-Current pass shape:
-1. update uniforms and scene-dependent state
-2. emit inflow particles
-3. clear metrics and hot grid buffers
-4. rebuild bed lookup / clear bed-coupling scratch as needed
-5. `p2g`
-6. `grid_update`
-7. `boundary_project`
-8. `classify_cells`
-9. pressure projection and residual passes
-10. packing preparation/application for coffee particles
-11. viscosity preparation/application
-12. `g2p`
-13. bed coupling, extraction advection, and bed dynamics
-14. `prepare_render`
+## MPM v2 state
 
-Important invariant:
-- simulation passes own physical behavior
-- UI, renderer, and debug HUD must not invent physical state
+MPM v2 uses water material points followed by a fixed solid-material-point suffix. A pour scene
+preallocates dormant water slots between the live-water prefix and solid suffix; dormant slots are
+parked outside render space and never dispatched.
 
-## Module Map
+Canonical per-particle state is:
 
-- `mod.rs`
-  - top-level settings
-  - scene presets
-  - debug-scene catalog and seed dispatch
-  - per-frame orchestration
-  - buffer upload, metrics, and water-diagnostics readback helpers
-- `brew_config.rs`
-  - default V60 recipe, particle sampling, permeability, and extraction
-    parameters
-- `units.rs`
-  - scene-unit to SI-unit calibration for length, gravity, velocity, and volume
-- `state.rs`
-  - `MpmUniforms`
-  - buffer allocation
-  - SDF and cached cell-solid classification generation
-  - device limits and fixed-point constants
-- `shader.rs`
-  - WGSL kernels for particle-grid transfer, grid solve, coupling, and render packing
-  - the hottest path and the main source of solver behavior
-- `pipelines.rs`
-  - pipeline and bind-group creation for the WGSL passes
-- `inflow.rs`
-  - kettle/spout parameterization
-  - inflow state machine and particle emission
-- `bed.rs`
-  - bed particle initialization
-  - bed property seeding and helper logic
-- `filter.rs`
-  - geometric filter configuration
-- `filter_mesh.rs`
-  - static filter support mesh and upload-ready vertex state
-- `physics_tests.rs`
-  - headless GPU regression tests against the MPM stack
+- `pos.xyz`: position;
+- water `pos.w`: remaining solvent-carrier fraction;
+- grain `pos.w`: bound-water volume;
+- `vel.xyz`: velocity; `vel.w` is a transient signed chemistry-mass bridge cleared by final G2P;
+- water `chem.xy`: solute-to-solvent ratio and absolute temperature;
+- water `chem.zw`: paper-storage marker and pore-transit progress;
+- grain `chem.xyzw`: fast pool, slow pool, absolute temperature, and wet-contact time;
+- `cmat`: APIC affine rows; their `w` lanes transiently carry chemistry momentum;
+- `fmat` and `sstate`: deformation, stress, compaction cap, and accumulated compaction.
 
-## Solver Boundary
+Water has two distinct mass notions. Solvent/carrier mass controls volume, fill, saturation, and
+density relief. Dissolved solute adds inertia and heat capacity but not liquid volume. Grain inertia
+is insoluble dry mass plus remaining extractable pools plus bound water. Dissolution transfers mass,
+momentum, capacity, and enthalpy between those two ledgers.
 
-`solvers::base::Solver` is the internal seam for complete simulation methods.
-The registry currently exposes one production solver:
-- `SolverId::Mpm`
+Long-lived grid/buffer state includes separate water and solid momentum grids, a carrier-water
+census, structural solid volume, mixture-pressure fields, compaction state, moisture and chemistry
+integer ledgers, and persistent paper-reservoir counters. Static SDF primitives carry explicit
+semantic flags; porous paper is never inferred from a generic grain-collision mask.
 
-The renderer consumes a shared `ui::RenderView` instead of `MpmSim3D` directly.
-The MPM solver still owns the physical state and provides the same render
-buffer, filter mesh vertices, settings, and particle counts as before. Future
-solvers should implement `Solver`, add one registry entry, and provide a render
-view without changing the browser API.
+## MPM v2 frame order
 
-## Buffer Ownership
+The production path batches dependent dispatches into one compute pass where the backend permits,
+while retaining individual dispatch accounting. Its logical order is:
 
-Hot simulation buffers:
-- `particles`
-- `affine`
-- `grid`
-- `grid_vel`
-- `bed_lookup`
-- `bed_delta`
+1. Emit declared pour parcels and upload physical `dt` and uniforms.
+2. Clear transient water, solid, pressure, moisture, chemistry, and classification grids.
+3. When enabled, exchange mobile solvent and bound water conservatively at fixed positions.
+4. Scatter water solution mass/momentum plus a separate solvent census; scatter solid inertial
+   mass, momentum, structural volume, stress, and compaction state.
+5. Advance the soft deviatoric predictor and semi-implicit bounded compaction solve.
+6. Decode phase grids, apply external forces, exact two-mass drag, porous-paper relaxation, and
+   phase-consistent contact constraints.
+7. Classify the free surface/gas region and solve one mixture-pressure operator family. Production
+   V60 scenes use explicitly atmospheric gas; sealed diagnostic scenes retain pocket handling.
+8. Transfer dissolved solute and thermal energy with the shared fixed-point chemistry ledger.
+9. Advance/release whole paper-held parcels, then perform water G2P; paper admission is fused into
+   water G2P and uses an exact whole-parcel capacity reservation.
+10. Perform final solid G2P, consuming the signed chemistry mass/momentum bridge.
+11. At low cadence, schedule a compact nonblocking inventory reduction; normal frame/UI getters
+    return only the latest completed cache and never wait for full particle readback.
 
-Medium-frequency state:
-- `bed_extract`
-- `metrics`
-- filter mesh render vertices
+Filter resistance and storage are independent. Zero storage capacity disables admission but does
+not remove Darcy resistance. The whole-bed retention target contains bound and capillary pore water;
+paper water is a separate whole-brewer inventory.
 
-Static/cold state:
-- `sdf_texture`
-- `sdf_class_texture`
+## Discrete mechanics
 
-Key ownership rule:
-- per-particle long-lived material state should stay on particles unless profiling proves a grid cache is necessary
-- per-cell hot state should be minimized and explicit
+Both phases use quadratic B-spline APIC transfers. Interphase drag is one exact exponential
+two-mass update, preserving node momentum before external contact impulses. Mixture continuity is
 
-## Browser API Surface
+```text
+div(phi_f * v_f + phi_s * v_s) = source
+```
 
-`WasmSim3D` currently exposes:
-- scene loading, debug-scene loading, and reset
-- fixed-step frame advancement
-- water velocity and spout-position controls
-- camera manipulation
-- particle counts, emission totals, and capacity counters
-- exact delayed GPU metrics sampling for the debug panel
-- async water diagnostics for scripted realism evaluation
-- pressure residual adaptation hooks
-- TDS and extraction-yield estimates
+Pressure uses cell-centered pressure and node-centered velocity with one adjoint family
+`G = -D^T`. The solve and projection use the same symmetric constrained mobility, including the
+rank-one porous-paper normal reduction; hand-written alternate pressure stencils are prohibited.
 
-The browser app in `www-3d/main.js` owns:
-- main/debug scene selection
-- sidebar controls
-- animation loop
-- debug stats toggles and low-frequency metric sampling
-- scripted realism-evaluation plumbing on `window.__coffeeSim`
+Coffee compaction uses a bounded packing law in a semi-implicit scalar solve. A deliberately soft,
+CFL-bounded explicit shear predictor retains deviatoric shape without pretending to be the physical
+bulk stiffness. Numerical material-point count does not change recipe mass or represented bulk
+volume: exact quadrature weights preserve both when the 12,000-point production budget thins a bed.
 
-The browser app must stay a thin controller over `WasmSim3D`, not a second simulation layer.
+## Units and calibration
 
-## Scene Catalog
+Production time is seconds. The shared SI scale maps the 0.10 m V60 height to 5.77 simulation units,
+so gravity, flow, permeability, viscosity, filter thickness, density, temperature, and recipe volume
+are converted only at the Rust/WGSL boundary.
 
-Primary scenes:
-- Center Pour
-- Water Only
+`models/calibration.rs` owns the MPM-v2 control schema: stable id, label, units, finite range, step,
+default starting prior, and rebuild requirement. JavaScript builds the slider UI from that schema.
+The defaults are broad starting points, not regression truths. In particular, approximately 2.1 g/g
+retention and reported 0–15% particle-diameter swelling constrain plausibility only; automated tests
+protect equations, conservation, bounds, and monotone responses.
 
-Debug scenes exposed by both Rust and the browser UI:
-- Water Block
-- Off-Center Wall Pour
-- Paper-Wall Sheet
-- Filter Apex Drain
-- Cup Corner Contact
-- Asymmetric Mound
-- Hydrostatic Column
-- Dam Break Slosh
-- Sparse Free Jet
-- High-Velocity Impact
-- Uniform Bed Saturation
-- Permeability Stress
-- Capacity Stress
+See `docs/CALIBRATION.md` for inventory definitions, source limitations, and calibration order.
 
-Tests keep the Rust debug-scene catalog and browser buttons in sync.
+## Module map
 
-## Current Invariants
+- `solvers/twofield/mod.rs`: MPM-v2 buffer allocation, pipeline construction, pass order,
+  diagnostics cache, emission, reset, and solver seam;
+- `solvers/twofield/common.wgsl`: uniform/binding ABI, fixed-point scales, SDF helpers, and shared
+  mass definitions;
+- `transfers.wgsl`: water APIC P2G/G2P and whole-parcel paper admission;
+- `plasticity.wgsl` and `plasticity.rs`: legacy explicit solid update and CPU equation twins;
+- `compaction.wgsl`: semi-implicit production solid predictor/compaction path;
+- `coupling.wgsl`: two-way drag, wetting, capillarity, filter release, extraction, and heat;
+- `pressure.wgsl` and `surface.wgsl`: mixture projection and gas/free-surface handling;
+- `diagnostics.wgsl`: compact periodic inventory reduction;
+- `twofield_runtime.rs`: recipe/SI setup, calibration mapping, browser-facing `FrameSolver` adapter,
+  and the deterministic late-brew workload;
+- `solvers/mpm/*`: preserved legacy MPM implementation and its diagnostic/debug-scene suite;
+- `solvers/xpbd/*`: experimental XPBD baseline;
+- `models/*`: shared permeability, wetting, retention, filter, extraction, thermal, cohesion, and
+  granular equations.
 
-- `origin/main` is the authoritative mainline branch
-- the WebGPU app in `www-3d` is the primary product surface
-- tests in `physics_tests.rs` are the meaningful regression surface for the solver
-- known realism gaps should be recorded explicitly rather than hidden behind heuristic tuning
-- generated `pkg` artifacts should only be edited or rebuilt when the task
-  explicitly requires a browser package update
+Global WGSL binding numbers are stable across the concatenated MPM-v2 shader module. Auto layouts
+retain only bindings reachable from each entry point. The widest production entry point remains
+within the WebGPU target ceiling; adding a transitive helper dependency requires re-auditing both
+the Rust bind group and the documented count.
 
-## Known Architectural Gaps
+## Browser and profiling contract
 
-- free-flight jet cohesion is still weak
-- bed mechanics and bed hydraulics are still under active iteration
-- filter contact is still an approximation rather than a full contact solve
-- extraction is now particle-carried, but still uses coarse two-pool kinetics
-  rather than calibrated grind-distribution chemistry
-- the recipe and material model are centralized in `brew_config.rs`, but there
-  is no user-facing recipe editor yet
+`WasmSim3D` exposes solver/scene selection, calibration schema and validated setters, fixed-step
+advancement, canonical rendering, cached metrics, and explicit GPU fences. `www-3d/main.js` owns the
+thin interaction layer and publishes scripted hooks on `window.__coffeeSim`.
+
+The binding browser benchmark loads a deterministic late-brew MPM-v2 state with 75,000–80,000 live
+water points and exactly 12,000 solid points at 1280×720 DPR 1. One measured display frame advances
+two 1/60 s physics steps and renders once. After 120 warmup frames, 30 fenced ten-frame batches must
+have median normalized time no greater than 33.3 ms and real-time factor at least 1.0 on the stated
+reference device. The benchmark includes normal low-cadence diagnostics but excludes blocking debug
+readbacks.
+
+## Validation and remaining gaps
+
+Before landing, run formatting, warning-free clippy, the full test suite, Naga WebGPU validation,
+real-device finite/conservation probes, qualitative browser evaluation, and the representative FPS
+gate. Tests must not be deleted, ignored, or rewritten to bless a provisional calibration value.
+
+Known model limits remain explicit:
+
+- the fast/slow extraction model does not yet resolve a measured grind-size distribution or
+  species-specific chemistry;
+- capillary retention is a continuum mobility law, not a resolved pore network;
+- paper is a Darcy thin sheet plus finite whole-parcel reservoir, not a cellulose-fiber model;
+- public data does not jointly constrain time-resolved V60 bed shape, saturation, temperature,
+  retention, and extraction, so final behavioral calibration remains an interactive workflow;
+- legacy MPM remains selectable until MPM v2 clears the full physical and browser-performance
+  contract.

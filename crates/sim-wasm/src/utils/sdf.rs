@@ -24,6 +24,9 @@ pub const FREE: f32 = 1.0e30;
 pub const MASK_WATER: u32 = 1; // phase 0
 pub const MASK_GRAIN: u32 = 2; // phase 1
 pub const MASK_ALL: u32 = MASK_WATER | MASK_GRAIN;
+/// This analytic surface represents porous filter paper in addition to any collision role.
+/// Paper is explicit: an unrelated grains-only primitive must not acquire hydraulic resistance.
+pub const FLAG_FILTER_PAPER: u32 = 1;
 
 /// A static solid the particles collide with. Each kind is a **cavity** (interior allowed).
 #[derive(Clone, Copy, Debug)]
@@ -74,6 +77,8 @@ pub struct SdfPrimitive {
     pub species_mask: u32,
     /// Tangential Coulomb friction coefficient at this boundary (used for grains, like `floor_mu`).
     pub friction: f32,
+    /// Solver-neutral semantic flags such as [`FLAG_FILTER_PAPER`].
+    pub flags: u32,
 }
 
 /// The nearest binding constraint at a point for one species: the signed distance (interior
@@ -430,6 +435,7 @@ mod tests {
             },
             species_mask: MASK_GRAIN,
             friction: 0.5,
+            flags: FLAG_FILTER_PAPER,
         }
     }
 
@@ -448,6 +454,7 @@ mod tests {
             },
             species_mask: MASK_ALL,
             friction: 0.3,
+            flags: 0,
         }
     }
 
@@ -461,6 +468,7 @@ mod tests {
             },
             species_mask: MASK_ALL,
             friction: 0.2,
+            flags: 0,
         }
     }
 
@@ -665,6 +673,7 @@ mod tests {
             },
             species_mask: MASK_ALL,
             friction: 0.2,
+            flags: 0,
         }
     }
 

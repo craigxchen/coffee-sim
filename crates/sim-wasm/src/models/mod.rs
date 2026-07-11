@@ -85,7 +85,8 @@ pub struct Materials {
     /// (`k_T(T_ref) = 1`). Production calibration supplies absolute-K values.
     pub ea_over_r: f32,
     pub t_ref: f32,
-    /// Max solute concentration `c_sat` (8% by mass; the `(1−c/c_sat)` driving force → 0 here).
+    /// Maximum solute-to-solvent mass ratio `c_sat`; the `(1−c/c_sat)` driving force vanishes
+    /// here. Reported beverage TDS is the solution mass fraction `c/(1+c)`, not this carrier ratio.
     pub c_sat: f32,
     /// Fraction of the soluble dose in the fast pool, and the soluble fraction of the dry dose
     /// (≈0.28 — only this much of a grain is extractable). Used to seed the grain pools.

@@ -6,6 +6,7 @@ use crate::models::scaling::{
     capillary_suction_acceleration_m_s2, darcy_beta_per_s, water_sample_from_spacing,
     ReducedUnitScales,
 };
+use crate::models::water::{density_kg_m3, kinematic_viscosity_m2_s};
 use crate::models::Materials;
 use crate::solvers::base::{
     CalibrationApplyResult, CalibrationSupport, CommonMetrics, FrameContext, FrameSnapshot,
@@ -247,6 +248,21 @@ impl MpmV2FrameSolver {
         };
         let emitted_mass = self.core.total_emitted_water_mass();
         let emitted_ml = emitted_water_ml(emitted_mass, &self.materials);
+        let grams_per_reduced_mass = reduced_unit_scales(&self.materials, &self.calibration)
+            .map(|scales| (1_000.0 * scales.mass_kg_per_unit()) as f32)
+            .unwrap_or(0.0);
+        let mass_g = |mass: f32| mass * grams_per_reduced_mass;
+        let carrier_ml = |mass: f32| {
+            if self.materials.particle_mass <= 0.0 {
+                0.0
+            } else {
+                let volume =
+                    mass / self.materials.particle_mass * self.materials.particle_spacing.powi(3);
+                unit_scale().ml_from_sim_volume(f64::from(volume)) as f32
+            }
+        };
+        let volume_ml = |volume: f32| unit_scale().ml_from_sim_volume(f64::from(volume)) as f32;
+        let profile = RewriteSolver::profile(&self.core);
         CommonMetrics {
             particle_count: rewrite_metrics.particle_count as usize,
             water_slots_used: water_count,
@@ -270,6 +286,60 @@ impl MpmV2FrameSolver {
             extraction_yield: rewrite_metrics.extraction_yield,
             estimated_cup_tds: rewrite_metrics.tds,
             estimated_extraction_yield: rewrite_metrics.extraction_yield,
+            diagnostics_supported: true,
+            diagnostics_valid: diagnostics.sample_valid,
+            diagnostics_all_finite: diagnostics.sample_valid && !diagnostics.has_nonfinite_state,
+            diagnostics_pending: self.core.diagnostics_pending(),
+            diagnostics_sample_age_s: if diagnostics.sample_valid {
+                (self.sim_time_s - diagnostics.sample_time_s).max(0.0)
+            } else {
+                0.0
+            },
+            dispatches_per_frame: profile.dispatches_per_frame,
+            nonfinite_particle_count: diagnostics.nonfinite_particle_count,
+            nonfinite_grid_node_count: diagnostics.nonfinite_grid_node_count,
+            mean_water_temperature_k: diagnostics.mean_water_temperature,
+            mean_grain_temperature_k: diagnostics.mean_grain_temperature,
+            pond_carrier_mass_g: mass_g(diagnostics.pond_carrier_mass),
+            pond_carrier_volume_ml: carrier_ml(diagnostics.pond_carrier_mass),
+            mean_bound_saturation: diagnostics.mean_bound_saturation,
+            mean_diameter_ratio: diagnostics.mean_diameter_ratio,
+            mobile_carrier_mass_g: mass_g(diagnostics.mobile_carrier_mass),
+            paper_carrier_mass_g: mass_g(diagnostics.paper_carrier_mass),
+            bound_carrier_mass_g: mass_g(diagnostics.bound_carrier_mass),
+            total_carrier_mass_g: mass_g(diagnostics.total_carrier_mass),
+            mobile_carrier_volume_ml: carrier_ml(diagnostics.mobile_carrier_mass),
+            paper_carrier_volume_ml: carrier_ml(diagnostics.paper_carrier_mass),
+            bound_carrier_volume_ml: carrier_ml(diagnostics.bound_carrier_mass),
+            total_carrier_volume_ml: carrier_ml(diagnostics.total_carrier_mass),
+            mobile_solution_mass_g: mass_g(diagnostics.mobile_solution_mass),
+            paper_solution_mass_g: mass_g(diagnostics.paper_solution_mass),
+            grain_mass_g: mass_g(diagnostics.grain_mass),
+            mobile_solute_mass_g: mass_g(diagnostics.mobile_solute_mass),
+            paper_solute_mass_g: mass_g(diagnostics.paper_solute_mass),
+            remaining_grain_solute_mass_g: mass_g(diagnostics.remaining_grain_solute_mass),
+            dissolved_solute_mass_g: mass_g(diagnostics.dissolved_solute_mass),
+            cup_carrier_mass_g: mass_g(diagnostics.cup_carrier_mass),
+            cup_solute_mass_g: mass_g(diagnostics.cup_solute_mass),
+            cup_solution_mass_g: mass_g(diagnostics.cup_solution_mass),
+            total_solute_mass_g: mass_g(diagnostics.total_solute),
+            expected_carrier_mass_g: mass_g(diagnostics.expected_carrier_mass),
+            expected_solute_mass_g: mass_g(diagnostics.expected_solute_mass),
+            carrier_mass_residual_g: mass_g(diagnostics.carrier_mass_residual),
+            solute_mass_residual_g: mass_g(diagnostics.solute_mass_residual),
+            mechanical_mass_residual_g: mass_g(diagnostics.mechanical_mass_residual),
+            filter_occupied_ml: volume_ml(diagnostics.filter_occupied_volume),
+            filter_capacity_ml: volume_ml(diagnostics.filter_capacity_volume),
+            filter_saturation: diagnostics.filter_saturation,
+            filter_volume_residual_ml: volume_ml(diagnostics.filter_volume_residual),
+            filter_count_residual: diagnostics.filter_count_residual,
+            filter_held_parcels: diagnostics.filter_held_parcels,
+            filter_admitted: diagnostics.filter_admitted,
+            filter_released: diagnostics.filter_released,
+            filter_overflow: diagnostics.filter_overflow,
+            filter_errors: diagnostics.filter_errors,
+            filter_beta_max_per_s: diagnostics.filter_beta_max_per_s,
+            filter_pressure_mobility_min: diagnostics.filter_pressure_mobility_min,
             ..CommonMetrics::default()
         }
     }
@@ -309,7 +379,8 @@ impl MpmV2FrameSolver {
             positions,
             velocities,
             phases,
-            RenderMaterial::standard_coffee_particles(moisture_inv_cap),
+            RenderMaterial::standard_coffee_particles(moisture_inv_cap)
+                .with_max_diameter_swelling(self.calibration.max_diameter_swelling_fraction()),
         )
     }
 }
@@ -418,7 +489,9 @@ fn calibration_support(control: CalibrationControl) -> CalibrationSupport {
         | CalibrationControl::CapillaryRelativePermeabilityExponent
         | CalibrationControl::CapillaryMobilityFloor => CalibrationSupport::Rebuild,
         CalibrationControl::Log10FilterPaperPermeability
-        | CalibrationControl::FilterWaterCapacity => CalibrationSupport::ProfileOnly,
+        | CalibrationControl::FilterPaperThickness
+        | CalibrationControl::FilterPaperPorosity
+        | CalibrationControl::FilterWaterCapacity => CalibrationSupport::Rebuild,
     }
 }
 
@@ -453,7 +526,15 @@ fn apply_calibration_profile(
     config.tf_capillary_exponent = profile.capillary_relative_permeability_exponent();
     config.tf_capillary_mobility_floor = profile.capillary_mobility_floor_fraction();
     config.tf_filter_permeability_m2 = profile.filter_paper_permeability_m2();
+    config.tf_filter_kinematic_viscosity_m2_s =
+        kinematic_viscosity_m2_s(f64::from(profile.inlet_temperature_c()))
+            .map_err(|error| format!("filter-paper viscosity: {error}"))? as f32;
+    config.tf_filter_water_density_kg_m3 =
+        density_kg_m3(f64::from(profile.inlet_temperature_c()))
+            .map_err(|error| format!("filter-paper density: {error}"))? as f32;
     config.tf_filter_capacity_g = profile.filter_water_capacity_g();
+    config.tf_filter_thickness_m = profile.filter_paper_thickness_m();
+    config.tf_filter_porosity = profile.filter_paper_porosity_fraction();
     config.tf_wet_cohesion = reduced_stress_from_pa(materials, profile, profile.dp_cohesion_pa())?;
     config.tf_compaction_tangent =
         reduced_stress_from_pa(materials, profile, profile.bed_compaction_tangent_pa())?;
@@ -711,6 +792,16 @@ mod tests {
         profile
             .set_by_id("numerical_shear_modulus_pa", 40.0)
             .unwrap();
+        profile
+            .set_by_id("log10_filter_paper_permeability_m2", -12.0)
+            .unwrap();
+        profile
+            .set_by_id("filter_paper_thickness_mm", 0.35)
+            .unwrap();
+        profile
+            .set_by_id("filter_paper_porosity_fraction", 0.62)
+            .unwrap();
+        profile.set_by_id("filter_water_capacity_g", 2.7).unwrap();
 
         let (_, materials, config) =
             setup_for_scene_spec(&SceneSpec::CenterPour, &profile).unwrap();
@@ -751,19 +842,30 @@ mod tests {
             reduced_stress_from_pa(&materials, &profile, profile.numerical_shear_modulus_pa())
                 .unwrap()
         );
+        assert_eq!(
+            config.tf_filter_permeability_m2,
+            profile.filter_paper_permeability_m2()
+        );
+        assert_eq!(
+            config.tf_filter_thickness_m,
+            profile.filter_paper_thickness_m()
+        );
+        assert_eq!(
+            config.tf_filter_porosity,
+            profile.filter_paper_porosity_fraction()
+        );
+        assert_eq!(
+            config.tf_filter_capacity_g,
+            profile.filter_water_capacity_g()
+        );
+        assert!(config.tf_filter_kinematic_viscosity_m2_s.is_finite());
+        assert!(config.tf_filter_kinematic_viscosity_m2_s > 0.0);
+        assert!(config.tf_filter_water_density_kg_m3.is_finite());
+        assert!(config.tf_filter_water_density_kg_m3 > 0.0);
     }
 
     #[test]
     fn calibration_support_does_not_claim_unwired_physics() {
-        for control in [
-            CalibrationControl::Log10FilterPaperPermeability,
-            CalibrationControl::FilterWaterCapacity,
-        ] {
-            assert_eq!(
-                calibration_support(control),
-                CalibrationSupport::ProfileOnly
-            );
-        }
         assert_eq!(
             calibration_support(CalibrationControl::DragMultiplier),
             CalibrationSupport::Rebuild
@@ -798,6 +900,10 @@ mod tests {
             CalibrationControl::BedRetention,
             CalibrationControl::CapillaryRelativePermeabilityExponent,
             CalibrationControl::CapillaryMobilityFloor,
+            CalibrationControl::Log10FilterPaperPermeability,
+            CalibrationControl::FilterWaterCapacity,
+            CalibrationControl::FilterPaperThickness,
+            CalibrationControl::FilterPaperPorosity,
         ] {
             assert_eq!(calibration_support(control), CalibrationSupport::Rebuild);
         }

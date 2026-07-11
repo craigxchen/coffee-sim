@@ -49,19 +49,18 @@ pub struct PoreWaterFractions {
     pub mobile: f32,
 }
 
-/// Capillary volume required after bound-water and filter-paper inventories are accounted for.
+/// Capillary volume required after intragranular bound water is accounted for.
 ///
-/// When those inventories already meet or exceed the whole-bed target, the capillary target is
-/// zero rather than a negative volume.
+/// The target is explicitly whole-*bed* retention; paper water is a separate brewer-component
+/// inventory and must not reduce it. When bound water already meets or exceeds the bed target,
+/// the capillary target is zero rather than negative.
 pub fn capillary_target_volume(
     whole_bed_retention_volume: f32,
     bound_water_volume: f32,
-    filter_water_volume: f32,
 ) -> Result<f32, RetentionError> {
     nonnegative(whole_bed_retention_volume, "whole_bed_retention_volume")?;
     nonnegative(bound_water_volume, "bound_water_volume")?;
-    nonnegative(filter_water_volume, "filter_water_volume")?;
-    Ok((whole_bed_retention_volume - bound_water_volume - filter_water_volume).max(0.0))
+    Ok((whole_bed_retention_volume - bound_water_volume).max(0.0))
 }
 
 /// Convert a capillary target volume into a residual pore saturation.
@@ -223,24 +222,20 @@ mod tests {
     fn capillary_target_closes_the_inventory_ledger_and_scales_with_volume_units() {
         let whole = 13.0;
         let bound = 3.0;
-        let filter = 2.0;
-        let capillary = capillary_target_volume(whole, bound, filter).unwrap();
-        assert!(close(capillary + bound + filter, whole));
+        let capillary = capillary_target_volume(whole, bound).unwrap();
+        assert!(close(capillary + bound, whole));
 
         let unit_scale = 7.0;
-        let scaled =
-            capillary_target_volume(whole * unit_scale, bound * unit_scale, filter * unit_scale)
-                .unwrap();
+        let scaled = capillary_target_volume(whole * unit_scale, bound * unit_scale).unwrap();
         assert!(close(scaled, capillary * unit_scale));
     }
 
     #[test]
     fn capillary_target_is_bounded_and_monotone_in_each_inventory() {
-        let base = capillary_target_volume(10.0, 2.0, 1.0).unwrap();
-        assert!(capillary_target_volume(12.0, 2.0, 1.0).unwrap() > base);
-        assert!(capillary_target_volume(10.0, 3.0, 1.0).unwrap() < base);
-        assert!(capillary_target_volume(10.0, 2.0, 2.0).unwrap() < base);
-        assert_eq!(capillary_target_volume(1.0, 2.0, 3.0).unwrap(), 0.0);
+        let base = capillary_target_volume(10.0, 2.0).unwrap();
+        assert!(capillary_target_volume(12.0, 2.0).unwrap() > base);
+        assert!(capillary_target_volume(10.0, 3.0).unwrap() < base);
+        assert_eq!(capillary_target_volume(1.0, 2.0).unwrap(), 0.0);
     }
 
     #[test]
@@ -345,7 +340,7 @@ mod tests {
 
     #[test]
     fn zero_and_degenerate_inputs_are_finite_and_explicit() {
-        assert_eq!(capillary_target_volume(0.0, 0.0, 0.0).unwrap(), 0.0);
+        assert_eq!(capillary_target_volume(0.0, 0.0).unwrap(), 0.0);
 
         let dry = residual_pore_saturation(0.0, 0.0).unwrap();
         assert_eq!(dry.residual_saturation, 0.0);
@@ -373,7 +368,7 @@ mod tests {
     #[test]
     fn invalid_physical_parameters_are_rejected_instead_of_producing_nan() {
         assert!(matches!(
-            capillary_target_volume(f32::NAN, 0.0, 0.0),
+            capillary_target_volume(f32::NAN, 0.0),
             Err(RetentionError::NonFinite { .. })
         ));
         assert!(matches!(

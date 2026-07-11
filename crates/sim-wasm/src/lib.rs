@@ -71,6 +71,16 @@ fn set_bool(obj: &js_sys::Object, key: &str, value: bool) -> Result<(), JsValue>
 }
 
 #[cfg(target_arch = "wasm32")]
+fn set_i64(obj: &js_sys::Object, key: &str, value: i64) -> Result<(), JsValue> {
+    js_sys::Reflect::set(
+        obj,
+        &JsValue::from_str(key),
+        &JsValue::from_f64(value as f64),
+    )
+    .map(|_| ())
+}
+
+#[cfg(target_arch = "wasm32")]
 fn set_str(obj: &js_sys::Object, key: &str, value: &str) -> Result<(), JsValue> {
     js_sys::Reflect::set(obj, &JsValue::from_str(key), &JsValue::from_str(value)).map(|_| ())
 }
@@ -304,6 +314,194 @@ fn metrics_snapshot_object(snapshot: mpm_3d::MetricsSnapshot) -> Result<js_sys::
 }
 
 #[cfg(target_arch = "wasm32")]
+fn attach_common_diagnostics(obj: &js_sys::Object, snapshot: CommonMetrics) -> Result<(), JsValue> {
+    set_bool(obj, "diagnosticsSupported", snapshot.diagnostics_supported)?;
+    set_bool(obj, "diagnosticsValid", snapshot.diagnostics_valid)?;
+    set_bool(obj, "diagnosticsPending", snapshot.diagnostics_pending)?;
+    set_number(
+        obj,
+        "diagnosticsSampleAgeSeconds",
+        snapshot.diagnostics_sample_age_s,
+    )?;
+    set_u32(obj, "dispatchesPerFrame", snapshot.dispatches_per_frame)?;
+    set_u32(
+        obj,
+        "nonfiniteParticleCount",
+        snapshot.nonfinite_particle_count,
+    )?;
+    set_u32(
+        obj,
+        "nonfiniteGridNodeCount",
+        snapshot.nonfinite_grid_node_count,
+    )?;
+    set_number(
+        obj,
+        "meanWaterTemperatureK",
+        snapshot.mean_water_temperature_k,
+    )?;
+    set_number(
+        obj,
+        "meanGrainTemperatureK",
+        snapshot.mean_grain_temperature_k,
+    )?;
+    set_number(obj, "meanBoundSaturation", snapshot.mean_bound_saturation)?;
+    set_number(obj, "meanDiameterRatio", snapshot.mean_diameter_ratio)?;
+
+    let inventory = js_sys::Object::new();
+    set_number(
+        &inventory,
+        "mobileCarrierMassGrams",
+        snapshot.mobile_carrier_mass_g,
+    )?;
+    set_number(
+        &inventory,
+        "paperCarrierMassGrams",
+        snapshot.paper_carrier_mass_g,
+    )?;
+    set_number(
+        &inventory,
+        "boundCarrierMassGrams",
+        snapshot.bound_carrier_mass_g,
+    )?;
+    set_number(
+        &inventory,
+        "totalCarrierMassGrams",
+        snapshot.total_carrier_mass_g,
+    )?;
+    set_number(
+        &inventory,
+        "mobileCarrierVolumeMl",
+        snapshot.mobile_carrier_volume_ml,
+    )?;
+    set_number(
+        &inventory,
+        "paperCarrierVolumeMl",
+        snapshot.paper_carrier_volume_ml,
+    )?;
+    set_number(
+        &inventory,
+        "boundCarrierVolumeMl",
+        snapshot.bound_carrier_volume_ml,
+    )?;
+    set_number(
+        &inventory,
+        "totalCarrierVolumeMl",
+        snapshot.total_carrier_volume_ml,
+    )?;
+    set_number(
+        &inventory,
+        "pondCarrierMassGrams",
+        snapshot.pond_carrier_mass_g,
+    )?;
+    set_number(
+        &inventory,
+        "pondCarrierVolumeMl",
+        snapshot.pond_carrier_volume_ml,
+    )?;
+    set_number(
+        &inventory,
+        "mobileSolutionMassGrams",
+        snapshot.mobile_solution_mass_g,
+    )?;
+    set_number(
+        &inventory,
+        "paperSolutionMassGrams",
+        snapshot.paper_solution_mass_g,
+    )?;
+    set_number(&inventory, "grainMassGrams", snapshot.grain_mass_g)?;
+    set_number(
+        &inventory,
+        "mobileSoluteMassGrams",
+        snapshot.mobile_solute_mass_g,
+    )?;
+    set_number(
+        &inventory,
+        "paperSoluteMassGrams",
+        snapshot.paper_solute_mass_g,
+    )?;
+    set_number(
+        &inventory,
+        "remainingGrainSoluteMassGrams",
+        snapshot.remaining_grain_solute_mass_g,
+    )?;
+    set_number(
+        &inventory,
+        "dissolvedSoluteMassGrams",
+        snapshot.dissolved_solute_mass_g,
+    )?;
+    set_number(
+        &inventory,
+        "totalSoluteMassGrams",
+        snapshot.total_solute_mass_g,
+    )?;
+    set_number(
+        &inventory,
+        "cupCarrierMassGrams",
+        snapshot.cup_carrier_mass_g,
+    )?;
+    set_number(&inventory, "cupSoluteMassGrams", snapshot.cup_solute_mass_g)?;
+    set_number(
+        &inventory,
+        "cupSolutionMassGrams",
+        snapshot.cup_solution_mass_g,
+    )?;
+    set_number(
+        &inventory,
+        "expectedCarrierMassGrams",
+        snapshot.expected_carrier_mass_g,
+    )?;
+    set_number(
+        &inventory,
+        "expectedSoluteMassGrams",
+        snapshot.expected_solute_mass_g,
+    )?;
+    set_number(
+        &inventory,
+        "carrierMassResidualGrams",
+        snapshot.carrier_mass_residual_g,
+    )?;
+    set_number(
+        &inventory,
+        "soluteMassResidualGrams",
+        snapshot.solute_mass_residual_g,
+    )?;
+    set_number(
+        &inventory,
+        "mechanicalMassResidualGrams",
+        snapshot.mechanical_mass_residual_g,
+    )?;
+    set_object(obj, "inventory", &inventory)?;
+
+    let filter = js_sys::Object::new();
+    set_number(&filter, "occupiedMl", snapshot.filter_occupied_ml)?;
+    set_number(&filter, "capacityMl", snapshot.filter_capacity_ml)?;
+    set_number(&filter, "saturation", snapshot.filter_saturation)?;
+    set_number(
+        &filter,
+        "volumeResidualMl",
+        snapshot.filter_volume_residual_ml,
+    )?;
+    set_i64(
+        &filter,
+        "parcelCountResidual",
+        snapshot.filter_count_residual,
+    )?;
+    set_u32(&filter, "heldParcels", snapshot.filter_held_parcels)?;
+    set_u32(&filter, "admitted", snapshot.filter_admitted)?;
+    set_u32(&filter, "released", snapshot.filter_released)?;
+    set_u32(&filter, "overflow", snapshot.filter_overflow)?;
+    set_u32(&filter, "errors", snapshot.filter_errors)?;
+    set_number(&filter, "betaMaxPerSecond", snapshot.filter_beta_max_per_s)?;
+    set_number(
+        &filter,
+        "pressureMobilityMin",
+        snapshot.filter_pressure_mobility_min,
+    )?;
+    set_object(obj, "filter", &filter)?;
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
 fn common_metrics_object(snapshot: CommonMetrics) -> Result<js_sys::Object, JsValue> {
     let obj = js_sys::Object::new();
     set_number(&obj, "maxAbsDivergence", snapshot.max_abs_divergence)?;
@@ -329,21 +527,63 @@ fn common_metrics_object(snapshot: CommonMetrics) -> Result<js_sys::Object, JsVa
     set_number(&obj, "meanTds", snapshot.mean_tds)?;
     set_number(&obj, "cupTds", snapshot.cup_tds)?;
     set_number(&obj, "extractionYield", snapshot.extraction_yield)?;
+    attach_common_diagnostics(&obj, snapshot)?;
     Ok(obj)
 }
 
 #[cfg(target_arch = "wasm32")]
 fn common_water_diagnostics_object(snapshot: CommonMetrics) -> Result<js_sys::Object, JsValue> {
     let obj = js_sys::Object::new();
-    set_bool(&obj, "allFinite", true)?;
+    let sampled = snapshot.diagnostics_supported && snapshot.diagnostics_valid;
+    set_bool(
+        &obj,
+        "allFinite",
+        if snapshot.diagnostics_supported {
+            snapshot.diagnostics_valid && snapshot.diagnostics_all_finite
+        } else {
+            true
+        },
+    )?;
     set_number(&obj, "simTimeSeconds", snapshot.sim_time_s)?;
     set_u32(&obj, "activeCount", snapshot.water_slots_used)?;
     set_u32(&obj, "poolCount", snapshot.water_slots_used)?;
-    set_number(&obj, "activeMass", snapshot.total_emitted_mass)?;
-    set_number(&obj, "activeMassMl", snapshot.total_emitted_ml)?;
+    set_number(
+        &obj,
+        "activeMass",
+        if sampled {
+            snapshot.mobile_solution_mass_g + snapshot.paper_solution_mass_g
+        } else {
+            snapshot.total_emitted_mass
+        },
+    )?;
+    set_number(
+        &obj,
+        "activeMassMl",
+        if sampled {
+            snapshot.mobile_carrier_volume_ml + snapshot.paper_carrier_volume_ml
+        } else {
+            snapshot.total_emitted_ml
+        },
+    )?;
     set_number(&obj, "emittedMl", snapshot.total_emitted_ml)?;
-    set_number(&obj, "restVolumeMl", snapshot.total_emitted_ml)?;
-    set_number(&obj, "currentVolumeMl", snapshot.total_emitted_ml)?;
+    set_number(
+        &obj,
+        "restVolumeMl",
+        if sampled {
+            snapshot.mobile_carrier_volume_ml + snapshot.paper_carrier_volume_ml
+        } else {
+            snapshot.total_emitted_ml
+        },
+    )?;
+    set_number(
+        &obj,
+        "currentVolumeMl",
+        if sampled {
+            snapshot.mobile_carrier_volume_ml + snapshot.paper_carrier_volume_ml
+        } else {
+            snapshot.total_emitted_ml
+        },
+    )?;
     set_number(&obj, "meanJ", 1.0)?;
     set_number(&obj, "kineticEnergy", 0.0)?;
     set_number(&obj, "rmsSpeedMetersPerSecond", 0.0)?;
@@ -394,12 +634,17 @@ fn common_water_diagnostics_object(snapshot: CommonMetrics) -> Result<js_sys::Ob
     set_number(&pressure, "gradientPaPerMeter", 0.0)?;
     set_bool(&pressure, "bottomHigher", false)?;
     set_object(&obj, "hydrostaticPressure", &pressure)?;
-    set_number(&obj, "dissolvedSoluteMass", 0.0)?;
+    set_number(
+        &obj,
+        "dissolvedSoluteMass",
+        snapshot.dissolved_solute_mass_g,
+    )?;
     set_number(&obj, "meanTds", snapshot.mean_tds)?;
-    set_number(&obj, "cupWaterMass", 0.0)?;
-    set_number(&obj, "cupSoluteMass", 0.0)?;
+    set_number(&obj, "cupWaterMass", snapshot.cup_carrier_mass_g)?;
+    set_number(&obj, "cupSoluteMass", snapshot.cup_solute_mass_g)?;
     set_number(&obj, "cupTds", snapshot.cup_tds)?;
     set_number(&obj, "extractionYield", snapshot.extraction_yield)?;
+    attach_common_diagnostics(&obj, snapshot)?;
     Ok(obj)
 }
 

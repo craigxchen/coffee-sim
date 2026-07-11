@@ -10,9 +10,10 @@ ratio, swelling, drawdown, TDS, or extraction yield.
 - A published V60 protocol reports a liquid-retention ratio of approximately **2.1 g water per
   gram dry coffee**. It is one protocol, not a universal material property, and its accounting
   includes a pre-wetted paper filter and procedure-specific dead volume. MPM v2 therefore treats
-  2.1 g/g as a visible *whole-bed* prior and reports separately how much can be assigned to bound
-  water, capillary pore water, and filter water. An unattainable request remains visible rather
-  than being hidden by a clamp. [Protocol source](https://pmc.ncbi.nlm.nih.gov/articles/PMC10486461/)
+  2.1 g/g only as a broad *whole-bed* prior, not a fitted equality. The bed target is split between
+  bound and capillary pore water; paper water is reported as a separate brewer inventory so a
+  change in paper capacity cannot silently satisfy the bed target. An unattainable request remains
+  visible rather than being hidden by a clamp. [Protocol source](https://pmc.ncbi.nlm.nih.gov/articles/PMC10486461/)
 - Hargarten, Kuhn, and Briesen measured roughly **15% final particle-diameter increase**, with
   substantial particle scatter; approximately **60–80% of the final increase was reached after
   30 s**, and swelling was effectively complete after about 4 min. Earlier methods reported
@@ -53,9 +54,16 @@ The solver accounts for it as distinct inventories:
 ```text
 whole-bed target = intragranular bound water
                  + capillary/interstitial pore water
-                 + filter-paper water
                  + explicitly reported unmet target
+
+whole-brewer retained water = whole-bed retained water
+                            + independently reported filter-paper water
 ```
+
+Water-particle concentration is stored as the mechanically convenient solute-to-solvent ratio
+`c = m_solute / m_solvent`. Dissolved solute increases solution inertia and heat capacity but not
+carrier volume. User-facing TDS is the conventional solution mass fraction
+`m_solute / (m_solvent + m_solute) = c / (1 + c)`.
 
 Particle swelling is not another name for retention. With bound-water saturation `s` and the
 diameter control `a`, structural volume follows
@@ -81,8 +89,9 @@ when the representative workload uniformly thins material points.
 4. Calibrate drawdown and retention with intrinsic permeability, unresolved-drag multiplier,
    suction head, reference porosity, Corey exponent, and mobility floor. Check the inventory split,
    not only the final animation.
-5. Calibrate paper permeability/capacity against drainage and post-brew dripping. A zero paper
-   capacity removes paper storage only; it does not remove paper resistance.
+5. Calibrate paper permeability, physical thickness, porosity, and capacity against drainage and
+   post-brew dripping. Thickness and porosity control Darcy transit independently of the storage
+   slider. A zero paper capacity removes paper storage only; it does not remove paper resistance.
 6. Calibrate temperature and the fast/slow extraction rates last. Use TDS and extraction bands as
    plausibility diagnostics while checking that changing temperature, flow, and contact time has
    the expected monotone effect.

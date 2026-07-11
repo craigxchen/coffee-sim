@@ -8,8 +8,10 @@ WebAssembly, and WebGPU.
 ## Features
 
 - 3D V60-style pour-over scene
-- WebGPU MPM particle simulation
+- selectable legacy MPM, MPM v2 two-field, and XPBD solvers
+- WebGPU MPM v2 water/coffee mechanics with wetting, retention, paper transport, heat, and extraction
 - interactive pour controls
+- solver-generated calibration sliders for MPM v2
 - orbit, zoom, and pan camera controls
 - built-in benchmark and debug scenes
 - browser-based diagnostics overlay
@@ -59,6 +61,8 @@ Open <http://localhost:8080>.
 - Move the spout in X/Z with the plane control and adjust spout height with the
   height slider.
 - Show Debug Stats to inspect simulation diagnostics.
+- Select MPM v2 to expose its physical calibration panel; changes are validated in Rust and rebuild
+  the solver when required.
 
 ## Project Layout
 
@@ -73,11 +77,12 @@ Useful checks:
 
 ```bash
 cargo fmt --check
-cargo clippy -p coffee-sim-wasm -- -D warnings
-cargo test -p coffee-sim-wasm --lib
+cargo clippy --all-targets -- -D warnings
+cargo test
 wasm-pack build crates/sim-wasm --target web --release --out-dir www-3d/pkg
 ```
 
 ## More Info
 
 - [Architecture](docs/ARCHITECTURE.md)
+- [MPM v2 calibration](docs/CALIBRATION.md)

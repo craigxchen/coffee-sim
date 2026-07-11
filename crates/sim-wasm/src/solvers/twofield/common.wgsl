@@ -8,8 +8,8 @@
 //
 // Storage-buffer budget (KTD-7): the widest entry point binds 8 storage buffers
 // (MAX_STORAGE_BUFFERS_PER_ENTRY_POINT in mod.rs — cell_classify / pocket_mark; see the per-pass
-// derivation there); the device requests 9 per stage (src/utils/gpu.rs NEEDED_STORAGE_BUFFERS),
-// both within the 16 hardware cap. U1 adds NO binding (the flip knob is a Params lane, and
+// derivation there); shared required limits request 10 per stage
+// (`solvers/mpm/mod.rs::required_limits`), both within the 16 target cap. U1 adds NO binding (the flip knob is a Params lane, and
 // g2p_water reads only the already-bound vel/grid_vel). Grid mass+momentum share ONE
 // array<atomic<i32>> with stride 4 (mass, mom.xyz) rather than four arrays — one binding, one
 // clear pass, contiguous per-node lanes.
@@ -21,7 +21,7 @@
 const PHASE_WATER: u32 = 0u;
 const PHASE_SOLID: u32 = 1u;
 
-// Byte-identical to the Rust `Params` (352 bytes; vec4-aligned tail).
+// Byte-identical to the Rust `Params` (400 bytes; vec4-aligned tail).
 struct Params {
     box_min: vec4<f32>,     // simulation domain (w unused)
     box_max: vec4<f32>,     // (w unused)
@@ -78,12 +78,19 @@ struct Params {
     // initial consolidation pressure p_c0, full-tangent solid fraction, shear microstep dt).
     // K <= 0 is the exact legacy/off-path sentinel.
     granular: vec4<f32>,
+    // Porous filter paper: (permeability su², kinematic viscosity su²/s, physical thickness su,
+    // porosity). Geometry is independent of the coarse SDF collision shell and storage capacity.
+    filter0: vec4<f32>,
+    // Exact finite-reservoir capacity in FILTER_VOLUME_SCALE counts; remaining lanes reserved.
+    filter1: vec4<u32>,
+    // (insoluble grain mass, solute cp, initial extractable mass, reserved).
+    solute: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> params: Params;
 // Canonical particle state (ParticleBuffers layout): pos.w is the moisture lane (water =
 // remaining fraction, grain = bound-water volume). chem is phase-specific:
-// water=(solute mass fraction, temperature K, reserved, reserved),
+// water=(solute/carrier mass ratio, temperature K, filter state 0/1/2, pore-transit progress),
 // grain=(fast-pool mass, slow-pool mass, temperature K, wet-contact time).
 @group(0) @binding(1) var<storage, read_write> pos: array<vec4<f32>>;
 @group(0) @binding(2) var<storage, read_write> vel: array<vec4<f32>>;
@@ -99,15 +106,44 @@ struct Params {
 // WATER grid velocity decoded by grid_update; drag_fold subsequently applies forces, pair drag,
 // and boundary conditions, and project applies pore pressure. .xyz = velocity, .w = node mass.
 @group(0) @binding(7) var<storage, read_write> grid_vel: array<vec4<f32>>;
-// Per-CELL particle count (U4): the particle-presence discriminator for the free-surface
+// Combined auxiliary allocation. Prefix: per-CELL particle count (U4), the sharp
+// particle-presence discriminator for the free-surface
 // classification. Node mass alone cannot tell a real surface cell from a particle-free air
 // gap narrower than the B-spline smear (≈3h between two water walls): such a gap reads mean
 // corner density ≈ 0.3–0.5·ρ_rest, classifies as a constraint row, and its div = 0 row then
 // FORBIDS the refilling inflow — observed as a jet-dug chimney standing frozen forever. The
 // classical PIC/FLIP rule (a cell is fluid only if it contains particles) is the sharp
 // discriminator; mass still provides the fill-fraction taper for cells that ARE fluid.
-// Cleared by grid_clear, incremented by p2g_water, read by cell_classify.
+// Cleared by grid_clear, incremented by p2g_water, read by cell_classify. Suffix: one fixed-point
+// carrier/solvent mass count per NODE. Mechanics uses solution mass in grid_fp/grid_vel, while
+// fill, saturation, and density relief use this carrier census so dissolved solute cannot create
+// liquid volume.
 @group(0) @binding(18) var<storage, read_write> cell_cnt: array<atomic<u32>>;
+
+fn aux_cell_slots() -> u32 {
+    let cells = params.grid_dims.xyz - vec3<u32>(1u);
+    return cells.x * cells.y * cells.z;
+}
+
+fn carrier_mass_index(node: u32) -> u32 {
+    return aux_cell_slots() + node;
+}
+
+fn carrier_mass_at(node: u32) -> f32 {
+    return f32(atomicLoad(&cell_cnt[carrier_mass_index(node)])) / FP_SCALE;
+}
+
+fn water_solvent_mass(f_water: f32) -> f32 {
+    return params.particle_mass * clamp(f_water, 0.0, 1.0);
+}
+
+fn water_solute_mass(f_water: f32, concentration: f32) -> f32 {
+    return water_solvent_mass(f_water) * max(concentration, 0.0);
+}
+
+fn water_solution_mass(f_water: f32, concentration: f32) -> f32 {
+    return water_solvent_mass(f_water) + water_solute_mass(f_water, concentration);
+}
 // SOLID grid field (U6): per-node solid VOLUME, fixed-point (×FP_SCALE), one lane per node —
 // the φ_s carrier (KTD-8: a local evolving field, never a configured scalar). Cleared by
 // grid_clear, scattered by p2g_solid[_dyn] (saturation-driven structural volume), read wherever
@@ -139,12 +175,12 @@ const MOIST_QX: u32 = 2u;
 const MOIST_RT: u32 = 5u;
 @group(0) @binding(25) var<storage, read_write> grid_moist: array<atomic<i32>>;
 
-// Chemistry grid ledger, 7 lane-scaled integer lanes per node:
+// Chemistry grid ledger, 11 lane-scaled integer lanes per node:
 // [solute headroom H, proposed fast F, proposed slow L, water capacity Cw, water enthalpy Ew,
-// grain capacity Cg, grain enthalpy Eg]. chemistry_scatter freezes these totals after pressure;
-// chemistry_gather applies the same min(H,F+L) solute transfer and exact bounded heat exchange
-// to both phases, so closed-system solute and enthalpy are conservative up to FP quantization.
-const CHEM_STRIDE: u32 = 7u;
+// grain capacity Cg, grain enthalpy Eg, proposed solute momentum Jxyz, proposed solute enthalpy U].
+// chemistry_scatter freezes these totals after pressure; chemistry_gather applies the same
+// min(H,F+L) mass/momentum/enthalpy transfer and bounded heat exchange to both phases.
+const CHEM_STRIDE: u32 = 11u;
 const CHEM_HEADROOM: u32 = 0u;
 const CHEM_FAST: u32 = 1u;
 const CHEM_SLOW: u32 = 2u;
@@ -152,6 +188,8 @@ const CHEM_CW: u32 = 3u;
 const CHEM_EW: u32 = 4u;
 const CHEM_CG: u32 = 5u;
 const CHEM_EG: u32 = 6u;
+const CHEM_JX: u32 = 7u;
+const CHEM_U: u32 = 10u;
 @group(0) @binding(28) var<storage, read_write> grid_chem: array<atomic<i32>>;
 
 // Solid plastic-compaction moment, one fixed-point lane per node:
@@ -159,6 +197,49 @@ const CHEM_EG: u32 = 6u;
 // Dividing by grid_sfp gives the volume-weighted compaction carried by that node. It is kept
 // separate from stress magnitudes so the common FP_SCALE retains ample headroom.
 @group(0) @binding(29) var<storage, read_write> grid_scomp: array<atomic<i32>>;
+
+// Persistent finite paper reservoir (not cleared with the per-frame grid): occupied solvent
+// volume counts, cumulative admitted/released/overflow parcels, and invariant-error flags.
+const FILTER_OCCUPIED: u32 = 0u;
+const FILTER_ADMITTED: u32 = 1u;
+const FILTER_RELEASED: u32 = 2u;
+const FILTER_OVERFLOW: u32 = 3u;
+const FILTER_ERRORS: u32 = 4u;
+const FILTER_STATE_SLOTS: u32 = 5u;
+const FILTER_VOLUME_SCALE: f32 = 268435456.0; // 2^28, mirrored by Rust
+@group(0) @binding(30) var<storage, read_write> filter_state: array<atomic<u32>>;
+
+fn filter_volume_encode(volume: f32) -> u32 {
+    return u32(clamp(round(max(volume, 0.0) * FILTER_VOLUME_SCALE), 0.0, 4294967040.0));
+}
+
+fn filter_volume_decode(counts: u32) -> f32 {
+    return f32(counts) / FILTER_VOLUME_SCALE;
+}
+
+fn filter_try_reserve(parcel_counts: u32) -> bool {
+    let capacity = params.filter1.x;
+    if (parcel_counts == 0u || capacity == 0u || parcel_counts > capacity) {
+        atomicAdd(&filter_state[FILTER_OVERFLOW], 1u);
+        return false;
+    }
+    var observed = atomicLoad(&filter_state[FILTER_OCCUPIED]);
+    loop {
+        if (observed > capacity || parcel_counts > capacity - observed) {
+            atomicAdd(&filter_state[FILTER_OVERFLOW], 1u);
+            return false;
+        }
+        let exchanged = atomicCompareExchangeWeak(
+            &filter_state[FILTER_OCCUPIED], observed, observed + parcel_counts,
+        );
+        if (exchanged.exchanged) {
+            atomicAdd(&filter_state[FILTER_ADMITTED], 1u);
+            return true;
+        }
+        observed = exchanged.old_value;
+    }
+    return false; // structurally required by WGSL validation; the loop exits only via returns
+}
 
 // --- fixed-point encoding (KEEP.md §3 pattern, headroom re-validated for U2) -----------------
 //
@@ -199,6 +280,7 @@ fn fp_decode(c: i32) -> f32 {
 //   chemistry F,L: 2^27 -> 16      proposed solute mass
 //   chemistry C  : 2^22 -> 512     heat capacity
 //   chemistry E  : 2^13 -> 262144  capacity·kelvin
+//   chemistry J  : 2^26 -> 32      solute mass·velocity, signed per component
 //
 // Runtime recipe sampling keeps the actual node totals well inside these bounds. Raising a scale
 // reduces its physical range and therefore requires a new node-headroom audit.
@@ -209,6 +291,7 @@ const CHEM_H_SCALE: f32 = 67108864.0;     // 2^26
 const CHEM_FL_SCALE: f32 = 134217728.0;   // 2^27
 const CHEM_C_SCALE: f32 = 4194304.0;      // 2^22
 const CHEM_E_SCALE: f32 = 8192.0;         // 2^13
+const CHEM_J_SCALE: f32 = 67108864.0;      // 2^26
 
 fn lane_encode(x: f32, scale: f32) -> i32 {
     return i32(clamp(round(x * scale), -FP_CLAMP, FP_CLAMP));
@@ -230,12 +313,14 @@ fn chem_encode(lane: u32, x: f32) -> i32 {
     if (lane == CHEM_HEADROOM) { return lane_encode(x, CHEM_H_SCALE); }
     if (lane == CHEM_FAST || lane == CHEM_SLOW) { return lane_encode(x, CHEM_FL_SCALE); }
     if (lane == CHEM_CW || lane == CHEM_CG) { return lane_encode(x, CHEM_C_SCALE); }
+    if (lane >= CHEM_JX && lane < CHEM_U) { return lane_encode(x, CHEM_J_SCALE); }
     return lane_encode(x, CHEM_E_SCALE);
 }
 fn chem_decode(lane: u32, count: i32) -> f32 {
     if (lane == CHEM_HEADROOM) { return lane_decode(count, CHEM_H_SCALE); }
     if (lane == CHEM_FAST || lane == CHEM_SLOW) { return lane_decode(count, CHEM_FL_SCALE); }
     if (lane == CHEM_CW || lane == CHEM_CG) { return lane_decode(count, CHEM_C_SCALE); }
+    if (lane >= CHEM_JX && lane < CHEM_U) { return lane_decode(count, CHEM_J_SCALE); }
     return lane_decode(count, CHEM_E_SCALE);
 }
 
@@ -301,7 +386,7 @@ struct Primitive {
     kind: u32,          // 0 = cone, 1 = cylinder, 2 = poly-cup
     species_mask: u32,
     friction: f32,
-    flags: u32,         // bit0 = apex_open
+    flags: u32,         // bit0 = apex_open, bit1 = porous filter paper
     a: vec4<f32>,       // cone:(apex_y, apex_r, top_y, top_r)  cyl:(floor_y, rim_y, radius, _)  poly:(floor_y, rim_y, apothem, sides)
     b: vec4<f32>,       // cone:(thickness, hole_radius, center_x, center_z)  cyl/poly:(center_x, center_z, _, _)
     c: vec4<f32>,       // reserved
@@ -310,6 +395,7 @@ struct Primitive {
 
 const SDF_EPS: f32 = 1.0e-6;
 const SDF_FREE: f32 = 1.0e30;
+const PRIMITIVE_FILTER_PAPER: u32 = 2u;
 
 struct SolidHit { dist: f32, grad: vec3<f32>, friction: f32 };
 struct SegCP { p: vec2<f32>, interior: bool };
@@ -443,6 +529,66 @@ fn solid_union(p: vec3<f32>, ph: u32) -> SolidHit {
         if (hit.dist < best.dist) { best = hit; }
     }
     return best;
+}
+
+// Explicit semantic query for porous paper. This intentionally ignores species_mask: the V60
+// paper does not collide with water, but its bit1 surface still supplies hydraulic resistance and
+// reservoir crossing. An unrelated grains-only primitive without bit1 has no paper behavior.
+fn filter_paper_hit(p: vec3<f32>) -> SolidHit {
+    var best = SolidHit(SDF_FREE, vec3<f32>(0.0, 0.0, 0.0), 0.0);
+    let n = params.num_solids;
+    for (var i = 0u; i < n; i = i + 1u) {
+        let prim = solids[i];
+        if ((prim.flags & PRIMITIVE_FILTER_PAPER) == 0u) { continue; }
+        let hit = solid_cavity(prim, p);
+        if (abs(hit.dist) < abs(best.dist)) { best = hit; }
+    }
+    return best;
+}
+
+struct PaperResponse {
+    normal: vec3<f32>,
+    coverage: f32,
+    alpha: f32,
+    beta: f32,
+    decay: f32,
+    sigma: f32,
+};
+
+// One-cell normalized delta band for a physically thin Darcy sheet. Integrating alpha across the
+// numerical band recovers the physical thickness L, so changing grid h does not change the sheet
+// resistance nu*L/k. sigma is the exact pressure/source mobility (1-exp(-x))/x.
+fn filter_paper_response(p: vec3<f32>) -> PaperResponse {
+    let hit = filter_paper_hit(p);
+    let h = params.grid_origin.w;
+    let permeability = params.filter0.x;
+    let viscosity = params.filter0.y;
+    let thickness = params.filter0.z;
+    let coverage = clamp(1.0 - abs(hit.dist) / h, 0.0, 1.0);
+    if (coverage <= 0.0 || length(hit.grad) <= SDF_EPS
+        || permeability <= 0.0 || viscosity <= 0.0 || thickness <= 0.0) {
+        return PaperResponse(hit.grad, 0.0, 0.0, 0.0, 1.0, 1.0);
+    }
+    let alpha = (thickness / h) * coverage;
+    let beta = (viscosity / permeability) * alpha;
+    let x = max(beta * params.dt, 0.0);
+    var decay: f32;
+    var sigma: f32;
+    if (x < 1.0e-3) {
+        decay = 1.0 - x + 0.5 * x * x;
+        sigma = 1.0 - 0.5 * x + x * x / 6.0;
+    } else {
+        decay = exp(-x);
+        sigma = (1.0 - decay) / x;
+    }
+    return PaperResponse(
+        sdf_normalize3(hit.grad),
+        coverage,
+        alpha,
+        beta,
+        clamp(decay, 0.0, 1.0),
+        clamp(sigma, 0.0, 1.0),
+    );
 }
 
 // MULTI-NORMAL wall BC (plan 2026-06-17-002): all cavity FACES within `band` of p, generalizing

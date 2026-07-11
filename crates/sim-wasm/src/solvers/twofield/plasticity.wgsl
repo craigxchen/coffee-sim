@@ -342,7 +342,7 @@ fn p2g_solid_dyn(@builtin(global_invocation_id) gid: vec3<u32>) {
     let t0 = vec3<f32>(sa.x, sa.y, sa.z); // (τxx, τxy, τxz)
     let t1 = vec3<f32>(sa.y, sa.w, sb.x); // (τxy, τyy, τyz)
     let t2 = vec3<f32>(sa.z, sb.x, sb.y); // (τxz, τyz, τzz)
-    let m_s = grain_effective_mass(pos[p].w);
+    let m_s = grain_effective_mass(p);
     let d = params.coupling.x;
     let v0 = d * d * d; // V_p⁰: one grain = one lattice cell of bulk bed
     // MLS-MPM fused force factor: contribution (m·C − Δt·V⁰·(4/h²)·τ)·d, scattered as a
@@ -487,9 +487,29 @@ fn g2p_solid(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
     let dinv = 4.0 / (h * h);
-    let c0 = b0 * dinv;
-    let c1 = b1 * dinv;
-    let c2 = b2 * dinv;
+    var c0 = b0 * dinv;
+    var c1 = b1 * dinv;
+    var c2 = b2 * dinv;
+
+    // Chemistry runs after this frame's P2G, so grid_svel still carries the grain's
+    // pre-dissolution inertial mass. Merge the accepted signed solute momentum bridged through
+    // the otherwise-unused .w lanes before applying the speed cap or updating F. For grain mass
+    // loss old/new exceeds one; clamp the affine factor so dissolution cannot amplify C.
+    let delta_mass = vel[p].w;
+    let delta_momentum = vec3<f32>(
+        cmat[3u * p + 0u].w,
+        cmat[3u * p + 1u].w,
+        cmat[3u * p + 2u].w,
+    );
+    let new_mass = grain_effective_mass(p);
+    let old_mass = max(new_mass - delta_mass, 0.0);
+    if (new_mass > params.extra.z) {
+        v = (old_mass * v + delta_momentum) / new_mass;
+        let affine_mass_fraction = clamp(old_mass / new_mass, 0.0, 1.0);
+        c0 *= affine_mass_fraction;
+        c1 *= affine_mass_fraction;
+        c2 *= affine_mass_fraction;
+    }
 
     let sp = length(v);
     if (sp > params.max_speed) {
@@ -569,7 +589,7 @@ fn g2p_solid(@builtin(global_invocation_id) gid: vec3<u32>) {
         * transpose(svd.u);
 
     pos[p] = vec4<f32>(x, pos[p].w);
-    vel[p] = vec4<f32>(v, vel[p].w);
+    vel[p] = vec4<f32>(v, 0.0);
     cmat[3u * p + 0u] = vec4<f32>(c0, 0.0);
     cmat[3u * p + 1u] = vec4<f32>(c1, 0.0);
     cmat[3u * p + 2u] = vec4<f32>(c2, 0.0);

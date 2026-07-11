@@ -163,7 +163,7 @@ fn node_phi_f(n: u32, xp: vec3<f32>) -> f32 {
 // reduced water density used to seed particle mass. A collapsed/invalid pore volume is dry rather
 // than singular; physical values are bounded because Corey mobility is defined on [0,1].
 fn pore_saturation_from_node_state(
-    water_mass: f32,
+    carrier_mass: f32,
     phi_f: f32,
     visible_volume: f32,
 ) -> f32 {
@@ -171,7 +171,7 @@ fn pore_saturation_from_node_state(
     if (pore_volume <= 0.0 || params.extra.x <= 0.0) {
         return 0.0;
     }
-    let water_volume = max(water_mass, 0.0) / params.extra.x;
+    let water_volume = max(carrier_mass, 0.0) / params.extra.x;
     return clamp(water_volume / pore_volume, 0.0, 1.0);
 }
 
@@ -215,7 +215,7 @@ fn bed_neighbor_saturation(
     let neighbor_xp = params.grid_origin.xyz + vec3<f32>(neighbor_coords) * h;
     let visible_volume = node_visible_volume(neighbor_xp);
     let phi_f = phi_f_from_solid_and_visible_volume(neighbor_solid_volume, visible_volume);
-    return pore_saturation_from_node_state(grid_vel[neighbor].w, phi_f, visible_volume);
+    return pore_saturation_from_node_state(carrier_mass_at(neighbor), phi_f, visible_volume);
 }
 
 // Capillarity pulls toward lower saturation: a_cap = -a_suction * q * normalize(grad S), with
@@ -265,13 +265,19 @@ fn grain_bound_water_mass(v_bound: f32) -> f32 {
     return 0.0;
 }
 
-fn grain_effective_mass(v_bound: f32) -> f32 {
-    return params.splas1.z + grain_bound_water_mass(v_bound);
+fn grain_remaining_solute_mass(p: u32) -> f32 {
+    return max(chem[p].x, 0.0) + max(chem[p].y, 0.0);
 }
 
-fn grain_heat_capacity(v_bound: f32) -> f32 {
-    return params.splas1.z * params.therm.y
-        + grain_bound_water_mass(v_bound) * params.therm.x;
+fn grain_effective_mass(p: u32) -> f32 {
+    return params.solute.x + grain_remaining_solute_mass(p)
+        + grain_bound_water_mass(pos[p].w);
+}
+
+fn grain_heat_capacity(p: u32) -> f32 {
+    return params.solute.x * params.therm.y
+        + grain_remaining_solute_mass(p) * params.solute.y
+        + grain_bound_water_mass(pos[p].w) * params.therm.x;
 }
 
 // =================================== p2g_solid =================================================
@@ -330,13 +336,14 @@ fn drag_fold(@builtin(global_invocation_id) gid: vec3<u32>) {
     var g = params.gravity.xyz;
     let c = node_coords(n);
     let xp = params.grid_origin.xyz + vec3<f32>(f32(c.x), f32(c.y), f32(c.z)) * params.grid_origin.w;
+    let open_base = params.coupling.w > 0.5;
     let sv = solid_volume_at(n);
     var phi_f = 1.0;
     var saturation = 0.0;
     if (sv > 0.0) {
         let visible_volume = node_visible_volume(xp);
         phi_f = phi_f_from_solid_and_visible_volume(sv, visible_volume);
-        saturation = pore_saturation_from_node_state(mass, phi_f, visible_volume);
+        saturation = pore_saturation_from_node_state(carrier_mass_at(n), phi_f, visible_volume);
 
         // The calibrated Green-Ampt magnitude now follows the local saturation-gradient normal,
         // not gravity. It is evaluated only inside the bed; missing/non-bed neighbors receive a
@@ -345,6 +352,25 @@ fn drag_fold(@builtin(global_invocation_id) gid: vec3<u32>) {
         let a_suction = params.wet1.x;
         if (a_suction > 0.0) {
             g = g + capillary_front_acceleration(vec3<i32>(c), saturation, a_suction);
+        }
+    }
+    // Thin-sheet paper split. The hard-wall projector first removes geometrically forbidden
+    // components from the paper normal. Normal body force is then owned exclusively by the exact
+    // paper solve below; tangential force continues through the ordinary bed/free-water path.
+    // Scaling the normal source by alpha=L/delta makes the terminal gravity flux k*g/nu
+    // independent of the numerical band thickness.
+    let paper = filter_paper_response(xp);
+    var paper_normal = vec3<f32>(0.0);
+    var paper_source = 0.0;
+    if (paper.coverage > 0.0) {
+        let hard = phase_hard_projector(xp, PHASE_WATER, open_base);
+        let allowed = minv_apply(hard, paper.normal);
+        let allowed_len = length(allowed);
+        if (allowed_len > SDF_NORMAL_MIN) {
+            paper_normal = allowed / allowed_len;
+            let normal_force = dot(g, paper_normal);
+            paper_source = paper.alpha * normal_force;
+            g = g - normal_force * paper_normal;
         }
     }
     var sig = 1.0;
@@ -404,6 +430,13 @@ fn drag_fold(@builtin(global_invocation_id) gid: vec3<u32>) {
         v = v + g * params.dt; // exact-zero passthrough: byte-identical pre-U6 gravity path
     }
 
+    if (length(paper_normal) > SDF_NORMAL_MIN) {
+        let old_normal_velocity = dot(v, paper_normal);
+        let new_normal_velocity = paper.decay * old_normal_velocity
+            + paper.sigma * params.dt * paper_source;
+        v = v + (new_normal_velocity - old_normal_velocity) * paper_normal;
+    }
+
     if (dynamic_pair) {
         // Drag can reintroduce an approaching contact component after solid_update. Reapply the
         // identical unilateral Coulomb BC at actual contact only; separating motion survives and
@@ -415,8 +448,6 @@ fn drag_fold(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     // --- grid-node BC (moved verbatim from U2's grid_update; see its original comments) -------
     let eps = 1.0e-4;
-    let open_base = params.coupling.w > 0.5;
-
     // Nodes strictly OUTSIDE the domain box are inside the walls (zero velocity, M̃⁻¹ = 0 in
     // node_setup). The open base exempts the below-floor pad layer: it carries the outflow's
     // B-spline smear and must keep its velocity or near-floor particles gather a zero-drag
@@ -540,6 +571,57 @@ fn bloom_factor(contact_t: f32) -> f32 {
     return t * t * (3.0 - 2.0 * t); // smoothstep
 }
 
+// ================================ FILTER RESERVOIR RELEASE ===================================
+// Stored parcels preserve solvent, solute, and temperature exactly while their Darcy pore-transit
+// clock advances. Release is a separate pass before g2p_water, so freed capacity is visible to all
+// admissions in the later dispatch. chem.z=2 is a one-dispatch handoff marker: g2p clears it while
+// preserving the release position/velocity instead of gathering from a grid the parcel did not
+// contribute to this frame.
+@compute @workgroup_size(256)
+fn filter_release(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let p = gid.x;
+    if (p >= params.water_count || params.filter1.x == 0u) {
+        return;
+    }
+    let state = chem[p];
+    if (state.z < 0.5 || state.z > 1.5) {
+        return;
+    }
+    let hit = filter_paper_hit(pos[p].xyz);
+    let downstream = -sdf_normalize3(hit.grad);
+    let permeability = params.filter0.x;
+    let viscosity = params.filter0.y;
+    let thickness = params.filter0.z;
+    let porosity = params.filter0.w;
+    if (length(downstream) <= SDF_EPS || permeability <= 0.0 || viscosity <= 0.0
+        || thickness <= 0.0 || porosity <= 0.0) {
+        atomicOr(&filter_state[FILTER_ERRORS], 1u);
+        return;
+    }
+    let superficial_flux = (permeability / viscosity)
+        * max(dot(params.gravity.xyz, downstream), 0.0);
+    let progress = state.w + superficial_flux * params.dt / (porosity * thickness);
+    if (progress < 1.0) {
+        chem[p] = vec4<f32>(state.xyz, clamp(progress, 0.0, 1.0));
+        return;
+    }
+
+    let parcel_counts = filter_volume_encode(clamp(pos[p].w, 0.0, 1.0) * wet_v_water());
+    let old_occupied = atomicSub(&filter_state[FILTER_OCCUPIED], parcel_counts);
+    if (old_occupied < parcel_counts) {
+        atomicStore(&filter_state[FILTER_OCCUPIED], 0u);
+        atomicOr(&filter_state[FILTER_ERRORS], 2u);
+    }
+    atomicAdd(&filter_state[FILTER_RELEASED], 1u);
+    let offset = max(thickness, 2.0 * SDF_EPS * params.grid_origin.w);
+    pos[p] = vec4<f32>(pos[p].xyz + downstream * offset, pos[p].w);
+    vel[p] = vec4<f32>(downstream * (superficial_flux / porosity), vel[p].w);
+    cmat[3u * p + 0u] = vec4<f32>(0.0);
+    cmat[3u * p + 1u] = vec4<f32>(0.0);
+    cmat[3u * p + 2u] = vec4<f32>(0.0);
+    chem[p] = vec4<f32>(state.xy, 2.0, 0.0);
+}
+
 // =================================== p2g_moisture =============================================
 @compute @workgroup_size(256)
 fn p2g_moisture(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -552,6 +634,9 @@ fn p2g_moisture(@builtin(global_invocation_id) gid: vec3<u32>) {
     let is_solid = p >= (params.particle_count - params.solid_count);
     if (!is_water && !is_solid) {
         return; // dormant pool slot — never scatters
+    }
+    if (is_water && chem[p].z > 0.5) {
+        return; // paper-held solvent is not available to the bed absorption ledger
     }
     let h = params.grid_origin.w;
     let x = pos[p].xyz;
@@ -647,6 +732,9 @@ fn g2p_absorb(@builtin(global_invocation_id) gid: vec3<u32>) {
     let is_water = p < params.water_count;
     let is_solid = p >= (params.particle_count - params.solid_count);
     if (!is_water && !is_solid) {
+        return;
+    }
+    if (is_water && chem[p].z > 0.5) {
         return;
     }
     let h = params.grid_origin.w;
@@ -771,7 +859,7 @@ fn g2p_absorb(@builtin(global_invocation_id) gid: vec3<u32>) {
             // water particles keep velocity while losing mass; Q/S carries exactly the velocity
             // of that lost mass into this receiver allocation.
             let water_mass_per_volume = params.particle_mass / wet_v_water();
-            let old_mass = grain_effective_mass(v_bound);
+            let old_mass = grain_effective_mass(p);
             let gained_mass = water_mass_per_volume * gain;
             let new_mass = old_mass + gained_mass;
             let new_velocity = (
@@ -782,7 +870,7 @@ fn g2p_absorb(@builtin(global_invocation_id) gid: vec3<u32>) {
 
             // Bound water carries its donor temperature into the grain. This is the thermal
             // analogue of the momentum merge and prevents phase change from creating enthalpy.
-            let old_capacity = grain_heat_capacity(v_bound);
+            let old_capacity = grain_heat_capacity(p);
             let incoming_capacity_per_volume = water_mass_per_volume * params.therm.x;
             let gained_capacity = incoming_capacity_per_volume * gain;
             let new_capacity = old_capacity + gained_capacity;
@@ -801,7 +889,7 @@ fn g2p_absorb(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 // ======================== CONSERVATIVE EXTRACTION + THERMAL TRANSPORT =========================
 // These two passes run after pressure projection and before particle advection. The scatter pass
-// freezes seven extensive node totals; the gather pass allocates one node transfer to both sides.
+// freezes eleven extensive node lanes; the gather pass allocates one node transfer to both sides.
 // No particle writes a shared float, so there are no cross-particle races. For every node:
 //
 //   X_n = min(H_n, F_n + L_n)
@@ -847,8 +935,9 @@ fn bounded_pool_release(pool: f32, rate: f32) -> f32 {
     return clamp(available * fraction, 0.0, available);
 }
 
-fn water_heat_capacity(f_water: f32) -> f32 {
-    return params.particle_mass * clamp(f_water, 0.0, 1.0) * max(params.therm.x, 0.0);
+fn water_heat_capacity(f_water: f32, concentration: f32) -> f32 {
+    return water_solvent_mass(f_water) * max(params.therm.x, 0.0)
+        + water_solute_mass(f_water, concentration) * max(params.solute.y, 0.0);
 }
 
 fn node_heat_transfer(c_water: f32, e_water: f32, c_grain: f32, e_grain: f32) -> f32 {
@@ -860,6 +949,59 @@ fn node_heat_transfer(c_water: f32, e_water: f32, c_grain: f32, e_grain: f32) ->
     let reduced_capacity = c_water * c_grain / (c_water + c_grain);
     let alpha = positive_decay_fraction(max(params.chem1.w, 0.0) * params.dt);
     return alpha * reduced_capacity * (t_grain - t_water);
+}
+
+struct ChemistryNodeState {
+    headroom: f32,
+    proposed: f32,
+    accepted_mass: f32,
+    accepted_momentum: vec3<f32>,
+    accepted_solute_enthalpy: f32,
+    water_capacity: f32,
+    grain_capacity: f32,
+    heat_to_water: f32,
+};
+
+fn chemistry_node_state(offset: u32) -> ChemistryNodeState {
+    let headroom = chem_decode(
+        CHEM_HEADROOM, atomicLoad(&grid_chem[offset + CHEM_HEADROOM]),
+    );
+    let fast = chem_decode(CHEM_FAST, atomicLoad(&grid_chem[offset + CHEM_FAST]));
+    let slow = chem_decode(CHEM_SLOW, atomicLoad(&grid_chem[offset + CHEM_SLOW]));
+    let proposed = fast + slow;
+    let accepted_mass = min(headroom, proposed);
+    var accepted_fraction = 0.0;
+    if (proposed > 0.0) { accepted_fraction = accepted_mass / proposed; }
+    let accepted_momentum = accepted_fraction * vec3<f32>(
+        chem_decode(CHEM_JX + 0u, atomicLoad(&grid_chem[offset + CHEM_JX + 0u])),
+        chem_decode(CHEM_JX + 1u, atomicLoad(&grid_chem[offset + CHEM_JX + 1u])),
+        chem_decode(CHEM_JX + 2u, atomicLoad(&grid_chem[offset + CHEM_JX + 2u])),
+    );
+    let accepted_solute_enthalpy = accepted_fraction * chem_decode(
+        CHEM_U, atomicLoad(&grid_chem[offset + CHEM_U]),
+    );
+    let old_cw = chem_decode(CHEM_CW, atomicLoad(&grid_chem[offset + CHEM_CW]));
+    let old_ew = chem_decode(CHEM_EW, atomicLoad(&grid_chem[offset + CHEM_EW]));
+    let old_cg = chem_decode(CHEM_CG, atomicLoad(&grid_chem[offset + CHEM_CG]));
+    let old_eg = chem_decode(CHEM_EG, atomicLoad(&grid_chem[offset + CHEM_EG]));
+    let transferred_capacity = max(params.solute.y, 0.0) * accepted_mass;
+    let water_capacity = old_cw + transferred_capacity;
+    let grain_capacity = max(old_cg - transferred_capacity, 0.0);
+    let water_enthalpy = old_ew + accepted_solute_enthalpy;
+    let grain_enthalpy = old_eg - accepted_solute_enthalpy;
+    let heat_to_water = node_heat_transfer(
+        water_capacity, water_enthalpy, grain_capacity, grain_enthalpy,
+    );
+    return ChemistryNodeState(
+        headroom,
+        proposed,
+        accepted_mass,
+        accepted_momentum,
+        accepted_solute_enthalpy,
+        water_capacity,
+        grain_capacity,
+        heat_to_water,
+    );
 }
 
 fn ambient_temperature_step(temperature: f32) -> f32 {
@@ -913,6 +1055,9 @@ fn chemistry_scatter(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (!is_water && !is_solid) {
         return;
     }
+    if (is_water && chem[p].z > 0.5) {
+        return; // stored paper inventory does not exchange with the bed this frame
+    }
     let h = params.grid_origin.w;
     let x = pos[p].xyz;
     if (params.coupling.w > 0.5 && x.y < params.box_min.y) {
@@ -923,14 +1068,19 @@ fn chemistry_scatter(@builtin(global_invocation_id) gid: vec3<u32>) {
     var release = vec2<f32>(0.0);
     var capacity = 0.0;
     var enthalpy = 0.0;
+    var proposal_momentum = vec3<f32>(0.0);
+    var proposal_solute_enthalpy = 0.0;
     if (is_water) {
-        let mass = params.particle_mass * clamp(pos[p].w, 0.0, 1.0);
-        headroom = max(params.chem1.x - chem[p].x, 0.0) * mass;
-        capacity = water_heat_capacity(pos[p].w);
+        let solvent_mass = water_solvent_mass(pos[p].w);
+        headroom = max(params.chem1.x - chem[p].x, 0.0) * solvent_mass;
+        capacity = water_heat_capacity(pos[p].w, chem[p].x);
         enthalpy = capacity * chem[p].y;
     } else {
         release = grain_release_proposal(p);
-        capacity = grain_heat_capacity(pos[p].w);
+        let proposed_mass = release.x + release.y;
+        proposal_momentum = proposed_mass * vel[p].xyz;
+        proposal_solute_enthalpy = proposed_mass * params.solute.y * chem[p].z;
+        capacity = grain_heat_capacity(p);
         enthalpy = capacity * chem[p].z;
     }
 
@@ -946,11 +1096,19 @@ fn chemistry_scatter(@builtin(global_invocation_id) gid: vec3<u32>) {
     let enthalpy_lane = select(CHEM_EG, CHEM_EW, is_water);
     let total_capacity = chem_encode(capacity_lane, capacity);
     let total_enthalpy = chem_encode(enthalpy_lane, enthalpy);
+    let total_momentum = vec3<i32>(
+        chem_encode(CHEM_JX + 0u, proposal_momentum.x),
+        chem_encode(CHEM_JX + 1u, proposal_momentum.y),
+        chem_encode(CHEM_JX + 2u, proposal_momentum.z),
+    );
+    let total_solute_enthalpy = chem_encode(CHEM_U, proposal_solute_enthalpy);
     var allocated_headroom = 0i;
     var allocated_fast = 0i;
     var allocated_slow = 0i;
     var allocated_capacity = 0i;
     var allocated_enthalpy = 0i;
+    var allocated_momentum = vec3<i32>(0);
+    var allocated_solute_enthalpy = 0i;
     var cumulative_weight = 0.0;
     for (var k = 0; k < 3; k = k + 1) {
         for (var j = 0; j < 3; j = j + 1) {
@@ -985,6 +1143,24 @@ fn chemistry_scatter(@builtin(global_invocation_id) gid: vec3<u32>) {
                     );
                     allocated_fast = fast_target;
                     allocated_slow = slow_target;
+                    for (var axis = 0; axis < 3; axis = axis + 1) {
+                        let momentum_target = extensive_partition_target(
+                            total_momentum[axis], cumulative_weight, is_last,
+                        );
+                        atomicAdd(
+                            &grid_chem[offset + CHEM_JX + u32(axis)],
+                            momentum_target - allocated_momentum[axis],
+                        );
+                        allocated_momentum[axis] = momentum_target;
+                    }
+                    let solute_enthalpy_target = extensive_partition_target(
+                        total_solute_enthalpy, cumulative_weight, is_last,
+                    );
+                    atomicAdd(
+                        &grid_chem[offset + CHEM_U],
+                        solute_enthalpy_target - allocated_solute_enthalpy,
+                    );
+                    allocated_solute_enthalpy = solute_enthalpy_target;
                 }
                 let capacity_target = extensive_partition_target(
                     total_capacity, cumulative_weight, is_last,
@@ -1019,6 +1195,9 @@ fn chemistry_gather(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (!is_water && !is_solid) {
         return;
     }
+    if (is_water && chem[p].z > 0.5) {
+        return;
+    }
     let h = params.grid_origin.w;
     let x = pos[p].xyz;
     if (params.coupling.w > 0.5 && x.y < params.box_min.y) {
@@ -1033,15 +1212,17 @@ fn chemistry_gather(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     if (is_water) {
         let fraction = clamp(pos[p].w, 0.0, 1.0);
-        let mass = params.particle_mass * fraction;
-        let my_headroom = max(params.chem1.x - chem[p].x, 0.0) * mass;
-        let my_capacity = water_heat_capacity(fraction);
+        let solvent_mass = water_solvent_mass(fraction);
+        let my_headroom = max(params.chem1.x - chem[p].x, 0.0) * solvent_mass;
+        let my_capacity = water_heat_capacity(fraction, chem[p].x);
         let headroom_total = chem_encode(CHEM_HEADROOM, my_headroom);
         let capacity_total = chem_encode(CHEM_CW, my_capacity);
         var allocated_headroom = 0i;
         var allocated_capacity = 0i;
         var cumulative_weight = 0.0;
         var solute_gain = 0.0;
+        var momentum_gain = vec3<f32>(0.0);
+        var solute_enthalpy_gain = 0.0;
         var heat_gain = 0.0;
         for (var k = 0; k < 3; k = k + 1) {
             for (var j = 0; j < 3; j = j + 1) {
@@ -1064,62 +1245,76 @@ fn chemistry_gather(@builtin(global_invocation_id) gid: vec3<u32>) {
                     allocated_headroom = headroom_target;
                     allocated_capacity = capacity_target;
                     let offset = node_index(base + vec3<i32>(i, j, k)) * CHEM_STRIDE;
-                    let headroom = chem_decode(
-                        CHEM_HEADROOM, atomicLoad(&grid_chem[offset + CHEM_HEADROOM]),
-                    );
-                    let fast = chem_decode(
-                        CHEM_FAST, atomicLoad(&grid_chem[offset + CHEM_FAST]),
-                    );
-                    let slow = chem_decode(
-                        CHEM_SLOW, atomicLoad(&grid_chem[offset + CHEM_SLOW]),
-                    );
-                    let c_water = chem_decode(
-                        CHEM_CW, atomicLoad(&grid_chem[offset + CHEM_CW]),
-                    );
-                    let e_water = chem_decode(
-                        CHEM_EW, atomicLoad(&grid_chem[offset + CHEM_EW]),
-                    );
-                    let c_grain = chem_decode(
-                        CHEM_CG, atomicLoad(&grid_chem[offset + CHEM_CG]),
-                    );
-                    let e_grain = chem_decode(
-                        CHEM_EG, atomicLoad(&grid_chem[offset + CHEM_EG]),
-                    );
-                    if (headroom > 0.0) {
-                        solute_gain += headroom_share * (min(headroom, fast + slow) / headroom);
+                    let node_state = chemistry_node_state(offset);
+                    var node_gain = 0.0;
+                    if (node_state.headroom > 0.0) {
+                        let receiver_fraction = headroom_share / node_state.headroom;
+                        node_gain = receiver_fraction * node_state.accepted_mass;
+                        solute_gain += node_gain;
+                        momentum_gain += receiver_fraction * node_state.accepted_momentum;
+                        solute_enthalpy_gain += receiver_fraction
+                            * node_state.accepted_solute_enthalpy;
                     }
-                    if (c_water > 0.0) {
-                        heat_gain += capacity_share / c_water
-                            * node_heat_transfer(c_water, e_water, c_grain, e_grain);
+                    if (node_state.water_capacity > 0.0) {
+                        let post_capacity_share = capacity_share
+                            + params.solute.y * node_gain;
+                        heat_gain += post_capacity_share / node_state.water_capacity
+                            * node_state.heat_to_water;
                     }
                 }
             }
         }
         // The analytic gather cannot exceed my_headroom. Clamp only the FP-rounding residue so
         // c<=c_sat is structural, rather than relying on an after-the-fact concentration clip.
+        let raw_solute_gain = solute_gain;
         solute_gain = min(max(solute_gain, 0.0), my_headroom);
+        if (raw_solute_gain > 0.0 && solute_gain != raw_solute_gain) {
+            let correction = solute_gain / raw_solute_gain;
+            momentum_gain *= correction;
+            solute_enthalpy_gain *= correction;
+        }
+        let new_capacity = my_capacity + params.solute.y * solute_gain;
         var new_temperature = chem[p].y;
-        if (my_capacity > 0.0) {
-            new_temperature += heat_gain / my_capacity;
+        if (new_capacity > 0.0) {
+            new_temperature = (
+                my_capacity * chem[p].y + solute_enthalpy_gain + heat_gain
+            ) / new_capacity;
         }
         new_temperature = ambient_temperature_step(new_temperature);
         var new_concentration = chem[p].x;
-        if (mass > 0.0) {
-            new_concentration = (chem[p].x * mass + solute_gain) / mass;
+        if (solvent_mass > 0.0) {
+            new_concentration = (chem[p].x * solvent_mass + solute_gain) / solvent_mass;
         }
         chem[p] = vec4<f32>(new_concentration, new_temperature, chem[p].zw);
+        vel[p] = vec4<f32>(vel[p].xyz, solute_gain);
+        cmat[3u * p + 0u] = vec4<f32>(cmat[3u * p + 0u].xyz, momentum_gain.x);
+        cmat[3u * p + 1u] = vec4<f32>(cmat[3u * p + 1u].xyz, momentum_gain.y);
+        cmat[3u * p + 2u] = vec4<f32>(cmat[3u * p + 2u].xyz, momentum_gain.z);
     } else {
         let proposal = grain_release_proposal(p);
-        let my_capacity = grain_heat_capacity(pos[p].w);
+        let my_capacity = grain_heat_capacity(p);
         let fast_total = chem_encode(CHEM_FAST, proposal.x);
         let slow_total = chem_encode(CHEM_SLOW, proposal.y);
         let capacity_total = chem_encode(CHEM_CG, my_capacity);
+        let proposed_mass = proposal.x + proposal.y;
+        let momentum_total = vec3<i32>(
+            chem_encode(CHEM_JX + 0u, proposed_mass * vel[p].x),
+            chem_encode(CHEM_JX + 1u, proposed_mass * vel[p].y),
+            chem_encode(CHEM_JX + 2u, proposed_mass * vel[p].z),
+        );
+        let solute_enthalpy_total = chem_encode(
+            CHEM_U, proposed_mass * params.solute.y * chem[p].z,
+        );
         var allocated_fast = 0i;
         var allocated_slow = 0i;
         var allocated_capacity = 0i;
+        var allocated_momentum = vec3<i32>(0);
+        var allocated_solute_enthalpy = 0i;
         var cumulative_weight = 0.0;
         var fast_loss = 0.0;
         var slow_loss = 0.0;
+        var momentum_loss = vec3<f32>(0.0);
+        var solute_enthalpy_loss = 0.0;
         var heat_gain = 0.0;
         for (var k = 0; k < 3; k = k + 1) {
             for (var j = 0; j < 3; j = j + 1) {
@@ -1136,6 +1331,15 @@ fn chemistry_gather(@builtin(global_invocation_id) gid: vec3<u32>) {
                     let capacity_target = extensive_partition_target(
                         capacity_total, cumulative_weight, is_last,
                     );
+                    var momentum_target = vec3<i32>(0);
+                    for (var axis = 0; axis < 3; axis = axis + 1) {
+                        momentum_target[axis] = extensive_partition_target(
+                            momentum_total[axis], cumulative_weight, is_last,
+                        );
+                    }
+                    let solute_enthalpy_target = extensive_partition_target(
+                        solute_enthalpy_total, cumulative_weight, is_last,
+                    );
                     let fast_share = chem_decode(
                         CHEM_FAST, fast_target - allocated_fast,
                     );
@@ -1145,49 +1349,57 @@ fn chemistry_gather(@builtin(global_invocation_id) gid: vec3<u32>) {
                     let capacity_share = chem_decode(
                         CHEM_CG, capacity_target - allocated_capacity,
                     );
+                    let momentum_share = vec3<f32>(
+                        chem_decode(CHEM_JX + 0u, momentum_target.x - allocated_momentum.x),
+                        chem_decode(CHEM_JX + 1u, momentum_target.y - allocated_momentum.y),
+                        chem_decode(CHEM_JX + 2u, momentum_target.z - allocated_momentum.z),
+                    );
+                    let solute_enthalpy_share = chem_decode(
+                        CHEM_U, solute_enthalpy_target - allocated_solute_enthalpy,
+                    );
                     allocated_fast = fast_target;
                     allocated_slow = slow_target;
                     allocated_capacity = capacity_target;
+                    allocated_momentum = momentum_target;
+                    allocated_solute_enthalpy = solute_enthalpy_target;
                     let offset = node_index(base + vec3<i32>(i, j, k)) * CHEM_STRIDE;
-                    let headroom = chem_decode(
-                        CHEM_HEADROOM, atomicLoad(&grid_chem[offset + CHEM_HEADROOM]),
-                    );
-                    let fast = chem_decode(
-                        CHEM_FAST, atomicLoad(&grid_chem[offset + CHEM_FAST]),
-                    );
-                    let slow = chem_decode(
-                        CHEM_SLOW, atomicLoad(&grid_chem[offset + CHEM_SLOW]),
-                    );
-                    let c_water = chem_decode(
-                        CHEM_CW, atomicLoad(&grid_chem[offset + CHEM_CW]),
-                    );
-                    let e_water = chem_decode(
-                        CHEM_EW, atomicLoad(&grid_chem[offset + CHEM_EW]),
-                    );
-                    let c_grain = chem_decode(
-                        CHEM_CG, atomicLoad(&grid_chem[offset + CHEM_CG]),
-                    );
-                    let e_grain = chem_decode(
-                        CHEM_EG, atomicLoad(&grid_chem[offset + CHEM_EG]),
-                    );
-                    let proposed = fast + slow;
-                    if (proposed > 0.0) {
-                        let accepted = min(headroom, proposed) / proposed;
-                        fast_loss += fast_share * accepted;
-                        slow_loss += slow_share * accepted;
+                    let node_state = chemistry_node_state(offset);
+                    var accepted_fraction = 0.0;
+                    if (node_state.proposed > 0.0) {
+                        accepted_fraction = node_state.accepted_mass / node_state.proposed;
                     }
-                    if (c_grain > 0.0) {
-                        heat_gain -= capacity_share / c_grain
-                            * node_heat_transfer(c_water, e_water, c_grain, e_grain);
+                    let fast_loss_node = fast_share * accepted_fraction;
+                    let slow_loss_node = slow_share * accepted_fraction;
+                    let mass_loss_node = fast_loss_node + slow_loss_node;
+                    fast_loss += fast_loss_node;
+                    slow_loss += slow_loss_node;
+                    momentum_loss += accepted_fraction * momentum_share;
+                    solute_enthalpy_loss += accepted_fraction * solute_enthalpy_share;
+                    if (node_state.grain_capacity > 0.0) {
+                        let post_capacity_share = max(
+                            capacity_share - params.solute.y * mass_loss_node, 0.0,
+                        );
+                        heat_gain -= post_capacity_share / node_state.grain_capacity
+                            * node_state.heat_to_water;
                     }
                 }
             }
         }
+        let raw_total_loss = fast_loss + slow_loss;
         fast_loss = min(max(fast_loss, 0.0), proposal.x);
         slow_loss = min(max(slow_loss, 0.0), proposal.y);
+        let total_mass_loss = fast_loss + slow_loss;
+        if (raw_total_loss > 0.0 && total_mass_loss != raw_total_loss) {
+            let correction = total_mass_loss / raw_total_loss;
+            momentum_loss *= correction;
+            solute_enthalpy_loss *= correction;
+        }
+        let new_capacity = max(my_capacity - params.solute.y * total_mass_loss, 0.0);
         var new_temperature = chem[p].z;
-        if (my_capacity > 0.0) {
-            new_temperature += heat_gain / my_capacity;
+        if (new_capacity > 0.0) {
+            new_temperature = (
+                my_capacity * chem[p].z - solute_enthalpy_loss + heat_gain
+            ) / new_capacity;
         }
         new_temperature = ambient_temperature_step(new_temperature);
         chem[p] = vec4<f32>(
@@ -1196,5 +1408,9 @@ fn chemistry_gather(@builtin(global_invocation_id) gid: vec3<u32>) {
             new_temperature,
             chem[p].w,
         );
+        vel[p] = vec4<f32>(vel[p].xyz, -total_mass_loss);
+        cmat[3u * p + 0u] = vec4<f32>(cmat[3u * p + 0u].xyz, -momentum_loss.x);
+        cmat[3u * p + 1u] = vec4<f32>(cmat[3u * p + 1u].xyz, -momentum_loss.y);
+        cmat[3u * p + 2u] = vec4<f32>(cmat[3u * p + 2u].xyz, -momentum_loss.z);
     }
 }

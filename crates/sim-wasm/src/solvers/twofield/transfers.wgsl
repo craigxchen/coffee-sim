@@ -78,6 +78,7 @@ fn grid_clear(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (n < num_fine_cells()) {
         atomicStore(&cell_cnt[n], 0u);
     }
+    atomicStore(&cell_cnt[carrier_mass_index(n)], 0u);
 }
 
 // Quadratic B-spline scatter of mass + APIC momentum m·(v + C·(x_i − x_p)) via fixed-point
@@ -86,6 +87,10 @@ fn grid_clear(@builtin(global_invocation_id) gid: vec3<u32>) {
 fn p2g_water(@builtin(global_invocation_id) gid: vec3<u32>) {
     let p = gid.x;
     if (p >= params.water_count) {
+        return;
+    }
+    // Paper-held parcels remain full thermochemical particles but are not free-water mechanics.
+    if (chem[p].z > 0.5) {
         return;
     }
     let h = params.grid_origin.w;
@@ -111,7 +116,8 @@ fn p2g_water(@builtin(global_invocation_id) gid: vec3<u32>) {
     // scatters proportionally less mass/volume (models::wetting::water_eff_mass), so the bed
     // pore volume falls exactly as water is absorbed — the projection sees the real remaining
     // fluid. With absorption off f_w ≡ 1 and this is bit-identical to the U2 constant mass.
-    let m = params.particle_mass * clamp(pos[p].w, 0.0, 1.0);
+    let carrier_mass = water_solvent_mass(pos[p].w);
+    let m = water_solution_mass(pos[p].w, chem[p].x);
 
     // Particle-presence census for the surface classification (see cell_cnt in common.wgsl).
     let ci = clamp(
@@ -145,6 +151,10 @@ fn p2g_water(@builtin(global_invocation_id) gid: vec3<u32>) {
                 atomicAdd(&grid_fp[idx + 1u], fp_encode(m * wijk * vaff.x));
                 atomicAdd(&grid_fp[idx + 2u], fp_encode(m * wijk * vaff.y));
                 atomicAdd(&grid_fp[idx + 3u], fp_encode(m * wijk * vaff.z));
+                atomicAdd(
+                    &cell_cnt[carrier_mass_index(node_index(node))],
+                    u32(max(fp_encode(carrier_mass * wijk), 0)),
+                );
             }
         }
     }
@@ -189,8 +199,20 @@ fn g2p_water(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (p >= params.water_count) {
         return;
     }
+    let filter_marker = chem[p].z;
+    if (filter_marker >= 0.5 && filter_marker <= 1.5) {
+        return; // still stored; filter_release advanced only its pore-transit clock
+    }
+    if (filter_marker > 1.5) {
+        // Just released by the preceding pass. Preserve its pore velocity/position because this
+        // parcel did not contribute to the grid being gathered, then clear the handoff marker.
+        chem[p] = vec4<f32>(chem[p].xy, 0.0, 0.0);
+        vel[p] = vec4<f32>(vel[p].xyz, 0.0);
+        return;
+    }
     let h = params.grid_origin.w;
-    var x = pos[p].xyz;
+    let old_x = pos[p].xyz;
+    var x = old_x;
 
     // Open base (U6 drained-flux mode): escaped particles fall ballistically — they no
     // longer scatter (p2g guard), so gathering from the empty grid would freeze them.
@@ -199,7 +221,7 @@ fn g2p_water(@builtin(global_invocation_id) gid: vec3<u32>) {
         var v = vel[p].xyz + params.gravity.xyz * params.dt;
         x = x + v * params.dt;
         pos[p] = vec4<f32>(x, pos[p].w);
-        vel[p] = vec4<f32>(v, vel[p].w);
+        vel[p] = vec4<f32>(v, 0.0);
         cmat[3u * p + 0u] = vec4<f32>(0.0);
         cmat[3u * p + 1u] = vec4<f32>(0.0);
         cmat[3u * p + 2u] = vec4<f32>(0.0);
@@ -228,9 +250,10 @@ fn g2p_water(@builtin(global_invocation_id) gid: vec3<u32>) {
                 let wijk = w[i].x * w[j].y * w[k].z;
                 let node = base + vec3<i32>(i, j, k);
                 let d = (vec3<f32>(node) - xl) * h;
-                let gvel = grid_vel[node_index(node)];
+                let flat_node = node_index(node);
+                let gvel = grid_vel[flat_node];
                 let gv = gvel.xyz;
-                let gm = gvel.w; // decoded node mass
+                let gm = carrier_mass_at(flat_node); // carrier volume census, excluding solute
                 v = v + wijk * gv;
                 b0 = b0 + (wijk * gv.x) * d;
                 b1 = b1 + (wijk * gv.y) * d;
@@ -298,6 +321,26 @@ fn g2p_water(@builtin(global_invocation_id) gid: vec3<u32>) {
     c1 = c1 * affine_keep;
     c2 = c2 * affine_keep;
 
+    // Chemistry ran after this frame's P2G, so the grid carries the pre-transfer inertial mass.
+    // Merge its gathered momentum with the accepted solute momentum bridged through the otherwise
+    // unused .w lanes. This makes dissolution mechanically conservative without another buffer or
+    // pass; solute changes inertia but not carrier volume.
+    let delta_mass = vel[p].w;
+    let delta_momentum = vec3<f32>(
+        cmat[3u * p + 0u].w,
+        cmat[3u * p + 1u].w,
+        cmat[3u * p + 2u].w,
+    );
+    let new_mass = water_solution_mass(pos[p].w, chem[p].x);
+    let old_mass = max(new_mass - delta_mass, 0.0);
+    if (new_mass > params.extra.z) {
+        v = (old_mass * v + delta_momentum) / new_mass;
+        let affine_mass_fraction = clamp(old_mass / new_mass, 0.0, 1.0);
+        c0 *= affine_mass_fraction;
+        c1 *= affine_mass_fraction;
+        c2 *= affine_mass_fraction;
+    }
+
     // Velocity cap backstop (anti-blow-up; the other half of the FP headroom contract). U3: the
     // water path uses the separate splash cap (flip.w) so the crown survives; sentinel ≤ 0 ⇒
     // global max_speed (byte-identical default).
@@ -333,8 +376,33 @@ fn g2p_water(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
 
+    // Whole-parcel storage admission. Crossing is from the paper cavity (positive distance) to
+    // downstream (non-positive). A successful CAS reserves the complete remaining solvent volume;
+    // failure leaves the parcel entirely mobile, so water/solute/enthalpy are never fractionally
+    // deleted. The aggregate inventory is exact although which equal parcels win a simultaneous
+    // capacity race is intentionally scheduling-independent.
+    if (params.filter1.x > 0u && params.num_solids > 0u) {
+        let old_paper = filter_paper_hit(old_x);
+        let new_paper = filter_paper_hit(x);
+        if (old_paper.dist > 0.0 && new_paper.dist <= 0.0) {
+            let denom = old_paper.dist - new_paper.dist;
+            let crossing_t = clamp(old_paper.dist / max(denom, SDF_EPS), 0.0, 1.0);
+            let parcel_counts = filter_volume_encode(
+                clamp(pos[p].w, 0.0, 1.0) * params.wet0.z,
+            );
+            if (filter_try_reserve(parcel_counts)) {
+                x = mix(old_x, x, crossing_t);
+                v = vec3<f32>(0.0);
+                c0 = vec3<f32>(0.0);
+                c1 = vec3<f32>(0.0);
+                c2 = vec3<f32>(0.0);
+                chem[p] = vec4<f32>(chem[p].xy, 1.0, 0.0);
+            }
+        }
+    }
+
     pos[p] = vec4<f32>(x, pos[p].w);
-    vel[p] = vec4<f32>(v, vel[p].w);
+    vel[p] = vec4<f32>(v, 0.0);
     cmat[3u * p + 0u] = vec4<f32>(c0, 0.0);
     cmat[3u * p + 1u] = vec4<f32>(c1, 0.0);
     cmat[3u * p + 2u] = vec4<f32>(c2, 0.0);

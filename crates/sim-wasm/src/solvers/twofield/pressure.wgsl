@@ -278,6 +278,25 @@ fn minv_add(lhs: Minv, rhs: Minv) -> Minv {
     );
 }
 
+fn minv_reduce_along_allowed_normal(base: Minv, normal: vec3<f32>, strength: f32) -> Minv {
+    let allowed = minv_apply(base, normal);
+    let len = length(allowed);
+    if (len <= SDF_NORMAL_MIN || strength <= 0.0) {
+        return base;
+    }
+    let n = allowed / len;
+    let s = clamp(strength, 0.0, 1.0);
+    return Minv(
+        base.a - s * vec4<f32>(n.x * n.x, n.x * n.y, n.x * n.z, n.y * n.y),
+        vec4<f32>(
+            base.b.x - s * n.y * n.z,
+            base.b.y - s * n.z * n.z,
+            base.b.z,
+            base.b.w,
+        ),
+    );
+}
+
 // Unit pressure-response projector for one phase at a grid node. The pressure operator and
 // phase correction call this same function, so constraints cannot drift between
 // A = -D M^-1 G and project(). Water uses the one-cell SDF support band needed by its
@@ -286,7 +305,7 @@ fn minv_add(lhs: Minv, rhs: Minv) -> Minv {
 // is geometry-dependent between steps, but frozen for this solve, preserving a linear SPD
 // operator. A fully unilateral pressure complementarity solve would be nonlinear and is outside
 // this fixed-budget Jacobi family.
-fn phase_pressure_projector(xp: vec3<f32>, ph: u32, open_y_min: bool) -> Minv {
+fn phase_hard_projector(xp: vec3<f32>, ph: u32, open_y_min: bool) -> Minv {
     var out_lo = xp < params.box_min.xyz - vec3<f32>(NODE_BC_EPS);
     if (open_y_min) {
         out_lo.y = false;
@@ -361,6 +380,18 @@ fn phase_pressure_projector(xp: vec3<f32>, ph: u32, open_y_min: bool) -> Minv {
         vec4<f32>(pxx, pxy, pxz, pyy),
         vec4<f32>(pyz, pzz, 1.0, 0.0),
     );
+}
+
+// Compose porous-paper mobility with the hard-wall projector in its allowed subspace. The
+// rank-one reduction is symmetric PSD and is shared verbatim by node_setup and project, so the
+// pressure operator remains A = -D M^-1 G even where a paper band intersects another boundary.
+fn phase_pressure_projector(xp: vec3<f32>, ph: u32, open_y_min: bool) -> Minv {
+    let hard = phase_hard_projector(xp, ph, open_y_min);
+    if (ph != PHASE_WATER || hard.b.z < 0.5) {
+        return hard;
+    }
+    let paper = filter_paper_response(xp);
+    return minv_reduce_along_allowed_normal(hard, paper.normal, 1.0 - paper.sigma);
 }
 
 struct PhaseMobilities {
@@ -536,9 +567,10 @@ fn cell_classify(@builtin(global_invocation_id) gid: vec3<u32>) {
                     wallish = solid_union(xp, PHASE_WATER).dist < 0.0;
                 }
                 if (!wallish) {
-                    mass = mass + gv.w / phin;
+                    let carrier_mass = carrier_mass_at(nflat);
+                    mass = mass + carrier_mass / phin;
                     cnt = cnt + 1.0;
-                    mmin = min(mmin, gv.w / phin);
+                    mmin = min(mmin, carrier_mass / phin);
                 }
             }
         }

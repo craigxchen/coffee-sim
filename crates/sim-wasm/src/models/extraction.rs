@@ -8,9 +8,10 @@
 //! relative flow can at most double it. Numerical particle pitch is deliberately not treated as
 //! a physical grind-diameter area factor. These pure functions are the CPU mirror of the GPU
 //! kinetics and are unit-tested here first.
-//! Released solute moves to overlapping water particles' concentration `c`; the transfer is
-//! conservation-exact (the GPU pass mirrors the Phase-1.4 atomic-free two-sided allocation). Reference
-//! constants + the yield/TDS target band: `KEEP.md` §1/§5 (re-validate, not gospel).
+//! Released solute moves to overlapping water particles' solute-to-solvent ratio `c`; the transfer
+//! is conservation-exact (the GPU pass mirrors the Phase-1.4 atomic-free two-sided allocation).
+//! User-facing TDS converts that carrier ratio to a solution mass fraction. Reference constants +
+//! the yield/TDS target band: `KEEP.md` §1/§5 (re-validate, not gospel).
 
 /// Below this a denominator is treated as degenerate (guards divides for degenerate params).
 const EPS: f32 = 1.0e-6;

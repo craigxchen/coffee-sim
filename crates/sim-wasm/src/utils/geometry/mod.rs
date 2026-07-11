@@ -6,7 +6,7 @@
 //! recorded in `KEEP.md` §4 — treat them as reference values to re-validate against the new solver's
 //! own contact gates (`KEEP.md` §5), not gospel.
 
-use crate::utils::sdf::{SdfPrimitive, SolidKind, MASK_ALL, MASK_GRAIN};
+use crate::utils::sdf::{SdfPrimitive, SolidKind, FLAG_FILTER_PAPER, MASK_ALL, MASK_GRAIN};
 use glam::Vec3;
 
 /// Build the V60 dripper geometry: a rigid support cone (open apex outlet, both species), a
@@ -33,6 +33,7 @@ pub fn v60_dripper() -> Vec<SdfPrimitive> {
             },
             species_mask: MASK_ALL,
             friction: 0.3,
+            flags: 0,
         },
         // Filter paper: grains-only, closed tip (KEEP.md §4, filter center (0,-0.35,0) → absolute
         // y-extent [-3.37, +2.40], outer top radius 4.10, tip radius 0, thickness 0.08). The closed
@@ -50,6 +51,7 @@ pub fn v60_dripper() -> Vec<SdfPrimitive> {
             },
             species_mask: MASK_GRAIN,
             friction: 0.6,
+            flags: FLAG_FILTER_PAPER,
         },
         // Catch cup: an open-top cylinder below the dripper that water pools into.
         SdfPrimitive {
@@ -61,6 +63,7 @@ pub fn v60_dripper() -> Vec<SdfPrimitive> {
             },
             species_mask: MASK_ALL,
             friction: 0.2,
+            flags: 0,
         },
     ]
 }
@@ -97,6 +100,9 @@ mod tests {
             _ => panic!("solid 1 should be the filter cone"),
         }
         assert_eq!(solids[1].species_mask, MASK_GRAIN, "filter is grains-only");
+        assert_eq!(solids[1].flags, FLAG_FILTER_PAPER);
+        assert_eq!(solids[0].flags, 0);
+        assert_eq!(solids[2].flags, 0);
         // cup
         assert!(matches!(solids[2].kind, SolidKind::Cylinder { .. }));
     }

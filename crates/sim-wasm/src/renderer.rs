@@ -33,6 +33,7 @@ struct Particle3DUniforms {
     camera_forward: vec4<f32>,
     light_dir: vec4<f32>,
     params: vec4<f32>,
+    material: vec4<f32>,
 };
 
 @group(0) @binding(0)
@@ -285,6 +286,7 @@ struct Particle3DUniforms {
     camera_forward: vec4<f32>,
     light_dir: vec4<f32>,
     params: vec4<f32>,
+    material: vec4<f32>,
 };
 
 @group(0) @binding(0)
@@ -326,7 +328,9 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32, @builtin(instance_index) in
         return dormant;
     }
     let phase = phases[instance_index];
-    let grain_scale = select(1.0, uniforms.params.z, phase == 1u);
+    let saturation = clamp(position.w * uniforms.params.w, 0.0, 1.0);
+    let grain_swelling = 1.0 + saturation * uniforms.material.x;
+    let grain_scale = select(1.0, uniforms.params.z * grain_swelling, phase == 1u);
     let speed_t = clamp(length(velocities[instance_index].xyz) * uniforms.params.y, 0.0, 1.0);
     let water_radius = uniforms.params.x * mix(1.0, 0.72, clamp(speed_t * 0.7, 0.0, 1.0));
     let radius = select(water_radius, uniforms.params.x * grain_scale, phase == 1u);
@@ -339,7 +343,7 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32, @builtin(instance_index) in
     output.local = local;
     output.speed_t = speed_t;
     output.phase = phase;
-    output.saturation = clamp(position.w * uniforms.params.w, 0.0, 1.0);
+    output.saturation = saturation;
     return output;
 }
 
@@ -437,7 +441,9 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32, @builtin(instance_index) in
         && position.y <= y_max
         && position.y > -1e5;
     let visible = select(0.0, 1.0, in_slice && in_bounds && !dormant);
-    let grain_scale = select(1.0, uniforms.params.z, phase == 1u);
+    let saturation = clamp(position.w * uniforms.material.x, 0.0, 1.0);
+    let grain_swelling = 1.0 + saturation * uniforms.material.z;
+    let grain_scale = select(1.0, uniforms.params.z * grain_swelling, phase == 1u);
     let speed_t = clamp(length(velocities[instance_index].xyz) * uniforms.material.y, 0.0, 1.0);
     let water_radius = uniforms.params.w * mix(1.0, 0.72, clamp(speed_t * 0.7, 0.0, 1.0));
     let particle_radius = select(water_radius, uniforms.params.w * grain_scale, phase == 1u);
@@ -459,7 +465,7 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32, @builtin(instance_index) in
     output.local = local;
     output.speed_t = speed_t;
     output.phase = phase;
-    output.saturation = clamp(position.w * uniforms.material.x, 0.0, 1.0);
+    output.saturation = saturation;
     output.visible = visible;
     return output;
 }
@@ -505,6 +511,7 @@ struct Particle3DUniforms {
     camera_forward: [f32; 4],
     light_dir: [f32; 4],
     params: [f32; 4],
+    material: [f32; 4],
 }
 
 #[repr(C)]
@@ -1474,6 +1481,7 @@ impl Renderer {
                 simulation.grain_radius_scale(),
                 simulation.moisture_inv_cap(),
             ],
+            material: [simulation.max_diameter_swelling(), 0.0, 0.0, 0.0],
         };
         self.queue.write_buffer(
             &self.particle_3d_uniform_buffer,
@@ -1496,7 +1504,7 @@ impl Renderer {
             material: [
                 simulation.moisture_inv_cap(),
                 1.0 / CANONICAL_COLOR_MAX_SPEED,
-                0.0,
+                simulation.max_diameter_swelling(),
                 0.0,
             ],
         };

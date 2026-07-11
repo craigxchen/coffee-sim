@@ -32,10 +32,12 @@ impl fmt::Display for FilterError {
 
 impl std::error::Error for FilterError {}
 
-/// Effective saturated paper geometry derived from its liquid pore capacity.
+/// Physical paper geometry. Reservoir capacity is deliberately independent: cellulose sorption
+/// and folds can retain water beyond the open pore volume, while zero storage capacity must not
+/// remove the paper's hydraulic resistance.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct SaturatedPaperGeometry {
-    pub effective_thickness_m: f64,
+pub struct PaperGeometry {
+    pub physical_thickness_m: f64,
     pub pore_volume_m3: f64,
 }
 
@@ -45,6 +47,113 @@ pub struct FilterSaturationResult {
     pub saturation: f64,
     pub retained_volume: f64,
     pub overflow_volume: f64,
+}
+
+/// Exact response of the one-cell thin-sheet Darcy regularization.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PaperRelaxation {
+    pub coverage: f64,
+    pub alpha: f64,
+    pub beta_per_s: f64,
+    pub decay: f64,
+    pub pressure_mobility: f64,
+}
+
+/// Reference equation mirrored by the WGSL filter-paper response.
+pub fn thin_sheet_relaxation(
+    signed_distance: f64,
+    numerical_band_thickness: f64,
+    physical_paper_thickness: f64,
+    kinematic_viscosity: f64,
+    permeability: f64,
+    dt: f64,
+) -> Result<PaperRelaxation, FilterError> {
+    finite(signed_distance, "signed_distance")?;
+    positive(numerical_band_thickness, "numerical_band_thickness")?;
+    nonnegative(physical_paper_thickness, "physical_paper_thickness")?;
+    positive(kinematic_viscosity, "kinematic_viscosity")?;
+    positive(permeability, "permeability")?;
+    nonnegative(dt, "dt")?;
+
+    let coverage = (1.0 - signed_distance.abs() / numerical_band_thickness).clamp(0.0, 1.0);
+    if coverage == 0.0 || physical_paper_thickness == 0.0 {
+        return Ok(PaperRelaxation {
+            coverage,
+            alpha: 0.0,
+            beta_per_s: 0.0,
+            decay: 1.0,
+            pressure_mobility: 1.0,
+        });
+    }
+    let alpha = physical_paper_thickness / numerical_band_thickness * coverage;
+    let beta_per_s = kinematic_viscosity / permeability * alpha;
+    let x = beta_per_s * dt;
+    let (decay, pressure_mobility) = if x < 1.0e-3 {
+        (1.0 - x + 0.5 * x * x, 1.0 - 0.5 * x + x * x / 6.0)
+    } else {
+        let decay = (-x).exp();
+        (decay, (1.0 - decay) / x)
+    };
+    for (value, operation) in [
+        (alpha, "thin-sheet alpha"),
+        (beta_per_s, "thin-sheet beta"),
+        (decay, "thin-sheet decay"),
+        (pressure_mobility, "thin-sheet pressure mobility"),
+    ] {
+        finite_result(value, operation)?;
+    }
+    Ok(PaperRelaxation {
+        coverage,
+        alpha,
+        beta_per_s,
+        decay: decay.clamp(0.0, 1.0),
+        pressure_mobility: pressure_mobility.clamp(0.0, 1.0),
+    })
+}
+
+/// Compose a symmetric hard-wall projector with the paper's allowed normal mobility.
+///
+/// `B = P - (1-sigma) n_a n_a^T`, with `n_a = normalize(P n)`. The helper is a CPU reference
+/// for operator tests; the GPU evaluates the same rank-one update in `pressure.wgsl`.
+pub fn compose_porous_projector(
+    hard_projector: [[f64; 3]; 3],
+    paper_normal: [f64; 3],
+    pressure_mobility: f64,
+) -> Result<[[f64; 3]; 3], FilterError> {
+    for row in hard_projector {
+        for value in row {
+            finite(value, "hard_projector")?;
+        }
+    }
+    for value in paper_normal {
+        finite(value, "paper_normal")?;
+    }
+    finite(pressure_mobility, "pressure_mobility")?;
+    let sigma = pressure_mobility.clamp(0.0, 1.0);
+    let mut allowed = [0.0; 3];
+    for i in 0..3 {
+        allowed[i] = hard_projector[i][0] * paper_normal[0]
+            + hard_projector[i][1] * paper_normal[1]
+            + hard_projector[i][2] * paper_normal[2];
+    }
+    let len = allowed
+        .iter()
+        .map(|value| value * value)
+        .sum::<f64>()
+        .sqrt();
+    if len <= 1.0e-12 {
+        return Ok(hard_projector);
+    }
+    for value in &mut allowed {
+        *value /= len;
+    }
+    let mut result = hard_projector;
+    for i in 0..3 {
+        for j in 0..3 {
+            result[i][j] -= (1.0 - sigma) * allowed[i] * allowed[j];
+        }
+    }
+    Ok(result)
 }
 
 /// Lateral paper area of a right conical frustum.
@@ -81,33 +190,23 @@ pub fn water_mass_capacity_to_volume_m3(
     )
 }
 
-/// Infer effective saturated paper thickness from area, porosity, and liquid pore capacity.
+/// Compute paper pore volume from independently calibrated physical geometry.
 ///
-/// At saturation, liquid capacity is the pore volume and
-/// `V_pore = area * effective_thickness * porosity`. Zero capacity produces zero pore volume and
-/// thickness, including for a degenerate zero-area surface. Positive capacity requires positive
-/// area. Porosity is a physical volume fraction strictly between zero and one.
-pub fn saturated_paper_geometry(
+/// `V_pore = area * physical_thickness * porosity`. Capacity is intentionally absent: changing
+/// the finite reservoir must not silently alter Darcy resistance or pore transit distance.
+pub fn paper_geometry(
     paper_area_m2: f64,
+    physical_thickness_m: f64,
     paper_porosity: f64,
-    saturated_liquid_capacity_m3: f64,
-) -> Result<SaturatedPaperGeometry, FilterError> {
+) -> Result<PaperGeometry, FilterError> {
     nonnegative(paper_area_m2, "paper_area_m2")?;
+    nonnegative(physical_thickness_m, "physical_thickness_m")?;
     valid_porosity(paper_porosity)?;
-    nonnegative(saturated_liquid_capacity_m3, "saturated_liquid_capacity_m3")?;
-
-    if saturated_liquid_capacity_m3 == 0.0 {
-        return Ok(SaturatedPaperGeometry {
-            effective_thickness_m: 0.0,
-            pore_volume_m3: 0.0,
-        });
-    }
-    positive(paper_area_m2, "paper_area_m2")?;
-    let effective_thickness_m = saturated_liquid_capacity_m3 / (paper_area_m2 * paper_porosity);
-    finite_result(effective_thickness_m, "effective_thickness_m")?;
-    Ok(SaturatedPaperGeometry {
-        effective_thickness_m,
-        pore_volume_m3: saturated_liquid_capacity_m3,
+    let pore_volume_m3 = paper_area_m2 * physical_thickness_m * paper_porosity;
+    finite_result(pore_volume_m3, "paper_pore_volume_m3")?;
+    Ok(PaperGeometry {
+        physical_thickness_m,
+        pore_volume_m3,
     })
 }
 
@@ -226,23 +325,108 @@ mod tests {
     }
 
     #[test]
-    fn saturated_geometry_closes_pore_volume_identity_and_is_monotone() {
+    fn physical_geometry_closes_pore_volume_identity_and_is_monotone() {
         let area = 0.42;
+        let thickness = 0.000_2;
         let porosity = 0.63;
-        let capacity = 0.0024;
-        let geometry = saturated_paper_geometry(area, porosity, capacity).unwrap();
+        let geometry = paper_geometry(area, thickness, porosity).unwrap();
         assert!(close(
-            area * geometry.effective_thickness_m * porosity,
+            area * geometry.physical_thickness_m * porosity,
             geometry.pore_volume_m3
         ));
-        assert!(close(geometry.pore_volume_m3, capacity));
+        assert!(close(geometry.physical_thickness_m, thickness));
 
-        let larger_area = saturated_paper_geometry(area * 2.0, porosity, capacity).unwrap();
-        assert!(larger_area.effective_thickness_m < geometry.effective_thickness_m);
-        let larger_porosity = saturated_paper_geometry(area, porosity + 0.2, capacity).unwrap();
-        assert!(larger_porosity.effective_thickness_m < geometry.effective_thickness_m);
-        let larger_capacity = saturated_paper_geometry(area, porosity, capacity * 2.0).unwrap();
-        assert!(larger_capacity.effective_thickness_m > geometry.effective_thickness_m);
+        let larger_area = paper_geometry(area * 2.0, thickness, porosity).unwrap();
+        assert!(larger_area.pore_volume_m3 > geometry.pore_volume_m3);
+        let larger_porosity = paper_geometry(area, thickness, porosity + 0.2).unwrap();
+        assert!(larger_porosity.pore_volume_m3 > geometry.pore_volume_m3);
+        let thicker = paper_geometry(area, thickness * 2.0, porosity).unwrap();
+        assert!(thicker.pore_volume_m3 > geometry.pore_volume_m3);
+    }
+
+    #[test]
+    fn thin_sheet_resistance_and_darcy_limits_are_grid_band_invariant() {
+        let (thickness, nu, permeability, dt) = (0.000_2, 3.2e-7, 1.0e-13, 1.0 / 120.0);
+        let (gravity, pressure_jump, density) = (9.806_65, 2_400.0, 970.0);
+        let mut reference_gravity_velocity = None;
+        let mut reference_pressure_velocity = None;
+        for band in [0.000_5, 0.002, 0.02] {
+            let response =
+                thin_sheet_relaxation(0.0, band, thickness, nu, permeability, dt).unwrap();
+            assert!(close(
+                response.beta_per_s * band,
+                nu * thickness / permeability
+            ));
+
+            let gravity_velocity = response.alpha * gravity / response.beta_per_s;
+            let pressure_acceleration = pressure_jump / (density * band);
+            let pressure_velocity = pressure_acceleration / response.beta_per_s;
+            let expected_gravity = permeability * gravity / nu;
+            let expected_pressure = permeability * pressure_jump / (density * nu * thickness);
+            assert!(close(gravity_velocity, expected_gravity));
+            assert!(close(pressure_velocity, expected_pressure));
+            if let Some(reference) = reference_gravity_velocity {
+                assert!(close(gravity_velocity, reference));
+            }
+            if let Some(reference) = reference_pressure_velocity {
+                assert!(close(pressure_velocity, reference));
+            }
+            reference_gravity_velocity = Some(gravity_velocity);
+            reference_pressure_velocity = Some(pressure_velocity);
+        }
+    }
+
+    #[test]
+    fn exact_paper_relaxation_is_bounded_and_composes_with_timestep_partitioning() {
+        let args = (0.0, 0.003, 0.000_2, 4.0e-7, 2.0e-12);
+        let whole = thin_sheet_relaxation(args.0, args.1, args.2, args.3, args.4, 0.02).unwrap();
+        let half = thin_sheet_relaxation(args.0, args.1, args.2, args.3, args.4, 0.01).unwrap();
+        assert!((0.0..=1.0).contains(&whole.decay));
+        assert!((0.0..=1.0).contains(&whole.pressure_mobility));
+        assert!(close(whole.decay, half.decay * half.decay));
+
+        let outside = thin_sheet_relaxation(0.004, 0.003, args.2, args.3, args.4, 0.02).unwrap();
+        assert_eq!(outside.coverage, 0.0);
+        assert_eq!(outside.decay, 1.0);
+        assert_eq!(outside.pressure_mobility, 1.0);
+    }
+
+    #[test]
+    fn porous_projector_is_symmetric_psd_and_has_sigma_normal_eigenvalue() {
+        let hard = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 0.0]];
+        let sigma = 0.23;
+        let paper_normal = [1.0, 2.0, 3.0];
+        let tensor = compose_porous_projector(hard, paper_normal, sigma).unwrap();
+        for (i, row) in tensor.iter().enumerate() {
+            for (j, value) in row.iter().enumerate() {
+                assert!(close(*value, tensor[j][i]));
+            }
+        }
+        let allowed_len = 5.0_f64.sqrt();
+        let allowed = [1.0 / allowed_len, 2.0 / allowed_len, 0.0];
+        let tangent = [-allowed[1], allowed[0], 0.0];
+        let apply = |vector: [f64; 3]| {
+            [
+                tensor[0][0] * vector[0] + tensor[0][1] * vector[1] + tensor[0][2] * vector[2],
+                tensor[1][0] * vector[0] + tensor[1][1] * vector[1] + tensor[1][2] * vector[2],
+                tensor[2][0] * vector[0] + tensor[2][1] * vector[1] + tensor[2][2] * vector[2],
+            ]
+        };
+        let normal_result = apply(allowed);
+        let tangent_result = apply(tangent);
+        for axis in 0..3 {
+            assert!(close(normal_result[axis], sigma * allowed[axis]));
+            assert!(close(tangent_result[axis], tangent[axis]));
+        }
+        for vector in [[1.0, -2.0, 0.4], [-0.3, 0.8, 2.0], [0.0, 0.0, 1.0]] {
+            let result = apply(vector);
+            let energy = vector
+                .iter()
+                .zip(result)
+                .map(|(lhs, rhs)| lhs * rhs)
+                .sum::<f64>();
+            assert!(energy >= -1.0e-12);
+        }
     }
 
     #[test]
@@ -276,9 +460,9 @@ mod tests {
     fn zero_capacity_and_zero_geometry_are_safe_and_conservative() {
         assert_eq!(water_mass_capacity_to_volume_m3(0.0, 900.0).unwrap(), 0.0);
         assert_eq!(
-            saturated_paper_geometry(0.0, 0.5, 0.0).unwrap(),
-            SaturatedPaperGeometry {
-                effective_thickness_m: 0.0,
+            paper_geometry(0.0, 0.0, 0.5).unwrap(),
+            PaperGeometry {
+                physical_thickness_m: 0.0,
                 pore_volume_m3: 0.0,
             }
         );
@@ -304,13 +488,13 @@ mod tests {
         ));
         for porosity in [0.0, -0.1, 1.0, 1.1] {
             assert_eq!(
-                saturated_paper_geometry(1.0, porosity, 1.0),
+                paper_geometry(1.0, 0.001, porosity),
                 Err(FilterError::InvalidPorosity)
             );
         }
         assert!(matches!(
-            saturated_paper_geometry(0.0, 0.5, 1.0),
-            Err(FilterError::NonPositive { .. })
+            paper_geometry(1.0, -0.001, 0.5),
+            Err(FilterError::Negative { .. })
         ));
         assert!(matches!(
             finite_capacity_saturation(f64::NAN, 1.0),
