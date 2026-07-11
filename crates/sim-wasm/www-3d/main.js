@@ -1880,8 +1880,9 @@ async function advanceMpmV2ObservationFrames(frameCount, secondsPerFrame = 1 / 6
   }
 }
 
-function lastAcceptedObservationSample(samples) {
-  return [...samples].reverse().find((sample) => sample.diagnostics) ?? null;
+function terminalAcceptedObservationSample(samples) {
+  const terminal = samples[samples.length - 1];
+  return terminal?.diagnostics ? terminal : null;
 }
 
 function observedNumericOrdering(values, comparator) {
@@ -1969,7 +1970,7 @@ async function runTimedMpmV2Probe({
     ));
   }
   const initial = samples.find((sample) => sample.diagnostics);
-  const final = lastAcceptedObservationSample(samples);
+  const final = terminalAcceptedObservationSample(samples);
   return {
     scenarioId,
     durationSeconds: totalFrames / 60,
@@ -2064,7 +2065,7 @@ async function runFullDoseMpmV2Observation(options) {
       diagnosticOptions,
     ));
     const drawdown = deriveDrawdownObservation(samples);
-    const last = lastAcceptedObservationSample(samples);
+    const last = terminalAcceptedObservationSample(samples);
     const belowThreshold = drawdown.peakPondCarrierMassGrams > 0
       && last
       && last.diagnostics.inventory.pondCarrierMassGrams
@@ -2075,7 +2076,7 @@ async function runFullDoseMpmV2Observation(options) {
       break;
     }
   }
-  const final = lastAcceptedObservationSample(samples);
+  const final = terminalAcceptedObservationSample(samples);
   return {
     scenarioId,
     recipe: {
@@ -2124,7 +2125,7 @@ function clampCalibrationProbeValue(schema, id, value) {
 }
 
 function deriveRetentionComparison(fullDose) {
-  const final = lastAcceptedObservationSample(fullDose.samples);
+  const final = terminalAcceptedObservationSample(fullDose.samples);
   if (!final) return { available: false, reason: "no-accepted-diagnostics" };
   const { retention, inventory } = final.diagnostics;
   const ledgerComponents = {
@@ -2160,7 +2161,7 @@ function deriveRetentionComparison(fullDose) {
 }
 
 function deriveSwellingComparison(fullDose, selectedMaximumFraction) {
-  const final = lastAcceptedObservationSample(fullDose.samples);
+  const final = terminalAcceptedObservationSample(fullDose.samples);
   const measuredRatio = final?.diagnostics.meanDiameterRatio ?? null;
   const measuredFraction = measuredRatio === null ? null : measuredRatio - 1;
   return {
