@@ -60,9 +60,21 @@ fn grid_clear(@builtin(global_invocation_id) gid: vec3<u32>) {
     atomicStore(&grid_sm[n * 4u + 1u], 0);
     atomicStore(&grid_sm[n * 4u + 2u], 0);
     atomicStore(&grid_sm[n * 4u + 3u], 0);
-    // U9 moisture lanes (read only when absorption is on; cleared unconditionally).
-    atomicStore(&grid_moist[n * 2u + 0u], 0);
-    atomicStore(&grid_moist[n * 2u + 1u], 0);
+    // U9 moisture volume + volume-momentum ledger (read only when absorption is on; cleared
+    // unconditionally so the node pass count does not change with the feature gate).
+    let moist = n * MOIST_STRIDE;
+    atomicStore(&grid_moist[moist + MOIST_SUPPLY], 0);
+    atomicStore(&grid_moist[moist + MOIST_DEMAND], 0);
+    atomicStore(&grid_moist[moist + MOIST_QX + 0u], 0);
+    atomicStore(&grid_moist[moist + MOIST_QX + 1u], 0);
+    atomicStore(&grid_moist[moist + MOIST_QX + 2u], 0);
+    atomicStore(&grid_moist[moist + MOIST_RT], 0);
+    // Conservative extraction/thermal ledger (dispatched only when chemistry is enabled, but
+    // cleared here without adding a pass).
+    let chemistry = n * CHEM_STRIDE;
+    for (var lane = 0u; lane < CHEM_STRIDE; lane = lane + 1u) {
+        atomicStore(&grid_chem[chemistry + lane], 0);
+    }
     if (n < num_fine_cells()) {
         atomicStore(&cell_cnt[n], 0u);
     }

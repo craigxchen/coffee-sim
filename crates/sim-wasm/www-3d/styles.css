@@ -114,6 +114,112 @@ h1 {
   border: 1px solid var(--panel-border);
 }
 
+.calibration-panel[hidden] {
+  display: none;
+}
+
+.calibration-heading {
+  display: flex;
+  align-items: start;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.calibration-heading > div {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+}
+
+.calibration-title {
+  color: var(--ink);
+  font-size: 0.8rem;
+  font-weight: 700;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+}
+
+.calibration-subtitle,
+.calibration-control-note {
+  color: var(--muted);
+  font-size: 0.68rem;
+  line-height: 1.35;
+}
+
+.calibration-reset {
+  flex: none;
+  min-height: 28px;
+  padding: 4px 8px;
+  font-size: 0.68rem;
+}
+
+.calibration-status {
+  min-height: 2.5em;
+  margin: 0;
+  padding: 7px 8px;
+  border-radius: 8px;
+  border: 1px solid rgba(177, 200, 194, 0.16);
+  background: rgba(9, 16, 19, 0.32);
+  color: var(--muted);
+  font-size: 0.7rem;
+  line-height: 1.35;
+}
+
+.calibration-status[data-state="pending"] {
+  border-color: rgba(217, 179, 106, 0.44);
+  color: var(--accent);
+}
+
+.calibration-status[data-state="error"] {
+  border-color: rgba(232, 121, 110, 0.52);
+  color: #efaaa2;
+}
+
+.calibration-controls {
+  display: grid;
+  gap: 8px;
+}
+
+.calibration-control {
+  min-width: 0;
+  display: grid;
+  gap: 5px;
+  padding-top: 8px;
+  border-top: 1px solid rgba(177, 200, 194, 0.12);
+}
+
+.calibration-control:first-child {
+  padding-top: 0;
+  border-top: 0;
+}
+
+.calibration-control-label {
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 0.72rem;
+}
+
+.calibration-control-label span:first-child {
+  min-width: 0;
+}
+
+.calibration-control-value {
+  flex: none;
+  color: var(--ink);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.68rem;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.calibration-control-note[data-application="profile-only"] {
+  color: #d9b36a;
+}
+
 .timeseries-drawer {
   --drawer-tab-height: 38px;
   position: fixed;

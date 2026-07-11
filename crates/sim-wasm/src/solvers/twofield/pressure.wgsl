@@ -14,12 +14,11 @@
 //                        (G p)_n = −Σ_{adjacent ACTIVE cells c}  s(o(n,c))·p_c / (4h)
 //                    Adjointness identity the gates assert on twins AND GPU readbacks:
 //                        u·(G p) = −(D u)·p          for ALL u, p, on ANY masks.
-//   mass weighting : per-node symmetric constrained inverse-mass matrix
-//                        M̃⁻¹_n = invρ_n·(P_box − n̂ n̂ᵀ),    invρ_n = 1 / max(ρ_n, ρ_floor),
-//                    where ρ_n = node mass / h³, P_box zeroes box-face axes (mutually
-//                    orthogonal), and n̂ is the SDF wall normal orthogonalized against the box
-//                    axes — symmetric PSD, so wall-Neumann rows are part of the operator, not
-//                    bolted on. Massless nodes get M̃⁻¹ = 0 (the projection never moves them).
+//   mass weighting : per-node symmetric constrained mobility M̃⁻¹_n. Water-only/frozen
+//                    nodes use invρ_floor-stabilized water mobility. A dynamic phase pair uses
+//                    the exact m_f,m_s-derived two-phase mobility in MIXTURE FAMILY below (no
+//                    density floor). Box/SDF projectors are symmetric PSD, so wall-Neumann rows
+//                    are part of the operator, not bolted on. Massless nodes get M̃⁻¹ = 0.
 //   Laplacian      : EXISTS ONLY AS THE COMPOSITION  A = −D·M̃⁻¹·G,  evaluated inline in the
 //                    Jacobi kernels by literally composing the three loops above. Never a
 //                    hand-written stencil — a hand stencil is exactly how main got A ≠ D·G and
@@ -101,19 +100,22 @@
 // with ρ̄_c the mean corner-node density: compression is relieved over a few frames; an
 // under-dense (free-surface) cell gets NO suction — surface physics belongs to U4.
 //
-// ================================ MIXTURE FAMILY (U6, KTD-4) ==================================
-// With the U6 solid field present the constraint becomes the mixture continuity
-// ∇·(φ_f·v_f + φ_s·v_s) = s with v_s ≡ 0 (rigid skeleton): the divergence weights each
-// corner-node velocity by that node's φ_f (the nm b.w lane, from node_setup), and the same
-// φ_f scales the node mobility in the operator,
-//     A = −D·Φ·M̃⁻¹·G,   Φ = diag(φ_f per node)   (scalar per node ⇒ A stays symmetric PSD),
-// while the velocity correction applied by `project` is M̃⁻¹·(G p) WITHOUT φ — per KTD-4 the
-// intrinsic-velocity correction is Δv = −(Δt_eff/ρ_w)∇p and φ never scales it. Two more U6
-// ingredients live inside M̃⁻¹ itself (node_setup): the node density is the INTRINSIC water
-// density ρ_n/φ_f (the bulk pore-water density under-states ρ_w by φ_f), and the matrix is
-// scaled by ς = Δt_eff/Δt, the exponential-integrator weight from the drag fold (see
-// coupling.wgsl's header for why the plain-Δt split mis-partitions the hydrostatic load).
-// All three are exact-passthrough at φ_f = 1, ς = 1 (multiplication/division by exactly 1.0
+// ================================ MIXTURE FAMILY (U6/U7, KTD-4) ===============================
+// With a solid field the constraint is mixture continuity
+//     div(phi_f*v_f + phi_s*v_s) = s.
+// Frozen mode has v_s=0 and retains the U6 operator
+//     A = -D * phi_f * (sigma/rho_f) * P_f * G.
+// Dynamic mode obtains sigma from the exact two-mass drag pair and analytically condenses its
+// pressure response into phase mobilities r_f and r_s. node_setup assembles
+//     K = phi_f*r_f*P_f + phi_s*r_s*P_s,
+// the symmetric positive node mobility seen by A=-D*K*G; project applies the corresponding
+// intrinsic phase corrections r_f*P_f*G p and r_s*P_s*G p separately. Thus neither phase is a
+// diagnostic reaction sink, and D, A, and project all use one two-phase operator family.
+//
+// The water density is intrinsic rho_n/phi_f (bulk pore-water density under-states rho_f by
+// phi_f); solid density is its co-scattered node mass/volume. Frozen sigma is Delta-t_eff/dt;
+// dynamic sigma=(1-exp(-gamma*dt))/(gamma*dt), the relative-mode response of the pair (see
+// coupling.wgsl). The free-water limit phi_f=1, sigma=1 is exact passthrough (arithmetic by 1
 // is bitwise-identical — the free-water regression gate pins this). cell_classify's density
 // census normalizes by the corner φ_f for the same reason: a saturated pore cell at
 // ρ̄ = φ_f·ρ_rest is FULL, not a surface cell, and must get neither relief nor suction.
@@ -127,7 +129,7 @@
 //
 // Sparsity: over-dispatch + early-out on inactive cells/empty nodes — NEVER indirect dispatch
 // (R8). Tint discipline: no workgroupBarrier anywhere in this family, so the guard returns
-// are uniform-control-flow safe. Storage buffers per entry point ≤ 5 (see mod.rs derivation).
+// are uniform-control-flow safe. Storage buffers per entry point ≤ 8 (see mod.rs derivation).
 
 // --- pressure-family bindings (indices continue the global table in common.wgsl) -------------
 // Per-node M̃⁻¹, 2 vec4 per node: [2n] = (xx, xy, xz, yy), [2n+1] = (yz, zz, massy_flag, 0).
@@ -173,9 +175,9 @@ const SURF_FULL_FRAC: f32 = 0.5;
 const SURF_MIN_CORNER: f32 = 0.1;
 const NODE_BC_EPS: f32 = 1.0e-4;     // box-face epsilon (matches grid_update)
 const SDF_NORMAL_MIN: f32 = 1.0e-3;  // degenerate orthogonalized-normal guard
-// SDF no-penetration band in cell sizes: a node within WALL_BAND·h on the FLUID side of a wall
-// gets the wall-normal projector (the supporting fluid layer of a non-grid-aligned wall). Mirror
-// of `drag_fold`'s velocity BC band in coupling.wgsl — they MUST match for operator consistency.
+// WATER SDF no-penetration band in cell sizes: a fluid node within WALL_BAND·h on the cavity
+// side gets the supporting-wall projector, matching drag_fold. Solid pressure and velocity
+// constraints deliberately use actual contact (dist < 0), not this pre-contact band.
 const WALL_BAND: f32 = 1.0;
 // Flood-fill OUTSIDE seed band in cell sizes (surface.wgsl flood_init): an air cell within
 // FLOOD_WALL_BAND·h of an SDF wall is seeded OPEN. Wider than WALL_BAND so the seed reaches the
@@ -189,8 +191,9 @@ const FLOOD_WALL_BAND: f32 = 2.0;
 //            WALL_BAND·h — the original behavior, kept byte-identical here.
 //   > 0.5  → WALL_BC_MULTI: the orthonormal-basis projector P = I − Q·Qᵀ over ALL in-band faces
 //            (build_constraint_basis in common.wgsl), constraining BOTH surfaces at a concave seam
-//            (the cup floor∩wall corner). node_setup builds M̃⁻¹ = invr·P; drag_fold applies
-//            v ← P·v from the SAME basis (lockstep — A = D·M̃⁻¹·G holds).
+//            (the cup floor∩wall corner). Water node_setup builds M̃⁻¹ = invr·P and drag_fold
+//            applies v ← P·v from the same basis. Solid pressure uses the same construction only
+//            over currently penetrating faces; solid velocity uses unilateral Coulomb contact.
 fn wall_bc_multi() -> bool { return params.dbg.y > 0.5; }
 
 // --- fine-grid cell helpers --------------------------------------------------------------------
@@ -257,6 +260,158 @@ fn minv_apply(m: Minv, v: vec3<f32>) -> vec3<f32> {
     );
 }
 
+fn minv_zero() -> Minv {
+    return Minv(vec4<f32>(0.0), vec4<f32>(0.0));
+}
+
+fn minv_scale(m: Minv, scale: f32) -> Minv {
+    return Minv(
+        vec4<f32>(m.a.xyz * scale, m.a.w * scale),
+        vec4<f32>(m.b.xy * scale, m.b.zw),
+    );
+}
+
+fn minv_add(lhs: Minv, rhs: Minv) -> Minv {
+    return Minv(
+        lhs.a + rhs.a,
+        vec4<f32>(lhs.b.xy + rhs.b.xy, max(lhs.b.z, rhs.b.z), 0.0),
+    );
+}
+
+// Unit pressure-response projector for one phase at a grid node. The pressure operator and
+// phase correction call this same function, so constraints cannot drift between
+// A = -D M^-1 G and project(). Water uses the one-cell SDF support band needed by its
+// collocated pressure stencil. Solids constrain SDF normals only at actual contact (dist < 0),
+// matching solid_update; using the water band would pre-contact grains. The contact active set
+// is geometry-dependent between steps, but frozen for this solve, preserving a linear SPD
+// operator. A fully unilateral pressure complementarity solve would be nonlinear and is outside
+// this fixed-budget Jacobi family.
+fn phase_pressure_projector(xp: vec3<f32>, ph: u32, open_y_min: bool) -> Minv {
+    var out_lo = xp < params.box_min.xyz - vec3<f32>(NODE_BC_EPS);
+    if (open_y_min) {
+        out_lo.y = false;
+    }
+    if (any(out_lo) || any(xp > params.box_max.xyz + vec3<f32>(NODE_BC_EPS))) {
+        return minv_zero();
+    }
+
+    var box_mask = 0u;
+    if (xp.x <= params.box_min.x + NODE_BC_EPS || xp.x >= params.box_max.x - NODE_BC_EPS) {
+        box_mask = box_mask | 1u;
+    }
+    if ((xp.y <= params.box_min.y + NODE_BC_EPS && !open_y_min)
+        || xp.y >= params.box_max.y - NODE_BC_EPS) {
+        box_mask = box_mask | 2u;
+    }
+    if (xp.z <= params.box_min.z + NODE_BC_EPS || xp.z >= params.box_max.z - NODE_BC_EPS) {
+        box_mask = box_mask | 4u;
+    }
+
+    let sdf_band = select(0.0, WALL_BAND * params.grid_origin.w, ph == PHASE_WATER);
+
+    if (!wall_bc_multi()) {
+        var d = vec3<f32>(1.0);
+        if ((box_mask & 1u) != 0u) { d.x = 0.0; }
+        if ((box_mask & 2u) != 0u) { d.y = 0.0; }
+        if ((box_mask & 4u) != 0u) { d.z = 0.0; }
+
+        var a = vec4<f32>(d.x, 0.0, 0.0, d.y);
+        var b = vec4<f32>(0.0, d.z, 1.0, 0.0);
+        if (params.num_solids > 0u) {
+            let hit = solid_union(xp, ph);
+            if (hit.dist < sdf_band) {
+                var nrm = hit.grad;
+                if (d.x == 0.0) { nrm.x = 0.0; }
+                if (d.y == 0.0) { nrm.y = 0.0; }
+                if (d.z == 0.0) { nrm.z = 0.0; }
+                let len = length(nrm);
+                if (len > SDF_NORMAL_MIN) {
+                    nrm = nrm / len;
+                    a -= vec4<f32>(
+                        nrm.x * nrm.x,
+                        nrm.x * nrm.y,
+                        nrm.x * nrm.z,
+                        nrm.y * nrm.y,
+                    );
+                    b -= vec4<f32>(nrm.y * nrm.z, nrm.z * nrm.z, 0.0, 0.0);
+                }
+            }
+        }
+        return Minv(a, b);
+    }
+
+    var faces: WallFaces;
+    faces.count = 0u;
+    if (params.num_solids > 0u) {
+        faces = wall_binding_faces(xp, ph, sdf_band);
+    }
+    let cb = build_constraint_basis(box_mask, faces);
+    var pxx = 1.0; var pyy = 1.0; var pzz = 1.0;
+    var pxy = 0.0; var pxz = 0.0; var pyz = 0.0;
+    for (var i = 0u; i < cb.count; i = i + 1u) {
+        let q = cb.q[i];
+        pxx = pxx - q.x * q.x;
+        pyy = pyy - q.y * q.y;
+        pzz = pzz - q.z * q.z;
+        pxy = pxy - q.x * q.y;
+        pxz = pxz - q.x * q.z;
+        pyz = pyz - q.y * q.z;
+    }
+    return Minv(
+        vec4<f32>(pxx, pxy, pxz, pyy),
+        vec4<f32>(pyz, pzz, 1.0, 0.0),
+    );
+}
+
+struct PhaseMobilities {
+    fluid: f32,
+    solid: f32,
+    mixture: f32,
+};
+
+// Exact pressure-force response of the same two node masses used by drag_fold. Derive intrinsic
+// densities directly from those masses — never from a stabilized/floored density — so
+// phi_f*rho_f : phi_s*rho_s == m_f : m_s and sigma condenses the identical relative mode.
+// `sigma = (1-exp(-gamma*dt))/(gamma*dt)`: sigma=1 recovers uncoupled 1/rho phase response;
+// sigma->0 gives the shared barycentric response.
+fn dynamic_phase_mobilities_from_node_masses(
+    phi_f: f32,
+    fluid_mass: f32,
+    solid_mass: f32,
+    h: f32,
+    sigma: f32,
+) -> PhaseMobilities {
+    let phi_s = 1.0 - phi_f;
+    let h3 = h * h * h;
+    let rho_f = fluid_mass / (phi_f * h3);
+    let rho_s = solid_mass / (phi_s * h3);
+    let bulk_density = phi_f * rho_f + phi_s * rho_s;
+    let y_f = phi_f * rho_f / bulk_density;
+    let y_s = phi_s * rho_s / bulk_density;
+    let inverse_density_delta = 1.0 / rho_f - 1.0 / rho_s;
+    let inv_bulk = 1.0 / bulk_density;
+    let sig = clamp(sigma, 0.0, 1.0);
+    let fluid = inv_bulk + y_s * sig * inverse_density_delta;
+    let solid = inv_bulk - y_f * sig * inverse_density_delta;
+    return PhaseMobilities(
+        fluid,
+        solid,
+        phi_f * fluid + phi_s * solid,
+    );
+}
+
+// The velocity whose divergence closes the incompressible mixture constraint. Dynamic mode
+// carries both phase velocities; frozen mode deliberately reduces to phi_f*v_f because v_s=0.
+// Keep every RHS/debug/cavity gather on this helper so the pressure family cannot accidentally
+// regress to a water-only divergence in one path.
+fn mixture_velocity_at(n: u32, phi_f: f32) -> vec3<f32> {
+    var velocity = phi_f * grid_vel[n].xyz;
+    if (params.splas0.x > 0.5 && grid_svel[n].w > params.extra.z) {
+        velocity += (1.0 - phi_f) * grid_svel[n].xyz;
+    }
+    return velocity;
+}
+
 // Corner sign vector for offset o ∈ {0,1}³ (the ONE sign function D, G, and diag(A) share).
 fn corner_sign(o: vec3<i32>) -> vec3<f32> {
     return vec3<f32>(o) * 2.0 - vec3<f32>(1.0);
@@ -271,18 +426,18 @@ fn hat_w(fi: i32, ci: i32, r: i32) -> f32 {
 }
 
 // =================================== node_setup ================================================
-// Build M̃⁻¹ per fine node from this frame's node mass (grid_vel.w) and the wall geometry.
-// U6: the matrix carries the intrinsic-density inverse 1/(ρ_n/φ_f) and the ς integrator
-// weight from the drag fold (header: MIXTURE FAMILY); b.w carries φ_f for the divergence
-// weighting and the cell census (written for EVERY node, massy or not).
+// Build the pressure operator mobility per fine node. Frozen mode retains the U6
+// φ_f*sigma/rho_f response. Dynamic mode stores
+//   [φ_f*r_f*P_f + φ_s*r_s*P_s] / φ_f,
+// while b.w continues to carry φ_f; every A application multiplies by b.w and therefore sees
+// the exact two-phase mixture response. `project` applies r_f*P_f and r_s*P_s separately.
 @compute @workgroup_size(256)
 fn node_setup(@builtin(global_invocation_id) gid: vec3<u32>) {
     let n = gid.x;
     if (n >= params.grid_dims.w) {
         return;
     }
-    var a = vec4<f32>(0.0);
-    var b = vec4<f32>(0.0);
+    var mobility = minv_zero();
     let mass = grid_vel[n].w;
     let h = params.grid_origin.w;
     let sig = react[n].w;
@@ -292,106 +447,55 @@ fn node_setup(@builtin(global_invocation_id) gid: vec3<u32>) {
     // skips the vis loop entirely at zero-solid nodes: exact passthrough φ_f = 1.0).
     let phi_f = node_phi_f(n, xp);
     let open_base = params.coupling.w > 0.5;
-    // Strictly-outside-the-box nodes are inside the walls: v = 0 in drag_fold, M̃⁻¹ = 0
-    // here (the projection never moves them) — one consistent treatment across the family.
-    // The open base exempts the below-floor pad layer, mirroring drag_fold's BC.
-    var out_lo = xp < params.box_min.xyz - vec3<f32>(NODE_BC_EPS);
-    if (open_base) {
-        out_lo.y = false;
-    }
-    let outside = any(out_lo) || any(xp > params.box_max.xyz + vec3<f32>(NODE_BC_EPS));
-    if (mass > params.extra.z && !outside) {
-        // Intrinsic water density (KTD-4): the node measures the BULK pore-water density
-        // φ_f·ρ_w; dividing by φ_f recovers ρ_w so the correction is Δv = −(Δt_eff/ρ_w)∇p.
-        let rho = mass / (h * h * h) / phi_f;
-
-        // Wall-truncated control volume: count the node's 8 adjacent cell slots whose center
-        // is inside the box and not inside a solid. A wall/edge/corner node sees only
-        // vis/8 of its slots, so BOTH its gathered gradient (G sums those slots) AND its
-        // measured density are truncated by the same factor — flooring the density at
-        // vis·ρ_rest/8 instead of ρ_rest keeps invρ·(G p) equal to the full physical
-        // gradient there. With the global ρ_rest floor, box-EDGE nodes (2 of 8 slots) got a
-        // 4×-truncated kick, their columns kept ~half of gravity every frame, and the tank
-        // pumped itself into sloshing (observed). Surface nodes are NOT rescaled: air slots
-        // are geometrically visible, so vis = 8 and the stable under-kick floor remains.
-        let vis = node_vis(xp);
-        let invr = 1.0 / max(rho, params.extra.y * max(vis, 1.0) / 8.0);
-
-        // Box faces: mutually orthogonal axis constraints (exact projector). The open base
-        // leaves the y-min face free (the outflow Dirichlet lives in the masked pad cells).
-        var d = vec3<f32>(invr);
-        if (xp.x <= params.box_min.x + NODE_BC_EPS || xp.x >= params.box_max.x - NODE_BC_EPS) { d.x = 0.0; }
-        if ((xp.y <= params.box_min.y + NODE_BC_EPS && !open_base)
-            || xp.y >= params.box_max.y - NODE_BC_EPS) { d.y = 0.0; }
-        if (xp.z <= params.box_min.z + NODE_BC_EPS || xp.z >= params.box_max.z - NODE_BC_EPS) { d.z = 0.0; }
-        a = vec4<f32>(d.x, 0.0, 0.0, d.y);
-        b = vec4<f32>(0.0, d.z, 1.0, 0.0);
-
-        // SDF wall: subtract the dyad of the (box-orthogonalized) unit normal — symmetric PSD.
-        // The constraint must engage on the FLUID node layer adjacent to the wall, not only on
-        // nodes strictly inside the wall material (hit.dist < 0): an SDF surface (e.g. the cup
-        // floor at y = -8) almost never coincides with a node, so the node that actually carries
-        // the supporting fluid column sits up to one cell OUTSIDE the wall (hit.dist ∈ [0, h)).
-        // With the old `< 0` test that node was left y-FREE, gravity drove the column into the
-        // floor unchecked, and it pancaked to 10–20× rest (the V60-cup collapse the box-face
-        // floor never showed, because there nodes land exactly on the face). The band is the
-        // cell size h — the standard staircase reach of a collocated no-penetration BC. The
-        // SAME band is mirrored in drag_fold's velocity BC so the pre-projection field D sees and
-        // M̃⁻¹ constrains the SAME axes (operator consistency A = D·M̃⁻¹·G).
-        if (params.num_solids > 0u) {
-            if (!wall_bc_multi()) {
-                // SINGLE-NORMAL (default): the most-penetrated normal, box-orthogonalized, banded.
-                let hit = solid_union(xp, PHASE_WATER);
-                if (hit.dist < WALL_BAND * h) {
-                    var nrm = hit.grad;
-                    if (d.x == 0.0) { nrm.x = 0.0; }
-                    if (d.y == 0.0) { nrm.y = 0.0; }
-                    if (d.z == 0.0) { nrm.z = 0.0; }
-                    let len = length(nrm);
-                    if (len > SDF_NORMAL_MIN) {
-                        nrm = nrm / len;
-                        let invc = max(max(d.x, d.y), d.z);
-                        a -= invc * vec4<f32>(nrm.x * nrm.x, nrm.x * nrm.y, nrm.x * nrm.z, nrm.y * nrm.y);
-                        b -= invc * vec4<f32>(nrm.y * nrm.z, nrm.z * nrm.z, 0.0, 0.0);
-                    }
-                }
+    let fluid_projector = phase_pressure_projector(xp, PHASE_WATER, open_base);
+    if (mass > params.extra.z && fluid_projector.b.z > 0.5) {
+        let phi_s = 1.0 - phi_f;
+        let solid_mass = grid_svel[n].w;
+        let dynamic_pair = params.splas0.x > 0.5
+            && solid_mass > params.extra.z
+            && phi_s > 0.0;
+        if (dynamic_pair) {
+            // No density floor in the paired system: sigma came from these exact two masses.
+            let phase_mobility = dynamic_phase_mobilities_from_node_masses(
+                phi_f,
+                mass,
+                solid_mass,
+                h,
+                sig,
+            );
+            let solid_projector = phase_pressure_projector(xp, PHASE_SOLID, false);
+            mobility = minv_add(
+                minv_scale(fluid_projector, phase_mobility.fluid),
+                minv_scale(
+                    solid_projector,
+                    phi_s * phase_mobility.solid / phi_f,
+                ),
+            );
+        } else {
+            // Water-only/frozen stabilization retains the wall-truncated density floor. It must
+            // not enter a dynamic pair because it would change the mass fractions relative to
+            // drag's actual m_f/m_s system.
+            let rho_f = mass / (h * h * h) / phi_f;
+            let vis = node_vis(xp);
+            let invr_f = 1.0 / max(rho_f, params.extra.y * max(vis, 1.0) / 8.0);
+            if (params.splas0.x > 0.5) {
+                // Dynamic node without a resolved solid-volume/mass partner: water-only.
+                mobility = minv_scale(fluid_projector, invr_f);
             } else {
-                // MULTI-NORMAL: rebuild M̃⁻¹ = invr·(I − Q·Qᵀ) over the active box axes + ALL in-band
-                // wall faces (orthonormal basis). Reduces to the single/box paths in their limits;
-                // PSD for any normals (even a non-orthogonal poly edge). drag_fold mirrors the SAME
-                // basis (lockstep). box_mask matches the box-face axes zeroed in `d` above.
-                var box_mask = 0u;
-                if (d.x == 0.0) { box_mask = box_mask | 1u; }
-                if (d.y == 0.0) { box_mask = box_mask | 2u; }
-                if (d.z == 0.0) { box_mask = box_mask | 4u; }
-                let faces = wall_binding_faces(xp, PHASE_WATER, WALL_BAND * h);
-                let cb = build_constraint_basis(box_mask, faces);
-                var pxx = 1.0; var pyy = 1.0; var pzz = 1.0;
-                var pxy = 0.0; var pxz = 0.0; var pyz = 0.0;
-                for (var i = 0u; i < cb.count; i = i + 1u) {
-                    let q = cb.q[i];
-                    pxx = pxx - q.x * q.x; pyy = pyy - q.y * q.y; pzz = pzz - q.z * q.z;
-                    pxy = pxy - q.x * q.y; pxz = pxz - q.x * q.z; pyz = pyz - q.y * q.z;
-                }
-                a = invr * vec4<f32>(pxx, pxy, pxz, pyy);
-                b = vec4<f32>(invr * pyz, invr * pzz, 1.0, 0.0);
+                // Frozen skeleton: retain the exact U6 forced-drag mobility sigma/rho_f.
+                mobility = minv_scale(fluid_projector, invr_f * sig);
             }
         }
-        // ς fold (header: MIXTURE FAMILY): the projection's effective step at a drag node is
-        // Δt_eff = ς·Δt, carried INSIDE the matrix so A and `project` stay one family. ×1.0
-        // exact at drag-free nodes.
-        a = a * sig;
-        b.x = b.x * sig;
-        b.y = b.y * sig;
     }
-    nm[2u * n + 0u] = a;
-    nm[2u * n + 1u] = vec4<f32>(b.x, b.y, b.z, phi_f);
+    nm[2u * n + 0u] = mobility.a;
+    nm[2u * n + 1u] = vec4<f32>(mobility.b.x, mobility.b.y, mobility.b.z, phi_f);
 }
 
 // =================================== cell_classify =============================================
 // Per fine cell: fill fraction f from grid mass (header: FREE SURFACE — f = 0 masks the cell,
 // f < 1 tapers its row through the surface band), rhs = f·(s_target − D(Φv))/dt on fluid rows
-// (the U6 MIXTURE divergence — v_s = 0 contributes nothing), and zero both pressure
+// using the shared mixture velocity phi_f*v_f + phi_s*v_s (with v_s=0 in frozen mode), and
+// zero both pressure
 // ping-pong slots (the deterministic p₀ = 0 — the coarse prolongation overwrites the seed
 // when enabled). The density census divides each corner mass by its φ_f so a saturated pore
 // cell measures RELATIVE density ≈ 1 (header: MIXTURE FAMILY) — both ×/÷ by exactly 1.0 in
@@ -415,10 +519,10 @@ fn cell_classify(@builtin(global_invocation_id) gid: vec3<u32>) {
             for (var ox = 0; ox < 2; ox = ox + 1) {
                 let node = cc + vec3<i32>(ox, oy, oz);
                 let nflat = node_index(node);
-                let gv = grid_vel[nflat];
                 let phin = nm[2u * nflat + 1u].w; // φ_f (node_setup runs first)
                 let s = corner_sign(vec3<i32>(ox, oy, oz));
-                div = div + dot(s, phin * gv.xyz) / (4.0 * h);
+                div = div + dot(s, mixture_velocity_at(nflat, phin)) / (4.0 * h);
+                let gv = grid_vel[nflat];
                 // Corner census for classification: only corners that COULD see fluid count —
                 // nodes at/behind the box faces or inside an SDF solid are geometrically
                 // truncated (a wall, not a surface) and must not deactivate wall-hugging
@@ -872,14 +976,13 @@ fn prolong_add(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 
 // =================================== project ===================================================
-// v ← v − dt·M̃⁻¹·(G p), the SAME G and M̃⁻¹ the solve used (binding 11 holds the final-parity
-// pressure; the U6 ς integrator weight is inside M̃⁻¹, so this IS Δv = −(Δt_eff/ρ_w)∇p — φ
-// never scales the correction, per KTD-4). Constrained wall components receive nothing by
-// construction of M̃⁻¹. U6 ledger: at solid-carrying nodes the pressure impulse the frozen
-// skeleton absorbs is accumulated into `react` — the direct −φ_s·∇p force on the solid
-// volume plus the (1−ς) share of the water-column pressure force that the drag fold
-// transmits to the skeleton within the step (see coupling.wgsl's header; at hydrostatic
-// equilibrium the ledger nets exactly the displaced-volume weight).
+// Apply the same pressure response assembled by node_setup. Frozen mode retains
+// v_f <- v_f - dt*(sigma/rho_f)*P_f*grad(p) and its rigid-skeleton reaction accounting.
+// Dynamic mode applies the exact drag-condensed phase mobilities separately:
+//   v_f <- v_f - dt*r_f*P_f*grad(p),  v_s <- v_s - dt*r_s*P_s*grad(p).
+// Their volume-weighted sum is exactly the matrix stored in nm, so projection and the
+// A=-D M^-1 G solve are one operator. Dynamic pressure impulses go directly into both phase
+// velocities; they are not diverted through the frozen diagnostic reaction ledger.
 @compute @workgroup_size(256)
 fn project(@builtin(global_invocation_id) gid: vec3<u32>) {
     let n = gid.x;
@@ -911,8 +1014,44 @@ fn project(@builtin(global_invocation_id) gid: vec3<u32>) {
             }
         }
     }
-    let dv = minv_apply(m, gp) * params.dt; // ς·Δt·M̃⁻¹·∇p (ς folded into the matrix)
-    if (sv > 0.0) {
+    let dynamic = params.splas0.x > 0.5;
+    let water_mass = grid_vel[n].w;
+    let solid_mass = grid_svel[n].w;
+    let phi_f = m.b.w;
+    let phi_s = 1.0 - phi_f;
+    let dynamic_pair = dynamic
+        && m.b.z >= 0.5
+        && water_mass > params.extra.z
+        && solid_mass > params.extra.z
+        && phi_s > 0.0;
+    if (dynamic_pair) {
+        let coords = node_coords(n);
+        let xp = params.grid_origin.xyz
+            + vec3<f32>(f32(coords.x), f32(coords.y), f32(coords.z)) * h;
+        // Reuse the exact mass-derived response assembled by node_setup. No phase density floor
+        // is permitted here: it would make project differ from A and from drag's m_f/m_s pair.
+        let phase_mobility = dynamic_phase_mobilities_from_node_masses(
+            phi_f,
+            water_mass,
+            solid_mass,
+            h,
+            react[n].w,
+        );
+        let fluid_projector = phase_pressure_projector(
+            xp,
+            PHASE_WATER,
+            params.coupling.w > 0.5,
+        );
+        let solid_projector = phase_pressure_projector(xp, PHASE_SOLID, false);
+        let dv_f = params.dt * phase_mobility.fluid * minv_apply(fluid_projector, gp);
+        let dv_s = params.dt * phase_mobility.solid * minv_apply(solid_projector, gp);
+        grid_vel[n] = vec4<f32>(grid_vel[n].xyz - dv_f, water_mass);
+        grid_svel[n] = vec4<f32>(grid_svel[n].xyz - dv_s, solid_mass);
+        return;
+    }
+
+    let dv = minv_apply(m, gp) * params.dt;
+    if (!dynamic && sv > 0.0) {
         let sig = react[n].w;
         var via = vec3<f32>(0.0);
         if (m.b.z >= 0.5 && sig > 1.0e-6) {
@@ -921,29 +1060,6 @@ fn project(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
         let direct = -sv * params.dt * gp; // −V_s·Δt·∇p: pressure on the solid volume
         react[n] = vec4<f32>(react[n].xyz + direct - via, sig);
-        // U7 (KTD-4): release the solid field — submerged grains feel buoyancy through the
-        // momentum equation. The pore pressure IS the projection pressure, so the solid
-        // velocity correction is Δv_s = −(Δt/ρ_s)·∇p (the SAME ∇p the water sees; φ_s is in
-        // the operator/mass, NOT the velocity correction, exactly as for water). ρ_s = solid
-        // node mass / h³ (grid_svel.w, set by solid_update). Wall-constrained axes are zeroed
-        // by reusing the water node's d-axis flags (massless box-face/SDF projector in nm.a),
-        // so buoyancy never drives a grain through a wall — and frozen mode (solid_dynamics
-        // off) skips this entirely (grid_svel is dormant), keeping U6 bitwise.
-        if (params.splas0.x > 0.5) {
-            let sm = grid_svel[n].w;
-            if (sm > params.extra.z) {
-                let h3 = h * h * h;
-                let rho_s = sm / h3;
-                var dvs = gp * (params.dt / max(rho_s, 0.1));
-                // Reuse the water projector's free-axis mask (nm.a.x/.w/.b.y are the box-face
-                // /SDF-constrained inverse-mass diagonal — 0 on a constrained axis): a zero
-                // there means the node cannot move on that axis, for either phase.
-                if (m.a.x == 0.0) { dvs.x = 0.0; }
-                if (m.a.w == 0.0) { dvs.y = 0.0; }
-                if (m.b.y == 0.0) { dvs.z = 0.0; }
-                grid_svel[n] = vec4<f32>(grid_svel[n].xyz - dvs, sm);
-            }
-        }
     }
     if (m.b.z >= 0.5) {
         grid_vel[n] = vec4<f32>(grid_vel[n].xyz - dv, grid_vel[n].w);
@@ -953,9 +1069,9 @@ fn project(@builtin(global_invocation_id) gid: vec3<u32>) {
 // =================================== test-only debug taps ======================================
 // Never dispatched in step(); they expose the EXACT D and G kernels to the operator gates
 // (adjointness + MMS on GPU readbacks). dbg_div writes the masked MIXTURE divergence D(Φv)
-// of grid_vel into cell_meta.z (φ_f from the nm lane — exactly 1 in free water, so the U3
-// gates are unchanged); dbg_grad writes the raw masked gradient of pf (binding 11) into
-// grid_vel.
+// into cell_meta.z, using the same phi_f*v_f + phi_s*v_s helper as cell_classify and
+// pocket_mark (phi_f is exactly 1 in free water, so the U3 gates are unchanged); dbg_grad
+// writes the raw masked gradient of pf (binding 11) into grid_vel.
 @compute @workgroup_size(256)
 fn dbg_div(@builtin(global_invocation_id) gid: vec3<u32>) {
     let c = gid.x;
@@ -972,9 +1088,8 @@ fn dbg_div(@builtin(global_invocation_id) gid: vec3<u32>) {
                 for (var ox = 0; ox < 2; ox = ox + 1) {
                     let s = corner_sign(vec3<i32>(ox, oy, oz));
                     let nflat = node_index(cc + vec3<i32>(ox, oy, oz));
-                    let gv = grid_vel[nflat];
                     let phin = nm[2u * nflat + 1u].w;
-                    div = div + dot(s, phin * gv.xyz) / (4.0 * h);
+                    div = div + dot(s, mixture_velocity_at(nflat, phin)) / (4.0 * h);
                 }
             }
         }

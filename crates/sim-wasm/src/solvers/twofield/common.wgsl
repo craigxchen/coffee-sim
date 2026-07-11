@@ -6,8 +6,8 @@
 // each pipeline's auto layout (`layout: None`) keeps only the bindings its entry point
 // actually uses, but an index never means two different buffers.
 //
-// Storage-buffer budget (KTD-7): the widest entry point binds 7 storage buffers
-// (MAX_STORAGE_BUFFERS_PER_ENTRY_POINT in mod.rs — g2p_solid / cell_classify; see the per-pass
+// Storage-buffer budget (KTD-7): the widest entry point binds 8 storage buffers
+// (MAX_STORAGE_BUFFERS_PER_ENTRY_POINT in mod.rs — cell_classify / pocket_mark; see the per-pass
 // derivation there); the device requests 9 per stage (src/utils/gpu.rs NEEDED_STORAGE_BUFFERS),
 // both within the 16 hardware cap. U1 adds NO binding (the flip knob is a Params lane, and
 // g2p_water reads only the already-bound vel/grid_vel). Grid mass+momentum share ONE
@@ -21,7 +21,7 @@
 const PHASE_WATER: u32 = 0u;
 const PHASE_SOLID: u32 = 1u;
 
-// Byte-identical to the Rust `Params` (272 bytes after the U1 `flip` vec4; vec4-aligned tail).
+// Byte-identical to the Rust `Params` (352 bytes; vec4-aligned tail).
 struct Params {
     box_min: vec4<f32>,     // simulation domain (w unused)
     box_max: vec4<f32>,     // (w unused)
@@ -39,18 +39,18 @@ struct Params {
     // U3 pressure stack (pressure.wgsl):
     coarse_dims: vec4<u32>, // coarse CELLS per axis (= ceil(fine_cells/ratio)); .w = ratio
     extra: vec4<f32>,       // (rest_density, rho_floor, mass_eps, U7 wet-cohesion s_peak)
-    // U6 coupling (coupling.wgsl): (grain_diameter d, drag_scale, grain_volume π/6·d³,
-    // open_base flag — the dev/test drained-column outflow mode).
+    // U6 coupling (coupling.wgsl): (solid sample pitch, drag_scale, dry structural sample
+    // volume, open_base flag — the dev/test drained-column outflow mode).
     coupling: vec4<f32>,
     // U5 plasticity (plasticity.wgsl; mirrors twofield::plasticity constants):
     splas0: vec4<f32>, // (solid_dynamics flag, Lamé μ, Lamé λ, DP α)
-    splas1: vec4<f32>, // (cap hardening ξ, φ_max = packing limit, grain mass m_s, cohesion y_c)
+    splas1: vec4<f32>, // (cap hardening ξ, φ_max, dry grain mass m_dry, cohesion y_c)
     splas2: vec4<f32>, // (floor/wall Coulomb μ_b, guard K_sp, guard onset φ_on, U7 wet c_max)
-    // U9 infiltration interface (coupling.wgsl; mirrors models::wetting + the test UNIT MAPPING):
-    wet0: vec4<f32>, // (tf_absorb_rate k_abs, V_cap = r_max·ρ_ratio·V_dry, V_w = water vol,
-                     //  absorb_roundoff — the f_w/V_abs saturation floor)
+    // U9 infiltration interface (coupling.wgsl; rates and delays use physical seconds):
+    wet0: vec4<f32>, // (tf_absorb_rate k_abs, V_cap from dry recipe mass, V_w = water vol,
+                     //  absorb_roundoff — the f_w/V_bound saturation floor)
     wet1: vec4<f32>, // (suction body-force accel a_suction, bloom_delay seconds, filter_floor
-                     //  flag, V_dry = grain sphere volume π/6·d³)
+                     //  flag, maximum fractional DIAMETER swelling at saturation)
     dbg: vec4<f32>,  // diagnostic toggles (test-only): .x = density-relief enable (1 = on);
                      //  .y = SDF wall-BC mode selector: ≤ 0.5 → binary no-penetration band
                      //  (default, byte-identical to pre-coverage); > 0.5 → graded coverage weight
@@ -66,11 +66,25 @@ struct Params {
                      //  c_surface = 1.0 ⇒ v = v_grid = pure-PIC; div_scale ≤ 0 ⇒ merge discriminator
                      //  off; water_splash_cap ≤ 0 ⇒ fall back to the global max_speed. The U2 curve
                      //  reads these; plumbed-but-unused in U1 (default path stays pure-PIC).
+    // Conservative extraction + thermal transport (coupling.wgsl):
+    chem0: vec4<f32>, // (scaled k_fast, scaled k_slow, Ea/R in K, T_ref in K)
+    chem1: vec4<f32>, // (c_sat, relative-flow u_half, wet-gate s_on, thermal exchange rate)
+    therm: vec4<f32>, // (cp_water, cp_dry_grain, ambient loss rate, ambient T_K)
+    // Capillary retention (coupling.wgsl): (residual pore saturation, Corey exponent,
+    // relative-mobility floor, all-gas-atmospheric flag). The target-attainment ledger stays
+    // on the CPU; surface.wgsl consumes .w for the explicitly vented production mode.
+    retention: vec4<f32>,
+    // Semi-implicit granular split (compaction.wgsl): (maximum packing tangent K,
+    // initial consolidation pressure p_c0, full-tangent solid fraction, shear microstep dt).
+    // K <= 0 is the exact legacy/off-path sentinel.
+    granular: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> params: Params;
 // Canonical particle state (ParticleBuffers layout): pos.w is the moisture lane (water =
-// remaining fraction, grain = absorbed volume), chem = (concentration, temperature, _, _).
+// remaining fraction, grain = bound-water volume). chem is phase-specific:
+// water=(solute mass fraction, temperature K, reserved, reserved),
+// grain=(fast-pool mass, slow-pool mass, temperature K, wet-contact time).
 @group(0) @binding(1) var<storage, read_write> pos: array<vec4<f32>>;
 @group(0) @binding(2) var<storage, read_write> vel: array<vec4<f32>>;
 @group(0) @binding(3) var<storage, read_write> phase: array<u32>;
@@ -82,8 +96,8 @@ struct Params {
 // mom.z], each value × FP_SCALE. Cleared by grid_clear, scattered by p2g_water, read by
 // grid_update. (The SOLID field generalizes this in U5 — not built here.)
 @group(0) @binding(6) var<storage, read_write> grid_fp: array<atomic<i32>>;
-// WATER grid velocity after grid_update (gravity + boundary conditions applied):
-// .xyz = velocity, .w = node mass (decoded float; diagnostics only).
+// WATER grid velocity decoded by grid_update; drag_fold subsequently applies forces, pair drag,
+// and boundary conditions, and project applies pore pressure. .xyz = velocity, .w = node mass.
 @group(0) @binding(7) var<storage, read_write> grid_vel: array<vec4<f32>>;
 // Per-CELL particle count (U4): the particle-presence discriminator for the free-surface
 // classification. Node mass alone cannot tell a real surface cell from a particle-free air
@@ -96,30 +110,55 @@ struct Params {
 @group(0) @binding(18) var<storage, read_write> cell_cnt: array<atomic<u32>>;
 // SOLID grid field (U6): per-node solid VOLUME, fixed-point (×FP_SCALE), one lane per node —
 // the φ_s carrier (KTD-8: a local evolving field, never a configured scalar). Cleared by
-// grid_clear, scattered by p2g_solid (grain sphere volume π/6·d³ per grain), read wherever
+// grid_clear, scattered by p2g_solid[_dyn] (saturation-driven structural volume), read wherever
 // φ_s/φ_f is needed (drag_fold, node_setup, project). Headroom: |V_s| per node ≤ PHI_S-clamped
 // h³ ≈ 8 ≪ the 2^13 fixed-point ceiling.
 @group(0) @binding(19) var<storage, read_write> grid_sfp: array<atomic<i32>>;
-// U6 constraint-reaction ledger: per node, .xyz = the impulse the kinematically frozen
-// skeleton absorbs this frame (drag fold + pressure on the solid volume — NEVER silently
-// discarded; the buoyant-reaction gate sums it), .w = ς = Δt_eff/Δt, the exponential-
-// integrator mobility factor the drag fold hands to node_setup (1.0 where no solid mass).
-// Written by drag_fold every frame, accumulated by project; no clear pass needed.
+// Interphase drag state: per node, .xyz is the drag impulse water gives the solid. Frozen mode
+// records the impulse a kinematically constrained skeleton would absorb and project accumulates
+// its pressure reaction; dynamic mode applies the equal-and-opposite impulse directly to
+// grid_svel and keeps .xyz only as an observation of that already-applied exchange. .w is
+// sigma, the exact relative-mode exponential mobility handed to node_setup (1 at an unpaired
+// node). Written by drag_fold every frame; no clear pass needed.
 @group(0) @binding(20) var<storage, read_write> react: array<vec4<f32>>;
 // U5 SOLID momentum grid field (dynamic skeleton, plasticity.wgsl): fixed-point, 4 lanes per
 // node [mass, mom.xyz] — the solid mirror of grid_fp. Cleared by grid_clear, scattered by
 // p2g_solid_dyn, decoded by solid_update. Only dispatched-to when Config::solid_dynamics is
 // on (params.splas0.x > 0.5); cleared unconditionally (never read in frozen mode).
 @group(0) @binding(21) var<storage, read_write> grid_sm: array<atomic<i32>>;
-// U9 MOISTURE grid field (coupling.wgsl, GIC-style absorption): per node, 2 fixed-point lanes —
-// [0] = water SUPPLY S_n = Σ_w w·f_w·V_w, [1] = grain DEMAND D_n = Σ_g w·demand_g (the
-// models::wetting per-step demand). The actual node transfer is T_n = min(S_n, D_n); g2p_absorb
-// gathers the node drain/fill fractions T_n/S_n and T_n/D_n so water-loss == grain-gain EXACTLY
-// per node (header in coupling.wgsl). Cleared by grid_clear, scattered by p2g_moisture, read by
-// g2p_absorb. Only dispatched-to when Config::tf_absorb_rate > 0 (params.wet0.x); the clear runs
-// unconditionally (one node-sized dispatch). Headroom: |S_n|,|D_n| per node ≤ a few V_w ≈ a few
-// ≪ the 2^13 fixed-point ceiling.
+// U9 MOISTURE grid ledger (coupling.wgsl, GIC absorption), 6 lane-scaled integer lanes per node:
+// [S,D,Qx,Qy,Qz,R]. S/D are supply/demand, Q=Σ w·V·v is donor volume-momentum, and
+// R=Σ w·V·T is donor volume-temperature. T=min(S,D) transfers volume; Q/S and R/S transfer
+// its velocity and temperature to grains. Multiplication by particle_mass/V_w converts both
+// sides to reduced mass, momentum, heat capacity, and enthalpy. Lane scales and their audited
+// representable magnitudes are documented beside the encode/decode helpers below.
+const MOIST_STRIDE: u32 = 6u;
+const MOIST_SUPPLY: u32 = 0u;
+const MOIST_DEMAND: u32 = 1u;
+const MOIST_QX: u32 = 2u;
+const MOIST_RT: u32 = 5u;
 @group(0) @binding(25) var<storage, read_write> grid_moist: array<atomic<i32>>;
+
+// Chemistry grid ledger, 7 lane-scaled integer lanes per node:
+// [solute headroom H, proposed fast F, proposed slow L, water capacity Cw, water enthalpy Ew,
+// grain capacity Cg, grain enthalpy Eg]. chemistry_scatter freezes these totals after pressure;
+// chemistry_gather applies the same min(H,F+L) solute transfer and exact bounded heat exchange
+// to both phases, so closed-system solute and enthalpy are conservative up to FP quantization.
+const CHEM_STRIDE: u32 = 7u;
+const CHEM_HEADROOM: u32 = 0u;
+const CHEM_FAST: u32 = 1u;
+const CHEM_SLOW: u32 = 2u;
+const CHEM_CW: u32 = 3u;
+const CHEM_EW: u32 = 4u;
+const CHEM_CG: u32 = 5u;
+const CHEM_EG: u32 = 6u;
+@group(0) @binding(28) var<storage, read_write> grid_chem: array<atomic<i32>>;
+
+// Solid plastic-compaction moment, one fixed-point lane per node:
+//     sum_p w_ip * V_struct,p * e_p.
+// Dividing by grid_sfp gives the volume-weighted compaction carried by that node. It is kept
+// separate from stress magnitudes so the common FP_SCALE retains ample headroom.
+@group(0) @binding(29) var<storage, read_write> grid_scomp: array<atomic<i32>>;
 
 // --- fixed-point encoding (KEEP.md §3 pattern, headroom re-validated for U2) -----------------
 //
@@ -144,6 +183,78 @@ fn fp_encode(x: f32) -> i32 {
 }
 fn fp_decode(c: i32) -> f32 {
     return f32(c) / FP_SCALE;
+}
+
+// --- phase-change / chemistry lane scales ----------------------------------------------------
+// A single 2^18 scale cannot resolve the smallest UI-rate constitutive increments without
+// independently rounding 27 stencil contributions. These ledgers instead encode each PARTICLE
+// extensive total once, then partition that integer exactly across the stencil (see
+// extensive_partition_target). The scales below are the audited safe starting powers; the
+// corresponding maximum decoded magnitude before i32 saturation is approximately:
+//
+//   moisture S,D : 2^30 -> 2       reduced volume
+//   moisture Q   : 2^26 -> 32      volume·velocity, each signed component
+//   moisture R   : 2^24 -> 128     volume·kelvin
+//   chemistry H  : 2^26 -> 32      solute-mass headroom
+//   chemistry F,L: 2^27 -> 16      proposed solute mass
+//   chemistry C  : 2^22 -> 512     heat capacity
+//   chemistry E  : 2^13 -> 262144  capacity·kelvin
+//
+// Runtime recipe sampling keeps the actual node totals well inside these bounds. Raising a scale
+// reduces its physical range and therefore requires a new node-headroom audit.
+const MOIST_SD_SCALE: f32 = 1073741824.0; // 2^30
+const MOIST_Q_SCALE: f32 = 67108864.0;    // 2^26
+const MOIST_R_SCALE: f32 = 16777216.0;    // 2^24
+const CHEM_H_SCALE: f32 = 67108864.0;     // 2^26
+const CHEM_FL_SCALE: f32 = 134217728.0;   // 2^27
+const CHEM_C_SCALE: f32 = 4194304.0;      // 2^22
+const CHEM_E_SCALE: f32 = 8192.0;         // 2^13
+
+fn lane_encode(x: f32, scale: f32) -> i32 {
+    return i32(clamp(round(x * scale), -FP_CLAMP, FP_CLAMP));
+}
+fn lane_decode(count: i32, scale: f32) -> f32 {
+    return f32(count) / scale;
+}
+fn moist_encode(lane: u32, x: f32) -> i32 {
+    if (lane == MOIST_SUPPLY || lane == MOIST_DEMAND) { return lane_encode(x, MOIST_SD_SCALE); }
+    if (lane == MOIST_RT) { return lane_encode(x, MOIST_R_SCALE); }
+    return lane_encode(x, MOIST_Q_SCALE);
+}
+fn moist_decode(lane: u32, count: i32) -> f32 {
+    if (lane == MOIST_SUPPLY || lane == MOIST_DEMAND) { return lane_decode(count, MOIST_SD_SCALE); }
+    if (lane == MOIST_RT) { return lane_decode(count, MOIST_R_SCALE); }
+    return lane_decode(count, MOIST_Q_SCALE);
+}
+fn chem_encode(lane: u32, x: f32) -> i32 {
+    if (lane == CHEM_HEADROOM) { return lane_encode(x, CHEM_H_SCALE); }
+    if (lane == CHEM_FAST || lane == CHEM_SLOW) { return lane_encode(x, CHEM_FL_SCALE); }
+    if (lane == CHEM_CW || lane == CHEM_CG) { return lane_encode(x, CHEM_C_SCALE); }
+    return lane_encode(x, CHEM_E_SCALE);
+}
+fn chem_decode(lane: u32, count: i32) -> f32 {
+    if (lane == CHEM_HEADROOM) { return lane_decode(count, CHEM_H_SCALE); }
+    if (lane == CHEM_FAST || lane == CHEM_SLOW) { return lane_decode(count, CHEM_FL_SCALE); }
+    if (lane == CHEM_CW || lane == CHEM_CG) { return lane_decode(count, CHEM_C_SCALE); }
+    return lane_decode(count, CHEM_E_SCALE);
+}
+
+// Cumulative-rounding partition of one already-encoded particle total. Call in deterministic
+// stencil order while carrying `allocated` and cumulative B-spline weight. The final node receives
+// the exact integer remainder. Thus Σ_node share == total for positive and signed lanes, and the
+// gather can reproduce byte-identical shares without a per-particle residual buffer.
+fn extensive_partition_target(total: i32, cumulative_weight: f32, is_last: bool) -> i32 {
+    if (is_last) { return total; }
+    // An arbitrary i32 cannot be represented exactly as f32. Split into 256-count blocks so the
+    // quotient (|q| < 2^23) and signed remainder are both exact f32 integers. Partitioning each
+    // monotone component separately prevents a positive total from producing a negative final
+    // correction merely because f32(total) rounded upward.
+    let blocks = total / 256;
+    let remainder = total - blocks * 256;
+    let prefix = clamp(cumulative_weight, 0.0, 1.0);
+    let block_prefix = i32(round(f32(blocks) * prefix));
+    let remainder_prefix = i32(round(f32(remainder) * prefix));
+    return block_prefix * 256 + remainder_prefix;
 }
 
 // --- quadratic B-spline weights (KEEP.md §3 validated math) -----------------------------------
@@ -337,8 +448,8 @@ fn solid_union(p: vec3<f32>, ph: u32) -> SolidHit {
 // MULTI-NORMAL wall BC (plan 2026-06-17-002): all cavity FACES within `band` of p, generalizing
 // solid_union's single most-penetrated pick. At a concave seam (cup floor∩wall) two faces are
 // in-band and BOTH must be constrained — solid_union would return only one, leaving the other
-// direction free (the corner over-pack). `band` is passed in (= WALL_BAND·h; WALL_BAND lives in
-// pressure.wgsl, concatenated after this file). Floor face is pushed FIRST per primitive so the
+// direction free (the corner over-pack). `band` is phase-selected by pressure.wgsl: WALL_BAND·h
+// for water's supporting layer, zero for solid actual contact. Floor is pushed FIRST so the
 // rank-aware basis build (build_constraint_basis) never drops it. cone stays single-normal (it is
 // one smooth converging surface, not discrete faces). Cap WF_MAX candidates.
 const WF_MAX: u32 = 4u;
@@ -360,6 +471,8 @@ fn wf_push(wf: ptr<function, WallFaces>, nrm: vec3<f32>) {
 // 1 = x axis constrained, 2 = y, 4 = z (the axes node_setup/drag_fold zero on box faces). Rank-aware:
 // box axes first, then wall faces residualized + dropped if near-dependent, stop at rank 3 — so a
 // floor normal is never crowded out (the floor face is pushed first by wall_binding_faces).
+// This lockstep matrix/velocity statement applies to the water phase; solid velocity contact is
+// unilateral Coulomb, while its pressure active set is frozen into a linear projector per solve.
 const CB_RESIDUAL_MIN: f32 = 1.0e-3;
 struct CBasis { q: array<vec3<f32>, 3>, count: u32 };
 

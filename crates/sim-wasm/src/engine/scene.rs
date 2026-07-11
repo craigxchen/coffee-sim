@@ -125,6 +125,27 @@ impl Scene {
         }
     }
 
+    /// Deterministic late-brew throughput scene used only by the browser performance contract.
+    ///
+    /// The complete 15 g bed remains in the filter while the delivered 250 mL water inventory is
+    /// pre-seeded in the catch cup. This avoids timing thousands of emission-only warm-up frames
+    /// and keeps the binding workload at the production particle count. It is a performance fixture,
+    /// not a calibration endpoint: physical retention/chemistry scenarios are validated separately.
+    pub fn v60_late_brew_benchmark() -> Self {
+        let mut scene = Self::v60_pour();
+        scene.water_ml = 250.0;
+        scene.pour_water_ml = 0.0;
+        // Fill high enough that the production 250 mL-derived spacing leaves roughly 78k live
+        // samples after the solver's 0.4-unit SDF seed-clearance removes the cup floor/wall band.
+        // The top remains well below the open cup rim at y=-3.5.
+        scene.regions.push(SeedRegion {
+            min: [-2.85, -7.85, -2.85],
+            max: [2.85, -5.37, 2.85],
+            species: Species::Water,
+        });
+        scene
+    }
+
     /// A V60 **pour into the empty dripper** — the same support cone + grains-only filter + cup
     /// geometry as [`Scene::v60_pour`] but with **NO coffee bed**: water is poured into the clean
     /// cone and drains through the filter apex into the cup (the filter only blocks grains, so it
@@ -527,5 +548,15 @@ mod tests {
         );
         assert!(s.box_max[1] >= 3.0, "domain top reaches above the cone top");
         assert!(!s.regions.is_empty(), "v60 seeds a bed + a water column");
+    }
+
+    #[test]
+    fn late_brew_benchmark_declares_a_closed_delivered_inventory_without_emission() {
+        let scene = Scene::v60_late_brew_benchmark();
+        assert_eq!(scene.dose_g, 15.0);
+        assert_eq!(scene.water_ml, 250.0);
+        assert_eq!(scene.pour_water_ml, 0.0);
+        assert!(scene.regions.iter().any(|r| r.species == Species::Grain));
+        assert!(scene.regions.iter().any(|r| r.species == Species::Water));
     }
 }

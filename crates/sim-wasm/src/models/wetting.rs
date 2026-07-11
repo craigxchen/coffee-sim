@@ -1,10 +1,11 @@
 //! Wetting / swelling / absorption math shared by solvers (CPU reference).
 //!
-//! When a dry grain absorbs water, the water **leaves the fluid phase and becomes grain volume**:
-//! the solid swells by exactly the absorbed volume, so total volume (fluid + solid) is conserved.
-//! Mass moves with it (the absorbed water's mass joins the grain). These pure functions are the
-//! CPU mirror of what the GPU absorption passes compute, so the conservation/swelling math is
-//! unit-tested here first. Reference values + ranges: the wetting plan + `KEEP.md` §1.
+//! Bound water and structural grain volume are separate inventories. Absorption transfers an
+//! exact water volume (and its corresponding mass) from the free-water phase into `V_bound`.
+//! Structural swelling is a saturation-driven constitutive response with its own maximum
+//! diameter fraction; it is **not** `V_dry + V_bound`. This distinction prevents a retention
+//! target from silently forcing an equal geometric-volume increase. These pure functions mirror
+//! the GPU formulas and keep the independent conservation and swelling contracts testable.
 
 /// Per-grain absorption capacity, as a **volume of water** the grain can hold.
 ///
@@ -16,40 +17,75 @@ pub fn capacity(v_dry: f32, r_max: f32, rho_ratio: f32) -> f32 {
     r_max * rho_ratio * v_dry
 }
 
-/// Saturation fraction `s ∈ [0, 1]` = absorbed volume over capacity. Drives the cohesion curve.
-/// A grain with no capacity (degenerate) reads as dry.
+/// Bound-water capacity derived from the actual dry material-point mass.
+///
+/// `particle_mass / v_water` is the reduced water density, so dividing the gravimetric bound
+/// mass `r_max * m_dry` by it gives a water volume in solver units. Production recipe solvers
+/// should use this form: it remains invariant when the number or spacing of numerical solid
+/// samples changes and cannot disagree with the mass used by P2G.
 #[inline]
-pub fn saturation(v_abs: f32, v_cap: f32) -> f32 {
+pub fn capacity_from_dry_mass(m_dry: f32, r_max: f32, v_water: f32, particle_mass: f32) -> f32 {
+    if particle_mass <= 0.0 {
+        0.0
+    } else {
+        m_dry.max(0.0) * r_max.max(0.0) * v_water.max(0.0) / particle_mass
+    }
+}
+
+/// Saturation fraction `s ∈ [0, 1]` = bound-water volume over capacity. Drives swelling and
+/// cohesion. A grain with no capacity (degenerate) reads as dry.
+#[inline]
+pub fn saturation(v_bound: f32, v_cap: f32) -> f32 {
     if v_cap <= 0.0 {
         0.0
     } else {
-        (v_abs / v_cap).clamp(0.0, 1.0)
+        (v_bound / v_cap).clamp(0.0, 1.0)
     }
 }
 
-/// Swollen grain volume. Swelling **equals** the absorbed volume by construction (`V_dry + V_abs`),
-/// which is what makes absorption volume-conserving: fluid lost == solid gained.
+/// Structural diameter at the current saturation.
+///
+/// `max_diameter_swelling` is the fractional diameter increase at saturation. Negative inputs
+/// are treated as zero, so the diameter remains in
+/// `[d_dry, d_dry * (1 + max_diameter_swelling)]` for physical non-negative inputs.
 #[inline]
-pub fn effective_volume(v_dry: f32, v_abs: f32) -> f32 {
-    v_dry + v_abs
+pub fn structural_diameter(
+    d_dry: f32,
+    v_bound: f32,
+    v_cap: f32,
+    max_diameter_swelling: f32,
+) -> f32 {
+    let stretch = 1.0 + saturation(v_bound, v_cap) * max_diameter_swelling.max(0.0);
+    d_dry * stretch
 }
 
-/// Swollen contact diameter from the swollen volume (a sphere grows as the cube root of volume).
-/// Guards a degenerate dry volume.
+/// Structural volume at the current saturation:
+/// `V_struct = V_dry * (1 + s * max_diameter_swelling)^3`.
+///
+/// This depends on bound water only through saturation. It does not consume, create, or alias
+/// bound-water volume.
 #[inline]
-pub fn effective_diameter(d_dry: f32, v_eff: f32, v_dry: f32) -> f32 {
-    if v_dry > 0.0 {
-        d_dry * (v_eff / v_dry).cbrt()
+pub fn structural_volume(v_dry: f32, v_bound: f32, v_cap: f32, max_diameter_swelling: f32) -> f32 {
+    let stretch = 1.0 + saturation(v_bound, v_cap) * max_diameter_swelling.max(0.0);
+    v_dry * stretch * stretch * stretch
+}
+
+/// Reduced-unit mass carried by a bound-water volume. One full water-particle volume `v_water`
+/// carries `particle_mass`; the same ratio is used on the free-water and bound-water sides.
+#[inline]
+pub fn bound_water_mass(v_bound: f32, v_water: f32, particle_mass: f32) -> f32 {
+    if v_water <= 0.0 {
+        0.0
     } else {
-        d_dry
+        v_bound.max(0.0) / v_water * particle_mass
     }
 }
 
-/// Effective grain mass once it has absorbed `v_abs` of water: the dry mass plus the absorbed
-/// water's mass `ρ_w · V_abs`. Used wherever a velocity/momentum/XPBD weight depends on grain mass.
+/// Effective grain mass: immutable dry recipe mass plus the independently-accounted bound-water
+/// mass. Structural swelling does not enter this equation.
 #[inline]
-pub fn grain_eff_mass(m_dry: f32, v_abs: f32, rho_w: f32) -> f32 {
-    m_dry + rho_w * v_abs
+pub fn grain_effective_mass(m_dry: f32, v_bound: f32, v_water: f32, particle_mass: f32) -> f32 {
+    m_dry + bound_water_mass(v_bound, v_water, particle_mass)
 }
 
 /// Effective water-particle mass as it shrinks: a partially-absorbed particle (remaining-volume
@@ -60,12 +96,12 @@ pub fn water_eff_mass(particle_mass: f32, f_w: f32) -> f32 {
 }
 
 /// Volume a grain wants to absorb this step — a **bounded** first-order law toward capacity:
-/// `(V_cap − V_abs) · (1 − e^{−k·dt})`. The `(1 − e^{−k·dt})` factor is in `[0, 1)` for any `dt`,
+/// `(V_cap − V_bound) · (1 − e^{−k·dt})`. The exponential factor is in `[0, 1)` for any `dt`,
 /// so the demand can never exceed the remaining deficit (no overshoot of `V_cap`, even at large
 /// `dt`). `k_abs` sets how fast a wet grain saturates.
 #[inline]
-pub fn absorb_demand(v_abs: f32, v_cap: f32, k_abs: f32, dt: f32) -> f32 {
-    let deficit = (v_cap - v_abs).max(0.0);
+pub fn absorb_demand(v_bound: f32, v_cap: f32, k_abs: f32, dt: f32) -> f32 {
+    let deficit = (v_cap - v_bound).max(0.0);
     deficit * (1.0 - (-k_abs * dt).exp())
 }
 
@@ -78,22 +114,29 @@ mod tests {
     #[test]
     fn capacity_is_r_max_times_rho_ratio_times_volume() {
         assert!((capacity(2.0, 1.5, 1.3) - 1.5 * 1.3 * 2.0).abs() < EPS);
+        let (m_dry, r_max, v_water, particle_mass) = (7.0, 0.4, 0.25, 2.0);
+        let volume = capacity_from_dry_mass(m_dry, r_max, v_water, particle_mass);
+        assert!((bound_water_mass(volume, v_water, particle_mass) - r_max * m_dry).abs() < EPS);
     }
 
     #[test]
-    fn effective_volume_grows_linearly_and_is_dry_at_zero() {
-        assert!((effective_volume(3.0, 0.0) - 3.0).abs() < EPS);
-        // doubling absorbed volume doubles the swelling increment
-        let inc1 = effective_volume(3.0, 1.0) - 3.0;
-        let inc2 = effective_volume(3.0, 2.0) - 3.0;
-        assert!((inc2 - 2.0 * inc1).abs() < EPS);
+    fn zero_swelling_keeps_structural_volume_independent_of_bound_water() {
+        let v_dry = 3.0;
+        for v_bound in [0.0, 0.25, 2.0, 20.0] {
+            assert!((structural_volume(v_dry, v_bound, 2.0, 0.0) - v_dry).abs() < EPS);
+        }
     }
 
     #[test]
-    fn effective_diameter_is_cube_root_scaling() {
-        // V_eff = 8·V_dry ⇒ d_eff = 2·d_dry
-        let v_dry = 1.5;
-        assert!((effective_diameter(2.0, 8.0 * v_dry, v_dry) - 4.0).abs() < EPS);
+    fn structural_swelling_is_saturation_bounded_and_volume_matches_diameter() {
+        let (d_dry, v_dry, v_cap, max_swelling) = (2.0, 1.5, 4.0, 0.25);
+        for v_bound in [-1.0, 0.0, 1.0, 4.0, 40.0] {
+            let diameter = structural_diameter(d_dry, v_bound, v_cap, max_swelling);
+            let volume = structural_volume(v_dry, v_bound, v_cap, max_swelling);
+            assert!(diameter >= d_dry && diameter <= d_dry * (1.0 + max_swelling));
+            assert!(volume >= v_dry && volume <= v_dry * (1.0 + max_swelling).powi(3));
+            assert!((volume / v_dry - (diameter / d_dry).powi(3)).abs() < EPS);
+        }
     }
 
     #[test]
@@ -122,16 +165,72 @@ mod tests {
     }
 
     #[test]
-    fn grain_mass_rises_by_exactly_absorbed_water_mass() {
-        let (m_dry, v_abs, rho_w) = (1.5, 0.4, 1.0);
-        assert!((grain_eff_mass(m_dry, v_abs, rho_w) - (m_dry + rho_w * v_abs)).abs() < EPS);
-        // water-side mass scales with the remaining fraction
-        assert!((water_eff_mass(1.0, 0.25) - 0.25).abs() < EPS);
+    fn transferred_water_mass_and_momentum_are_identical_on_both_sides() {
+        let (particle_mass, v_water, transferred) = (3.0, 2.0, 0.4);
+        let free_mass_loss = water_eff_mass(particle_mass, transferred / v_water);
+        let bound_mass_gain = bound_water_mass(transferred, v_water, particle_mass);
+        assert!((free_mass_loss - bound_mass_gain).abs() < EPS);
+
+        let m_dry = 7.0;
+        assert!(
+            (grain_effective_mass(m_dry, transferred, v_water, particle_mass)
+                - (m_dry + bound_mass_gain))
+                .abs()
+                < EPS
+        );
+
+        // One-node algebra of the GPU S/D/Q ledger. Donors lose shares T/S at their own
+        // velocities; receivers gain shares T/D at Q/S. Both sums equal rho*T*Q/S.
+        let donor_volume = [0.2_f32, 0.5, 0.8];
+        let donor_velocity = [-1.2_f32, 0.4, 2.1];
+        let supply: f32 = donor_volume.iter().sum();
+        let volume_momentum: f32 = donor_volume
+            .iter()
+            .zip(donor_velocity)
+            .map(|(volume, velocity)| volume * velocity)
+            .sum();
+        let demand_shares = [0.3_f32, 0.7];
+        let demand: f32 = demand_shares.iter().sum();
+        let transfer = 0.6_f32.min(supply).min(demand);
+        let water_mass_per_volume = particle_mass / v_water;
+
+        let donor_lost_momentum: f32 = donor_volume
+            .iter()
+            .zip(donor_velocity)
+            .map(|(volume, velocity)| {
+                water_mass_per_volume * volume * (transfer / supply) * velocity
+            })
+            .sum();
+        let ledger_momentum = water_mass_per_volume * transfer * volume_momentum / supply;
+        let receiver_gained_momentum: f32 = demand_shares
+            .iter()
+            .map(|share| {
+                let gained_volume = share * transfer / demand;
+                water_mass_per_volume * gained_volume * volume_momentum / supply
+            })
+            .sum();
+        assert!((donor_lost_momentum - ledger_momentum).abs() < EPS);
+        assert!((receiver_gained_momentum - ledger_momentum).abs() < EPS);
+
+        // The receiver's inelastic merge preserves its old momentum plus its ledger share.
+        let old_mass = 4.0_f32;
+        let old_velocity = -0.6_f32;
+        let receiver_gain = demand_shares[0] * transfer / demand;
+        let gained_mass = water_mass_per_volume * receiver_gain;
+        let incoming_momentum = gained_mass * volume_momentum / supply;
+        let new_mass = old_mass + gained_mass;
+        let new_velocity = (old_mass * old_velocity + incoming_momentum) / new_mass;
+        assert!(
+            (new_mass * new_velocity - (old_mass * old_velocity + incoming_momentum)).abs() < EPS
+        );
     }
 
     #[test]
-    fn volume_identity_holds() {
-        let (v_dry, v_abs) = (1.2, 0.7);
-        assert!((v_dry + v_abs - effective_volume(v_dry, v_abs)).abs() < EPS);
+    fn equal_saturation_can_have_equal_structure_but_different_bound_mass() {
+        let max_swelling = 0.3;
+        let v_a = structural_volume(1.0, 0.5, 1.0, max_swelling);
+        let v_b = structural_volume(1.0, 1.0, 2.0, max_swelling);
+        assert!((v_a - v_b).abs() < EPS);
+        assert!(bound_water_mass(1.0, 1.0, 1.0) > bound_water_mass(0.5, 1.0, 1.0));
     }
 }

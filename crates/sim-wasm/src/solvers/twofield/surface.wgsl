@@ -40,7 +40,7 @@
 // Tint discipline: bubble_fine/bubble_coarse run as ONE workgroup with a uniform trip count
 // (now over the COMPACTED pocket list, not all cells — U8 R9 fix) and predicated bodies, so
 // every workgroupBarrier() is in uniform control flow. All other passes use guard returns with
-// no barriers. Over-dispatch + early-out only (R8). Storage buffers per entry point ≤ 7 (see
+// no barriers. Over-dispatch + early-out only (R8). Storage buffers per entry point ≤ 8 (see
 // MAX_STORAGE_BUFFERS_PER_ENTRY_POINT in mod.rs).
 
 // --- bindings (continue the global table; 17 is the bubble state) -----------------------------
@@ -77,6 +77,11 @@ const FLOOD_OUTSIDE: f32 = 1.0;
 // too), so the coarse correction releases on exactly the same criterion as the fine solve.
 const MIN_POCKET_FINE_CELLS: u32 = 8u;
 
+// Explicit production approximation for geometry whose gas volume is physically vented:
+// every gas cell remains CELL_AIR with Dirichlet p = 0. Generic/default scenes leave this false
+// and retain the complete flood-fill + sealed-pocket constraint.
+fn all_gas_atmospheric() -> bool { return params.retention.w > 0.5; }
+
 // =================================== flood_init ================================================
 // Seed the OUTSIDE label: air cells in the topmost in-box layer (the open atmosphere face), AND
 // every air cell WITHIN ONE CELL OF AN SDF WALL. The wall-adjacent seed is what makes the pocket
@@ -97,6 +102,15 @@ fn flood_init(@builtin(global_invocation_id) gid: vec3<u32>) {
         bubble[2] = 0.0; // pocket-present flag, raised by pocket_mark this frame
         atomicStore(&pocket_f[0], 0u); // reset the compacted pocket-list counters this frame
         atomicStore(&pocket_c[0], 0u);
+        if (all_gas_atmospheric()) {
+            bubble[0] = 0.0;
+            bubble[1] = 0.0;
+        }
+    }
+    // The host dispatches one workgroup in atmospheric mode: thread zero performs the complete
+    // stale-state reset above and every thread returns before the Manhattan label scan.
+    if (all_gas_atmospheric()) {
+        return;
     }
     if (c >= num_fine_cells()) {
         return;
@@ -218,11 +232,16 @@ fn pocket_mark(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
         return;
     }
+    // Atmospheric mode deliberately keeps every gas cell as CELL_AIR. The scan above still runs
+    // over all cells because it owns the under-density half of the two-sided density correction.
+    if (all_gas_atmospheric()) {
+        return;
+    }
     if (cm.w != CELL_AIR || label > 0.5) {
         return;
     }
-    // Enclosed: compute the cell MIXTURE divergence (same φ-weighted corner gather as
-    // cell_classify — one family, U6).
+    // Enclosed: compute the cell MIXTURE divergence with the exact shared
+    // phi_f*v_f + phi_s*v_s gather used by cell_classify.
     let h = params.grid_origin.w;
     var div = 0.0;
     for (var oz = 0; oz < 2; oz = oz + 1) {
@@ -230,9 +249,8 @@ fn pocket_mark(@builtin(global_invocation_id) gid: vec3<u32>) {
             for (var ox = 0; ox < 2; ox = ox + 1) {
                 let s = corner_sign(vec3<i32>(ox, oy, oz));
                 let nflat = node_index(cc + vec3<i32>(ox, oy, oz));
-                let gv = grid_vel[nflat];
                 let phin = nm[2u * nflat + 1u].w;
-                div = div + dot(s, phin * gv.xyz) / (4.0 * h);
+                div = div + dot(s, mixture_velocity_at(nflat, phin)) / (4.0 * h);
             }
         }
     }

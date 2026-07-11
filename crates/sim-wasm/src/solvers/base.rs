@@ -1,5 +1,6 @@
 use crate::emission::EmissionInput;
 use crate::engine::{Metrics, Scene};
+use crate::models::calibration::{CalibrationControl, CalibrationProfile, SetControlResult};
 use crate::models::Materials;
 use crate::profiling::Profile;
 use crate::ui::RenderView;
@@ -12,7 +13,7 @@ use coffee_sim_core::Vec3;
 pub(crate) enum SolverId {
     Mpm,
     Xpbd,
-    Twofield,
+    MpmV2,
 }
 
 impl SolverId {
@@ -20,19 +21,19 @@ impl SolverId {
         match self {
             Self::Mpm => "mpm",
             Self::Xpbd => "xpbd",
-            Self::Twofield => "twofield",
+            Self::MpmV2 => "mpm-v2",
         }
     }
 
     pub(crate) fn all() -> &'static [Self] {
-        &[Self::Mpm, Self::Xpbd, Self::Twofield]
+        &[Self::Mpm, Self::Xpbd, Self::MpmV2]
     }
 
     pub(crate) fn from_id(id: &str) -> Option<Self> {
         match id {
             "mpm" => Some(Self::Mpm),
             "xpbd" => Some(Self::Xpbd),
-            "twofield" => Some(Self::Twofield),
+            "mpm-v2" | "twofield" => Some(Self::MpmV2),
             _ => None,
         }
     }
@@ -132,6 +133,30 @@ pub(crate) struct FrameSnapshot<'a> {
     pub(crate) metrics: CommonMetrics,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CalibrationSupport {
+    Unsupported,
+    ProfileOnly,
+    Rebuild,
+}
+
+impl CalibrationSupport {
+    pub(crate) fn id(self) -> &'static str {
+        match self {
+            Self::Unsupported => "unsupported",
+            Self::ProfileOnly => "profile-only",
+            Self::Rebuild => "rebuild",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct CalibrationApplyResult {
+    pub(crate) update: SetControlResult,
+    pub(crate) support: CalibrationSupport,
+    pub(crate) simulation_reset: bool,
+}
+
 pub(crate) trait FrameSolver {
     fn reset(&mut self, ctx: ResetContext<'_>) -> CommonMetrics;
     fn reset_scene(
@@ -144,6 +169,23 @@ pub(crate) trait FrameSolver {
     fn set_water_velocity_m_s(&mut self, speed_m_s: f32);
     fn set_spout_position(&mut self, x: f32, y: f32, z: f32);
     fn set_pressure_residual_adaptation(&mut self, _target: f32, _max_pairs: u32) {}
+    fn calibration_profile(&self) -> Option<&CalibrationProfile> {
+        None
+    }
+    fn calibration_support(&self, _control: CalibrationControl) -> CalibrationSupport {
+        CalibrationSupport::Unsupported
+    }
+    fn set_calibration_value(
+        &mut self,
+        _ctx: ResetContext<'_>,
+        _id: &str,
+        _value: f32,
+    ) -> Result<CalibrationApplyResult, String> {
+        Err("active solver does not support calibration controls".to_string())
+    }
+    fn reset_calibration_defaults(&mut self, _ctx: ResetContext<'_>) -> Result<bool, String> {
+        Err("active solver does not support calibration controls".to_string())
+    }
     #[cfg(target_arch = "wasm32")]
     fn metrics_buffer(&self) -> Option<wgpu::Buffer> {
         None

@@ -1717,7 +1717,9 @@ impl Renderer {
                         };
                         pass.set_pipeline(&self.canonical_particle_3d_pipeline);
                         pass.set_bind_group(0, particle_bind_group, &[]);
-                        pass.draw(0..6, 0..simulation.particle_count() as u32);
+                        for instance_range in simulation.particle_instance_ranges() {
+                            pass.draw(0..6, instance_range);
+                        }
 
                         if let Some((overlay_x, overlay_y, overlay_width, overlay_height, _)) =
                             cross_section_viewport
@@ -1732,7 +1734,9 @@ impl Renderer {
                             );
                             pass.set_pipeline(&self.canonical_cross_section_pipeline);
                             pass.set_bind_group(0, cross_section_bind_group, &[]);
-                            pass.draw(0..6, 0..simulation.particle_count() as u32);
+                            for instance_range in simulation.particle_instance_ranges() {
+                                pass.draw(0..6, instance_range);
+                            }
                             pass.set_viewport(
                                 0.0,
                                 0.0,

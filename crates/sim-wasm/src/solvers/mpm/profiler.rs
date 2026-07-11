@@ -48,6 +48,8 @@ use crate::profiling::{
     env_flag, parse_solver_specs, solver_list_summary, solver_run_metadata, SolverRunMetadata,
     SolverSpec,
 };
+use crate::solvers::base::{FrameContext, SceneSpec, SolverId};
+use crate::solvers::registry::build_solver;
 
 use super::inflow::{EmissionResult, MASS_UNITS_PER_ML, PARTICLES_PER_ML};
 use super::state::{sparse_tile_slot_count, tile_count, METRICS_SLOT_COUNT, NUM_THREADS};
@@ -753,6 +755,24 @@ fn output_path() -> PathBuf {
     ))
 }
 
+fn output_path_for(solver_run: &SolverRunMetadata) -> PathBuf {
+    let path = output_path();
+    if !solver_run.multiple_outputs {
+        return path;
+    }
+
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("coffee-sim-profile");
+    let extension = path.extension().and_then(|value| value.to_str());
+    let file_name = match extension {
+        Some(extension) => format!("{stem}-{}.{}", solver_run.current, extension),
+        None => format!("{stem}-{}", solver_run.current),
+    };
+    path.with_file_name(file_name)
+}
+
 #[test]
 #[ignore = "profiling harness; run explicitly with --ignored --release"]
 fn profile_mpm_pipeline() {
@@ -789,6 +809,11 @@ fn run_profile_solvers_from_env() {
     for &solver in &solvers {
         match solver {
             SolverSpec::Mpm => run_profile_mpm_pipeline(
+                "profile_solvers",
+                options.clone(),
+                solver_run_metadata(&solvers, solver),
+            ),
+            SolverSpec::MpmV2 => run_profile_frame_solver(
                 "profile_solvers",
                 options.clone(),
                 solver_run_metadata(&solvers, solver),
@@ -858,7 +883,7 @@ fn print_dry_run_plan(solvers: &[SolverSpec], options: &ProfilerRunOptions, json
 }
 
 #[test]
-fn profile_solvers_dry_run_plan_records_mpm_metadata() {
+fn profile_solvers_dry_run_plan_records_registered_solver_metadata() {
     let options = ProfilerRunOptions {
         scene: "center_pour".into(),
         warmup: 1,
@@ -869,10 +894,133 @@ fn profile_solvers_dry_run_plan_records_mpm_metadata() {
     let solvers = parse_solver_specs("all").expect("all resolves");
     let plan = dry_run_plan(&solvers, &options);
     assert_eq!(plan.version, 1);
-    assert_eq!(plan.solvers, vec!["mpm"]);
+    assert_eq!(plan.solvers, vec!["mpm", "mpm-v2"]);
     assert_eq!(plan.scene, "center_pour");
-    assert_eq!(plan.solver_runs.len(), 1);
+    assert_eq!(plan.solver_runs.len(), 2);
     assert_eq!(plan.solver_runs[0].current, "mpm");
+    assert_eq!(plan.solver_runs[1].current, "mpm-v2");
+}
+
+#[derive(Serialize)]
+struct ProductionFrameProfileMetadata {
+    solver_run: SolverRunMetadata,
+    scene: String,
+    adapter: String,
+    backend: String,
+    device_type: String,
+    warmup_frames: u32,
+    measured_frames: u32,
+    calibration_frames: u32,
+    frame_dt_s: f32,
+    particle_count_end: usize,
+    water_particles_end: u32,
+    bed_particles_end: u32,
+    per_pass_breakdown_available: bool,
+}
+
+#[derive(Serialize)]
+struct ProductionFrameProfileReport {
+    version: u32,
+    metadata: ProductionFrameProfileMetadata,
+    production_frame: Stat,
+    notes: Vec<String>,
+}
+
+fn run_profile_frame_solver(
+    entrypoint: &str,
+    options: ProfilerRunOptions,
+    solver_run: SolverRunMetadata,
+) {
+    let Some(adapter) = request_adapter() else {
+        if options.require_gpu {
+            panic!("{entrypoint}: no GPU adapter available and require_gpu=true");
+        }
+        eprintln!("{entrypoint}: no GPU adapter available; skipping.");
+        return;
+    };
+
+    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        label: Some("coffee-sim production-frame profiler device"),
+        required_features: wgpu::Features::empty(),
+        required_limits: required_limits(),
+        memory_hints: wgpu::MemoryHints::Performance,
+        trace: wgpu::Trace::default(),
+        experimental_features: wgpu::ExperimentalFeatures::disabled(),
+    }))
+    .expect("request production-frame profiler device");
+
+    let scene = match options.scene.as_str() {
+        "center_pour" | "center-pour" => SceneSpec::CenterPour,
+        "free_stream" | "free-stream" => SceneSpec::FreeStream,
+        other => panic!("{entrypoint}: MPM v2 profiler does not support scene '{other}'"),
+    };
+    let mut solver = build_solver(SolverId::MpmV2, &device, &queue, &scene)
+        .expect("build MPM v2 profiler solver");
+
+    for _ in 0..options.warmup.saturating_add(options.calibration) {
+        solver.step_frame(FrameContext {
+            device: &device,
+            queue: &queue,
+            dt: FRAME_DT,
+        });
+    }
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+
+    let mut production_ms = Vec::with_capacity(options.measured as usize);
+    for _ in 0..options.measured {
+        let start = Instant::now();
+        solver.step_frame(FrameContext {
+            device: &device,
+            queue: &queue,
+            dt: FRAME_DT,
+        });
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        production_ms.push(ms(start));
+    }
+
+    let info = adapter.get_info();
+    let metrics = solver.snapshot().metrics;
+    let report = ProductionFrameProfileReport {
+        version: 1,
+        metadata: ProductionFrameProfileMetadata {
+            solver_run: solver_run.clone(),
+            scene: options.scene,
+            adapter: info.name,
+            backend: format!("{:?}", info.backend),
+            device_type: format!("{:?}", info.device_type),
+            warmup_frames: options.warmup,
+            measured_frames: options.measured,
+            calibration_frames: options.calibration,
+            frame_dt_s: FRAME_DT,
+            particle_count_end: metrics.particle_count,
+            water_particles_end: metrics.water_slots_used,
+            bed_particles_end: metrics.bed_particle_count,
+            per_pass_breakdown_available: false,
+        },
+        production_frame: Stat::from_samples(production_ms),
+        notes: vec![
+            "Production step_frame wall time includes a wait for GPU completion.".to_string(),
+            "MPM v2 does not fabricate a legacy-MPM timestamp pass breakdown.".to_string(),
+        ],
+    };
+
+    let json = serde_json::to_string_pretty(&report).expect("serialize MPM v2 profile");
+    let path = output_path_for(&solver_run);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).expect("create output dir");
+    }
+    std::fs::write(&path, json).expect("write MPM v2 profile json");
+
+    println!(
+        "\n=== MPM v2 production-frame profile ({}) ===",
+        report.metadata.scene
+    );
+    println!(
+        "production step_frame: {:.3} ms/frame (p95 {:.3})",
+        report.production_frame.mean_ms, report.production_frame.p95_ms,
+    );
+    println!("per-pass GPU breakdown: unavailable (not fabricated)");
+    println!("\nJSON written to: {}", path.display());
 }
 
 fn run_profile_mpm_pipeline(
@@ -1080,7 +1228,7 @@ fn run_profile_mpm_pipeline(
     };
 
     let json = serde_json::to_string_pretty(&report).expect("serialize report");
-    let path = output_path();
+    let path = output_path_for(&report.metadata.solver_run);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).expect("create output dir");
     }

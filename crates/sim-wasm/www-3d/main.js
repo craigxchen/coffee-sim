@@ -1,4 +1,4 @@
-import init, { WasmSim3D } from "./pkg/coffee_sim_wasm.js?v=solver-refresh-1";
+import init, { WasmSim3D } from "./pkg/coffee_sim_wasm.js?v=calibration-ui-1";
 
 const canvas = document.getElementById("sim-canvas");
 const viewCubeStage = document.getElementById("view-cube-stage");
@@ -6,6 +6,10 @@ const toggleButton = document.getElementById("toggle");
 const resetButton = document.getElementById("reset");
 const solverSelect = document.getElementById("solver-select");
 const solverEyebrow = document.getElementById("solver-eyebrow");
+const calibrationPanel = document.getElementById("calibration-panel");
+const calibrationControls = document.getElementById("calibration-controls");
+const calibrationStatus = document.getElementById("calibration-status");
+const resetCalibrationButton = document.getElementById("reset-calibration");
 const sceneMainTab = document.getElementById("scene-tab-main");
 const sceneDebugTab = document.getElementById("scene-tab-debug");
 const sceneMainPanel = document.getElementById("scene-panel-main");
@@ -68,6 +72,9 @@ const TIMESERIES_SAMPLE_INTERVAL = 6;
 const TIMESERIES_MAX_SAMPLES = 720;
 const HUD_REFRESH_INTERVAL = 6;
 const MAX_RENDER_DPR = 1.5;
+const MAX_SIM_STEPS_PER_DISPLAY_FRAME = 4;
+const CALIBRATION_SOLVER_ID = "mpm-v2";
+const CALIBRATION_DEBOUNCE_MS = 160;
 let activeSolverId = "mpm";
 let metricsSamplesPending = 0;
 let latestExactMetrics = null;
@@ -78,6 +85,7 @@ let paused = false;
 let autoPauseTimer = 0;
 let lastFrameTime = 0;
 let skipStepOnce = false;
+let simulationAccumulatorSeconds = 0;
 let evaluationActive = false;
 let fpsWindow = [];
 let dragging = false;
@@ -128,6 +136,9 @@ let timeseriesFrameCounter = TIMESERIES_SAMPLE_INTERVAL;
 let hudFrameCounter = HUD_REFRESH_INTERVAL;
 const timeseriesSamples = [];
 const integerFormatter = new Intl.NumberFormat();
+const calibrationControlViews = new Map();
+const calibrationApplyTimers = new Map();
+let calibrationPanelBuilt = false;
 const TIMESERIES_CHARTS = [
   {
     key: "totalEnergy",
@@ -249,7 +260,7 @@ async function bootstrap() {
   try {
     buildTimeseriesCharts();
     buildTimeseriesMenu();
-    await init(new URL("./pkg/coffee_sim_wasm_bg.wasm?v=solver-refresh-1", import.meta.url));
+    await init(new URL("./pkg/coffee_sim_wasm_bg.wasm?v=calibration-ui-1", import.meta.url));
     app = await WasmSim3D.create(canvas);
     populateSolverSelect();
     app.loadBenchmarkCenterPour();
@@ -294,6 +305,10 @@ async function bootstrap() {
 
   solverSelect.addEventListener("change", () => {
     selectSolver(solverSelect.value);
+  });
+
+  resetCalibrationButton.addEventListener("click", () => {
+    resetCalibrationProfile();
   });
 
   toggleTimeseriesButton.addEventListener("click", () => {
@@ -596,7 +611,6 @@ function animate(timestamp) {
   if (!lastFrameTime) lastFrameTime = timestamp;
 
   const wallFrameTime = Math.min((timestamp - lastFrameTime) / 1000, 0.05);
-  const frameTime = fixedStepSeconds ?? wallFrameTime;
   lastFrameTime = timestamp;
 
   if (evaluationActive) {
@@ -604,12 +618,31 @@ function animate(timestamp) {
     return;
   }
 
-  applyKeyboardPan(frameTime);
+  applyKeyboardPan(wallFrameTime);
 
   if (!paused && skipStepOnce) {
     skipStepOnce = false;
+    simulationAccumulatorSeconds = 0;
   } else if (!paused) {
-    app.stepFrame(frameTime);
+    if (fixedStepSeconds) {
+      // Keep physics on its deterministic clock. At the 30 FPS target a displayed frame advances
+      // two 1/60 s steps and renders once; one step per RAF would silently run at half speed.
+      simulationAccumulatorSeconds = Math.min(
+        simulationAccumulatorSeconds + wallFrameTime,
+        fixedStepSeconds * MAX_SIM_STEPS_PER_DISPLAY_FRAME,
+      );
+      let steps = 0;
+      while (
+        simulationAccumulatorSeconds + Number.EPSILON >= fixedStepSeconds &&
+        steps < MAX_SIM_STEPS_PER_DISPLAY_FRAME
+      ) {
+        app.stepFrame(fixedStepSeconds);
+        simulationAccumulatorSeconds -= fixedStepSeconds;
+        steps += 1;
+      }
+    } else {
+      app.stepFrame(wallFrameTime);
+    }
   }
 
   app.render();
@@ -627,6 +660,7 @@ function setPaused(nextPaused) {
   toggleButton.textContent = paused ? "Play" : "Pause";
   if (!paused) {
     lastFrameTime = 0;
+    simulationAccumulatorSeconds = 0;
     fpsWindow = [];
     skipStepOnce = true;
   }
@@ -1037,6 +1071,7 @@ function syncSolverSelect() {
   const selectedSolver = solverSelect.selectedOptions[0]?.textContent ?? "MPM";
   solverEyebrow.textContent = `Coffee Sim / ${selectedSolver.replace(" (experimental)", "")}`;
   applySceneControls();
+  syncCalibrationPanel();
 }
 
 function selectSolver(solverId) {
@@ -1050,6 +1085,7 @@ function selectSolver(solverId) {
     }
     fixedStepSeconds = 1 / 60;
     lastFrameTime = 0;
+    simulationAccumulatorSeconds = 0;
     syncControlDefaultsFromSim();
     applySceneControls();
     setPaused(false);
@@ -1060,6 +1096,215 @@ function selectSolver(solverId) {
   } finally {
     syncSolverSelect();
   }
+}
+
+function syncCalibrationPanel() {
+  const visible = activeSolverId === CALIBRATION_SOLVER_ID;
+  calibrationPanel.hidden = !visible;
+  if (!visible || !app) {
+    clearCalibrationApplyTimers();
+    return;
+  }
+  if (!calibrationPanelBuilt) {
+    buildCalibrationPanel(Array.from(app.calibrationSchema()));
+    calibrationPanelBuilt = true;
+  }
+  syncCalibrationValues();
+}
+
+function buildCalibrationPanel(schema) {
+  calibrationControls.textContent = "";
+  calibrationControlViews.clear();
+  for (const descriptor of schema) {
+    const field = document.createElement("div");
+    field.className = "calibration-control";
+
+    const label = document.createElement("label");
+    label.className = "calibration-control-label";
+    const labelText = document.createElement("span");
+    labelText.textContent = descriptor.label;
+    const output = document.createElement("output");
+    output.className = "calibration-control-value";
+    label.append(labelText, output);
+
+    const input = document.createElement("input");
+    input.type = "range";
+    input.setAttribute("aria-label", `${descriptor.label} (${descriptor.units})`);
+    if (descriptor.logarithmic) {
+      input.min = "0";
+      input.max = "1";
+      input.step = "0.001";
+    } else {
+      input.min = String(descriptor.min);
+      input.max = String(descriptor.max);
+      input.step = String(descriptor.step);
+    }
+    input.disabled = descriptor.application === "unsupported";
+    label.htmlFor = `calibration-${descriptor.id}`;
+    input.id = `calibration-${descriptor.id}`;
+
+    const note = document.createElement("span");
+    note.className = "calibration-control-note";
+    note.dataset.application = descriptor.application;
+    note.textContent = calibrationApplicationLabel(descriptor);
+    input.setAttribute("aria-describedby", `${input.id}-note`);
+    note.id = `${input.id}-note`;
+
+    input.addEventListener("input", () => {
+      const value = calibrationValueFromInput(descriptor, input);
+      output.textContent = formatCalibrationValue(descriptor, value);
+      queueCalibrationApply(descriptor, value);
+    });
+
+    field.append(label, input, note);
+    calibrationControls.append(field);
+    calibrationControlViews.set(descriptor.id, {
+      descriptor,
+      input,
+      output,
+    });
+  }
+}
+
+function calibrationApplicationLabel(descriptor) {
+  if (descriptor.application === "profile-only") {
+    return "Profile target only; current solver physics wiring is pending.";
+  }
+  if (descriptor.application === "rebuild" || descriptor.requiresRebuild) {
+    return "Applied by rebuilding and resetting the active simulation.";
+  }
+  return descriptor.application === "unsupported"
+    ? "Not supported by the active solver."
+    : "Applied live.";
+}
+
+function syncCalibrationValues() {
+  if (activeSolverId !== CALIBRATION_SOLVER_ID || !calibrationPanelBuilt) return;
+  const values = new Map(
+    Array.from(app.calibrationValues()).map((entry) => [entry.id, entry.value]),
+  );
+  for (const [id, view] of calibrationControlViews) {
+    if (!values.has(id)) continue;
+    const value = values.get(id);
+    setCalibrationInputValue(view.descriptor, view.input, value);
+    view.output.textContent = formatCalibrationValue(view.descriptor, value);
+  }
+}
+
+function setCalibrationInputValue(descriptor, input, value) {
+  if (!descriptor.logarithmic) {
+    input.value = String(value);
+    return;
+  }
+  const logMin = Math.log(descriptor.min);
+  const logRange = Math.log(descriptor.max) - logMin;
+  input.value = String((Math.log(value) - logMin) / logRange);
+}
+
+function calibrationValueFromInput(descriptor, input) {
+  let value = Number(input.value);
+  if (descriptor.logarithmic) {
+    const logMin = Math.log(descriptor.min);
+    const logRange = Math.log(descriptor.max) - logMin;
+    value = Math.exp(logMin + value * logRange);
+  }
+  const steps = Math.round((value - descriptor.min) / descriptor.step);
+  return clamp(descriptor.min + steps * descriptor.step, descriptor.min, descriptor.max);
+}
+
+function formatCalibrationValue(descriptor, value) {
+  const magnitude = Math.abs(value);
+  let formatted;
+  if (magnitude > 0 && (magnitude < 0.001 || magnitude >= 10000)) {
+    formatted = value.toExponential(2);
+  } else {
+    const decimals = Math.min(6, Math.max(0, Math.ceil(-Math.log10(descriptor.step))));
+    formatted = value.toFixed(decimals);
+  }
+  return `${formatted} ${descriptor.units}`;
+}
+
+function queueCalibrationApply(descriptor, value) {
+  const previousTimer = calibrationApplyTimers.get(descriptor.id);
+  if (previousTimer) window.clearTimeout(previousTimer);
+  const resets = descriptor.requiresRebuild || descriptor.application === "rebuild";
+  setCalibrationStatus(
+    resets ? "pending" : "idle",
+    resets
+      ? `Pending ${descriptor.label}; the simulation will reset after you stop dragging.`
+      : `Pending ${descriptor.label}.`,
+  );
+  const timer = window.setTimeout(() => {
+    calibrationApplyTimers.delete(descriptor.id);
+    applyCalibrationValue(descriptor, value);
+  }, CALIBRATION_DEBOUNCE_MS);
+  calibrationApplyTimers.set(descriptor.id, timer);
+}
+
+function applyCalibrationValue(descriptor, value) {
+  try {
+    const result = app.setCalibrationValue(descriptor.id, value);
+    syncCalibrationValues();
+    if (result.simulationReset) {
+      lastFrameTime = 0;
+      simulationAccumulatorSeconds = 0;
+      resetTimeseries();
+      syncControlDefaultsFromSim();
+    }
+    if (!result.appliedToSolver) {
+      const resetText = result.simulationReset ? " The simulation reset as declared." : "";
+      setCalibrationStatus(
+        "idle",
+        `${descriptor.label} saved in the profile; solver physics wiring is pending.${resetText}`,
+      );
+    } else {
+      const clampText = result.clamped ? " (clamped to the schema range)" : "";
+      setCalibrationStatus(
+        "idle",
+        `${descriptor.label} applied${clampText}${result.simulationReset ? "; simulation reset." : "."}`,
+      );
+    }
+    syncUi();
+  } catch (error) {
+    setCalibrationStatus("error", `Could not apply ${descriptor.label}: ${errorMessage(error)}`);
+    syncCalibrationValues();
+  }
+}
+
+function resetCalibrationProfile() {
+  if (activeSolverId !== CALIBRATION_SOLVER_ID) return;
+  clearCalibrationApplyTimers();
+  try {
+    const simulationReset = app.resetCalibrationDefaults();
+    syncCalibrationValues();
+    if (simulationReset) {
+      lastFrameTime = 0;
+      simulationAccumulatorSeconds = 0;
+      resetTimeseries();
+      syncControlDefaultsFromSim();
+    }
+    setCalibrationStatus(
+      "idle",
+      simulationReset
+        ? "Calibration defaults restored; simulation reset."
+        : "Calibration defaults restored.",
+    );
+    syncUi();
+  } catch (error) {
+    setCalibrationStatus("error", `Could not reset calibration: ${errorMessage(error)}`);
+  }
+}
+
+function clearCalibrationApplyTimers() {
+  for (const timer of calibrationApplyTimers.values()) {
+    window.clearTimeout(timer);
+  }
+  calibrationApplyTimers.clear();
+}
+
+function setCalibrationStatus(state, message) {
+  calibrationStatus.dataset.state = state;
+  calibrationStatus.textContent = message;
 }
 
 function setSceneTab(tabName) {
@@ -1088,6 +1333,7 @@ function finishSceneLoad({ sceneId, label, tab, pausedOnLoad = false }) {
   }
   setPaused(pausedOnLoad);
   lastFrameTime = 0;
+  simulationAccumulatorSeconds = 0;
   syncUi();
   resetTimeseries();
 }
@@ -1136,6 +1382,7 @@ function reloadCurrentScene() {
     applyWaterVelocityControl();
     applySpoutControls();
     lastFrameTime = 0;
+    simulationAccumulatorSeconds = 0;
     syncUi();
     resetTimeseries();
   }
@@ -1234,6 +1481,7 @@ function publishDebugHooks() {
     stepFramesForEvaluation,
     sampleRealism: captureRealismSample,
     runRealismEvaluation,
+    benchmarkWebGpu: runWebGpuBenchmark,
   };
   document.addEventListener("coffee-sim-run-realism-evaluation", (event) => {
     const output = ensureRealismEvaluationOutput();
@@ -1347,6 +1595,7 @@ function loadEvaluationScene(scene) {
   syncControlDefaultsFromSim();
   applySceneControls();
   lastFrameTime = 0;
+  simulationAccumulatorSeconds = 0;
   syncUi();
 }
 
@@ -1432,6 +1681,7 @@ async function runRealismEvaluation(options = {}) {
   } finally {
     evaluationActive = false;
     lastFrameTime = 0;
+    simulationAccumulatorSeconds = 0;
     syncUi();
   }
 }
@@ -1520,4 +1770,127 @@ function assessRealismSamples(samples) {
       surfaceCoverage: surface?.coverage ?? 0,
     },
   };
+}
+
+function quantile(sortedValues, probability) {
+  if (sortedValues.length === 0) return 0;
+  const index = (sortedValues.length - 1) * probability;
+  const low = Math.floor(index);
+  const high = Math.ceil(index);
+  if (low === high) return sortedValues[low];
+  const fraction = index - low;
+  return sortedValues[low] * (1 - fraction) + sortedValues[high] * fraction;
+}
+
+/**
+ * Binding WebGPU throughput probe from the MPM-v2 implementation contract.
+ *
+ * One measured display frame advances two 1/60 s steps and renders once. Timings are taken in
+ * ten-frame batches and include a queue completion fence, so they cannot pass by measuring command
+ * submission while GPU work remains outstanding.
+ */
+async function runWebGpuBenchmark(options = {}) {
+  if (evaluationActive) {
+    throw new Error("A realism evaluation or WebGPU benchmark is already running");
+  }
+  const {
+    warmupDisplayFrames = 120,
+    batchCount = 30,
+    displayFramesPerBatch = 10,
+    width = 1280,
+    height = 720,
+  } = options;
+  if (warmupDisplayFrames < 0 || batchCount <= 0 || displayFramesPerBatch <= 0) {
+    throw new Error("Benchmark frame and batch counts must be positive");
+  }
+
+  evaluationActive = true;
+  try {
+    setPaused(true);
+    heldKeys.clear();
+    dragging = false;
+    spoutPlaneDragging = false;
+    if (activeSolverId !== CALIBRATION_SOLVER_ID) {
+      selectSolver(CALIBRATION_SOLVER_ID);
+      setPaused(true);
+    }
+    app.loadMpmV2LateBrewBenchmark();
+    currentSceneId = "mpm-v2-late-brew-benchmark";
+    currentSceneMode = "MPM v2 Late Brew Benchmark";
+    fixedStepSeconds = 1 / 60;
+    lastFrameTime = 0;
+    simulationAccumulatorSeconds = 0;
+    canvas.width = width;
+    canvas.height = height;
+    app.resizeWithCssSize(width, height, width, height);
+
+    const waterSamples = app.waterSlotsUsed();
+    const solidSamples = app.bedParticleCount();
+    if (waterSamples < 75_000 || waterSamples > 80_000) {
+      throw new Error(`Benchmark requires 75k–80k live water samples; scene has ${waterSamples}`);
+    }
+    if (solidSamples !== 12_000) {
+      throw new Error(`Benchmark requires exactly 12,000 solid samples; scene has ${solidSamples}`);
+    }
+
+    const runDisplayFrame = () => {
+      app.stepFrame(1 / 60);
+      app.stepFrame(1 / 60);
+      app.render();
+    };
+    for (let frame = 0; frame < warmupDisplayFrames; frame += 1) {
+      runDisplayFrame();
+      if ((frame + 1) % displayFramesPerBatch === 0) {
+        await app.waitForGpu();
+      }
+    }
+    await app.waitForGpu();
+
+    const normalizedFrameMilliseconds = [];
+    let measuredWallMilliseconds = 0;
+    for (let batch = 0; batch < batchCount; batch += 1) {
+      const started = performance.now();
+      for (let frame = 0; frame < displayFramesPerBatch; frame += 1) {
+        runDisplayFrame();
+      }
+      await app.waitForGpu();
+      const elapsed = performance.now() - started;
+      measuredWallMilliseconds += elapsed;
+      normalizedFrameMilliseconds.push(elapsed / displayFramesPerBatch);
+    }
+
+    const sorted = [...normalizedFrameMilliseconds].sort((a, b) => a - b);
+    const medianMs = quantile(sorted, 0.5);
+    const p95Ms = quantile(sorted, 0.95);
+    const p99Ms = quantile(sorted, 0.99);
+    const measuredDisplayFrames = batchCount * displayFramesPerBatch;
+    const simulatedSeconds = measuredDisplayFrames * 2 / 60;
+    const realTimeFactor = simulatedSeconds / (measuredWallMilliseconds / 1000);
+    const result = {
+      contract: "mpm-v2-webgpu-30fps-v1",
+      passed: medianMs <= 33.3 && realTimeFactor >= 1.0,
+      medianMs,
+      p95Ms,
+      p99Ms,
+      realTimeFactor,
+      normalizedFrameMilliseconds,
+      warmupDisplayFrames,
+      batchCount,
+      displayFramesPerBatch,
+      physicsStepsPerDisplayFrame: 2,
+      physicsStepSeconds: 1 / 60,
+      resolution: { width, height, dpr: 1 },
+      waterSamples,
+      solidSamples,
+      userAgent: navigator.userAgent,
+    };
+    console.info("Coffee sim WebGPU benchmark", result);
+    return result;
+  } finally {
+    evaluationActive = false;
+    lastFrameTime = 0;
+    simulationAccumulatorSeconds = 0;
+    resizeCanvas();
+    syncUi();
+  }
 }

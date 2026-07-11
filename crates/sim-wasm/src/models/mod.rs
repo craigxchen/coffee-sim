@@ -6,11 +6,17 @@
 //! dry-bed grain params (contact, friction, cohesion). The physics functions and calibration
 //! tables land in later steps; their target values from v1 are recorded in `KEEP.md`.
 
+pub mod calibration;
 pub mod cohesion;
 pub mod extraction;
+pub mod filter;
 pub mod fines;
+pub mod granular;
 pub mod permeability;
+pub mod retention;
+pub mod scaling;
 pub mod thermal;
+pub mod water;
 pub mod wetting;
 
 /// Coffee + water material parameters and presets.
@@ -56,11 +62,14 @@ pub struct Materials {
     pub min_pore_fraction: f32,
 
     // --- wetting / cohesion (Phase 1.4) ---
-    /// Moisture ratio at saturation `r_max` (mass water / mass dry grain). Coffee ≈ 1.5 — grounds
-    /// absorb ~1.5× their dry mass, which is why bloom/drawdown-slowing are pronounced.
+    /// Intragranular bound-water capacity `r_max` (mass water / mass dry grain). This is not the
+    /// whole-bed liquid-retention ratio: interstitial/capillary and filter water are separate
+    /// inventories. Production MPM-v2 supplies the user calibration profile; the generic default
+    /// below is retained only for legacy solver/test compatibility.
     pub r_max: f32,
-    /// Grain/water density ratio `ρ_s/ρ_w`. Converts absorbed water mass into the grain's swelling
-    /// volume so absorption conserves volume (fluid lost = solid gained).
+    /// Grain/water density ratio `ρ_s/ρ_w`. Converts a gravimetric retention capacity into
+    /// the bound-water volume `V_cap = r_max·(ρ_s/ρ_w)·V_dry`. Structural swelling is a
+    /// separate saturation-driven constitutive response.
     pub rho_ratio: f32,
     /// Saturation `s ∈ [0,1]` at the cohesion-curve peak (~0.4; capillary bridges are strongest at
     /// partial saturation, collapse at full saturation). See [`cohesion::for_saturation`].
@@ -72,8 +81,8 @@ pub struct Materials {
     /// Base fast/slow-pool dissolution rate constants (1/s). Fast = surfaces/fines, slow = interiors.
     pub k0_fast: f32,
     pub k0_slow: f32,
-    /// Arrhenius `Ea/R` (temperature sensitivity of extraction) and reference temperature
-    /// (`k_T(t_ref) = 1`). Temperatures are a normalized scale (pour ≈ `t_ref`, ambient below).
+    /// Arrhenius `Ea/R` in kelvin and absolute reference temperature `T_ref` in kelvin
+    /// (`k_T(T_ref) = 1`). Production calibration supplies absolute-K values.
     pub ea_over_r: f32,
     pub t_ref: f32,
     /// Max solute concentration `c_sat` (8% by mass; the `(1−c/c_sat)` driving force → 0 here).
@@ -89,7 +98,8 @@ pub struct Materials {
     /// Moisture-gate onset saturation (a grain below this is too dry to extract).
     pub s_on: f32,
     /// Thermal pair conductance `κ`, per-species specific heats (`C = mass·cp`), ambient heat-loss
-    /// rate, ambient temperature, and the initial brew-water (pour) temperature. Normalized scale.
+    /// rate, ambient temperature, and initial brew-water temperature. Temperature fields are
+    /// absolute kelvin at production solver seams.
     pub kappa: f32,
     pub cp_water: f32,
     pub cp_grain: f32,
@@ -127,15 +137,15 @@ impl Default for Materials {
             coupling_radius: 0.0,
             porosity: 0.40,
             min_pore_fraction: 0.35,
-            // Wetting: coffee retains ~1.5× its dry mass; grain density ~1.3× water; cohesion peaks
-            // near 40% saturation. c_max starts at 0 (no wet cohesion until calibrated).
+            // Legacy/generic wetting fixture. Production MPM-v2 replaces r_max from its calibration
+            // profile and treats the ~2.1 g/g protocol observation as a whole-bed inventory rather
+            // than silently assigning it to every grain. c_max stays off until calibrated.
             r_max: 1.5,
             rho_ratio: 1.3,
             s_peak: 0.4,
             c_max: 0.0,
-            // Extraction/thermal (Phase 1.5) — KEEP.md §1 kinetics + a normalized thermal scale.
-            // These are reference values; calibration to the yield/TDS band is U7. Extraction is
-            // OFF until a scene sets Config.extract_rate > 0, so these defaults don't perturb suites.
+            // Extraction/thermal (Phase 1.5). These legacy generic-test reference values are
+            // replaced by absolute-kelvin calibration values in production runtime setup.
             k0_fast: 0.18,
             k0_slow: 0.018,
             ea_over_r: 6.0,

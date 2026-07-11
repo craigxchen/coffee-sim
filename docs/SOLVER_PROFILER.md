@@ -12,6 +12,8 @@ This refactor also adds the solver-neutral entrypoint:
 cargo test -p coffee-sim-wasm --lib --release profile_solvers -- --ignored --nocapture
 COFFEE_SIM_PROFILE_ARGS="--solver mpm --dry-run" \
   cargo test -p coffee-sim-wasm --lib --release profile_solvers -- --ignored --nocapture
+COFFEE_SIM_PROFILE_ARGS="--solver mpm-v2 --frames 120" \
+  cargo test -p coffee-sim-wasm --lib --release profile_solvers -- --ignored --nocapture
 COFFEE_SIM_PROFILE_ARGS="--list-solvers" \
   cargo test -p coffee-sim-wasm --lib --release profile_solvers -- --ignored --nocapture
 ```
@@ -19,7 +21,12 @@ COFFEE_SIM_PROFILE_ARGS="--list-solvers" \
 Runnable solver specs are currently:
 
 - `mpm`
-- `all` (currently resolves to `mpm`)
+- `mpm-v2` (`twofield` remains an accepted compatibility alias)
+- `all`
+
+Legacy `mpm` reports its instrumented timestamp-query pass breakdown. `mpm-v2`
+uses the common `FrameSolver` seam and reports production frame wall time through
+GPU completion; it does not fabricate a legacy-MPM per-pass breakdown.
 
 `profile_solvers` supports `--solver`, `--solvers`, `--scene`, `--warmup`,
 `--frames`, `--cal`, `--dry-run`, `--dry-run-json`, `--require-gpu`, and

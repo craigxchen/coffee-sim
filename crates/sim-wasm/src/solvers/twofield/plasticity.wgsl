@@ -14,16 +14,16 @@
 // water field (the scattered velocity m·v + A·d is magnitude-clamped to max_speed before
 // encoding). τ is the world-frame Kirchhoff stress computed by the PREVIOUS g2p_solid
 // (post-return-map), stored per particle in `sstate`; V_p⁰ = d³ (one grain represents one
-// lattice cell of bulk bed; the grain SPHERE volume π/6·d³ still feeds the φ_s field).
+// dry lattice cell of bulk bed; the separate structural volume feeds the φ_s field).
 //
 // ============================== UPDATE ORDER (per frame, dynamic mode) =======================
 //   grid_clear → p2g_water → p2g_solid_dyn → grid_update → solid_update → drag_fold
-//   → (U3/U4 pressure stack, water only) → project → g2p_water → g2p_solid
-// The solid field is NOT in the U6 mixture divergence (v_s enters the projection in U7); the
-// drag fold keeps its U6 frozen-skeleton semantics — in the dry L1 scenes there is no water
-// mass, so the pair never engages. Frozen mode (Config::solid_dynamics = false) dispatches
-// the U6 `p2g_solid` (coupling.wgsl, untouched) instead of `p2g_solid_dyn` and skips
-// solid_update/g2p_solid entirely — U6 behavior is preserved bitwise.
+//   → (U3/U4 two-phase pressure stack) → project → g2p_water → g2p_solid
+// drag_fold reads this grid_svel field as v_s, applies the equal-and-opposite drag impulse,
+// and writes the updated solid velocity back. Pressure uses div(phi_f*v_f + phi_s*v_s) and
+// corrects both grids through the same drag-condensed operator. Frozen mode
+// (Config::solid_dynamics = false) dispatches the U6 `p2g_solid` instead of
+// `p2g_solid_dyn` and skips solid_update/g2p_solid; its rigid-skeleton path remains valid.
 //
 // ============================== OVER-PACKING GUARD (KTD-5) ===================================
 // Grid-level solids pressure P_sp(φ_s) = K_sp·(φ_s − φ_on)²/(φ_max − φ_s) (the TFM/KTGF
@@ -274,9 +274,55 @@ fn coulomb(v: vec3<f32>, nrm: vec3<f32>, mu_b: f32) -> vec3<f32> {
     return out;
 }
 
+// One solid-grid velocity boundary function shared by solid_update and the post-drag update.
+// It is unilateral (coulomb leaves separating motion untouched) and activates SDF contact only
+// for actual penetration, hit.dist < 0. There is deliberately no water-style h-wide pressure
+// band: applying that band to grains pre-contacts them and deletes valid separation.
+fn solid_contact_velocity_bc(xp: vec3<f32>, velocity: vec3<f32>) -> vec3<f32> {
+    if (any(xp < params.box_min.xyz - vec3<f32>(NODE_BC_EPS))
+        || any(xp > params.box_max.xyz + vec3<f32>(NODE_BC_EPS))) {
+        return vec3<f32>(0.0);
+    }
+
+    var v = velocity;
+    let mu_b = params.splas2.x;
+    if (xp.x <= params.box_min.x + NODE_BC_EPS) {
+        v = coulomb(v, vec3<f32>(1.0, 0.0, 0.0), mu_b);
+    }
+    if (xp.x >= params.box_max.x - NODE_BC_EPS) {
+        v = coulomb(v, vec3<f32>(-1.0, 0.0, 0.0), mu_b);
+    }
+    if (xp.y <= params.box_min.y + NODE_BC_EPS) {
+        v = coulomb(v, vec3<f32>(0.0, 1.0, 0.0), mu_b);
+    }
+    if (xp.y >= params.box_max.y - NODE_BC_EPS) {
+        v = coulomb(v, vec3<f32>(0.0, -1.0, 0.0), mu_b);
+    }
+    if (xp.z <= params.box_min.z + NODE_BC_EPS) {
+        v = coulomb(v, vec3<f32>(0.0, 0.0, 1.0), mu_b);
+    }
+    if (xp.z >= params.box_max.z - NODE_BC_EPS) {
+        v = coulomb(v, vec3<f32>(0.0, 0.0, -1.0), mu_b);
+    }
+    if (params.num_solids > 0u) {
+        let hit = solid_union(xp, PHASE_SOLID);
+        if (hit.dist < 0.0) {
+            v = coulomb(v, hit.grad, hit.friction);
+        }
+    }
+
+    let speed = length(v);
+    if (speed > params.max_speed) {
+        v = v * (params.max_speed / speed);
+    }
+    return v;
+}
+
 // =================================== p2g_solid_dyn =============================================
-// Solid P2G, dynamic mode: grain sphere volume into grid_sfp (byte-identical arithmetic to the
-// frozen p2g_solid) + mass/momentum with APIC and the fused MLS-MPM stress force into grid_sm.
+// Solid P2G, dynamic mode: saturation-driven structural volume into grid_sfp (the same helper
+// as frozen p2g_solid) plus wet effective mass/momentum with APIC and the fused MLS-MPM stress
+// force into grid_sm. The dry recipe mass remains params.splas1.z; bound water adds exactly
+// V_bound/V_water*particle_mass.
 @compute @workgroup_size(256)
 fn p2g_solid_dyn(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
@@ -296,11 +342,12 @@ fn p2g_solid_dyn(@builtin(global_invocation_id) gid: vec3<u32>) {
     let t0 = vec3<f32>(sa.x, sa.y, sa.z); // (τxx, τxy, τxz)
     let t1 = vec3<f32>(sa.y, sa.w, sb.x); // (τxy, τyy, τyz)
     let t2 = vec3<f32>(sa.z, sb.x, sb.y); // (τxz, τyz, τzz)
-    let m_s = params.splas1.z;
+    let m_s = grain_effective_mass(pos[p].w);
     let d = params.coupling.x;
     let v0 = d * d * d; // V_p⁰: one grain = one lattice cell of bulk bed
     // MLS-MPM fused force factor: contribution (m·C − Δt·V⁰·(4/h²)·τ)·d, scattered as a
-    // velocity (divide by m) so the max_speed clamp keeps the FP headroom contract.
+    // velocity. Dividing by this same wet effective mass makes the stress acceleration and
+    // subsequently scattered momentum one consistent mass discretization.
     let k = params.dt * v0 * 4.0 / (h * h) / m_s;
 
     let xl = (x - params.grid_origin.xyz) / h;
@@ -308,7 +355,7 @@ fn p2g_solid_dyn(@builtin(global_invocation_id) gid: vec3<u32>) {
     base = clamp(base, vec3<i32>(0), vec3<i32>(params.grid_dims.xyz) - vec3<i32>(3));
     let fx = xl - vec3<f32>(base);
     var w = bspline_w(fx);
-    let vg = params.coupling.z;
+    let vg = grain_structural_volume(pos[p].w);
     for (var kk = 0; kk < 3; kk = kk + 1) {
         for (var j = 0; j < 3; j = j + 1) {
             for (var i2 = 0; i2 < 3; i2 = i2 + 1) {
@@ -396,31 +443,9 @@ fn solid_update(@builtin(global_invocation_id) gid: vec3<u32>) {
         v = v + kick;
     }
 
-    // Grid-node BC (solid phase): walls + box faces with Coulomb friction (μ_b from
-    // Materials::floor_mu), SDF solids with their own friction coefficient.
-    let eps = 1.0e-4;
-    if (any(xp < params.box_min.xyz - vec3<f32>(eps))
-        || any(xp > params.box_max.xyz + vec3<f32>(eps))) {
-        grid_svel[n] = vec4<f32>(vec3<f32>(0.0), mass);
-        return;
-    }
-    let mu_b = params.splas2.x;
-    if (xp.x <= params.box_min.x + eps) { v = coulomb(v, vec3<f32>(1.0, 0.0, 0.0), mu_b); }
-    if (xp.x >= params.box_max.x - eps) { v = coulomb(v, vec3<f32>(-1.0, 0.0, 0.0), mu_b); }
-    if (xp.y <= params.box_min.y + eps) { v = coulomb(v, vec3<f32>(0.0, 1.0, 0.0), mu_b); }
-    if (xp.y >= params.box_max.y - eps) { v = coulomb(v, vec3<f32>(0.0, -1.0, 0.0), mu_b); }
-    if (xp.z <= params.box_min.z + eps) { v = coulomb(v, vec3<f32>(0.0, 0.0, 1.0), mu_b); }
-    if (xp.z >= params.box_max.z - eps) { v = coulomb(v, vec3<f32>(0.0, 0.0, -1.0), mu_b); }
-    if (params.num_solids > 0u) {
-        let hit = solid_union(xp, PHASE_SOLID);
-        if (hit.dist < 0.0) {
-            v = coulomb(v, hit.grad, hit.friction);
-        }
-    }
-    let sp = length(v);
-    if (sp > params.max_speed) {
-        v = v * (params.max_speed / sp);
-    }
+    // Shared unilateral, actual-contact Coulomb BC; drag_fold calls the same function after its
+    // pair impulse so neither pass pre-contacts grains or removes separating motion.
+    v = solid_contact_velocity_bc(xp, v);
     grid_svel[n] = vec4<f32>(v, mass);
 }
 
@@ -516,14 +541,9 @@ fn g2p_solid(@builtin(global_invocation_id) gid: vec3<u32>) {
     // debt into the rebuilt F.
     let vc = fmat[3u * i + 0u].w;
     let eps_eff = eps_tr + vec3<f32>(vc / 3.0);
-    // U7 Bishop effective-stress cohesion: local grain saturation s = V_abs/V_cap (V_abs rides
-    // pos.w on grains, V_cap = wet_v_cap()) maps to the saturation-dependent wet cohesion fed
-    // into the DP yield. Dry grains (V_abs = 0) and c_max = 0 both give y_c = cohesion::dry().
-    let v_cap = wet_v_cap();
-    var sat = 0.0;
-    if (v_cap > 0.0) {
-        sat = clamp(pos[p].w / v_cap, 0.0, 1.0);
-    }
+    // U7 Bishop effective-stress cohesion uses the same bound-water saturation as structural
+    // swelling. Dry grains and c_max=0 both give y_c = cohesion::dry().
+    let sat = grain_bound_saturation(pos[p].w);
     let y_coh = cohesion_for_saturation(sat);
     let rm = return_map(eps_eff, sb_old.z, y_coh);
     let tr_eff = eps_eff.x + eps_eff.y + eps_eff.z;

@@ -19,17 +19,19 @@ impl Profile {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SolverSpec {
     Mpm,
+    MpmV2,
 }
 
 impl SolverSpec {
     pub(crate) fn id(self) -> &'static str {
         match self {
             Self::Mpm => "mpm",
+            Self::MpmV2 => "mpm-v2",
         }
     }
 
     pub(crate) fn runnable_specs() -> &'static [Self] {
-        &[Self::Mpm]
+        &[Self::Mpm, Self::MpmV2]
     }
 }
 
@@ -45,8 +47,9 @@ impl FromStr for SolverSpec {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value.trim().to_ascii_lowercase().as_str() {
             "" | "mpm" | "mpm:rbgs" | "rbgs" => Ok(Self::Mpm),
+            "mpm-v2" | "twofield" => Ok(Self::MpmV2),
             other => Err(format!(
-                "unknown profiler solver '{other}'; available solvers: mpm"
+                "unknown profiler solver '{other}'; available solvers: mpm, mpm-v2"
             )),
         }
     }
@@ -118,10 +121,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn profiler_solver_parser_accepts_mpm_and_all() {
+    fn profiler_solver_parser_accepts_registered_solvers_and_all() {
         assert_eq!(parse_solver_specs("mpm"), Ok(vec![SolverSpec::Mpm]));
         assert_eq!(parse_solver_specs("mpm:rbgs"), Ok(vec![SolverSpec::Mpm]));
-        assert_eq!(parse_solver_specs("all"), Ok(vec![SolverSpec::Mpm]));
+        assert_eq!(parse_solver_specs("mpm-v2"), Ok(vec![SolverSpec::MpmV2]));
+        assert_eq!(parse_solver_specs("twofield"), Ok(vec![SolverSpec::MpmV2]));
+        assert_eq!(
+            parse_solver_specs("all"),
+            Ok(vec![SolverSpec::Mpm, SolverSpec::MpmV2])
+        );
     }
 
     #[test]
@@ -132,12 +140,19 @@ mod tests {
 
     #[test]
     fn solver_run_metadata_tracks_single_mpm_run() {
-        let solvers = parse_solver_specs("all").unwrap();
+        let solvers = parse_solver_specs("mpm").unwrap();
         let metadata = solver_run_metadata(&solvers, SolverSpec::Mpm);
         assert_eq!(metadata.requested, vec!["mpm"]);
         assert_eq!(metadata.current, "mpm");
         assert_eq!(metadata.ordinal, 1);
         assert_eq!(metadata.count, 1);
         assert!(!metadata.multiple_outputs);
+    }
+
+    #[test]
+    fn solver_run_metadata_uses_the_canonical_mpm_v2_id() {
+        let metadata = solver_run_metadata(&[SolverSpec::MpmV2], SolverSpec::MpmV2);
+        assert_eq!(metadata.requested, vec!["mpm-v2"]);
+        assert_eq!(metadata.current, "mpm-v2");
     }
 }

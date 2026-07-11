@@ -1,3 +1,5 @@
+use std::ops::Range;
+
 use coffee_sim_core::Vec3;
 
 const STANDARD_RENDER_GRID_DX: f32 = 14.0 / 80.0;
@@ -67,7 +69,7 @@ pub(crate) struct RenderView<'a> {
     bounds_size: Vec3,
     render_radius: f32,
     material: RenderMaterial,
-    particle_count: usize,
+    particle_instance_ranges: [Range<u32>; 2],
     particle_source: ParticleRenderSource<'a>,
     filter_render_vertices: Option<&'a [[f32; 3]]>,
     filter_fill_vertices: Option<&'a [[f32; 3]]>,
@@ -86,6 +88,12 @@ pub(crate) enum ParticleRenderSource<'a> {
 }
 
 impl<'a> RenderView<'a> {
+    fn prefix_instance_ranges(particle_count: usize) -> [Range<u32>; 2] {
+        let particle_count =
+            u32::try_from(particle_count).expect("render particle count exceeds u32");
+        [0..particle_count, 0..0]
+    }
+
     pub(crate) fn new(
         bounds_size: Vec3,
         render_radius: f32,
@@ -99,7 +107,7 @@ impl<'a> RenderView<'a> {
             bounds_size,
             render_radius,
             material: RenderMaterial::default(),
-            particle_count,
+            particle_instance_ranges: Self::prefix_instance_ranges(particle_count),
             particle_source: ParticleRenderSource::Packed { render_buffer },
             filter_render_vertices,
             filter_fill_vertices,
@@ -120,7 +128,38 @@ impl<'a> RenderView<'a> {
             bounds_size,
             render_radius,
             material,
-            particle_count,
+            particle_instance_ranges: Self::prefix_instance_ranges(particle_count),
+            particle_source: ParticleRenderSource::Canonical {
+                positions,
+                velocities,
+                phases,
+            },
+            filter_render_vertices: None,
+            filter_fill_vertices: None,
+            static_filter_mesh_key: None,
+        }
+    }
+
+    pub(crate) fn new_canonical_with_ranges(
+        bounds_size: Vec3,
+        render_radius: f32,
+        particle_instance_ranges: [Range<u32>; 2],
+        positions: &'a wgpu::Buffer,
+        velocities: &'a wgpu::Buffer,
+        phases: &'a wgpu::Buffer,
+        material: RenderMaterial,
+    ) -> Self {
+        assert!(
+            particle_instance_ranges
+                .iter()
+                .all(|range| range.start <= range.end),
+            "render instance ranges must be ordered"
+        );
+        Self {
+            bounds_size,
+            render_radius,
+            material,
+            particle_instance_ranges,
             particle_source: ParticleRenderSource::Canonical {
                 positions,
                 velocities,
@@ -149,7 +188,17 @@ impl<'a> RenderView<'a> {
     }
 
     pub(crate) fn particle_count(&self) -> usize {
-        self.particle_count
+        self.particle_instance_ranges
+            .iter()
+            .map(|range| (range.end - range.start) as usize)
+            .sum()
+    }
+
+    pub(crate) fn particle_instance_ranges(&self) -> impl Iterator<Item = Range<u32>> + '_ {
+        self.particle_instance_ranges
+            .iter()
+            .filter(|range| !range.is_empty())
+            .cloned()
     }
 
     pub(crate) fn render_buffer(&self) -> &wgpu::Buffer {

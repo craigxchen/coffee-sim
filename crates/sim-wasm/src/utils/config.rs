@@ -52,6 +52,14 @@ pub struct Config {
     // --- initial seeding ---
     /// Initial position jitter as a fraction of particle spacing (breaks lattice symmetry).
     pub seed_jitter: f32,
+    /// Optional exact budget for twofield solid material points, applied after geometric/SDF
+    /// rejection. `0` preserves every accepted solid; a positive value uniformly selects at most
+    /// that many points with a deterministic seed-derived priority while retaining spatial order.
+    pub tf_solid_sample_budget: u32,
+    /// Treat every resolved gas cell as atmosphere (`p = 0`) and bypass enclosed-pocket
+    /// constraints. This is an explicit approximation for physically vented production geometry;
+    /// `false` preserves the generic flood-fill + sealed-pocket model.
+    pub tf_all_gas_atmospheric: bool,
 
     // --- granular bed (grain phase) ---
     /// Iteration cap for the contact solve (contacts converge slower than the density solve).
@@ -100,9 +108,11 @@ pub struct Config {
     /// PBF skips a water particle's density contribution when `f_w ≤ this` (stability near the wet
     /// front). Larger than `absorb_roundoff`, so skipped water is still absorption-eligible. (step 4)
     pub pbf_eps: f32,
-    /// Extraction/thermal opt-in gate (step 5). 0 = the extraction + thermal passes don't run, so
-    /// existing scenes are byte-unchanged; a brew scene sets it > 0 to enable dissolution kinetics.
+    /// Extraction opt-in/rate scale (step 5). Zero disables dissolution kinetics.
     pub extract_rate: f32,
+    /// Thermal transport opt-in/rate scale. Independent of extraction so a zero-extraction
+    /// calibration can still exchange/cool heat; zero preserves legacy/default twofield cadence.
+    pub thermal_rate: f32,
 
     // --- fines migration (Phase 6) ---
     /// Fines erosion/deposition rate scale + opt-in gate (1/s). 0 = the fines transfer pass and the
@@ -123,28 +133,58 @@ pub struct Config {
     /// Twofield moisture phase-change absorption gate + rate `k_abs` (1/s, reduced sim units).
     /// Zero skips the grid-projected absorption passes entirely (no φ_s/swelling change); a
     /// positive value enables GIC-style absorption into grain moisture via `models::wetting`.
-    /// Calibrated: 60–80% swelling complete ≤ 30 s physical (≈ 8.14 s sim) gives k_abs ≈
-    /// 0.11–0.20 (see `tests/twofield_infiltration.rs` UNIT MAPPING).
+    /// Time is physical seconds on the production MPM-v2 path. Ignoring finite supply and the
+    /// independently controlled bloom ramp, a first-order rate around 0.03–0.05 s⁻¹ reaches
+    /// roughly 60–80% of its asymptote after 30 s. This is a calibration prior, not a test target.
     pub tf_absorb_rate: f32,
-    /// Twofield wetting-front capillary suction body force (Green–Ampt magnitude, reduced
-    /// units): the extra downward acceleration on water at the unsaturated front, derived from
-    /// the suction head ψ_f ≈ 50–110 mm (≈ 1.39–3.05 su) — see the test's UNIT MAPPING. 0 =
-    /// no suction (the bare-Darcy arm).
+    /// Maximum fractional grain-diameter increase at full bound-water saturation. Structural
+    /// volume follows `V_struct/V_dry = (1 + s·tf_max_diameter_swelling)^3`, independently of
+    /// the absolute bound-water volume. Zero preserves the dry structural volume exactly.
+    pub tf_max_diameter_swelling: f32,
+    /// Twofield wetting-front capillary suction body-force magnitude in scene units/s²:
+    /// acceleration follows `-∇S` inside the bed and vanishes under uniform saturation.
+    /// Production derives this from the UI suction head at the explicit SI/scene boundary.
+    /// `0` disables suction (the bare-Darcy arm).
     pub tf_suction_accel: f32,
-    /// Twofield bloom delay (reduced sim seconds): a dry hydrophobic grain ramps from no
-    /// absorption/suction to full over this contact time. 0 = no bloom gate (grains wet on
-    /// contact). Calibrated seconds-scale: ≈ 2–6 s physical ⇒ ≈ 0.54–1.63 s sim.
+    /// Twofield bloom delay in physical seconds on the production path: a dry hydrophobic grain
+    /// ramps from no absorption/suction to full over this contact time. `0` removes the gate.
     pub tf_bloom_delay: f32,
     /// Twofield phase-selective filter floor: water drains through the y-min face (porous-jump
     /// outflow), the frozen solid skeleton is retained. 0 = sealed floor (the U6 default).
     pub tf_filter_floor: bool,
+    /// Whole-bed retained-water calibration target in g water / g dry coffee. A positive value
+    /// lets a recipe-aware solver derive residual pore saturation after subtracting bound-water
+    /// capacity; filter inventory remains separate until explicit filter state exists. Zero
+    /// disables the target without inventing a default.
+    pub tf_retention_target_g_per_g: f32,
+    /// Positive Corey exponent for capillary relative permeability on effective saturation.
+    pub tf_capillary_exponent: f32,
+    /// Lower bound on capillary relative mobility, in `[0,1]`, preventing a numerically singular
+    /// dry front while remaining explicit in the calibration profile.
+    pub tf_capillary_mobility_floor: f32,
+    /// Filter-paper intrinsic permeability in m². Zero disables porous-paper resistance.
+    pub tf_filter_permeability_m2: f32,
+    /// Finite filter-paper water capacity in grams. Overflow remains free water.
+    pub tf_filter_capacity_g: f32,
+
+    // --- MPM-v2 physical granular response (stress values are reduced at the Rust/WGSL seam) ---
+    /// Maximum tangent of the bounded packing-pressure law, in reduced stress units. Physical
+    /// bulk/compaction stiffness is handled by the implicit solid solve.
+    pub tf_compaction_tangent: f32,
+    /// Initial compaction-cap pressure in reduced stress units.
+    pub tf_initial_consolidation_pressure: f32,
+    /// Deliberately soft shear modulus used only by the explicit solid predictor, in reduced
+    /// stress units. This is numerical compliance, not the physical compaction stiffness.
+    pub tf_numerical_shear_modulus: f32,
+    /// Solid fraction at which the bounded compaction law reaches its maximum tangent.
+    pub tf_full_compaction_solid_fraction: f32,
 
     // --- twofield U7 effective-stress coupling (opt-in; default 0 / OFF so the U2–U6 suites and
     // the dry U5 bed are byte-unchanged: c_max = 0 ⇒ `cohesion::for_saturation` ≡ 0 ⇒ the DP
     // yield uses `cohesion::dry()` exactly) ---
     /// Twofield wet-cohesion peak `c_max` (stress units): the saturation-dependent capillary
     /// cohesion bump (`models::cohesion::for_saturation`) fed into the U5 Drucker-Prager yield
-    /// apex as a function of local grain saturation s = V_abs/V_cap. 0 = no wet cohesion (dry
+    /// apex as a function of local grain saturation s = V_bound/V_cap. 0 = no wet cohesion (dry
     /// `cohesion::dry()`), so the dry bed and the U5 gates are bitwise unchanged.
     pub tf_wet_cohesion: f32,
     /// Saturation at which the wet-cohesion bump peaks (`models::cohesion::for_saturation`
@@ -214,6 +254,8 @@ impl Default for Config {
             // Velocity cap as a pure safety backstop, above believable water speeds.
             max_speed: 50.0,
             seed_jitter: 0.1,
+            tf_solid_sample_budget: 0,
+            tf_all_gas_atmospheric: false,
             // Granular bed: contacts need more iterations + a tighter penetration tolerance than
             // the density solve, and a more frequent grid rebuild (contact-heavy).
             bed_max_iters: 24,
@@ -235,8 +277,10 @@ impl Default for Config {
             absorb_rate: 0.0,
             absorb_roundoff: 1.0e-3,
             pbf_eps: 0.05,
-            // Extraction/thermal OFF by default (step 5; like absorb_rate): a brew scene opts in.
+            // Extraction and thermal transport are independently OFF by default; production brew
+            // setup opts into both without changing legacy/default twofield cadence.
             extract_rate: 0.0,
+            thermal_rate: 0.0,
             // Fines OFF by default (step 6; like extract_rate): a brew scene opts in.
             fines_rate: 0.0,
             // Pour spout: a thin stream by default; a pour scene tunes these to its grind/flow.
@@ -246,9 +290,19 @@ impl Default for Config {
             // passes are CPU-elided (absorb_rate gate) and the filter floor is sealed, so the
             // U2–U6 twofield suites and every existing scene are byte-unchanged.
             tf_absorb_rate: 0.0,
+            tf_max_diameter_swelling: 0.0,
             tf_suction_accel: 0.0,
             tf_bloom_delay: 0.0,
             tf_filter_floor: false,
+            tf_retention_target_g_per_g: 0.0,
+            tf_capillary_exponent: 3.0,
+            tf_capillary_mobility_floor: 1.0,
+            tf_filter_permeability_m2: 0.0,
+            tf_filter_capacity_g: 0.0,
+            tf_compaction_tangent: 0.0,
+            tf_initial_consolidation_pressure: 0.0,
+            tf_numerical_shear_modulus: 0.0,
+            tf_full_compaction_solid_fraction: 0.72,
             // U7 effective-stress coupling: OFF by default — c_max = 0 makes the wet-cohesion
             // curve identically zero, so the DP yield falls back to cohesion::dry() and the dry
             // U5 bed + the U2–U6 suites are byte-unchanged. A saturated brew bed opts in.

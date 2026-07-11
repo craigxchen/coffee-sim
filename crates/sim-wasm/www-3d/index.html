@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Coffee Sim | 3D Pourover</title>
-    <link rel="stylesheet" href="./styles.css?v=solver-select-fit-1" />
+    <link rel="stylesheet" href="./styles.css?v=calibration-ui-1" />
   </head>
   <body>
     <main class="layout">
@@ -24,8 +24,22 @@
             <span>Solver</span>
             <select id="solver-select" aria-label="Solver">
               <option value="mpm" selected>MPM</option>
+              <option value="mpm-v2">MPM v2 (experimental)</option>
             </select>
           </label>
+        </div>
+        <div id="calibration-panel" class="control-panel calibration-panel" hidden>
+          <div class="calibration-heading">
+            <div>
+              <span class="calibration-title">MPM v2 Calibration</span>
+              <span class="calibration-subtitle">Physical targets from the Rust schema</span>
+            </div>
+            <button id="reset-calibration" class="calibration-reset" type="button">Defaults</button>
+          </div>
+          <p id="calibration-status" class="calibration-status" aria-live="polite">
+            Adjust a control to begin calibration.
+          </p>
+          <div id="calibration-controls" class="calibration-controls"></div>
         </div>
         <div class="control-panel">
           <div class="slider-field">
@@ -305,6 +319,6 @@
         ></div>
       </div>
     </aside>
-    <script type="module" src="./main.js?v=solver-refresh-1"></script>
+    <script type="module" src="./main.js?v=calibration-ui-1"></script>
   </body>
 </html>

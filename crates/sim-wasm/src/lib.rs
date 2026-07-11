@@ -29,9 +29,13 @@ mod renderer_shader_tests;
 #[cfg(target_arch = "wasm32")]
 use engine::Simulator;
 #[cfg(target_arch = "wasm32")]
+use models::calibration::calibration_schema as calibration_control_schema;
+#[cfg(target_arch = "wasm32")]
 use renderer::{OrbitCamera, Renderer};
 #[cfg(target_arch = "wasm32")]
-use solvers::base::{CommonMetrics, SceneSpec, SolverId};
+use solvers::base::{
+    CalibrationApplyResult, CalibrationSupport, CommonMetrics, SceneSpec, SolverId,
+};
 #[cfg(target_arch = "wasm32")]
 use solvers::mpm::MpmSettings;
 #[cfg(target_arch = "wasm32")]
@@ -74,6 +78,27 @@ fn set_str(obj: &js_sys::Object, key: &str, value: &str) -> Result<(), JsValue> 
 #[cfg(target_arch = "wasm32")]
 fn set_object(obj: &js_sys::Object, key: &str, value: &js_sys::Object) -> Result<(), JsValue> {
     js_sys::Reflect::set(obj, &JsValue::from_str(key), value).map(|_| ())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn calibration_apply_result_object(
+    result: CalibrationApplyResult,
+) -> Result<js_sys::Object, JsValue> {
+    let obj = js_sys::Object::new();
+    let metadata = result.update.control.metadata();
+    set_str(&obj, "id", metadata.id)?;
+    set_number(&obj, "requested", result.update.requested)?;
+    set_number(&obj, "applied", result.update.applied)?;
+    set_bool(&obj, "clamped", result.update.clamped)?;
+    set_bool(&obj, "requiresRebuild", result.update.requires_rebuild)?;
+    set_str(&obj, "application", result.support.id())?;
+    set_bool(
+        &obj,
+        "appliedToSolver",
+        result.support == CalibrationSupport::Rebuild,
+    )?;
+    set_bool(&obj, "simulationReset", result.simulation_reset)?;
+    Ok(obj)
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -433,6 +458,69 @@ impl WasmSim3D {
         Ok(solvers)
     }
 
+    #[wasm_bindgen(js_name = calibrationSchema)]
+    pub fn calibration_schema(&self) -> Result<js_sys::Array, JsValue> {
+        let schema = js_sys::Array::new();
+        for metadata in calibration_control_schema() {
+            let support = self.sim.calibration_support(metadata.control);
+            let obj = js_sys::Object::new();
+            set_str(&obj, "id", metadata.id)?;
+            set_str(&obj, "label", metadata.label)?;
+            set_str(&obj, "units", metadata.units)?;
+            set_number(&obj, "min", metadata.min)?;
+            set_number(&obj, "max", metadata.max)?;
+            set_number(&obj, "step", metadata.step)?;
+            set_bool(&obj, "logarithmic", metadata.logarithmic)?;
+            set_bool(&obj, "requiresRebuild", metadata.requires_rebuild)?;
+            set_str(&obj, "application", support.id())?;
+            set_bool(
+                &obj,
+                "appliedToSolver",
+                support == CalibrationSupport::Rebuild,
+            )?;
+            schema.push(&obj);
+        }
+        Ok(schema)
+    }
+
+    #[wasm_bindgen(js_name = calibrationValues)]
+    pub fn calibration_values(&self) -> Result<js_sys::Array, JsValue> {
+        let profile = self.sim.calibration_profile().ok_or_else(|| {
+            JsValue::from_str("active solver does not support calibration controls")
+        })?;
+        let values = js_sys::Array::new();
+        for metadata in calibration_control_schema() {
+            let obj = js_sys::Object::new();
+            set_str(&obj, "id", metadata.id)?;
+            let value = profile
+                .value_by_id(metadata.id)
+                .map_err(|error| JsValue::from_str(&error.to_string()))?;
+            set_number(&obj, "value", value)?;
+            values.push(&obj);
+        }
+        Ok(values)
+    }
+
+    #[wasm_bindgen(js_name = setCalibrationValue)]
+    pub fn set_calibration_value(
+        &mut self,
+        id: &str,
+        value: f32,
+    ) -> Result<js_sys::Object, JsValue> {
+        let result = self
+            .sim
+            .set_calibration_value(self.renderer.queue(), self.renderer.device(), id, value)
+            .map_err(|error| JsValue::from_str(&error))?;
+        calibration_apply_result_object(result)
+    }
+
+    #[wasm_bindgen(js_name = resetCalibrationDefaults)]
+    pub fn reset_calibration_defaults(&mut self) -> Result<bool, JsValue> {
+        self.sim
+            .reset_calibration_defaults(self.renderer.queue(), self.renderer.device())
+            .map_err(|error| JsValue::from_str(&error))
+    }
+
     #[wasm_bindgen(js_name = activeSolver)]
     pub fn active_solver(&self) -> String {
         self.sim.active_id().id().to_string()
@@ -462,6 +550,14 @@ impl WasmSim3D {
     #[wasm_bindgen(js_name = loadBenchmarkCenterPour)]
     pub fn load_benchmark_center_pour(&mut self) -> Result<(), JsValue> {
         self.load_scene(SceneSpec::CenterPour)
+    }
+
+    /// Hidden deterministic workload used by the binding MPM-v2 browser performance gate.
+    #[wasm_bindgen(js_name = loadMpmV2LateBrewBenchmark)]
+    pub fn load_mpm_v2_late_brew_benchmark(&mut self) -> Result<(), JsValue> {
+        self.load_scene(SceneSpec::Debug {
+            id: "mpm-v2-late-brew-benchmark".to_string(),
+        })
     }
 
     #[wasm_bindgen(js_name = loadBenchmarkFilterWaterBlock)]
@@ -532,6 +628,20 @@ impl WasmSim3D {
     pub fn render(&mut self) -> Result<(), JsValue> {
         let snapshot = self.sim.snapshot();
         self.renderer.render_3d(&snapshot.render, self.camera)
+    }
+
+    /// Resolve only after every command submitted before this call has completed on the GPU.
+    /// Browser performance probes use this batch fence so their timings include WebGPU execution
+    /// instead of measuring only JavaScript/Rust command encoding and queue submission.
+    #[wasm_bindgen(js_name = waitForGpu)]
+    pub async fn wait_for_gpu(&self) -> Result<(), JsValue> {
+        let queue_done = js_sys::Promise::new(&mut |resolve, _reject| {
+            self.renderer.queue().on_submitted_work_done(move || {
+                let _ = resolve.call0(&JsValue::NULL);
+            });
+        });
+        wasm_bindgen_futures::JsFuture::from(queue_done).await?;
+        Ok(())
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {

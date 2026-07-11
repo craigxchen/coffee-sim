@@ -2,9 +2,12 @@
 //!
 //! Coffee solute lives in a fast pool (surfaces, fines, broken cells) and a slow pool (intact
 //! interiors). A wet grain dissolves solute into the surrounding water at a rate
-//! `k_eff = k0 · k_T(T) · area(d) · driving(c) · flux(|u_rel|) · wet(s)`, and per substep releases a
-//! **bounded** fraction `pool·(1 − e^{−k_eff·dt})` (never overshoots the pool, at any `dt`). These pure
-//! functions are the CPU mirror of the GPU dissolution pass, so the kinetics are unit-tested here first.
+//! `k_eff = k0 · k_T(T) · renewal(|u_rel|) · wet(s)` in the MPM-v2 grid projection, and per
+//! substep releases a **bounded** fraction `pool·(1 − e^{−k_eff·dt})` (never overshoots the pool,
+//! at any `dt`). `renewal = 1 + u/(u+u_half)`: diffusion supplies the finite zero-flow baseline;
+//! relative flow can at most double it. Numerical particle pitch is deliberately not treated as
+//! a physical grind-diameter area factor. These pure functions are the CPU mirror of the GPU
+//! kinetics and are unit-tested here first.
 //! Released solute moves to overlapping water particles' concentration `c`; the transfer is
 //! conservation-exact (the GPU pass mirrors the Phase-1.4 atomic-free two-sided allocation). Reference
 //! constants + the yield/TDS target band: `KEEP.md` §1/§5 (re-validate, not gospel).
@@ -42,6 +45,14 @@ pub fn flux_factor(u_rel: f32, u_half: f32) -> f32 {
     let u = u_rel.max(0.0);
     let denom = u + u_half.max(EPS);
     (u / denom).clamp(0.0, 1.0)
+}
+
+/// Finite surface-renewal factor for grid-projected extraction:
+/// `1 + u/(u + u_half) ∈ [1, 2)`. Molecular diffusion provides the parameter-free baseline at
+/// zero flow; relative advection increases renewal without becoming a prerequisite for release.
+#[inline]
+pub fn renewal_factor(u_rel: f32, u_half: f32) -> f32 {
+    1.0 + flux_factor(u_rel, u_half)
 }
 
 /// Moisture gate: `smoothstep(0, s_on, saturation)`. A dry grain (`saturation ≈ 0`) doesn't extract;
@@ -120,6 +131,15 @@ mod tests {
         assert_eq!(flux_factor(0.0, uh), 0.0);
         assert!(flux_factor(1.0, uh) > flux_factor(0.2, uh)); // monotone
         assert!(flux_factor(1.0e6, uh) < 1.0 && flux_factor(1.0e6, uh) > 0.99); // saturates → 1
+    }
+
+    #[test]
+    fn renewal_has_finite_zero_flow_release_and_is_bounded() {
+        let baseline = renewal_factor(0.0, 0.5);
+        assert_eq!(baseline, 1.0);
+        assert!(release(1.0, baseline, 0.1) > 0.0);
+        let moving = renewal_factor(2.0, 0.5);
+        assert!(moving > baseline && moving < 2.0);
     }
 
     #[test]

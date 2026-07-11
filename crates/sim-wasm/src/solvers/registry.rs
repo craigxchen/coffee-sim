@@ -1,7 +1,8 @@
 use super::base::{FrameSolver, Paradigm, SceneSpec, SolverId, SolverInfo, Stability};
 use super::mpm::MpmSim3D;
-use super::twofield_runtime::TwofieldFrameSolver;
+use super::twofield_runtime::MpmV2FrameSolver;
 use super::xpbd_runtime::XpbdFrameSolver;
+use crate::models::calibration::CalibrationProfile;
 
 const MPM_INFO: SolverInfo = SolverInfo {
     id: SolverId::Mpm,
@@ -21,9 +22,9 @@ const XPBD_INFO: SolverInfo = SolverInfo {
     experimental: true,
 };
 
-const TWOFIELD_INFO: SolverInfo = SolverInfo {
-    id: SolverId::Twofield,
-    name: "Two-field",
+const MPM_V2_INFO: SolverInfo = SolverInfo {
+    id: SolverId::MpmV2,
+    name: "MPM v2",
     paradigm: Paradigm::Hybrid,
     owns_grid: true,
     stability: Stability::CflLimited { c: 0.5 },
@@ -34,7 +35,7 @@ pub(crate) fn info_for(id: SolverId) -> SolverInfo {
     match id {
         SolverId::Mpm => MPM_INFO,
         SolverId::Xpbd => XPBD_INFO,
-        SolverId::Twofield => TWOFIELD_INFO,
+        SolverId::MpmV2 => MPM_V2_INFO,
     }
 }
 
@@ -43,6 +44,20 @@ pub(crate) fn build_solver(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     scene: &SceneSpec,
+) -> Result<Box<dyn FrameSolver>, String> {
+    build_solver_with_mpm_v2_calibration(id, device, queue, scene, None)
+}
+
+/// Build a solver while optionally supplying MPM-v2's complete calibration profile at
+/// construction time. The engine uses this path when returning to MPM-v2 so the solver is built
+/// exactly once with the saved profile instead of constructing defaults and replaying controls.
+/// Other solvers ignore the profile.
+pub(crate) fn build_solver_with_mpm_v2_calibration(
+    id: SolverId,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    scene: &SceneSpec,
+    mpm_v2_calibration: Option<&CalibrationProfile>,
 ) -> Result<Box<dyn FrameSolver>, String> {
     match id {
         SolverId::Mpm => {
@@ -62,7 +77,15 @@ pub(crate) fn build_solver(
             Ok(Box::new(solver))
         }
         SolverId::Xpbd => Ok(Box::new(XpbdFrameSolver::new(device, queue, scene)?)),
-        SolverId::Twofield => Ok(Box::new(TwofieldFrameSolver::new(device, queue, scene)?)),
+        SolverId::MpmV2 => {
+            let solver = match mpm_v2_calibration {
+                Some(profile) => {
+                    MpmV2FrameSolver::new_with_calibration(device, queue, scene, profile.clone())?
+                }
+                None => MpmV2FrameSolver::new(device, queue, scene)?,
+            };
+            Ok(Box::new(solver))
+        }
     }
 }
 
@@ -104,10 +127,22 @@ mod tests {
     }
 
     #[test]
+    fn public_mpm_solver_identities_are_stable() {
+        assert_eq!(SolverId::Mpm.id(), "mpm");
+        assert_eq!(info_for(SolverId::Mpm).name, "MPM");
+        assert!(!info_for(SolverId::Mpm).experimental);
+
+        assert_eq!(SolverId::MpmV2.id(), "mpm-v2");
+        assert_eq!(info_for(SolverId::MpmV2).name, "MPM v2");
+        assert!(info_for(SolverId::MpmV2).experimental);
+    }
+
+    #[test]
     fn solver_ids_parse_registered_values() {
         for &id in SolverId::all() {
             assert_eq!(SolverId::from_id(id.id()), Some(id));
         }
+        assert_eq!(SolverId::from_id("twofield"), Some(SolverId::MpmV2));
         assert_eq!(SolverId::from_id("nope"), None);
     }
 
@@ -163,7 +198,7 @@ mod tests {
         .expect("build MPM debug scene");
         assert_eq!(sim.active_id(), SolverId::Mpm);
 
-        for &id in &[SolverId::Xpbd, SolverId::Twofield] {
+        for &id in &[SolverId::Xpbd, SolverId::MpmV2] {
             sim.switch_solver(&device, &queue, id)
                 .expect("switch falls back from MPM debug scene");
             assert_eq!(sim.active_id(), id);

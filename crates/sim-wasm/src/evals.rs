@@ -5,7 +5,7 @@
 //! solver should mean registering it and letting these evals exercise it without
 //! adding a solver-specific test path here.
 
-use std::sync::mpsc;
+use std::{mem::size_of, sync::mpsc};
 
 use bytemuck::cast_slice;
 use coffee_sim_core::Vec3;
@@ -104,6 +104,7 @@ fn read_buffer(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     source: &wgpu::Buffer,
+    source_offset: u64,
     bytes: u64,
 ) -> Vec<u8> {
     let bytes = bytes.max(4);
@@ -117,7 +118,7 @@ fn read_buffer(
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("solver eval readback"),
     });
-    encoder.copy_buffer_to_buffer(source, 0, &staging, 0, bytes);
+    encoder.copy_buffer_to_buffer(source, source_offset, &staging, 0, bytes);
     queue.submit(Some(encoder.finish()));
 
     let slice = staging.slice(..);
@@ -149,7 +150,7 @@ fn sample_particles(
     match snapshot.render.particle_source() {
         ParticleRenderSource::Packed { render_buffer } => {
             let bytes = (count * 8 * std::mem::size_of::<f32>()) as u64;
-            let data = read_buffer(device, queue, render_buffer, bytes);
+            let data = read_buffer(device, queue, render_buffer, 0, bytes);
             let floats = cast_slice::<u8, f32>(&data);
             floats
                 .chunks_exact(8)
@@ -173,17 +174,21 @@ fn sample_particles(
             velocities,
             phases,
         } => {
-            let vec4_bytes = (count * 4 * std::mem::size_of::<f32>()) as u64;
-            let phase_bytes = (count * std::mem::size_of::<u32>()) as u64;
-            let pos_data = read_buffer(device, queue, positions, vec4_bytes);
-            let vel_data = read_buffer(device, queue, velocities, vec4_bytes);
-            let phase_data = read_buffer(device, queue, phases, phase_bytes);
-            let pos = cast_slice::<u8, f32>(&pos_data);
-            let vel = cast_slice::<u8, f32>(&vel_data);
-            let phase = cast_slice::<u8, u32>(&phase_data);
+            let mut samples = Vec::with_capacity(count);
+            for instance_range in snapshot.render.particle_instance_ranges() {
+                let range_count = (instance_range.end - instance_range.start) as usize;
+                let vec4_offset = u64::from(instance_range.start) * 4 * size_of::<f32>() as u64;
+                let phase_offset = u64::from(instance_range.start) * size_of::<u32>() as u64;
+                let vec4_bytes = (range_count * 4 * size_of::<f32>()) as u64;
+                let phase_bytes = (range_count * size_of::<u32>()) as u64;
+                let pos_data = read_buffer(device, queue, positions, vec4_offset, vec4_bytes);
+                let vel_data = read_buffer(device, queue, velocities, vec4_offset, vec4_bytes);
+                let phase_data = read_buffer(device, queue, phases, phase_offset, phase_bytes);
+                let pos = cast_slice::<u8, f32>(&pos_data);
+                let vel = cast_slice::<u8, f32>(&vel_data);
+                let phase = cast_slice::<u8, u32>(&phase_data);
 
-            (0..count)
-                .filter_map(|i| {
+                samples.extend((0..range_count).filter_map(|i| {
                     let p = Vec3::new(pos[i * 4], pos[i * 4 + 1], pos[i * 4 + 2]);
                     if p.y <= ACTIVE_PARK_Y {
                         return None;
@@ -193,8 +198,9 @@ fn sample_particles(
                         vel: Vec3::new(vel[i * 4], vel[i * 4 + 1], vel[i * 4 + 2]),
                         phase: phase[i],
                     })
-                })
-                .collect()
+                }));
+            }
+            samples
         }
     }
 }
