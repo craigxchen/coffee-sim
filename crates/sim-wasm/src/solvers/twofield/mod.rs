@@ -93,6 +93,7 @@ const ACTIVE_WATER_INDIRECT_OFFSET: u64 = 0;
 // Internal sequence sentinels. WebGPU's per-dimension workgroup ceiling is far below these, so
 // they cannot alias a legal direct dispatch size; the actual counts stay in the GPU args buffer.
 const ACTIVE_WATER_INDIRECT: u32 = u32::MAX;
+const ACTIVE_TILE_MARKER: u32 = u32::MAX - 1;
 
 fn groups(n: u32) -> u32 {
     n.div_ceil(WG)
@@ -138,7 +139,7 @@ fn active_tiling_enabled(implicit_solid: bool, all_gas_atmospheric: bool) -> boo
 /// scatter binds 6 and gather binds 7 around the 11-lane chemistry ledger; the semi-implicit
 /// family's widest pass is `p2g_solid_macro` at 8 (pos, vel, chem, cmat, grid_sfp, grid_sm,
 /// sstate, grid_scomp), while its scalar Jacobi binds 4. Tiled fine-pressure relaxation adds one
-/// scheduler binding; its active-water marker binds 3 (pos, chem, scheduler). The occasional
+/// scheduler binding; its occupancy marker binds 2 (cell census, scheduler). The occasional
 /// compact diagnostics pass
 /// binds 6 storage buffers (pos, chem, grid_vel, cell_cnt, filter_state, output). All remain at or
 /// below the cap; re-derive when passes are added. Shared required limits request 10 storage
@@ -3051,7 +3052,7 @@ impl Solver for TwofieldSolver {
             let active_tile_mark = make("active_tile_mark");
             let active_tile_mark_bind = bg(
                 &active_tile_mark,
-                &[(0, &params_buf), (1, &pos), (4, &chem), (33, &active_tiles)],
+                &[(0, &params_buf), (18, &cell_cnt), (33, &active_tiles)],
             );
             let grid_clear = make("grid_clear");
             let grid_clear_bind = bg(
@@ -4057,27 +4058,10 @@ impl Solver for TwofieldSolver {
         let cnode_groups = groups((cd[0] + 1) * (cd[1] + 1) * (cd[2] + 1)).max(1);
 
         if self.active_tiling {
-            // The marker must finish before its count becomes an indirect argument. Keep the
-            // scheduler STORAGE-writable and the argument record INDIRECT-only: clear and mark
-            // in the first compute pass, end it, then copy just the counter's x word. All later
-            // dense and indirect work remains in this encoder and the frame still submits once.
-            rec.flush();
+            // Clear before grid_clear/P2G opens the first compute pass. The post-P2G tile census
+            // will end that pass before copying this scheduler's count into the INDIRECT-only
+            // argument record; the frame still uses one encoder and one submission.
             enc.clear_buffer(&self.active_tiles, 0, None);
-            rec.dispatch(
-                &mut enc,
-                &self.pipelines.active_tile_mark.0,
-                &self.pipelines.active_tile_mark.1,
-                "active_tile_mark",
-                water_groups,
-            );
-            rec.flush();
-            enc.copy_buffer_to_buffer(
-                &self.active_tiles,
-                ACTIVE_WATER_COUNT_OFFSET,
-                &self.active_tile_indirect,
-                ACTIVE_WATER_INDIRECT_OFFSET,
-                4,
-            );
         }
 
         // Dry dynamic mode (U5_DRY_DISPATCHES): no live water → only the solid passes run.
@@ -4194,6 +4178,14 @@ impl Solver for TwofieldSolver {
             &self.pipelines.p2g_water.1,
             water_groups,
         ));
+        if self.active_tiling {
+            seq.push((
+                "active_tile_mark",
+                &self.pipelines.active_tile_mark.0,
+                &self.pipelines.active_tile_mark.1,
+                ACTIVE_TILE_MARKER,
+            ));
+        }
         if self.implicit_solid {
             // Multirate IMEX split: only the deliberately soft deviatoric predictor is
             // subcycled. The water grid remains resident while solid-only clears rebuild the
@@ -4543,6 +4535,18 @@ impl Solver for TwofieldSolver {
                 rec.disable_timestamps();
             }
             for &(label, pipe, bind, g) in &seq {
+                if g == ACTIVE_TILE_MARKER {
+                    rec.dispatch(&mut enc, pipe, bind, label, self.active_tile_count.max(1));
+                    rec.flush();
+                    enc.copy_buffer_to_buffer(
+                        &self.active_tiles,
+                        ACTIVE_WATER_COUNT_OFFSET,
+                        &self.active_tile_indirect,
+                        ACTIVE_WATER_INDIRECT_OFFSET,
+                        4,
+                    );
+                    continue;
+                }
                 let indirect_offset = match g {
                     ACTIVE_WATER_INDIRECT => Some(ACTIVE_WATER_INDIRECT_OFFSET),
                     _ => None,
@@ -4691,7 +4695,7 @@ mod seed_tests {
     }
 
     #[test]
-    fn active_tile_boxes_cover_every_contract_cell_at_grid_boundaries() {
+    fn active_tile_neighbor_halo_covers_every_one_cell_operator_neighbor() {
         use std::collections::BTreeSet;
 
         assert!(!active_tiling_enabled(false, false));
@@ -4707,39 +4711,57 @@ mod seed_tests {
             tile_dims.into_iter().product::<u32>()
         );
 
-        let tile_id = |cell: [u32; 3]| {
+        let tile_id = |cell: [u32; 3]| -> u32 {
             let tile = cell.map(|coordinate| coordinate / ACTIVE_TILE_EDGE);
             tile[0] + tile_dims[0] * (tile[1] + tile_dims[1] * tile[2])
         };
-        let marked_for_box = |lo: [i32; 3], hi: [i32; 3]| {
+        let marked_for_occupied_cell = |cell: [u32; 3]| {
             let mut marked = BTreeSet::new();
-            let lo: [i32; 3] =
-                std::array::from_fn(|axis| lo[axis].clamp(0, cell_dims[axis] as i32 - 1));
-            let hi: [i32; 3] =
-                std::array::from_fn(|axis| hi[axis].clamp(0, cell_dims[axis] as i32 - 1));
-            for z in (lo[2] as u32 / ACTIVE_TILE_EDGE)..=(hi[2] as u32 / ACTIVE_TILE_EDGE) {
-                for y in (lo[1] as u32 / ACTIVE_TILE_EDGE)..=(hi[1] as u32 / ACTIVE_TILE_EDGE) {
-                    for x in (lo[0] as u32 / ACTIVE_TILE_EDGE)..=(hi[0] as u32 / ACTIVE_TILE_EDGE) {
-                        marked.insert(x + tile_dims[0] * (y + tile_dims[1] * z));
+            let center = cell.map(|coordinate| (coordinate / ACTIVE_TILE_EDGE) as i32);
+            for dz in -1..=1 {
+                for dy in -1..=1 {
+                    for dx in -1..=1 {
+                        let tile = [center[0] + dx, center[1] + dy, center[2] + dz];
+                        if (0..3).all(|axis| tile[axis] >= 0 && tile[axis] < tile_dims[axis] as i32)
+                        {
+                            marked.insert(
+                                tile[0] as u32
+                                    + tile_dims[0]
+                                        * (tile[1] as u32 + tile_dims[1] * tile[2] as u32),
+                            );
+                        }
                     }
                 }
             }
-            (lo, hi, marked)
+            marked
         };
 
-        // Covers low/high clamps, partial edge tiles, the water +/-1 operator halo, and boxes
-        // spanning more than one tile boundary.
-        for (lo, hi) in [
-            ([-1, -1, -1], [1, 1, 1]),
-            ([6, 7, 7], [9, 10, 10]),
-            ([14, 13, 12], [20, 20, 20]),
-            ([-4, 2, 3], [17, 15, 14]),
+        // Interior, tile-face/edge/corner, low-domain, and partial-high-tile occupancy cases.
+        for occupied in [
+            [0, 0, 0],
+            [7, 7, 7],
+            [8, 8, 8],
+            [15, 8, 7],
+            [cell_dims[0] - 1, cell_dims[1] - 1, cell_dims[2] - 1],
         ] {
-            let (clamped_lo, clamped_hi, marked) = marked_for_box(lo, hi);
-            for z in clamped_lo[2] as u32..=clamped_hi[2] as u32 {
-                for y in clamped_lo[1] as u32..=clamped_hi[1] as u32 {
-                    for x in clamped_lo[0] as u32..=clamped_hi[0] as u32 {
-                        assert!(marked.contains(&tile_id([x, y, z])));
+            let marked = marked_for_occupied_cell(occupied);
+            for dz in -1..=1 {
+                for dy in -1..=1 {
+                    for dx in -1..=1 {
+                        let neighbor = [
+                            occupied[0] as i32 + dx,
+                            occupied[1] as i32 + dy,
+                            occupied[2] as i32 + dz,
+                        ];
+                        if (0..3).all(|axis| {
+                            neighbor[axis] >= 0 && neighbor[axis] < cell_dims[axis] as i32
+                        }) {
+                            assert!(marked.contains(&tile_id([
+                                neighbor[0] as u32,
+                                neighbor[1] as u32,
+                                neighbor[2] as u32,
+                            ])));
+                        }
                     }
                 }
             }

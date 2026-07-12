@@ -2,9 +2,11 @@
 //
 // Dense setup/clear/node/coarse passes and every solid-compaction pass remain authoritative.
 // On the guarded semi-implicit, explicitly vented production path, one workgroup owns one 8^3
-// water-cell tile: its 256 lanes process `lane` and `lane + 256`. The host copies the atomic
-// compact-list count into a separate INDIRECT-only dispatch record between compute passes; the
-// writable scheduler is never itself used as an indirect-argument buffer.
+// water-cell tile: its 256 lanes inspect `lane` and `lane + 256` in the cell-presence census
+// produced by p2g_water. Only leaders of occupied tiles touch the global scheduler, marking a
+// conservative 3^3 neighboring-tile halo. The host copies the atomic compact-list count into a
+// separate INDIRECT-only dispatch record between compute passes; the writable scheduler is never
+// itself used as an indirect-argument buffer.
 
 const ACTIVE_TILE_EDGE: u32 = 8u;
 const ACTIVE_WATER_COUNT: u32 = 0u;
@@ -61,46 +63,51 @@ fn active_mark_tile(tile: vec3<i32>) {
     }
 }
 
-// Mark every tile intersecting the inclusive cell-space box. Marking the tile-space bounding box
-// is exactly the same set as marking each cell and deduplicating afterwards.
-fn active_mark_cell_box(lo_arg: vec3<i32>, hi_arg: vec3<i32>) {
-    let last_cell = vec3<i32>(fine_cells()) - vec3<i32>(1);
-    let lo = clamp(lo_arg, vec3<i32>(0), last_cell);
-    let hi = clamp(hi_arg, vec3<i32>(0), last_cell);
-    let tile_lo = lo / i32(ACTIVE_TILE_EDGE);
-    let tile_hi = hi / i32(ACTIVE_TILE_EDGE);
-    for (var tz = tile_lo.z; tz <= tile_hi.z; tz = tz + 1) {
-        for (var ty = tile_lo.y; ty <= tile_hi.y; ty = ty + 1) {
-            for (var tx = tile_lo.x; tx <= tile_hi.x; tx = tx + 1) {
-                active_mark_tile(vec3<i32>(tx, ty, tz));
+var<workgroup> active_tile_occupied: atomic<u32>;
+
+// One workgroup scans one 8^3 cell tile. p2g_water is the sole writer of the presence census, so
+// held paper parcels and open-base escaped water are already excluded exactly. A one-TILE halo is
+// deliberately conservative for the required one-CELL operator halo [ci-1, ci+1], including
+// occupancy on a tile face/edge/corner. No invocation returns before the workgroup barriers.
+@compute @workgroup_size(256)
+fn active_tile_mark(
+    @builtin(workgroup_id) workgroup: vec3<u32>,
+    @builtin(local_invocation_index) lane: u32,
+) {
+    if (lane == 0u) {
+        atomicStore(&active_tile_occupied, 0u);
+    }
+    workgroupBarrier();
+
+    let tile_id = workgroup.x;
+    let cell0 = active_tile_cell(tile_id, lane);
+    let cell1 = active_tile_cell(tile_id, lane + 256u);
+    var occupied = false;
+    if (cell_in_range(cell0)) {
+        occupied = occupied || atomicLoad(&cell_cnt[cell_index(cell0)]) > 0u;
+    }
+    if (cell_in_range(cell1)) {
+        occupied = occupied || atomicLoad(&cell_cnt[cell_index(cell1)]) > 0u;
+    }
+    if (occupied) {
+        atomicOr(&active_tile_occupied, 1u);
+    }
+    workgroupBarrier();
+
+    if (lane == 0u && atomicLoad(&active_tile_occupied) != 0u) {
+        let center = vec3<i32>(active_tile_coords(tile_id));
+        let dims = vec3<i32>(active_tile_dims());
+        for (var dz = -1; dz <= 1; dz = dz + 1) {
+            for (var dy = -1; dy <= 1; dy = dy + 1) {
+                for (var dx = -1; dx <= 1; dx = dx + 1) {
+                    let neighbor = center + vec3<i32>(dx, dy, dz);
+                    if (all(neighbor >= vec3<i32>(0)) && all(neighbor < dims)) {
+                        active_mark_tile(neighbor);
+                    }
+                }
             }
         }
     }
-}
-
-// The marker is dispatched over the live water prefix only. It uses the particle-presence cell
-// plus the one-cell pressure-operator halo. Paper-held and open-base escaped water match the
-// p2g_water mechanics guards exactly.
-@compute @workgroup_size(256)
-fn active_tile_mark(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let p = gid.x;
-    if (p >= params.water_count) {
-        return;
-    }
-    if (chem[p].z > 0.5) {
-        return;
-    }
-    let x = pos[p].xyz;
-    if (params.coupling.w > 0.5 && x.y < params.box_min.y) {
-        return;
-    }
-    let xl = (x - params.grid_origin.xyz) / params.grid_origin.w;
-    let ci = clamp(
-        vec3<i32>(floor(xl)),
-        vec3<i32>(0),
-        vec3<i32>(params.grid_dims.xyz) - vec3<i32>(2),
-    );
-    active_mark_cell_box(ci - vec3<i32>(1), ci + vec3<i32>(1));
 }
 
 fn active_tile_list_value(workgroup: u32) -> u32 {
