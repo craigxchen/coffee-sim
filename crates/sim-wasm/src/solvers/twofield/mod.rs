@@ -86,16 +86,13 @@ const DORMANT_PARK_Y: f32 = -1.0e9;
 /// Fine-cell tile shape shared with `active_tiles.wgsl`. One 256-thread workgroup processes
 /// exactly two lanes per cell tile (512 cells total).
 const ACTIVE_TILE_EDGE: u32 = 8;
-const ACTIVE_TILE_HEADER_WORDS: u32 = 2;
-const ACTIVE_TILE_WORDS_PER_TILE: u32 = 4;
+const ACTIVE_TILE_HEADER_WORDS: u32 = 1;
+const ACTIVE_TILE_WORDS_PER_TILE: u32 = 2;
 const ACTIVE_WATER_COUNT_OFFSET: u64 = 0;
-const ACTIVE_SOLID_COUNT_OFFSET: u64 = 4;
 const ACTIVE_WATER_INDIRECT_OFFSET: u64 = 0;
-const ACTIVE_SOLID_INDIRECT_OFFSET: u64 = 16;
 // Internal sequence sentinels. WebGPU's per-dimension workgroup ceiling is far below these, so
 // they cannot alias a legal direct dispatch size; the actual counts stay in the GPU args buffer.
 const ACTIVE_WATER_INDIRECT: u32 = u32::MAX;
-const ACTIVE_SOLID_INDIRECT: u32 = u32::MAX - 1;
 
 fn groups(n: u32) -> u32 {
     n.div_ceil(WG)
@@ -140,8 +137,9 @@ fn active_tiling_enabled(implicit_solid: bool, all_gas_atmospheric: bool) -> boo
 /// (pos, vel, chem, grid_moist), `g2p_absorb` 4 (pos, vel, chem, grid_moist); chemistry/thermal
 /// scatter binds 6 and gather binds 7 around the 11-lane chemistry ledger; the semi-implicit
 /// family's widest pass is `p2g_solid_macro` at 8 (pos, vel, chem, cmat, grid_sfp, grid_sm,
-/// sstate, grid_scomp), while its tiled scalar Jacobi binds 5. The active-tile marker binds 3
-/// (pos, chem, scheduler). The occasional compact diagnostics pass
+/// sstate, grid_scomp), while its scalar Jacobi binds 4. Tiled fine-pressure relaxation adds one
+/// scheduler binding; its active-water marker binds 3 (pos, chem, scheduler). The occasional
+/// compact diagnostics pass
 /// binds 6 storage buffers (pos, chem, grid_vel, cell_cnt, filter_state, output). All remain at or
 /// below the cap; re-derive when passes are added. Shared required limits request 10 storage
 /// buffers per stage (see `solvers/mpm/mod.rs::required_limits`), within the WebGPU-target cap.
@@ -1030,9 +1028,9 @@ pub struct TwofieldSolver {
     grid_scomp: wgpu::Buffer,
     // Persistent paper reservoir (binding 30), intentionally not part of per-frame grid clear.
     filter_state: wgpu::Buffer,
-    // Phase-1 sparse relaxation scheduler (binding 33) and its separate INDIRECT-only argument
-    // records. Enabled only for the semi-implicit + explicitly vented production path; every
-    // setup/clear/node/coarse pass remains dense.
+    // Phase-1 sparse water-pressure scheduler (binding 33) and its separate INDIRECT-only
+    // argument record. Enabled only for the semi-implicit + explicitly vented production path;
+    // every solid, setup, clear, node, and coarse pass remains dense.
     active_tiles: wgpu::Buffer,
     active_tile_indirect: wgpu::Buffer,
     active_tile_count: u32,
@@ -1191,7 +1189,6 @@ struct Pipelines {
     compaction_node_setup: (wgpu::ComputePipeline, wgpu::BindGroup),
     compaction_cell_setup: (wgpu::ComputePipeline, wgpu::BindGroup),
     compaction_jacobi: (wgpu::ComputePipeline, [wgpu::BindGroup; 2]),
-    compaction_jacobi_tiled: (wgpu::ComputePipeline, [wgpu::BindGroup; 2]),
     compaction_project: (wgpu::ComputePipeline, wgpu::BindGroup),
     compaction_state_gather: (wgpu::ComputePipeline, wgpu::BindGroup),
     grid_update: (wgpu::ComputePipeline, wgpu::BindGroup),
@@ -1638,11 +1635,11 @@ impl TwofieldSolver {
         [raw[0], raw[1], raw[2], raw[3], raw[4]]
     }
 
-    /// Blocking dev/profile readback of the current compact water/solid relaxation tile counts.
+    /// Blocking dev/profile readback of the current compact water-pressure tile count.
     /// Production frame execution never calls this; the scheduler remains fully GPU-driven.
-    pub fn read_active_tile_counts(&self) -> [u32; 2] {
-        let raw: Vec<u32> = bytemuck::cast_slice(&self.read_bytes(&self.active_tiles, 8)).to_vec();
-        [raw[0], raw[1]]
+    pub fn read_active_tile_count(&self) -> u32 {
+        let raw: Vec<u32> = bytemuck::cast_slice(&self.read_bytes(&self.active_tiles, 4)).to_vec();
+        raw[0]
     }
 
     /// Read back the interphase drag state, one vec4 per node: .xyz = the water-to-solid
@@ -2793,11 +2790,11 @@ impl Solver for TwofieldSolver {
                 * 4,
             wgpu::BufferUsages::COPY_SRC,
         );
-        // Two independently addressable [x, y, z, padding] records. Only x is copied from the
-        // GPU scheduler each frame; y/z remain one, and the padding keeps offsets 16-byte aligned.
+        // One [x, y, z, padding] record. Only x is copied from the GPU scheduler each frame;
+        // y/z remain one, and the padding keeps the allocation 16-byte aligned.
         let active_tile_indirect = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("twofield-active-tile-indirect"),
-            contents: bytemuck::cast_slice(&[[0u32, 1, 1, 0], [0u32, 1, 1, 0]]),
+            contents: bytemuck::cast_slice(&[[0u32, 1, 1, 0]]),
             usage: wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_DST,
         });
         let diagnostics_gpu = Self::storage(
@@ -3256,31 +3253,6 @@ impl Solver for TwofieldSolver {
                         (10, &cell_meta),
                         (11, &pf_b),
                         (12, &pf_a),
-                    ],
-                ),
-            ];
-            let compaction_jacobi_tiled = make("compaction_jacobi_tiled");
-            let compaction_jacobi_tiled_binds = [
-                bg(
-                    &compaction_jacobi_tiled,
-                    &[
-                        (0, &params_buf),
-                        (9, &nm),
-                        (10, &cell_meta),
-                        (11, &pf_a),
-                        (12, &pf_b),
-                        (33, &active_tiles),
-                    ],
-                ),
-                bg(
-                    &compaction_jacobi_tiled,
-                    &[
-                        (0, &params_buf),
-                        (9, &nm),
-                        (10, &cell_meta),
-                        (11, &pf_b),
-                        (12, &pf_a),
-                        (33, &active_tiles),
                     ],
                 ),
             ];
@@ -3767,7 +3739,6 @@ impl Solver for TwofieldSolver {
                 compaction_node_setup: (compaction_node_setup, compaction_node_setup_bind),
                 compaction_cell_setup: (compaction_cell_setup, compaction_cell_setup_bind),
                 compaction_jacobi: (compaction_jacobi, compaction_jacobi_binds),
-                compaction_jacobi_tiled: (compaction_jacobi_tiled, compaction_jacobi_tiled_binds),
                 compaction_project: (compaction_project, compaction_project_bind),
                 compaction_state_gather: (compaction_state_gather, compaction_state_gather_bind),
                 grid_update: (grid_update, grid_update_bind),
@@ -4072,8 +4043,8 @@ impl Solver for TwofieldSolver {
 
         // The U2 transfer pipeline + U3 pressure stack, one substep per frame. Passes dispatch
         // at least one workgroup so the dispatch/profiling path is real even on an empty scene.
-        // Dense setup/coarse/fallback stages early-out on live-set/mask guards; only the guarded
-        // repeated fine-grid relaxation stages use GPU-produced indirect tile counts.
+        // Dense solid/setup/coarse/fallback stages early-out on live-set/mask guards; only the
+        // guarded repeated water fine-pressure stages use a GPU-produced indirect tile count.
         let node_groups = groups(self.num_nodes).max(1);
         let water_groups = groups(self.water_count).max(1);
         let solid_groups = groups(self.solid_count).max(1);
@@ -4086,9 +4057,9 @@ impl Solver for TwofieldSolver {
         let cnode_groups = groups((cd[0] + 1) * (cd[1] + 1) * (cd[2] + 1)).max(1);
 
         if self.active_tiling {
-            // The marker must finish before its counters become indirect arguments. Keep the
-            // scheduler STORAGE-writable and the argument records INDIRECT-only: clear and mark
-            // in the first compute pass, end it, then copy just each counter's x word. All later
+            // The marker must finish before its count becomes an indirect argument. Keep the
+            // scheduler STORAGE-writable and the argument record INDIRECT-only: clear and mark
+            // in the first compute pass, end it, then copy just the counter's x word. All later
             // dense and indirect work remains in this encoder and the frame still submits once.
             rec.flush();
             enc.clear_buffer(&self.active_tiles, 0, None);
@@ -4097,7 +4068,7 @@ impl Solver for TwofieldSolver {
                 &self.pipelines.active_tile_mark.0,
                 &self.pipelines.active_tile_mark.1,
                 "active_tile_mark",
-                part_groups,
+                water_groups,
             );
             rec.flush();
             enc.copy_buffer_to_buffer(
@@ -4105,13 +4076,6 @@ impl Solver for TwofieldSolver {
                 ACTIVE_WATER_COUNT_OFFSET,
                 &self.active_tile_indirect,
                 ACTIVE_WATER_INDIRECT_OFFSET,
-                4,
-            );
-            enc.copy_buffer_to_buffer(
-                &self.active_tiles,
-                ACTIVE_SOLID_COUNT_OFFSET,
-                &self.active_tile_indirect,
-                ACTIVE_SOLID_INDIRECT_OFFSET,
                 4,
             );
         }
@@ -4301,20 +4265,11 @@ impl Solver for TwofieldSolver {
                 ),
             ]);
             for sweep in 0..COMPACTION_SWEEPS {
-                let family = if self.active_tiling {
-                    &self.pipelines.compaction_jacobi_tiled
-                } else {
-                    &self.pipelines.compaction_jacobi
-                };
                 seq.push((
                     "compaction_jacobi",
-                    &family.0,
-                    &family.1[(sweep % 2) as usize],
-                    if self.active_tiling {
-                        ACTIVE_SOLID_INDIRECT
-                    } else {
-                        cell_groups
-                    },
+                    &self.pipelines.compaction_jacobi.0,
+                    &self.pipelines.compaction_jacobi.1[(sweep % 2) as usize],
+                    cell_groups,
                 ));
             }
             debug_assert!(COMPACTION_SWEEPS.is_multiple_of(2));
@@ -4590,7 +4545,6 @@ impl Solver for TwofieldSolver {
             for &(label, pipe, bind, g) in &seq {
                 let indirect_offset = match g {
                     ACTIVE_WATER_INDIRECT => Some(ACTIVE_WATER_INDIRECT_OFFSET),
-                    ACTIVE_SOLID_INDIRECT => Some(ACTIVE_SOLID_INDIRECT_OFFSET),
                     _ => None,
                 };
                 if let Some(offset) = indirect_offset {
@@ -4773,8 +4727,8 @@ mod seed_tests {
             (lo, hi, marked)
         };
 
-        // Covers low/high clamps, partial edge tiles, the water +/-1 operator halo, and a
-        // representative solid support expanded past more than one tile boundary.
+        // Covers low/high clamps, partial edge tiles, the water +/-1 operator halo, and boxes
+        // spanning more than one tile boundary.
         for (lo, hi) in [
             ([-1, -1, -1], [1, 1, 1]),
             ([6, 7, 7], [9, 10, 10]),
@@ -4815,7 +4769,7 @@ mod seed_tests {
     }
 
     #[test]
-    fn tiled_relaxation_matches_dense_relaxation_on_the_gpu() {
+    fn water_tiled_relaxation_matches_dense_relaxation_on_the_gpu() {
         let Some((device, queue)) = create_test_device() else {
             eprintln!("no GPU adapter available; skipping active-tile equivalence test");
             return;
@@ -4866,9 +4820,8 @@ mod seed_tests {
             dense.dispatches + 1,
             "indirect relaxation dispatches stay individually counted; only the marker is new"
         );
-        let counts = tiled.read_active_tile_counts();
-        assert!(counts[0] > 0 && counts[0] <= tiled.active_tile_count);
-        assert!(counts[1] > 0 && counts[1] <= tiled.active_tile_count);
+        let count = tiled.read_active_tile_count();
+        assert!(count > 0 && count <= tiled.active_tile_count);
 
         let assert_close = |name: &str, left: &[f32], right: &[f32]| {
             assert_eq!(left.len(), right.len(), "{name} length");

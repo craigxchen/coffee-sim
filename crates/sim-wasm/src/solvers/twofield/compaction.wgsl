@@ -483,7 +483,9 @@ fn compaction_cell_setup(@builtin(global_invocation_id) gid: vec3<u32>) {
     pf_dst[flat] = pressure;
 }
 
-fn compaction_jacobi_cell(flat: u32) {
+@compute @workgroup_size(256)
+fn compaction_jacobi(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let flat = gid.x;
     if (flat >= num_fine_cells()) { return; }
     let cm = cell_meta[flat];
     if (cm.w <= 0.0 || cm.z <= 0.0) { pf_dst[flat] = 0.0; return; }
@@ -526,29 +528,6 @@ fn compaction_jacobi_cell(flat: u32) {
         0.0,
         cm.z,
     );
-}
-
-@compute @workgroup_size(256)
-fn compaction_jacobi(@builtin(global_invocation_id) gid: vec3<u32>) {
-    compaction_jacobi_cell(gid.x);
-}
-
-// Sparse production variant: one workgroup owns one compacted solid tile. Both calls are kept
-// explicit (rather than a loop) so the 8^3 mapping is auditable against ACTIVE_TILE_VOLUME.
-@compute @workgroup_size(256)
-fn compaction_jacobi_tiled(
-    @builtin(workgroup_id) workgroup: vec3<u32>,
-    @builtin(local_invocation_index) lane: u32,
-) {
-    let tile = active_tile_list_value(workgroup.x, true);
-    let cell0 = active_tile_cell(tile, lane);
-    if (cell_in_range(cell0)) {
-        compaction_jacobi_cell(cell_index(cell0));
-    }
-    let cell1 = active_tile_cell(tile, lane + 256u);
-    if (cell_in_range(cell1)) {
-        compaction_jacobi_cell(cell_index(cell1));
-    }
 }
 
 @compute @workgroup_size(256)

@@ -128,11 +128,11 @@
 // behind an opt-in Config gate, else it is removed (plan: "Deferred to Implementation").
 //
 // Sparsity: setup/node/coarse passes retain dense over-dispatch + early-out. On the guarded
-// semi-implicit, explicitly vented production path, only repeated fine-grid relaxation uses the
-// particle-derived indirect tile lists in active_tiles.wgsl; the dense entry points remain the
-// exact fallback and equivalence oracle. Tint discipline: no workgroupBarrier anywhere in this
-// family, so the guard returns are uniform-control-flow safe. Storage buffers per entry point ≤ 8
-// (see mod.rs derivation).
+// semi-implicit, explicitly vented production path, only repeated WATER fine-pressure relaxation
+// uses the particle-derived indirect tile list in active_tiles.wgsl; solid compaction remains
+// dense, and the dense water entry points remain the exact fallback/equivalence oracle. Tint
+// discipline: no workgroupBarrier anywhere in this family, so the guard returns are uniform-
+// control-flow safe. Storage buffers per entry point ≤ 8 (see mod.rs derivation).
 
 // --- pressure-family bindings (indices continue the global table in common.wgsl) -------------
 // Per-node M̃⁻¹, 2 vec4 per node: [2n] = (xx, xy, xz, yy), [2n+1] = (yz, zz, massy_flag, 0).
@@ -837,7 +837,7 @@ fn residual_tiled(
     @builtin(workgroup_id) workgroup: vec3<u32>,
     @builtin(local_invocation_index) lane: u32,
 ) {
-    let tile = active_tile_list_value(workgroup.x, false);
+    let tile = active_tile_list_value(workgroup.x);
     let cell0 = active_tile_cell(tile, lane);
     if (cell_in_range(cell0)) {
         residual_cell(cell_index(cell0));
@@ -925,7 +925,7 @@ fn jacobi_fine_tiled(
     @builtin(workgroup_id) workgroup: vec3<u32>,
     @builtin(local_invocation_index) lane: u32,
 ) {
-    let tile = active_tile_list_value(workgroup.x, false);
+    let tile = active_tile_list_value(workgroup.x);
     let cell0 = active_tile_cell(tile, lane);
     if (cell_in_range(cell0)) {
         jacobi_fine_cell(cell_index(cell0));
@@ -1056,7 +1056,7 @@ fn prolong_add_tiled(
     @builtin(workgroup_id) workgroup: vec3<u32>,
     @builtin(local_invocation_index) lane: u32,
 ) {
-    let tile = active_tile_list_value(workgroup.x, false);
+    let tile = active_tile_list_value(workgroup.x);
     let cell0 = active_tile_cell(tile, lane);
     if (cell_in_range(cell0)) {
         prolong_add_cell(cell_index(cell0));
