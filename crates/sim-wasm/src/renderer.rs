@@ -542,6 +542,61 @@ struct CrossSectionUniforms {
     material: [f32; 4],
 }
 
+struct UniformWriteCache<T> {
+    value: Option<T>,
+}
+
+impl<T> Default for UniformWriteCache<T> {
+    fn default() -> Self {
+        Self { value: None }
+    }
+}
+
+impl<T: Pod> UniformWriteCache<T> {
+    fn update(&mut self, value: T) -> bool {
+        if self
+            .value
+            .as_ref()
+            .is_some_and(|cached| bytemuck::bytes_of(cached) == bytemuck::bytes_of(&value))
+        {
+            return false;
+        }
+
+        self.value = Some(value);
+        true
+    }
+}
+
+struct CanonicalParticleBindGroups {
+    positions: wgpu::Buffer,
+    velocities: wgpu::Buffer,
+    phases: wgpu::Buffer,
+    particle_3d: wgpu::BindGroup,
+    cross_section: wgpu::BindGroup,
+}
+
+impl CanonicalParticleBindGroups {
+    fn matches(
+        &self,
+        positions: &wgpu::Buffer,
+        velocities: &wgpu::Buffer,
+        phases: &wgpu::Buffer,
+    ) -> bool {
+        self.positions == *positions && self.velocities == *velocities && self.phases == *phases
+    }
+}
+
+fn write_uniform_if_changed<T: Pod>(
+    queue: &wgpu::Queue,
+    buffer: &wgpu::Buffer,
+    cache: &mut UniformWriteCache<T>,
+    value: T,
+) {
+    if cache.update(value) {
+        queue.write_buffer(buffer, 0, bytemuck::bytes_of(&value));
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct OrbitCamera {
     pub(crate) yaw: f32,
@@ -622,14 +677,20 @@ pub(crate) struct Renderer {
     axis_pipeline: wgpu::RenderPipeline,
     particle_3d_uniform_buffer: wgpu::Buffer,
     particle_3d_bind_group: wgpu::BindGroup,
+    particle_3d_uniform_cache: UniformWriteCache<Particle3DUniforms>,
     cross_section_uniform_buffer: wgpu::Buffer,
     cross_section_bind_group: wgpu::BindGroup,
+    cross_section_uniform_cache: UniformWriteCache<CrossSectionUniforms>,
     cone_uniform_buffer: wgpu::Buffer,
     cone_bind_group: wgpu::BindGroup,
+    cone_uniform_cache: UniformWriteCache<ConeUniforms>,
     axis_uniform_buffer: wgpu::Buffer,
     axis_bind_group: wgpu::BindGroup,
+    axis_uniform_cache: UniformWriteCache<AxisUniforms>,
     filter_uniform_buffer: wgpu::Buffer,
     filter_bind_group: wgpu::BindGroup,
+    filter_uniform_cache: UniformWriteCache<ConeUniforms>,
+    canonical_particle_bind_groups: Option<CanonicalParticleBindGroups>,
     quad_vertex_buffer: wgpu::Buffer,
     cone_vertex_buffer: wgpu::Buffer,
     cone_vertex_count: u32,
@@ -1337,14 +1398,20 @@ impl Renderer {
             axis_pipeline,
             particle_3d_uniform_buffer,
             particle_3d_bind_group,
+            particle_3d_uniform_cache: UniformWriteCache::default(),
             cross_section_uniform_buffer,
             cross_section_bind_group,
+            cross_section_uniform_cache: UniformWriteCache::default(),
             cone_uniform_buffer,
             cone_bind_group,
+            cone_uniform_cache: UniformWriteCache::default(),
             axis_uniform_buffer,
             axis_bind_group,
+            axis_uniform_cache: UniformWriteCache::default(),
             filter_uniform_buffer,
             filter_bind_group,
+            filter_uniform_cache: UniformWriteCache::default(),
+            canonical_particle_bind_groups: None,
             quad_vertex_buffer,
             cone_vertex_buffer,
             cone_vertex_count,
@@ -1448,6 +1515,79 @@ impl Renderer {
         self.uploaded_filter_mesh_key = mesh_key;
     }
 
+    fn sync_canonical_particle_bind_groups(&mut self, source: &ParticleRenderSource<'_>) {
+        let ParticleRenderSource::Canonical {
+            positions,
+            velocities,
+            phases,
+        } = source
+        else {
+            self.canonical_particle_bind_groups = None;
+            return;
+        };
+
+        if self
+            .canonical_particle_bind_groups
+            .as_ref()
+            .is_some_and(|cache| cache.matches(positions, velocities, phases))
+        {
+            return;
+        }
+
+        let particle_3d = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("canonical particle 3d bind group"),
+            layout: &self.canonical_particle_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.particle_3d_uniform_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: positions.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: velocities.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: phases.as_entire_binding(),
+                },
+            ],
+        });
+        let cross_section = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("canonical cross section bind group"),
+            layout: &self.canonical_particle_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.cross_section_uniform_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: positions.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: velocities.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: phases.as_entire_binding(),
+                },
+            ],
+        });
+
+        self.canonical_particle_bind_groups = Some(CanonicalParticleBindGroups {
+            positions: (*positions).clone(),
+            velocities: (*velocities).clone(),
+            phases: (*phases).clone(),
+            particle_3d,
+            cross_section,
+        });
+    }
+
     pub(crate) fn render_3d(
         &mut self,
         simulation: &RenderView<'_>,
@@ -1483,10 +1623,11 @@ impl Renderer {
             ],
             material: [simulation.max_diameter_swelling(), 0.0, 0.0, 0.0],
         };
-        self.queue.write_buffer(
+        write_uniform_if_changed(
+            &self.queue,
             &self.particle_3d_uniform_buffer,
-            0,
-            bytemuck::bytes_of(&particle_uniforms),
+            &mut self.particle_3d_uniform_cache,
+            particle_uniforms,
         );
 
         let cross_section_viewport = self.cross_section_viewport();
@@ -1508,10 +1649,11 @@ impl Renderer {
                 0.0,
             ],
         };
-        self.queue.write_buffer(
+        write_uniform_if_changed(
+            &self.queue,
             &self.cross_section_uniform_buffer,
-            0,
-            bytemuck::bytes_of(&cross_section_uniforms),
+            &mut self.cross_section_uniform_cache,
+            cross_section_uniforms,
         );
 
         // Update cone uniforms
@@ -1519,84 +1661,34 @@ impl Renderer {
             view_proj,
             color: [0.95, 0.90, 0.78, 0.35],
         };
-        self.queue.write_buffer(
+        write_uniform_if_changed(
+            &self.queue,
             &self.cone_uniform_buffer,
-            0,
-            bytemuck::bytes_of(&cone_uniforms),
+            &mut self.cone_uniform_cache,
+            cone_uniforms,
         );
 
         let axis_uniforms = AxisUniforms { view_proj };
-        self.queue.write_buffer(
+        write_uniform_if_changed(
+            &self.queue,
             &self.axis_uniform_buffer,
-            0,
-            bytemuck::bytes_of(&axis_uniforms),
+            &mut self.axis_uniform_cache,
+            axis_uniforms,
         );
 
         let filter_uniforms = ConeUniforms {
             view_proj,
             color: [0.96, 0.93, 0.85, 0.42],
         };
-        self.queue.write_buffer(
+        write_uniform_if_changed(
+            &self.queue,
             &self.filter_uniform_buffer,
-            0,
-            bytemuck::bytes_of(&filter_uniforms),
+            &mut self.filter_uniform_cache,
+            filter_uniforms,
         );
 
         self.sync_filter_mesh_vertices(simulation);
-
-        let canonical_bind_groups = match simulation.particle_source() {
-            ParticleRenderSource::Canonical {
-                positions,
-                velocities,
-                phases,
-            } => Some((
-                self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("canonical particle 3d bind group"),
-                    layout: &self.canonical_particle_bind_group_layout,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: self.particle_3d_uniform_buffer.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: positions.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 2,
-                            resource: velocities.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 3,
-                            resource: phases.as_entire_binding(),
-                        },
-                    ],
-                }),
-                self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("canonical cross section bind group"),
-                    layout: &self.canonical_particle_bind_group_layout,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: self.cross_section_uniform_buffer.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: positions.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 2,
-                            resource: velocities.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 3,
-                            resource: phases.as_entire_binding(),
-                        },
-                    ],
-                }),
-            )),
-            ParticleRenderSource::Packed { .. } => None,
-        };
+        self.sync_canonical_particle_bind_groups(simulation.particle_source());
 
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame)
@@ -1718,13 +1810,11 @@ impl Renderer {
                         }
                     }
                     ParticleRenderSource::Canonical { .. } => {
-                        let Some((particle_bind_group, cross_section_bind_group)) =
-                            canonical_bind_groups.as_ref()
-                        else {
+                        let Some(bind_groups) = self.canonical_particle_bind_groups.as_ref() else {
                             return Err(JsValue::from_str("canonical particle bind group missing"));
                         };
                         pass.set_pipeline(&self.canonical_particle_3d_pipeline);
-                        pass.set_bind_group(0, particle_bind_group, &[]);
+                        pass.set_bind_group(0, &bind_groups.particle_3d, &[]);
                         for instance_range in simulation.particle_instance_ranges() {
                             pass.draw(0..6, instance_range);
                         }
@@ -1741,7 +1831,7 @@ impl Renderer {
                                 1.0,
                             );
                             pass.set_pipeline(&self.canonical_cross_section_pipeline);
-                            pass.set_bind_group(0, cross_section_bind_group, &[]);
+                            pass.set_bind_group(0, &bind_groups.cross_section, &[]);
                             for instance_range in simulation.particle_instance_ranges() {
                                 pass.draw(0..6, instance_range);
                             }
@@ -2121,6 +2211,12 @@ fn js_error(error: impl ToString) -> JsValue {
 mod tests {
     use super::*;
 
+    #[repr(C)]
+    #[derive(Clone, Copy, Pod, Zeroable)]
+    struct TestUniform {
+        value: f32,
+    }
+
     #[test]
     fn default_camera_starts_in_positive_octant() {
         let bounds = Vec3::new(14.0, 20.0, 14.0);
@@ -2139,5 +2235,20 @@ mod tests {
         let delta = camera.target - original;
         assert!(delta.length() > 0.0);
         assert!((camera.target.y - (original.y + 2.0)).abs() < 1e-5);
+    }
+
+    #[test]
+    fn uniform_write_cache_compares_exact_pod_bytes() {
+        let mut cache = UniformWriteCache::default();
+
+        assert!(cache.update(TestUniform { value: 1.0 }));
+        assert!(!cache.update(TestUniform { value: 1.0 }));
+        assert!(cache.update(TestUniform { value: 2.0 }));
+        assert!(!cache.update(TestUniform { value: 2.0 }));
+
+        // Equal floating-point values can still have different bytes. The
+        // cache tracks the actual uniform upload payload, not float equality.
+        assert!(cache.update(TestUniform { value: 0.0 }));
+        assert!(cache.update(TestUniform { value: -0.0 }));
     }
 }
