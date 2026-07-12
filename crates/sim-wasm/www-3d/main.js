@@ -1773,8 +1773,10 @@ function assessRealismSamples(samples) {
   };
 }
 
-const MPM_V2_OBSERVATION_CONTRACT = "mpm-v2-calibration-observations-v1";
+const MPM_V2_OBSERVATION_CONTRACT = "mpm-v2-calibration-observations-v2";
 const MPM_V2_OBSERVATION_DRY_COFFEE_GRAMS = 15.0;
+const MPM_V2_OBSERVATION_WATER_DOSE_ML = 250.0;
+const MPM_V2_WEBGPU_PROFILE_NAME = "factory-default";
 const RETENTION_PRIOR_GRAMS_PER_GRAM = 2.1;
 const SWELLING_LITERATURE_ENVELOPE_FRACTION = [0.0, 0.15];
 // Compact MPM-v2 diagnostics are dispatched every 0.25 simulated seconds. The extra 0.05 s
@@ -1783,6 +1785,44 @@ const MPM_V2_DIAGNOSTICS_FRESHNESS_SECONDS = 0.30;
 // Numerical ledger gates scale with the conserved inventory. They do not encode coffee behavior.
 const WEBGPU_LEDGER_RELATIVE_TOLERANCE = 1e-4;
 const WEBGPU_LEDGER_ABSOLUTE_TOLERANCE_GRAMS = 1e-3;
+
+function requireFinitePositiveNumber(name, value) {
+  if (!Number.isFinite(value) || value <= 0) {
+    throw new Error(`${name} must be a finite positive number`);
+  }
+}
+
+function requireFiniteNonNegativeNumber(name, value) {
+  if (!Number.isFinite(value) || value < 0) {
+    throw new Error(`${name} must be a finite non-negative number`);
+  }
+}
+
+function requirePositiveInteger(name, value) {
+  if (!Number.isFinite(value) || !Number.isSafeInteger(value) || value <= 0) {
+    throw new Error(`${name} must be a finite positive safe integer`);
+  }
+}
+
+function requireNonNegativeInteger(name, value) {
+  if (!Number.isFinite(value) || !Number.isSafeInteger(value) || value < 0) {
+    throw new Error(`${name} must be a finite non-negative safe integer`);
+  }
+}
+
+function requireFrameDurationSeconds(name, value, { allowZero = false } = {}) {
+  if (allowZero) {
+    requireFiniteNonNegativeNumber(name, value);
+  } else {
+    requireFinitePositiveNumber(name, value);
+  }
+  const frames = Math.round(value * 60);
+  if (!Number.isSafeInteger(frames) || (!allowZero && frames <= 0)) {
+    throw new Error(
+      `${name} must resolve to ${allowZero ? "a non-negative" : "a positive"} safe frame count`,
+    );
+  }
+}
 
 function calibrationValuesObject() {
   return Object.fromEntries(
@@ -1885,6 +1925,12 @@ function terminalAcceptedObservationSample(samples) {
   return terminal?.diagnostics ? terminal : null;
 }
 
+function requireAcceptedInitialObservationSample(sample) {
+  if (sample?.diagnostics) return sample;
+  const reason = sample?.diagnosticsStatus?.rejectionReason ?? "diagnostics-unavailable";
+  throw new Error(`${sample?.scenarioId ?? "observation"} initial sample rejected: ${reason}`);
+}
+
 function observedNumericOrdering(values, comparator) {
   if (!values.every(Number.isFinite)) return null;
   return values.slice(1).every((value, index) => comparator(values[index], value));
@@ -1953,9 +1999,10 @@ async function runTimedMpmV2Probe({
 }) {
   loadMpmV2ObservationScene("uniform-bed-saturation");
   setEvaluationWaterVelocity(0);
-  const samples = [
+  const initial = requireAcceptedInitialObservationSample(
     await captureMpmV2ObservationSample("initial", scenarioId, diagnosticOptions),
-  ];
+  );
+  const samples = [initial];
   const totalFrames = Math.max(0, Math.round(durationSeconds * 60));
   const sampleFrames = Math.max(1, Math.round(sampleEverySeconds * 60));
   let advancedFrames = 0;
@@ -1969,7 +2016,6 @@ async function runTimedMpmV2Probe({
       diagnosticOptions,
     ));
   }
-  const initial = samples.find((sample) => sample.diagnostics);
   const final = terminalAcceptedObservationSample(samples);
   return {
     scenarioId,
@@ -2012,25 +2058,47 @@ async function runFullDoseMpmV2Observation(options) {
   const scenarioId = "full-15g-250ml-center-pour";
   loadMpmV2ObservationScene("center-pour");
   setEvaluationWaterVelocity(pourSpeedMetersPerSecond);
-  const samples = [
+  const appliedPourSpeedMetersPerSecond = app.waterVelocityMetersPerSecond();
+  const appliedPourRateMlPerSecond = app.flowRate();
+  requireFinitePositiveNumber(
+    "appliedPourSpeedMetersPerSecond",
+    appliedPourSpeedMetersPerSecond,
+  );
+  requireFinitePositiveNumber(
+    "appliedPourRateMlPerSecond",
+    appliedPourRateMlPerSecond,
+  );
+  const initial = requireAcceptedInitialObservationSample(
     await captureMpmV2ObservationSample("initial", scenarioId, diagnosticOptions),
-  ];
+  );
+  const samples = [initial];
+  const emissionLedgerStartMl = app.totalEmittedMl();
   const pourIntervalFrames = Math.max(1, Math.round(pourSampleEverySeconds * 60));
   const maxPourFrames = Math.max(1, Math.round(maxPourSeconds * 60));
   let pourFrames = 0;
+  let nextPourSampleFrame = pourIntervalFrames;
   let stagnantSamples = 0;
   let priorEmittedMl = app.totalEmittedMl();
   let deliveryStopReason = "target-reached";
-  while (app.totalEmittedMl() < targetWaterMl && pourFrames < maxPourFrames) {
-    const nextFrames = Math.min(pourIntervalFrames, maxPourFrames - pourFrames);
-    await advanceMpmV2ObservationFrames(nextFrames);
-    pourFrames += nextFrames;
+  while (app.totalEmittedMl() - emissionLedgerStartMl < targetWaterMl
+      && pourFrames < maxPourFrames) {
+    app.stepFrame(1 / 60);
+    pourFrames += 1;
+    if (pourFrames % 60 === 0) {
+      await app.waitForGpu();
+      await nextAnimationFrame();
+    }
+    const reachedTarget = app.totalEmittedMl() - emissionLedgerStartMl >= targetWaterMl;
+    const reachedSampleFrame = pourFrames >= nextPourSampleFrame;
+    const reachedTimeLimit = pourFrames >= maxPourFrames;
+    if (!reachedTarget && !reachedSampleFrame && !reachedTimeLimit) continue;
     const sample = await captureMpmV2ObservationSample(
       `pour-${(pourFrames / 60).toFixed(2)}s`,
       scenarioId,
       diagnosticOptions,
     );
     samples.push(sample);
+    while (nextPourSampleFrame <= pourFrames) nextPourSampleFrame += pourIntervalFrames;
     const emittedMl = app.totalEmittedMl();
     stagnantSamples = emittedMl <= priorEmittedMl + 1e-6 ? stagnantSamples + 1 : 0;
     priorEmittedMl = emittedMl;
@@ -2039,10 +2107,12 @@ async function runFullDoseMpmV2Observation(options) {
       break;
     }
   }
-  if (app.totalEmittedMl() < targetWaterMl && deliveryStopReason === "target-reached") {
+  if (app.totalEmittedMl() - emissionLedgerStartMl < targetWaterMl
+      && deliveryStopReason === "target-reached") {
     deliveryStopReason = "max-pour-time";
   }
 
+  const appliedWaterDoseMl = app.totalEmittedMl() - emissionLedgerStartMl;
   setEvaluationWaterVelocity(0);
   samples.push(await captureMpmV2ObservationSample(
     "pour-off",
@@ -2077,15 +2147,25 @@ async function runFullDoseMpmV2Observation(options) {
     }
   }
   const final = terminalAcceptedObservationSample(samples);
+  const pourDurationSeconds = pourFrames / 60;
   return {
     scenarioId,
     recipe: {
-      dryCoffeeMassGrams: MPM_V2_OBSERVATION_DRY_COFFEE_GRAMS,
-      requestedWaterMl: targetWaterMl,
-      pourSpeedMetersPerSecond,
+      nominalDryCoffeeMassGrams: MPM_V2_OBSERVATION_DRY_COFFEE_GRAMS,
+      waterDoseContractMl: MPM_V2_OBSERVATION_WATER_DOSE_ML,
+      emissionLedgerStartMl,
+      appliedWaterDoseMl,
+      doseDifferenceFromContractMl: appliedWaterDoseMl - MPM_V2_OBSERVATION_WATER_DOSE_ML,
+      requestedPourSpeedMetersPerSecond: pourSpeedMetersPerSecond,
+      appliedPourSpeedMetersPerSecond,
+      appliedPourRateMlPerSecond,
+      realizedAverageDeliveryRateMlPerSecond: pourDurationSeconds > 0
+        ? appliedWaterDoseMl / pourDurationSeconds
+        : null,
+      note: "Applied dose is the emitted-particle inventory; the fixed 250 mL contract may differ because emission is discretized into particle quanta.",
     },
-    deliveredWaterMl: app.totalEmittedMl(),
-    pourDurationSeconds: pourFrames / 60,
+    appliedWaterDoseMl,
+    pourDurationSeconds,
     drainDurationSeconds: drainFrames / 60,
     deliveryStopReason,
     drainStopReason,
@@ -2127,70 +2207,113 @@ function clampCalibrationProbeValue(schema, id, value) {
 function deriveRetentionComparison(fullDose) {
   const final = terminalAcceptedObservationSample(fullDose.samples);
   if (!final) return { available: false, reason: "no-accepted-diagnostics" };
-  const { retention, inventory } = final.diagnostics;
-  const ledgerComponents = {
-    boundCapacityCarrierMassGrams: retention.boundCapacityCarrierMassGrams,
-    capillaryAllocatedCarrierMassGrams: retention.capillaryAllocatedCarrierMassGrams,
-    unmetCarrierMassGrams: retention.unmetCarrierMassGrams,
-  };
-  const accountedTarget = Object.values(ledgerComponents).reduce((sum, value) => sum + value, 0);
-  const broadPriorMass = RETENTION_PRIOR_GRAMS_PER_GRAM
-    * MPM_V2_OBSERVATION_DRY_COFFEE_GRAMS;
-  return {
-    available: true,
-    interpretation: "build-time whole-bed allocation; paper is a separate measured inventory",
+  const { inventory } = final.diagnostics;
+  const broadPriorMass = Number.isFinite(inventory.dryCoffeeMassGrams)
+      && inventory.dryCoffeeMassGrams > 0
+    ? RETENTION_PRIOR_GRAMS_PER_GRAM * inventory.dryCoffeeMassGrams
+    : null;
+  const comparison = {
+    available: false,
+    basis: "live bound carrier plus all unbound carrier physically inside the coffee-bed volume",
     broadPrior: {
       gramsWaterPerGramDryCoffee: RETENTION_PRIOR_GRAMS_PER_GRAM,
-      carrierMassGramsForRecipe: broadPriorMass,
+      carrierMassGramsForObservedDryDose: broadPriorMass,
       use: "comparison only, not an equality target",
     },
-    configuredWholeBedTargetCarrierMassGrams: retention.targetWholeBedCarrierMassGrams,
-    configuredWholeBedTargetGramsPerGram:
-      retention.targetWholeBedCarrierMassGrams / MPM_V2_OBSERVATION_DRY_COFFEE_GRAMS,
-    ledgerComponents,
-    ledgerAccountedTargetCarrierMassGrams: accountedTarget,
-    ledgerClosureResidualGrams: accountedTarget - retention.targetWholeBedCarrierMassGrams,
-    targetAttainable: retention.targetAttainable,
-    residualPoreSaturation: retention.residualPoreSaturation,
-    measuredAtFinalSample: {
-      boundCarrierMassGrams: inventory.boundCarrierMassGrams,
-      paperCarrierMassGrams: inventory.paperCarrierMassGrams,
-      note: "capillary allocation is a constitutive ledger, not a separately tagged live phase",
+    paperInventory: {
+      carrierMassGrams: Number.isFinite(inventory.paperCarrierMassGrams)
+          && inventory.paperCarrierMassGrams >= 0
+        ? inventory.paperCarrierMassGrams
+        : null,
+      includedInBedRetention: false,
     },
+    requiredDiagnosticsFields: [
+      "inventory.boundCarrierMassGrams",
+      "inventory.bedPoreCarrierMassGrams",
+      "inventory.dryCoffeeMassGrams",
+    ],
+  };
+  const boundCarrierMassGrams = inventory.boundCarrierMassGrams;
+  const bedPoreCarrierMassGrams = inventory.bedPoreCarrierMassGrams;
+  const dryCoffeeMassGrams = inventory.dryCoffeeMassGrams;
+  if (!Number.isFinite(boundCarrierMassGrams)
+      || !Number.isFinite(bedPoreCarrierMassGrams)
+      || !Number.isFinite(dryCoffeeMassGrams)) {
+    return {
+      ...comparison,
+      reason: "live-bed-retention-diagnostics-unavailable",
+    };
+  }
+  if (boundCarrierMassGrams < 0 || bedPoreCarrierMassGrams < 0 || dryCoffeeMassGrams <= 0) {
+    return {
+      ...comparison,
+      reason: "live-bed-retention-diagnostics-invalid",
+    };
+  }
+  const liveBedRetainedCarrierMassGrams = boundCarrierMassGrams + bedPoreCarrierMassGrams;
+  const liveBedRetentionGramsPerGram = liveBedRetainedCarrierMassGrams / dryCoffeeMassGrams;
+  return {
+    ...comparison,
+    available: true,
+    reason: null,
+    dryCoffeeMassGrams,
+    boundCarrierMassGrams,
+    bedPoreCarrierMassGrams,
+    liveBedRetainedCarrierMassGrams,
+    liveBedRetentionGramsPerGram,
+    differenceFromBroadPriorGramsPerGram:
+      liveBedRetentionGramsPerGram - RETENTION_PRIOR_GRAMS_PER_GRAM,
+    interpretation: "live final-sample inventory; paper is reported separately and the literature prior is not a pass/fail gate",
   };
 }
 
-function deriveSwellingComparison(fullDose, selectedMaximumFraction) {
+function derivePredictedSwellingResponse(fullDose, selectedMaximumFraction) {
   const final = terminalAcceptedObservationSample(fullDose.samples);
-  const measuredRatio = final?.diagnostics.meanDiameterRatio ?? null;
-  const measuredFraction = measuredRatio === null ? null : measuredRatio - 1;
+  const predictedRatio = final?.diagnostics.meanDiameterRatio ?? null;
+  const predictedFraction = predictedRatio === null ? null : predictedRatio - 1;
   return {
-    selectedMaximumDiameterSwellingFraction: selectedMaximumFraction,
-    measuredMeanBoundSaturation: final?.diagnostics.meanBoundSaturation ?? null,
-    measuredMeanDiameterRatio: measuredRatio,
-    measuredMeanDiameterSwellingFraction: measuredFraction,
-    saturationWeightedRatioFromSelectedSlider: final
+    modelInputMaximumDiameterSwellingFraction: selectedMaximumFraction,
+    modelStateMeanBoundSaturation: final?.diagnostics.meanBoundSaturation ?? null,
+    predictedMeanDiameterRatio: predictedRatio,
+    predictedMeanDiameterSwellingFraction: predictedFraction,
+    predictedRatioFromSelectedSlider: final
       ? 1 + final.diagnostics.meanBoundSaturation * selectedMaximumFraction
       : null,
     literatureDiameterSwellingEnvelopeFraction: SWELLING_LITERATURE_ENVELOPE_FRACTION,
-    measuredWithinLiteratureEnvelope: measuredFraction === null
+    predictedWithinLiteratureEnvelope: predictedFraction === null
       ? null
-      : measuredFraction >= SWELLING_LITERATURE_ENVELOPE_FRACTION[0]
-        && measuredFraction <= SWELLING_LITERATURE_ENVELOPE_FRACTION[1],
-    interpretation: "observation only; the literature envelope is not a calibration assertion",
+      : predictedFraction >= SWELLING_LITERATURE_ENVELOPE_FRACTION[0]
+        && predictedFraction <= SWELLING_LITERATURE_ENVELOPE_FRACTION[1],
+    interpretation: "model-predicted constitutive response, not an independent swelling measurement; the literature envelope is not a pass/fail gate",
   };
 }
 
 function captureObservationUiState() {
   return {
-    solverId: activeSolverId,
+    solverId: app.activeSolver(),
     sceneId: currentSceneId,
     sceneMode: currentSceneMode,
+    selectedSceneTab: sceneDebugTab.getAttribute("aria-selected") === "true"
+      ? "debug"
+      : "main",
     paused,
     fixedStepSeconds,
     waterVelocityMetersPerSecond: app.waterVelocityMetersPerSecond(),
     spout: { x: app.spoutX(), y: app.spoutY(), z: app.spoutZ() },
+    cameraOrientation: { yaw: app.cameraYaw(), pitch: app.cameraPitch() },
   };
+}
+
+function restoreCameraOrientation(savedOrientation) {
+  if (!Number.isFinite(savedOrientation?.yaw) || !Number.isFinite(savedOrientation?.pitch)) {
+    return false;
+  }
+  app.orbitCamera(
+    (app.cameraYaw() - savedOrientation.yaw) * 100,
+    (app.cameraPitch() - savedOrientation.pitch) * 100,
+  );
+  return Math.abs(app.cameraYaw() - savedOrientation.yaw) <= 1e-5
+    && Math.abs(app.cameraPitch() - savedOrientation.pitch) <= 1e-5;
 }
 
 async function restoreObservationUiState(saved, savedCalibration, touchedCalibration) {
@@ -2223,10 +2346,11 @@ async function restoreObservationUiState(saved, savedCalibration, touchedCalibra
   }
   currentSceneId = saved.sceneId;
   currentSceneMode = saved.sceneMode;
-  setSceneTab(saved.sceneId.startsWith("debug:") ? "debug" : "main");
+  setSceneTab(saved.selectedSceneTab);
   fixedStepSeconds = saved.fixedStepSeconds;
   app.setWaterVelocityMetersPerSecond(saved.waterVelocityMetersPerSecond);
   app.setSpoutPosition(saved.spout.x, saved.spout.y, saved.spout.z);
+  const cameraOrientationRestored = restoreCameraOrientation(saved.cameraOrientation);
   syncControlDefaultsFromSim();
   setPaused(saved.paused);
   lastFrameTime = 0;
@@ -2237,9 +2361,12 @@ async function restoreObservationUiState(saved, savedCalibration, touchedCalibra
   return {
     solverRestored: app.activeSolver() === saved.solverId,
     sceneSelectionRestored: currentSceneId === saved.sceneId,
+    sceneTabRestored:
+      sceneDebugTab.getAttribute("aria-selected") === String(saved.selectedSceneTab === "debug"),
+    cameraOrientationRestored,
     calibrationRestored,
     priorSimulationProgressRestored: false,
-    note: "The selected scene and controls are restored by reloading; GPU particle history cannot be snapshotted.",
+    note: "The selected scene, tab, controls, and camera yaw/pitch are restored by reloading; GPU particle history and camera pan/zoom cannot be snapshotted by the current API.",
   };
 }
 
@@ -2253,7 +2380,7 @@ async function runMpmV2CalibrationObservations(options = {}) {
     throw new Error("A realism evaluation, calibration observation, or benchmark is already running");
   }
   const settings = {
-    targetWaterMl: options.targetWaterMl ?? 250,
+    targetWaterMl: options.targetWaterMl ?? MPM_V2_OBSERVATION_WATER_DOSE_ML,
     pourSpeedMetersPerSecond: options.pourSpeedMetersPerSecond ?? 0.60,
     pourSampleEverySeconds: options.pourSampleEverySeconds ?? 2,
     maxPourSeconds: options.maxPourSeconds ?? 45,
@@ -2272,17 +2399,40 @@ async function runMpmV2CalibrationObservations(options = {}) {
       onSample: options.onSample ?? null,
     },
   };
-  for (const [name, value] of Object.entries(settings)) {
-    if (name === "diagnosticOptions") continue;
-    if (!Number.isFinite(value) || value < 0) throw new Error(`${name} must be non-negative`);
+  requireFinitePositiveNumber("targetWaterMl", settings.targetWaterMl);
+  if (settings.targetWaterMl !== MPM_V2_OBSERVATION_WATER_DOSE_ML) {
+    throw new Error(
+      `targetWaterMl is fixed at ${MPM_V2_OBSERVATION_WATER_DOSE_ML} mL for this observation contract`,
+    );
   }
-  if (!Number.isInteger(settings.diagnosticOptions.maxAttempts)
-      || settings.diagnosticOptions.maxAttempts <= 0) {
-    throw new Error("diagnosticMaxAttempts must be a positive integer");
+  requireFinitePositiveNumber(
+    "pourSpeedMetersPerSecond",
+    settings.pourSpeedMetersPerSecond,
+  );
+  requireFrameDurationSeconds("pourSampleEverySeconds", settings.pourSampleEverySeconds);
+  requireFrameDurationSeconds("maxPourSeconds", settings.maxPourSeconds);
+  requireFrameDurationSeconds("drainSampleEverySeconds", settings.drainSampleEverySeconds);
+  requireFrameDurationSeconds("minDrainSeconds", settings.minDrainSeconds, { allowZero: true });
+  requireFrameDurationSeconds("maxDrainSeconds", settings.maxDrainSeconds);
+  if (settings.maxDrainSeconds < settings.minDrainSeconds) {
+    throw new Error("maxDrainSeconds must be greater than or equal to minDrainSeconds");
   }
-  if (!Number.isFinite(settings.diagnosticOptions.freshnessSeconds)
-      || settings.diagnosticOptions.freshnessSeconds < 0) {
-    throw new Error("diagnosticFreshnessSeconds must be non-negative");
+  requireFrameDurationSeconds("permeabilityProbeSeconds", settings.permeabilityProbeSeconds);
+  requireFrameDurationSeconds("extractionProbeSeconds", settings.extractionProbeSeconds);
+  requireFrameDurationSeconds("probeSampleEverySeconds", settings.probeSampleEverySeconds);
+  requireFinitePositiveNumber("permeabilityDeltaLog10", settings.permeabilityDeltaLog10);
+  requireFinitePositiveNumber("extractionLowScale", settings.extractionLowScale);
+  if (settings.extractionLowScale >= 1) {
+    throw new Error("extractionLowScale must be less than 1");
+  }
+  requirePositiveInteger("diagnosticMaxAttempts", settings.diagnosticOptions.maxAttempts);
+  requireFinitePositiveNumber(
+    "diagnosticFreshnessSeconds",
+    settings.diagnosticOptions.freshnessSeconds,
+  );
+  if (settings.diagnosticOptions.onSample !== null
+      && typeof settings.diagnosticOptions.onSample !== "function") {
+    throw new Error("onSample must be a function when provided");
   }
 
   const savedUi = captureObservationUiState();
@@ -2297,7 +2447,7 @@ async function runMpmV2CalibrationObservations(options = {}) {
     heldKeys.clear();
     dragging = false;
     spoutPlaneDragging = false;
-    if (activeSolverId !== CALIBRATION_SOLVER_ID) {
+    if (app.activeSolver() !== CALIBRATION_SOLVER_ID) {
       app.setSolver(CALIBRATION_SOLVER_ID);
       activeSolverId = app.activeSolver();
     }
@@ -2403,7 +2553,7 @@ async function runMpmV2CalibrationObservations(options = {}) {
       scenarios: { fullDose, permeability, extraction },
       comparisons: {
         retention: deriveRetentionComparison(fullDose),
-        swelling: deriveSwellingComparison(
+        predictedSwellingResponse: derivePredictedSwellingResponse(
           fullDose,
           savedCalibration.max_diameter_swelling_fraction,
         ),
@@ -2571,21 +2721,58 @@ async function runWebGpuBenchmark(options = {}) {
     displayFramesPerBatch = 10,
     width = 1280,
     height = 720,
+    profileName = MPM_V2_WEBGPU_PROFILE_NAME,
   } = options;
-  if (warmupDisplayFrames < 0 || batchCount <= 0 || displayFramesPerBatch <= 0) {
-    throw new Error("Benchmark frame and batch counts must be positive");
+  requireNonNegativeInteger("warmupDisplayFrames", warmupDisplayFrames);
+  requirePositiveInteger("batchCount", batchCount);
+  requirePositiveInteger("displayFramesPerBatch", displayFramesPerBatch);
+  requirePositiveInteger("width", width);
+  requirePositiveInteger("height", height);
+  if (width > 0xffff_ffff || height > 0xffff_ffff) {
+    throw new Error("Benchmark width and height must fit the WebAssembly u32 interface");
+  }
+  const measuredDisplayFrames = batchCount * displayFramesPerBatch;
+  if (!Number.isSafeInteger(measuredDisplayFrames)
+      || !Number.isSafeInteger(measuredDisplayFrames * 2)) {
+    throw new Error("Benchmark batchCount × displayFramesPerBatch is too large");
+  }
+  if (profileName !== MPM_V2_WEBGPU_PROFILE_NAME) {
+    throw new Error(
+      `profileName must be the reproducible benchmark profile '${MPM_V2_WEBGPU_PROFILE_NAME}'`,
+    );
   }
 
+  const appliedOptions = {
+    warmupDisplayFrames,
+    batchCount,
+    displayFramesPerBatch,
+    width,
+    height,
+    profileName,
+  };
+  const savedUi = captureObservationUiState();
+  const touchedCalibration = new Set();
+  let savedCalibration = null;
+  let benchmarkCalibration = null;
+  let profileResetSimulation = false;
+  let result = null;
   evaluationActive = true;
+  clearCalibrationApplyTimers();
   try {
     setPaused(true);
     heldKeys.clear();
     dragging = false;
     spoutPlaneDragging = false;
-    if (activeSolverId !== CALIBRATION_SOLVER_ID) {
-      selectSolver(CALIBRATION_SOLVER_ID);
-      setPaused(true);
+    if (app.activeSolver() !== CALIBRATION_SOLVER_ID) {
+      app.setSolver(CALIBRATION_SOLVER_ID);
+      activeSolverId = app.activeSolver();
     }
+    savedCalibration = calibrationValuesObject();
+    for (const id of Object.keys(savedCalibration)) touchedCalibration.add(id);
+    profileResetSimulation = app.resetCalibrationDefaults();
+    benchmarkCalibration = calibrationValuesObject();
+    syncSolverSelect();
+    setPaused(true);
     app.loadMpmV2LateBrewBenchmark();
     currentSceneId = "mpm-v2-late-brew-benchmark";
     currentSceneMode = "MPM v2 Late Brew Benchmark";
@@ -2635,7 +2822,6 @@ async function runWebGpuBenchmark(options = {}) {
     const medianMs = quantile(sorted, 0.5);
     const p95Ms = quantile(sorted, 0.95);
     const p99Ms = quantile(sorted, 0.99);
-    const measuredDisplayFrames = batchCount * displayFramesPerBatch;
     const simulatedSeconds = measuredDisplayFrames * 2 / 60;
     const realTimeFactor = simulatedSeconds / (measuredWallMilliseconds / 1000);
     // This compact-cache freshness poll is deliberately after the final measured batch. It may
@@ -2647,8 +2833,15 @@ async function runWebGpuBenchmark(options = {}) {
     if (medianMs > 33.3) rejectionReasons.push(`median-frame-ms:${medianMs}`);
     if (realTimeFactor < 1.0) rejectionReasons.push(`real-time-factor:${realTimeFactor}`);
     rejectionReasons.push(...diagnosticAssessment.rejectionReasons);
-    const result = {
-      contract: "mpm-v2-webgpu-30fps-v1",
+    result = {
+      contract: "mpm-v2-webgpu-30fps-v2",
+      appliedOptions,
+      benchmarkProfile: {
+        name: profileName,
+        source: "MPM-v2 calibration defaults applied with resetCalibrationDefaults",
+        calibrationValues: benchmarkCalibration,
+        simulationResetWhenApplied: profileResetSimulation,
+      },
       passed: timingPassed && diagnosticAssessment.accepted,
       timingPassed,
       diagnosticsPassed: diagnosticAssessment.accepted,
@@ -2682,10 +2875,20 @@ async function runWebGpuBenchmark(options = {}) {
     console.info("Coffee sim WebGPU benchmark", result);
     return result;
   } finally {
-    evaluationActive = false;
-    lastFrameTime = 0;
-    simulationAccumulatorSeconds = 0;
-    resizeCanvas();
-    syncUi();
+    let restoration;
+    try {
+      restoration = await restoreObservationUiState(
+        savedUi,
+        savedCalibration,
+        touchedCalibration,
+      );
+    } finally {
+      evaluationActive = false;
+      lastFrameTime = 0;
+      simulationAccumulatorSeconds = 0;
+      resizeCanvas();
+      syncUi();
+    }
+    if (result) result.restoration = restoration;
   }
 }
