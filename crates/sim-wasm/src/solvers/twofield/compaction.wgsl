@@ -167,6 +167,13 @@ fn p2g_solid_macro(@builtin(global_invocation_id) gid: vec3<u32>) {
     base = clamp(base, vec3<i32>(0), vec3<i32>(params.grid_dims.xyz) - vec3<i32>(3));
     let fx = xl - vec3<f32>(base);
     var w = bspline_w(fx);
+    let total_structure = fp_encode(volume);
+    let total_capacity = fp_encode(max(params.solute.w, 0.0));
+    let total_bloom_volume = fp_encode(volume * bloom_factor(chem[p].w));
+    var allocated_structure = 0i;
+    var allocated_capacity = 0i;
+    var allocated_bloom_volume = 0i;
+    var cumulative_weight = 0.0;
     for (var k = 0; k < 3; k = k + 1) {
         for (var j = 0; j < 3; j = j + 1) {
             for (var ii = 0; ii < 3; ii = ii + 1) {
@@ -178,7 +185,29 @@ fn p2g_solid_macro(@builtin(global_invocation_id) gid: vec3<u32>) {
                 if (speed > params.max_speed) { va *= params.max_speed / speed; }
                 let n = node_index(node);
                 let mi = 4u * n;
-                atomicAdd(&grid_sfp[n], fp_encode(volume * weight));
+                cumulative_weight += weight;
+                let is_last = ii == 2 && j == 2 && k == 2;
+                let structure_target = extensive_partition_target(
+                    total_structure, cumulative_weight, is_last,
+                );
+                let capacity_target = extensive_partition_target(
+                    total_capacity, cumulative_weight, is_last,
+                );
+                let bloom_target = extensive_partition_target(
+                    total_bloom_volume, cumulative_weight, is_last,
+                );
+                atomicAdd(&grid_sfp[n], structure_target - allocated_structure);
+                atomicAdd(
+                    &cell_cnt[capillary_capacity_index(n)],
+                    u32(max(capacity_target - allocated_capacity, 0)),
+                );
+                atomicAdd(
+                    &cell_cnt[bloom_volume_index(n)],
+                    u32(max(bloom_target - allocated_bloom_volume, 0)),
+                );
+                allocated_structure = structure_target;
+                allocated_capacity = capacity_target;
+                allocated_bloom_volume = bloom_target;
                 atomicAdd(&grid_scomp[n], fp_encode(volume * ep * weight));
                 atomicAdd(&grid_sm[mi + 0u], fp_encode(mass * weight));
                 atomicAdd(&grid_sm[mi + 1u], fp_encode(mass * weight * va.x));

@@ -318,6 +318,44 @@ fn solid_contact_velocity_bc(xp: vec3<f32>, velocity: vec3<f32>) -> vec3<f32> {
     return v;
 }
 
+// ================================ p2g_solid_reference ==========================================
+// Preserve the frame-start pure APIC dry-solid proposal. The semi-implicit path rebuilds grid_sm
+// during shear microsteps, so that final grid cannot serve as v_s^n for the later retention split.
+@compute @workgroup_size(256)
+fn p2g_solid_reference(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= params.solid_count) { return; }
+    let p = params.particle_count - params.solid_count + i;
+    let h = params.grid_origin.w;
+    let x = pos[p].xyz;
+    let v = vel[p].xyz;
+    let c0 = cmat[3u * p + 0u].xyz;
+    let c1 = cmat[3u * p + 1u].xyz;
+    let c2 = cmat[3u * p + 2u].xyz;
+    let mass = grain_effective_mass(p);
+    let xl = (x - params.grid_origin.xyz) / h;
+    var base = vec3<i32>(floor(xl - vec3<f32>(0.5)));
+    base = clamp(base, vec3<i32>(0), vec3<i32>(params.grid_dims.xyz) - vec3<i32>(3));
+    let w = bspline_w(xl - vec3<f32>(base));
+    for (var kk = 0; kk < 3; kk = kk + 1) {
+        for (var j = 0; j < 3; j = j + 1) {
+            for (var ii = 0; ii < 3; ii = ii + 1) {
+                let weight = w[ii].x * w[j].y * w[kk].z;
+                let node = base + vec3<i32>(ii, j, kk);
+                let d = (vec3<f32>(node) - xl) * h;
+                var va = v + vec3<f32>(dot(c0, d), dot(c1, d), dot(c2, d));
+                let speed = length(va);
+                if (speed > params.max_speed) { va *= params.max_speed / speed; }
+                let n = node_index(node) * 4u;
+                atomicAdd(&grid_sraw[n + 0u], fp_encode(mass * weight));
+                atomicAdd(&grid_sraw[n + 1u], fp_encode(mass * weight * va.x));
+                atomicAdd(&grid_sraw[n + 2u], fp_encode(mass * weight * va.y));
+                atomicAdd(&grid_sraw[n + 3u], fp_encode(mass * weight * va.z));
+            }
+        }
+    }
+}
+
 // =================================== p2g_solid_dyn =============================================
 // Solid P2G, dynamic mode: saturation-driven structural volume into grid_sfp (the same helper
 // as frozen p2g_solid) plus wet effective mass/momentum with APIC and the fused MLS-MPM stress
@@ -356,6 +394,13 @@ fn p2g_solid_dyn(@builtin(global_invocation_id) gid: vec3<u32>) {
     let fx = xl - vec3<f32>(base);
     var w = bspline_w(fx);
     let vg = grain_structural_volume(pos[p].w);
+    let total_structure = fp_encode(vg);
+    let total_capacity = fp_encode(max(params.solute.w, 0.0));
+    let total_bloom_volume = fp_encode(vg * bloom_factor(chem[p].w));
+    var allocated_structure = 0i;
+    var allocated_capacity = 0i;
+    var allocated_bloom_volume = 0i;
+    var cumulative_weight = 0.0;
     for (var kk = 0; kk < 3; kk = kk + 1) {
         for (var j = 0; j < 3; j = j + 1) {
             for (var i2 = 0; i2 < 3; i2 = i2 + 1) {
@@ -370,7 +415,29 @@ fn p2g_solid_dyn(@builtin(global_invocation_id) gid: vec3<u32>) {
                     vaff = vaff * (params.max_speed / sp);
                 }
                 let ni = node_index(node);
-                atomicAdd(&grid_sfp[ni], fp_encode(vg * wijk));
+                cumulative_weight += wijk;
+                let is_last = i2 == 2 && j == 2 && kk == 2;
+                let structure_target = extensive_partition_target(
+                    total_structure, cumulative_weight, is_last,
+                );
+                let capacity_target = extensive_partition_target(
+                    total_capacity, cumulative_weight, is_last,
+                );
+                let bloom_target = extensive_partition_target(
+                    total_bloom_volume, cumulative_weight, is_last,
+                );
+                atomicAdd(&grid_sfp[ni], structure_target - allocated_structure);
+                atomicAdd(
+                    &cell_cnt[capillary_capacity_index(ni)],
+                    u32(max(capacity_target - allocated_capacity, 0)),
+                );
+                atomicAdd(
+                    &cell_cnt[bloom_volume_index(ni)],
+                    u32(max(bloom_target - allocated_bloom_volume, 0)),
+                );
+                allocated_structure = structure_target;
+                allocated_capacity = capacity_target;
+                allocated_bloom_volume = bloom_target;
                 let mi = ni * 4u;
                 atomicAdd(&grid_sm[mi + 0u], fp_encode(m_s * wijk));
                 atomicAdd(&grid_sm[mi + 1u], fp_encode(m_s * wijk * vaff.x));

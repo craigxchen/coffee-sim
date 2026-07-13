@@ -101,24 +101,24 @@
 // under-dense (free-surface) cell gets NO suction — surface physics belongs to U4.
 //
 // ================================ MIXTURE FAMILY (U6/U7, KTD-4) ===============================
-// With a solid field the constraint is mixture continuity
-//     div(phi_f*v_f + phi_s*v_s) = s.
-// Frozen mode has v_s=0 and retains the U6 operator
-//     A = -D * phi_f * (sigma/rho_f) * P_f * G.
+// With retention the constraint is mobile/composite mixture continuity
+//     div(phi_m*v_m + phi_c*v_c) = s.
+// Frozen mode has v_c=0 and retains the U6 operator
+//     A = -D * phi_m * (sigma/rho_m) * P_m * G.
 // Dynamic mode obtains sigma from the exact two-mass drag pair and analytically condenses its
 // pressure response into phase mobilities r_f and r_s. node_setup assembles
-//     K = phi_f*r_f*P_f + phi_s*r_s*P_s,
+//     K = phi_m*r_m*P_m + phi_c*r_c*P_c,
 // the symmetric positive node mobility seen by A=-D*K*G; project applies the corresponding
 // intrinsic phase corrections r_f*P_f*G p and r_s*P_s*G p separately. Thus neither phase is a
 // diagnostic reaction sink, and D, A, and project all use one two-phase operator family.
 //
-// The water density is intrinsic rho_n/phi_f (bulk pore-water density under-states rho_f by
-// phi_f); solid density is its co-scattered node mass/volume. Frozen sigma is Delta-t_eff/dt;
+// The mobile-water density is intrinsic rho_n/phi_m; composite mass is dry solid plus held water.
+// Frozen sigma is Delta-t_eff/dt;
 // dynamic sigma=(1-exp(-gamma*dt))/(gamma*dt), the relative-mode response of the pair (see
-// coupling.wgsl). The free-water limit phi_f=1, sigma=1 is exact passthrough (arithmetic by 1
+// coupling.wgsl). The free-water limit phi_m=1, sigma=1 is exact passthrough (arithmetic by 1
 // is bitwise-identical — the free-water regression gate pins this). cell_classify's density
-// census normalizes by the corner φ_f for the same reason: a saturated pore cell at
-// ρ̄ = φ_f·ρ_rest is FULL, not a surface cell, and must get neither relief nor suction.
+// census normalizes by the corner phi_m for the same reason: mobile carrier filling the available
+// phase is FULL, not a surface cell, and must get neither relief nor suction.
 //
 // Damped Jacobi: p ← p + ω·(rhs − A p)/diag(A), ω = JACOBI_OMEGA (fixed algorithmic constant,
 // mirrored in mod.rs for the CPU twins), diag(A)_c = Σ_n s(o)ᵀ·M̃⁻¹_n·s(o) / (16h²).
@@ -434,13 +434,27 @@ fn dynamic_phase_mobilities_from_node_masses(
     );
 }
 
-// The velocity whose divergence closes the incompressible mixture constraint. Dynamic mode
-// carries both phase velocities; frozen mode deliberately reduces to phi_f*v_f because v_s=0.
-// Keep every RHS/debug/cavity gather on this helper so the pressure family cannot accidentally
-// regress to a water-only divergence in one path.
+// grid_vel carries the homogenized single-water velocity
+//   v_bar = theta*v_mobile + (1-theta)*v_s.
+// Reconstruct intrinsic mobile velocity before taking mixture divergence so D remains adjoint to
+// the G/project response. Capacity zero gives theta=1 and returns grid_vel bit-for-bit.
+fn intrinsic_mobile_velocity_at(n: u32) -> vec3<f32> {
+    let theta = measured_mobile_fraction(n);
+    var solid_velocity = vec3<f32>(0.0);
+    if (params.splas0.x > 0.5) {
+        solid_velocity = grid_svel[n].xyz;
+    }
+    if (theta <= 0.0) { return solid_velocity; }
+    if (theta >= 1.0) { return grid_vel[n].xyz; }
+    return (grid_vel[n].xyz - (1.0 - theta) * solid_velocity) / theta;
+}
+
+// The velocity whose divergence closes the incompressible mixture constraint. Keep every
+// RHS/debug/cavity gather on this helper so the pressure family cannot accidentally regress to a
+// homogenized-water or water-only divergence in one path.
 fn mixture_velocity_at(n: u32, phi_f: f32) -> vec3<f32> {
-    var velocity = phi_f * grid_vel[n].xyz;
-    if (params.splas0.x > 0.5 && grid_svel[n].w > params.extra.z) {
+    var velocity = phi_f * intrinsic_mobile_velocity_at(n);
+    if (params.splas0.x > 0.5) {
         velocity += (1.0 - phi_f) * grid_svel[n].xyz;
     }
     return velocity;
@@ -477,23 +491,42 @@ fn node_setup(@builtin(global_invocation_id) gid: vec3<u32>) {
     let sig = react[n].w;
     let c = node_coords(n);
     let xp = params.grid_origin.xyz + vec3<f32>(f32(c.x), f32(c.y), f32(c.z)) * h;
-    // φ_f from the solid field, wall-truncation-normalized (node_phi_f in coupling.wgsl —
-    // skips the vis loop entirely at zero-solid nodes: exact passthrough φ_f = 1.0).
-    let phi_f = node_phi_f(n, xp);
+    // Resolved structural pore volume is reduced by ACTUAL H, not a build-time target. Normally
+    // (P-H)/V_visible is the mobile phase in nm.b.w; the explicit overflow closure remains finite
+    // when P-H=0,M>0. Capacity zero recovers structural phi_f exactly.
+    let structural_phi_f = node_phi_f(n, xp);
+    var phi_f = structural_phi_f;
+    var theta = 1.0;
+    var mobile_mass = mass;
+    var held_mass = 0.0;
+    if (structural_phi_f < 1.0) {
+        let visible_volume = node_visible_volume(xp);
+        let capillary = capillary_node_state(n, structural_phi_f, visible_volume);
+        phi_f = capillary_mobile_fraction(capillary, visible_volume);
+        theta = store_measured_held_carrier(n, capillary);
+        mobile_mass = mass * theta;
+        held_mass = mass - mobile_mass;
+    } else {
+        atomicStore(&cell_cnt[held_carrier_mass_index(n)], 0u);
+    }
     let open_base = params.coupling.w > 0.5;
     let fluid_projector = phase_pressure_projector(xp, PHASE_WATER, open_base);
-    if (mass > params.extra.z && fluid_projector.b.z > 0.5) {
+    if (mobile_mass > params.extra.z && theta > 0.0 && fluid_projector.b.z > 0.5) {
         let phi_s = 1.0 - phi_f;
         let solid_mass = grid_svel[n].w;
+        let composite_mass = solid_mass + held_mass;
+        // Held water alone cannot turn a quantized dry-bed fringe into a dynamic skeleton. A
+        // paired composite exists only when an independently resolved dry-solid mass exists.
         let dynamic_pair = params.splas0.x > 0.5
             && solid_mass > params.extra.z
+            && composite_mass > params.extra.z
             && phi_s > 0.0;
         if (dynamic_pair) {
             // No density floor in the paired system: sigma came from these exact two masses.
             let phase_mobility = dynamic_phase_mobilities_from_node_masses(
                 phi_f,
-                mass,
-                solid_mass,
+                mobile_mass,
+                composite_mass,
                 h,
                 sig,
             );
@@ -506,19 +539,16 @@ fn node_setup(@builtin(global_invocation_id) gid: vec3<u32>) {
                 ),
             );
         } else {
-            // Water-only/frozen stabilization retains the wall-truncated density floor. It must
-            // not enter a dynamic pair because it would change the mass fractions relative to
-            // drag's actual m_f/m_s system.
-            let rho_f = mass / (h * h * h) / phi_f;
+            // A stores the intrinsic mobile response because D reconstructs intrinsic mobile
+            // velocity from v_bar. Project multiplies the gathered correction by theta before
+            // writing the homogenized field, keeping D/G/project adjoint.
+            let rho_f = mobile_mass / (h * h * h) / phi_f;
             let vis = node_vis(xp);
             let invr_f = 1.0 / max(rho_f, params.extra.y * max(vis, 1.0) / 8.0);
-            if (params.splas0.x > 0.5) {
-                // Dynamic node without a resolved solid-volume/mass partner: water-only.
-                mobility = minv_scale(fluid_projector, invr_f);
-            } else {
-                // Frozen skeleton: retain the exact U6 forced-drag mobility sigma/rho_f.
-                mobility = minv_scale(fluid_projector, invr_f * sig);
-            }
+            // Frozen skeleton, including a quantized structural fringe with no independently
+            // resolved dry mass: retain the exact forced-drag mobility sigma/rho_f. The M=0
+            // branch never reaches here, so a positive Corey floor cannot mobilize held water.
+            mobility = minv_scale(fluid_projector, invr_f * sig);
         }
     }
     nm[2u * n + 0u] = mobility.a;
@@ -528,7 +558,7 @@ fn node_setup(@builtin(global_invocation_id) gid: vec3<u32>) {
 // =================================== cell_classify =============================================
 // Per fine cell: fill fraction f from grid mass (header: FREE SURFACE — f = 0 masks the cell,
 // f < 1 tapers its row through the surface band), rhs = f·(s_target − D(Φv))/dt on fluid rows
-// using the shared mixture velocity phi_f*v_f + phi_s*v_s (with v_s=0 in frozen mode), and
+// using the shared mixture velocity phi_m*v_m + phi_c*v_c (with v_c=0 in frozen mode), and
 // zero both pressure
 // ping-pong slots (the deterministic p₀ = 0 — the coarse prolongation overwrites the seed
 // when enabled). The density census divides each corner mass by its φ_f so a saturated pore
@@ -553,7 +583,7 @@ fn cell_classify(@builtin(global_invocation_id) gid: vec3<u32>) {
             for (var ox = 0; ox < 2; ox = ox + 1) {
                 let node = cc + vec3<i32>(ox, oy, oz);
                 let nflat = node_index(node);
-                let phin = nm[2u * nflat + 1u].w; // φ_f (node_setup runs first)
+                let phin = nm[2u * nflat + 1u].w; // remaining mobile-pore fraction
                 let s = corner_sign(vec3<i32>(ox, oy, oz));
                 div = div + dot(s, mixture_velocity_at(nflat, phin)) / (4.0 * h);
                 let gv = grid_vel[nflat];
@@ -570,10 +600,25 @@ fn cell_classify(@builtin(global_invocation_id) gid: vec3<u32>) {
                     wallish = solid_union(xp, PHASE_WATER).dist < 0.0;
                 }
                 if (!wallish) {
-                    let carrier_mass = carrier_mass_at(nflat);
-                    mass = mass + carrier_mass / phin;
-                    cnt = cnt + 1.0;
-                    mmin = min(mmin, carrier_mass / phin);
+                    let sv = solid_volume_at(nflat);
+                    if (sv <= 0.0) {
+                        // Exact disabled/water-only path: do not round-trip carrier mass through
+                        // volume when no bed closure exists.
+                        let carrier_mass = carrier_mass_at(nflat);
+                        mass = mass + carrier_mass / phin;
+                        cnt = cnt + 1.0;
+                        mmin = min(mmin, carrier_mass / phin);
+                    } else {
+                        let visible = node_visible_volume(xp);
+                        let structural_phi_f = phi_f_from_solid_and_visible_volume(sv, visible);
+                        let capillary = capillary_node_state(nflat, structural_phi_f, visible);
+                        if (phin > 0.0 && capillary.mobile_volume > 0.0) {
+                            let mobile_carrier_mass = capillary.mobile_volume * params.extra.x;
+                            mass = mass + mobile_carrier_mass / phin;
+                            cnt = cnt + 1.0;
+                            mmin = min(mmin, mobile_carrier_mass / phin);
+                        }
+                    }
                 }
             }
         }
@@ -1107,25 +1152,37 @@ fn project(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
     let dynamic = params.splas0.x > 0.5;
-    let water_mass = grid_vel[n].w;
+    let total_water_mass = grid_vel[n].w;
+    var theta = 1.0;
+    var visible_volume = h * h * h;
+    var held_volume = 0.0;
+    let coords = node_coords(n);
+    let xp = params.grid_origin.xyz
+        + vec3<f32>(f32(coords.x), f32(coords.y), f32(coords.z)) * h;
+    if (sv > 0.0) {
+        visible_volume = node_visible_volume(xp);
+        theta = measured_mobile_fraction(n);
+        held_volume = measured_held_volume_at(n);
+    }
+    let water_mass = total_water_mass * theta;
+    let held_mass = total_water_mass - water_mass;
     let solid_mass = grid_svel[n].w;
+    let composite_mass = solid_mass + held_mass;
     let phi_f = m.b.w;
     let phi_s = 1.0 - phi_f;
     let dynamic_pair = dynamic
         && m.b.z >= 0.5
         && water_mass > params.extra.z
         && solid_mass > params.extra.z
+        && composite_mass > params.extra.z
         && phi_s > 0.0;
     if (dynamic_pair) {
-        let coords = node_coords(n);
-        let xp = params.grid_origin.xyz
-            + vec3<f32>(f32(coords.x), f32(coords.y), f32(coords.z)) * h;
         // Reuse the exact mass-derived response assembled by node_setup. No phase density floor
         // is permitted here: it would make project differ from A and from drag's m_f/m_s pair.
         let phase_mobility = dynamic_phase_mobilities_from_node_masses(
             phi_f,
             water_mass,
-            solid_mass,
+            composite_mass,
             h,
             react[n].w,
         );
@@ -1137,24 +1194,34 @@ fn project(@builtin(global_invocation_id) gid: vec3<u32>) {
         let solid_projector = phase_pressure_projector(xp, PHASE_SOLID, false);
         let dv_f = params.dt * phase_mobility.fluid * minv_apply(fluid_projector, gp);
         let dv_s = params.dt * phase_mobility.solid * minv_apply(solid_projector, gp);
-        grid_vel[n] = vec4<f32>(grid_vel[n].xyz - dv_f, water_mass);
+        let dv_shared = theta * dv_f + (1.0 - theta) * dv_s;
+        grid_vel[n] = vec4<f32>(grid_vel[n].xyz - dv_shared, total_water_mass);
         grid_svel[n] = vec4<f32>(grid_svel[n].xyz - dv_s, solid_mass);
         return;
     }
 
-    let dv = minv_apply(m, gp) * params.dt;
-    if (!dynamic && sv > 0.0) {
+    let dv_mobile = minv_apply(m, gp) * params.dt;
+    let dv_shared = theta * dv_mobile;
+    if (!dynamic_pair && sv > 0.0) {
         let sig = react[n].w;
         var via = vec3<f32>(0.0);
-        if (m.b.z >= 0.5 && sig > 1.0e-6) {
-            // (1−ς)/ς · m_w·|dv|: the pressure share routed through the drag fold.
-            via = grid_vel[n].w * dv * ((1.0 - sig) / sig);
+        if (m.b.z >= 0.5 && phi_f > 0.0) {
+            // Drag-transmitted pressure share on a fixed composite. This explicit volume form is
+            // finite at sigma=0 and equals (1-sigma)*phi_m*V*dt*P_f*grad(p).
+            let fluid_projector = phase_pressure_projector(
+                xp,
+                PHASE_WATER,
+                params.coupling.w > 0.5,
+            );
+            via = (1.0 - sig) * phi_f * visible_volume * params.dt
+                * minv_apply(fluid_projector, gp);
         }
-        let direct = -sv * params.dt * gp; // −V_s·Δt·∇p: pressure on the solid volume
+        // Direct pressure load acts on the complete fixed composite Vs+H, not dry structure only.
+        let direct = -(sv + held_volume) * params.dt * gp;
         react[n] = vec4<f32>(react[n].xyz + direct - via, sig);
     }
     if (m.b.z >= 0.5) {
-        grid_vel[n] = vec4<f32>(grid_vel[n].xyz - dv, grid_vel[n].w);
+        grid_vel[n] = vec4<f32>(grid_vel[n].xyz - dv_shared, grid_vel[n].w);
     }
 }
 

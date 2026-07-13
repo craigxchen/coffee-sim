@@ -42,8 +42,8 @@ const DENS_SLOW_LO: f32 = 0.5;
 const DENS_SLOW_HI: f32 = 3.0;
 
 // Zero the fixed-point water-field lanes (mass + momentum), the solid-volume lane (U6), and
-// the per-cell particle counts for this frame's scatter (cells < nodes, so the node-sized
-// dispatch covers both).
+// the per-cell/node auxiliary counts for this frame's scatter (cells < nodes, so the node-sized
+// dispatch covers both). The finite paper reservoir is persistent and intentionally absent.
 @compute @workgroup_size(256)
 fn grid_clear(@builtin(global_invocation_id) gid: vec3<u32>) {
     let n = gid.x;
@@ -60,6 +60,10 @@ fn grid_clear(@builtin(global_invocation_id) gid: vec3<u32>) {
     atomicStore(&grid_sm[n * 4u + 1u], 0);
     atomicStore(&grid_sm[n * 4u + 2u], 0);
     atomicStore(&grid_sm[n * 4u + 3u], 0);
+    atomicStore(&grid_sraw[n * 4u + 0u], 0);
+    atomicStore(&grid_sraw[n * 4u + 1u], 0);
+    atomicStore(&grid_sraw[n * 4u + 2u], 0);
+    atomicStore(&grid_sraw[n * 4u + 3u], 0);
     // U9 moisture volume + volume-momentum ledger (read only when absorption is on; cleared
     // unconditionally so the node pass count does not change with the feature gate).
     let moist = n * MOIST_STRIDE;
@@ -79,6 +83,9 @@ fn grid_clear(@builtin(global_invocation_id) gid: vec3<u32>) {
         atomicStore(&cell_cnt[n], 0u);
     }
     atomicStore(&cell_cnt[carrier_mass_index(n)], 0u);
+    atomicStore(&cell_cnt[capillary_capacity_index(n)], 0u);
+    atomicStore(&cell_cnt[bloom_volume_index(n)], 0u);
+    atomicStore(&cell_cnt[held_carrier_mass_index(n)], 0u);
 }
 
 // Quadratic B-spline scatter of mass + APIC momentum m·(v + C·(x_i − x_p)) via fixed-point

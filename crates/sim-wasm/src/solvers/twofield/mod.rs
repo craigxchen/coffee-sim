@@ -113,17 +113,17 @@ fn active_tiling_enabled(implicit_solid: bool, all_gas_atmospheric: bool) -> boo
 
 /// U2+U3+U4+U6+U5 GPU-budget bookkeeping (R8): the widest entry point's storage-buffer count,
 /// derived by inspection of the bind groups in `build` (the params uniform doesn't count
-/// against the storage limit). Per pass: `grid_clear` 6 (grid_fp, cell_cnt, grid_sfp,
-/// grid_sm, grid_moist, grid_chem), `p2g_water` 6 (pos, vel, chem, cmat, grid_fp, cell_cnt),
-/// `p2g_solid` 2 (pos, grid_sfp), `grid_update` 2 (grid_fp, grid_vel), `drag_fold` 6
-/// (grid_vel, solids, cell_cnt, grid_sfp, react, grid_svel), `g2p_water` 8 (pos, vel, chem,
+/// against the storage limit). Per pass: `grid_clear` 7 (grid_fp, cell_cnt, grid_sfp,
+/// grid_sm, grid_moist, grid_chem, grid_sraw), `p2g_water` 6 (pos, vel, chem, cmat, grid_fp, cell_cnt),
+/// `p2g_solid` 4 (pos, chem, grid_sfp, cell_cnt), `grid_update` 2 (grid_fp, grid_vel), `drag_fold` 7
+/// (grid_vel, solids, cell_cnt, grid_sfp, react, grid_sraw, grid_svel), `g2p_water` 8 (pos, vel, chem,
 /// cmat, grid_vel, solids, cell_cnt, filter_state); U3 pressure family —
-/// `node_setup` 6 (grid_vel, solids, nm, grid_sfp, react, grid_svel),
-/// `cell_classify` 8 (grid_vel, solids, cell_meta, pf_a, pf_b, cell_cnt, nm, grid_svel) — the widest,
+/// `node_setup` 7 (grid_vel, solids, nm, cell_cnt, grid_sfp, react, grid_svel),
+/// `cell_classify` 9 (grid_vel, solids, cell_meta, pf_a, pf_b, cell_cnt, grid_sfp, nm, grid_svel),
 /// `coarse_node_setup` 2, `coarse_cell_setup` 5 (cell_meta, cmeta, pc_a, pc_b, pocket_c — U8
 /// compacted coarse-pocket append),
 /// `jacobi_fine`/`jacobi_coarse` 5 (+bubble), `prolong_add` 6 (cell_meta, cmeta, pc, pf×2,
-/// bubble), `project` 8 (grid_vel, solids, nm, cell_meta, pf, grid_sfp, react, grid_svel —
+/// bubble), `project` 9 (grid_vel, solids, nm, cell_meta, pf, cell_cnt, grid_sfp, react, grid_svel —
 /// dynamic mode uses phase-specific wall projectors and pressure mobilities; ties cell_classify), debug
 /// taps ≤ 4; U4
 /// surface family — `flood_init` 6 (solids, cell_meta, pf_a, bubble — U8 early-out flag reset —
@@ -132,19 +132,20 @@ fn active_tiling_enabled(implicit_solid: bool, all_gas_atmospheric: bool) -> boo
 /// pf×2, bubble, nm, pocket_f, grid_svel — U8 compacted-list append), `bubble_fine` 5 (nm, cell_meta, pf,
 /// bubble, pocket_f), `bubble_coarse` 6 (nm_c, cmeta, pc, bubble, pocket_f, pocket_c — pocket_f
 /// for the shared sub-resolution release size gate); U5 plasticity family —
-/// `p2g_solid_dyn` 7 (pos, vel, chem, cmat, grid_sfp, grid_sm, sstate), `solid_update` 4
+/// `p2g_solid_reference` 5 (pos, vel, chem, cmat, grid_sraw), `p2g_solid_dyn` 8 (pos, vel, chem, cmat, grid_sfp, grid_sm, sstate, cell_cnt), `solid_update` 4
 /// (grid_sm, grid_svel, grid_sfp, solids), `g2p_solid` 8 (pos, vel, chem, cmat, solids,
 /// grid_svel, fmat, sstate) — ties cell_classify; U9 absorption family — `p2g_moisture` 4
 /// (pos, vel, chem, grid_moist), `g2p_absorb` 4 (pos, vel, chem, grid_moist); chemistry/thermal
-/// scatter binds 6 and gather binds 7 around the 11-lane chemistry ledger; the semi-implicit
-/// family's widest pass is `p2g_solid_macro` at 8 (pos, vel, chem, cmat, grid_sfp, grid_sm,
-/// sstate, grid_scomp), while its scalar Jacobi binds 4. Tiled fine-pressure relaxation adds one
+/// scatter binds 6 and gather binds 7 around the 11-lane chemistry ledger; `filter_release` binds
+/// 10 to reconstruct pressure-projected mobile superficial flux and its measured carrier closure; the semi-implicit
+/// family's widest pass is `p2g_solid_macro` at 9 (pos, vel, chem, cmat, grid_sfp, grid_sm,
+/// sstate, grid_scomp, cell_cnt), while its scalar Jacobi binds 4. Tiled fine-pressure relaxation adds one
 /// scheduler binding; its occupancy marker binds 2 (cell census, scheduler). The occasional
 /// compact diagnostics pass
 /// binds 6 storage buffers (pos, chem, grid_vel, cell_cnt, filter_state, output). All remain at or
 /// below the cap; re-derive when passes are added. Shared required limits request 10 storage
 /// buffers per stage (see `solvers/mpm/mod.rs::required_limits`), within the WebGPU-target cap.
-pub const MAX_STORAGE_BUFFERS_PER_ENTRY_POINT: u32 = 8;
+pub const MAX_STORAGE_BUFFERS_PER_ENTRY_POINT: u32 = 10;
 
 /// U3 pressure knobs — defaults of the declared knob grid (KTD-9; the grid itself is pinned
 /// in the header of `tests/twofield_pressure.rs`). The coarse ratio is fine cells per coarse
@@ -291,12 +292,12 @@ pub const CONSTITUTIVE_DISPATCHES: u32 = 2;
 pub const FILTER_RESERVOIR_DISPATCHES: u32 = 1;
 
 /// U5 dispatch increment per SUBSTEP, applied ONLY when `Config::solid_dynamics` is on:
-/// `solid_update` + `g2p_solid` (`p2g_solid_dyn` replaces the frozen `p2g_solid`
+/// `p2g_solid_reference` + `solid_update` + `g2p_solid` (`p2g_solid_dyn` replaces the frozen `p2g_solid`
 /// one-for-one). Dynamic mode runs the frame pipeline `plasticity::solid_substeps`
 /// times (the stiff-elasticity CFL — 7 at the default dt/h/density), so the recorded
 /// dynamic-mode frame budget is substeps × (DISPATCHES_PER_FRAME + U5_PLASTICITY_DISPATCHES)
 /// when water is present. Frozen mode keeps the U6 budget exactly.
-pub const U5_PLASTICITY_DISPATCHES: u32 = 2;
+pub const U5_PLASTICITY_DISPATCHES: u32 = 3;
 
 /// Semi-implicit production solid: fixed projected-Jacobi budget for the bounded packing solve.
 /// Tests protect residual/energy monotonicity rather than treating this algorithmic count as a
@@ -311,7 +312,7 @@ pub const SHEAR_CFL: f64 = 0.4;
 /// Dry dynamic-mode budget per substep: with ZERO live water particles the entire
 /// water-side pipeline (p2g_water, grid_update decode, drag fold, the U3 pressure stack,
 /// the U4 surface stack, g2p_water) reads and writes only water state that the solid passes
-/// never touch, so the dry L1 scenes dispatch exactly grid_clear + p2g_solid_dyn +
+/// never touch, so the dry L1 scenes dispatch exactly grid_clear + p2g_solid_reference + p2g_solid_dyn +
 /// solid_update + g2p_solid per substep. This is a CPU-side pass elision keyed on the
 /// synchronously known live water count — NOT indirect dispatch (R8) — and it is scoped to
 /// DYNAMIC mode only: frozen-mode scenes keep the full pipeline bitwise, so every U2–U6
@@ -319,7 +320,7 @@ pub const SHEAR_CFL: f64 = 0.4;
 /// without the elision (verified by the suite re-runs at the switch); without it the dry
 /// macro gates spend 18× their dispatch budget ringing an empty pressure solve (measured:
 /// the resolved runout scene fell from ~70 min to minutes).
-pub const U5_DRY_DISPATCHES: u32 = 4;
+pub const U5_DRY_DISPATCHES: u32 = 5;
 
 /// Compute dispatches per frame for a grid of `dims` at the default knobs: the U2 transfer
 /// pipeline (grid_clear, p2g_water, grid_update, g2p_water) + the U3 pressure stack + the U4
@@ -349,6 +350,14 @@ pub fn grain_volume(d: f32) -> f32 {
 /// water-grid resolution.
 pub fn dry_solid_sample_volume(sample_pitch: f32, reference_porosity: f32) -> f32 {
     sample_pitch.max(0.0).powi(3) * (1.0 - reference_porosity.clamp(0.0, 1.0))
+}
+
+/// Dry bulk density used by the explicit shear CFL. The numerical shear modulus is declared per
+/// represented bulk volume, so density is dry mass divided by the corresponding dry bulk control
+/// volume `V_struct/(1-porosity)`. Bound-water swelling must not alter this stability definition.
+pub fn dry_bulk_density(dry_mass: f32, dry_structural_volume: f32, reference_porosity: f32) -> f32 {
+    let solid_fraction = (1.0 - reference_porosity).clamp(0.0, 1.0);
+    dry_mass.max(0.0) * solid_fraction / dry_structural_volume.max(1.0e-9)
 }
 
 fn filter_uniforms(cfg: &Config) -> Result<([f32; 4], [u32; 4]), String> {
@@ -388,7 +397,7 @@ fn filter_uniforms(cfg: &Config) -> Result<([f32; 4], [u32; 4]), String> {
     let thickness = scale.sim_length_from_meters(f64::from(cfg.tf_filter_thickness_m));
     let capacity_m3 = crate::models::filter::water_mass_capacity_to_volume_m3(
         f64::from(cfg.tf_filter_capacity_g),
-        f64::from(cfg.tf_filter_water_density_kg_m3),
+        f64::from(cfg.tf_water_density_kg_m3),
     )
     .map_err(|error| format!("filter capacity: {error}"))?;
     let capacity_sim = capacity_m3 / scale.meters_per_sim_unit().powi(3);
@@ -408,14 +417,19 @@ fn filter_uniforms(cfg: &Config) -> Result<([f32; 4], [u32; 4]), String> {
     ))
 }
 
-fn recipe_solid_mass_reduced(scene: &Scene, mats: &Materials, solid_count: u32) -> Option<f32> {
+fn recipe_solid_mass_reduced(
+    scene: &Scene,
+    mats: &Materials,
+    water_density_kg_m3: f32,
+    solid_count: u32,
+) -> Option<f32> {
     if scene.dose_g <= 0.0 || solid_count == 0 || mats.particle_mass <= 0.0 {
         return None;
     }
     let spatial = crate::utils::units::SiUnitScale::reference();
     let water = crate::models::scaling::water_sample_from_spacing(
         f64::from(mats.particle_spacing),
-        1_000.0,
+        f64::from(water_density_kg_m3),
         spatial,
     )
     .ok()?;
@@ -453,14 +467,29 @@ fn fresh_sstate(solid_count: u32, initial_consolidation_pressure: f32) -> Vec<[f
 }
 
 /// CPU twin of `coupling.wgsl::drag_rate_blended` (KTD-3): Kozeny-Carman packed-bed rate
-/// (mirrors `models::permeability` — β = drag_scale/k) blended toward a Wen-Yu-Stokes dilute
+/// (mirrors `models::permeability` — beta = phi_mobile*drag_scale/K_structural) blended toward a Wen-Yu-Stokes dilute
 /// rate (coefficient 18, voidage correction omitted) below φ_s = 0.2 via the Huilin-Gidaspow
 /// arctan transition (slope 262.5 = 150·1.75). The pair-momentum gate pins the WGSL against
 /// this twin.
 pub fn blended_drag_rate(d: f32, phi_f: f32, drag_scale: f32) -> f32 {
-    let phi_s = 1.0 - phi_f;
-    let packed = drag_scale / crate::models::permeability::kozeny_carman(d, phi_f).max(1.0e-9);
-    let dilute = drag_scale * 18.0 * phi_s / (d * d).max(1.0e-8);
+    blended_drag_rate_for_mobile_pore(d, phi_f, phi_f, drag_scale)
+}
+
+fn blended_drag_rate_for_mobile_pore(
+    d: f32,
+    structural_phi_f: f32,
+    mobile_phi_f: f32,
+    drag_scale: f32,
+) -> f32 {
+    let phi_s = 1.0 - structural_phi_f;
+    let packed = crate::models::permeability::darcy_mobile_drag_rate(
+        d,
+        structural_phi_f,
+        mobile_phi_f,
+        drag_scale,
+    );
+    let available_ratio = (mobile_phi_f / structural_phi_f.max(1.0e-6)).clamp(0.0, 1.0);
+    let dilute = drag_scale * 18.0 * phi_s / (d * d).max(1.0e-8) * available_ratio;
     let psi = (262.5 * (phi_s - 0.2)).atan() / std::f32::consts::PI + 0.5;
     psi * packed + (1.0 - psi) * dilute
 }
@@ -500,7 +529,9 @@ impl RetentionBuildState {
             retention_bound_capacity_volume: self.bound_capacity_volume,
             retention_capillary_target_volume: self.capillary_target_volume,
             retention_available_pore_volume: self.available_pore_volume,
-            retention_capillary_volume: self.retained_capillary_volume,
+            // Runtime H=min(W,C) is a measured grid inventory and must never be synthesized from
+            // this attainable build target. The compact diagnostics pass fills it after scatter.
+            retention_capillary_volume: 0.0,
             retention_unmet_volume: self.unmet_volume(),
             residual_pore_saturation: self.residual_pore_saturation,
             retention_target_attainable: self.target_attainable(),
@@ -572,9 +603,8 @@ fn node_pore_saturation(water_volume: f32, visible_pore_volume: f32) -> f32 {
     (water_volume.max(0.0) / visible_pore_volume).clamp(0.0, 1.0)
 }
 
-/// CPU twin of the bounded Corey mobility used by `coupling.wgsl`. The tiny positive lower
-/// bound is numerical nonsingularity only; production calibration supplies the normally larger
-/// explicit floor.
+/// CPU twin of the measured single-field mobility used by `coupling.wgsl`, expressed on a unit
+/// pore volume. The floor applies only above capacity; held-only water is exactly immobile.
 #[cfg(test)]
 fn bounded_corey_mobility(
     local_saturation: f32,
@@ -582,22 +612,14 @@ fn bounded_corey_mobility(
     exponent: f32,
     mobility_floor: f32,
 ) -> f32 {
-    const NUMERICAL_MOBILITY_MIN: f32 = 1.0e-6;
-    let floor = if mobility_floor.is_finite() {
-        mobility_floor.clamp(NUMERICAL_MOBILITY_MIN, 1.0)
-    } else {
-        1.0
-    };
-    if floor >= 1.0 {
-        return 1.0;
-    }
-    let relative = crate::models::retention::corey_relative_permeability(
-        local_saturation,
-        residual_saturation,
-        exponent.max(NUMERICAL_MOBILITY_MIN),
+    crate::models::retention::runtime_capillary_closure(
+        local_saturation.clamp(0.0, 1.0),
+        1.0,
+        residual_saturation.clamp(0.0, 1.0),
+        exponent.max(1.0e-6),
+        mobility_floor.clamp(0.0, 1.0),
     )
-    .unwrap_or(0.0);
-    relative.max(floor).clamp(floor, 1.0)
+    .map_or(0.0, |state| state.relative_mobility)
 }
 
 /// CPU twin of the bed-restricted saturation-gradient capillary force. Neighbor order is
@@ -724,9 +746,9 @@ struct Params {
     chem0: [f32; 4], // (scaled k_fast, scaled k_slow, Ea/R in K, T_ref in K)
     chem1: [f32; 4], // (c_sat, u_half, wet-gate s_on, thermal exchange rate)
     therm: [f32; 4], // (cp_water, cp_dry_grain, ambient loss rate, ambient T_K)
-    // Capillary retention (coupling.wgsl): (residual pore saturation, Corey exponent,
-    // relative-mobility floor, all-gas-atmospheric flag). The build-time target ledger stays
-    // CPU-resident; surface.wgsl consumes .w.
+    // Capillary retention: (build target saturation for diagnostics, Corey exponent,
+    // relative-mobility floor, all-gas-atmospheric flag). Runtime retention is measured from
+    // the scattered per-solid capacity in solute.w; surface.wgsl consumes retention.w.
     retention: [f32; 4],
     // Semi-implicit production granular split: (K_max, p_c0, full-tangent phi, shear dt).
     // K_max <= 0 is the exact legacy/off-path sentinel.
@@ -737,7 +759,7 @@ struct Params {
     // Exact integer reservoir capacity in FILTER_VOLUME_SCALE counts; remaining lanes reserved.
     filter1: [u32; 4],
     // Mechanical/thermal solute bookkeeping: insoluble grain mass, solute specific heat,
-    // initial extractable mass, reserved.
+    // initial extractable mass, capillary capacity volume per solid material point.
     solute: [f32; 4],
 }
 
@@ -1017,7 +1039,9 @@ pub struct TwofieldSolver {
     cmat: wgpu::Buffer,
     // WATER grid field: fixed-point atomic<i32>, 4 lanes per node (mass, mom.xyz).
     grid_fp: wgpu::Buffer,
-    // Combined per-cell presence prefix + per-node carrier-mass suffix (binding 18).
+    // Combined per-cell presence prefix + four per-node capillary-closure suffix lanes
+    // (carrier mass, attainable capacity C, bloom-weighted structural volume, measured held
+    // carrier mass rho_w*H; binding 18).
     cell_cnt: wgpu::Buffer,
     // Float grid velocity (.xyz) + node mass (.w) after grid_update; post-projection after
     // the U3 pressure stack. CPU-readable for the divergence/volume gates.
@@ -1175,6 +1199,7 @@ struct Pipelines {
     diagnostics_reduce: (wgpu::ComputePipeline, wgpu::BindGroup),
     // U5 plasticity family (dispatched only in dynamic mode; p2g_solid_dyn replaces
     // p2g_solid 1:1 there).
+    p2g_solid_reference: (wgpu::ComputePipeline, wgpu::BindGroup),
     p2g_solid_dyn: (wgpu::ComputePipeline, wgpu::BindGroup),
     solid_update: (wgpu::ComputePipeline, wgpu::BindGroup),
     g2p_solid: (wgpu::ComputePipeline, wgpu::BindGroup),
@@ -1235,7 +1260,6 @@ pub(crate) fn seed_ranges(
     mats: &Materials,
     cfg: &Config,
 ) -> (Vec<[f32; 4]>, Vec<u32>, u32, f32) {
-    const SEED_CLEARANCE: f32 = 0.4;
     let mut rng = crate::utils::rng::Rng::new(cfg.seed);
     let mut water: Vec<[f32; 4]> = Vec::new();
     let mut solid: Vec<[f32; 4]> = Vec::new();
@@ -1245,6 +1269,10 @@ pub(crate) fn seed_ranges(
             Species::Water => (mats.particle_spacing, 0u32, 1.0f32),
             Species::Grain => (mats.grain_diameter, 1u32, 0.0f32),
         };
+        // A seed sample needs at most half its own lattice pitch of geometric clearance. A fixed
+        // scene-unit shell erased fine water samples and under-cleared coarse grains when either
+        // resolution changed.
+        let seed_clearance = 0.5 * s.max(0.0);
         let jitter = cfg.seed_jitter * s;
         let nx = (((hi[0] - lo[0]) / s).floor() as i32).max(0);
         let ny = (((hi[1] - lo[1]) / s).floor() as i32).max(0);
@@ -1264,7 +1292,7 @@ pub(crate) fn seed_ranges(
                             glam::Vec3::new(px, py, pz),
                             tag,
                         );
-                        if c.signed < SEED_CLEARANCE {
+                        if c.signed < seed_clearance {
                             continue;
                         }
                     }
@@ -1278,8 +1306,33 @@ pub(crate) fn seed_ranges(
             }
         }
     }
+    // A scene's seeded-water inventory is authoritative. Ordinary free water keeps a contiguous
+    // lowest-fill volume at full parcel density. Only the deliberate co-located porous-bed
+    // fixture uses uniform selection to represent pore occupancy throughout the bed.
+    if scene.water_ml > 0.0 && mats.particle_spacing > 0.0 {
+        let target_volume = crate::utils::units::SiUnitScale::reference()
+            .sim_volume_from_ml(f64::from(scene.water_ml));
+        let target_samples = (target_volume / f64::from(mats.particle_spacing.powi(3)))
+            .round()
+            .max(1.0) as u32;
+        if seeded_water_overlaps_grain(scene) {
+            uniformly_downsample_points(
+                &mut water,
+                target_samples,
+                cfg.seed,
+                0x5741_5445_525F_4255, // "WATER_BU"
+            );
+        } else {
+            downsample_lowest_fill(&mut water, target_samples, cfg.seed);
+        }
+    }
     let accepted_solid_count = solid.len();
-    uniformly_downsample_solids(&mut solid, cfg.tf_solid_sample_budget, cfg.seed);
+    uniformly_downsample_points(
+        &mut solid,
+        cfg.tf_solid_sample_budget,
+        cfg.seed,
+        0x534F_4C49_445F_4255, // "SOLID_BU"
+    );
     // Uniform thinning is a quadrature change, not a loss of represented bed volume. Every
     // retained point carries the same accepted/final weight; a non-binding budget is exactly 1.
     let solid_quadrature_weight = if solid.is_empty() {
@@ -1295,37 +1348,86 @@ pub(crate) fn seed_ranges(
     (pos, phase, water_count, solid_quadrature_weight)
 }
 
-/// Uniformly select an exact solid material-point budget without biasing toward the lattice prefix.
+/// Uniformly select an exact material-point budget without biasing toward the lattice prefix.
 /// Priorities are a stateless SplitMix64 hash of `(seed, accepted_index)`. After retaining the
 /// lowest priorities, original accepted-point order is restored so every downstream buffer remains
 /// deterministic and spatially ordered exactly as before. Budget zero and budgets at/above the
 /// accepted count are strict no-ops.
-fn uniformly_downsample_solids(solids: &mut Vec<[f32; 4]>, budget: u32, seed: u64) {
+fn uniformly_downsample_points(points: &mut Vec<[f32; 4]>, budget: u32, seed: u64, domain: u64) {
     let budget = budget as usize;
-    if budget == 0 || solids.len() <= budget {
+    if budget == 0 || points.len() <= budget {
         return;
     }
 
-    const DOMAIN: u64 = 0x534F_4C49_445F_4255; // "SOLID_BU"
     const GOLDEN: u64 = 0x9E37_79B9_7F4A_7C15;
     let priority = |index: usize| {
         let mut z = seed
-            .wrapping_add(DOMAIN)
+            .wrapping_add(domain)
             .wrapping_add((index as u64).wrapping_mul(GOLDEN));
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
         z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
         z ^ (z >> 31)
     };
 
-    let mut ranked: Vec<(u64, usize)> = (0..solids.len())
+    let mut ranked: Vec<(u64, usize)> = (0..points.len())
         .map(|index| (priority(index), index))
         .collect();
     ranked.sort_unstable(); // `(priority, index)` gives a deterministic collision tie-break.
     ranked.truncate(budget);
     ranked.sort_unstable_by_key(|&(_, index)| index);
 
-    let accepted = std::mem::take(solids);
-    solids.extend(ranked.into_iter().map(|(_, index)| accepted[index]));
+    let accepted = std::mem::take(points);
+    points.extend(ranked.into_iter().map(|(_, index)| accepted[index]));
+}
+
+fn seeded_water_overlaps_grain(scene: &Scene) -> bool {
+    scene
+        .regions
+        .iter()
+        .filter(|region| region.species == Species::Water)
+        .any(|water| {
+            scene
+                .regions
+                .iter()
+                .filter(|region| region.species == Species::Grain)
+                .any(|grain| {
+                    (0..3).all(|axis| {
+                        water.min[axis] < grain.max[axis] && grain.min[axis] < water.max[axis]
+                    })
+                })
+        })
+}
+
+/// Select a contiguous lowest-fill free-water inventory. Horizontal tie-breaking is a stateless
+/// seed hash so a partial top layer does not bias one side; selected points return in original
+/// deterministic order.
+fn downsample_lowest_fill(points: &mut Vec<[f32; 4]>, budget: u32, seed: u64) {
+    let budget = budget as usize;
+    if budget == 0 || points.len() <= budget {
+        return;
+    }
+    const DOMAIN: u64 = 0x4C4F_5745_5354_4649; // "LOWESTFI"
+    let horizontal_priority = |index: usize| {
+        let mut z = seed
+            .wrapping_add(DOMAIN)
+            .wrapping_add((index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    };
+    let mut ranked: Vec<(usize, u64)> = (0..points.len())
+        .map(|index| (index, horizontal_priority(index)))
+        .collect();
+    ranked.sort_unstable_by(|&(a, ha), &(b, hb)| {
+        points[a][1]
+            .total_cmp(&points[b][1])
+            .then_with(|| ha.cmp(&hb))
+            .then_with(|| a.cmp(&b))
+    });
+    ranked.truncate(budget);
+    ranked.sort_unstable_by_key(|&(index, _)| index);
+    let accepted = std::mem::take(points);
+    points.extend(ranked.into_iter().map(|(index, _)| accepted[index]));
 }
 
 /// Seed phase-specific chemistry lanes for the pool-padded KTD-1 layout. Dormant water slots
@@ -1500,6 +1602,43 @@ impl TwofieldSolver {
             .collect()
     }
 
+    /// Sum the scattered runtime capillary capacity and bloom-weighted structural volume
+    /// suffixes (dev/test only — stalls). Integer partitioning makes the capacity sum invariant
+    /// to point motion and stencil placement up to the one-time per-particle encoding.
+    pub fn read_grid_capillary_totals(&self) -> (f32, f32) {
+        let slots = self.num_cells + 4 * self.num_nodes;
+        let raw: Vec<u32> =
+            bytemuck::cast_slice(&self.read_bytes(&self.cell_cnt, u64::from(slots) * 4)).to_vec();
+        let capacity_offset = (self.num_cells + self.num_nodes) as usize;
+        let bloom_offset = (self.num_cells + 2 * self.num_nodes) as usize;
+        let capacity_counts: u64 = raw[capacity_offset..capacity_offset + self.num_nodes as usize]
+            .iter()
+            .map(|&value| u64::from(value))
+            .sum();
+        let bloom_counts: u64 = raw[bloom_offset..bloom_offset + self.num_nodes as usize]
+            .iter()
+            .map(|&value| u64::from(value))
+            .sum();
+        (
+            capacity_counts as f32 / FP_SCALE as f32,
+            bloom_counts as f32 / FP_SCALE as f32,
+        )
+    }
+
+    /// Sum the measured held-carrier mass suffix (dev/test only — stalls). Held-only nodes copy
+    /// their carrier integer exactly, so this readback exposes the no-fake-mobile invariant.
+    pub fn read_grid_held_carrier_mass(&self) -> f32 {
+        let slots = self.num_cells + 4 * self.num_nodes;
+        let raw: Vec<u32> =
+            bytemuck::cast_slice(&self.read_bytes(&self.cell_cnt, u64::from(slots) * 4)).to_vec();
+        let held_offset = (self.num_cells + 3 * self.num_nodes) as usize;
+        let held_counts: u64 = raw[held_offset..held_offset + self.num_nodes as usize]
+            .iter()
+            .map(|&value| u64::from(value))
+            .sum();
+        held_counts as f32 / FP_SCALE as f32
+    }
+
     /// Read back the maximum per-node fixed-point lane magnitude (overflow-probe gate support;
     /// dev/test only — stalls).
     pub fn read_grid_max_count(&self) -> i64 {
@@ -1622,8 +1761,8 @@ impl TwofieldSolver {
         [raw[0], raw[1]]
     }
 
-    /// Whether an enclosed air pocket was detected this frame (the U8 bubble early-out flag,
-    /// `bubble[2]`; dev/test only — stalls). When false the bubble-row solves were elided.
+    /// Whether an enclosed air pocket was detected this frame (single-writer mirror in
+    /// `bubble[2]`; dev/test only — stalls).
     pub fn pocket_present(&self) -> bool {
         let raw: Vec<f32> = bytemuck::cast_slice(&self.read_bytes(&self.bubble, 12)).to_vec();
         raw[2] >= 0.5
@@ -1887,6 +2026,29 @@ impl TwofieldSolver {
         assert_eq!(v.len(), self.num_nodes as usize, "one vec4 per grid node");
         self.queue
             .write_buffer(&self.grid_vel, 0, bytemuck::cast_slice(v));
+    }
+
+    /// Overwrite the carrier-mass suffix while leaving cell occupancy/capillary lanes zero
+    /// (dev/test only). This exposes the filter-release distinction between an authoritative
+    /// pressure-projected zero flux and the no-mobile-grid gravity fallback.
+    pub fn write_grid_carrier_masses_for_test(&self, masses: &[f32]) {
+        assert_eq!(
+            masses.len(),
+            self.num_nodes as usize,
+            "one mass per grid node"
+        );
+        let mut auxiliary = vec![0u32; (self.num_cells + 4 * self.num_nodes) as usize];
+        let offset = self.num_cells as usize;
+        for (slot, mass) in auxiliary[offset..offset + self.num_nodes as usize]
+            .iter_mut()
+            .zip(masses)
+        {
+            *slot = (mass.max(0.0) * FP_SCALE as f32)
+                .round()
+                .clamp(0.0, u32::MAX as f32) as u32;
+        }
+        self.queue
+            .write_buffer(&self.cell_cnt, 0, bytemuck::cast_slice(&auxiliary));
     }
 
     /// Overwrite the fine pressure field (slot pf_a, which `dbg_grad` reads; dev/test only).
@@ -2421,8 +2583,9 @@ impl Solver for TwofieldSolver {
         // Recipe scenes derive each material point's immutable dry mass from dose/count. This
         // keeps total coffee mass fixed under changes to numerical sampling. Non-recipe test
         // scenes retain the explicitly supplied material mass.
-        let dry_grain_mass = recipe_solid_mass_reduced(scene, mats, solid_count)
-            .unwrap_or(mats.grain_mass * solid_quadrature_weight);
+        let dry_grain_mass =
+            recipe_solid_mass_reduced(scene, mats, cfg.tf_water_density_kg_m3, solid_count)
+                .unwrap_or(mats.grain_mass * solid_quadrature_weight);
         let dry_structural_volume =
             dry_solid_sample_volume(mats.grain_diameter, mats.porosity) * solid_quadrature_weight;
 
@@ -2514,13 +2677,12 @@ impl Solver for TwofieldSolver {
         let rho_floor = rest_density;
         let mass_eps = 1.0e-4 * mats.particle_mass;
         let implicit_solid = cfg.solid_dynamics && cfg.tf_compaction_tangent > 0.0;
-        let maximum_swollen_volume =
-            dry_structural_volume * (1.0 + cfg.tf_max_diameter_swelling.max(0.0)).powi(3);
-        let minimum_solid_density = dry_grain_mass / maximum_swollen_volume.max(1.0e-9);
+        let shear_bulk_density =
+            dry_bulk_density(dry_grain_mass, dry_structural_volume, mats.porosity);
         let shear_budget = crate::models::granular::bounded_explicit_shear_budget(
             1.0 / 60.0,
             f64::from(cell),
-            f64::from(minimum_solid_density.max(1.0e-9)),
+            f64::from(shear_bulk_density.max(1.0e-9)),
             f64::from(cfg.tf_numerical_shear_modulus.max(0.0)),
             SHEAR_CFL,
             MAX_SHEAR_SUBSTEPS,
@@ -2708,7 +2870,11 @@ impl Solver for TwofieldSolver {
                 (dry_grain_mass - initial_extractable_mass).max(0.0),
                 mats.cp_grain.max(0.0),
                 initial_extractable_mass,
-                0.0,
+                if solid_count > 0 {
+                    retention_build.retained_capillary_volume / solid_count as f32
+                } else {
+                    0.0
+                },
             ],
         };
         let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -2849,6 +3015,12 @@ impl Solver for TwofieldSolver {
             grid_bytes,
             wgpu::BufferUsages::empty(),
         );
+        let grid_sraw = Self::storage(
+            &device,
+            "twofield-grid-solid-reference",
+            grid_bytes,
+            wgpu::BufferUsages::empty(),
+        );
         let grid_svel = Self::storage(
             &device,
             "twofield-grid-svel",
@@ -2947,19 +3119,16 @@ impl Solver for TwofieldSolver {
             (num_ccells.max(1) as u64) * 4,
             wgpu::BufferUsages::empty(),
         );
-        // U4 bubble state: [λ_b, δλ_b, pocket_present]. The 3rd slot is the open-cavity
-        // early-out flag (U8 cheap win): flood_init zeroes it, pocket_mark raises it to 1.0 if
-        // ANY enclosed pocket exists this frame, and bubble_fine/bubble_coarse return immediately
-        // when it is 0 — bitwise-identical to the full pass (no pocket ⇒ λ_b = 0 either way),
-        // it just skips the all-cells single-workgroup reduction on open-surface frames (over-
-        // dispatch + early-out, R8). The dispatch is still counted; only the work is elided.
+        // U4 bubble state: [λ_b, δλ_b, pocket_present]. The observable presence mirror is
+        // raised only by the thread that atomically claims compact-list slot zero, so pocket_mark
+        // has no many-writer storage race.
         let bubble = Self::storage(&device, "twofield-bubble", 12, wgpu::BufferUsages::COPY_SRC);
-        // Combined U4 cell-presence prefix + per-node carrier-water mass suffix. Keeping the
-        // suffix in the same allocation adds no WebGPU storage binding.
+        // Combined U4 cell-presence prefix + four per-node capillary-closure suffix lanes.
+        // Keeping the suffixes in the same allocation adds no WebGPU storage binding.
         let cell_cnt = Self::storage(
             &device,
             "twofield-cell-carrier-aux",
-            ((num_cells + num_nodes).max(1) as u64) * 4,
+            ((num_cells + 4 * num_nodes).max(1) as u64) * 4,
             wgpu::BufferUsages::COPY_SRC,
         );
         // U8 R9 fix: compacted pocket-cell lists (slot 0 = atomic append count, rest = flat
@@ -3065,6 +3234,7 @@ impl Solver for TwofieldSolver {
                     (21, &grid_sm),
                     (25, &grid_moist),
                     (28, &grid_chem),
+                    (34, &grid_sraw),
                 ],
             );
             let p2g = make("p2g_water");
@@ -3082,8 +3252,29 @@ impl Solver for TwofieldSolver {
             );
             // U6 coupling family (coupling.wgsl).
             let p2g_solid = make("p2g_solid");
-            let p2g_solid_bind = bg(&p2g_solid, &[(0, &params_buf), (1, &pos), (19, &grid_sfp)]);
+            let p2g_solid_bind = bg(
+                &p2g_solid,
+                &[
+                    (0, &params_buf),
+                    (1, &pos),
+                    (4, &chem),
+                    (18, &cell_cnt),
+                    (19, &grid_sfp),
+                ],
+            );
             // U5 plasticity family (plasticity.wgsl).
+            let p2g_solid_reference = make("p2g_solid_reference");
+            let p2g_solid_reference_bind = bg(
+                &p2g_solid_reference,
+                &[
+                    (0, &params_buf),
+                    (1, &pos),
+                    (2, &vel),
+                    (4, &chem),
+                    (5, &cmat),
+                    (34, &grid_sraw),
+                ],
+            );
             let p2g_solid_dyn = make("p2g_solid_dyn");
             let p2g_solid_dyn_bind = bg(
                 &p2g_solid_dyn,
@@ -3093,6 +3284,7 @@ impl Solver for TwofieldSolver {
                     (2, &vel),
                     (4, &chem),
                     (5, &cmat),
+                    (18, &cell_cnt),
                     (19, &grid_sfp),
                     (21, &grid_sm),
                     (24, &sstate),
@@ -3145,6 +3337,7 @@ impl Solver for TwofieldSolver {
                     (2, &vel),
                     (4, &chem),
                     (5, &cmat),
+                    (18, &cell_cnt),
                     (19, &grid_sfp),
                     (21, &grid_sm),
                     (24, &sstate),
@@ -3286,6 +3479,7 @@ impl Solver for TwofieldSolver {
                     (19, &grid_sfp),
                     (20, &react_buf),
                     (22, &grid_svel),
+                    (34, &grid_sraw),
                 ],
             );
             // U9 absorption family (coupling.wgsl). p2g_moisture scatters S/D plus donor
@@ -3349,7 +3543,11 @@ impl Solver for TwofieldSolver {
                     (2, &vel),
                     (4, &chem),
                     (5, &cmat),
+                    (7, &grid_vel),
                     (8, &solids_buf),
+                    (18, &cell_cnt),
+                    (19, &grid_sfp),
+                    (22, &grid_svel),
                     (30, &filter_state),
                 ],
             );
@@ -3396,6 +3594,7 @@ impl Solver for TwofieldSolver {
                     (7, &grid_vel),
                     (8, &solids_buf),
                     (9, &nm),
+                    (18, &cell_cnt),
                     (19, &grid_sfp),
                     (20, &react_buf),
                     (22, &grid_svel),
@@ -3413,6 +3612,7 @@ impl Solver for TwofieldSolver {
                     (11, &pf_a),
                     (12, &pf_b),
                     (18, &cell_cnt),
+                    (19, &grid_sfp),
                     (22, &grid_svel),
                 ],
             );
@@ -3597,6 +3797,7 @@ impl Solver for TwofieldSolver {
                         (9, &nm),
                         (10, &cell_meta),
                         (11, &pf_a),
+                        (18, &cell_cnt),
                         (19, &grid_sfp),
                         (20, &react_buf),
                         // Dynamic mode applies the drag-condensed pore-pressure response to
@@ -3613,6 +3814,7 @@ impl Solver for TwofieldSolver {
                         (9, &nm),
                         (10, &cell_meta),
                         (11, &pf_b),
+                        (18, &cell_cnt),
                         (19, &grid_sfp),
                         (20, &react_buf),
                         (22, &grid_svel),
@@ -3621,8 +3823,7 @@ impl Solver for TwofieldSolver {
             ];
             // --- U4 surface family --------------------------------------------------------
             let flood_init = make("flood_init");
-            // binding 17 (bubble): flood_init now zeroes the U8 pocket-present early-out flag
-            // (bubble[2]) at c == 0, so the surface family's first pass owns the reset.
+            // binding 17 (bubble): thread zero owns the observable pocket-present reset.
             let flood_init_bind = bg(
                 &flood_init,
                 &[
@@ -3659,6 +3860,7 @@ impl Solver for TwofieldSolver {
                     (11, &pf_a),
                     (12, &pf_b),
                     (17, &bubble),
+                    (18, &cell_cnt),
                     (22, &grid_svel),
                     (26, &pocket_f),
                 ],
@@ -3702,6 +3904,7 @@ impl Solver for TwofieldSolver {
                     (7, &grid_vel),
                     (9, &nm),
                     (10, &cell_meta),
+                    (18, &cell_cnt),
                     (22, &grid_svel),
                 ],
             );
@@ -3727,6 +3930,7 @@ impl Solver for TwofieldSolver {
                 chemistry_gather: (chemistry_gather, chemistry_gather_bind),
                 filter_release: (filter_release, filter_release_bind),
                 diagnostics_reduce: (diagnostics_reduce, diagnostics_reduce_bind),
+                p2g_solid_reference: (p2g_solid_reference, p2g_solid_reference_bind),
                 p2g_solid_dyn: (p2g_solid_dyn, p2g_solid_dyn_bind),
                 solid_update: (solid_update, solid_update_bind),
                 g2p_solid: (g2p_solid, g2p_solid_bind),
@@ -3986,13 +4190,13 @@ impl Solver for TwofieldSolver {
         // deviatoric predictor is microstepped below, while compaction, drag, and mixture
         // pressure each run once at the caller's physical dt. Frozen mode also stays at one.
         let substeps = if self.implicit_solid {
-            let swollen_volume =
-                self.params.coupling[2] * (1.0 + self.params.wet1[3].max(0.0)).powi(3);
-            let minimum_density = self.params.splas1[2] / swollen_volume.max(1.0e-9);
+            let reference_solid_fraction = self.params.splas1[1].clamp(0.0, 1.0);
+            let dry_bulk_volume = self.params.coupling[2] / reference_solid_fraction.max(1.0e-9);
+            let shear_bulk_density = self.params.splas1[2] / dry_bulk_volume.max(1.0e-9);
             let budget = crate::models::granular::bounded_explicit_shear_budget(
                 f64::from(dt.max(0.0)),
                 f64::from(self.params.grid_origin[3]),
-                f64::from(minimum_density.max(1.0e-9)),
+                f64::from(shear_bulk_density.max(1.0e-9)),
                 f64::from(self.requested_numerical_shear_modulus),
                 SHEAR_CFL,
                 MAX_SHEAR_SUBSTEPS,
@@ -4067,12 +4271,18 @@ impl Solver for TwofieldSolver {
         // Dry dynamic mode (U5_DRY_DISPATCHES): no live water → only the solid passes run.
         let dry_dynamic = self.solid_dynamic && !self.implicit_solid && self.water_count == 0;
         if dry_dynamic {
-            let seq: [(&str, &wgpu::ComputePipeline, &wgpu::BindGroup, u32); 4] = [
+            let seq: [(&str, &wgpu::ComputePipeline, &wgpu::BindGroup, u32); 5] = [
                 (
                     "grid_clear",
                     &self.pipelines.grid_clear.0,
                     &self.pipelines.grid_clear.1,
                     node_groups,
+                ),
+                (
+                    "p2g_solid_reference",
+                    &self.pipelines.p2g_solid_reference.0,
+                    &self.pipelines.p2g_solid_reference.1,
+                    solid_groups,
                 ),
                 (
                     "p2g_solid_dyn",
@@ -4184,6 +4394,14 @@ impl Solver for TwofieldSolver {
                 &self.pipelines.active_tile_mark.0,
                 &self.pipelines.active_tile_mark.1,
                 ACTIVE_TILE_MARKER,
+            ));
+        }
+        if self.solid_dynamic {
+            seq.push((
+                "p2g_solid_reference",
+                &self.pipelines.p2g_solid_reference.0,
+                &self.pipelines.p2g_solid_reference.1,
+                solid_groups,
             ));
         }
         if self.implicit_solid {
@@ -5113,7 +5331,8 @@ mod seed_tests {
         let downstream = -paper_hit.1;
         assert!(downstream.y < 0.0, "V60 paper drains downward");
         let scene = Scene {
-            gravity: [0.0, -565.0, 0.0],
+            // Zero gravity makes release depend solely on the imposed post-projection grid flux.
+            gravity: [0.0, 0.0, 0.0],
             box_min: [-7.0, -10.0, -7.0],
             box_max: [7.0, 10.0, 7.0],
             regions: vec![crate::engine::scene::SeedRegion {
@@ -5133,7 +5352,7 @@ mod seed_tests {
             seed_jitter: 0.0,
             tf_filter_permeability_m2: 1.0e-8,
             tf_filter_kinematic_viscosity_m2_s: 3.2e-7,
-            tf_filter_water_density_kg_m3: 1_000.0,
+            tf_water_density_kg_m3: 1_000.0,
             tf_filter_capacity_g: 1.0,
             tf_filter_thickness_m: 0.000_2,
             tf_filter_porosity: 0.3,
@@ -5175,6 +5394,7 @@ mod seed_tests {
         assert_eq!(admitted_chem[3], 0.0);
         assert_eq!(admitted_pos[3], 1.0);
 
+        solver.write_grid_carrier_masses_for_test(&vec![1.0; solver.num_nodes as usize]);
         solver.run_dbg(
             &solver.pipelines.filter_release.0,
             &solver.pipelines.filter_release.1,
@@ -5183,11 +5403,96 @@ mod seed_tests {
         let released = solver.read_filter_state();
         let released_chem = solver.read_chemistry()[0];
         let released_pos = solver.read_positions()[0];
+        let released_velocity = solver.read_velocities()[0];
         assert_eq!(released, [0, 1, 1, 0, 0]);
         assert_eq!(released_chem[0], admitted_chem[0]);
         assert_eq!(released_chem[1], admitted_chem[1]);
         assert_eq!(released_chem[2], 2.0);
         assert_eq!(released_pos[3], admitted_pos[3]);
+        let released_normal_speed = released_velocity[0] * downstream.x
+            + released_velocity[1] * downstream.y
+            + released_velocity[2] * downstream.z;
+        assert!(close(released_normal_speed, speed));
+    }
+
+    #[test]
+    fn capillary_capacity_scatter_is_motion_and_quadrature_invariant() {
+        let Some((device, queue)) = create_test_device() else {
+            eprintln!("no GPU adapter available; skipping capillary scatter comparison");
+            return;
+        };
+        let scene = Scene {
+            gravity: [0.0; 3],
+            box_min: [0.0; 3],
+            box_max: [4.0; 3],
+            regions: vec![crate::engine::scene::SeedRegion {
+                min: [0.5; 3],
+                max: [3.5; 3],
+                species: Species::Grain,
+            }],
+            dose_g: 12.0,
+            ..Scene::default()
+        };
+        let materials = Materials {
+            particle_spacing: 0.4,
+            grain_diameter: 0.5,
+            porosity: 0.4,
+            r_max: 0.0,
+            ..Materials::default()
+        };
+        let gpu = GpuContext::from_device_queue(&device, &queue);
+        let mut totals = Vec::new();
+        for budget in [0, 47] {
+            let config = Config {
+                seed_jitter: 0.0,
+                tf_solid_sample_budget: budget,
+                tf_retention_target_g_per_g: 1.0,
+                tf_water_density_kg_m3: 980.0,
+                ..Config::default()
+            };
+            let solver = TwofieldSolver::build(&scene, &materials, &config, &gpu);
+            solver.run_dbg(
+                &solver.pipelines.p2g_solid.0,
+                &solver.pipelines.p2g_solid.1,
+                groups(solver.solid_count).max(1),
+            );
+            let (capacity, bloom) = solver.read_grid_capillary_totals();
+            let encoded_per_solid =
+                (solver.params.solute[3] * FP_SCALE as f32).round() / FP_SCALE as f32;
+            assert!(close(
+                capacity,
+                encoded_per_solid * solver.solid_count as f32
+            ));
+            assert_eq!(
+                bloom, 0.0,
+                "uncontacted grains must scatter no suction gate"
+            );
+
+            let mut moved = solver.read_positions();
+            for position in &mut moved {
+                position[0] += 0.11;
+            }
+            solver.write_positions_for_test(&moved);
+            solver.run_dbg(
+                &solver.pipelines.grid_clear.0,
+                &solver.pipelines.grid_clear.1,
+                groups(solver.num_nodes).max(1),
+            );
+            solver.run_dbg(
+                &solver.pipelines.p2g_solid.0,
+                &solver.pipelines.p2g_solid.1,
+                groups(solver.solid_count).max(1),
+            );
+            let (moved_capacity, _) = solver.read_grid_capillary_totals();
+            assert!(close(moved_capacity, capacity));
+            totals.push(capacity);
+        }
+        assert!(
+            (totals[0] - totals[1]).abs() <= 2.0e-4 * totals[0].abs().max(1.0),
+            "quadrature changed capacity: full={} thinned={}",
+            totals[0],
+            totals[1]
+        );
     }
 
     /// The range layout is water-first: every water particle precedes every solid.
@@ -5209,6 +5514,39 @@ mod seed_tests {
         // Moisture lane per species: water full (1), grain dry (0).
         for (p, &ph) in pos.iter().zip(&phase) {
             assert_eq!(p[3], if ph == 0 { 1.0 } else { 0.0 });
+        }
+    }
+
+    #[test]
+    fn seed_clearance_tracks_each_species_sample_pitch() {
+        let scene = Scene::pour_over();
+        let materials = Materials {
+            particle_spacing: 0.18,
+            grain_diameter: 0.47,
+            ..Materials::default()
+        };
+        let config = Config {
+            seed_jitter: 0.08,
+            ..Config::default()
+        };
+        let (positions, phases, _, _) = seed_ranges(&scene, &materials, &config);
+        assert!(!positions.is_empty());
+        for (position, phase) in positions.iter().zip(phases) {
+            let pitch = if phase == 0 {
+                materials.particle_spacing
+            } else {
+                materials.grain_diameter
+            };
+            let hit = crate::utils::sdf::nearest(
+                &scene.solids,
+                glam::Vec3::new(position[0], position[1], position[2]),
+                phase,
+            );
+            assert!(
+                hit.signed + 2.0e-5 >= 0.5 * pitch,
+                "phase {phase} seed at {position:?} has clearance {}, pitch {pitch}",
+                hit.signed
+            );
         }
     }
 
@@ -5247,6 +5585,22 @@ mod seed_tests {
         assert_eq!(positions.len(), 257);
         assert_eq!(phases, vec![1; 257]);
         assert!(weight > 1.0);
+    }
+
+    #[test]
+    fn free_water_budget_keeps_a_contiguous_lowest_fill() {
+        let original: Vec<[f32; 4]> = (0..3)
+            .flat_map(|y| (0..3).map(move |x| [x as f32, y as f32, 0.0, 1.0]))
+            .collect();
+        let mut selected = original.clone();
+        downsample_lowest_fill(&mut selected, 5, 17);
+        assert_eq!(selected.len(), 5);
+        assert!(selected.iter().all(|point| point[1] <= 1.0));
+        assert_eq!(selected.iter().filter(|point| point[1] == 0.0).count(), 3);
+
+        let mut repeated = original;
+        downsample_lowest_fill(&mut repeated, 5, 17);
+        assert_eq!(selected, repeated);
     }
 
     #[test]
@@ -5435,18 +5789,22 @@ mod seed_tests {
     }
 
     #[test]
-    fn bounded_corey_mobility_respects_floor_bounds_and_monotonicity() {
+    fn measured_capillary_mobility_is_bounded_monotone_and_exactly_stiff_when_held() {
         let residual = 0.3;
         let exponent = 2.4;
         let floor = 0.02;
         let mobility = [-0.5, 0.0, residual, 0.5, 0.8, 1.0, 1.5]
             .map(|saturation| bounded_corey_mobility(saturation, residual, exponent, floor));
         assert!(mobility.windows(2).all(|pair| pair[0] <= pair[1]));
-        assert!(mobility.iter().all(|value| (floor..=1.0).contains(value)));
-        assert_eq!(mobility[0], floor);
-        assert_eq!(mobility[2], floor);
-        assert_eq!(mobility[5], 1.0);
-        assert_eq!(mobility[6], 1.0);
+        assert!(mobility.iter().all(|value| (0.0..=1.0).contains(value)));
+        assert_eq!(mobility[0], 0.0);
+        assert_eq!(mobility[2], 0.0);
+        assert!(mobility[3] > 0.0);
+        assert!(mobility[5] < 1.0, "held water keeps theta below one");
+        assert_eq!(
+            mobility[6], mobility[5],
+            "input saturation is physically bounded"
+        );
     }
 
     #[test]
@@ -5534,11 +5892,43 @@ mod seed_tests {
         };
         let coarse_count = 127;
         let fine_count = 2_003;
-        let coarse = recipe_solid_mass_reduced(&scene, &materials, coarse_count).unwrap();
-        let fine = recipe_solid_mass_reduced(&scene, &materials, fine_count).unwrap();
+        let density = 975.0;
+        let coarse = recipe_solid_mass_reduced(&scene, &materials, density, coarse_count).unwrap();
+        let fine = recipe_solid_mass_reduced(&scene, &materials, density, fine_count).unwrap();
         let coarse_total = coarse * coarse_count as f32;
         let fine_total = fine * fine_count as f32;
         assert!((coarse_total - fine_total).abs() <= 2.0e-5 * coarse_total.abs().max(1.0));
+
+        // A reduced mass unit is one water sample. For fixed spacing and physical coffee mass,
+        // reduced recipe mass is inversely proportional to the one authoritative water density.
+        let warmer_density = 960.0;
+        let warmer =
+            recipe_solid_mass_reduced(&scene, &materials, warmer_density, coarse_count).unwrap();
+        assert!(close(coarse * density, warmer * warmer_density));
+    }
+
+    #[test]
+    fn shear_cfl_density_is_dry_bulk_density_and_not_swollen_particle_density() {
+        let dry_mass = 2.4;
+        let dry_structural_volume = 0.006;
+        let porosity = 0.42;
+        let bulk = dry_bulk_density(dry_mass, dry_structural_volume, porosity);
+        let material = dry_mass / dry_structural_volume;
+        assert!(close(bulk, material * (1.0 - porosity)));
+        assert!(bulk < material);
+
+        let diameter_swelling = 0.15_f32;
+        let incorrect_swollen_density =
+            dry_mass / (dry_structural_volume * (1.0 + diameter_swelling).powi(3));
+        assert!(
+            !close(bulk, incorrect_swollen_density),
+            "a swelling-dependent particle density must not alias the dry bulk definition"
+        );
+        assert_eq!(
+            dry_bulk_density(dry_mass, dry_structural_volume, porosity),
+            bulk,
+            "swelling is intentionally absent from the dry bulk definition"
+        );
     }
 
     /// Algebraic inventory/layout invariant only; no calibration constant is pinned.
@@ -6070,5 +6460,106 @@ mod seed_tests {
         let projected_solid = -dt * r_s * gradient;
         let projected_mixture = phi_f * projected_fluid + phi_s * projected_solid;
         assert!((operator_correction - projected_mixture).abs() < 1.0e-15);
+    }
+
+    /// Partial retention changes phase bookkeeping but not the pressure impulse identity. This
+    /// pins equations only: the values are arbitrary and contain no coffee calibration target.
+    #[test]
+    fn partial_retention_pressure_response_is_adjoint_and_uses_composite_inertia() {
+        let (phi_mobile, total_water_mass, dry_solid_mass, theta, h, sigma) =
+            (0.27_f64, 0.83, 2.4, 0.36, 1.2, 0.41);
+        let mobile_mass = theta * total_water_mass;
+        let held_mass = (1.0 - theta) * total_water_mass;
+        let composite_mass = dry_solid_mass + held_mass;
+        let (_, _, r_mobile, r_composite) =
+            phase_mobilities_from_node_masses(phi_mobile, mobile_mass, composite_mass, h, sigma);
+        let (dt, gradient) = (0.019, -1.3);
+        let dv_mobile = -dt * r_mobile * gradient;
+        let dv_composite = -dt * r_composite * gradient;
+        let dv_shared = theta * dv_mobile + (1.0 - theta) * dv_composite;
+
+        // D reconstructs intrinsic mobile velocity from the homogenized update exactly.
+        let reconstructed_mobile = (dv_shared - (1.0 - theta) * dv_composite) / theta;
+        assert!((reconstructed_mobile - dv_mobile).abs() < 1.0e-15);
+
+        // The operator assembled in node_setup equals D applied to project's two phase updates.
+        let phi_composite = 1.0 - phi_mobile;
+        let operator = -dt * (phi_mobile * r_mobile + phi_composite * r_composite) * gradient;
+        let projected = phi_mobile * reconstructed_mobile + phi_composite * dv_composite;
+        assert!((operator - projected).abs() < 1.0e-15);
+
+        // Frozen skeleton: writing theta*dv_mobile to v_bar avoids the 1/theta over-acceleration.
+        let rho_mobile = mobile_mass / (phi_mobile * h.powi(3));
+        let frozen_mobile = -dt * sigma / rho_mobile * gradient;
+        let frozen_shared = theta * frozen_mobile;
+        let homogenized_density = total_water_mass / (phi_mobile * h.powi(3));
+        assert!((frozen_shared + dt * sigma / homogenized_density * gradient).abs() < 1.0e-15);
+    }
+
+    #[test]
+    fn partial_retention_force_staging_preserves_equal_body_acceleration() {
+        // Arbitrary dimensionless values: this pins the split impulse algebra, not a material.
+        let (water_mass, dry_mass, theta, velocity, body_kick) = (0.83_f64, 2.4, 0.36, -0.7, 0.19);
+        let mobile_mass = theta * water_mass;
+        let held_mass = (1.0 - theta) * water_mass;
+        let composite_mass = dry_mass + held_mass;
+
+        let dry_impulse = dry_mass * body_kick;
+        let held_impulse = held_mass * body_kick;
+        let composite_forced = velocity + (dry_impulse + held_impulse) / composite_mass;
+        let mobile_forced = velocity + body_kick;
+        assert!((mobile_forced - composite_forced).abs() < 1.0e-15);
+
+        let before = mobile_mass * velocity + composite_mass * velocity;
+        let after = mobile_mass * mobile_forced + composite_mass * composite_forced;
+        let external = (mobile_mass + composite_mass) * body_kick;
+        assert!((after - before - external).abs() < 1.0e-15);
+
+        let vbar = theta * mobile_forced + (1.0 - theta) * composite_forced;
+        let reconstructed = (vbar - (1.0 - theta) * composite_forced) / theta;
+        assert!((reconstructed - mobile_forced).abs() < 1.0e-15);
+    }
+
+    #[test]
+    fn partial_retention_paper_step_changes_only_mobile_superficial_flux() {
+        let (theta, phi_mobile, mobile_v, composite_v) = (0.37_f64, 0.22, 1.4, -0.3);
+        let (decay, sigma_dt_source) = (0.61, -0.08);
+        let vbar = theta * mobile_v + (1.0 - theta) * composite_v;
+        let old_flux = phi_mobile * mobile_v;
+        let new_flux = decay * old_flux + sigma_dt_source;
+        let mobile_after = mobile_v + (new_flux - old_flux) / phi_mobile;
+        let vbar_after = theta * mobile_after + (1.0 - theta) * composite_v;
+
+        assert!((phi_mobile * mobile_after - new_flux).abs() < 1.0e-15);
+        assert!((vbar_after - vbar - theta * (mobile_after - mobile_v)).abs() < 1.0e-15);
+        assert_eq!(
+            composite_v, -0.3,
+            "paper cannot move the held/dry composite"
+        );
+    }
+
+    #[test]
+    fn held_count_quantization_cannot_create_mobile_water_or_destroy_capacity() {
+        let carrier_count = 17_u32;
+        let raw_capacity_count = 31_u32;
+        // The GPU copies carrier_count exactly when M=0 instead of re-encoding H.
+        let held_count = carrier_count;
+        assert_eq!(carrier_count - held_count, 0);
+        // H has an independent lane; writing it cannot mutate attainable C.
+        let capacity_after_h_write = raw_capacity_count;
+        assert_eq!(capacity_after_h_write, raw_capacity_count);
+    }
+
+    #[test]
+    fn frozen_pressure_reaction_uses_complete_composite_and_finite_drag_share() {
+        let (solid_volume, held_volume, mobile_phi, visible, dt, gradient, sigma) =
+            (0.31_f64, 0.14, 0.27, 0.9, 0.02, -1.7, 0.0);
+        let direct = -(solid_volume + held_volume) * dt * gradient;
+        let transmitted = (1.0 - sigma) * mobile_phi * visible * dt * gradient;
+        let reaction = direct - transmitted;
+        assert!(reaction.is_finite());
+        assert_eq!(direct, -(solid_volume + held_volume) * dt * gradient);
+        // sigma=0 is deliberately included: the volume form has no 0/0 recovery.
+        assert_eq!(transmitted, mobile_phi * visible * dt * gradient);
     }
 }

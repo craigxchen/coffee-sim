@@ -98,6 +98,20 @@ two-mass update, preserving node momentum before external contact impulses. Mixt
 div(phi_f * v_f + phi_s * v_s) = source
 ```
 
+Packed-bed drag evolves intrinsic mobile-pore velocity. Structural porosity determines `K`, while
+the packed coefficient uses the available mobile phase fraction `phi_m` and Corey permeability
+`k_r`, recovering `q = phi_m(v_m-v_c) = K k_r F/nu` independently of the stored mobile fraction
+`theta`. Capillary retention remains in the single canonical water field: solids scatter
+quadrature-invariant attainable capacity `C`, and a separate fixed-point lane records measured
+held carrier `rho_w H` without overwriting `C`. Only measured mobile carrier plus remaining pore
+volume enter free-surface fill and density relief. Dynamic coupling pairs mobile mass with the
+dry-plus-held composite, using a frame-start solid reference grid so body/stress impulses are
+divided by the correct composite inertia even after semi-implicit solid subcycling. Solute and
+enthalpy never disappear into an untransported retention scalar. Bloom/contact is scattered by
+structural volume and gates suction independently of whether the configured retention target is
+zero. Porous-paper transit gathers water superficial flux `q`, never homogenized `v_bar` or solid
+volume flux.
+
 Pressure uses cell-centered pressure and node-centered velocity with one adjoint family
 `G = -D^T`. The solve and projection use the same symmetric constrained mobility, including the
 rank-one porous-paper normal reduction; hand-written alternate pressure stencils are prohibited.

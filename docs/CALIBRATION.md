@@ -60,10 +60,28 @@ whole-brewer retained water = whole-bed retained water
                             + independently reported filter-paper water
 ```
 
+The target only assigns a per-solid capillary capacity; it is not treated as observed water. At
+runtime each grid node measures pore volume `P`, capacity `C`, water `W`, held water
+`H = min(W,C)`, and mobile water `M = W-H`. Pressure fill uses `M` in the remaining pore `P-H`,
+while relative mobility is `M/W * max((M/(P-H))^n, floor)`. A held-only node is exactly immobile;
+the numerical floor cannot manufacture drainage. The diagnostic reports measured `sum(H)`
+separately from the recipe target and attainable capacity.
+
+The drag fold reconstructs intrinsic `v_m` from the homogenized field. Its packed rate is
+`beta = phi_m nu/(K k_r)`: `theta=M/W` belongs only to mass and velocity storage and is not divided
+into `beta` a second time. When `P-H=0` and `M>0`, the explicit finite overflow partition uses
+`phi_m=M/(M+V_s+H)`; the exact `W=C=P` endpoint remains stiff. The measured held lane stores
+carrier mass, copying the carrier integer exactly at `M=0`, so fixed-point rounding cannot create
+a one-count mobile phase.
+
 Water-particle concentration is stored as the mechanically convenient solute-to-solvent ratio
 `c = m_solute / m_solvent`. Dissolved solute increases solution inertia and heat capacity but not
 carrier volume. User-facing TDS is the conventional solution mass fraction
 `m_solute / (m_solvent + m_solute) = c / (1 + c)`.
+
+Inlet temperature supplies one water-density value for recipe mass reduction, stress scaling,
+filter-capacity conversion, emitted mass, and diagnostics. Millilitres and grams are therefore
+reported separately rather than relying on the approximate `1 g/mL` coincidence.
 
 Particle swelling is not another name for retention. With bound-water saturation `s` and the
 diameter control `a`, structural volume follows

@@ -167,8 +167,10 @@ pub struct Config {
     /// Reference kinematic viscosity in m²/s, frozen for one pressure solve. Production derives
     /// this from the calibrated inlet temperature.
     pub tf_filter_kinematic_viscosity_m2_s: f32,
-    /// Reference liquid density in kg/m³ used only to convert the storage-capacity slider.
-    pub tf_filter_water_density_kg_m3: f32,
+    /// Authoritative inlet-temperature liquid-water density in kg/m³. The MPM-v2 SI boundary
+    /// uses this same value for recipe mass scaling, stress reduction, emitted mass, diagnostics,
+    /// and filter-capacity conversion.
+    pub tf_water_density_kg_m3: f32,
     /// Finite filter-paper water capacity in grams. Overflow remains free water.
     pub tf_filter_capacity_g: f32,
     /// Physical filter-paper thickness in metres. Independent of reservoir capacity and the
@@ -309,7 +311,7 @@ impl Default for Config {
             tf_capillary_mobility_floor: 1.0,
             tf_filter_permeability_m2: 0.0,
             tf_filter_kinematic_viscosity_m2_s: 1.004e-6,
-            tf_filter_water_density_kg_m3: 998.2,
+            tf_water_density_kg_m3: 998.2,
             tf_filter_capacity_g: 0.0,
             tf_filter_thickness_m: 0.0,
             tf_filter_porosity: 0.3,

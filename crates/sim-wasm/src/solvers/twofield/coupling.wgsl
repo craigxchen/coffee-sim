@@ -9,12 +9,13 @@
 // saturation through the independent maximum-diameter swelling law below. φ_s is clamped at
 // PHI_S_MAX = 0.95 (mirrors the
 // xpbd packing clamp: φ_f never below 0.05, so the mixture operator stays nonsingular).
-// φ_f = 1 − φ_s. The field is local and kernel-smoothed — a configured global porosity
-// scalar is the rejected anti-pattern.
+// Structural φ_f = 1 − φ_s. Retention then defines the mobile phase fraction
+// φ_m=(P-H)/V_visible; the explicit overflow branch uses M/(M+V_s+H). Both fields are local and
+// kernel-smoothed — a configured global porosity scalar is the rejected anti-pattern.
 //
 // ================================ DRAG FOLD (KTD-3, exact forms) ==============================
 // The drag rate β(φ) comes from Kozeny-Carman (mirrors models::permeability — same clamps,
-// same 150 coefficient, β = drag_scale/k), blended toward a Wen-Yu-style dilute rate below
+// same 150 coefficient, β = φ_m*drag_scale/(K_structural*k_r)), blended toward a Wen-Yu-style dilute rate below
 // φ_s ≈ 0.2 with the Huilin-Gidaspow smooth arctan transition (constants below). The fold is
 // the FORCED exponential integrator for dv/dt = −β·(v − v_s) + g with v_s ≡ 0
 // in frozen mode:
@@ -25,8 +26,8 @@
 // pore-pressure slope collapses to ρg·(1−e)/(βΔt), and the pre-registered buoyancy/undrained
 // gates fail at stiff β (measured: the recorded buoyant reaction flips SIGN at β·Δt ≈ 1.9).
 //
-// In dynamic mode beta is the fluid-side relaxation rate. For node masses m_f and m_s the
-// relative rate is gamma = beta*(1 + m_f/m_s). After both phases receive their non-drag force
+// In dynamic mode beta is the mobile-fluid-side relaxation rate. For mobile mass m_m and
+// dry+held composite mass m_c the relative rate is gamma = beta*(1 + m_m/m_c). After both phases receive their non-drag force
 // updates, one exact pair impulse is applied:
 //     J = mu*(1-exp(-gamma*dt))*(v_f-v_s),  mu = m_f*m_s/(m_f+m_s),
 //     v_f' = v_f - J/m_f,                   v_s' = v_s + J/m_s.
@@ -47,20 +48,20 @@
 // REACTION LEDGER: the frozen skeleton has no dynamics, so every impulse it absorbs is
 // recorded (never discarded): this pass records the pair-update impulse m·(v_naive − v⁺)
 // (v_naive = v + gΔt, the no-drag path); `project` adds the pressure share (the direct
-// −φ_s·∇p force on the solid volume plus the (1−ς) fraction of the water-column pressure
+// −(V_s+H)·∇p force on the fixed composite plus the (1−ς) fraction of the mobile-column pressure
 // force transmitted through the drag during the fold). At hydrostatic equilibrium the three
 // terms net to exactly the displaced-volume weight — the buoyancy gate. Dynamic mode applies J
 // to grid_svel immediately; react.xyz may expose that already-applied impulse for diagnostics,
 // but project never substitutes ledger bookkeeping for a solid velocity update.
 //
 // EXACT-ZERO PASSTHROUGH (free-water regression gate): every coupling kernel gates on the
-// solid-mass census (decoded grid_sfp = 0), not on β → 0 — zero-solid nodes take the
-// byte-identical pre-U6 arithmetic path (no exp(0) rounding in the loop).
+// solid-mass census (decoded grid_sfp = 0), not on β → 0 — zero-solid nodes take the exact
+// algebraic free-water path (no exp(0) rounding in the loop).
 //
 // This pass also owns the grid forces + grid-node boundary conditions (moved verbatim from
 // U2's grid_update, which now only decodes): the fold must integrate the gravity source
 // itself, and the BCs must come after all velocity updates. Pipeline order (the U6 HTD):
-//   grid_clear → p2g_water → p2g_solid[_dyn] → grid_update(decode)
+//   grid_clear → p2g_water → p2g_solid_reference → p2g_solid[_dyn] → grid_update(decode)
 //   → [solid_update] → drag_fold(forces+drag+BC)
 //   → node_setup → … pressure … → project → g2p_water.
 //
@@ -95,11 +96,19 @@ fn kozeny_carman(d: f32, phi: f32) -> f32 {
 
 // Blended drag rate β(φ) in 1/s (mirrors models::permeability::drag_rate for the packed arm;
 // CPU twin twofield::blended_drag_rate is pinned against this by the pair-momentum gate).
-fn drag_rate_blended(phi_s: f32, phi_f: f32) -> f32 {
+fn drag_rate_blended(phi_s: f32, structural_phi_f: f32, mobile_phi_f: f32) -> f32 {
     let d = params.coupling.x;
     let scale = params.coupling.y;
-    let packed = scale / max(kozeny_carman(d, phi_f), 1.0e-9);
-    let dilute = scale * WEN_YU_COEFF * phi_s / max(d * d, 1.0e-8);
+    // v_m is intrinsic mobile-pore velocity while Darcy's q is superficial:
+    // q=phi_m*(v_m-v_c). K remains a property of the structural pore geometry, so
+    // beta=phi_m*nu/K makes the steady fold recover q=K*kr*F/nu after beta is divided by kr.
+    // Scaling the dilute arm by the same available-pore ratio keeps the blend continuous as a
+    // wetting front closes; it is exactly one in the capacity-zero path.
+    let structural_phi = clamp(structural_phi_f, NUMERICAL_MOBILITY_MIN, 1.0);
+    let available_ratio = clamp(mobile_phi_f / structural_phi, 0.0, 1.0);
+    let packed = scale * mobile_phi_f
+        / max(kozeny_carman(d, structural_phi_f), 1.0e-9);
+    let dilute = scale * WEN_YU_COEFF * phi_s / max(d * d, 1.0e-8) * available_ratio;
     let psi = atan(HUILIN_SLOPE * (phi_s - PHI_S_BLEND)) / PI_F32 + 0.5;
     return psi * packed + (1.0 - psi) * dilute;
 }
@@ -159,38 +168,119 @@ fn node_phi_f(n: u32, xp: vec3<f32>) -> f32 {
     return phi_f_from_solid_and_visible_volume(sv, node_visible_volume(xp));
 }
 
-// Local pore saturation S = V_water / (phi_f * V_visible), with V_water decoded from the same
-// reduced water density used to seed particle mass. A collapsed/invalid pore volume is dry rather
-// than singular; physical values are bounded because Corey mobility is defined on [0,1].
-fn pore_saturation_from_node_state(
-    carrier_mass: f32,
-    phi_f: f32,
-    visible_volume: f32,
-) -> f32 {
-    let pore_volume = max(phi_f, 0.0) * visible_volume;
+// Runtime capillary closure for the ONE canonical water field. P is resolved pore volume, C is
+// the quadrature-invariant target capacity scattered by the solid points, H=min(W,C) is actual
+// capillary-held water, and M=W-H is mobile water. No solvent, solute, or enthalpy leaves the
+// particle field: theta=M/W homogenizes its velocity response, while the exact M=0 branches in
+// drag_fold/node_setup pin the held inventory without introducing an untransported scalar phase.
+// Se is the mobile saturation in the remaining pore P-H (which equals P-C whenever M>0).
+struct CapillaryNodeState {
+    pore_volume: f32,
+    capacity_volume: f32,
+    held_volume: f32,
+    mobile_volume: f32,
+    mobile_pore_volume: f32,
+    theta: f32,
+    effective_saturation: f32,
+};
+
+fn capillary_node_state(n: u32, phi_f: f32, visible_volume: f32) -> CapillaryNodeState {
+    let pore_volume = max(phi_f, 0.0) * max(visible_volume, 0.0);
     if (pore_volume <= 0.0 || params.extra.x <= 0.0) {
-        return 0.0;
+        return CapillaryNodeState(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
     }
-    let water_volume = max(carrier_mass, 0.0) / params.extra.x;
-    return clamp(water_volume / pore_volume, 0.0, 1.0);
+    let water_volume = max(carrier_mass_at(n), 0.0) / params.extra.x;
+    let capacity_volume = min(max(capillary_capacity_at(n), 0.0), pore_volume);
+    let held_volume = min(water_volume, capacity_volume);
+    let mobile_volume = max(water_volume - held_volume, 0.0);
+    let mobile_pore_volume = max(pore_volume - held_volume, 0.0);
+    var theta = 0.0;
+    var effective_saturation = 0.0;
+    if (mobile_volume > 0.0 && water_volume > 0.0) {
+        theta = clamp(mobile_volume / water_volume, 0.0, 1.0);
+        if (mobile_pore_volume > 0.0) {
+            effective_saturation = clamp(mobile_volume / mobile_pore_volume, 0.0, 1.0);
+        } else {
+            // Capacity filled the resolved pore; excess carrier is free, fully saturated overflow.
+            effective_saturation = 1.0;
+        }
+    }
+    return CapillaryNodeState(
+        pore_volume,
+        capacity_volume,
+        held_volume,
+        mobile_volume,
+        mobile_pore_volume,
+        theta,
+        effective_saturation,
+    );
 }
 
-// Wetting-phase Corey mobility on effective saturation. The configured positive floor prevents
-// a singular drag rate at a dry front; NUMERICAL_MOBILITY_MIN is only a guard for malformed direct
-// Config construction. A floor of one is an exact legacy passthrough (k_r = 1, no pow cost).
+fn capillary_mobile_fraction(state: CapillaryNodeState, visible_volume: f32) -> f32 {
+    if (state.mobile_volume <= 0.0 || visible_volume <= 0.0) { return 0.0; }
+    if (state.mobile_pore_volume > 0.0) {
+        return clamp(state.mobile_pore_volume / visible_volume, 0.0, 1.0);
+    }
+    // Explicit overflow partition: H=P and M>0 leaves no geometric pore denominator. Normalize
+    // the mobile excess against itself plus the occupied solid+held composite (Vs+H), rather than
+    // producing a zero-volume singularity or clamping M/V to a disappearing composite. At
+    // W=C=P, M is exactly zero and the earlier branch remains exactly stiff.
+    let composite_volume = max(visible_volume - state.pore_volume + state.held_volume, 0.0);
+    return clamp(
+        state.mobile_volume / max(state.mobile_volume + composite_volume, NUMERICAL_MOBILITY_MIN),
+        0.0,
+        1.0,
+    );
+}
+
+// node_setup writes measured held carrier mass into its dedicated suffix lane. Taking the ratio
+// in integer-derived mass units avoids the C -> H -> carrier round trip that could create a fake
+// one-count mobile phase at an exactly held node.
+fn measured_mobile_fraction(n: u32) -> f32 {
+    let carrier_mass = max(carrier_mass_at(n), 0.0);
+    if (carrier_mass <= 0.0) { return 0.0; }
+    let held_mass = min(max(held_carrier_mass_at(n), 0.0), carrier_mass);
+    return clamp((carrier_mass - held_mass) / carrier_mass, 0.0, 1.0);
+}
+
+fn store_measured_held_carrier(n: u32, state: CapillaryNodeState) -> f32 {
+    let carrier_count = atomicLoad(&cell_cnt[carrier_mass_index(n)]);
+    var held_count = u32(max(fp_encode(state.held_volume * params.extra.x), 0));
+    if (state.mobile_volume <= 0.0) {
+        held_count = carrier_count;
+    } else {
+        held_count = min(held_count, carrier_count);
+    }
+    atomicStore(&cell_cnt[held_carrier_mass_index(n)], held_count);
+    if (carrier_count == 0u) { return 0.0; }
+    return f32(carrier_count - held_count) / f32(carrier_count);
+}
+
+fn capillary_bloom_contact(n: u32, solid_volume: f32) -> f32 {
+    if (solid_volume <= 0.0) { return 0.0; }
+    return clamp(bloom_volume_at(n) / solid_volume, 0.0, 1.0);
+}
+
+// Intrinsic mobile-water relative permeability is kr=max(Se^n,floor). The configured floor
+// regularizes only a genuinely mobile front; it cannot make held-only water creep. Pressure sees
+// the homogenized mobility theta*kr, but drag acts on reconstructed intrinsic v_mobile and must
+// divide beta by kr ONLY. Dividing by theta*kr here and then weighting the carrier by theta again
+// would suppress steady Darcy flux by an erroneous second factor of theta.
 const NUMERICAL_MOBILITY_MIN: f32 = 1.0e-6;
-fn bounded_corey_mobility(local_saturation: f32) -> f32 {
+fn capillary_relative_permeability(state: CapillaryNodeState) -> f32 {
+    if (state.mobile_volume <= 0.0 || state.theta <= 0.0) {
+        return 0.0;
+    }
     let floor = clamp(params.retention.z, NUMERICAL_MOBILITY_MIN, 1.0);
     if (floor >= 1.0) {
         return 1.0;
     }
-    let residual = clamp(params.retention.x, 0.0, 1.0);
-    if (residual >= 1.0) {
-        return floor;
-    }
-    let effective = clamp((local_saturation - residual) / (1.0 - residual), 0.0, 1.0);
     let exponent = max(params.retention.y, NUMERICAL_MOBILITY_MIN);
-    return clamp(max(pow(effective, exponent), floor), floor, 1.0);
+    return clamp(max(pow(state.effective_saturation, exponent), floor), 0.0, 1.0);
+}
+
+fn effective_capillary_mobility(state: CapillaryNodeState) -> f32 {
+    return state.theta * capillary_relative_permeability(state);
 }
 
 // A missing/domain-exterior/non-bed neighbor adopts center saturation (homogeneous Neumann), so
@@ -215,7 +305,7 @@ fn bed_neighbor_saturation(
     let neighbor_xp = params.grid_origin.xyz + vec3<f32>(neighbor_coords) * h;
     let visible_volume = node_visible_volume(neighbor_xp);
     let phi_f = phi_f_from_solid_and_visible_volume(neighbor_solid_volume, visible_volume);
-    return pore_saturation_from_node_state(carrier_mass_at(neighbor), phi_f, visible_volume);
+    return capillary_node_state(neighbor, phi_f, visible_volume).effective_saturation;
 }
 
 // Capillarity pulls toward lower saturation: a_cap = -a_suction * q * normalize(grad S), with
@@ -306,15 +396,74 @@ fn p2g_solid(@builtin(global_invocation_id) gid: vec3<u32>) {
     // V_struct = V_dry*(1 + s*max_diameter_swelling)^3. The default maximum is zero, preserving
     // the dry U6 scatter exactly even when a calibration stores bound water.
     let vg = grain_structural_volume(pos[p].w);
+    let total_structure = fp_encode(vg);
+    let total_capacity = fp_encode(max(params.solute.w, 0.0));
+    let total_bloom_volume = fp_encode(vg * bloom_factor(chem[p].w));
+    var allocated_structure = 0i;
+    var allocated_capacity = 0i;
+    var allocated_bloom_volume = 0i;
+    var cumulative_weight = 0.0;
     for (var k = 0; k < 3; k = k + 1) {
         for (var j = 0; j < 3; j = j + 1) {
             for (var i2 = 0; i2 < 3; i2 = i2 + 1) {
                 let wijk = w[i2].x * w[j].y * w[k].z;
                 let node = base + vec3<i32>(i2, j, k);
-                atomicAdd(&grid_sfp[node_index(node)], fp_encode(vg * wijk));
+                let n = node_index(node);
+                cumulative_weight += wijk;
+                let is_last = i2 == 2 && j == 2 && k == 2;
+                let structure_target = extensive_partition_target(
+                    total_structure, cumulative_weight, is_last,
+                );
+                let capacity_target = extensive_partition_target(
+                    total_capacity, cumulative_weight, is_last,
+                );
+                let bloom_target = extensive_partition_target(
+                    total_bloom_volume, cumulative_weight, is_last,
+                );
+                atomicAdd(&grid_sfp[n], structure_target - allocated_structure);
+                atomicAdd(
+                    &cell_cnt[capillary_capacity_index(n)],
+                    u32(max(capacity_target - allocated_capacity, 0)),
+                );
+                atomicAdd(
+                    &cell_cnt[bloom_volume_index(n)],
+                    u32(max(bloom_target - allocated_bloom_volume, 0)),
+                );
+                allocated_structure = structure_target;
+                allocated_capacity = capacity_target;
+                allocated_bloom_volume = bloom_target;
             }
         }
     }
+}
+
+// Decode the frame-start dry-skeleton APIC proposal preserved before solid_update/implicit shear
+// applies stress, body, compaction, and contact impulses. Partial-retention reconstruction must
+// use this time-level consistently: grid_vel is still the homogenized water proposal, whereas
+// grid_svel is already force-updated.
+fn preforce_solid_velocity(n: u32) -> vec3<f32> {
+    let mass_count = atomicLoad(&grid_sraw[4u * n]);
+    if (fp_decode(mass_count) <= params.extra.z || mass_count == 0) {
+        return vec3<f32>(0.0);
+    }
+    return vec3<f32>(
+        f32(atomicLoad(&grid_sraw[4u * n + 1u])),
+        f32(atomicLoad(&grid_sraw[4u * n + 2u])),
+        f32(atomicLoad(&grid_sraw[4u * n + 3u])),
+    ) / f32(mass_count);
+}
+
+fn mobile_water_velocity_bc(xp: vec3<f32>, velocity: vec3<f32>, open_base: bool) -> vec3<f32> {
+    // Use the identical hard projector assembled for node_setup/project, but apply it to the
+    // intrinsic MOBILE phase. Projecting v_bar would also damp the capillary-held share and break
+    // v_bar=theta*v_m+(1-theta)*v_c at contacts.
+    var bounded = minv_apply(phase_hard_projector(xp, PHASE_WATER, open_base), velocity);
+    let water_cap = select(params.max_speed, params.flip.w, params.flip.w > 0.0);
+    let speed = length(bounded);
+    if (speed > water_cap) {
+        bounded *= water_cap / speed;
+    }
+    return bounded;
 }
 
 // =================================== drag_fold =================================================
@@ -333,25 +482,36 @@ fn drag_fold(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
     var v = gv.xyz;
-    var g = params.gravity.xyz;
+    let gravity_accel = params.gravity.xyz;
+    var mobile_external_accel = gravity_accel;
     let c = node_coords(n);
     let xp = params.grid_origin.xyz + vec3<f32>(f32(c.x), f32(c.y), f32(c.z)) * params.grid_origin.w;
     let open_base = params.coupling.w > 0.5;
     let sv = solid_volume_at(n);
     var phi_f = 1.0;
-    var saturation = 0.0;
+    var mobile_phi_f = 1.0;
+    var measured_theta = 1.0;
+    var capillary = CapillaryNodeState(0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0);
     if (sv > 0.0) {
         let visible_volume = node_visible_volume(xp);
         phi_f = phi_f_from_solid_and_visible_volume(sv, visible_volume);
-        saturation = pore_saturation_from_node_state(carrier_mass_at(n), phi_f, visible_volume);
+        capillary = capillary_node_state(n, phi_f, visible_volume);
+        measured_theta = store_measured_held_carrier(n, capillary);
+        mobile_phi_f = capillary_mobile_fraction(capillary, visible_volume);
+        if (measured_theta <= 0.0) { mobile_phi_f = 0.0; }
 
         // The calibrated Green-Ampt magnitude now follows the local saturation-gradient normal,
         // not gravity. It is evaluated only inside the bed; missing/non-bed neighbors receive a
-        // zero-normal-gradient boundary value. Folding it into g keeps the forced exponential
-        // drag integration and its pressure mobility sigma algebraically unchanged.
+        // zero-normal-gradient boundary value. Suction is independently gated by the local,
+        // structural-volume-weighted bloom contact; a retention target of zero cannot disable it.
+        // Adding it only to mobile forcing keeps the forced exponential drag integration and
+        // pressure mobility sigma algebraically unchanged without accelerating held water.
         let a_suction = params.wet1.x;
-        if (a_suction > 0.0) {
-            g = g + capillary_front_acceleration(vec3<i32>(c), saturation, a_suction);
+        let bloom_contact = capillary_bloom_contact(n, sv);
+        if (a_suction > 0.0 && bloom_contact > 0.0) {
+            mobile_external_accel += bloom_contact * capillary_front_acceleration(
+                vec3<i32>(c), capillary.effective_saturation, a_suction,
+            );
         }
     }
     // Thin-sheet paper split. The hard-wall projector first removes geometrically forbidden
@@ -362,15 +522,18 @@ fn drag_fold(@builtin(global_invocation_id) gid: vec3<u32>) {
     let paper = filter_paper_response(xp);
     var paper_normal = vec3<f32>(0.0);
     var paper_source = 0.0;
-    if (paper.coverage > 0.0) {
+    if (paper.coverage > 0.0 && (sv <= 0.0 || capillary.mobile_volume > 0.0)) {
         let hard = phase_hard_projector(xp, PHASE_WATER, open_base);
         let allowed = minv_apply(hard, paper.normal);
         let allowed_len = length(allowed);
         if (allowed_len > SDF_NORMAL_MIN) {
             paper_normal = allowed / allowed_len;
-            let normal_force = dot(g, paper_normal);
+            let normal_force = dot(mobile_external_accel, paper_normal);
             paper_source = paper.alpha * normal_force;
-            g = g - normal_force * paper_normal;
+            // The paper ODE owns superficial normal flux. The ordinary drag/body step advances
+            // only the tangential intrinsic mobile velocity, then the q solve below restores the
+            // normal component without ever touching held water.
+            mobile_external_accel -= normal_force * paper_normal;
         }
     }
     var sig = 1.0;
@@ -378,20 +541,58 @@ fn drag_fold(@builtin(global_invocation_id) gid: vec3<u32>) {
     var solid_v = grid_svel[n].xyz;
     let solid_mass = grid_svel[n].w;
     var dynamic_pair = false;
+    var theta_node = 1.0;
     if (sv > 0.0) {
         let phi_s = 1.0 - phi_f;
-        // Relative permeability modifies only beta. The exact pair impulse and react.w sigma are
-        // still derived from that same beta, so node_setup/project retain the identical condensed
-        // pressure operator and dynamic pair momentum remains equal-and-opposite.
-        let relative_mobility = bounded_corey_mobility(saturation);
-        let beta = drag_rate_blended(phi_s, phi_f) / relative_mobility;
-        if (params.splas0.x > 0.5 && solid_mass > params.extra.z) {
-            // Both phases already contain their non-drag forces (water `g` here, solids in
-            // solid_update). Apply the exact homogeneous pair flow once. `imp` is the impulse
-            // water gives the solid; equal-and-opposite updates conserve node momentum exactly
-            // before wall projection and safety caps.
-            let fluid_forced = v + g * params.dt;
-            let gamma = beta * (1.0 + mass / solid_mass);
+        let theta = measured_theta;
+        theta_node = theta;
+        let mobile_mass = mass * theta;
+        let held_mass = mass - mobile_mass;
+        let composite_mass = solid_mass + held_mass;
+        // Relative permeability modifies beta while mobile water exists. theta is already present
+        // in mobile_mass and v_bar; including it in beta would count retention twice. Held-only
+        // water is an explicit infinite-drag branch, so no numerical floor can make M=0 creep.
+        let relative_permeability = capillary_relative_permeability(capillary);
+        if (theta <= 0.0 || relative_permeability <= 0.0) {
+            let fluid_forced = v + gravity_accel * params.dt;
+            sig = 0.0;
+            if (params.splas0.x > 0.5 && solid_mass > params.extra.z) {
+                // All solution mass is held. Merge its independently forced momentum with the
+                // dry-solid proposal in the exact barycentric stiff limit.
+                let reduced_mass = mass * solid_mass / (mass + solid_mass);
+                imp = reduced_mass * (fluid_forced - solid_v);
+                v = fluid_forced - imp / mass;
+                solid_v = solid_v + imp / solid_mass;
+                dynamic_pair = true;
+            } else {
+                // A structural-volume node without decoded dynamic mass is a kinematically fixed
+                // support, not free water. This keeps M=0 exactly stiff even at a quantized bed
+                // fringe instead of letting the numerical mobility floor create creep.
+                imp = mass * fluid_forced;
+                v = vec3<f32>(0.0);
+            }
+        } else if (params.splas0.x > 0.5
+            && solid_mass > params.extra.z
+            && composite_mass > params.extra.z) {
+            let beta = drag_rate_blended(phi_s, phi_f, mobile_phi_f)
+                / relative_permeability;
+            // Momentum staging at one consistent time level:
+            //   p_m* = m_m v_m^n + I_m,
+            //   p_c* = m_c v_s^n + I_s + I_h.
+            // grid_sraw supplies v_s^n before solid forces; grid_svel supplies the dry
+            // proposal after them. Dividing its dry impulse by m_c gives held water real inertia
+            // instead of letting the skeleton accelerate as if H had no mass.
+            let solid_preforce = preforce_solid_velocity(n);
+            var mobile_preforce = v;
+            if (theta < 1.0) {
+                mobile_preforce = (v - (1.0 - theta) * solid_preforce) / theta;
+            }
+            let mobile_forced = mobile_preforce + mobile_external_accel * params.dt;
+            let dry_impulse = solid_mass * (solid_v - solid_preforce);
+            let held_body_impulse = held_mass * gravity_accel * params.dt;
+            solid_v = solid_preforce
+                + (dry_impulse + held_body_impulse) / composite_mass;
+            let gamma = beta * (1.0 + mobile_mass / composite_mass);
             let a = gamma * params.dt;
             var one_minus_e: f32;
             if (a < 1.0e-3) {
@@ -401,116 +602,75 @@ fn drag_fold(@builtin(global_invocation_id) gid: vec3<u32>) {
                 one_minus_e = 1.0 - exp(-a);
                 sig = one_minus_e / a;
             }
-            let reduced_mass = mass * solid_mass / (mass + solid_mass);
-            imp = reduced_mass * one_minus_e * (fluid_forced - solid_v);
-            v = fluid_forced - imp / mass;
-            solid_v = solid_v + imp / solid_mass;
+            let reduced_mass = mobile_mass * composite_mass / (mobile_mass + composite_mass);
+            imp = reduced_mass * one_minus_e * (mobile_forced - solid_v);
+            let mobile_after = mobile_forced - imp / mobile_mass;
+            solid_v = solid_v + imp / composite_mass;
+            v = theta * mobile_after + (1.0 - theta) * solid_v;
             dynamic_pair = true;
         } else {
-            // Frozen mode keeps the forced exponential integrator exactly. A dynamic node with
-            // no resolved solid mass has no pair partner and follows the drag-free force path.
-            if (params.splas0.x > 0.5) {
-                v = v + g * params.dt;
+            // Frozen mode keeps the forced exponential integrator exactly. A structural-volume
+            // node with no independently resolved dry mass is also a fixed bed fringe, not a
+            // held-only dynamic composite.
+            let beta = drag_rate_blended(phi_s, phi_f, mobile_phi_f)
+                / relative_permeability;
+            let a = beta * params.dt;
+            let e = exp(-a);
+            var srcf: f32;
+            if (a < 1.0e-3) {
+                srcf = params.dt * (1.0 - 0.5 * a);
             } else {
-                let a = beta * params.dt;
-                let e = exp(-a);
-                var srcf: f32;
-                if (a < 1.0e-3) {
-                    srcf = params.dt * (1.0 - 0.5 * a);
-                } else {
-                    srcf = (1.0 - e) / beta;
-                }
-                let naive = v + g * params.dt;
-                v = v * e + g * srcf;
-                sig = srcf / params.dt;
-                imp = mass * (naive - v);
+                srcf = (1.0 - e) / beta;
             }
+            let mobile_v = v / theta;
+            let mobile_after = mobile_v * e + mobile_external_accel * srcf;
+            // Held water receives gravity before its exact fixed-support constraint; mobile-only
+            // suction and the ordinary (non-paper-normal) mobile force are theta weighted.
+            let naive = v + (
+                theta * mobile_external_accel + (1.0 - theta) * gravity_accel
+            ) * params.dt;
+            v = theta * mobile_after;
+            sig = srcf / params.dt;
+            imp = mass * (naive - v);
         }
     } else {
-        v = v + g * params.dt; // exact-zero passthrough: byte-identical pre-U6 gravity path
-    }
-
-    if (length(paper_normal) > SDF_NORMAL_MIN) {
-        let old_normal_velocity = dot(v, paper_normal);
-        let new_normal_velocity = paper.decay * old_normal_velocity
-            + paper.sigma * params.dt * paper_source;
-        v = v + (new_normal_velocity - old_normal_velocity) * paper_normal;
+        v += mobile_external_accel * params.dt;
     }
 
     if (dynamic_pair) {
         // Drag can reintroduce an approaching contact component after solid_update. Reapply the
         // identical unilateral Coulomb BC at actual contact only; separating motion survives and
-        // grains outside the water pressure band are untouched. This wall impulse is external to
-        // the momentum-conserving pair update.
-        solid_v = solid_contact_velocity_bc(xp, solid_v);
+        // grains outside the water pressure band are untouched. Recompose the held share after
+        // this external phase impulse; changing v_s without (1-theta)*delta-v_s would corrupt the
+        // single-water-field identity.
+        let solid_before_bc = solid_v;
+        solid_v = solid_contact_velocity_bc(xp, solid_before_bc);
+        v += (1.0 - theta_node) * (solid_v - solid_before_bc);
         grid_svel[n] = vec4<f32>(solid_v, solid_mass);
     }
 
-    // --- grid-node BC (moved verbatim from U2's grid_update; see its original comments) -------
-    let eps = 1.0e-4;
-    // Nodes strictly OUTSIDE the domain box are inside the walls (zero velocity, M̃⁻¹ = 0 in
-    // node_setup). The open base exempts the below-floor pad layer: it carries the outflow's
-    // B-spline smear and must keep its velocity or near-floor particles gather a zero-drag
-    // brake (the same edge-column artifact the original comment records).
-    var out_lo = xp < params.box_min.xyz - vec3<f32>(eps);
-    if (open_base) {
-        out_lo.y = false;
-    }
-    if (any(out_lo) || any(xp > params.box_max.xyz + vec3<f32>(eps))) {
-        grid_vel[n] = vec4<f32>(vec3<f32>(0.0), mass);
-        react[n] = vec4<f32>(imp, sig);
-        return;
-    }
-    // Wall BC. The box-face normal components are removed (free slip tangentially), matching the
-    // constrained M̃⁻¹; the SDF wall adds its in-band normal(s). Both modes share the SAME basis
-    // node_setup builds (operator consistency A = D·M̃⁻¹·G; a one-sided BC here was tried and
-    // reverted). The open base keeps the y-min face open for the water field.
-    if (!wall_bc_multi()) {
-        // SINGLE-NORMAL (default): box-face axis zeroing + the most-penetrated SDF normal, banded,
-        // box-orthogonalized — byte-identical to the original BC.
-        if (xp.x <= params.box_min.x + eps || xp.x >= params.box_max.x - eps) { v.x = 0.0; }
-        if ((xp.y <= params.box_min.y + eps && !open_base) || xp.y >= params.box_max.y - eps) { v.y = 0.0; }
-        if (xp.z <= params.box_min.z + eps || xp.z >= params.box_max.z - eps) { v.z = 0.0; }
-        if (params.num_solids > 0u) {
-            let hit = solid_union(xp, PHASE_WATER);
-            if (hit.dist < WALL_BAND * params.grid_origin.w) {
-                var nrm = hit.grad;
-                if (xp.x <= params.box_min.x + eps || xp.x >= params.box_max.x - eps) { nrm.x = 0.0; }
-                if ((xp.y <= params.box_min.y + eps && !open_base) || xp.y >= params.box_max.y - eps) { nrm.y = 0.0; }
-                if (xp.z <= params.box_min.z + eps || xp.z >= params.box_max.z - eps) { nrm.z = 0.0; }
-                let len = length(nrm);
-                if (len > SDF_NORMAL_MIN) {
-                    nrm = nrm / len;
-                    v = v - dot(v, nrm) * nrm;
-                }
-            }
+    // Recover intrinsic mobile velocity, advance the paper NORMAL equation in superficial flux
+    // q=phi_m*v_m, then apply water contacts to v_m only. Held water never sees paper damping or
+    // water-wall clipping; it follows the composite skeleton velocity by construction.
+    var mobile_v = solid_v;
+    if (theta_node > 0.0) {
+        if (theta_node < 1.0) {
+            mobile_v = (v - (1.0 - theta_node) * solid_v) / theta_node;
+        } else {
+            mobile_v = v;
         }
+        if (length(paper_normal) > SDF_NORMAL_MIN && mobile_phi_f > NUMERICAL_MOBILITY_MIN) {
+            let old_flux = mobile_phi_f * dot(mobile_v, paper_normal);
+            let new_flux = paper.decay * old_flux
+                + paper.sigma * params.dt * paper_source;
+            mobile_v += ((new_flux - old_flux) / mobile_phi_f) * paper_normal;
+        }
+        mobile_v = mobile_water_velocity_bc(xp, mobile_v, open_base);
+        v = theta_node * mobile_v + (1.0 - theta_node) * solid_v;
     } else {
-        // MULTI-NORMAL: v ← P·v with P = I − Q·Qᵀ over the active box axes + ALL in-band wall faces
-        // — the IDENTICAL basis node_setup builds for M̃⁻¹ = invr·P (exact lockstep). box_mask
-        // matches the single path's box-face conditions; faces empty when no solids.
-        var box_mask = 0u;
-        if (xp.x <= params.box_min.x + eps || xp.x >= params.box_max.x - eps) { box_mask = box_mask | 1u; }
-        if ((xp.y <= params.box_min.y + eps && !open_base) || xp.y >= params.box_max.y - eps) { box_mask = box_mask | 2u; }
-        if (xp.z <= params.box_min.z + eps || xp.z >= params.box_max.z - eps) { box_mask = box_mask | 4u; }
-        var faces: WallFaces;
-        faces.count = 0u;
-        if (params.num_solids > 0u) {
-            faces = wall_binding_faces(xp, PHASE_WATER, WALL_BAND * params.grid_origin.w);
-        }
-        let cb = build_constraint_basis(box_mask, faces);
-        v = cbasis_project_vec(cb, v);
+        v = solid_v;
     }
-    // Speed-cap backstop (couples to the FP headroom math in common.wgsl). U3: this is the WATER
-    // grid (writes grid_vel) and runs BEFORE project/g2p, so it must use the separate splash cap
-    // (flip.w) — clipping the water grid at the global 12/max_speed here would defeat the crown.
-    // Sentinel ≤ 0 ⇒ global max_speed (byte-identical default). The solid grid clamp lives in
-    // solid_update (plasticity.wgsl) and stays on the global max_speed — grain dynamics unperturbed.
-    let water_cap = select(params.max_speed, params.flip.w, params.flip.w > 0.0);
-    let s = length(v);
-    if (s > water_cap) {
-        v = v * (water_cap / s);
-    }
+
     grid_vel[n] = vec4<f32>(v, mass);
     react[n] = vec4<f32>(imp, sig);
 }
@@ -566,6 +726,7 @@ fn water_solvent_floor(f_water: f32, concentration: f32) -> f32 {
 // (chem.w, physical seconds) over bloom_delay. No delay ⇒ factor 1 immediately.
 fn bloom_factor(contact_t: f32) -> f32 {
     let bd = params.wet1.y;
+    if (contact_t <= 0.0) { return 0.0; }
     if (bd <= 0.0) { return 1.0; }
     let t = clamp(contact_t / bd, 0.0, 1.0);
     return t * t * (3.0 - 2.0 * t); // smoothstep
@@ -577,6 +738,61 @@ fn bloom_factor(contact_t: f32) -> f32 {
 // admissions in the later dispatch. chem.z=2 is a one-dispatch handoff marker: g2p clears it while
 // preserving the release position/velocity instead of gathering from a grid the parcel did not
 // contribute to this frame.
+struct PaperFluxSample {
+    superficial_flux: vec3<f32>,
+    mobile_carrier_mass: f32,
+};
+
+// Gather post-projection WATER superficial flux q_w=phi_m*v_m at a held parcel's paper location.
+// Never gather raw v_bar and never add a solid volumetric term: the paper reservoir advances water
+// carrier transit relative to stationary paper, so skeleton motion alone cannot release it. The
+// carrier census distinguishes a real zero-flux pressure balance from the special case where the
+// held parcel is the only local water and did not contribute to this frame's grid.
+fn paper_flux_sample(x: vec3<f32>) -> PaperFluxSample {
+    let h = params.grid_origin.w;
+    let xl = (x - params.grid_origin.xyz) / h;
+    var base = vec3<i32>(floor(xl - vec3<f32>(0.5)));
+    base = clamp(base, vec3<i32>(0), vec3<i32>(params.grid_dims.xyz) - vec3<i32>(3));
+    let w = bspline_w(xl - vec3<f32>(base));
+    var superficial_flux = vec3<f32>(0.0);
+    var mobile_carrier_mass = 0.0;
+    for (var k = 0; k < 3; k = k + 1) {
+        for (var j = 0; j < 3; j = j + 1) {
+            for (var i = 0; i < 3; i = i + 1) {
+                let weight = w[i].x * w[j].y * w[k].z;
+                let node = base + vec3<i32>(i, j, k);
+                let n = node_index(node);
+                let sv = solid_volume_at(n);
+                if (sv <= 0.0) {
+                    superficial_flux += weight * grid_vel[n].xyz;
+                    mobile_carrier_mass += weight * carrier_mass_at(n);
+                } else {
+                    let xp = params.grid_origin.xyz + vec3<f32>(node) * h;
+                    let visible = node_visible_volume(xp);
+                    let structural_phi_f = phi_f_from_solid_and_visible_volume(sv, visible);
+                    let state = capillary_node_state(n, structural_phi_f, visible);
+                    let theta = measured_mobile_fraction(n);
+                    let mobile_phi_f = capillary_mobile_fraction(state, visible);
+                    if (theta > 0.0 && mobile_phi_f > 0.0) {
+                        var solid_velocity = vec3<f32>(0.0);
+                        if (params.splas0.x > 0.5 && grid_svel[n].w > params.extra.z) {
+                            solid_velocity = grid_svel[n].xyz;
+                        }
+                        let mobile_velocity = (grid_vel[n].xyz
+                            - (1.0 - theta) * solid_velocity) / theta;
+                        superficial_flux += weight * mobile_phi_f * mobile_velocity;
+                    }
+                    mobile_carrier_mass += weight * max(
+                        carrier_mass_at(n) - held_carrier_mass_at(n),
+                        0.0,
+                    );
+                }
+            }
+        }
+    }
+    return PaperFluxSample(superficial_flux, mobile_carrier_mass);
+}
+
 @compute @workgroup_size(256)
 fn filter_release(@builtin(global_invocation_id) gid: vec3<u32>) {
     let p = gid.x;
@@ -598,8 +814,15 @@ fn filter_release(@builtin(global_invocation_id) gid: vec3<u32>) {
         atomicOr(&filter_state[FILTER_ERRORS], 1u);
         return;
     }
-    let superficial_flux = (permeability / viscosity)
-        * max(dot(params.gravity.xyz, downstream), 0.0);
+    let sample = paper_flux_sample(pos[p].xyz);
+    var superficial_flux = max(dot(sample.superficial_flux, downstream), 0.0);
+    if (sample.mobile_carrier_mass <= params.extra.z) {
+        // A held parcel does not scatter. If it is the only local carrier there is no projected
+        // grid velocity to gather, so advance it by the gravity-only Darcy limit. Never use this
+        // fallback when mobile water is present: zero then means pressure really balanced gravity.
+        superficial_flux = (permeability / viscosity)
+            * max(dot(params.gravity.xyz, downstream), 0.0);
+    }
     let progress = state.w + superficial_flux * params.dt / (porosity * thickness);
     if (progress < 1.0) {
         chem[p] = vec4<f32>(state.xyz, clamp(progress, 0.0, 1.0));
@@ -615,7 +838,9 @@ fn filter_release(@builtin(global_invocation_id) gid: vec3<u32>) {
     atomicAdd(&filter_state[FILTER_RELEASED], 1u);
     let offset = max(thickness, 2.0 * SDF_EPS * params.grid_origin.w);
     pos[p] = vec4<f32>(pos[p].xyz + downstream * offset, pos[p].w);
-    vel[p] = vec4<f32>(downstream * (superficial_flux / porosity), vel[p].w);
+    // Released free water leaves at the superficial flux represented by the solver grid. Dividing
+    // by paper porosity here would inject an unphysical velocity jump at the phase handoff.
+    vel[p] = vec4<f32>(downstream * superficial_flux, vel[p].w);
     cmat[3u * p + 0u] = vec4<f32>(0.0);
     cmat[3u * p + 1u] = vec4<f32>(0.0);
     cmat[3u * p + 2u] = vec4<f32>(0.0);

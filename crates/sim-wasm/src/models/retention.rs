@@ -49,6 +49,107 @@ pub struct PoreWaterFractions {
     pub mobile: f32,
 }
 
+/// Measured node closure for capillary retention in a single transported water field.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RuntimeCapillaryClosure {
+    pub pore_volume: f32,
+    pub capacity_volume: f32,
+    pub held_volume: f32,
+    pub mobile_volume: f32,
+    pub mobile_pore_volume: f32,
+    pub mobile_fraction: f32,
+    pub effective_saturation: f32,
+    pub relative_mobility: f32,
+}
+
+/// Partition measured water into held and mobile inventories at a grid node.
+///
+/// `H=min(W,C)`, `M=W-H`, `theta=M/W`, `S_e=M/(P-H)`, and
+/// `k_eff=theta*max(S_e^n, floor)`. The mobility floor applies only when `M>0`; a held-only node
+/// is exactly immobile. All quantities are volumes in one caller-selected unit.
+pub fn runtime_capillary_closure(
+    water_volume: f32,
+    pore_volume: f32,
+    capacity_volume: f32,
+    shape_exponent: f32,
+    mobility_floor: f32,
+) -> Result<RuntimeCapillaryClosure, RetentionError> {
+    nonnegative(water_volume, "water_volume")?;
+    nonnegative(pore_volume, "pore_volume")?;
+    nonnegative(capacity_volume, "capacity_volume")?;
+    positive(shape_exponent, "shape_exponent")?;
+    nonnegative(mobility_floor, "mobility_floor")?;
+
+    let capacity = capacity_volume.min(pore_volume);
+    let held = water_volume.min(capacity);
+    let mobile = (water_volume - held).max(0.0);
+    let mobile_pore = (pore_volume - held).max(0.0);
+    let (theta, effective_saturation, relative_mobility) = if mobile > 0.0 && water_volume > 0.0 {
+        let theta = (mobile / water_volume).clamp(0.0, 1.0);
+        // If held water fills the resolved pore exactly, any excess is free overflow rather
+        // than trapped zero-mobility water. It is a fully saturated mobile branch.
+        let effective = if mobile_pore > 0.0 {
+            (mobile / mobile_pore).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        let corey = effective
+            .powf(shape_exponent)
+            .max(mobility_floor.clamp(0.0, 1.0));
+        (theta, effective, (theta * corey).clamp(0.0, 1.0))
+    } else {
+        (0.0, 0.0, 0.0)
+    };
+    Ok(RuntimeCapillaryClosure {
+        pore_volume,
+        capacity_volume: capacity,
+        held_volume: held,
+        mobile_volume: mobile,
+        mobile_pore_volume: mobile_pore,
+        mobile_fraction: theta,
+        effective_saturation,
+        relative_mobility,
+    })
+}
+
+/// Bounded mobile phase fraction used by the pressure/drag split.
+///
+/// Ordinarily this is the remaining mobile pore `(P-H)/V`. If `H=P` but excess mobile water
+/// exists, the geometric denominator has collapsed; normalize overflow against itself plus the
+/// occupied solid+held composite. This keeps both phases finite and positive. `W=C=P` remains
+/// exactly stiff because its mobile inventory is zero.
+pub fn mobile_phase_fraction(
+    closure: RuntimeCapillaryClosure,
+    visible_volume: f32,
+) -> Result<f32, RetentionError> {
+    positive(visible_volume, "visible_volume")?;
+    if closure.mobile_volume <= 0.0 {
+        return Ok(0.0);
+    }
+    if closure.mobile_pore_volume > 0.0 {
+        return Ok((closure.mobile_pore_volume / visible_volume).clamp(0.0, 1.0));
+    }
+    let composite_volume = (visible_volume - closure.pore_volume + closure.held_volume).max(0.0);
+    Ok(
+        (closure.mobile_volume / (closure.mobile_volume + composite_volume).max(f32::EPSILON))
+            .clamp(0.0, 1.0),
+    )
+}
+
+/// Smooth wet-contact gate mirrored by the GPU bloom/suction closure.
+pub fn bloom_contact_factor(contact_time_s: f32, delay_s: f32) -> Result<f32, RetentionError> {
+    nonnegative(contact_time_s, "contact_time_s")?;
+    nonnegative(delay_s, "delay_s")?;
+    if contact_time_s == 0.0 {
+        return Ok(0.0);
+    }
+    if delay_s == 0.0 {
+        return Ok(1.0);
+    }
+    let t = (contact_time_s / delay_s).clamp(0.0, 1.0);
+    Ok(t * t * (3.0 - 2.0 * t))
+}
+
 /// Capillary volume required after intragranular bound water is accounted for.
 ///
 /// The target is explicitly whole-*bed* retention; paper water is a separate brewer-component
@@ -294,6 +395,79 @@ mod tests {
                 mobile: 0.0,
             }
         );
+    }
+
+    #[test]
+    fn runtime_closure_conserves_measured_water_and_uses_remaining_pore() {
+        let state = runtime_capillary_closure(7.0, 12.0, 3.0, 2.0, 0.05).unwrap();
+        assert!(close(state.held_volume + state.mobile_volume, 7.0));
+        assert!(close(state.held_volume, 3.0));
+        assert!(close(state.mobile_pore_volume, 9.0));
+        assert!(close(state.mobile_fraction, 4.0 / 7.0));
+        assert!(close(state.effective_saturation, 4.0 / 9.0));
+        assert!(close(
+            state.relative_mobility,
+            (4.0 / 7.0) * (4.0f32 / 9.0).powi(2)
+        ));
+    }
+
+    #[test]
+    fn held_only_water_is_exactly_immobile_despite_a_positive_floor() {
+        let held = runtime_capillary_closure(2.0, 10.0, 4.0, 3.0, 0.25).unwrap();
+        assert_eq!(held.held_volume, 2.0);
+        assert_eq!(held.mobile_volume, 0.0);
+        assert_eq!(held.mobile_fraction, 0.0);
+        assert_eq!(held.relative_mobility, 0.0);
+
+        let no_capacity = runtime_capillary_closure(2.0, 10.0, 0.0, 3.0, 1.0).unwrap();
+        assert_eq!(no_capacity.mobile_fraction, 1.0);
+        assert_eq!(no_capacity.relative_mobility, 1.0);
+    }
+
+    #[test]
+    fn runtime_closure_is_unit_scale_invariant_and_capacity_bounded_by_pore() {
+        let base = runtime_capillary_closure(7.0, 12.0, 3.0, 2.5, 0.02).unwrap();
+        let scale = 11.0;
+        let scaled =
+            runtime_capillary_closure(7.0 * scale, 12.0 * scale, 3.0 * scale, 2.5, 0.02).unwrap();
+        assert!(close(scaled.held_volume, base.held_volume * scale));
+        assert!(close(scaled.mobile_volume, base.mobile_volume * scale));
+        assert!(close(
+            scaled.mobile_pore_volume,
+            base.mobile_pore_volume * scale
+        ));
+        assert!(close(scaled.relative_mobility, base.relative_mobility));
+
+        let over_capacity = runtime_capillary_closure(1.0, 4.0, 9.0, 2.0, 0.1).unwrap();
+        assert_eq!(over_capacity.capacity_volume, 4.0);
+        assert_eq!(over_capacity.held_volume, 1.0);
+
+        let overflow = runtime_capillary_closure(6.0, 4.0, 9.0, 2.0, 0.1).unwrap();
+        assert_eq!(overflow.held_volume, 4.0);
+        assert_eq!(overflow.mobile_volume, 2.0);
+        assert_eq!(overflow.mobile_pore_volume, 0.0);
+        assert_eq!(overflow.effective_saturation, 1.0);
+        assert!(close(overflow.mobile_fraction, 1.0 / 3.0));
+        assert!(close(overflow.relative_mobility, overflow.mobile_fraction));
+
+        // W=C=P is exactly stiff, while W>P=C takes the explicit finite overflow branch. The
+        // assertions pin only partition structure and bounds, not a calibration value.
+        let exactly_full = runtime_capillary_closure(4.0, 4.0, 4.0, 2.0, 0.1).unwrap();
+        assert_eq!(mobile_phase_fraction(exactly_full, 7.0).unwrap(), 0.0);
+        let overflow_fraction = mobile_phase_fraction(overflow, 7.0).unwrap();
+        assert!(overflow_fraction.is_finite());
+        assert!(overflow_fraction > 0.0 && overflow_fraction < 1.0);
+        assert!(close(overflow_fraction, 2.0 / (2.0 + 7.0)));
+    }
+
+    #[test]
+    fn bloom_gate_requires_contact_and_zero_delay_is_exactly_full_after_contact() {
+        assert_eq!(bloom_contact_factor(0.0, 0.0).unwrap(), 0.0);
+        assert_eq!(bloom_contact_factor(0.0, 3.0).unwrap(), 0.0);
+        assert_eq!(bloom_contact_factor(f32::EPSILON, 0.0).unwrap(), 1.0);
+        let half = bloom_contact_factor(1.5, 3.0).unwrap();
+        assert!(close(half, 0.5));
+        assert_eq!(bloom_contact_factor(3.0, 3.0).unwrap(), 1.0);
     }
 
     #[test]

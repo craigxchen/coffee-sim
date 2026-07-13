@@ -59,6 +59,40 @@ pub struct PaperRelaxation {
     pub pressure_mobility: f64,
 }
 
+/// Select the superficial release flux for a parcel held in the paper reservoir.
+///
+/// With mobile carrier at the paper, the reconstructed post-projection superficial water flux is
+/// authoritative: it contains both gravity and pressure head and may legitimately be zero. Raw
+/// homogenized grid velocity is not a valid substitute under partial retention. A held parcel
+/// does not scatter, so gravity-only Darcy flux is used only when no mobile carrier exists locally.
+pub fn release_superficial_flux(
+    projected_superficial_flux: [f64; 3],
+    downstream_normal: [f64; 3],
+    mobile_carrier_mass: f64,
+    gravity: [f64; 3],
+    permeability: f64,
+    kinematic_viscosity: f64,
+) -> Result<f64, FilterError> {
+    for value in projected_superficial_flux {
+        finite(value, "projected_superficial_flux")?;
+    }
+    for value in downstream_normal {
+        finite(value, "downstream_normal")?;
+    }
+    for value in gravity {
+        finite(value, "gravity")?;
+    }
+    nonnegative(mobile_carrier_mass, "mobile_carrier_mass")?;
+    positive(permeability, "permeability")?;
+    positive(kinematic_viscosity, "kinematic_viscosity")?;
+    let dot = |a: [f64; 3], b: [f64; 3]| a.into_iter().zip(b).map(|(x, y)| x * y).sum::<f64>();
+    if mobile_carrier_mass > 0.0 {
+        Ok(dot(projected_superficial_flux, downstream_normal).max(0.0))
+    } else {
+        Ok((permeability / kinematic_viscosity) * dot(gravity, downstream_normal).max(0.0))
+    }
+}
+
 /// Reference equation mirrored by the WGSL filter-paper response.
 pub fn thin_sheet_relaxation(
     signed_distance: f64,
@@ -374,6 +408,34 @@ mod tests {
             reference_gravity_velocity = Some(gravity_velocity);
             reference_pressure_velocity = Some(pressure_velocity);
         }
+    }
+
+    #[test]
+    fn release_uses_projected_superficial_flux_and_gravity_only_without_mobile_carrier() {
+        let downstream = [0.0, -1.0, 0.0];
+        let imposed_flux = 0.037;
+        let from_pressure = release_superficial_flux(
+            [0.0, -imposed_flux, 0.0],
+            downstream,
+            1.0,
+            [0.0, 0.0, 0.0],
+            2.0e-12,
+            4.0e-7,
+        )
+        .unwrap();
+        assert!(close(from_pressure, imposed_flux));
+
+        // A true pressure balance remains zero; gravity must not be re-added when mobile water
+        // made the post-projection field authoritative.
+        let balanced =
+            release_superficial_flux([0.0; 3], downstream, 1.0, [0.0, -9.0, 0.0], 2.0e-12, 4.0e-7)
+                .unwrap();
+        assert_eq!(balanced, 0.0);
+
+        let gravity_only =
+            release_superficial_flux([0.0; 3], downstream, 0.0, [0.0, -9.0, 0.0], 2.0e-12, 4.0e-7)
+                .unwrap();
+        assert!(close(gravity_only, 2.0e-12 / 4.0e-7 * 9.0));
     }
 
     #[test]

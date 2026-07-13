@@ -19,14 +19,30 @@ pub fn drag_rate(k: f32, scale: f32) -> f32 {
     scale / k.max(1.0e-9)
 }
 
-/// Local Darcy drag rate in reduced solver units.
+/// Local intrinsic-velocity Darcy drag rate in reduced solver units.
+///
+/// The solver evolves pore velocity `v_f`, while Darcy flux is superficial
+/// `q = phi * (v_f - v_s)`. With `beta = phi * nu / K`, steady forcing `F` therefore gives
+/// `q = phi * F / beta = K * F / nu` independently of which porosity is used to represent the
+/// same intrinsic permeability.
 pub fn darcy_drag_rate(d: f32, phi: f32, scale: f32) -> f32 {
-    drag_rate(kozeny_carman(d, phi), scale)
+    darcy_mobile_drag_rate(d, phi, phi, scale)
+}
+
+/// Intrinsic mobile-velocity drag rate for a partially occupied structural pore.
+///
+/// `K` is fixed by the structural porosity, while superficial mobile flux is
+/// `q = phi_mobile * (v_mobile-v_composite)`. Consequently beta uses `phi_mobile` in its
+/// numerator. Relative permeability is applied by the caller as `beta/kr`.
+pub fn darcy_mobile_drag_rate(d: f32, structural_phi: f32, mobile_phi: f32, scale: f32) -> f32 {
+    mobile_phi.clamp(0.0, 1.0) * drag_rate(kozeny_carman(d, structural_phi), scale)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{darcy_drag_rate, drag_rate, kozeny_carman, DARCY_VISCOUS_COEFF};
+    use super::{
+        darcy_drag_rate, darcy_mobile_drag_rate, drag_rate, kozeny_carman, DARCY_VISCOUS_COEFF,
+    };
 
     #[test]
     fn finer_grind_has_lower_permeability_and_higher_drag() {
@@ -41,7 +57,7 @@ mod tests {
 
     /// Quantitative Kozeny–Carman law: permeability matches the closed form and
     /// scales as `d²` at fixed porosity, so the solver's resolved drag rate
-    /// (`β = drag_scale / k`) scales as `d⁻²`.
+    /// (`β = phi*drag_scale / k`) scales as `d⁻²`.
     /// This pins the grind→flow exponent the ordinal test above only orders.
     #[test]
     fn permeability_obeys_kozeny_carman_scaling() {
@@ -80,10 +96,51 @@ mod tests {
         );
 
         let beta = darcy_drag_rate(1.0, phi, gamma);
-        let closed_beta = gamma * DARCY_VISCOUS_COEFF * (1.0 - phi).powi(2) / phi.powi(3);
+        let closed_beta = gamma * DARCY_VISCOUS_COEFF * (1.0 - phi).powi(2) / phi.powi(2);
         assert!(
             (beta - closed_beta).abs() <= 1.0e-5 * closed_beta,
             "Darcy beta {beta} vs closed form {closed_beta}"
         );
+    }
+
+    #[test]
+    fn intrinsic_drag_recovers_superficial_darcy_flux_across_porosity() {
+        let forcing = 2.7;
+        let viscosity_scale = 0.031;
+        for phi in [0.25_f32, 0.4, 0.65, 0.85] {
+            let permeability = kozeny_carman(0.8, phi);
+            let beta = darcy_drag_rate(0.8, phi, viscosity_scale);
+            let intrinsic_relative_velocity = forcing / beta;
+            let superficial_flux = phi * intrinsic_relative_velocity;
+            let darcy_flux = permeability * forcing / viscosity_scale;
+            assert!(
+                (superficial_flux - darcy_flux).abs()
+                    <= 2.0e-6 * superficial_flux.abs().max(darcy_flux.abs()).max(1.0),
+                "phi={phi}: q={superficial_flux}, K F/nu={darcy_flux}"
+            );
+        }
+    }
+
+    #[test]
+    fn partial_pore_drag_recovers_corey_scaled_darcy_flux_independent_of_theta() {
+        let (diameter, structural_phi, forcing, viscosity_scale, relative_permeability) =
+            (0.8_f32, 0.42, 2.7, 0.031, 0.23);
+        let permeability = kozeny_carman(diameter, structural_phi);
+        let expected = permeability * relative_permeability * forcing / viscosity_scale;
+        for (mobile_phi, theta) in [(0.08_f32, 0.15_f32), (0.21, 0.5), (0.41, 0.95)] {
+            let beta =
+                darcy_mobile_drag_rate(diameter, structural_phi, mobile_phi, viscosity_scale)
+                    / relative_permeability;
+            let intrinsic_mobile_velocity = forcing / beta;
+            let superficial_flux = mobile_phi * intrinsic_mobile_velocity;
+            assert!((superficial_flux - expected).abs() <= 2.0e-6 * expected.abs().max(1.0));
+
+            // theta changes only how v_mobile is stored in v_bar; it cannot enter intrinsic beta.
+            let homogenized_relative_velocity = theta * intrinsic_mobile_velocity;
+            assert!(
+                (homogenized_relative_velocity / theta - intrinsic_mobile_velocity).abs()
+                    <= 2.0e-6 * intrinsic_mobile_velocity.abs().max(1.0)
+            );
+        }
     }
 }

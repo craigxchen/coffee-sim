@@ -40,11 +40,13 @@
 // Tint discipline: bubble_fine/bubble_coarse run as ONE workgroup with a uniform trip count
 // (now over the COMPACTED pocket list, not all cells — U8 R9 fix) and predicated bodies, so
 // every workgroupBarrier() is in uniform control flow. All other passes use guard returns with
-// no barriers. Over-dispatch + early-out only (R8). Storage buffers per entry point ≤ 8 (see
+// no barriers. Over-dispatch + early-out only (R8). Storage buffers per entry point ≤ 9 (see
 // MAX_STORAGE_BUFFERS_PER_ENTRY_POINT in mod.rs).
 
 // --- bindings (continue the global table; 17 is the bubble state) -----------------------------
 // bubble[0] = λ_b (fine-level pocket pressure), bubble[1] = δλ_b (coarse correction).
+// bubble[2] mirrors pocket presence for CPU observation. Only the thread that atomically claims
+// compact-list slot zero may raise it, avoiding the former many-writer storage race.
 @group(0) @binding(17) var<storage, read_write> bubble: array<f32>;
 
 // U8 R9 fix: COMPACTED pocket-cell lists (the parallel-reduction approach). Element 0 is an
@@ -99,7 +101,7 @@ fn all_gas_atmospheric() -> bool { return params.retention.w > 0.5; }
 fn flood_init(@builtin(global_invocation_id) gid: vec3<u32>) {
     let c = gid.x;
     if (c == 0u) {
-        bubble[2] = 0.0; // pocket-present flag, raised by pocket_mark this frame
+        bubble[2] = 0.0;
         atomicStore(&pocket_f[0], 0u); // reset the compacted pocket-list counters this frame
         atomicStore(&pocket_c[0], 0u);
         if (all_gas_atmospheric()) {
@@ -255,9 +257,11 @@ fn pocket_mark(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
     cell_meta[c] = vec4<f32>((0.0 - div) / params.dt, 1.0, 0.0, CELL_POCKET);
-    bubble[2] = 1.0; // an enclosed pocket exists: arm the bubble-row solves this frame
     // Append this fine pocket cell to the compacted list (slot 0 is the count).
     let slot = atomicAdd(&pocket_f[0], 1u);
+    if (slot == 0u) {
+        bubble[2] = 1.0;
+    }
     atomicStore(&pocket_f[slot + 1u], c);
 }
 
@@ -356,9 +360,9 @@ fn bubble_fine(@builtin(local_invocation_id) lid: vec3<u32>) {
     }
     if (t == 0u) {
         // Sub-resolution release (header: MIN_POCKET_FINE_CELLS): a pocket too small to be a
-        // resolved incompressible bubble is open air — λ = 0, present-flag cleared (so the next
-        // frame's bubble solves early-out and pocket_present() reads false). Guards the residual
-        // V60-cone draining-film entrainment without touching the large pour cavity.
+        // resolved incompressible bubble is open air — λ = 0 and the single reduction writer
+        // clears the observable mirror flag. Guards the residual V60-cone draining-film
+        // entrainment without touching the large pour cavity.
         if (count < MIN_POCKET_FINE_CELLS) {
             bubble[0] = 0.0;
             bubble[1] = 0.0;

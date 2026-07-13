@@ -42,13 +42,21 @@ fn sim_units_per_meter() -> f32 {
     unit_scale().sim_units_per_meter() as f32
 }
 
-fn emitted_water_ml(emitted_mass: f32, materials: &Materials) -> f32 {
+fn emitted_water_volume_ml(emitted_mass: f32, materials: &Materials) -> f32 {
     if materials.particle_mass <= 0.0 {
         return 0.0;
     }
     let emitted_particles = emitted_mass / materials.particle_mass;
     let volume_sim_units = emitted_particles * materials.particle_spacing.powi(3);
     (unit_scale().ml_from_sim_volume(volume_sim_units as f64)) as f32
+}
+
+fn water_mass_g_from_volume_ml(volume_ml: f32, density_kg_m3: f32) -> f32 {
+    if !volume_ml.is_finite() || !density_kg_m3.is_finite() || density_kg_m3 <= 0.0 {
+        return 0.0;
+    }
+    // kg/m³ == g/L; one millilitre is 1/1000 litre.
+    volume_ml.max(0.0) * density_kg_m3 / 1_000.0
 }
 
 fn water_spacing_for_recipe(volume_ml: f32, samples: u32) -> Result<f32, String> {
@@ -76,9 +84,10 @@ fn calibrated_drag_scale(
     let beta_reference = darcy_beta_per_s(viscosity, profile.permeability_m2() as f64, 1.0)
         .map_err(|error| error.to_string())?
         * f64::from(profile.drag_multiplier());
-    // The WGSL evaluates beta = drag_scale / K_KC(d, phi). Choosing the scale below makes that
-    // expression equal nu/K_ref at the declared reference porosity; the numerical sample pitch
-    // cancels from the porosity-relative response and is not misreported as a physical grind size.
+    // The WGSL evaluates beta = phi_f*drag_scale/K_KC(d,phi). Choosing the scale below makes the
+    // intrinsic-velocity equation beta=phi_f*nu/K_ref; therefore superficial flux is exactly
+    // q=phi_f*(vf-vs)=K_ref*F/nu. The numerical sample pitch cancels from the porosity-relative
+    // response and is not misreported as a physical grind size.
     let numerical_reference_k =
         crate::models::permeability::kozeny_carman(materials.grain_diameter, materials.porosity);
     let scale = beta_reference * f64::from(numerical_reference_k);
@@ -110,23 +119,24 @@ fn calibrated_suction_accel(
 
 fn reduced_unit_scales(
     materials: &Materials,
-    profile: &CalibrationProfile,
+    water_density_kg_m3: f32,
 ) -> Result<ReducedUnitScales, String> {
-    let density = crate::models::water::density_kg_m3(profile.inlet_temperature_c() as f64)
-        .map_err(|error| error.to_string())?;
-    let water_sample =
-        water_sample_from_spacing(materials.particle_spacing as f64, density, unit_scale())
-            .map_err(|error| error.to_string())?;
+    let water_sample = water_sample_from_spacing(
+        materials.particle_spacing as f64,
+        f64::from(water_density_kg_m3),
+        unit_scale(),
+    )
+    .map_err(|error| error.to_string())?;
     ReducedUnitScales::from_spatial_scale(unit_scale(), water_sample.mass_kg, 1.0)
         .map_err(|error| error.to_string())
 }
 
 fn reduced_stress_from_pa(
     materials: &Materials,
-    profile: &CalibrationProfile,
+    water_density_kg_m3: f32,
     pressure_pa: f32,
 ) -> Result<f32, String> {
-    let reduced = reduced_unit_scales(materials, profile)?
+    let reduced = reduced_unit_scales(materials, water_density_kg_m3)?
         .reduced_stress_from_pa(pressure_pa as f64)
         .map_err(|error| error.to_string())?;
     if !reduced.is_finite() || reduced < 0.0 || reduced > f64::from(f32::MAX) {
@@ -138,13 +148,20 @@ fn reduced_stress_from_pa(
 fn bound_water_capacity_per_solid(
     scene: &Scene,
     profile: &CalibrationProfile,
+    water_density_kg_m3: f32,
     solid_count: u32,
 ) -> f32 {
     if solid_count == 0 || scene.dose_g <= 0.0 {
         return 0.0;
     }
-    let capacity_ml = profile.bound_water_capacity_g_per_g() * scene.dose_g;
-    (unit_scale().sim_volume_from_ml(capacity_ml as f64) / f64::from(solid_count)) as f32
+    let capacity_g = profile.bound_water_capacity_g_per_g() * scene.dose_g;
+    let capacity_m3 = crate::models::filter::water_mass_capacity_to_volume_m3(
+        f64::from(capacity_g),
+        f64::from(water_density_kg_m3),
+    )
+    .unwrap_or(0.0);
+    let capacity_sim = capacity_m3 / unit_scale().meters_per_sim_unit().powi(3);
+    (capacity_sim / f64::from(solid_count)) as f32
 }
 
 pub(crate) struct MpmV2FrameSolver {
@@ -248,10 +265,12 @@ impl MpmV2FrameSolver {
             0.0
         };
         let emitted_mass = self.core.total_emitted_water_mass();
-        let emitted_ml = emitted_water_ml(emitted_mass, &self.materials);
-        let grams_per_reduced_mass = reduced_unit_scales(&self.materials, &self.calibration)
-            .map(|scales| (1_000.0 * scales.mass_kg_per_unit()) as f32)
-            .unwrap_or(0.0);
+        let emitted_ml = emitted_water_volume_ml(emitted_mass, &self.materials);
+        let emitted_g = water_mass_g_from_volume_ml(emitted_ml, self.config.tf_water_density_kg_m3);
+        let grams_per_reduced_mass =
+            reduced_unit_scales(&self.materials, self.config.tf_water_density_kg_m3)
+                .map(|scales| (1_000.0 * scales.mass_kg_per_unit()) as f32)
+                .unwrap_or(0.0);
         let mass_g = |mass: f32| mass * grams_per_reduced_mass;
         let carrier_mass_g_from_volume = |volume: f32| {
             mass_g(
@@ -276,10 +295,9 @@ impl MpmV2FrameSolver {
             bed_particle_count: solid_count,
             max_particles: self.core.water_pool_capacity() + solid_count,
             sim_time_s: self.sim_time_s,
-            // Water density is approximately 1 g/mL, so the physical emitted mass in grams
-            // is numerically equal to the emitted volume in mL. The core's `emitted_mass`
-            // is a reduced particle mass and must not be reported directly as grams.
-            total_emitted_mass: emitted_ml,
+            // Emission accounting keeps volume and mass distinct. The core reports reduced
+            // particle mass; the shared inlet-temperature density closes the physical conversion.
+            total_emitted_mass: emitted_g,
             total_emitted_ml: emitted_ml,
             flow_rate_ml_s: (unit_scale().ml_from_sim_volume(flow_rate as f64)) as f32,
             exit_speed: self.water_velocity_m_s * sim_units_per_meter(),
@@ -397,7 +415,12 @@ impl MpmV2FrameSolver {
         let solid_end = solid_start
             .checked_add(solid_count)
             .expect("two-field particle range exceeds u32");
-        let v_cap = bound_water_capacity_per_solid(&self.scene, &self.calibration, solid_count);
+        let v_cap = bound_water_capacity_per_solid(
+            &self.scene,
+            &self.calibration,
+            self.config.tf_water_density_kg_m3,
+            solid_count,
+        );
         let moisture_inv_cap = if v_cap > 0.0 { 1.0 / v_cap } else { 0.0 };
         RenderView::new_canonical_with_ranges(
             bounds,
@@ -556,22 +579,32 @@ fn apply_calibration_profile(
     config.tf_filter_kinematic_viscosity_m2_s =
         kinematic_viscosity_m2_s(f64::from(profile.inlet_temperature_c()))
             .map_err(|error| format!("filter-paper viscosity: {error}"))? as f32;
-    config.tf_filter_water_density_kg_m3 =
-        density_kg_m3(f64::from(profile.inlet_temperature_c()))
-            .map_err(|error| format!("filter-paper density: {error}"))? as f32;
+    config.tf_water_density_kg_m3 = density_kg_m3(f64::from(profile.inlet_temperature_c()))
+        .map_err(|error| format!("inlet-water density: {error}"))?
+        as f32;
     config.tf_filter_capacity_g = profile.filter_water_capacity_g();
     config.tf_filter_thickness_m = profile.filter_paper_thickness_m();
     config.tf_filter_porosity = profile.filter_paper_porosity_fraction();
-    config.tf_wet_cohesion = reduced_stress_from_pa(materials, profile, profile.dp_cohesion_pa())?;
-    config.tf_compaction_tangent =
-        reduced_stress_from_pa(materials, profile, profile.bed_compaction_tangent_pa())?;
+    config.tf_wet_cohesion = reduced_stress_from_pa(
+        materials,
+        config.tf_water_density_kg_m3,
+        profile.dp_cohesion_pa(),
+    )?;
+    config.tf_compaction_tangent = reduced_stress_from_pa(
+        materials,
+        config.tf_water_density_kg_m3,
+        profile.bed_compaction_tangent_pa(),
+    )?;
     config.tf_initial_consolidation_pressure = reduced_stress_from_pa(
         materials,
-        profile,
+        config.tf_water_density_kg_m3,
         profile.initial_consolidation_pressure_pa(),
     )?;
-    config.tf_numerical_shear_modulus =
-        reduced_stress_from_pa(materials, profile, profile.numerical_shear_modulus_pa())?;
+    config.tf_numerical_shear_modulus = reduced_stress_from_pa(
+        materials,
+        config.tf_water_density_kg_m3,
+        profile.numerical_shear_modulus_pa(),
+    )?;
     config.tf_full_compaction_solid_fraction = profile.full_compaction_solid_fraction();
     Ok(())
 }
@@ -617,6 +650,51 @@ fn setup_production_bed_scene(
         tf_flip_water_splash_cap: DEFAULT_MAX_WATER_SPEED_M_S * sim_units_per_meter(),
         ..Config::default()
     };
+    apply_calibration_profile(&mut materials, &mut config, calibration)?;
+    Ok((scene, materials, config))
+}
+
+fn seeded_bed_pore_volume_sim(
+    scene: &Scene,
+    materials: &Materials,
+    config: &Config,
+) -> Result<f64, String> {
+    let mut solid_scene = scene.clone();
+    solid_scene.water_ml = 0.0;
+    solid_scene.pour_water_ml = 0.0;
+    solid_scene
+        .regions
+        .retain(|region| region.species == Species::Grain);
+    let (positions, _, water_count, quadrature_weight) =
+        crate::solvers::twofield::seed_ranges(&solid_scene, materials, config);
+    let solid_count = positions.len().saturating_sub(water_count as usize);
+    if solid_count == 0 {
+        return Err("uniform drainage fixture has no accepted solid samples".to_string());
+    }
+    let bulk_volume = solid_count as f64
+        * f64::from(materials.grain_diameter).powi(3)
+        * f64::from(quadrature_weight);
+    let pore_volume = bulk_volume * f64::from(materials.porosity);
+    if !pore_volume.is_finite() || pore_volume <= 0.0 {
+        return Err("uniform drainage fixture produced an invalid pore volume".to_string());
+    }
+    Ok(pore_volume)
+}
+
+fn setup_uniform_bed_drainage_scene(
+    scene: Scene,
+    calibration: &CalibrationProfile,
+) -> Result<(Scene, Materials, Config), String> {
+    let provisional_volume_ml = scene.water_ml;
+    let (mut scene, mut materials, mut config) =
+        setup_production_bed_scene(scene, provisional_volume_ml, calibration)?;
+    let pore_volume_sim = seeded_bed_pore_volume_sim(&scene, &materials, &config)?;
+    scene.water_ml = unit_scale().ml_from_sim_volume(pore_volume_sim) as f32;
+    materials.particle_spacing =
+        water_spacing_for_recipe(scene.water_ml, TARGET_RECIPE_WATER_SAMPLES)?;
+    materials.support_radius = 2.0 * materials.particle_spacing;
+    // Suction-front thickness and all reduced stress/mass scales depend on water spacing, so the
+    // same calibration profile must be re-applied after the pore-volume-derived parcel size.
     apply_calibration_profile(&mut materials, &mut config, calibration)?;
     Ok((scene, materials, config))
 }
@@ -667,8 +745,7 @@ fn setup_for_scene_spec(
         }
         SceneSpec::Debug { id } if id == MPM_V2_CALIBRATION_DRAINAGE_SCENE_ID => {
             let scene = Scene::debug_uniform_bed_saturation();
-            let recipe_water_ml = scene.water_ml;
-            setup_production_bed_scene(scene, recipe_water_ml, calibration)
+            setup_uniform_bed_drainage_scene(scene, calibration)
         }
         SceneSpec::Debug { id } => Err(format!("MPM v2 does not support MPM debug scene: {id}")),
     }
@@ -726,7 +803,7 @@ mod tests {
     }
 
     #[test]
-    fn emitted_mass_conversion_uses_particle_volume_not_reduced_mass() {
+    fn emitted_volume_and_mass_round_trip_through_temperature_density() {
         let materials = Materials {
             particle_spacing: 0.2,
             particle_mass: 2.0,
@@ -734,8 +811,14 @@ mod tests {
         };
         let two_particles_reduced_mass = 2.0 * materials.particle_mass;
         let expected = unit_scale().ml_from_sim_volume(2.0 * 0.2_f64.powi(3)) as f32;
-        let actual = emitted_water_ml(two_particles_reduced_mass, &materials);
+        let actual = emitted_water_volume_ml(two_particles_reduced_mass, &materials);
         assert!((actual - expected).abs() < 1.0e-6);
+        for temperature_c in [20.0_f32, 60.0, 93.0] {
+            let density = density_kg_m3(f64::from(temperature_c)).unwrap() as f32;
+            let mass_g = water_mass_g_from_volume_ml(actual, density);
+            let reconstructed_ml = mass_g * 1_000.0 / density;
+            assert!((reconstructed_ml - actual).abs() <= 2.0e-6 * actual.max(1.0));
+        }
     }
 
     #[test]
@@ -770,9 +853,12 @@ mod tests {
         let (positions, _, water, _) =
             crate::solvers::twofield::seed_ranges(&scene, &materials, &config);
         let solids = positions.len() as u32 - water;
+        let parcel_volume = materials.particle_spacing.powi(3);
+        let represented_volume = f64::from(water) * f64::from(parcel_volume);
+        let declared_volume = unit_scale().sim_volume_from_ml(f64::from(scene.water_ml));
         assert!(
-            (75_000..=80_000).contains(&water),
-            "late-brew water workload must stay near the delivered 250 mL inventory; got {water}"
+            (represented_volume - declared_volume).abs() <= 0.5 * f64::from(parcel_volume),
+            "seeded inventory must close to within half a parcel: represented={represented_volume}, declared={declared_volume}"
         );
         assert!(
             solids == PRODUCTION_SOLID_SAMPLE_BUDGET,
@@ -785,7 +871,8 @@ mod tests {
         let spec = SceneSpec::Debug {
             id: MPM_V2_CALIBRATION_DRAINAGE_SCENE_ID.to_string(),
         };
-        let (scene, _, _) = setup_for_scene_spec(&spec, &CalibrationProfile::default()).unwrap();
+        let (scene, materials, config) =
+            setup_for_scene_spec(&spec, &CalibrationProfile::default()).unwrap();
         assert!(!twofield_scene_accepts_pour(&spec));
         assert_eq!(scene.pour_water_ml, 0.0);
         assert!(scene
@@ -796,6 +883,25 @@ mod tests {
             .regions
             .iter()
             .any(|region| region.species == Species::Grain));
+        let declared_volume = unit_scale().sim_volume_from_ml(f64::from(scene.water_ml));
+        let pore_volume = seeded_bed_pore_volume_sim(&scene, &materials, &config).unwrap();
+        assert!(
+            (declared_volume - pore_volume).abs()
+                <= 2.0e-6 * declared_volume.abs().max(pore_volume.abs()).max(1.0),
+            "declared drainage water must equal accepted bed pore volume"
+        );
+        let (positions, _, water_count, _) =
+            crate::solvers::twofield::seed_ranges(&scene, &materials, &config);
+        assert!(
+            positions.len() > water_count as usize,
+            "fixture must retain its bed"
+        );
+        let parcel_volume = f64::from(materials.particle_spacing).powi(3);
+        let represented_water = f64::from(water_count) * parcel_volume;
+        assert!(
+            (represented_water - pore_volume).abs() <= 0.5 * parcel_volume,
+            "seeded water must close pore volume within half a parcel"
+        );
     }
 
     #[test]
@@ -876,22 +982,30 @@ mod tests {
         );
         assert_eq!(
             config.tf_compaction_tangent,
-            reduced_stress_from_pa(&materials, &profile, profile.bed_compaction_tangent_pa())
-                .unwrap()
+            reduced_stress_from_pa(
+                &materials,
+                config.tf_water_density_kg_m3,
+                profile.bed_compaction_tangent_pa(),
+            )
+            .unwrap()
         );
         assert_eq!(
             config.tf_initial_consolidation_pressure,
             reduced_stress_from_pa(
                 &materials,
-                &profile,
+                config.tf_water_density_kg_m3,
                 profile.initial_consolidation_pressure_pa()
             )
             .unwrap()
         );
         assert_eq!(
             config.tf_numerical_shear_modulus,
-            reduced_stress_from_pa(&materials, &profile, profile.numerical_shear_modulus_pa())
-                .unwrap()
+            reduced_stress_from_pa(
+                &materials,
+                config.tf_water_density_kg_m3,
+                profile.numerical_shear_modulus_pa(),
+            )
+            .unwrap()
         );
         assert_eq!(
             config.tf_filter_permeability_m2,
@@ -911,8 +1025,8 @@ mod tests {
         );
         assert!(config.tf_filter_kinematic_viscosity_m2_s.is_finite());
         assert!(config.tf_filter_kinematic_viscosity_m2_s > 0.0);
-        assert!(config.tf_filter_water_density_kg_m3.is_finite());
-        assert!(config.tf_filter_water_density_kg_m3 > 0.0);
+        assert!(config.tf_water_density_kg_m3.is_finite());
+        assert!(config.tf_water_density_kg_m3 > 0.0);
     }
 
     #[test]

@@ -6,7 +6,7 @@
 // each pipeline's auto layout (`layout: None`) keeps only the bindings its entry point
 // actually uses, but an index never means two different buffers.
 //
-// Storage-buffer budget (KTD-7): the widest entry point binds 8 storage buffers
+// Storage-buffer budget (KTD-7): the widest entry point binds 9 storage buffers
 // (MAX_STORAGE_BUFFERS_PER_ENTRY_POINT in mod.rs — cell_classify / pocket_mark; active tiled
 // relaxation adds one scheduler binding but remains below them; see the per-pass derivation
 // there); shared required limits request 10 per stage
@@ -84,7 +84,8 @@ struct Params {
     filter0: vec4<f32>,
     // Exact finite-reservoir capacity in FILTER_VOLUME_SCALE counts; remaining lanes reserved.
     filter1: vec4<u32>,
-    // (insoluble grain mass, solute cp, initial extractable mass, reserved).
+    // (insoluble grain mass, solute cp, initial extractable mass,
+    //  capillary-retention capacity carried by one solid material point as a solver volume).
     solute: vec4<f32>,
 };
 
@@ -115,23 +116,65 @@ struct Params {
 // FORBIDS the refilling inflow — observed as a jet-dug chimney standing frozen forever. The
 // classical PIC/FLIP rule (a cell is fluid only if it contains particles) is the sharp
 // discriminator; mass still provides the fill-fraction taper for cells that ARE fluid.
-// Cleared by grid_clear, incremented by p2g_water, read by cell_classify. Suffix: one fixed-point
-// carrier/solvent mass count per NODE. Mechanics uses solution mass in grid_fp/grid_vel, while
-// fill, saturation, and density relief use this carrier census so dissolved solute cannot create
-// liquid volume.
+// Cleared by grid_clear, incremented by p2g_water, read by cell_classify. Suffix: four fixed-point
+// counts per NODE: mobile-field carrier/solvent mass, scattered attainable capillary capacity C,
+// structural-volume-weighted bloom contact, and measured held carrier mass rho_w*H. Mechanics
+// keeps the complete solution (including solute and enthalpy) in the one canonical particle
+// field. C remains immutable for the whole frame; node_setup writes rho_w*H into its independent
+// lane. Storing held MASS makes an M=0 node exact: node_setup can copy the carrier integer instead
+// of round-tripping W through volume and accidentally manufacturing a one-count mobile phase.
 @group(0) @binding(18) var<storage, read_write> cell_cnt: array<atomic<u32>>;
+
+const AUX_NODE_CARRIER: u32 = 0u;
+const AUX_NODE_CAPILLARY: u32 = 1u;
+const AUX_NODE_BLOOM_VOLUME: u32 = 2u;
+const AUX_NODE_HELD_CARRIER: u32 = 3u;
+const AUX_NODE_LANES: u32 = 4u;
 
 fn aux_cell_slots() -> u32 {
     let cells = params.grid_dims.xyz - vec3<u32>(1u);
     return cells.x * cells.y * cells.z;
 }
 
+fn aux_node_index(lane: u32, node: u32) -> u32 {
+    return aux_cell_slots() + lane * params.grid_dims.w + node;
+}
+
 fn carrier_mass_index(node: u32) -> u32 {
-    return aux_cell_slots() + node;
+    return aux_node_index(AUX_NODE_CARRIER, node);
 }
 
 fn carrier_mass_at(node: u32) -> f32 {
     return f32(atomicLoad(&cell_cnt[carrier_mass_index(node)])) / FP_SCALE;
+}
+
+fn capillary_capacity_index(node: u32) -> u32 {
+    return aux_node_index(AUX_NODE_CAPILLARY, node);
+}
+
+fn capillary_capacity_at(node: u32) -> f32 {
+    return f32(atomicLoad(&cell_cnt[capillary_capacity_index(node)])) / FP_SCALE;
+}
+
+fn bloom_volume_index(node: u32) -> u32 {
+    return aux_node_index(AUX_NODE_BLOOM_VOLUME, node);
+}
+
+fn bloom_volume_at(node: u32) -> f32 {
+    return f32(atomicLoad(&cell_cnt[bloom_volume_index(node)])) / FP_SCALE;
+}
+
+fn held_carrier_mass_index(node: u32) -> u32 {
+    return aux_node_index(AUX_NODE_HELD_CARRIER, node);
+}
+
+fn held_carrier_mass_at(node: u32) -> f32 {
+    return f32(atomicLoad(&cell_cnt[held_carrier_mass_index(node)])) / FP_SCALE;
+}
+
+fn measured_held_volume_at(node: u32) -> f32 {
+    if (params.extra.x <= 0.0) { return 0.0; }
+    return held_carrier_mass_at(node) / params.extra.x;
 }
 
 fn water_solvent_mass(f_water: f32) -> f32 {
@@ -209,6 +252,11 @@ const FILTER_ERRORS: u32 = 4u;
 const FILTER_STATE_SLOTS: u32 = 5u;
 const FILTER_VOLUME_SCALE: f32 = 268435456.0; // 2^28, mirrored by Rust
 @group(0) @binding(30) var<storage, read_write> filter_state: array<atomic<u32>>;
+
+// Frame-start dry-solid reference grid (mass, pure APIC momentum.xyz). Unlike grid_sm this field
+// excludes stress/body/contact proposals and survives the semi-implicit shear microsteps, so the
+// one-water-field split can reconstruct v_mobile and stage composite impulses at one time level.
+@group(0) @binding(34) var<storage, read_write> grid_sraw: array<atomic<i32>>;
 
 fn filter_volume_encode(volume: f32) -> u32 {
     return u32(clamp(round(max(volume, 0.0) * FILTER_VOLUME_SCALE), 0.0, 4294967040.0));

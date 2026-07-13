@@ -135,8 +135,8 @@ impl Scene {
         let mut scene = Self::v60_pour();
         scene.water_ml = 250.0;
         scene.pour_water_ml = 0.0;
-        // Fill high enough that the production 250 mL-derived spacing leaves roughly 78k live
-        // samples after the solver's 0.4-unit SDF seed-clearance removes the cup floor/wall band.
+        // Deliberately overfill the geometric seed slab: the solver clips accepted samples to the
+        // declared 250 mL using parcel volume, independently of its species-scaled SDF clearance.
         // The top remains well below the open cup rim at y=-3.5.
         scene.regions.push(SeedRegion {
             min: [-2.85, -7.85, -2.85],
