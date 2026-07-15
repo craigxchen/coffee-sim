@@ -1785,6 +1785,7 @@ const MPM_V2_DIAGNOSTICS_FRESHNESS_SECONDS = 0.30;
 // Numerical ledger gates scale with the conserved inventory. They do not encode coffee behavior.
 const WEBGPU_LEDGER_RELATIVE_TOLERANCE = 1e-4;
 const WEBGPU_LEDGER_ABSOLUTE_TOLERANCE_GRAMS = 1e-3;
+const WEBGPU_ENTHALPY_RELATIVE_TOLERANCE = 1e-3;
 
 function requireFinitePositiveNumber(name, value) {
   if (!Number.isFinite(value) || value <= 0) {
@@ -1834,11 +1835,19 @@ function calibrationSchemaMap() {
   return new Map(Array.from(app.calibrationSchema()).map((entry) => [entry.id, entry]));
 }
 
-function observationDiagnosticsRejection(diagnostics, freshnessSeconds) {
+function observationDiagnosticsRejection(diagnostics, freshnessSeconds, ticket = null) {
   if (!diagnostics?.diagnosticsSupported) return "diagnostics-unsupported";
   if (!diagnostics.diagnosticsValid) return "diagnostics-invalid";
   if (diagnostics.diagnosticsPending) return "diagnostics-pending";
   if (!diagnostics.allFinite) return "non-finite-state";
+  if (ticket) {
+    if (diagnostics.diagnosticsSampleGeneration !== ticket.generation) {
+      return "diagnostics-generation-mismatch";
+    }
+    if (diagnostics.diagnosticsSampleTimeSeconds !== ticket.simTimeSeconds) {
+      return "diagnostics-time-mismatch";
+    }
+  }
   const age = diagnostics.diagnosticsSampleAgeSeconds;
   if (!Number.isFinite(age)) return "diagnostics-age-non-finite";
   if (age > freshnessSeconds) return "diagnostics-stale";
@@ -1846,9 +1855,8 @@ function observationDiagnosticsRejection(diagnostics, freshnessSeconds) {
 }
 
 /**
- * Drain the compact diagnostic readback ring without ever treating a stale cache entry as data.
- * A zero-dt step polls completed mappings without advancing simulated time. Two iterations are
- * commonly required: one to submit the current snapshot and one to apply its mapped result.
+ * Request exactly one state-neutral snapshot, then poll that request. No physics step is used as
+ * a polling side effect, so observation cannot emit, diffuse, project, or advance sim time.
  */
 async function readFreshMpmV2Diagnostics({
   maxAttempts = 8,
@@ -1856,19 +1864,35 @@ async function readFreshMpmV2Diagnostics({
 } = {}) {
   let lastDiagnostics = null;
   let rejectionReason = "diagnostics-unavailable";
+  const ticket = app.requestDiagnosticsSnapshot();
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     await app.waitForGpu();
     await nextAnimationFrame();
-    app.stepFrame(0);
-    await app.waitForGpu();
-    await nextAnimationFrame();
+    const status = app.pollDiagnostics();
+    if (status.requestId !== ticket.requestId) {
+      rejectionReason = "diagnostics-request-mismatch";
+      continue;
+    }
+    if (status.status === "superseded") {
+      rejectionReason = "diagnostics-superseded";
+      break;
+    }
+    if (status.status !== "ready") {
+      rejectionReason = `diagnostics-${status.status}`;
+      continue;
+    }
     lastDiagnostics = await app.waterDiagnostics();
-    rejectionReason = observationDiagnosticsRejection(lastDiagnostics, freshnessSeconds);
+    rejectionReason = observationDiagnosticsRejection(
+      lastDiagnostics,
+      freshnessSeconds,
+      ticket,
+    );
     if (!rejectionReason) {
       return {
         accepted: true,
         attempts: attempt,
         freshnessSeconds,
+        ticket,
         diagnostics: lastDiagnostics,
       };
     }
@@ -1878,6 +1902,7 @@ async function readFreshMpmV2Diagnostics({
     attempts: maxAttempts,
     freshnessSeconds,
     rejectionReason,
+    ticket,
     rejectedDiagnostics: lastDiagnostics,
   };
 }
@@ -2682,6 +2707,25 @@ function assessWebGpuBenchmarkDiagnostics(diagnosticRead) {
   )) {
     rejectionReasons.push(`mechanical-mass-residual-g:${inventory.mechanicalMassResidualGrams}`);
   }
+  const enthalpyScale = Math.max(Math.abs(diagnostics.enthalpy.expected), 1);
+  const enthalpyRelativeResidual = Math.abs(diagnostics.enthalpy.residual) / enthalpyScale;
+  if (!Number.isFinite(diagnostics.enthalpy.total)
+      || !Number.isFinite(diagnostics.enthalpy.expected)
+      || !Number.isFinite(diagnostics.enthalpy.residual)
+      || enthalpyRelativeResidual > WEBGPU_ENTHALPY_RELATIVE_TOLERANCE) {
+    rejectionReasons.push(`enthalpy-relative-residual:${enthalpyRelativeResidual}`);
+  }
+  const pressure = diagnostics.pressureResidual;
+  if (!Number.isFinite(pressure.preRms)
+      || !Number.isFinite(pressure.postRms)
+      || !Number.isFinite(pressure.postMax)
+      || !Number.isFinite(pressure.ratio)
+      || pressure.cellCount === 0
+      || pressure.ratio > 1.05) {
+    rejectionReasons.push(
+      `pressure-residual:cells=${pressure.cellCount},ratio=${pressure.ratio}`,
+    );
+  }
   return {
     accepted: rejectionReasons.length === 0,
     rejectionReasons,
@@ -2690,6 +2734,9 @@ function assessWebGpuBenchmarkDiagnostics(diagnosticRead) {
       absoluteToleranceGrams: WEBGPU_LEDGER_ABSOLUTE_TOLERANCE_GRAMS,
       residuals: checks,
       filterVolumeResidualToleranceMl: filterVolumeToleranceMl,
+      enthalpyRelativeResidual,
+      enthalpyRelativeTolerance: WEBGPU_ENTHALPY_RELATIVE_TOLERANCE,
+      pressureResidual: pressure,
     },
   };
 }
@@ -2824,8 +2871,8 @@ async function runWebGpuBenchmark(options = {}) {
     const p99Ms = quantile(sorted, 0.99);
     const simulatedSeconds = measuredDisplayFrames * 2 / 60;
     const realTimeFactor = simulatedSeconds / (measuredWallMilliseconds / 1000);
-    // This compact-cache freshness poll is deliberately after the final measured batch. It may
-    // submit zero-dt diagnostic work, but cannot improve or contaminate the timings above.
+    // This state-neutral snapshot is deliberately after the final measured batch. It submits
+    // diagnostics only and cannot improve or contaminate the timings above.
     const diagnosticRead = await readFreshMpmV2Diagnostics();
     const diagnosticAssessment = assessWebGpuBenchmarkDiagnostics(diagnosticRead);
     const timingPassed = medianMs <= 33.3 && realTimeFactor >= 1.0;

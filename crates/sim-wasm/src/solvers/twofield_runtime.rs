@@ -9,8 +9,8 @@ use crate::models::scaling::{
 use crate::models::water::{density_kg_m3, kinematic_viscosity_m2_s};
 use crate::models::Materials;
 use crate::solvers::base::{
-    CalibrationApplyResult, CalibrationSupport, CommonMetrics, FrameContext, FrameSnapshot,
-    FrameSolver, ResetContext, SceneSpec, Solver as RewriteSolver,
+    CalibrationApplyResult, CalibrationSupport, CommonMetrics, DiagnosticsPoll, DiagnosticsTicket,
+    FrameContext, FrameSnapshot, FrameSolver, ResetContext, SceneSpec, Solver as RewriteSolver,
 };
 use crate::solvers::twofield::TwofieldSolver;
 use crate::ui::{RenderMaterial, RenderView, STANDARD_WATER_RENDER_RADIUS};
@@ -249,6 +249,22 @@ impl MpmV2FrameSolver {
     fn common_metrics(&self) -> CommonMetrics {
         let rewrite_metrics = RewriteSolver::metrics(&self.core);
         let diagnostics = self.core.diagnostics();
+        let diagnostic_aggregates_finite = [
+            diagnostics.mobile_carrier_mass,
+            diagnostics.paper_carrier_mass,
+            diagnostics.bound_carrier_mass,
+            diagnostics.bed_pore_carrier_mass,
+            diagnostics.total_enthalpy,
+            diagnostics.expected_enthalpy,
+            diagnostics.enthalpy_residual,
+            diagnostics.pressure_residual_pre_rms,
+            diagnostics.pressure_residual_post_rms,
+            diagnostics.pressure_residual_post_max,
+            diagnostics.pressure_residual_ratio,
+            diagnostics.evenness,
+        ]
+        .into_iter()
+        .all(f32::is_finite);
         let (water_count, solid_count) = self.core.phase_counts();
         let has_bed = self
             .scene
@@ -313,13 +329,17 @@ impl MpmV2FrameSolver {
             estimated_extraction_yield: rewrite_metrics.extraction_yield,
             diagnostics_supported: true,
             diagnostics_valid: diagnostics.sample_valid,
-            diagnostics_all_finite: diagnostics.sample_valid && !diagnostics.has_nonfinite_state,
+            diagnostics_all_finite: diagnostics.sample_valid
+                && !diagnostics.has_nonfinite_state
+                && diagnostic_aggregates_finite,
             diagnostics_pending: self.core.diagnostics_pending(),
             diagnostics_sample_age_s: if diagnostics.sample_valid {
                 (self.sim_time_s - diagnostics.sample_time_s).max(0.0)
             } else {
                 0.0
             },
+            diagnostics_sample_generation: diagnostics.sample_generation,
+            diagnostics_sample_time_s: diagnostics.sample_time_s,
             dispatches_per_frame: profile.dispatches_per_frame,
             nonfinite_particle_count: diagnostics.nonfinite_particle_count,
             nonfinite_grid_node_count: diagnostics.nonfinite_grid_node_count,
@@ -332,6 +352,8 @@ impl MpmV2FrameSolver {
             mobile_carrier_mass_g: mass_g(diagnostics.mobile_carrier_mass),
             paper_carrier_mass_g: mass_g(diagnostics.paper_carrier_mass),
             bound_carrier_mass_g: mass_g(diagnostics.bound_carrier_mass),
+            bed_pore_carrier_mass_g: mass_g(diagnostics.bed_pore_carrier_mass),
+            dry_coffee_mass_g: mass_g(self.core.dry_coffee_mass()),
             total_carrier_mass_g: mass_g(diagnostics.total_carrier_mass),
             mobile_carrier_volume_ml: carrier_ml(diagnostics.mobile_carrier_mass),
             paper_carrier_volume_ml: carrier_ml(diagnostics.paper_carrier_mass),
@@ -353,6 +375,16 @@ impl MpmV2FrameSolver {
             carrier_mass_residual_g: mass_g(diagnostics.carrier_mass_residual),
             solute_mass_residual_g: mass_g(diagnostics.solute_mass_residual),
             mechanical_mass_residual_g: mass_g(diagnostics.mechanical_mass_residual),
+            total_enthalpy: diagnostics.total_enthalpy,
+            expected_enthalpy: diagnostics.expected_enthalpy,
+            enthalpy_residual: diagnostics.enthalpy_residual,
+            pressure_residual_pre_rms: diagnostics.pressure_residual_pre_rms,
+            pressure_residual_post_rms: diagnostics.pressure_residual_post_rms,
+            pressure_residual_post_max: diagnostics.pressure_residual_post_max,
+            pressure_residual_ratio: diagnostics.pressure_residual_ratio,
+            pressure_residual_cell_count: diagnostics.pressure_residual_cell_count,
+            outlet_evenness_valid: diagnostics.evenness_valid,
+            outlet_evenness: diagnostics.evenness,
             retention_target_carrier_mass_g: carrier_mass_g_from_volume(
                 diagnostics.retention_target_volume,
             ),
@@ -511,6 +543,17 @@ impl FrameSolver for MpmV2FrameSolver {
     fn reset_calibration_defaults(&mut self, ctx: ResetContext<'_>) -> Result<bool, String> {
         self.rebuild_with_calibration(ctx, CalibrationProfile::default())?;
         Ok(true)
+    }
+
+    fn request_diagnostics_snapshot(
+        &mut self,
+        _ctx: ResetContext<'_>,
+    ) -> Result<DiagnosticsTicket, String> {
+        self.core.request_diagnostics_snapshot()
+    }
+
+    fn poll_diagnostics(&mut self) -> DiagnosticsPoll {
+        self.core.poll_explicit_diagnostics()
     }
 }
 
@@ -767,7 +810,7 @@ mod tests {
     #[test]
     fn shader_parses_with_naga() {
         let shader_src = format!(
-            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
             include_str!("twofield/common.wgsl"),
             include_str!("twofield/transfers.wgsl"),
             include_str!("twofield/pressure.wgsl"),
@@ -776,6 +819,7 @@ mod tests {
             include_str!("twofield/coupling.wgsl"),
             include_str!("twofield/plasticity.wgsl"),
             include_str!("twofield/compaction.wgsl"),
+            include_str!("twofield/diagnostics.wgsl"),
         );
         let module =
             naga::front::wgsl::parse_str(&shader_src).expect("two-field WGSL should parse");

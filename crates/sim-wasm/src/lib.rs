@@ -34,7 +34,8 @@ use models::calibration::calibration_schema as calibration_control_schema;
 use renderer::{OrbitCamera, Renderer};
 #[cfg(target_arch = "wasm32")]
 use solvers::base::{
-    CalibrationApplyResult, CalibrationSupport, CommonMetrics, SceneSpec, SolverId,
+    CalibrationApplyResult, CalibrationSupport, CommonMetrics, DiagnosticsPoll, DiagnosticsTicket,
+    SceneSpec, SolverId,
 };
 #[cfg(target_arch = "wasm32")]
 use solvers::mpm::MpmSettings;
@@ -47,6 +48,16 @@ use web_sys::HtmlCanvasElement;
 
 #[cfg(target_arch = "wasm32")]
 fn set_number(obj: &js_sys::Object, key: &str, value: f32) -> Result<(), JsValue> {
+    js_sys::Reflect::set(
+        obj,
+        &JsValue::from_str(key),
+        &JsValue::from_f64(value as f64),
+    )
+    .map(|_| ())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn set_u64(obj: &js_sys::Object, key: &str, value: u64) -> Result<(), JsValue> {
     js_sys::Reflect::set(
         obj,
         &JsValue::from_str(key),
@@ -323,6 +334,16 @@ fn attach_common_diagnostics(obj: &js_sys::Object, snapshot: CommonMetrics) -> R
         "diagnosticsSampleAgeSeconds",
         snapshot.diagnostics_sample_age_s,
     )?;
+    set_u64(
+        obj,
+        "diagnosticsSampleGeneration",
+        snapshot.diagnostics_sample_generation,
+    )?;
+    set_number(
+        obj,
+        "diagnosticsSampleTimeSeconds",
+        snapshot.diagnostics_sample_time_s,
+    )?;
     set_u32(obj, "dispatchesPerFrame", snapshot.dispatches_per_frame)?;
     set_u32(
         obj,
@@ -363,6 +384,12 @@ fn attach_common_diagnostics(obj: &js_sys::Object, snapshot: CommonMetrics) -> R
         "boundCarrierMassGrams",
         snapshot.bound_carrier_mass_g,
     )?;
+    set_number(
+        &inventory,
+        "bedPoreCarrierMassGrams",
+        snapshot.bed_pore_carrier_mass_g,
+    )?;
+    set_number(&inventory, "dryCoffeeMassGrams", snapshot.dry_coffee_mass_g)?;
     set_number(
         &inventory,
         "totalCarrierMassGrams",
@@ -472,6 +499,45 @@ fn attach_common_diagnostics(obj: &js_sys::Object, snapshot: CommonMetrics) -> R
     )?;
     set_object(obj, "inventory", &inventory)?;
 
+    let energy = js_sys::Object::new();
+    set_number(&energy, "total", snapshot.total_enthalpy)?;
+    set_number(&energy, "expected", snapshot.expected_enthalpy)?;
+    set_number(&energy, "residual", snapshot.enthalpy_residual)?;
+    set_object(obj, "enthalpy", &energy)?;
+
+    let pressure_residual = js_sys::Object::new();
+    set_number(
+        &pressure_residual,
+        "preRms",
+        snapshot.pressure_residual_pre_rms,
+    )?;
+    set_number(
+        &pressure_residual,
+        "postRms",
+        snapshot.pressure_residual_post_rms,
+    )?;
+    set_number(
+        &pressure_residual,
+        "postMax",
+        snapshot.pressure_residual_post_max,
+    )?;
+    set_number(
+        &pressure_residual,
+        "ratio",
+        snapshot.pressure_residual_ratio,
+    )?;
+    set_u32(
+        &pressure_residual,
+        "cellCount",
+        snapshot.pressure_residual_cell_count,
+    )?;
+    set_object(obj, "pressureResidual", &pressure_residual)?;
+
+    let outlet = js_sys::Object::new();
+    set_bool(&outlet, "valid", snapshot.outlet_evenness_valid)?;
+    set_number(&outlet, "participationRatio", snapshot.outlet_evenness)?;
+    set_object(obj, "outletEvenness", &outlet)?;
+
     let retention = js_sys::Object::new();
     set_number(
         &retention,
@@ -575,9 +641,23 @@ fn common_metrics_object(snapshot: CommonMetrics) -> Result<js_sys::Object, JsVa
 }
 
 #[cfg(target_arch = "wasm32")]
+fn diagnostics_ticket_object(
+    status: &str,
+    ticket: DiagnosticsTicket,
+) -> Result<js_sys::Object, JsValue> {
+    let obj = js_sys::Object::new();
+    set_str(&obj, "status", status)?;
+    set_u64(&obj, "requestId", ticket.request_id)?;
+    set_u64(&obj, "generation", ticket.generation)?;
+    set_number(&obj, "simTimeSeconds", ticket.sim_time_s())?;
+    Ok(obj)
+}
+
+#[cfg(target_arch = "wasm32")]
 fn common_water_diagnostics_object(snapshot: CommonMetrics) -> Result<js_sys::Object, JsValue> {
     let obj = js_sys::Object::new();
     let sampled = snapshot.diagnostics_supported && snapshot.diagnostics_valid;
+    set_bool(&obj, "valid", snapshot.diagnostics_valid)?;
     set_bool(
         &obj,
         "allFinite",
@@ -1077,6 +1157,29 @@ impl WasmSim3D {
     #[wasm_bindgen(js_name = waterDiagnostics)]
     pub async fn water_diagnostics(&self) -> Result<JsValue, JsValue> {
         Ok(common_water_diagnostics_object(self.sim.common_metrics())?.into())
+    }
+
+    #[wasm_bindgen(js_name = requestDiagnosticsSnapshot)]
+    pub fn request_diagnostics_snapshot(&mut self) -> Result<js_sys::Object, JsValue> {
+        let ticket = self
+            .sim
+            .request_diagnostics_snapshot(self.renderer.queue(), self.renderer.device())
+            .map_err(|error| JsValue::from_str(&error))?;
+        diagnostics_ticket_object("pending", ticket)
+    }
+
+    #[wasm_bindgen(js_name = pollDiagnostics)]
+    pub fn poll_diagnostics(&mut self) -> Result<js_sys::Object, JsValue> {
+        match self.sim.poll_diagnostics() {
+            DiagnosticsPoll::Pending(ticket) => diagnostics_ticket_object("pending", ticket),
+            DiagnosticsPoll::Ready(ticket) => diagnostics_ticket_object("ready", ticket),
+            DiagnosticsPoll::Superseded(ticket) => diagnostics_ticket_object("superseded", ticket),
+            DiagnosticsPoll::Unsupported => {
+                let obj = js_sys::Object::new();
+                set_str(&obj, "status", "unsupported")?;
+                Ok(obj)
+            }
+        }
     }
 
     #[wasm_bindgen(js_name = maxAbsDivergence)]

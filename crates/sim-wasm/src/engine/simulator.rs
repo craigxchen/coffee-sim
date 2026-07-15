@@ -1,7 +1,7 @@
 use crate::models::calibration::{CalibrationControl, CalibrationProfile};
 use crate::solvers::base::{
-    CalibrationApplyResult, CalibrationSupport, CommonMetrics, FrameContext, FrameSnapshot,
-    FrameSolver, ResetContext, SceneSpec, SolverId,
+    CalibrationApplyResult, CalibrationSupport, CommonMetrics, DiagnosticsPoll, DiagnosticsTicket,
+    FrameContext, FrameSnapshot, FrameSolver, ResetContext, SceneSpec, SolverId,
 };
 use crate::solvers::registry::build_solver_with_mpm_v2_calibration;
 use crate::solvers::twofield_runtime::{
@@ -150,6 +150,24 @@ impl Simulator {
 
     pub(crate) fn common_metrics(&self) -> CommonMetrics {
         self.metrics
+    }
+
+    pub(crate) fn request_diagnostics_snapshot(
+        &mut self,
+        queue: &wgpu::Queue,
+        device: &wgpu::Device,
+    ) -> Result<DiagnosticsTicket, String> {
+        let ticket = self
+            .solver
+            .request_diagnostics_snapshot(ResetContext { device, queue })?;
+        self.metrics = self.solver.snapshot().metrics;
+        Ok(ticket)
+    }
+
+    pub(crate) fn poll_diagnostics(&mut self) -> DiagnosticsPoll {
+        let status = self.solver.poll_diagnostics();
+        self.metrics = self.solver.snapshot().metrics;
+        status
     }
 
     #[cfg(target_arch = "wasm32")]

@@ -99,6 +99,12 @@ fn groups(n: u32) -> u32 {
     n.div_ceil(WG)
 }
 
+const DIAGNOSTICS_GRID_ITEMS_PER_LANE: u32 = 8;
+
+fn diagnostics_grid_groups(n: u32) -> u32 {
+    n.div_ceil(WG * DIAGNOSTICS_GRID_ITEMS_PER_LANE)
+}
+
 fn active_tile_dims_for_grid(node_dims: [u32; 3]) -> [u32; 3] {
     node_dims.map(|nodes| (nodes - 1).div_ceil(ACTIVE_TILE_EDGE))
 }
@@ -136,13 +142,13 @@ fn active_tiling_enabled(implicit_solid: bool, all_gas_atmospheric: bool) -> boo
 /// (grid_sm, grid_svel, grid_sfp, solids), `g2p_solid` 8 (pos, vel, chem, cmat, solids,
 /// grid_svel, fmat, sstate) — ties cell_classify; U9 absorption family — `p2g_moisture` 4
 /// (pos, vel, chem, grid_moist), `g2p_absorb` 4 (pos, vel, chem, grid_moist); chemistry/thermal
-/// scatter binds 6 and gather binds 7 around the 11-lane chemistry ledger; `filter_release` binds
+/// scatter binds 6 and gather binds 8 around the 11-lane chemistry ledger plus the external
+/// ambient-enthalpy ledger; `filter_release` binds
 /// 10 to reconstruct pressure-projected mobile superficial flux and its measured carrier closure; the semi-implicit
 /// family's widest pass is `p2g_solid_macro` at 9 (pos, vel, chem, cmat, grid_sfp, grid_sm,
 /// sstate, grid_scomp, cell_cnt), while its scalar Jacobi binds 4. Tiled fine-pressure relaxation adds one
 /// scheduler binding; its occupancy marker binds 2 (cell census, scheduler). The occasional
-/// compact diagnostics pass
-/// binds 6 storage buffers (pos, chem, grid_vel, cell_cnt, filter_state, output). All remain at or
+/// compact diagnostics particle/grid passes bind 9 and 10 storage buffers respectively. All remain at or
 /// below the cap; re-derive when passes are added. Shared required limits request 10 storage
 /// buffers per stage (see `solvers/mpm/mod.rs::required_limits`), within the WebGPU-target cap.
 pub const MAX_STORAGE_BUFFERS_PER_ENTRY_POINT: u32 = 10;
@@ -774,9 +780,11 @@ const _: () = assert!(std::mem::size_of::<Params>() == 400);
 struct DiagnosticsConfig {
     cup0: [f32; 4], // (center x, center z, radius, minimum y)
     cup1: [f32; 4], // (maximum y, enabled, seeded bed top, reserved)
+    bed0: [f32; 4], // (minimum x, maximum x, minimum z, maximum z)
+    bed1: [f32; 4], // (minimum y, maximum y, outlet half-band in cell widths, valid)
 }
 
-const _: () = assert!(std::mem::size_of::<DiagnosticsConfig>() == 32);
+const _: () = assert!(std::mem::size_of::<DiagnosticsConfig>() == 64);
 
 /// Compact GPU result mirrored by `diagnostics.wgsl::DiagnosticsOutput`. These are primitive
 /// extensive sums; solution/grain totals and conservation residuals are derived on the CPU so
@@ -789,12 +797,23 @@ struct DiagnosticsGpu {
     grain: [f32; 4],
     cup: [f32; 4],
     grid: [f32; 4],
+    pressure: [f32; 4],
+    pressure_ext: [f32; 4],
+    even0: [f32; 4],
+    even1: [f32; 4],
+    even2: [f32; 4],
+    even3: [f32; 4],
     counts: [u32; 4],
     filter0: [u32; 4],
     filter1: [u32; 4],
+    snapshot_meta: [u32; 4],
+    reserved: [f32; 4],
 }
 
-const _: () = assert!(std::mem::size_of::<DiagnosticsGpu>() == 128);
+const _: () = assert!(std::mem::size_of::<DiagnosticsGpu>() == 256);
+
+const DIAGNOSTICS_PARTICLE_CANARY: u32 = 0x4450_4731; // "DPG1"
+const DIAGNOSTICS_GRID_CANARY: u32 = 0x4450_4732; // "DPG2"
 
 /// GPU record for one static SDF solid — byte-identical to the WGSL `Primitive` (64 bytes,
 /// vec4-aligned; mirrors the xpbd packing of `utils::sdf` primitives). Cone radii in `a` are
@@ -889,6 +908,9 @@ struct DiagnosticsPending {
     receiver: std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>,
     sample_time_s: f32,
     expected_carrier_mass: f32,
+    expected_enthalpy: f32,
+    generation: u64,
+    request_id: Option<u64>,
     epoch: u64,
 }
 
@@ -907,13 +929,16 @@ pub struct TwofieldDiagnostics {
     /// time represented by that snapshot. Production getters return this cache without mapping.
     pub sample_valid: bool,
     pub sample_time_s: f32,
+    pub sample_generation: u64,
     /// Live free-water particles above the bed surface (the pond), latest sample.
     pub free_water_above_bed: u32,
     pub pond_carrier_mass: f32,
     /// Sim time (s) when the pond first drained below the drawdown threshold; 0 = not latched.
     pub drawdown_time: f32,
-    /// Flow-evenness placeholder (1.0 = even); channel histogram work remains separate.
+    /// Scale-free 4×4 participation ratio of downward mobile superficial flux through the
+    /// seeded lower-bed band. Invalid when the band has no resolved outflow.
     pub evenness: f32,
+    pub evenness_valid: bool,
     /// Peak per-node grid occupancy proxy (max decoded node mass / rest density), latest sample.
     pub max_occupancy: f32,
     /// Dissolved solute mass divided by total dry coffee mass.
@@ -930,6 +955,9 @@ pub struct TwofieldDiagnostics {
     pub mobile_carrier_mass: f32,
     pub paper_carrier_mass: f32,
     pub bound_carrier_mass: f32,
+    /// Carrier represented on nodes that also carry resolved dry structural volume. Paper is
+    /// excluded because held filter parcels do not scatter to the grid.
+    pub bed_pore_carrier_mass: f32,
     pub total_carrier_mass: f32,
     pub mobile_solution_mass: f32,
     pub paper_solution_mass: f32,
@@ -950,6 +978,14 @@ pub struct TwofieldDiagnostics {
     /// term (and inlet/outflow); `total_solute` changes only through inlet/outflow.
     pub total_solute: f32,
     pub total_enthalpy: f32,
+    pub expected_enthalpy: f32,
+    pub enthalpy_residual: f32,
+    pub pressure_residual_pre_rms: f32,
+    pub pressure_residual_post_rms: f32,
+    pub pressure_residual_pre_max: f32,
+    pub pressure_residual_post_max: f32,
+    pub pressure_residual_ratio: f32,
+    pub pressure_residual_cell_count: u32,
     /// Source-side expectations and signed conservation residuals. Open-base particles remain in
     /// the canonical arrays, so these whole-system ledgers include escaped parcels.
     pub expected_carrier_mass: f32,
@@ -1051,6 +1087,9 @@ pub struct TwofieldSolver {
     grid_sfp: wgpu::Buffer,
     // Semi-implicit solid plastic-compaction moment, one fixed-point lane per node.
     grid_scomp: wgpu::Buffer,
+    // Projected dry/composite solid grid velocity, retained so reset and explicit diagnostics
+    // can observe a defined t=0 state without submitting a physics frame.
+    grid_svel: wgpu::Buffer,
     // Persistent paper reservoir (binding 30), intentionally not part of per-frame grid clear.
     filter_state: wgpu::Buffer,
     // Phase-1 sparse water-pressure scheduler (binding 33) and its separate INDIRECT-only
@@ -1063,10 +1102,16 @@ pub struct TwofieldSolver {
     // Compact periodic observability path. `diagnostics_gpu` is reduced on the GPU; two tiny
     // staging slots are mapped asynchronously and never waited on by the frame loop.
     diagnostics_gpu: wgpu::Buffer,
+    diagnostics_grid_partials: wgpu::Buffer,
     diagnostics_config: wgpu::Buffer,
     diagnostics_readbacks: [DiagnosticsReadbackSlot; DIAGNOSTICS_READBACK_SLOTS],
+    diagnostics_explicit: DiagnosticsReadbackSlot,
     diagnostics_elapsed_s: f32,
     diagnostics_epoch: u64,
+    state_generation: u64,
+    next_diagnostics_request_id: u64,
+    completed_diagnostics_request: Option<crate::solvers::base::DiagnosticsTicket>,
+    superseded_diagnostics_request: Option<crate::solvers::base::DiagnosticsTicket>,
     react: wgpu::Buffer,
     // U5 dynamic-solid per-particle state (plasticity.wgsl bindings 23/24): deformation
     // gradient (3 vec4 rows) and (τ, p_c, compaction). The grid_sm/grid_svel node fields
@@ -1119,7 +1164,9 @@ pub struct TwofieldSolver {
     cached_diag: TwofieldDiagnostics,
     initial_carrier_mass: f32,
     initial_solute_mass: f32,
+    initial_enthalpy: f32,
     insoluble_grain_mass: f32,
+    ambient_enthalpy: wgpu::Buffer,
 
     // Retained for reset (exact, deterministic re-seed; pool-padded layout).
     initial_positions: Vec<[f32; 4]>,
@@ -1196,7 +1243,9 @@ struct Pipelines {
     chemistry_scatter: (wgpu::ComputePipeline, wgpu::BindGroup),
     chemistry_gather: (wgpu::ComputePipeline, wgpu::BindGroup),
     filter_release: (wgpu::ComputePipeline, wgpu::BindGroup),
-    diagnostics_reduce: (wgpu::ComputePipeline, wgpu::BindGroup),
+    diagnostics_particles: (wgpu::ComputePipeline, wgpu::BindGroup),
+    diagnostics_grid: [(wgpu::ComputePipeline, wgpu::BindGroup); 2],
+    diagnostics_grid_finalize: (wgpu::ComputePipeline, wgpu::BindGroup),
     // U5 plasticity family (dispatched only in dynamic mode; p2g_solid_dyn replaces
     // p2g_solid 1:1 there).
     p2g_solid_reference: (wgpu::ComputePipeline, wgpu::BindGroup),
@@ -1452,14 +1501,23 @@ fn seed_chemistry(
     seeded
 }
 
-/// Grid dimensions for a scene: cell size `h = CELL_SIZE_FACTOR · particle_spacing`, node 0 one
-/// cell OUTSIDE `box_min` (a pad layer), `ceil(extent/h) + 3` nodes per axis. With the pad, a
-/// particle anywhere in the box — including exactly on a face after the G2P clamp — has its
-/// full 3-node B-spline support in range: `xl = (x − origin)/h ∈ [1, 1 + extent/h]`, so
-/// `base = floor(xl − 0.5) ∈ [0, dims − 3]`. The node layer at exactly `box_min` always exists
-/// (origin + h = box_min), which is what the grid box-face BC keys on.
+/// Grid dimensions for a scene. A mixed water/solid MPM grid resolves the coarser of the two
+/// material-point pitches; using only a small water parcel pitch over-refines the shared grid,
+/// changes the solid quadrature's effective loading, and can exceed WebGPU's baseline storage
+/// binding size in low-water calibration fixtures. Water-only scenes retain their own pitch.
+/// Node 0 sits one cell outside `box_min`, and `ceil(extent/h) + 3` nodes preserve the full
+/// three-node B-spline support at both box faces.
 pub fn grid_spec_for(scene: &Scene, mats: &Materials) -> ([f32; 3], f32, [u32; 3]) {
-    let h = CELL_SIZE_FACTOR * mats.particle_spacing;
+    let has_solid_points = scene
+        .regions
+        .iter()
+        .any(|region| region.species == Species::Grain);
+    let material_pitch = if has_solid_points {
+        mats.particle_spacing.max(mats.grain_diameter)
+    } else {
+        mats.particle_spacing
+    };
+    let h = CELL_SIZE_FACTOR * material_pitch;
     let origin = [
         scene.box_min[0] - h,
         scene.box_min[1] - h,
@@ -2081,7 +2139,7 @@ impl TwofieldSolver {
     /// Read back the frame's solved pressure (the final-parity ping-pong buffer the project
     /// pass consumed; dev/test only — stalls).
     pub fn read_pressure(&self) -> Vec<f32> {
-        let buf = if self.fine_sweeps.is_multiple_of(2) {
+        let buf = if self.pressure_parity() == 0 {
             &self.pf_a
         } else {
             &self.pf_b
@@ -2194,15 +2252,24 @@ impl TwofieldSolver {
         }
     }
 
+    fn expected_enthalpy_without_ambient(&self) -> f32 {
+        self.initial_enthalpy
+            + self.inflow.emitted_mass * self.params.therm[0].max(0.0) * self.inflow.pour_t
+    }
+
     fn apply_diagnostics_gpu(
         &mut self,
         snapshot: DiagnosticsGpu,
         sample_time_s: f32,
         expected_carrier_mass: f32,
+        expected_enthalpy_without_ambient: f32,
+        generation: u64,
     ) {
-        if self.cached_diag.sample_valid && sample_time_s < self.cached_diag.sample_time_s {
+        if self.cached_diag.sample_valid && generation < self.cached_diag.sample_generation {
             return;
         }
+        let passes_completed = snapshot.snapshot_meta[0] == DIAGNOSTICS_PARTICLE_CANARY
+            && snapshot.snapshot_meta[1] == DIAGNOSTICS_GRID_CANARY;
         let mobile_carrier = snapshot.mobile[0].max(0.0);
         let mobile_solute = snapshot.mobile[1].max(0.0);
         let paper_carrier = snapshot.paper[0].max(0.0);
@@ -2234,12 +2301,29 @@ impl TwofieldSolver {
         let grain_enthalpy = snapshot.grain[3];
 
         let mut diag = self.cached_diag;
-        diag.sample_valid = true;
+        diag.sample_valid = passes_completed;
         diag.sample_time_s = sample_time_s;
+        diag.sample_generation = generation;
         diag.free_water_above_bed = snapshot.counts[0];
         diag.pond_carrier_mass = snapshot.cup[2].max(0.0);
-        diag.evenness = 1.0;
+        let outlet_bins = snapshot
+            .even0
+            .into_iter()
+            .chain(snapshot.even1)
+            .chain(snapshot.even2)
+            .chain(snapshot.even3);
+        let (outlet_sum, outlet_square_sum) = outlet_bins.fold((0.0, 0.0), |acc, value| {
+            let bounded = value.max(0.0);
+            (acc.0 + bounded, acc.1 + bounded * bounded)
+        });
+        diag.evenness_valid = outlet_sum > 0.0 && outlet_square_sum > 0.0;
+        diag.evenness = if diag.evenness_valid {
+            (outlet_sum * outlet_sum / (16.0 * outlet_square_sum)).clamp(1.0 / 16.0, 1.0)
+        } else {
+            0.0
+        };
         diag.max_occupancy = snapshot.grid[0].max(0.0);
+        diag.bed_pore_carrier_mass = snapshot.grid[1].max(0.0);
         let total_dry_mass = self.insoluble_grain_mass + self.initial_solute_mass;
         diag.extraction_yield = if total_dry_mass > 0.0 {
             dissolved_solute / total_dry_mass
@@ -2286,6 +2370,30 @@ impl TwofieldSolver {
         diag.mean_diameter_ratio = 1.0 + diag.mean_bound_saturation * self.params.wet1[3].max(0.0);
         diag.total_solute = total_solute;
         diag.total_enthalpy = water_enthalpy + grain_enthalpy;
+        diag.expected_enthalpy = expected_enthalpy_without_ambient + snapshot.grid[2];
+        diag.enthalpy_residual = diag.total_enthalpy - diag.expected_enthalpy;
+        let pressure_cells = snapshot.pressure_ext[2].max(0.0) as u32;
+        diag.pressure_residual_cell_count = pressure_cells;
+        if pressure_cells > 0 {
+            let inv_count = 1.0 / pressure_cells as f32;
+            diag.pressure_residual_pre_rms = (snapshot.pressure[1].max(0.0) * inv_count).sqrt();
+            diag.pressure_residual_post_rms = (snapshot.pressure[3].max(0.0) * inv_count).sqrt();
+            diag.pressure_residual_pre_max = snapshot.pressure_ext[0].max(0.0);
+            diag.pressure_residual_post_max = snapshot.pressure_ext[1].max(0.0);
+            diag.pressure_residual_ratio = if diag.pressure_residual_pre_rms > 0.0 {
+                diag.pressure_residual_post_rms / diag.pressure_residual_pre_rms
+            } else if diag.pressure_residual_post_rms == 0.0 {
+                0.0
+            } else {
+                f32::INFINITY
+            };
+        } else {
+            diag.pressure_residual_pre_rms = 0.0;
+            diag.pressure_residual_post_rms = 0.0;
+            diag.pressure_residual_pre_max = 0.0;
+            diag.pressure_residual_post_max = 0.0;
+            diag.pressure_residual_ratio = 0.0;
+        }
         diag.expected_carrier_mass = expected_carrier_mass;
         diag.expected_solute_mass = self.initial_solute_mass;
         diag.carrier_mass_residual = total_carrier - expected_carrier_mass;
@@ -2310,8 +2418,9 @@ impl TwofieldSolver {
         diag.filter_errors = snapshot.filter1[0];
         diag.nonfinite_particle_count = snapshot.counts[3];
         diag.nonfinite_grid_node_count = snapshot.filter1[1];
-        diag.has_nonfinite_state =
-            diag.nonfinite_particle_count > 0 || diag.nonfinite_grid_node_count > 0;
+        diag.has_nonfinite_state = !passes_completed
+            || diag.nonfinite_particle_count > 0
+            || diag.nonfinite_grid_node_count > 0;
         let (beta, mobility) = self.filter_relaxation_observability();
         diag.filter_beta_max_per_s = beta;
         diag.filter_pressure_mobility_min = mobility;
@@ -2357,13 +2466,23 @@ impl TwofieldSolver {
                 completed.push((
                     pending.sample_time_s,
                     pending.expected_carrier_mass,
+                    pending.expected_enthalpy,
+                    pending.generation,
                     snapshot,
                 ));
             }
         }
-        completed.sort_by(|a, b| a.0.total_cmp(&b.0));
-        for (sample_time_s, expected_carrier_mass, snapshot) in completed {
-            self.apply_diagnostics_gpu(snapshot, sample_time_s, expected_carrier_mass);
+        completed.sort_by_key(|sample| sample.3);
+        for (sample_time_s, expected_carrier_mass, expected_enthalpy, generation, snapshot) in
+            completed
+        {
+            self.apply_diagnostics_gpu(
+                snapshot,
+                sample_time_s,
+                expected_carrier_mass,
+                expected_enthalpy,
+                generation,
+            );
         }
     }
 
@@ -2391,6 +2510,9 @@ impl TwofieldSolver {
             receiver,
             sample_time_s,
             expected_carrier_mass: self.initial_carrier_mass + self.inflow.emitted_mass,
+            expected_enthalpy: self.expected_enthalpy_without_ambient(),
+            generation: self.state_generation,
+            request_id: None,
             epoch: self.diagnostics_epoch,
         });
     }
@@ -2523,6 +2645,8 @@ impl TwofieldSolver {
             snapshot,
             self.sim_time,
             self.initial_carrier_mass + self.inflow.emitted_mass,
+            self.expected_enthalpy_without_ambient(),
+            self.state_generation,
         );
     }
 
@@ -2537,17 +2661,202 @@ impl TwofieldSolver {
     }
 
     pub fn diagnostics_pending(&self) -> bool {
-        self.diagnostics_readbacks.iter().any(|slot| {
-            slot.pending
-                .as_ref()
-                .is_some_and(|pending| pending.epoch == self.diagnostics_epoch)
-        })
+        self.diagnostics_explicit
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.epoch == self.diagnostics_epoch)
+    }
+
+    /// Submit a compact snapshot containing diagnostics dispatches and one tiny copy only. No
+    /// physics pass, parameter update, emitter tick, or simulation clock mutation is encoded.
+    pub fn request_diagnostics_snapshot(
+        &mut self,
+    ) -> Result<crate::solvers::base::DiagnosticsTicket, String> {
+        self.poll_periodic_diagnostics();
+        if let Some(pending) = self.diagnostics_explicit.pending.as_ref() {
+            return Ok(crate::solvers::base::DiagnosticsTicket::new(
+                pending.request_id.unwrap_or(0),
+                pending.generation,
+                pending.sample_time_s,
+            ));
+        }
+
+        let request_id = self.next_diagnostics_request_id;
+        self.next_diagnostics_request_id = self.next_diagnostics_request_id.wrapping_add(1).max(1);
+        let ticket = crate::solvers::base::DiagnosticsTicket::new(
+            request_id,
+            self.state_generation,
+            self.sim_time,
+        );
+        self.completed_diagnostics_request = None;
+        self.superseded_diagnostics_request = None;
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("twofield-explicit-diagnostics"),
+            });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("twofield-explicit-diagnostics-particles"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pipelines.diagnostics_particles.0);
+            pass.set_bind_group(0, Some(&self.pipelines.diagnostics_particles.1), &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+        self.queue.submit(Some(encoder.finish()));
+
+        let mut grid_encoder =
+            self.device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("twofield-explicit-diagnostics-grid"),
+                });
+        {
+            // Isolate the widest ten-storage grid reduction in its own command buffer. WebGPU
+            // invalidates a whole command encoder when any pass fails validation; keeping the
+            // particle inventory independent ensures its canary diagnoses that failure instead
+            // of a mapped all-zero buffer masquerading as a valid dry scene.
+            let mut pass = grid_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("twofield-explicit-diagnostics-grid"),
+                timestamp_writes: None,
+            });
+            let parity = self.pressure_parity();
+            pass.set_pipeline(&self.pipelines.diagnostics_grid[parity].0);
+            pass.set_bind_group(0, Some(&self.pipelines.diagnostics_grid[parity].1), &[]);
+            pass.dispatch_workgroups(
+                diagnostics_grid_groups(self.num_nodes.max(self.num_cells)).max(1),
+                1,
+                1,
+            );
+        }
+        self.queue.submit(Some(grid_encoder.finish()));
+
+        let mut finalize_encoder =
+            self.device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("twofield-explicit-diagnostics-finalize"),
+                });
+        {
+            let mut pass = finalize_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("twofield-explicit-diagnostics-finalize"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pipelines.diagnostics_grid_finalize.0);
+            pass.set_bind_group(0, Some(&self.pipelines.diagnostics_grid_finalize.1), &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+        self.queue.submit(Some(finalize_encoder.finish()));
+
+        // Submit the readback copy separately. Queue order preserves the dependency while making
+        // it visible to WebGPU's mapping lifetime rules (the destination is mapped immediately
+        // below and must not alias an unfinished compute+copy command buffer transaction).
+        let mut copy_encoder =
+            self.device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("twofield-explicit-diagnostics-copy"),
+                });
+        copy_encoder.copy_buffer_to_buffer(
+            &self.diagnostics_gpu,
+            0,
+            &self.diagnostics_explicit.buffer,
+            0,
+            std::mem::size_of::<DiagnosticsGpu>() as u64,
+        );
+        self.queue.submit(Some(copy_encoder.finish()));
+
+        let slice = self.diagnostics_explicit.buffer.slice(..);
+        let (tx, receiver) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = tx.send(result);
+        });
+        self.diagnostics_explicit.pending = Some(DiagnosticsPending {
+            receiver,
+            sample_time_s: self.sim_time,
+            expected_carrier_mass: self.initial_carrier_mass + self.inflow.emitted_mass,
+            expected_enthalpy: self.expected_enthalpy_without_ambient(),
+            generation: self.state_generation,
+            request_id: Some(request_id),
+            epoch: self.diagnostics_epoch,
+        });
+        Ok(ticket)
+    }
+
+    pub fn poll_explicit_diagnostics(&mut self) -> crate::solvers::base::DiagnosticsPoll {
+        use crate::solvers::base::DiagnosticsPoll;
+        let _ = self.device.poll(wgpu::PollType::Poll);
+        let ready = match self.diagnostics_explicit.pending.as_ref() {
+            Some(pending) => match pending.receiver.try_recv() {
+                Ok(result) => Some(Some(result)),
+                Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(None),
+            },
+            None => None,
+        };
+        if let Some(result) = ready {
+            let pending = self
+                .diagnostics_explicit
+                .pending
+                .take()
+                .expect("explicit diagnostics pending state disappeared");
+            let ticket = crate::solvers::base::DiagnosticsTicket::new(
+                pending.request_id.unwrap_or(0),
+                pending.generation,
+                pending.sample_time_s,
+            );
+            match result {
+                Some(Ok(())) if pending.epoch == self.diagnostics_epoch => {
+                    let snapshot = {
+                        let view = self
+                            .diagnostics_explicit
+                            .buffer
+                            .slice(..)
+                            .get_mapped_range();
+                        *bytemuck::from_bytes::<DiagnosticsGpu>(&view)
+                    };
+                    self.diagnostics_explicit.buffer.unmap();
+                    self.apply_diagnostics_gpu(
+                        snapshot,
+                        pending.sample_time_s,
+                        pending.expected_carrier_mass,
+                        pending.expected_enthalpy,
+                        pending.generation,
+                    );
+                    self.completed_diagnostics_request = Some(ticket);
+                    return DiagnosticsPoll::Ready(ticket);
+                }
+                Some(Ok(())) => {
+                    self.diagnostics_explicit.buffer.unmap();
+                }
+                _ => {}
+            }
+            self.superseded_diagnostics_request = Some(ticket);
+            return DiagnosticsPoll::Superseded(ticket);
+        }
+        if let Some(pending) = self.diagnostics_explicit.pending.as_ref() {
+            return DiagnosticsPoll::Pending(crate::solvers::base::DiagnosticsTicket::new(
+                pending.request_id.unwrap_or(0),
+                pending.generation,
+                pending.sample_time_s,
+            ));
+        }
+        if let Some(ticket) = self.completed_diagnostics_request {
+            return DiagnosticsPoll::Ready(ticket);
+        }
+        if let Some(ticket) = self.superseded_diagnostics_request {
+            return DiagnosticsPoll::Superseded(ticket);
+        }
+        DiagnosticsPoll::Unsupported
     }
 
     /// Live particle count currently simulated (water prefix + solids). Mirrors
     /// `XpbdSolver::active_count` — the scaling-probe / perf-test particle-count read.
     pub fn active_count(&self) -> u32 {
         self.water_count + self.solid_count
+    }
+
+    pub fn dry_coffee_mass(&self) -> f32 {
+        self.insoluble_grain_mass + self.params.solute[2].max(0.0) * self.solid_count as f32
     }
 
     /// Allocated water-pool capacity (`seed + dose headroom`; dev/test). The upper bound the
@@ -2655,6 +2964,33 @@ impl Solver for TwofieldSolver {
         let insoluble_grain_mass =
             (dry_grain_mass - mats.soluble_fraction.clamp(0.0, 1.0) * dry_grain_mass).max(0.0)
                 * solid_count as f32;
+        let initial_water_enthalpy = positions[..water_seed as usize]
+            .iter()
+            .zip(&initial_chemistry[..water_seed as usize])
+            .map(|(p, c)| {
+                let carrier = mats.particle_mass * p[3].clamp(0.0, 1.0);
+                let solute = carrier * c[0].max(0.0);
+                (carrier * mats.cp_water.max(0.0) + solute * mats.cp_grain.max(0.0)) * c[1]
+            })
+            .sum::<f32>();
+        let insoluble_per_solid = if solid_count > 0 {
+            insoluble_grain_mass / solid_count as f32
+        } else {
+            0.0
+        };
+        let initial_grain_enthalpy = positions[water_capacity as usize..]
+            .iter()
+            .zip(&initial_chemistry[water_capacity as usize..])
+            .map(|(p, c)| {
+                let bound = water_mass_per_volume * p[3].max(0.0);
+                let remaining = c[0].max(0.0) + c[1].max(0.0);
+                (insoluble_per_solid * mats.cp_grain.max(0.0)
+                    + remaining * mats.cp_grain.max(0.0)
+                    + bound * mats.cp_water.max(0.0))
+                    * c[2]
+            })
+            .sum::<f32>();
+        let initial_enthalpy = initial_water_enthalpy + initial_grain_enthalpy;
 
         let (origin, cell, dims) = grid_spec_for(scene, mats);
         let num_nodes = dims[0] * dims[1] * dims[2];
@@ -2910,6 +3246,12 @@ impl Solver for TwofieldSolver {
             vec4,
             wgpu::BufferUsages::COPY_SRC,
         ));
+        let ambient_enthalpy = Self::storage(
+            &device,
+            "twofield-ambient-enthalpy-ledger",
+            n * 4,
+            wgpu::BufferUsages::COPY_SRC,
+        );
         // APIC C matrices: 3 vec4 rows per particle, zero-initialized (C = 0 at rest).
         // COPY_SRC for the snapshot/replay readback in the U3 divergence-decay gate.
         let cmat = Self::storage(
@@ -2970,15 +3312,49 @@ impl Solver for TwofieldSolver {
             std::mem::size_of::<DiagnosticsGpu>() as u64,
             wgpu::BufferUsages::COPY_SRC,
         );
+        let diagnostics_grid_partial_count =
+            diagnostics_grid_groups(num_nodes.max(num_cells)).max(1);
+        let diagnostics_grid_partials = Self::storage(
+            &device,
+            "twofield-diagnostics-grid-partials",
+            u64::from(diagnostics_grid_partial_count)
+                * std::mem::size_of::<DiagnosticsGpu>() as u64,
+            wgpu::BufferUsages::empty(),
+        );
+        let solid_positions = &positions[water_capacity as usize..];
+        let bed_bounds = solid_positions.first().map(|first| {
+            solid_positions.iter().fold(
+                [first[0], first[0], first[2], first[2], first[1], first[1]],
+                |mut bounds, point| {
+                    bounds[0] = bounds[0].min(point[0]);
+                    bounds[1] = bounds[1].max(point[0]);
+                    bounds[2] = bounds[2].min(point[2]);
+                    bounds[3] = bounds[3].max(point[2]);
+                    bounds[4] = bounds[4].min(point[1]);
+                    bounds[5] = bounds[5].max(point[1]);
+                    bounds
+                },
+            )
+        });
+        let (bed0, bed1) = bed_bounds.map_or(([0.0; 4], [0.0; 4]), |bounds| {
+            (
+                [bounds[0], bounds[1], bounds[2], bounds[3]],
+                [bounds[4], bounds[5], 1.5, 1.0],
+            )
+        });
         let diagnostics_config_data = if let Some(cup) = cup {
             DiagnosticsConfig {
                 cup0: [cup.cx, cup.cz, cup.radius, cup.y_min],
                 cup1: [cup.y_max, 1.0, bed_top_seed, 0.0],
+                bed0,
+                bed1,
             }
         } else {
             DiagnosticsConfig {
                 cup0: [0.0; 4],
                 cup1: [0.0, 0.0, bed_top_seed, 0.0],
+                bed0,
+                bed1,
             }
         };
         let diagnostics_config = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -2999,6 +3375,15 @@ impl Solver for TwofieldSolver {
             }),
             pending: None,
         });
+        let diagnostics_explicit = DiagnosticsReadbackSlot {
+            buffer: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("twofield-diagnostics-readback-explicit"),
+                size: std::mem::size_of::<DiagnosticsGpu>() as u64,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            }),
+            pending: None,
+        };
         // Interphase drag state: per-node vec4 (impulse.xyz, sigma). Frozen-mode pressure
         // reaction accounting shares the buffer; dynamic impulses are applied to grid_svel.
         let react_buf = Self::storage(
@@ -3025,7 +3410,7 @@ impl Solver for TwofieldSolver {
             &device,
             "twofield-grid-svel",
             grid_bytes,
-            wgpu::BufferUsages::empty(),
+            wgpu::BufferUsages::COPY_SRC,
         );
         // U9 moisture ledger: 6 fixed-point lanes per node (supply S, demand D, donor
         // volume-momentum Q.xyz, and donor volume-temperature R). Q/S and R/S carry the
@@ -3532,6 +3917,7 @@ impl Solver for TwofieldSolver {
                     (7, &grid_vel),
                     (22, &grid_svel),
                     (28, &grid_chem),
+                    (35, &ambient_enthalpy),
                 ],
             );
             let filter_release = make("filter_release");
@@ -3551,18 +3937,52 @@ impl Solver for TwofieldSolver {
                     (30, &filter_state),
                 ],
             );
-            let diagnostics_reduce = make("diagnostics_reduce");
-            let diagnostics_reduce_bind = bg(
-                &diagnostics_reduce,
+            let diagnostics_particles = make("diagnostics_particles");
+            let diagnostics_particles_bind = bg(
+                &diagnostics_particles,
                 &[
                     (0, &params_buf),
                     (1, &pos),
+                    (2, &vel),
+                    (3, &phase),
                     (4, &chem),
-                    (7, &grid_vel),
-                    (18, &cell_cnt),
-                    (30, &filter_state),
-                    (31, &diagnostics_gpu),
+                    (5, &cmat),
+                    (23, &fmat),
+                    (24, &sstate),
+                    (36, &diagnostics_gpu),
                     (32, &diagnostics_config),
+                    (35, &ambient_enthalpy),
+                ],
+            );
+            let diagnostics_grid = std::array::from_fn(|parity| {
+                let pipeline = make("diagnostics_grid");
+                let pressure = if parity == 0 { &pf_a } else { &pf_b };
+                let bind = bg(
+                    &pipeline,
+                    &[
+                        (0, &params_buf),
+                        (7, &grid_vel),
+                        (9, &nm),
+                        (10, &cell_meta),
+                        (11, pressure),
+                        (18, &cell_cnt),
+                        (19, &grid_sfp),
+                        (20, &react_buf),
+                        (22, &grid_svel),
+                        (30, &filter_state),
+                        (31, &diagnostics_grid_partials),
+                        (32, &diagnostics_config),
+                    ],
+                );
+                (pipeline, bind)
+            });
+            let diagnostics_grid_finalize = make("diagnostics_grid_finalize");
+            let diagnostics_grid_finalize_bind = bg(
+                &diagnostics_grid_finalize,
+                &[
+                    (0, &params_buf),
+                    (31, &diagnostics_grid_partials),
+                    (36, &diagnostics_gpu),
                 ],
             );
             let grid_update = make("grid_update");
@@ -3929,7 +4349,12 @@ impl Solver for TwofieldSolver {
                 chemistry_scatter: (chemistry_scatter, chemistry_scatter_bind),
                 chemistry_gather: (chemistry_gather, chemistry_gather_bind),
                 filter_release: (filter_release, filter_release_bind),
-                diagnostics_reduce: (diagnostics_reduce, diagnostics_reduce_bind),
+                diagnostics_particles: (diagnostics_particles, diagnostics_particles_bind),
+                diagnostics_grid,
+                diagnostics_grid_finalize: (
+                    diagnostics_grid_finalize,
+                    diagnostics_grid_finalize_bind,
+                ),
                 p2g_solid_reference: (p2g_solid_reference, p2g_solid_reference_bind),
                 p2g_solid_dyn: (p2g_solid_dyn, p2g_solid_dyn_bind),
                 solid_update: (solid_update, solid_update_bind),
@@ -4010,6 +4435,7 @@ impl Solver for TwofieldSolver {
         initial_diag.numerical_shear_limited = shear_budget.limited;
         initial_diag.expected_carrier_mass = initial_carrier_mass;
         initial_diag.expected_solute_mass = initial_solute_mass;
+        initial_diag.expected_enthalpy = initial_enthalpy;
         initial_diag.filter_capacity_volume = if filter_paper_present {
             filter1[0] as f32 / FILTER_VOLUME_SCALE as f32
         } else {
@@ -4053,17 +4479,24 @@ impl Solver for TwofieldSolver {
             grid_vel,
             grid_sfp,
             grid_scomp,
+            grid_svel,
             filter_state,
             active_tiles,
             active_tile_indirect,
             active_tile_count,
             active_tiling: active_tiling_enabled(implicit_solid, cfg.tf_all_gas_atmospheric),
             diagnostics_gpu,
+            diagnostics_grid_partials,
             diagnostics_config,
             diagnostics_readbacks,
+            diagnostics_explicit,
             // Sample immediately after the first completed physics frame, then at 4 Hz.
             diagnostics_elapsed_s: DIAGNOSTICS_PERIOD_S,
             diagnostics_epoch: 0,
+            state_generation: 0,
+            next_diagnostics_request_id: 1,
+            completed_diagnostics_request: None,
+            superseded_diagnostics_request: None,
             react: react_buf,
             fmat,
             sstate,
@@ -4095,7 +4528,9 @@ impl Solver for TwofieldSolver {
             cached_diag: initial_diag,
             initial_carrier_mass,
             initial_solute_mass,
+            initial_enthalpy,
             insoluble_grain_mass,
+            ambient_enthalpy,
             initial_positions: positions,
             initial_phases: phases,
             initial_chemistry,
@@ -4150,8 +4585,34 @@ impl Solver for TwofieldSolver {
             .write_buffer(&self.bubble, 0, bytemuck::cast_slice(&[0.0f32; 3]));
         self.queue
             .write_buffer(&self.filter_state, 0, bytemuck::cast_slice(&[0u32; 5]));
+        let mut reset_encoder =
+            self.device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("twofield-reset-transient-state"),
+                });
+        for buffer in [
+            &self.ambient_enthalpy,
+            &self.grid_fp,
+            &self.cell_cnt,
+            &self.grid_vel,
+            &self.grid_sfp,
+            &self.grid_scomp,
+            &self.grid_svel,
+            &self.react,
+            &self.nm,
+            &self.cell_meta,
+            &self.pf_a,
+            &self.pf_b,
+            &self.diagnostics_gpu,
+            &self.diagnostics_grid_partials,
+        ] {
+            reset_encoder.clear_buffer(buffer, 0, None);
+        }
+        self.queue.submit(Some(reset_encoder.finish()));
         self.water_count = self.initial_water;
         self.params.water_count = self.initial_water;
+        self.queue
+            .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&self.params));
         self.inflow.accumulator = 0.0;
         self.inflow.axial = 0.0;
         self.inflow.last_exit_speed = 0.0;
@@ -4163,9 +4624,21 @@ impl Solver for TwofieldSolver {
         self.pond_peak_carrier_mass = 0.0;
         self.diagnostics_elapsed_s = DIAGNOSTICS_PERIOD_S;
         self.diagnostics_epoch = self.diagnostics_epoch.wrapping_add(1);
+        self.state_generation = self.state_generation.wrapping_add(1);
+        self.completed_diagnostics_request = None;
+        if let Some(pending) = self.diagnostics_explicit.pending.as_ref() {
+            self.superseded_diagnostics_request = pending.request_id.map(|request_id| {
+                crate::solvers::base::DiagnosticsTicket::new(
+                    request_id,
+                    pending.generation,
+                    pending.sample_time_s,
+                )
+            });
+        }
         self.cached_diag = self.retention_build.diagnostics();
         self.cached_diag.expected_carrier_mass = self.initial_carrier_mass;
         self.cached_diag.expected_solute_mass = self.initial_solute_mass;
+        self.cached_diag.expected_enthalpy = self.initial_enthalpy;
         self.cached_diag.filter_capacity_volume = if self.filter_paper_present {
             self.params.filter1[0] as f32 / FILTER_VOLUME_SCALE as f32
         } else {
@@ -4180,6 +4653,7 @@ impl Solver for TwofieldSolver {
 
     fn step(&mut self, dt: f32, input: &EmissionInput) {
         self.poll_periodic_diagnostics();
+        self.state_generation = self.state_generation.wrapping_add(1);
         // Pour emission first (grows water_count for this frame); no-op when not pouring.
         self.emit(input, dt);
         self.sim_time += dt;
@@ -4316,9 +4790,24 @@ impl Solver for TwofieldSolver {
             if diagnostics_slot.is_some() {
                 rec.dispatch(
                     &mut enc,
-                    &self.pipelines.diagnostics_reduce.0,
-                    &self.pipelines.diagnostics_reduce.1,
-                    "diagnostics_reduce",
+                    &self.pipelines.diagnostics_particles.0,
+                    &self.pipelines.diagnostics_particles.1,
+                    "diagnostics_particles",
+                    1,
+                );
+                let pressure_parity = self.pressure_parity();
+                rec.dispatch(
+                    &mut enc,
+                    &self.pipelines.diagnostics_grid[pressure_parity].0,
+                    &self.pipelines.diagnostics_grid[pressure_parity].1,
+                    "diagnostics_grid",
+                    diagnostics_grid_groups(self.num_nodes.max(self.num_cells)).max(1),
+                );
+                rec.dispatch(
+                    &mut enc,
+                    &self.pipelines.diagnostics_grid_finalize.0,
+                    &self.pipelines.diagnostics_grid_finalize.1,
+                    "diagnostics_grid_finalize",
                     1,
                 );
             }
@@ -4786,9 +5275,23 @@ impl Solver for TwofieldSolver {
         if diagnostics_slot.is_some() {
             rec.dispatch(
                 &mut enc,
-                &self.pipelines.diagnostics_reduce.0,
-                &self.pipelines.diagnostics_reduce.1,
-                "diagnostics_reduce",
+                &self.pipelines.diagnostics_particles.0,
+                &self.pipelines.diagnostics_particles.1,
+                "diagnostics_particles",
+                1,
+            );
+            rec.dispatch(
+                &mut enc,
+                &self.pipelines.diagnostics_grid[par].0,
+                &self.pipelines.diagnostics_grid[par].1,
+                "diagnostics_grid",
+                diagnostics_grid_groups(self.num_nodes.max(self.num_cells)).max(1),
+            );
+            rec.dispatch(
+                &mut enc,
+                &self.pipelines.diagnostics_grid_finalize.0,
+                &self.pipelines.diagnostics_grid_finalize.1,
+                "diagnostics_grid_finalize",
                 1,
             );
         }
@@ -5006,6 +5509,110 @@ mod seed_tests {
             experimental_features: wgpu::ExperimentalFeatures::disabled(),
         }))
         .ok()
+    }
+
+    #[test]
+    fn explicit_diagnostics_snapshot_is_state_neutral_on_the_gpu() {
+        let Some((device, queue)) = create_test_device() else {
+            eprintln!("no GPU adapter available; skipping diagnostics neutrality test");
+            return;
+        };
+        let scene = Scene {
+            gravity: [0.0, -9.0, 0.0],
+            box_min: [-2.0; 3],
+            box_max: [2.0; 3],
+            regions: vec![
+                crate::engine::scene::SeedRegion {
+                    min: [-0.5, 0.5, -0.5],
+                    max: [0.5, 1.0, 0.5],
+                    species: Species::Water,
+                },
+                crate::engine::scene::SeedRegion {
+                    min: [-0.75, -0.75, -0.75],
+                    max: [0.75, 0.25, 0.75],
+                    species: Species::Grain,
+                },
+            ],
+            ..Scene::default()
+        };
+        let materials = Materials {
+            particle_spacing: 0.5,
+            support_radius: 1.0,
+            grain_diameter: 0.5,
+            ..Materials::default()
+        };
+        let config = Config {
+            seed_jitter: 0.0,
+            max_speed: 4.0,
+            tf_all_gas_atmospheric: true,
+            solid_dynamics: true,
+            tf_compaction_tangent: 8.0,
+            ..Config::default()
+        };
+        let gpu = GpuContext::from_device_queue(&device, &queue);
+        let mut solver = TwofieldSolver::build(&scene, &materials, &config, &gpu);
+        solver.step(1.0 / 120.0, &EmissionInput::default());
+
+        let snapshot_physics_bytes = |solver: &TwofieldSolver| {
+            let particle_count = u64::from(solver.params.particle_count);
+            let nodes = u64::from(solver.num_nodes);
+            let cells = u64::from(solver.num_cells);
+            let mut bytes = Vec::new();
+            for (buffer, size) in [
+                (&*solver.pos, particle_count * 16),
+                (&*solver.vel, particle_count * 16),
+                (&*solver.phase, particle_count * 4),
+                (&*solver.chem, particle_count * 16),
+                (&solver.cmat, particle_count * 48),
+                (&solver.fmat, u64::from(solver.solid_count.max(1)) * 48),
+                (&solver.sstate, u64::from(solver.solid_count.max(1)) * 32),
+                (&solver.grid_fp, nodes * 16),
+                (
+                    &solver.cell_cnt,
+                    u64::from(solver.num_cells + 4 * solver.num_nodes) * 4,
+                ),
+                (&solver.grid_vel, nodes * 16),
+                (&solver.grid_sfp, nodes * 4),
+                (&solver.grid_scomp, nodes * 4),
+                (&solver.grid_svel, nodes * 16),
+                (&solver.react, nodes * 16),
+                (&solver.nm, nodes * 32),
+                (&solver.cell_meta, cells * 16),
+                (&solver.pf_a, cells * 4),
+                (&solver.pf_b, cells * 4),
+                (&solver.filter_state, 20),
+                (&solver.ambient_enthalpy, particle_count * 4),
+            ] {
+                bytes.extend(solver.read_bytes(buffer, size));
+            }
+            bytes
+        };
+
+        let before = snapshot_physics_bytes(&solver);
+        let generation = solver.state_generation;
+        let sim_time = solver.sim_time;
+        let ticket = solver.request_diagnostics_snapshot().unwrap();
+        let _ = device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        });
+        assert_eq!(
+            solver.poll_explicit_diagnostics(),
+            crate::solvers::base::DiagnosticsPoll::Ready(ticket)
+        );
+        let diagnostics = solver.diagnostics();
+        assert!(
+            diagnostics.sample_valid,
+            "a mapped snapshot is valid only after both diagnostic passes stamp their canaries"
+        );
+        assert!(
+            diagnostics.total_carrier_mass > 0.0,
+            "a scene with live seeded water must report a positive carrier inventory"
+        );
+        let after = snapshot_physics_bytes(&solver);
+        assert_eq!(before, after);
+        assert_eq!(solver.state_generation, generation);
+        assert_eq!(solver.sim_time.to_bits(), sim_time.to_bits());
     }
 
     #[test]
@@ -6333,7 +6940,16 @@ mod seed_tests {
         let scene = Scene::default();
         let mats = Materials::default();
         let (origin, h, dims) = grid_spec_for(&scene, &mats);
-        assert_eq!(h, CELL_SIZE_FACTOR * mats.particle_spacing);
+        let has_solid_points = scene
+            .regions
+            .iter()
+            .any(|region| region.species == Species::Grain);
+        let expected_pitch = if has_solid_points {
+            mats.particle_spacing.max(mats.grain_diameter)
+        } else {
+            mats.particle_spacing
+        };
+        assert_eq!(h, CELL_SIZE_FACTOR * expected_pitch);
         for a in 0..3 {
             assert_eq!(origin[a], scene.box_min[a] - h);
             for x in [scene.box_min[a], scene.box_max[a]] {

@@ -1505,7 +1505,9 @@ fn chemistry_gather(@builtin(global_invocation_id) gid: vec3<u32>) {
                 my_capacity * chem[p].y + solute_enthalpy_gain + heat_gain
             ) / new_capacity;
         }
+        let pre_ambient_temperature = new_temperature;
         new_temperature = ambient_temperature_step(new_temperature);
+        ambient_enthalpy[p] += new_capacity * (new_temperature - pre_ambient_temperature);
         var new_concentration = chem[p].x;
         if (solvent_mass > 0.0) {
             new_concentration = (chem[p].x * solvent_mass + solute_gain) / solvent_mass;
@@ -1626,7 +1628,9 @@ fn chemistry_gather(@builtin(global_invocation_id) gid: vec3<u32>) {
                 my_capacity * chem[p].z - solute_enthalpy_loss + heat_gain
             ) / new_capacity;
         }
+        let pre_ambient_temperature = new_temperature;
         new_temperature = ambient_temperature_step(new_temperature);
+        ambient_enthalpy[p] += new_capacity * (new_temperature - pre_ambient_temperature);
         chem[p] = vec4<f32>(
             max(chem[p].x - fast_loss, 0.0),
             max(chem[p].y - slow_loss, 0.0),

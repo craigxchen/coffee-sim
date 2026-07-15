@@ -125,6 +125,12 @@ struct Params {
 // of round-tripping W through volume and accidentally manufacturing a one-count mobile phase.
 @group(0) @binding(18) var<storage, read_write> cell_cnt: array<atomic<u32>>;
 
+// Per-particle cumulative external enthalpy supplied by the explicit ambient relaxation. This
+// is an observability ledger, not solver state: chemistry_gather is already one invocation per
+// particle, so each particle owns one race-free lane. Diagnostics can therefore distinguish
+// legitimate ambient exchange from numerical energy creation without changing the thermal law.
+@group(0) @binding(35) var<storage, read_write> ambient_enthalpy: array<f32>;
+
 const AUX_NODE_CARRIER: u32 = 0u;
 const AUX_NODE_CAPILLARY: u32 = 1u;
 const AUX_NODE_BLOOM_VOLUME: u32 = 2u;
