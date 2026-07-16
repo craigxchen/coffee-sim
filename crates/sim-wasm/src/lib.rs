@@ -794,7 +794,7 @@ impl WasmSim3D {
         let sim = Simulator::new(
             renderer.device(),
             renderer.queue(),
-            SolverId::Mpm,
+            SolverId::MpmV2,
             initial_scene,
         )
         .map_err(|err| JsValue::from_str(&err))?;
@@ -1011,14 +1011,42 @@ impl WasmSim3D {
     /// Browser performance probes use this batch fence so their timings include WebGPU execution
     /// instead of measuring only JavaScript/Rust command encoding and queue submission.
     #[wasm_bindgen(js_name = waitForGpu)]
-    pub async fn wait_for_gpu(&self) -> Result<(), JsValue> {
-        let queue_done = js_sys::Promise::new(&mut |resolve, _reject| {
-            self.renderer.queue().on_submitted_work_done(move || {
-                let _ = resolve.call0(&JsValue::NULL);
-            });
-        });
-        wasm_bindgen_futures::JsFuture::from(queue_done).await?;
-        Ok(())
+    pub fn wait_for_gpu(&self) -> js_sys::Promise {
+        // A mapped sentinel is a portable completion fence: its clear is queued after all prior
+        // work, and map_async cannot complete until that submission retires. Chrome's
+        // onSubmittedWorkDone callback can fail to settle while a paused WASM harness owns other
+        // pending maps; this path uses the same explicitly-polled mechanism as diagnostics.
+        let fence = std::sync::Arc::new(self.renderer.device().create_buffer(
+            &wgpu::BufferDescriptor {
+                label: Some("webgpu-completion-fence"),
+                size: 4,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            },
+        ));
+        let mut encoder =
+            self.renderer
+                .device()
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("webgpu-completion-fence"),
+                });
+        encoder.clear_buffer(&fence, 0, None);
+        self.renderer.queue().submit(Some(encoder.finish()));
+        js_sys::Promise::new(&mut |resolve, reject| {
+            let mapped_fence = fence.clone();
+            fence
+                .slice(..)
+                .map_async(wgpu::MapMode::Read, move |result| match result {
+                    Ok(()) => {
+                        mapped_fence.unmap();
+                        let _ = resolve.call0(&JsValue::NULL);
+                    }
+                    Err(error) => {
+                        let _ =
+                            reject.call1(&JsValue::NULL, &JsValue::from_str(&error.to_string()));
+                    }
+                });
+        })
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {

@@ -28,7 +28,7 @@ const MPM_V2_INFO: SolverInfo = SolverInfo {
     paradigm: Paradigm::Hybrid,
     owns_grid: true,
     stability: Stability::CflLimited { c: 0.5 },
-    experimental: true,
+    experimental: false,
 };
 
 pub(crate) fn info_for(id: SolverId) -> SolverInfo {
@@ -134,7 +134,7 @@ mod tests {
 
         assert_eq!(SolverId::MpmV2.id(), "mpm-v2");
         assert_eq!(info_for(SolverId::MpmV2).name, "MPM v2");
-        assert!(info_for(SolverId::MpmV2).experimental);
+        assert!(!info_for(SolverId::MpmV2).experimental);
     }
 
     #[test]

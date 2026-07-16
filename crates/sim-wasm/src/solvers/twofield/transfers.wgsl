@@ -119,6 +119,10 @@ fn p2g_water(@builtin(global_invocation_id) gid: vec3<u32>) {
     base = clamp(base, vec3<i32>(0), vec3<i32>(params.grid_dims.xyz) - vec3<i32>(3));
     let fx = xl - vec3<f32>(base);
     var w = bspline_w(fx);
+    // Retention uses the node ledger scattered immediately before this pass. Reusing this
+    // particle's basis eliminates a redundant full-particle gather without changing the exact
+    // nodewise donor share. The helper is inert when no supply/demand ledger is active.
+    apply_water_retention(p, base, w);
     // U9 effective water mass: a partially-absorbed particle (remaining fraction f_w = pos.w)
     // scatters proportionally less mass/volume (models::wetting::water_eff_mass), so the bed
     // pore volume falls exactly as water is absorbed — the projection sees the real remaining

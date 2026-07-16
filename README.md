@@ -8,7 +8,7 @@ WebAssembly, and WebGPU.
 ## Features
 
 - 3D V60-style pour-over scene
-- selectable legacy MPM, MPM v2 two-field, and XPBD solvers
+- MPM v2 two-field solver by default, with legacy MPM and XPBD still selectable
 - WebGPU MPM v2 water/coffee mechanics with wetting, retention, paper transport, heat, and extraction
 - interactive pour controls
 - solver-generated calibration sliders for MPM v2
@@ -61,8 +61,8 @@ Open <http://localhost:8080>.
 - Move the spout in X/Z with the plane control and adjust spout height with the
   height slider.
 - Show Debug Stats to inspect simulation diagnostics.
-- Select MPM v2 to expose its physical calibration panel; changes are validated in Rust and rebuild
-  the solver when required.
+- Use the default MPM v2 calibration panel to tune physical controls; changes are validated in Rust
+  and rebuild the solver when required.
 
 ## Project Layout
 

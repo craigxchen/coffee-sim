@@ -949,6 +949,30 @@ mod tests {
     }
 
     #[test]
+    fn calibration_drainage_scatter_has_local_retention_contact() {
+        let Some((device, queue)) = crate::solvers::twofield::seed_tests::create_test_device()
+        else {
+            eprintln!("no GPU adapter available; skipping drainage contact test");
+            return;
+        };
+        let spec = SceneSpec::Debug {
+            id: MPM_V2_CALIBRATION_DRAINAGE_SCENE_ID.to_string(),
+        };
+        let mut runtime = MpmV2FrameSolver::new(&device, &queue, &spec).unwrap();
+        RewriteSolver::step(&mut runtime.core, 1.0 / 60.0, &EmissionInput::default());
+        let (supply, demand) = runtime.core.read_grid_moisture_totals();
+        let positions = runtime.core.read_positions();
+        let solid_start = positions.len() - runtime.core.phase_counts().1 as usize;
+        let retained: f64 = positions[solid_start..]
+            .iter()
+            .map(|position| f64::from(position[3]))
+            .sum();
+        eprintln!("drainage moisture supply={supply} demand={demand} retained={retained}");
+        assert!(supply > 0.0 && demand > 0.0);
+        assert!(retained > 0.0);
+    }
+
+    #[test]
     fn physical_permeability_maps_monotonically_to_numerical_drag() {
         let (_, materials, _) =
             setup_for_scene_spec(&SceneSpec::CenterPour, &CalibrationProfile::default()).unwrap();

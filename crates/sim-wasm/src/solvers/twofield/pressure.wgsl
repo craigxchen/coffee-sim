@@ -127,12 +127,13 @@
 // The knob grid pins Tait ∈ {off}; if a later unit shows an iteration-budget win it ships
 // behind an opt-in Config gate, else it is removed (plan: "Deferred to Implementation").
 //
-// Sparsity: setup/node/coarse passes retain dense over-dispatch + early-out. On the guarded
-// semi-implicit, explicitly vented production path, only repeated WATER fine-pressure relaxation
-// uses the particle-derived indirect tile list in active_tiles.wgsl; solid compaction remains
-// dense, and the dense water entry points remain the exact fallback/equivalence oracle. Tint
-// discipline: no workgroupBarrier anywhere in this family, so the guard returns are uniform-
-// control-flow safe. Storage buffers per entry point ≤ 8 (see mod.rs derivation).
+// Sparsity: node/coarse passes retain dense over-dispatch + early-out. On the guarded
+// semi-implicit, explicitly vented production path, water cell classification and repeated fine
+// relaxation use the particle-derived indirect tile list in active_tiles.wgsl; setup first clears
+// cell_meta so unvisited cells are exactly inactive. Solid compaction remains dense, and the dense
+// water entry points remain the exact fallback/equivalence oracle. Tint discipline: no
+// workgroupBarrier anywhere in this family, so the guard returns are uniform-control-flow safe.
+// Storage buffers per entry point ≤ 10 (see mod.rs derivation).
 
 // --- pressure-family bindings (indices continue the global table in common.wgsl) -------------
 // Per-node M̃⁻¹, 2 vec4 per node: [2n] = (xx, xy, xz, yy), [2n+1] = (yz, zz, massy_flag, 0).
@@ -564,12 +565,7 @@ fn node_setup(@builtin(global_invocation_id) gid: vec3<u32>) {
 // when enabled). The density census divides each corner mass by its φ_f so a saturated pore
 // cell measures RELATIVE density ≈ 1 (header: MIXTURE FAMILY) — both ×/÷ by exactly 1.0 in
 // free water.
-@compute @workgroup_size(256)
-fn cell_classify(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let c = gid.x;
-    if (c >= num_fine_cells()) {
-        return;
-    }
+fn classify_cell(c: u32) {
     pf_src[c] = 0.0;
     pf_dst[c] = 0.0;
     let h = params.grid_origin.w;
@@ -698,6 +694,27 @@ fn cell_classify(@builtin(global_invocation_id) gid: vec3<u32>) {
         s_target = params.dbg.x * max(e_over, 0.0) / (DENSITY_RELAX_FRAMES * params.dt);
     }
     cell_meta[c] = vec4<f32>(select(0.0, f * (s_target - div) / params.dt, f > 0.0), f, rho, cat);
+}
+
+@compute @workgroup_size(256)
+fn cell_classify(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (gid.x >= num_fine_cells()) { return; }
+    classify_cell(gid.x);
+}
+
+// Production pressure is already scheduled over the compact occupied-tile list. Classification
+// uses the same one-tile halo, so every cell that can enter a fine/coarse operator or an active
+// cell's air-neighbor test is initialized while the empty remainder stays at its host-cleared 0.
+@compute @workgroup_size(256)
+fn cell_classify_tiled(
+    @builtin(workgroup_id) workgroup: vec3<u32>,
+    @builtin(local_invocation_index) lane: u32,
+) {
+    let tile_id = active_tile_list_value(workgroup.x);
+    let cell0 = active_tile_cell(tile_id, lane);
+    let cell1 = active_tile_cell(tile_id, lane + 256u);
+    if (cell_in_range(cell0)) { classify_cell(cell_index(cell0)); }
+    if (cell_in_range(cell1)) { classify_cell(cell_index(cell1)); }
 }
 
 // =================================== coarse setup ==============================================

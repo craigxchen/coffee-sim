@@ -131,8 +131,9 @@ pub struct Config {
     // --- twofield U9 infiltration interface (opt-in; all default 0 / OFF so existing scenes
     // and the U2–U6 twofield suites are byte-unchanged) ---
     /// Twofield moisture phase-change absorption gate + rate `k_abs` (1/s, reduced sim units).
-    /// Zero skips the grid-projected absorption passes entirely (no φ_s/swelling change); a
-    /// positive value enables GIC-style absorption into grain moisture via `models::wetting`.
+    /// Zero disables particle absorption and swelling, while a configured capillary-retention
+    /// reservoir may still use the same conservative transfer passes. A positive value enables
+    /// GIC-style absorption into grain moisture via `models::wetting`.
     /// Time is physical seconds on the production MPM-v2 path. Ignoring finite supply and the
     /// independently controlled bloom ramp, a first-order rate around 0.03–0.05 s⁻¹ reaches
     /// roughly 60–80% of its asymptote after 30 s. This is a calibration prior, not a test target.

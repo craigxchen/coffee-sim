@@ -6,10 +6,9 @@
 // each pipeline's auto layout (`layout: None`) keeps only the bindings its entry point
 // actually uses, but an index never means two different buffers.
 //
-// Storage-buffer budget (KTD-7): the widest entry point binds 9 storage buffers
-// (MAX_STORAGE_BUFFERS_PER_ENTRY_POINT in mod.rs — cell_classify / pocket_mark; active tiled
-// relaxation adds one scheduler binding but remains below them; see the per-pass derivation
-// there); shared required limits request 10 per stage
+// Storage-buffer budget (KTD-7): the widest entry points bind 10 storage buffers
+// (MAX_STORAGE_BUFFERS_PER_ENTRY_POINT in mod.rs — filter release and compact diagnostics; see
+// the per-pass derivation there); shared required limits request 10 per stage
 // (`solvers/mpm/mod.rs::required_limits`), both within the 16 target cap. U1 adds NO binding (the flip knob is a Params lane, and
 // g2p_water reads only the already-bound vel/grid_vel). Grid mass+momentum share ONE
 // array<atomic<i32>> with stride 4 (mass, mom.xyz) rather than four arrays — one binding, one
@@ -49,7 +48,7 @@ struct Params {
     splas2: vec4<f32>, // (floor/wall Coulomb μ_b, guard K_sp, guard onset φ_on, U7 wet c_max)
     // U9 infiltration interface (coupling.wgsl; rates and delays use physical seconds):
     wet0: vec4<f32>, // (tf_absorb_rate k_abs, V_cap from dry recipe mass, V_w = water vol,
-                     //  absorb_roundoff — the f_w/V_bound saturation floor)
+                     //  absorb_roundoff — the free/absorbed-carrier saturation floor)
     wet1: vec4<f32>, // (suction body-force accel a_suction, bloom_delay seconds, filter_floor
                      //  flag, maximum fractional DIAMETER swelling at saturation)
     dbg: vec4<f32>,  // diagnostic toggles (test-only): .x = density-relief enable (1 = on);
@@ -91,7 +90,8 @@ struct Params {
 
 @group(0) @binding(0) var<uniform> params: Params;
 // Canonical particle state (ParticleBuffers layout): pos.w is the moisture lane (water =
-// remaining fraction, grain = bound-water volume). chem is phase-specific:
+// remaining fraction, grain = total retained carrier volume). Per-grain capillary capacity splits
+// that scalar into fast pore retention followed by absorbed water. chem is phase-specific:
 // water=(solute/carrier mass ratio, temperature K, filter state 0/1/2, pore-transit progress),
 // grain=(fast-pool mass, slow-pool mass, temperature K, wet-contact time).
 @group(0) @binding(1) var<storage, read_write> pos: array<vec4<f32>>;

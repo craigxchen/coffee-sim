@@ -104,6 +104,7 @@ fn diagnostics_particles(@builtin(local_invocation_index) lane: u32) {
     var paper_capacity = 0.0;
     var paper_enthalpy = 0.0;
     var bound_carrier = 0.0;
+    var capillary_carrier = 0.0;
     var remaining_solute = 0.0;
     var grain_capacity = 0.0;
     var grain_enthalpy = 0.0;
@@ -200,12 +201,17 @@ fn diagnostics_particles(@builtin(local_invocation_index) lane: u32) {
             bad_particles += 1u;
         } else {
             ambient_total += ambient;
-            let bound = max(position.w, 0.0) * params.particle_mass / max(params.wet0.z, 1.0e-9);
+            let capillary_volume = min(max(position.w, 0.0), max(params.solute.w, 0.0));
+            let absorbed_volume = max(position.w - capillary_volume, 0.0);
+            let bound = absorbed_volume * params.particle_mass / max(params.wet0.z, 1.0e-9);
+            let capillary = capillary_volume * params.particle_mass / max(params.wet0.z, 1.0e-9);
+            let retained = bound + capillary;
             let remaining = max(state.x, 0.0) + max(state.y, 0.0);
             let capacity = params.solute.x * max(params.therm.y, 0.0)
                 + remaining * max(params.solute.y, 0.0)
-                + bound * max(params.therm.x, 0.0);
+                + retained * max(params.therm.x, 0.0);
             bound_carrier += bound;
+            capillary_carrier += capillary;
             remaining_solute += remaining;
             grain_capacity += capacity;
             grain_enthalpy += capacity * state.z;
@@ -226,6 +232,7 @@ fn diagnostics_particles(@builtin(local_invocation_index) lane: u32) {
         diagnostics_sum_f32(cup_carrier, lane), diagnostics_sum_f32(cup_solute, lane),
         diagnostics_sum_f32(pond_carrier, lane), 0.0);
     let ambient = diagnostics_sum_f32(ambient_total, lane);
+    let capillary = diagnostics_sum_f32(capillary_carrier, lane);
     let counts = vec4<u32>(
         diagnostics_sum_u32(pond_count, lane), diagnostics_sum_u32(held_count, lane),
         diagnostics_sum_u32(held_volume_counts, lane), diagnostics_sum_u32(bad_particles, lane));
@@ -246,7 +253,7 @@ fn diagnostics_particles(@builtin(local_invocation_index) lane: u32) {
         diagnostics_output.filter0 = vec4<u32>(0u);
         diagnostics_output.filter1 = vec4<u32>(0u);
         diagnostics_output.snapshot_meta = vec4<u32>(DIAGNOSTICS_PARTICLE_CANARY, 0u, 0u, 0u);
-        diagnostics_output.reserved = vec4<f32>(0.0);
+        diagnostics_output.reserved = vec4<f32>(capillary, 0.0, 0.0, 0.0);
     }
 }
 

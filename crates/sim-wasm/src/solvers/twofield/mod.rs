@@ -75,7 +75,10 @@ use crate::utils::config::Config;
 use crate::utils::gpu::GpuContext;
 
 const WG: u32 = 256;
+#[cfg(not(target_arch = "wasm32"))]
 const DIAGNOSTICS_PERIOD_S: f32 = 0.25;
+#[cfg(target_arch = "wasm32")]
+const DIAGNOSTICS_PERIOD_S: f32 = 0.0;
 const DIAGNOSTICS_READBACK_SLOTS: usize = 2;
 
 /// Y-coordinate at which un-emitted (dormant) water-pool slots are parked: far below any scene so
@@ -94,6 +97,7 @@ const ACTIVE_WATER_INDIRECT_OFFSET: u64 = 0;
 // they cannot alias a legal direct dispatch size; the actual counts stay in the GPU args buffer.
 const ACTIVE_WATER_INDIRECT: u32 = u32::MAX;
 const ACTIVE_TILE_MARKER: u32 = u32::MAX - 1;
+const SOLID_GRID_BUFFER_CLEAR: u32 = u32::MAX - 2;
 
 fn groups(n: u32) -> u32 {
     n.div_ceil(WG)
@@ -120,12 +124,14 @@ fn active_tiling_enabled(implicit_solid: bool, all_gas_atmospheric: bool) -> boo
 /// U2+U3+U4+U6+U5 GPU-budget bookkeeping (R8): the widest entry point's storage-buffer count,
 /// derived by inspection of the bind groups in `build` (the params uniform doesn't count
 /// against the storage limit). Per pass: `grid_clear` 7 (grid_fp, cell_cnt, grid_sfp,
-/// grid_sm, grid_moist, grid_chem, grid_sraw), `p2g_water` 6 (pos, vel, chem, cmat, grid_fp, cell_cnt),
-/// `p2g_solid` 4 (pos, chem, grid_sfp, cell_cnt), `grid_update` 2 (grid_fp, grid_vel), `drag_fold` 7
+/// grid_sm, grid_moist, grid_chem, grid_sraw), `p2g_water` 7 (pos, vel, chem, cmat, grid_fp,
+/// cell_cnt, grid_moist), `p2g_solid` 6 (pos, vel, chem, grid_sfp, cell_cnt, grid_moist),
+/// `grid_update` 2 (grid_fp, grid_vel), `drag_fold` 7
 /// (grid_vel, solids, cell_cnt, grid_sfp, react, grid_sraw, grid_svel), `g2p_water` 8 (pos, vel, chem,
 /// cmat, grid_vel, solids, cell_cnt, filter_state); U3 pressure family —
 /// `node_setup` 7 (grid_vel, solids, nm, cell_cnt, grid_sfp, react, grid_svel),
-/// `cell_classify` 9 (grid_vel, solids, cell_meta, pf_a, pf_b, cell_cnt, grid_sfp, nm, grid_svel),
+/// `cell_classify` 9 (grid_vel, solids, cell_meta, pf_a, pf_b, cell_cnt, grid_sfp, nm, grid_svel)
+/// and 10 for its production tiled variant (+active_tiles),
 /// `coarse_node_setup` 2, `coarse_cell_setup` 5 (cell_meta, cmeta, pc_a, pc_b, pocket_c — U8
 /// compacted coarse-pocket append),
 /// `jacobi_fine`/`jacobi_coarse` 5 (+bubble), `prolong_add` 6 (cell_meta, cmeta, pc, pf×2,
@@ -138,10 +144,11 @@ fn active_tiling_enabled(implicit_solid: bool, all_gas_atmospheric: bool) -> boo
 /// pf×2, bubble, nm, pocket_f, grid_svel — U8 compacted-list append), `bubble_fine` 5 (nm, cell_meta, pf,
 /// bubble, pocket_f), `bubble_coarse` 6 (nm_c, cmeta, pc, bubble, pocket_f, pocket_c — pocket_f
 /// for the shared sub-resolution release size gate); U5 plasticity family —
-/// `p2g_solid_reference` 5 (pos, vel, chem, cmat, grid_sraw), `p2g_solid_dyn` 8 (pos, vel, chem, cmat, grid_sfp, grid_sm, sstate, cell_cnt), `solid_update` 4
+/// `p2g_solid_reference` 6 (pos, vel, chem, cmat, grid_moist, grid_sraw), `p2g_solid_dyn` 8 (pos, vel, chem, cmat, grid_sfp, grid_sm, sstate, cell_cnt), `solid_update` 4
 /// (grid_sm, grid_svel, grid_sfp, solids), `g2p_solid` 8 (pos, vel, chem, cmat, solids,
-/// grid_svel, fmat, sstate) — ties cell_classify; U9 absorption family — `p2g_moisture` 4
-/// (pos, vel, chem, grid_moist), `g2p_absorb` 4 (pos, vel, chem, grid_moist); chemistry/thermal
+/// grid_svel, fmat, sstate) — ties cell_classify; U9 retention family — `p2g_moisture` 4
+/// (pos, vel, chem, grid_moist), with its gather fused into the phase P2Gs; the test-only
+/// `g2p_absorb` harness binds the same 4; chemistry/thermal
 /// scatter binds 6 and gather binds 8 around the 11-lane chemistry ledger plus the external
 /// ambient-enthalpy ledger; `filter_release` binds
 /// 10 to reconstruct pressure-projected mobile superficial flux and its measured carrier closure; the semi-implicit
@@ -284,16 +291,19 @@ pub fn u4_surface_dispatches_for(dims: [u32; 3]) -> u32 {
 /// (`drag_fold`, which also absorbed grid_update's force/BC work — net one new pass).
 pub const U6_COUPLING_DISPATCHES: u32 = 2;
 
-/// U9 dispatch increment, applied ONLY when `Config::tf_absorb_rate > 0` (opt-in; default-knob
+/// U9 dispatch increment, applied only when particle absorption or capillary retention is active (default-knob
 /// frozen-water scenes keep the U6 budget bitwise, so `DISPATCHES_PER_FRAME` and every U2–U6
-/// suite's pinned budget are untouched): `p2g_moisture` + `g2p_absorb`. Suction and the filter
+/// suite's pinned budget are untouched): demand-first `p2g_moisture_demand` +
+/// `p2g_moisture_supply`; the conservative gather is fused into the existing water and solid
+/// P2Gs, reusing their interpolation basis. Suction and the filter
 /// floor add ZERO passes — suction folds into `drag_fold`'s existing force step, the filter
 /// floor is a branch in `drag_fold`/`node_setup`/`g2p_water`'s existing BC code.
 pub const U9_INFILTRATION_DISPATCHES: u32 = 2;
 
-/// Conservative chemistry/thermal scatter + gather, conditionally dispatched when either the
-/// extraction or independent thermal Config gate is enabled.
-pub const CONSTITUTIVE_DISPATCHES: u32 = 2;
+/// Conservative chemistry/thermal grain scatter + locality-culled water scatter + gather,
+/// conditionally dispatched when either the extraction or independent thermal Config gate is
+/// enabled.
+pub const CONSTITUTIVE_DISPATCHES: u32 = 3;
 /// Finite paper storage adds one release pass; whole-parcel admission is fused into g2p_water.
 pub const FILTER_RESERVOIR_DISPATCHES: u32 = 1;
 
@@ -1064,7 +1074,7 @@ pub struct TwofieldSolver {
 
     params_buf: wgpu::Buffer,
     // Canonical particle state, exposed through `ParticleBuffers`: pos.w carries the moisture
-    // lane (water = remaining fraction, grain = bound-water volume). `chem` is phase-specific:
+    // lane (water = remaining fraction, grain = absorbed + retained-pore carrier volume). `chem` is phase-specific:
     // water=(solute/carrier mass ratio, T_K, filter state 0/1/2, pore-transit progress),
     // grain=(fast-pool mass, slow-pool mass, T_K, wet-contact time).
     pos: Arc<wgpu::Buffer>,
@@ -1085,16 +1095,21 @@ pub struct TwofieldSolver {
     // Solid-volume field plus interphase drag state (per-node impulse.xyz, sigma) —
     // coupling.wgsl bindings 19/20.
     grid_sfp: wgpu::Buffer,
+    // Solid mass/momentum field, retained so shear microsteps can use WebGPU's native buffer
+    // clear instead of launching a dense six-atomic clear shader.
+    grid_sm: wgpu::Buffer,
     // Semi-implicit solid plastic-compaction moment, one fixed-point lane per node.
     grid_scomp: wgpu::Buffer,
     // Projected dry/composite solid grid velocity, retained so reset and explicit diagnostics
     // can observe a defined t=0 state without submitting a physics frame.
     grid_svel: wgpu::Buffer,
+    // Conservative carrier supply/retention-demand ledger (binding 25).
+    grid_moist: wgpu::Buffer,
     // Persistent paper reservoir (binding 30), intentionally not part of per-frame grid clear.
     filter_state: wgpu::Buffer,
     // Phase-1 sparse water-pressure scheduler (binding 33) and its separate INDIRECT-only
     // argument record. Enabled only for the semi-implicit + explicitly vented production path;
-    // every solid, setup, clear, node, and coarse pass remains dense.
+    // it drives water classification and relaxation while node/coarse and solid passes stay dense.
     active_tiles: wgpu::Buffer,
     active_tile_indirect: wgpu::Buffer,
     active_tile_count: u32,
@@ -1126,9 +1141,9 @@ pub struct TwofieldSolver {
     requested_numerical_shear_modulus: f32,
     applied_numerical_shear_modulus: f32,
     shear_substeps: u32,
-    /// `Config::tf_absorb_rate > 0`: dispatch the U9 moisture phase-change absorption passes
-    /// (`p2g_moisture` + `g2p_absorb`). Off (default) ⇒ the passes are CPU-elided, so the
-    /// U2–U6 suites and existing scenes are byte-unchanged.
+    /// Dispatch the U9 conservative carrier-transfer passes when particle absorption is enabled,
+    /// or when the recipe allocates capillary storage and suction is nonzero. Otherwise the
+    /// passes are CPU-elided, so the U2–U6 suites and existing scenes are byte-unchanged.
     absorb_on: bool,
     /// Extraction and heat activation are independent. They share one conservative grid
     /// scatter/gather pair, dispatched when either constitutive subsystem has nonzero rates.
@@ -1236,11 +1251,15 @@ struct Pipelines {
     // forces + BCs — see coupling.wgsl).
     p2g_solid: (wgpu::ComputePipeline, wgpu::BindGroup),
     drag_fold: (wgpu::ComputePipeline, wgpu::BindGroup),
-    // U9 moisture phase-change absorption (dispatched only when Config::tf_absorb_rate > 0).
+    // U9 conservative particle-absorption/capillary-retention transfer.
     p2g_moisture: (wgpu::ComputePipeline, wgpu::BindGroup),
+    p2g_moisture_demand: (wgpu::ComputePipeline, wgpu::BindGroup),
+    p2g_moisture_supply: (wgpu::ComputePipeline, wgpu::BindGroup),
     g2p_absorb: (wgpu::ComputePipeline, wgpu::BindGroup),
     // Conservative extraction + thermal transport (dispatched when either independent gate is on).
     chemistry_scatter: (wgpu::ComputePipeline, wgpu::BindGroup),
+    chemistry_scatter_grain: (wgpu::ComputePipeline, wgpu::BindGroup),
+    chemistry_scatter_water: (wgpu::ComputePipeline, wgpu::BindGroup),
     chemistry_gather: (wgpu::ComputePipeline, wgpu::BindGroup),
     filter_release: (wgpu::ComputePipeline, wgpu::BindGroup),
     diagnostics_particles: (wgpu::ComputePipeline, wgpu::BindGroup),
@@ -1273,6 +1292,7 @@ struct Pipelines {
     // prolong/project carry parity variants selecting the final-parity buffer.
     node_setup: (wgpu::ComputePipeline, wgpu::BindGroup),
     cell_classify: (wgpu::ComputePipeline, wgpu::BindGroup),
+    cell_classify_tiled: (wgpu::ComputePipeline, wgpu::BindGroup),
     residual: (wgpu::ComputePipeline, [wgpu::BindGroup; 2]),
     residual_tiled: (wgpu::ComputePipeline, [wgpu::BindGroup; 2]),
     coarse_node_setup: (wgpu::ComputePipeline, wgpu::BindGroup),
@@ -1301,8 +1321,8 @@ struct Pipelines {
 /// (`[0, water_count)`), then all solids. Lattice + seeded jitter per species spacing, with
 /// cone-aware SDF rejection (mirrors xpbd's `seed_block`; RNG draws happen per lattice point
 /// regardless of rejection, so the layout is deterministic for a given `cfg.seed`). The 4th
-/// position lane carries moisture: water = remaining fraction (1 = full), grain = bound-water
-/// volume (0 = dry). Wet-contact time starts at zero in `chem.w`, independent of these seeds.
+/// position lane carries moisture: water = remaining fraction (1 = full), grain = total retained
+/// carrier volume (0 = dry). Wet-contact time starts at zero in `chem.w`, independent of seeds.
 /// Returns `(positions, phases, water_count, solid_quadrature_weight)`.
 pub(crate) fn seed_ranges(
     scene: &Scene,
@@ -1680,6 +1700,25 @@ impl TwofieldSolver {
         (
             capacity_counts as f32 / FP_SCALE as f32,
             bloom_counts as f32 / FP_SCALE as f32,
+        )
+    }
+
+    /// Sum the phase-change ledger's scattered carrier supply and retention demand
+    /// (dev/test only — stalls). These are diagnostic totals, not calibration targets.
+    pub fn read_grid_moisture_totals(&self) -> (f64, f64) {
+        const MOIST_STRIDE: usize = 6;
+        const MOIST_SD_SCALE: f64 = 1_073_741_824.0;
+        let bytes = u64::from(self.num_nodes) * (MOIST_STRIDE as u64) * 4;
+        let raw: Vec<i32> =
+            bytemuck::cast_slice(&self.read_bytes(&self.grid_moist, bytes)).to_vec();
+        let (mut supply, mut demand) = (0i64, 0i64);
+        for node in raw.chunks_exact(MOIST_STRIDE) {
+            supply += i64::from(node[0]);
+            demand += i64::from(node[1]);
+        }
+        (
+            supply as f64 / MOIST_SD_SCALE,
+            demand as f64 / MOIST_SD_SCALE,
         )
     }
 
@@ -2275,11 +2314,13 @@ impl TwofieldSolver {
         let paper_carrier = snapshot.paper[0].max(0.0);
         let paper_solute = snapshot.paper[1].max(0.0);
         let bound_carrier = snapshot.grain[0].max(0.0);
+        let capillary_carrier = snapshot.reserved[0].max(0.0);
         let remaining_solute = snapshot.grain[1].max(0.0);
         let mobile_solution = mobile_carrier + mobile_solute;
         let paper_solution = paper_carrier + paper_solute;
-        let grain_mass = self.insoluble_grain_mass + remaining_solute + bound_carrier;
-        let total_carrier = mobile_carrier + paper_carrier + bound_carrier;
+        let grain_mass =
+            self.insoluble_grain_mass + remaining_solute + bound_carrier + capillary_carrier;
+        let total_carrier = mobile_carrier + paper_carrier + bound_carrier + capillary_carrier;
         let dissolved_solute = mobile_solute + paper_solute;
         let total_solute = dissolved_solute + remaining_solute;
         let observed_mechanical_mass = mobile_solution + paper_solution + grain_mass;
@@ -2323,7 +2364,7 @@ impl TwofieldSolver {
             0.0
         };
         diag.max_occupancy = snapshot.grid[0].max(0.0);
-        diag.bed_pore_carrier_mass = snapshot.grid[1].max(0.0);
+        diag.bed_pore_carrier_mass = snapshot.grid[1].max(0.0) + capillary_carrier;
         let total_dry_mass = self.insoluble_grain_mass + self.initial_solute_mass;
         diag.extraction_yield = if total_dry_mass > 0.0 {
             dissolved_solute / total_dry_mass
@@ -2486,6 +2527,7 @@ impl TwofieldSolver {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn periodic_diagnostics_slot(&mut self, dt: f32) -> Option<usize> {
         self.diagnostics_elapsed_s += dt.max(0.0);
         if self.diagnostics_elapsed_s < DIAGNOSTICS_PERIOD_S {
@@ -2517,8 +2559,9 @@ impl TwofieldSolver {
         });
     }
 
-    /// Explicit full blocking validation snapshot (dev/test only). Production uses the compact
-    /// asynchronous ring above; getters never call this synchronization point.
+    /// Explicit full blocking validation snapshot (dev/test only). Native production uses the
+    /// compact asynchronous ring above; WASM uses JavaScript-driven ticketed snapshots. Getters
+    /// never call this synchronization point.
     pub fn sample_diagnostics(&mut self) {
         if let Some(ts) = &self.ts {
             if ts.count >= 2 {
@@ -2615,12 +2658,17 @@ impl TwofieldSolver {
                 snapshot.counts[3] += 1;
                 continue;
             }
-            let bound_mass = water_mass_per_volume * p[3].max(0.0);
+            let capillary_volume = p[3].max(0.0).min(self.params.solute[3].max(0.0));
+            let absorbed_volume = (p[3] - capillary_volume).max(0.0);
+            let bound_mass = water_mass_per_volume * absorbed_volume;
+            let capillary_mass = water_mass_per_volume * capillary_volume;
+            let retained_mass = bound_mass + capillary_mass;
             let remaining_solute = c[0].max(0.0) + c[1].max(0.0);
             let capacity = self.params.solute[0] * cp_grain
                 + remaining_solute * cp_solute
-                + bound_mass * cp_water;
+                + retained_mass * cp_water;
             snapshot.grain[0] += bound_mass;
+            snapshot.reserved[0] += capillary_mass;
             snapshot.grain[1] += remaining_solute;
             snapshot.grain[2] += capacity;
             snapshot.grain[3] += capacity * c[2];
@@ -2661,7 +2709,12 @@ impl TwofieldSolver {
     }
 
     pub fn diagnostics_pending(&self) -> bool {
-        self.diagnostics_explicit
+        self.diagnostics_readbacks.iter().any(|slot| {
+            slot.pending
+                .as_ref()
+                .is_some_and(|pending| pending.epoch == self.diagnostics_epoch)
+        }) || self
+            .diagnostics_explicit
             .pending
             .as_ref()
             .is_some_and(|pending| pending.epoch == self.diagnostics_epoch)
@@ -3419,7 +3472,7 @@ impl Solver for TwofieldSolver {
             &device,
             "twofield-grid-moist",
             (num_nodes.max(1) as u64) * 24,
-            wgpu::BufferUsages::empty(),
+            wgpu::BufferUsages::COPY_SRC,
         );
         // Conservative chemistry ledger: mass/headroom, phase capacity/enthalpy, and proposed
         // solute momentum/enthalpy (11 fixed-point lanes), cleared with the grids each substep.
@@ -3633,6 +3686,7 @@ impl Solver for TwofieldSolver {
                     (5, &cmat),
                     (6, &grid_fp),
                     (18, &cell_cnt),
+                    (25, &grid_moist),
                 ],
             );
             // U6 coupling family (coupling.wgsl).
@@ -3642,9 +3696,11 @@ impl Solver for TwofieldSolver {
                 &[
                     (0, &params_buf),
                     (1, &pos),
+                    (2, &vel),
                     (4, &chem),
                     (18, &cell_cnt),
                     (19, &grid_sfp),
+                    (25, &grid_moist),
                 ],
             );
             // U5 plasticity family (plasticity.wgsl).
@@ -3657,6 +3713,7 @@ impl Solver for TwofieldSolver {
                     (2, &vel),
                     (4, &chem),
                     (5, &cmat),
+                    (25, &grid_moist),
                     (34, &grid_sraw),
                 ],
             );
@@ -3867,12 +3924,34 @@ impl Solver for TwofieldSolver {
                     (34, &grid_sraw),
                 ],
             );
-            // U9 absorption family (coupling.wgsl). p2g_moisture scatters S/D plus donor
-            // volume-momentum Q; g2p_absorb conservatively transfers volume, mass, and momentum,
-            // updates pos.w (water f_w / grain V_bound), and ticks the bloom clock in chem.w.
+            // U9 conservative retention family (coupling.wgsl). p2g_moisture scatters S/D plus
+            // donor volume-momentum Q. Production gathers in the existing phase P2Gs; the
+            // standalone g2p_absorb remains wired for focused conservation tests.
             let p2g_moisture = make("p2g_moisture");
             let p2g_moisture_bind = bg(
                 &p2g_moisture,
+                &[
+                    (0, &params_buf),
+                    (1, &pos),
+                    (2, &vel),
+                    (4, &chem),
+                    (25, &grid_moist),
+                ],
+            );
+            let p2g_moisture_demand = make("p2g_moisture_demand");
+            let p2g_moisture_demand_bind = bg(
+                &p2g_moisture_demand,
+                &[
+                    (0, &params_buf),
+                    (1, &pos),
+                    (2, &vel),
+                    (4, &chem),
+                    (25, &grid_moist),
+                ],
+            );
+            let p2g_moisture_supply = make("p2g_moisture_supply");
+            let p2g_moisture_supply_bind = bg(
+                &p2g_moisture_supply,
                 &[
                     (0, &params_buf),
                     (1, &pos),
@@ -3895,6 +3974,32 @@ impl Solver for TwofieldSolver {
             let chemistry_scatter = make("chemistry_scatter");
             let chemistry_scatter_bind = bg(
                 &chemistry_scatter,
+                &[
+                    (0, &params_buf),
+                    (1, &pos),
+                    (2, &vel),
+                    (4, &chem),
+                    (7, &grid_vel),
+                    (22, &grid_svel),
+                    (28, &grid_chem),
+                ],
+            );
+            let chemistry_scatter_grain = make("chemistry_scatter_grain");
+            let chemistry_scatter_grain_bind = bg(
+                &chemistry_scatter_grain,
+                &[
+                    (0, &params_buf),
+                    (1, &pos),
+                    (2, &vel),
+                    (4, &chem),
+                    (7, &grid_vel),
+                    (22, &grid_svel),
+                    (28, &grid_chem),
+                ],
+            );
+            let chemistry_scatter_water = make("chemistry_scatter_water");
+            let chemistry_scatter_water_bind = bg(
+                &chemistry_scatter_water,
                 &[
                     (0, &params_buf),
                     (1, &pos),
@@ -4034,6 +4139,23 @@ impl Solver for TwofieldSolver {
                     (18, &cell_cnt),
                     (19, &grid_sfp),
                     (22, &grid_svel),
+                ],
+            );
+            let cell_classify_tiled = make("cell_classify_tiled");
+            let cell_classify_tiled_bind = bg(
+                &cell_classify_tiled,
+                &[
+                    (0, &params_buf),
+                    (7, &grid_vel),
+                    (8, &solids_buf),
+                    (9, &nm),
+                    (10, &cell_meta),
+                    (11, &pf_a),
+                    (12, &pf_b),
+                    (18, &cell_cnt),
+                    (19, &grid_sfp),
+                    (22, &grid_svel),
+                    (33, &active_tiles),
                 ],
             );
             let coarse_node_setup = make("coarse_node_setup");
@@ -4345,8 +4467,12 @@ impl Solver for TwofieldSolver {
                 p2g_solid: (p2g_solid, p2g_solid_bind),
                 drag_fold: (drag_fold, drag_fold_bind),
                 p2g_moisture: (p2g_moisture, p2g_moisture_bind),
+                p2g_moisture_demand: (p2g_moisture_demand, p2g_moisture_demand_bind),
+                p2g_moisture_supply: (p2g_moisture_supply, p2g_moisture_supply_bind),
                 g2p_absorb: (g2p_absorb, g2p_absorb_bind),
                 chemistry_scatter: (chemistry_scatter, chemistry_scatter_bind),
+                chemistry_scatter_grain: (chemistry_scatter_grain, chemistry_scatter_grain_bind),
+                chemistry_scatter_water: (chemistry_scatter_water, chemistry_scatter_water_bind),
                 chemistry_gather: (chemistry_gather, chemistry_gather_bind),
                 filter_release: (filter_release, filter_release_bind),
                 diagnostics_particles: (diagnostics_particles, diagnostics_particles_bind),
@@ -4375,6 +4501,7 @@ impl Solver for TwofieldSolver {
                 g2p_water: (g2p, g2p_bind),
                 node_setup: (node_setup, node_setup_bind),
                 cell_classify: (cell_classify, cell_classify_bind),
+                cell_classify_tiled: (cell_classify_tiled, cell_classify_tiled_bind),
                 residual: (residual, residual_binds),
                 residual_tiled: (residual_tiled, residual_tiled_binds),
                 coarse_node_setup: (coarse_node_setup, coarse_node_setup_bind),
@@ -4478,8 +4605,10 @@ impl Solver for TwofieldSolver {
             cell_cnt,
             grid_vel,
             grid_sfp,
+            grid_sm,
             grid_scomp,
             grid_svel,
+            grid_moist,
             filter_state,
             active_tiles,
             active_tile_indirect,
@@ -4505,7 +4634,8 @@ impl Solver for TwofieldSolver {
             requested_numerical_shear_modulus: cfg.tf_numerical_shear_modulus.max(0.0),
             applied_numerical_shear_modulus: shear_budget.applied_modulus as f32,
             shear_substeps: shear_budget.substeps,
-            absorb_on: cfg.tf_absorb_rate > 0.0,
+            absorb_on: cfg.tf_absorb_rate > 0.0
+                || (retention_build.retained_capillary_volume > 0.0 && cfg.tf_suction_accel > 0.0),
             extraction_on: cfg.extract_rate > 0.0,
             thermal_on: cfg.thermal_rate > 0.0 && (mats.kappa > 0.0 || mats.h_amb > 0.0),
             filter_reservoir_on: filter_paper_present && filter1[0] > 0 && filter0[0] > 0.0,
@@ -4596,6 +4726,7 @@ impl Solver for TwofieldSolver {
             &self.cell_cnt,
             &self.grid_vel,
             &self.grid_sfp,
+            &self.grid_sm,
             &self.grid_scomp,
             &self.grid_svel,
             &self.react,
@@ -4657,7 +4788,14 @@ impl Solver for TwofieldSolver {
         // Pour emission first (grows water_count for this frame); no-op when not pouring.
         self.emit(input, dt);
         self.sim_time += dt;
+        // Browser-side diagnostics are explicitly ticketed by the UI/harness. Scheduling
+        // autonomous readbacks while JavaScript is encoding a long batch can leave several
+        // map operations queued ahead of its completion fence on WebGPU implementations.
+        // Native callers retain the low-rate automatic sampler used by the CLI and tests.
+        #[cfg(not(target_arch = "wasm32"))]
         let diagnostics_slot = self.periodic_diagnostics_slot(dt);
+        #[cfg(target_arch = "wasm32")]
+        let diagnostics_slot: Option<usize> = None;
         debug_assert!(self.water_count <= self.water_capacity);
         // The legacy U5 path repeats the whole frame at its explicit elastic CFL. The
         // semi-implicit path instead keeps one macro frame: only its deliberately soft
@@ -4727,8 +4865,6 @@ impl Solver for TwofieldSolver {
         let node_groups = groups(self.num_nodes).max(1);
         let water_groups = groups(self.water_count).max(1);
         let solid_groups = groups(self.solid_count).max(1);
-        // U9 absorption passes cover the full particle layout (water prefix + solid suffix);
-        // dormant pool slots early-out on the range guards.
         let part_groups = groups(self.params.particle_count).max(1);
         let cell_groups = groups(self.num_cells).max(1);
         let cd = self.params.coarse_dims;
@@ -4740,6 +4876,10 @@ impl Solver for TwofieldSolver {
             // will end that pass before copying this scheduler's count into the INDIRECT-only
             // argument record; the frame still uses one encoder and one submission.
             enc.clear_buffer(&self.active_tiles, 0, None);
+            // Tiled classification overwrites the occupied-tile halo. Zeroing the compact cell
+            // metadata first prevents a cell vacated since the preceding frame from surviving as
+            // a stale pressure row outside the new list.
+            enc.clear_buffer(&self.cell_meta, 0, None);
         }
 
         // Dry dynamic mode (U5_DRY_DISPATCHES): no live water → only the solid passes run.
@@ -4852,24 +4992,28 @@ impl Solver for TwofieldSolver {
             node_groups,
         )];
         // U9 moisture phase-change absorption (KTD-4c), only when on. Runs BEFORE the field
-        // P2Gs so they scatter updated free-water mass, bound-water grain mass, and the separate
-        // saturation-driven structural volume: p2g_moisture scatters node supply/demand and
-        // donor volume-momentum (S/D/Q) at the start-of-frame positions, g2p_absorb gathers the
-        // drain/fill fractions at the SAME positions (the transfer is a position-static phase
-        // change — water volume, mass, and momentum loss/gain match per node up to FP quantization).
+        // P2Gs so they scatter updated free-water mass, retained-carrier grain mass, and the
+        // separate saturation-driven structural volume: p2g_moisture freezes node supply/demand
+        // and donor volume-momentum (S/D/Q) at the start-of-frame positions. Demand is finalized
+        // first so water outside every grain support skips otherwise-unobservable atomic writes.
+        // The existing water
+        // and solid P2Gs gather their shares at those SAME positions while reusing base/weights
+        // (the phase change matches volume, mass, and momentum per node up to FP quantization).
         if self.absorb_on {
-            seq.push((
-                "p2g_moisture",
-                &self.pipelines.p2g_moisture.0,
-                &self.pipelines.p2g_moisture.1,
-                part_groups,
-            ));
-            seq.push((
-                "g2p_absorb",
-                &self.pipelines.g2p_absorb.0,
-                &self.pipelines.g2p_absorb.1,
-                part_groups,
-            ));
+            seq.extend([
+                (
+                    "p2g_moisture_demand",
+                    &self.pipelines.p2g_moisture_demand.0,
+                    &self.pipelines.p2g_moisture_demand.1,
+                    solid_groups,
+                ),
+                (
+                    "p2g_moisture_supply",
+                    &self.pipelines.p2g_moisture_supply.0,
+                    &self.pipelines.p2g_moisture_supply.1,
+                    water_groups,
+                ),
+            ]);
         }
         seq.push((
             "p2g_water",
@@ -4903,7 +5047,7 @@ impl Solver for TwofieldSolver {
                         "solid_grid_clear",
                         &self.pipelines.solid_grid_clear.0,
                         &self.pipelines.solid_grid_clear.1,
-                        node_groups,
+                        SOLID_GRID_BUFFER_CLEAR,
                     ),
                     (
                         "p2g_solid_shear",
@@ -5039,9 +5183,21 @@ impl Solver for TwofieldSolver {
             ),
             (
                 "cell_classify",
-                &self.pipelines.cell_classify.0,
-                &self.pipelines.cell_classify.1,
-                cell_groups,
+                if self.active_tiling {
+                    &self.pipelines.cell_classify_tiled.0
+                } else {
+                    &self.pipelines.cell_classify.0
+                },
+                if self.active_tiling {
+                    &self.pipelines.cell_classify_tiled.1
+                } else {
+                    &self.pipelines.cell_classify.1
+                },
+                if self.active_tiling {
+                    ACTIVE_WATER_INDIRECT
+                } else {
+                    cell_groups
+                },
             ),
         ]);
         // U4 gas handling. Generic scenes flood the OUTSIDE label through air, then promote the
@@ -5189,12 +5345,20 @@ impl Solver for TwofieldSolver {
         // pools/concentration and temperature before either phase advects. The two passes are
         // CPU-elided together only when both extraction and thermal transport are disabled.
         if self.extraction_on || self.thermal_on {
-            seq.push((
-                "chemistry_scatter",
-                &self.pipelines.chemistry_scatter.0,
-                &self.pipelines.chemistry_scatter.1,
-                part_groups,
-            ));
+            seq.extend([
+                (
+                    "chemistry_scatter_grain",
+                    &self.pipelines.chemistry_scatter_grain.0,
+                    &self.pipelines.chemistry_scatter_grain.1,
+                    solid_groups,
+                ),
+                (
+                    "chemistry_scatter_water",
+                    &self.pipelines.chemistry_scatter_water.0,
+                    &self.pipelines.chemistry_scatter_water.1,
+                    water_groups,
+                ),
+            ]);
             seq.push((
                 "chemistry_gather",
                 &self.pipelines.chemistry_gather.0,
@@ -5252,6 +5416,15 @@ impl Solver for TwofieldSolver {
                         ACTIVE_WATER_INDIRECT_OFFSET,
                         4,
                     );
+                    continue;
+                }
+                if g == SOLID_GRID_BUFFER_CLEAR {
+                    // Ordered WebGPU zero fills for the exact three arrays owned by the former
+                    // compute clear. This preserves every value seen by the next solid P2G.
+                    rec.flush();
+                    enc.clear_buffer(&self.grid_sm, 0, None);
+                    enc.clear_buffer(&self.grid_sfp, 0, None);
+                    enc.clear_buffer(&self.grid_scomp, 0, None);
                     continue;
                 }
                 let indirect_offset = match g {
@@ -5379,7 +5552,7 @@ impl Solver for TwofieldSolver {
 }
 
 #[cfg(test)]
-mod seed_tests {
+pub(crate) mod seed_tests {
     use super::*;
 
     fn close(a: f32, b: f32) -> bool {
@@ -5492,7 +5665,7 @@ mod seed_tests {
         }
     }
 
-    fn create_test_device() -> Option<(wgpu::Device, wgpu::Queue)> {
+    pub(crate) fn create_test_device() -> Option<(wgpu::Device, wgpu::Queue)> {
         if std::env::var_os("COFFEE_SIM_SKIP_GPU_TESTS").is_some() {
             return None;
         }
@@ -6054,6 +6227,7 @@ mod seed_tests {
                 seed_jitter: 0.0,
                 tf_solid_sample_budget: budget,
                 tf_retention_target_g_per_g: 1.0,
+                tf_suction_accel: 1.0,
                 tf_water_density_kg_m3: 980.0,
                 ..Config::default()
             };
@@ -6073,6 +6247,17 @@ mod seed_tests {
             assert_eq!(
                 bloom, 0.0,
                 "uncontacted grains must scatter no suction gate"
+            );
+            solver.run_dbg(
+                &solver.pipelines.p2g_moisture.0,
+                &solver.pipelines.p2g_moisture.1,
+                groups(solver.params.particle_count).max(1),
+            );
+            let (supply, demand) = solver.read_grid_moisture_totals();
+            assert_eq!(supply, 0.0, "a dry grain-only scene has no carrier supply");
+            assert!(
+                demand > 0.0,
+                "a positive capillary capacity and suction must create retention demand"
             );
 
             let mut moved = solver.read_positions();
@@ -6304,6 +6489,81 @@ mod seed_tests {
                 "axis {axis}: sample lost the high side of the accepted extent"
             );
         }
+    }
+
+    #[test]
+    fn capillary_retention_transfer_activates_only_with_local_carrier_supply() {
+        let Some((device, queue)) = create_test_device() else {
+            eprintln!("no GPU adapter available; skipping capillary transfer comparison");
+            return;
+        };
+        let region = crate::engine::scene::SeedRegion {
+            min: [0.75; 3],
+            max: [2.25; 3],
+            species: Species::Water,
+        };
+        let mut grain_region = region;
+        grain_region.species = Species::Grain;
+        let scene = Scene {
+            gravity: [0.0; 3],
+            box_min: [0.0; 3],
+            box_max: [3.0; 3],
+            regions: vec![region, grain_region],
+            dose_g: 12.0,
+            ..Scene::default()
+        };
+        let materials = Materials {
+            particle_spacing: 0.3,
+            grain_diameter: 0.3,
+            porosity: 0.5,
+            r_max: 0.0,
+            ..Materials::default()
+        };
+        let config = Config {
+            seed_jitter: 0.0,
+            tf_retention_target_g_per_g: 0.5,
+            tf_suction_accel: 1.0,
+            tf_absorb_rate: 0.01,
+            tf_water_density_kg_m3: 980.0,
+            ..Config::default()
+        };
+        let gpu = GpuContext::from_device_queue(&device, &queue);
+        let solver = TwofieldSolver::build(&scene, &materials, &config, &gpu);
+        let before = solver.read_positions();
+        solver.run_dbg(
+            &solver.pipelines.grid_clear.0,
+            &solver.pipelines.grid_clear.1,
+            groups(solver.num_nodes).max(1),
+        );
+        solver.run_dbg(
+            &solver.pipelines.p2g_moisture.0,
+            &solver.pipelines.p2g_moisture.1,
+            groups(solver.params.particle_count).max(1),
+        );
+        let (supply, demand) = solver.read_grid_moisture_totals();
+        assert!(supply > 0.0 && demand > 0.0);
+        solver.run_dbg(
+            &solver.pipelines.g2p_absorb.0,
+            &solver.pipelines.g2p_absorb.1,
+            groups(solver.params.particle_count).max(1),
+        );
+        let after = solver.read_positions();
+        let solid_start = (solver.params.particle_count - solver.params.solid_count) as usize;
+        let gained: f64 = after[solid_start..]
+            .iter()
+            .zip(&before[solid_start..])
+            .map(|(new, old)| f64::from(new[3] - old[3]))
+            .sum();
+        let lost: f64 = after[..solver.water_count as usize]
+            .iter()
+            .zip(&before[..solver.water_count as usize])
+            .map(|(new, old)| f64::from(old[3] - new[3]) * f64::from(solver.params.wet0[2]))
+            .sum();
+        assert!(
+            gained > 0.0,
+            "local carrier supply must fill capillary storage"
+        );
+        assert!((gained - lost).abs() <= 2.0e-5 * gained.max(lost).max(1.0));
     }
 
     #[test]

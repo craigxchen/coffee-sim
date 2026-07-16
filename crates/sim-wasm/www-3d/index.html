@@ -23,8 +23,8 @@
           <label class="slider-field solver-field" for="solver-select">
             <span>Solver</span>
             <select id="solver-select" aria-label="Solver">
-              <option value="mpm" selected>MPM</option>
-              <option value="mpm-v2">MPM v2 (experimental)</option>
+              <option value="mpm">MPM</option>
+              <option value="mpm-v2" selected>MPM v2</option>
             </select>
           </label>
         </div>
@@ -140,6 +140,20 @@
         </dl>
         <button id="toggle-debug" class="toggle-debug">Show Debug Stats</button>
         <dl class="stats debug-stats hidden" id="debug-stats">
+          <div>
+            <dt>WebGPU 30 FPS Gate</dt>
+            <dd>
+              <button id="run-webgpu-benchmark" type="button">Run</button>
+              <output id="webgpu-benchmark-status">Not run</output>
+            </dd>
+          </div>
+          <div>
+            <dt>Calibration Observations</dt>
+            <dd>
+              <button id="run-calibration-observations" type="button">Run</button>
+              <output id="calibration-observations-status">Not run</output>
+            </dd>
+          </div>
           <div>
             <dt>Scene</dt>
             <dd id="scene-mode">Center Pour</dd>
@@ -319,6 +333,6 @@
         ></div>
       </div>
     </aside>
-    <script type="module" src="./main.js?v=calibration-ui-1"></script>
+    <script type="module" src="./main.js?v=mpm-v2-retention-10"></script>
   </body>
 </html>

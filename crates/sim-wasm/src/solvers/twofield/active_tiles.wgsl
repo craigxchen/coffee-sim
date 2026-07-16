@@ -1,12 +1,14 @@
 // Phase-1 active-cell scheduler for repeated water fine-pressure relaxation.
 //
-// Dense setup/clear/node/coarse passes and every solid-compaction pass remain authoritative.
-// On the guarded semi-implicit, explicitly vented production path, one workgroup owns one 8^3
-// water-cell tile: its 256 lanes inspect `lane` and `lane + 256` in the cell-presence census
-// produced by p2g_water. Only leaders of occupied tiles touch the global scheduler, marking a
-// conservative 3^3 neighboring-tile halo. The host copies the atomic compact-list count into a
-// separate INDIRECT-only dispatch record between compute passes; the writable scheduler is never
-// itself used as an indirect-argument buffer.
+// Coarse passes and every solid-compaction pass remain dense. On the guarded semi-implicit,
+// explicitly vented production path, one workgroup owns one 8^3 water-cell tile: its 256 lanes
+// inspect `lane` and `lane + 256` in the cell-presence census produced by p2g_water. Only leaders
+// of occupied tiles touch the global scheduler, marking a conservative 3^3 neighboring-tile halo.
+// That halo drives water cell classification and repeated fine-pressure relaxation; setup clears
+// cell_meta before the tiled classifier so cells outside the halo retain the exact inactive state.
+// The host copies the atomic compact-list count into a separate INDIRECT-only dispatch record
+// between compute passes; the writable scheduler is never itself used as an indirect-argument
+// buffer.
 
 const ACTIVE_TILE_EDGE: u32 = 8u;
 const ACTIVE_WATER_COUNT: u32 = 0u;

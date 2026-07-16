@@ -7,16 +7,16 @@ physics state remains solver-owned GPU state behind `engine::Simulator` and the 
 
 The registry exposes three complete solvers:
 
-- `mpm`: the legacy, currently non-experimental MPM implementation under `solvers/mpm`. It stays
+- `mpm`: the legacy MPM implementation under `solvers/mpm`. It stays
   available as a visual and regression comparison.
 - `mpm-v2`: the replacement two-field MPM implementation under `solvers/twofield`, adapted to the
-  browser seam by `twofield_runtime.rs`. It is the calibration and performance target.
+  browser seam by `twofield_runtime.rs`. It is the browser default and calibration target.
 - `xpbd`: an experimental position-based water baseline. It is useful for isolating rendering,
   emission, and water-only behavior, not as the coffee-bed reference model.
 
-`origin/main` remains the authoritative integration base. MPM v2 must earn promotion through the
+`origin/main` remains the authoritative integration base. MPM v2 earned promotion through the
 conservation, stability, qualitative-calibration, and browser-throughput gates documented in
-`docs/plans/2026-07-11-mpm-v2-implementation.md`.
+`docs/plans/2026-07-11-mpm-v2-implementation.md`; those gates remain its release contract.
 
 ## Ownership and one-way data flow
 
@@ -186,5 +186,4 @@ Known model limits remain explicit:
 - paper is a Darcy thin sheet plus finite whole-parcel reservoir, not a cellulose-fiber model;
 - public data does not jointly constrain time-resolved V60 bed shape, saturation, temperature,
   retention, and extraction, so final behavioral calibration remains an interactive workflow;
-- legacy MPM remains selectable until MPM v2 clears the full physical and browser-performance
-  contract.
+- legacy MPM remains selectable as the regression and visual-comparison implementation.

@@ -332,9 +332,18 @@ fn capillary_front_acceleration(
     return -suction_accel * strength * gradient / magnitude;
 }
 
-// Bound-water inventory and structural swelling are deliberately independent. pos.w on a
-// grain is V_bound. It controls structure only through saturation; it contributes dynamic
-// mass through the exact reduced-unit water mass ratio, never through structural volume.
+// A grain's pos.w is its TOTAL mechanically retained carrier volume. Fast Washburn capillary
+// imbibition fills the per-grain pore reservoir first; slower intragranular absorption is the
+// excess above that capacity. This ordered two-reservoir state is fully reconstructible from one
+// conserved scalar, so the hot transfer/chemistry/solid scatters need no auxiliary state buffer.
+fn grain_capillary_volume(p: u32) -> f32 {
+    return min(max(pos[p].w, 0.0), max(params.solute.w, 0.0));
+}
+
+fn grain_absorbed_volume(p: u32) -> f32 {
+    return max(pos[p].w - max(params.solute.w, 0.0), 0.0);
+}
+
 fn grain_bound_saturation(v_bound: f32) -> f32 {
     let v_cap = params.wet0.y;
     if (v_cap <= 0.0) { return 0.0; }
@@ -392,12 +401,15 @@ fn p2g_solid(@builtin(global_invocation_id) gid: vec3<u32>) {
     base = clamp(base, vec3<i32>(0), vec3<i32>(params.grid_dims.xyz) - vec3<i32>(3));
     let fx = xl - vec3<f32>(base);
     var w = bspline_w(fx);
+    // In frozen mode this is the only solid P2G, so consume the grain's conservative retention
+    // share here before deriving wet mass, structural swelling, and residual capacity.
+    apply_grain_retention(p, base, w);
     // Structural volume is a saturation-driven constitutive response, not bound-water storage:
     // V_struct = V_dry*(1 + s*max_diameter_swelling)^3. The default maximum is zero, preserving
     // the dry U6 scatter exactly even when a calibration stores bound water.
-    let vg = grain_structural_volume(pos[p].w);
+    let vg = grain_structural_volume(grain_absorbed_volume(p));
     let total_structure = fp_encode(vg);
-    let total_capacity = fp_encode(max(params.solute.w, 0.0));
+    let total_capacity = fp_encode(max(params.solute.w - grain_capillary_volume(p), 0.0));
     let total_bloom_volume = fp_encode(vg * bloom_factor(chem[p].w));
     var allocated_structure = 0i;
     var allocated_capacity = 0i;
@@ -676,7 +688,7 @@ fn drag_fold(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 
 // ============================ U9 MOISTURE PHASE-CHANGE ABSORPTION (KTD-4c) =====================
-// GIC-style transfer of water from the free phase to the bound-water inventory. The transferred
+// GIC-style transfer of water from the free phase to the retained-carrier inventory. The transferred
 // water VOLUME and its corresponding reduced-unit MASS are exactly conserved; structural grain
 // volume is a separate saturation response (grain_structural_volume above). Grid-projected,
 // atomic-free in the gather pass, deterministic and two-sidedly capped.
@@ -684,7 +696,7 @@ fn drag_fold(@builtin(global_invocation_id) gid: vec3<u32>) {
 // p2g_moisture scatters six fixed-point grid lanes with the SAME quadratic B-spline weights as
 // the field transfers: water SUPPLY S_n = Σ_w w·f_w·V_w, grain DEMAND
 // D_n = Σ_g w·demand_g, and donor volume-momentum Q_n = Σ_w w·f_w·V_w·v_w.
-// demand_g = (V_cap − V_bound)·(1 − e^{−k_abs·dt}) (models::wetting::absorb_demand).
+// demand_g combines fast capillary-pore filling and slower absorbed-water filling.
 // The node transfer is T_n = min(S_n,D_n). g2p_absorb makes:
 //   * each WATER lose its weighted share  Σ_n w·(f_w·V_w)·(T_n/S_n),
 //   * each GRAIN gain its weighted share  Σ_n w·(demand_g)·(T_n/D_n).
@@ -692,7 +704,7 @@ fn drag_fold(@builtin(global_invocation_id) gid: vec3<u32>) {
 // grains gain D_n·(T_n/D_n) = T_n. Donors lose reduced momentum
 // (particle_mass/V_w)·T_n·Q_n/S_n; receivers gain the identical ledger amount through their
 // T_n/D_n shares, then merge it with their old momentum. Volume, mass, and momentum therefore
-// match per node up to the one shared fixed-point quantization. f_w / V_bound ride pos.w.
+// match per node up to the one shared fixed-point quantization. f_w / V_retained ride pos.w.
 // Bloom (KTD-4b): a dry grain's demand is
 // scaled by a contact-time ramp (chem.w accumulates wet contact; ramps 0→1 over bloom_delay) so
 // the hydrophobic entry delay falls out. Off by default (k_abs = 0 ⇒ CPU-elided in mod.rs).
@@ -714,6 +726,19 @@ fn positive_decay_fraction(x: f32) -> f32 {
 fn wet_demand(v_bound: f32) -> f32 {
     if (v_bound >= wet_sat_cutoff()) { return 0.0; }
     return (wet_v_cap() - v_bound) * positive_decay_fraction(params.wet0.x * params.dt);
+}
+
+// Washburn-style capillary filling time. Suction is an acceleration and the solid sample pitch
+// is the resolved pore length, so sqrt(a/L) is a rate. This keeps the fill kinetics dimensionally
+// tied to the independently exposed suction control instead of inventing a retention constant.
+fn capillary_demand(v_capillary: f32) -> f32 {
+    let capacity = max(params.solute.w, 0.0);
+    let deficit = max(capacity - v_capillary, 0.0);
+    if (deficit <= 0.0 || params.wet1.x <= 0.0 || params.coupling.x <= 0.0) {
+        return 0.0;
+    }
+    let rate = sqrt(params.wet1.x / params.coupling.x);
+    return deficit * positive_decay_fraction(rate * params.dt);
 }
 // Absorption removes solvent, not dissolved solute. Keeping at least f*c/c_sat solvent makes
 // c_new=c*f/f_new <= c_sat structurally; roundoff remains the independent deactivation floor.
@@ -848,18 +873,7 @@ fn filter_release(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 
 // =================================== p2g_moisture =============================================
-@compute @workgroup_size(256)
-fn p2g_moisture(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let p = gid.x;
-    if (p >= params.particle_count) {
-        return;
-    }
-    // Water range [0, water_count); solid range [particle_count − solid_count, particle_count).
-    let is_water = p < params.water_count;
-    let is_solid = p >= (params.particle_count - params.solid_count);
-    if (!is_water && !is_solid) {
-        return; // dormant pool slot — never scatters
-    }
+fn scatter_moisture_particle(p: u32, is_water: bool, cull_supply: bool) {
     if (is_water && chem[p].z > 0.5) {
         return; // paper-held solvent is not available to the bed absorption ledger
     }
@@ -880,8 +894,10 @@ fn p2g_moisture(@builtin(global_invocation_id) gid: vec3<u32>) {
         quantity = absorbable_fraction * wet_v_water();
         lane = MOIST_SUPPLY;
     } else {
-        let v_bound = pos[p].w;
-        let demand = wet_demand(v_bound) * bloom_factor(chem[p].w);
+        let v_bound = grain_absorbed_volume(p);
+        let v_capillary = grain_capillary_volume(p);
+        let demand = wet_demand(v_bound) * bloom_factor(chem[p].w)
+            + capillary_demand(v_capillary);
         if (demand <= 0.0) { return; } // saturated / unbloomed grain: no demand
         quantity = demand;
         lane = MOIST_DEMAND;
@@ -891,6 +907,23 @@ fn p2g_moisture(@builtin(global_invocation_id) gid: vec3<u32>) {
     base = clamp(base, vec3<i32>(0), vec3<i32>(params.grid_dims.xyz) - vec3<i32>(3));
     let fx = xl - vec3<f32>(base);
     var w = bspline_w(fx);
+    if (is_water && cull_supply) {
+        // Production scatters grain demand first. A water parcel whose entire support has exactly
+        // zero encoded demand cannot transfer anything this step, so its S/Q/R writes are
+        // mathematically unobservable. Avoiding those five atomics at 27 cup nodes is the dominant
+        // late-brew optimization; parcels at the bed interface take the unchanged exact path.
+        var overlaps_demand = false;
+        for (var k = 0; k < 3; k = k + 1) {
+            for (var j = 0; j < 3; j = j + 1) {
+                for (var i = 0; i < 3; i = i + 1) {
+                    let moist = node_index(base + vec3<i32>(i, j, k)) * MOIST_STRIDE;
+                    overlaps_demand = overlaps_demand
+                        || atomicLoad(&grid_moist[moist + MOIST_DEMAND]) > 0;
+                }
+            }
+        }
+        if (!overlaps_demand) { return; }
+    }
     let total_quantity = moist_encode(lane, quantity);
     var allocated_quantity = 0i;
     var total_q = vec3<i32>(0);
@@ -944,171 +977,203 @@ fn p2g_moisture(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 }
 
+// Combined entry point retained for isolated ledger/conservation tests.
+@compute @workgroup_size(256)
+fn p2g_moisture(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let p = gid.x;
+    if (p >= params.particle_count) { return; }
+    let is_water = p < params.water_count;
+    let is_solid = p >= (params.particle_count - params.solid_count);
+    if (!is_water && !is_solid) { return; }
+    scatter_moisture_particle(p, is_water, false);
+}
+
+// Production demand-first pair. Integer accumulation makes this split bit-equivalent on every
+// node that can transfer; the supply pass may skip only supports whose final demand is exactly 0.
+@compute @workgroup_size(256)
+fn p2g_moisture_demand(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (gid.x >= params.solid_count) { return; }
+    let p = params.particle_count - params.solid_count + gid.x;
+    scatter_moisture_particle(p, false, false);
+}
+
+@compute @workgroup_size(256)
+fn p2g_moisture_supply(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (gid.x >= params.water_count) { return; }
+    scatter_moisture_particle(gid.x, true, true);
+}
+
 // =================================== g2p_absorb ===============================================
 // Gather the node drain/fill fractions and apply the conserved transfer (atomic-free: each
-// particle writes only its own pos.w / chem.w). Water shrinks f_w; grain grows V_bound and
-// ticks its wet-contact timer (the bloom clock), leaving concentration/temperature untouched.
+// particle writes only its own pos.w / chem.w). Production calls these helpers from the existing
+// water and solid P2Gs, reusing their position, base, and B-spline weights. The standalone entry
+// point remains as an isolated conservation-test harness.
+fn apply_water_retention(p: u32, base: vec3<i32>, w: array<vec3<f32>, 3>) {
+    if (params.wet0.x <= 0.0 && (params.solute.w <= 0.0 || params.wet1.x <= 0.0)) {
+        return;
+    }
+    let f_w = pos[p].w;
+    let carrier_floor = water_solvent_floor(f_w, chem[p].x);
+    let absorbable_fraction = max(f_w - carrier_floor, 0.0);
+    if (absorbable_fraction <= 0.0) { return; }
+    let my_supply = absorbable_fraction * wet_v_water();
+    let my_supply_total = moist_encode(MOIST_SUPPLY, my_supply);
+    var allocated_supply = 0i;
+    var cumulative_weight = 0.0;
+    var loss = 0.0;
+    for (var k = 0; k < 3; k = k + 1) {
+        for (var j = 0; j < 3; j = j + 1) {
+            for (var i = 0; i < 3; i = i + 1) {
+                let wijk = w[i].x * w[j].y * w[k].z;
+                cumulative_weight += wijk;
+                let is_last = i == 2 && j == 2 && k == 2;
+                let supply_target = extensive_partition_target(
+                    my_supply_total, cumulative_weight, is_last,
+                );
+                let supply_share = moist_decode(
+                    MOIST_SUPPLY, supply_target - allocated_supply,
+                );
+                allocated_supply = supply_target;
+                let n = node_index(base + vec3<i32>(i, j, k));
+                let moist = n * MOIST_STRIDE;
+                let s_n = moist_decode(
+                    MOIST_SUPPLY, atomicLoad(&grid_moist[moist + MOIST_SUPPLY]),
+                );
+                let d_n = moist_decode(
+                    MOIST_DEMAND, atomicLoad(&grid_moist[moist + MOIST_DEMAND]),
+                );
+                if (s_n > 0.0) {
+                    let t_n = min(s_n, d_n);
+                    loss += supply_share * (t_n / s_n);
+                }
+            }
+        }
+    }
+    // Volume only leaves via the capped share. Preserve dissolved solute exactly while pure
+    // water becomes bound: c_new*f_new*m_p = c_old*f_old*m_p.
+    let new_f = max(f_w - loss / wet_v_water(), carrier_floor);
+    let new_c = chem[p].x * f_w / new_f;
+    pos[p].w = new_f;
+    chem[p].x = new_c;
+}
+
+fn apply_grain_retention(p: u32, base: vec3<i32>, w: array<vec3<f32>, 3>) {
+    if (params.wet0.x <= 0.0 && (params.solute.w <= 0.0 || params.wet1.x <= 0.0)) {
+        return;
+    }
+    let v_bound = grain_absorbed_volume(p);
+    let v_capillary = grain_capillary_volume(p);
+    let bloom = bloom_factor(chem[p].w);
+    let demand = wet_demand(v_bound) * bloom + capillary_demand(v_capillary);
+    let demand_total = moist_encode(MOIST_DEMAND, demand);
+    var allocated_demand = 0i;
+    var cumulative_weight = 0.0;
+    // Wet-contact clock for the bloom gate: a grain touching water (any local supply) ticks
+    // its timer regardless of whether it absorbed this step (it can be saturated yet wet).
+    var touching = false;
+    var gain = 0.0;
+    var incoming_volume_momentum = vec3<f32>(0.0);
+    var incoming_volume_temperature = 0.0;
+    for (var k = 0; k < 3; k = k + 1) {
+        for (var j = 0; j < 3; j = j + 1) {
+            for (var i = 0; i < 3; i = i + 1) {
+                let wijk = w[i].x * w[j].y * w[k].z;
+                cumulative_weight += wijk;
+                let is_last = i == 2 && j == 2 && k == 2;
+                let demand_target = extensive_partition_target(
+                    demand_total, cumulative_weight, is_last,
+                );
+                let demand_share = moist_decode(
+                    MOIST_DEMAND, demand_target - allocated_demand,
+                );
+                allocated_demand = demand_target;
+                let n = node_index(base + vec3<i32>(i, j, k));
+                let moist = n * MOIST_STRIDE;
+                let s_n = moist_decode(
+                    MOIST_SUPPLY, atomicLoad(&grid_moist[moist + MOIST_SUPPLY]),
+                );
+                let d_n = moist_decode(
+                    MOIST_DEMAND, atomicLoad(&grid_moist[moist + MOIST_DEMAND]),
+                );
+                if (s_n > 0.0) { touching = true; }
+                if (demand > 0.0 && s_n > 0.0 && d_n > 0.0) {
+                    let t_n = min(s_n, d_n);
+                    let gain_n = demand_share * (t_n / d_n);
+                    let q_n = vec3<f32>(
+                        moist_decode(
+                            MOIST_QX + 0u,
+                            atomicLoad(&grid_moist[moist + MOIST_QX + 0u]),
+                        ),
+                        moist_decode(
+                            MOIST_QX + 1u,
+                            atomicLoad(&grid_moist[moist + MOIST_QX + 1u]),
+                        ),
+                        moist_decode(
+                            MOIST_QX + 2u,
+                            atomicLoad(&grid_moist[moist + MOIST_QX + 2u]),
+                        ),
+                    );
+                    let r_n = moist_decode(
+                        MOIST_RT, atomicLoad(&grid_moist[moist + MOIST_RT]),
+                    );
+                    gain += gain_n;
+                    incoming_volume_momentum += gain_n * (q_n / s_n);
+                    incoming_volume_temperature += gain_n * (r_n / s_n);
+                }
+            }
+        }
+    }
+    var new_temperature = chem[p].z;
+    if (gain > 0.0 && wet_v_water() > 0.0) {
+        // Conservative inelastic merge of the old wet grain with transferred water. The water
+        // particles keep velocity while losing mass; Q/S carries the exact donor velocity.
+        let water_mass_per_volume = params.particle_mass / wet_v_water();
+        let old_mass = grain_effective_mass(p);
+        let gained_mass = water_mass_per_volume * gain;
+        let new_mass = old_mass + gained_mass;
+        let new_velocity = (
+            old_mass * vel[p].xyz
+            + water_mass_per_volume * incoming_volume_momentum
+        ) / new_mass;
+        vel[p] = vec4<f32>(new_velocity, vel[p].w);
+
+        // Bound water carries its donor temperature into the grain. This is the thermal
+        // analogue of the momentum merge and prevents phase change from creating enthalpy.
+        let old_capacity = grain_heat_capacity(p);
+        let incoming_capacity_per_volume = water_mass_per_volume * params.therm.x;
+        let gained_capacity = incoming_capacity_per_volume * gain;
+        let new_capacity = old_capacity + gained_capacity;
+        if (new_capacity > 0.0) {
+            new_temperature = (
+                old_capacity * chem[p].z
+                + incoming_capacity_per_volume * incoming_volume_temperature
+            ) / new_capacity;
+        }
+    }
+    pos[p].w += gain;
+    let contact_time = chem[p].w + select(0.0, params.dt, touching);
+    chem[p] = vec4<f32>(chem[p].xy, new_temperature, contact_time);
+}
+
 @compute @workgroup_size(256)
 fn g2p_absorb(@builtin(global_invocation_id) gid: vec3<u32>) {
     let p = gid.x;
-    if (p >= params.particle_count) {
-        return;
-    }
+    if (p >= params.particle_count) { return; }
     let is_water = p < params.water_count;
     let is_solid = p >= (params.particle_count - params.solid_count);
-    if (!is_water && !is_solid) {
-        return;
-    }
-    if (is_water && chem[p].z > 0.5) {
-        return;
-    }
+    if (!is_water && !is_solid) { return; }
+    if (is_water && chem[p].z > 0.5) { return; }
     let h = params.grid_origin.w;
     let x = pos[p].xyz;
-    if (params.coupling.w > 0.5 && x.y < params.box_min.y) {
-        return; // ballistic escaped water: no transfer
-    }
+    if (params.coupling.w > 0.5 && x.y < params.box_min.y) { return; }
     let xl = (x - params.grid_origin.xyz) / h;
     var base = vec3<i32>(floor(xl - vec3<f32>(0.5)));
     base = clamp(base, vec3<i32>(0), vec3<i32>(params.grid_dims.xyz) - vec3<i32>(3));
-    let fx = xl - vec3<f32>(base);
-    var w = bspline_w(fx);
-
+    let w = bspline_w(xl - vec3<f32>(base));
     if (is_water) {
-        let f_w = pos[p].w;
-        let carrier_floor = water_solvent_floor(f_w, chem[p].x);
-        let absorbable_fraction = max(f_w - carrier_floor, 0.0);
-        if (absorbable_fraction <= 0.0) { return; }
-        let my_supply = absorbable_fraction * wet_v_water();
-        let my_supply_total = moist_encode(MOIST_SUPPLY, my_supply);
-        var allocated_supply = 0i;
-        var cumulative_weight = 0.0;
-        var loss = 0.0;
-        for (var k = 0; k < 3; k = k + 1) {
-            for (var j = 0; j < 3; j = j + 1) {
-                for (var i = 0; i < 3; i = i + 1) {
-                    let wijk = w[i].x * w[j].y * w[k].z;
-                    cumulative_weight += wijk;
-                    let is_last = i == 2 && j == 2 && k == 2;
-                    let supply_target = extensive_partition_target(
-                        my_supply_total, cumulative_weight, is_last,
-                    );
-                    let supply_share = moist_decode(
-                        MOIST_SUPPLY, supply_target - allocated_supply,
-                    );
-                    allocated_supply = supply_target;
-                    let n = node_index(base + vec3<i32>(i, j, k));
-                    let moist = n * MOIST_STRIDE;
-                    let s_n = moist_decode(
-                        MOIST_SUPPLY, atomicLoad(&grid_moist[moist + MOIST_SUPPLY]),
-                    );
-                    let d_n = moist_decode(
-                        MOIST_DEMAND, atomicLoad(&grid_moist[moist + MOIST_DEMAND]),
-                    );
-                    if (s_n > 0.0) {
-                        let t_n = min(s_n, d_n);   // node transfer (two-sided cap)
-                        loss += supply_share * (t_n / s_n); // my exact integer-partition share
-                    }
-                }
-            }
-        }
-        // Volume only leaves via the capped share. Preserve dissolved solute exactly while pure
-        // water becomes bound: c_new*f_new*m_p = c_old*f_old*m_p.
-        let new_f = max(f_w - loss / wet_v_water(), carrier_floor);
-        let new_c = chem[p].x * f_w / new_f;
-        pos[p] = vec4<f32>(x, new_f);
-        chem[p] = vec4<f32>(new_c, chem[p].yzw);
+        apply_water_retention(p, base, w);
     } else {
-        let v_bound = pos[p].w;
-        let demand = wet_demand(v_bound) * bloom_factor(chem[p].w);
-        let demand_total = moist_encode(MOIST_DEMAND, demand);
-        var allocated_demand = 0i;
-        var cumulative_weight = 0.0;
-        // Wet-contact clock for the bloom gate: a grain touching water (any local supply) ticks
-        // its timer regardless of whether it absorbed this step (it can be saturated yet wet).
-        var touching = false;
-        var gain = 0.0;
-        var incoming_volume_momentum = vec3<f32>(0.0);
-        var incoming_volume_temperature = 0.0;
-        for (var k = 0; k < 3; k = k + 1) {
-            for (var j = 0; j < 3; j = j + 1) {
-                for (var i = 0; i < 3; i = i + 1) {
-                    let wijk = w[i].x * w[j].y * w[k].z;
-                    cumulative_weight += wijk;
-                    let is_last = i == 2 && j == 2 && k == 2;
-                    let demand_target = extensive_partition_target(
-                        demand_total, cumulative_weight, is_last,
-                    );
-                    let demand_share = moist_decode(
-                        MOIST_DEMAND, demand_target - allocated_demand,
-                    );
-                    allocated_demand = demand_target;
-                    let n = node_index(base + vec3<i32>(i, j, k));
-                    let moist = n * MOIST_STRIDE;
-                    let s_n = moist_decode(
-                        MOIST_SUPPLY, atomicLoad(&grid_moist[moist + MOIST_SUPPLY]),
-                    );
-                    let d_n = moist_decode(
-                        MOIST_DEMAND, atomicLoad(&grid_moist[moist + MOIST_DEMAND]),
-                    );
-                    if (s_n > 0.0) { touching = true; }
-                    if (demand > 0.0 && s_n > 0.0 && d_n > 0.0) {
-                        let t_n = min(s_n, d_n);
-                        let gain_n = demand_share * (t_n / d_n);
-                        let q_n = vec3<f32>(
-                            moist_decode(
-                                MOIST_QX + 0u,
-                                atomicLoad(&grid_moist[moist + MOIST_QX + 0u]),
-                            ),
-                            moist_decode(
-                                MOIST_QX + 1u,
-                                atomicLoad(&grid_moist[moist + MOIST_QX + 1u]),
-                            ),
-                            moist_decode(
-                                MOIST_QX + 2u,
-                                atomicLoad(&grid_moist[moist + MOIST_QX + 2u]),
-                            ),
-                        );
-                        let r_n = moist_decode(
-                            MOIST_RT, atomicLoad(&grid_moist[moist + MOIST_RT]),
-                        );
-                        gain += gain_n;
-                        incoming_volume_momentum += gain_n * (q_n / s_n);
-                        incoming_volume_temperature += gain_n * (r_n / s_n);
-                    }
-                }
-            }
-        }
-        var new_temperature = chem[p].z;
-        if (gain > 0.0 && wet_v_water() > 0.0) {
-            // Conservative inelastic merge of the old wet grain with transferred water. The
-            // water particles keep velocity while losing mass; Q/S carries exactly the velocity
-            // of that lost mass into this receiver allocation.
-            let water_mass_per_volume = params.particle_mass / wet_v_water();
-            let old_mass = grain_effective_mass(p);
-            let gained_mass = water_mass_per_volume * gain;
-            let new_mass = old_mass + gained_mass;
-            let new_velocity = (
-                old_mass * vel[p].xyz
-                + water_mass_per_volume * incoming_volume_momentum
-            ) / new_mass;
-            vel[p] = vec4<f32>(new_velocity, vel[p].w);
-
-            // Bound water carries its donor temperature into the grain. This is the thermal
-            // analogue of the momentum merge and prevents phase change from creating enthalpy.
-            let old_capacity = grain_heat_capacity(p);
-            let incoming_capacity_per_volume = water_mass_per_volume * params.therm.x;
-            let gained_capacity = incoming_capacity_per_volume * gain;
-            let new_capacity = old_capacity + gained_capacity;
-            if (new_capacity > 0.0) {
-                new_temperature = (
-                    old_capacity * chem[p].z
-                    + incoming_capacity_per_volume * incoming_volume_temperature
-                ) / new_capacity;
-            }
-        }
-        pos[p] = vec4<f32>(x, v_bound + gain);
-        let contact_time = chem[p].w + select(0.0, params.dt, touching);
-        chem[p] = vec4<f32>(chem[p].xy, new_temperature, contact_time);
+        apply_grain_retention(p, base, w);
     }
 }
 
@@ -1269,17 +1334,7 @@ fn grain_release_proposal(p: u32) -> vec2<f32> {
 }
 
 // ================================= chemistry_scatter =========================================
-@compute @workgroup_size(256)
-fn chemistry_scatter(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let p = gid.x;
-    if (p >= params.particle_count) {
-        return;
-    }
-    let is_water = p < params.water_count;
-    let is_solid = p >= (params.particle_count - params.solid_count);
-    if (!is_water && !is_solid) {
-        return;
-    }
+fn scatter_chemistry_particle(p: u32, is_water: bool, cull_water: bool) {
     if (is_water && chem[p].z > 0.5) {
         return; // stored paper inventory does not exchange with the bed this frame
     }
@@ -1314,6 +1369,22 @@ fn chemistry_scatter(@builtin(global_invocation_id) gid: vec3<u32>) {
     base = clamp(base, vec3<i32>(0), vec3<i32>(params.grid_dims.xyz) - vec3<i32>(3));
     let fx = xl - vec3<f32>(base);
     var w = bspline_w(fx);
+    if (is_water && cull_water) {
+        // Production finalizes grain lanes first. Without any encoded grain heat capacity on
+        // this support there can be neither extraction nor interphase heat transfer, so all nine
+        // water ledger atomics are unobservable. Ambient cooling remains particle-local in gather.
+        var overlaps_grain = false;
+        for (var k = 0; k < 3; k = k + 1) {
+            for (var j = 0; j < 3; j = j + 1) {
+                for (var i = 0; i < 3; i = i + 1) {
+                    let offset = node_index(base + vec3<i32>(i, j, k)) * CHEM_STRIDE;
+                    overlaps_grain = overlaps_grain
+                        || atomicLoad(&grid_chem[offset + CHEM_CG]) > 0;
+                }
+            }
+        }
+        if (!overlaps_grain) { return; }
+    }
     let total_headroom = chem_encode(CHEM_HEADROOM, headroom);
     let total_fast = chem_encode(CHEM_FAST, release.x);
     let total_slow = chem_encode(CHEM_SLOW, release.y);
@@ -1408,6 +1479,31 @@ fn chemistry_scatter(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 }
 
+// Combined entry remains the exact isolated-ledger harness. Production uses the ordered pair so
+// cup water can skip nodes that provably have no grain counterpart.
+@compute @workgroup_size(256)
+fn chemistry_scatter(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let p = gid.x;
+    if (p >= params.particle_count) { return; }
+    let is_water = p < params.water_count;
+    let is_solid = p >= (params.particle_count - params.solid_count);
+    if (!is_water && !is_solid) { return; }
+    scatter_chemistry_particle(p, is_water, false);
+}
+
+@compute @workgroup_size(256)
+fn chemistry_scatter_grain(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (gid.x >= params.solid_count) { return; }
+    let p = params.particle_count - params.solid_count + gid.x;
+    scatter_chemistry_particle(p, false, false);
+}
+
+@compute @workgroup_size(256)
+fn chemistry_scatter_water(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (gid.x >= params.water_count) { return; }
+    scatter_chemistry_particle(gid.x, true, true);
+}
+
 // ================================= chemistry_gather ==========================================
 @compute @workgroup_size(256)
 fn chemistry_gather(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -1434,6 +1530,42 @@ fn chemistry_gather(@builtin(global_invocation_id) gid: vec3<u32>) {
     base = clamp(base, vec3<i32>(0), vec3<i32>(params.grid_dims.xyz) - vec3<i32>(3));
     let fx = xl - vec3<f32>(base);
     var w = bspline_w(fx);
+
+    // Every conservative node exchange requires nonzero heat capacity from both phases. The
+    // ordered scatter makes that an exact locality oracle. Particles outside the opposite phase
+    // still take their physical ambient step and clear transfer observability lanes, but avoid
+    // decoding eleven node quantities at all 27 support nodes.
+    let opposite_capacity_lane = select(CHEM_CW, CHEM_CG, is_water);
+    var overlaps_opposite_phase = false;
+    for (var k = 0; k < 3; k = k + 1) {
+        for (var j = 0; j < 3; j = j + 1) {
+            for (var i = 0; i < 3; i = i + 1) {
+                let offset = node_index(base + vec3<i32>(i, j, k)) * CHEM_STRIDE;
+                overlaps_opposite_phase = overlaps_opposite_phase
+                    || atomicLoad(&grid_chem[offset + opposite_capacity_lane]) > 0;
+            }
+        }
+    }
+    if (!overlaps_opposite_phase) {
+        let capacity = select(
+            grain_heat_capacity(p),
+            water_heat_capacity(pos[p].w, chem[p].x),
+            is_water,
+        );
+        let old_temperature = select(chem[p].z, chem[p].y, is_water);
+        let new_temperature = ambient_temperature_step(old_temperature);
+        ambient_enthalpy[p] += capacity * (new_temperature - old_temperature);
+        if (is_water) {
+            chem[p].y = new_temperature;
+        } else {
+            chem[p].z = new_temperature;
+        }
+        vel[p].w = 0.0;
+        cmat[3u * p + 0u].w = 0.0;
+        cmat[3u * p + 1u].w = 0.0;
+        cmat[3u * p + 2u].w = 0.0;
+        return;
+    }
 
     if (is_water) {
         let fraction = clamp(pos[p].w, 0.0, 1.0);

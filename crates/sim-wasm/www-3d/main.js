@@ -1,4 +1,4 @@
-import init, { WasmSim3D } from "./pkg/coffee_sim_wasm.js?v=calibration-ui-1";
+import init, { WasmSim3D } from "./pkg/coffee_sim_wasm.js?v=mpm-v2-retention-10";
 
 const canvas = document.getElementById("sim-canvas");
 const viewCubeStage = document.getElementById("view-cube-stage");
@@ -53,6 +53,10 @@ const extractionYieldLabel = document.getElementById("extraction-yield");
 const pressureStatusLabel = document.getElementById("pressure-status");
 const toggleDebugButton = document.getElementById("toggle-debug");
 const debugStats = document.getElementById("debug-stats");
+const runWebGpuBenchmarkButton = document.getElementById("run-webgpu-benchmark");
+const webGpuBenchmarkStatus = document.getElementById("webgpu-benchmark-status");
+const runCalibrationObservationsButton = document.getElementById("run-calibration-observations");
+const calibrationObservationsStatus = document.getElementById("calibration-observations-status");
 const timeseriesDrawer = document.getElementById("timeseries-drawer");
 const toggleTimeseriesButton = document.getElementById("toggle-timeseries");
 const toggleTimeseriesMenuButton = document.getElementById("toggle-timeseries-menu");
@@ -75,7 +79,7 @@ const MAX_RENDER_DPR = 1.5;
 const MAX_SIM_STEPS_PER_DISPLAY_FRAME = 4;
 const CALIBRATION_SOLVER_ID = "mpm-v2";
 const CALIBRATION_DEBOUNCE_MS = 160;
-let activeSolverId = "mpm";
+let activeSolverId = CALIBRATION_SOLVER_ID;
 let metricsSamplesPending = 0;
 let latestExactMetrics = null;
 const AUTO_PAUSE_DELAY_MS = 30_000;
@@ -260,7 +264,7 @@ async function bootstrap() {
   try {
     buildTimeseriesCharts();
     buildTimeseriesMenu();
-    await init(new URL("./pkg/coffee_sim_wasm_bg.wasm?v=calibration-ui-1", import.meta.url));
+    await init(new URL("./pkg/coffee_sim_wasm_bg.wasm?v=mpm-v2-retention-10", import.meta.url));
     app = await WasmSim3D.create(canvas);
     populateSolverSelect();
     app.loadBenchmarkCenterPour();
@@ -329,6 +333,67 @@ async function bootstrap() {
     toggleDebugButton.textContent = debugPanelVisible()
       ? "Hide Debug Stats"
       : "Show Debug Stats";
+  });
+
+  runWebGpuBenchmarkButton.addEventListener("click", async () => {
+    runWebGpuBenchmarkButton.disabled = true;
+    webGpuBenchmarkStatus.textContent = "Running…";
+    try {
+      const result = await runWebGpuBenchmark();
+      const fps = result.medianMs > 0 ? 1000 / result.medianMs : 0;
+      window.__coffeeSim.lastWebGpuBenchmark = result;
+      webGpuBenchmarkStatus.dataset.status = result.passed ? "pass" : "fail";
+      webGpuBenchmarkStatus.dataset.medianMs = String(result.medianMs);
+      webGpuBenchmarkStatus.dataset.p95Ms = String(result.p95Ms);
+      webGpuBenchmarkStatus.dataset.p99Ms = String(result.p99Ms);
+      webGpuBenchmarkStatus.dataset.realTimeFactor = String(result.realTimeFactor);
+      webGpuBenchmarkStatus.dataset.rejectionReasons = JSON.stringify(result.rejectionReasons);
+      webGpuBenchmarkStatus.dataset.physicsOnlyMedianMs = String(
+        result.diagnosticBreakdown.physicsOnlyMedianMs,
+      );
+      webGpuBenchmarkStatus.dataset.renderOnlyMedianMs = String(
+        result.diagnosticBreakdown.renderOnlyMedianMs,
+      );
+      webGpuBenchmarkStatus.textContent =
+        `${result.passed ? "PASS" : "FAIL"} · ${fps.toFixed(1)} FPS median · `
+        + `p95 ${result.p95Ms.toFixed(1)} ms · ${result.realTimeFactor.toFixed(2)}× real time`;
+    } catch (error) {
+      webGpuBenchmarkStatus.dataset.status = "error";
+      webGpuBenchmarkStatus.textContent = `Error: ${error?.message ?? error}`;
+    } finally {
+      runWebGpuBenchmarkButton.disabled = false;
+    }
+  });
+
+  runCalibrationObservationsButton.addEventListener("click", async () => {
+    runCalibrationObservationsButton.disabled = true;
+    calibrationObservationsStatus.textContent = "Running…";
+    calibrationObservationsStatus.dataset.status = "running";
+    try {
+      const result = await runMpmV2CalibrationObservations();
+      window.__coffeeSim.lastCalibrationObservations = result;
+      const retention = result.comparisons.retention.liveBedRetentionGramsPerGram;
+      const swelling = result.comparisons.predictedSwellingResponse
+        .predictedMeanDiameterSwellingFraction;
+      calibrationObservationsStatus.dataset.status = "complete";
+      calibrationObservationsStatus.dataset.retentionGramsPerGram = String(retention);
+      calibrationObservationsStatus.dataset.swellingFraction = String(swelling);
+      calibrationObservationsStatus.dataset.permeability = JSON.stringify(
+        result.comparisons.permeability,
+      );
+      calibrationObservationsStatus.dataset.extraction = JSON.stringify(
+        result.comparisons.extraction,
+      );
+      const retentionText = Number.isFinite(retention) ? `${retention.toFixed(2)} g/g` : "n/a";
+      const swellingText = Number.isFinite(swelling) ? `${(100 * swelling).toFixed(1)}%` : "n/a";
+      calibrationObservationsStatus.textContent =
+        `Done · retention ${retentionText} · swelling ${swellingText}`;
+    } catch (error) {
+      calibrationObservationsStatus.dataset.status = "error";
+      calibrationObservationsStatus.textContent = `Error: ${error?.message ?? error}`;
+    } finally {
+      runCalibrationObservationsButton.disabled = false;
+    }
   });
 
   sceneMainTab.addEventListener("click", () => {
@@ -1549,6 +1614,26 @@ function nextAnimationFrame() {
   return new Promise((resolve) => requestAnimationFrame(() => resolve()));
 }
 
+function yieldToBrowserTasks() {
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+// Browser wgpu callbacks make progress through device polling. A bare queue-completion await can
+// deadlock when a paused harness makes no subsequent Rust call that reaches Device::poll.
+async function waitForGpuWithPolling() {
+  let settled = false;
+  let failure = null;
+  app.waitForGpu().then(
+    () => { settled = true; },
+    (error) => { failure = error; settled = true; },
+  );
+  while (!settled) {
+    app.pollDiagnostics();
+    await new Promise((resolve) => setTimeout(resolve, 4));
+  }
+  if (failure) throw failure;
+}
+
 function setEvaluationWaterVelocity(speed) {
   waterVelocityInput.value = clamp(
     speed,
@@ -1779,9 +1864,11 @@ const MPM_V2_OBSERVATION_WATER_DOSE_ML = 250.0;
 const MPM_V2_WEBGPU_PROFILE_NAME = "factory-default";
 const RETENTION_PRIOR_GRAMS_PER_GRAM = 2.1;
 const SWELLING_LITERATURE_ENVELOPE_FRACTION = [0.0, 0.15];
-// Compact MPM-v2 diagnostics are dispatched every 0.25 simulated seconds. The extra 0.05 s
-// allows normal frame quantization but is still strict enough to reject a missed readback cycle.
+// A ticketed MPM-v2 snapshot describes one exact solver generation. Allow a small simulated-time
+// age for callers that deliberately inspect a snapshot after advancing a few quantized frames.
 const MPM_V2_DIAGNOSTICS_FRESHNESS_SECONDS = 0.30;
+const MPM_V2_DIAGNOSTIC_POLL_DELAY_MS = 25;
+const MPM_V2_DIAGNOSTIC_MAX_ATTEMPTS = 16;
 // Numerical ledger gates scale with the conserved inventory. They do not encode coffee behavior.
 const WEBGPU_LEDGER_RELATIVE_TOLERANCE = 1e-4;
 const WEBGPU_LEDGER_ABSOLUTE_TOLERANCE_GRAMS = 1e-3;
@@ -1859,15 +1946,13 @@ function observationDiagnosticsRejection(diagnostics, freshnessSeconds, ticket =
  * a polling side effect, so observation cannot emit, diffuse, project, or advance sim time.
  */
 async function readFreshMpmV2Diagnostics({
-  maxAttempts = 8,
+  maxAttempts = MPM_V2_DIAGNOSTIC_MAX_ATTEMPTS,
   freshnessSeconds = MPM_V2_DIAGNOSTICS_FRESHNESS_SECONDS,
 } = {}) {
   let lastDiagnostics = null;
   let rejectionReason = "diagnostics-unavailable";
   const ticket = app.requestDiagnosticsSnapshot();
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-    await app.waitForGpu();
-    await nextAnimationFrame();
     const status = app.pollDiagnostics();
     if (status.requestId !== ticket.requestId) {
       rejectionReason = "diagnostics-request-mismatch";
@@ -1879,6 +1964,7 @@ async function readFreshMpmV2Diagnostics({
     }
     if (status.status !== "ready") {
       rejectionReason = `diagnostics-${status.status}`;
+      await new Promise((resolve) => setTimeout(resolve, MPM_V2_DIAGNOSTIC_POLL_DELAY_MS));
       continue;
     }
     lastDiagnostics = await app.waterDiagnostics();
@@ -1939,8 +2025,8 @@ async function advanceMpmV2ObservationFrames(frameCount, secondsPerFrame = 1 / 6
   for (let frame = 0; frame < count; frame += 1) {
     app.stepFrame(secondsPerFrame);
     if ((frame + 1) % 60 === 0) {
-      await app.waitForGpu();
-      await nextAnimationFrame();
+      await waitForGpuWithPolling();
+      await yieldToBrowserTasks();
     }
   }
 }
@@ -2110,8 +2196,8 @@ async function runFullDoseMpmV2Observation(options) {
     app.stepFrame(1 / 60);
     pourFrames += 1;
     if (pourFrames % 60 === 0) {
-      await app.waitForGpu();
-      await nextAnimationFrame();
+      await waitForGpuWithPolling();
+      await yieldToBrowserTasks();
     }
     const reachedTarget = app.totalEmittedMl() - emissionLedgerStartMl >= targetWaterMl;
     const reachedSampleFrame = pourFrames >= nextPourSampleFrame;
@@ -2342,7 +2428,7 @@ function restoreCameraOrientation(savedOrientation) {
 }
 
 async function restoreObservationUiState(saved, savedCalibration, touchedCalibration) {
-  await app.waitForGpu();
+  await waitForGpuWithPolling();
   let calibrationRestored = false;
   if (savedCalibration) {
     if (app.activeSolver() !== CALIBRATION_SOLVER_ID) app.setSolver(CALIBRATION_SOLVER_ID);
@@ -2418,7 +2504,7 @@ async function runMpmV2CalibrationObservations(options = {}) {
     permeabilityDeltaLog10: options.permeabilityDeltaLog10 ?? 1,
     extractionLowScale: options.extractionLowScale ?? 0.1,
     diagnosticOptions: {
-      maxAttempts: options.diagnosticMaxAttempts ?? 8,
+      maxAttempts: options.diagnosticMaxAttempts ?? MPM_V2_DIAGNOSTIC_MAX_ATTEMPTS,
       freshnessSeconds:
         options.diagnosticFreshnessSeconds ?? MPM_V2_DIAGNOSTICS_FRESHNESS_SECONDS,
       onSample: options.onSample ?? null,
@@ -2847,10 +2933,10 @@ async function runWebGpuBenchmark(options = {}) {
     for (let frame = 0; frame < warmupDisplayFrames; frame += 1) {
       runDisplayFrame();
       if ((frame + 1) % displayFramesPerBatch === 0) {
-        await app.waitForGpu();
+        await waitForGpuWithPolling();
       }
     }
-    await app.waitForGpu();
+    await waitForGpuWithPolling();
 
     const normalizedFrameMilliseconds = [];
     let measuredWallMilliseconds = 0;
@@ -2859,7 +2945,7 @@ async function runWebGpuBenchmark(options = {}) {
       for (let frame = 0; frame < displayFramesPerBatch; frame += 1) {
         runDisplayFrame();
       }
-      await app.waitForGpu();
+      await waitForGpuWithPolling();
       const elapsed = performance.now() - started;
       measuredWallMilliseconds += elapsed;
       normalizedFrameMilliseconds.push(elapsed / displayFramesPerBatch);
@@ -2875,6 +2961,25 @@ async function runWebGpuBenchmark(options = {}) {
     // diagnostics only and cannot improve or contaminate the timings above.
     const diagnosticRead = await readFreshMpmV2Diagnostics();
     const diagnosticAssessment = assessWebGpuBenchmarkDiagnostics(diagnosticRead);
+    // Non-gating attribution runs after the official measurement and diagnostics. Both paths use
+    // the same queue-completion fence as the contract; their purpose is to direct optimization,
+    // not to manufacture an additive timing model (resource state and batching differ).
+    const measureDiagnosticBatches = async (runFrame, diagnosticBatchCount = 5) => {
+      const samples = [];
+      for (let batch = 0; batch < diagnosticBatchCount; batch += 1) {
+        const started = performance.now();
+        for (let frame = 0; frame < displayFramesPerBatch; frame += 1) runFrame();
+        await waitForGpuWithPolling();
+        samples.push((performance.now() - started) / displayFramesPerBatch);
+      }
+      samples.sort((a, b) => a - b);
+      return quantile(samples, 0.5);
+    };
+    const renderOnlyMedianMs = await measureDiagnosticBatches(() => app.render());
+    const physicsOnlyMedianMs = await measureDiagnosticBatches(() => {
+      app.stepFrame(1 / 60);
+      app.stepFrame(1 / 60);
+    });
     const timingPassed = medianMs <= 33.3 && realTimeFactor >= 1.0;
     const rejectionReasons = [];
     if (medianMs > 33.3) rejectionReasons.push(`median-frame-ms:${medianMs}`);
@@ -2913,6 +3018,12 @@ async function runWebGpuBenchmark(options = {}) {
         rejectionReason: diagnosticRead.rejectionReason ?? null,
       },
       diagnosticAssessment,
+      diagnosticBreakdown: {
+        physicsOnlyMedianMs,
+        renderOnlyMedianMs,
+        batchCount: 5,
+        displayFramesPerBatch,
+      },
       finalDiagnostics: diagnosticRead.accepted ? diagnosticRead.diagnostics : null,
       rejectedDiagnostics: diagnosticRead.accepted
         ? null

@@ -328,15 +328,18 @@ fn p2g_solid_reference(@builtin(global_invocation_id) gid: vec3<u32>) {
     let p = params.particle_count - params.solid_count + i;
     let h = params.grid_origin.w;
     let x = pos[p].xyz;
+    let xl = (x - params.grid_origin.xyz) / h;
+    var base = vec3<i32>(floor(xl - vec3<f32>(0.5)));
+    base = clamp(base, vec3<i32>(0), vec3<i32>(params.grid_dims.xyz) - vec3<i32>(3));
+    let w = bspline_w(xl - vec3<f32>(base));
+    // Dynamic mode owns retention here exactly once, before the wet mass and velocity proposal
+    // are captured. Later solid P2Gs then reuse this updated canonical particle state.
+    apply_grain_retention(p, base, w);
     let v = vel[p].xyz;
     let c0 = cmat[3u * p + 0u].xyz;
     let c1 = cmat[3u * p + 1u].xyz;
     let c2 = cmat[3u * p + 2u].xyz;
     let mass = grain_effective_mass(p);
-    let xl = (x - params.grid_origin.xyz) / h;
-    var base = vec3<i32>(floor(xl - vec3<f32>(0.5)));
-    base = clamp(base, vec3<i32>(0), vec3<i32>(params.grid_dims.xyz) - vec3<i32>(3));
-    let w = bspline_w(xl - vec3<f32>(base));
     for (var kk = 0; kk < 3; kk = kk + 1) {
         for (var j = 0; j < 3; j = j + 1) {
             for (var ii = 0; ii < 3; ii = ii + 1) {
@@ -393,9 +396,9 @@ fn p2g_solid_dyn(@builtin(global_invocation_id) gid: vec3<u32>) {
     base = clamp(base, vec3<i32>(0), vec3<i32>(params.grid_dims.xyz) - vec3<i32>(3));
     let fx = xl - vec3<f32>(base);
     var w = bspline_w(fx);
-    let vg = grain_structural_volume(pos[p].w);
+    let vg = grain_structural_volume(grain_absorbed_volume(p));
     let total_structure = fp_encode(vg);
-    let total_capacity = fp_encode(max(params.solute.w, 0.0));
+    let total_capacity = fp_encode(max(params.solute.w - grain_capillary_volume(p), 0.0));
     let total_bloom_volume = fp_encode(vg * bloom_factor(chem[p].w));
     var allocated_structure = 0i;
     var allocated_capacity = 0i;
@@ -630,7 +633,7 @@ fn g2p_solid(@builtin(global_invocation_id) gid: vec3<u32>) {
     let eps_eff = eps_tr + vec3<f32>(vc / 3.0);
     // U7 Bishop effective-stress cohesion uses the same bound-water saturation as structural
     // swelling. Dry grains and c_max=0 both give y_c = cohesion::dry().
-    let sat = grain_bound_saturation(pos[p].w);
+    let sat = grain_bound_saturation(grain_absorbed_volume(p));
     let y_coh = cohesion_for_saturation(sat);
     let rm = return_map(eps_eff, sb_old.z, y_coh);
     let tr_eff = eps_eff.x + eps_eff.y + eps_eff.z;

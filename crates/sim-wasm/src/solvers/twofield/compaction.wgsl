@@ -160,7 +160,7 @@ fn p2g_solid_macro(@builtin(global_invocation_id) gid: vec3<u32>) {
     let c1 = cmat[3u * p + 1u].xyz;
     let c2 = cmat[3u * p + 2u].xyz;
     let mass = grain_effective_mass(p);
-    let volume = grain_structural_volume(pos[p].w);
+    let volume = grain_structural_volume(grain_absorbed_volume(p));
     let ep = max(sstate[2u * i + 1u].w, 0.0);
     let xl = (x - params.grid_origin.xyz) / h;
     var base = vec3<i32>(floor(xl - vec3<f32>(0.5)));
@@ -168,7 +168,7 @@ fn p2g_solid_macro(@builtin(global_invocation_id) gid: vec3<u32>) {
     let fx = xl - vec3<f32>(base);
     var w = bspline_w(fx);
     let total_structure = fp_encode(volume);
-    let total_capacity = fp_encode(max(params.solute.w, 0.0));
+    let total_capacity = fp_encode(max(params.solute.w - grain_capillary_volume(p), 0.0));
     let total_bloom_volume = fp_encode(volume * bloom_factor(chem[p].w));
     var allocated_structure = 0i;
     var allocated_capacity = 0i;
@@ -388,7 +388,7 @@ fn g2p_solid_shear(@builtin(global_invocation_id) gid: vec3<u32>) {
     let shear = max(params.splas0.y, 0.0);
     var principal = 2.0 * shear * eps;
     let q = max(sstate[2u * i + 1u].y, 0.0);
-    let y_coh = cohesion_for_saturation(grain_bound_saturation(pos[p].w));
+    let y_coh = cohesion_for_saturation(grain_bound_saturation(grain_absorbed_volume(p)));
     let radius = max(y_coh + 3.0 * params.splas0.w * q, 0.0);
     let stress_norm = length(principal);
     if (stress_norm > radius && stress_norm > 1.0e-12) {
