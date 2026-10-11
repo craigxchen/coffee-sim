@@ -6,13 +6,14 @@ struct Camera {
     right: vec4<f32>,   // camera right in world space (xyz)
     up: vec4<f32>,      // camera up in world space (xyz)
     params: vec4<f32>,  // x = radius, y = inv color-max-speed, z = grain radius scale, w = 1/V_cap (moisture tint)
-    clip: vec4<f32>,    // x = z_center, y = half_width, z = slab-enabled (>0.5), w = unused
+    clip: vec4<f32>,    // x = z_center, y = half_width, z = slab-enabled, w = normalized moisture present
 };
 
 @group(0) @binding(0) var<uniform> cam: Camera;
 @group(0) @binding(1) var<storage, read> positions: array<vec4<f32>>;
 @group(0) @binding(2) var<storage, read> velocities: array<vec4<f32>>;
 @group(0) @binding(3) var<storage, read> phases: array<u32>;
+@group(0) @binding(4) var<storage, read> moisture: array<f32>;
 
 const PHASE_GRAIN: u32 = 1u;
 
@@ -59,6 +60,9 @@ fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VsOut
     out.phase = phases[ii];
     // Grain saturation = V_abs / V_cap (pos.w · 1/V_cap); 0 when the tint is disabled (params.w=0).
     out.saturation = clamp(positions[ii].w * cam.params.w, 0.0, 1.0);
+    if (cam.clip.w > 0.5) {
+        out.saturation = clamp(moisture[ii], 0.0, 1.0);
+    }
     return out;
 }
 

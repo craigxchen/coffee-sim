@@ -9,10 +9,11 @@ It is organized as a **modular library of complete fluid-simulation solvers** be
 seam (`Solver`), sharing one physics layer (`models`) so methods can be implemented and
 compared fairly. One WGSL codebase targets native desktop now and WASM + WebGPU later.
 
-> **Status: rewrite in progress.** Phase 0 (the scaffold/harness) is in place: the solver
-> seam, the registry + runtime solver-switch, the headless `GpuContext`, and the local
-> profiler. Solver physics (XPBD water core first) comes next. The previous MPM
-> implementation it supersedes lives on `origin/*` branches.
+> **Status: solver development in progress.** XPBD, two-field, PB-MPM, and seam-blend
+> experiments share a registry, renderer, and validation harness. The new `mac` solver
+> is a CPU reference for coupled water/bed motion, absorption, and extraction.
+> `mac_gpu` runs that model in WebGPU compute, with a coarse interactive V60 preset.
+> The previous MPM implementation remains on `origin/*`.
 
 ## Quick Start
 
@@ -22,7 +23,19 @@ Prerequisites: [Rust](https://rustup.rs/) and a GPU with a Metal/Vulkan/DX12 bac
 git clone https://github.com/craigxchen/coffee-sim.git
 cd coffee-sim
 cargo run --example phase0_noop   # headless Phase 0 demo (skips if no GPU adapter)
+cargo run --release --example mac_pourover # small MAC coffee+water reference brew (CPU)
 ```
+
+## Web app
+
+```bash
+wasm-pack build --target web --out-dir www/pkg
+python3 -m http.server 8080 --directory www
+```
+
+Open [the MAC WebGPU solver](http://localhost:8080/?solver=mac_gpu), or select
+**MAC porous mixture (WebGPU)** in the solver dropdown. See the
+[GPU backend notes](docs/plans/solver_mac_gpu.md) for validation and numerical limits.
 
 ## Development
 
@@ -49,4 +62,5 @@ Single crate; the repo root is the workspace + package. Modular blocks under `sr
 
 - [Architecture](docs/ARCHITECTURE.md) — authoritative top-level design.
 - [Sub-module plans](docs/plans/) — per-block detail.
+- [MAC porous-mixture reference](docs/plans/solver_mac.md) — independent `mac` solver, coupling equations, configuration, and validation limits.
 - [KEEP.md](KEEP.md) — salvaged reference values (calibration, units, geometry) from v1.

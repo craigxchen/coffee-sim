@@ -79,6 +79,8 @@ async function bootstrap() {
     await init();
     app = await CoffeeSimApp.create(canvas);
     app.loadCenterPour();
+    const requestedSolver = new URLSearchParams(location.search).get("solver");
+    if (requestedSolver) app.setSolver(requestedSolver);
     populateSolverSelect();
     syncControlDefaultsFromSim();
     applyWaterVelocityControl();
@@ -314,6 +316,13 @@ function updateFps(frameTime) {
 
 function syncUi() {
   if (!app) return;
+  canvas.dataset.physicsDispatches = String(app.computeDispatches());
+  const seconds = app.simulatedSeconds();
+  const progress = document.getElementById("simulation-progress");
+  progress.hidden = seconds < 0;
+  document.getElementById("simulation-seconds").textContent = `${seconds.toFixed(1)}s`;
+  const pending = app.pendingSeconds();
+  document.getElementById("simulation-backlog").textContent = pending > 0.05 ? `${pending.toFixed(1)}s queued` : "Up to date";
   particleLabel.textContent = app.particleCount().toLocaleString();
   waterVelocityValue.textContent = `${app.waterVelocityMetersPerSecond().toFixed(2)} m/s`;
   spoutHeightValue.textContent = Number(spoutHeightInput.value).toFixed(1);

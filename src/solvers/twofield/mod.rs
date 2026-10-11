@@ -1244,29 +1244,28 @@ impl TwofieldSolver {
     /// full ledger lands per frame. The caller (the seam) zeroes the ledger after the frame.
     pub fn attach_seam_reaction(&mut self, ledger: &wgpu::Buffer) {
         let layout = self.pipelines.seam_inject.0.get_bind_group_layout(0);
-        self.pipelines.seam_inject.1 =
-            self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("seam_inject"),
-                layout: &layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: self.params_buf.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 21,
-                        resource: self.grid_sm.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 28,
-                        resource: ledger.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 29,
-                        resource: self.seam_uni_buf.as_entire_binding(),
-                    },
-                ],
-            });
+        self.pipelines.seam_inject.1 = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("seam_inject"),
+            layout: &layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 21,
+                    resource: self.grid_sm.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 28,
+                    resource: ledger.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 29,
+                    resource: self.seam_uni_buf.as_entire_binding(),
+                },
+            ],
+        });
         self.seam_armed = true;
     }
 

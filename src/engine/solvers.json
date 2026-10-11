@@ -9,7 +9,11 @@
     "name": "No-op B",
     "paradigm": "ForceBased",
     "owns_grid": true,
-    "stability": { "CflLimited": { "c": 0.5 } }
+    "stability": {
+      "CflLimited": {
+        "c": 0.5
+      }
+    }
   },
   "xpbd": {
     "name": "XPBD (PBF water)",
@@ -21,18 +25,50 @@
     "name": "Two-field (water+solid grid)",
     "paradigm": "Hybrid",
     "owns_grid": true,
-    "stability": { "CflLimited": { "c": 0.5 } }
+    "stability": {
+      "CflLimited": {
+        "c": 0.5
+      }
+    }
   },
   "pbmpm": {
     "name": "PB-MPM (position-based)",
     "paradigm": "Hybrid",
     "owns_grid": true,
-    "stability": { "CflLimited": { "c": 0.5 } }
+    "stability": {
+      "CflLimited": {
+        "c": 0.5
+      }
+    }
+  },
+  "mac": {
+    "name": "MAC porous mixture (CPU reference)",
+    "paradigm": "Hybrid",
+    "owns_grid": true,
+    "stability": {
+      "CflLimited": {
+        "c": 0.35
+      }
+    }
   },
   "seam": {
     "name": "Seam blend (PB-MPM water + two-field bed)",
     "paradigm": "Hybrid",
     "owns_grid": true,
-    "stability": { "CflLimited": { "c": 0.5 } }
+    "stability": {
+      "CflLimited": {
+        "c": 0.5
+      }
+    }
+  },
+  "mac_gpu": {
+    "name": "MAC porous mixture (WebGPU)",
+    "paradigm": "Hybrid",
+    "owns_grid": true,
+    "stability": {
+      "CflLimited": {
+        "c": 0.35
+      }
+    }
   }
 }

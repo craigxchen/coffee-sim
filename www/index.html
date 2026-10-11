@@ -9,10 +9,10 @@
   <body>
     <main class="layout">
       <section class="sidebar">
-        <p class="eyebrow">Coffee Sim / XPBD</p>
+        <p class="eyebrow">Coffee Sim / WebGPU</p>
         <h1>V60 Pourover</h1>
         <p class="lede">
-          GPU XPBD fluid simulation with a V60 cone boundary and porous coffee bed.
+          Water and coffee simulation with a V60 dripper and porous coffee bed.
           Drag to orbit, scroll to zoom, and adjust water velocity to change the stream.
         </p>
         <div class="controls">
@@ -116,6 +116,10 @@
             </label>
           </div>
         </div>
+        <dl class="stats" id="simulation-progress" hidden>
+          <div><dt>Simulated</dt><dd id="simulation-seconds">0.0s</dd></div>
+          <div><dt>Progress</dt><dd id="simulation-backlog">Up to date</dd></div>
+        </dl>
         <dl class="stats">
           <div>
             <dt>Particles</dt>
@@ -132,7 +136,7 @@
             <dd id="extraction-yield">0.0%</dd>
           </div>
           <div>
-            <dt>Cup TDS</dt>
+            <dt>Water TDS</dt>
             <dd id="cup-tds">0.00%</dd>
           </div>
           <div>

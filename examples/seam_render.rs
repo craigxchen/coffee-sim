@@ -125,7 +125,11 @@ fn main() {
             }
             let path = format!("/tmp/seam-m0/frame_{frame:04}.ppm");
             std::fs::write(&path, ppm).unwrap();
-            eprintln!("wrote {path} ({} water + {} grains)", seam.water_count(), seam.solid_count());
+            eprintln!(
+                "wrote {path} ({} water + {} grains)",
+                seam.water_count(),
+                seam.solid_count()
+            );
         }
     }
 }

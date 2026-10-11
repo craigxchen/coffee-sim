@@ -19,6 +19,8 @@ pub struct ParticleBuffers {
     pub phase_tag: Option<Arc<Buffer>>,
     pub concentration: Option<Arc<Buffer>>,
     pub temperature: Option<Arc<Buffer>>,
+    /// Optional normalized grain moisture (one f32 per particle). When absent, legacy
+    /// renderers derive it from position.w and the material's uniform capacity.
     pub moisture: Option<Arc<Buffer>>,
     /// Optional sampled fields for debug overlays.
     pub alpha_s: Option<Arc<Buffer>>,

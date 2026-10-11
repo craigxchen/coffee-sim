@@ -10,6 +10,9 @@
 pub struct Config {
     pub seed: u64,
 
+    /// Numerics for the independent MAC porous-mixture reference solver.
+    pub mac: crate::solvers::mac::MacConfig,
+
     /// Sub-steps per frame (smaller sub-`dt`); raise only if the CFL/displacement gate trips.
     pub substeps: u32,
 
@@ -241,6 +244,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            mac: crate::solvers::mac::MacConfig::default(),
             seed: 0x00C0_FFEE_5EED,
             substeps: 1,
             min_iters: 1,

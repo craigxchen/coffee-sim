@@ -28,6 +28,7 @@ fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
 /// The exact `g2p_water` U2 strength curve, given the gathered per-particle state and the
 /// `flip` lanes `(c_surface, density_gate, div_scale, _)`. `particle_mass` matches the shader's
 /// `params.particle_mass`. Returns `(c, affine_keep)`.
+#[allow(clippy::too_many_arguments)] // Keep this test oracle's inputs aligned with the shader.
 fn dissipation_c(
     v_own: [f32; 3],
     v_grid: [f32; 3],

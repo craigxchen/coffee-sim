@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use crate::engine::scene::Scene;
 use crate::models::Materials;
 use crate::solvers::base::{Solver, SolverInfo};
+use crate::solvers::mac::MacSolver;
 use crate::solvers::noop::{NoopSolverA, NoopSolverB};
 use crate::solvers::pbmpm::PbmpmSolver;
 use crate::solvers::seam::SeamSolver;
@@ -29,6 +30,8 @@ pub enum SolverId {
     Twofield,
     Pbmpm,
     Seam,
+    Mac,
+    MacGpu,
 }
 
 impl SolverId {
@@ -40,6 +43,8 @@ impl SolverId {
             SolverId::Twofield => "twofield",
             SolverId::Pbmpm => "pbmpm",
             SolverId::Seam => "seam",
+            SolverId::Mac => "mac",
+            SolverId::MacGpu => "mac_gpu",
         }
     }
 
@@ -52,6 +57,8 @@ impl SolverId {
             SolverId::Twofield,
             SolverId::Pbmpm,
             SolverId::Seam,
+            SolverId::Mac,
+            SolverId::MacGpu,
         ]
     }
 }
@@ -99,6 +106,10 @@ pub fn build_solver(
         SolverId::Twofield => Box::new(TwofieldSolver::build(scene, mats, cfg, gpu)),
         SolverId::Pbmpm => Box::new(PbmpmSolver::build(scene, mats, cfg, gpu)),
         SolverId::Seam => Box::new(SeamSolver::build(scene, mats, cfg, gpu)),
+        SolverId::Mac => Box::new(MacSolver::build(scene, mats, cfg, gpu)),
+        SolverId::MacGpu => Box::new(crate::solvers::mac_gpu::MacGpuSolver::build(
+            scene, mats, cfg, gpu,
+        )),
     }
 }
 

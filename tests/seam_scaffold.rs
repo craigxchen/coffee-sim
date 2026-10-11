@@ -230,7 +230,8 @@ fn seam_inject_placement_moves_the_bed() {
     for n in 0..nodes {
         data[n * 4 + 1] = (200.0 * coffee_sim::solvers::pbmpm::SEAM_IMPULSE_SCALE) as i32;
     }
-    gpu.queue.write_buffer(&reaction, 0, bytemuck::cast_slice(&data));
+    gpu.queue
+        .write_buffer(&reaction, 0, bytemuck::cast_slice(&data));
     seam.step(DT, &EmissionInput::default());
     let kicked = mean_vy(&seam);
     assert!(
@@ -309,8 +310,16 @@ fn merged_render_buffers_compose_both_sets() {
     assert_eq!(phases.len(), particles.particle_count as usize);
     let water_tags = phases.iter().filter(|&&p| p == 0).count() as u32;
     let grain_tags = phases.iter().filter(|&&p| p == 1).count() as u32;
-    assert_eq!(water_tags, seam.water_count(), "water phase tags round-trip");
-    assert_eq!(grain_tags, seam.solid_count(), "grain phase tags round-trip");
+    assert_eq!(
+        water_tags,
+        seam.water_count(),
+        "water phase tags round-trip"
+    );
+    assert_eq!(
+        grain_tags,
+        seam.solid_count(),
+        "grain phase tags round-trip"
+    );
     let pos = seam.read_render_positions_for_test();
     assert!(
         pos.iter().all(|p| p.iter().all(|x| x.is_finite())),

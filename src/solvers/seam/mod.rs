@@ -150,11 +150,16 @@ impl SeamSolver {
         }
         let wp = self.water.particles();
         let bp = self.bed.particles();
-        let lanes: [(&Option<Arc<wgpu::Buffer>>, &Option<Arc<wgpu::Buffer>>, &Arc<wgpu::Buffer>, u64); 4] = [
+        let lanes = [
             (&wp.position, &bp.position, &self.render_pos, VEC4),
             (&wp.velocity, &bp.velocity, &self.render_vel, VEC4),
             (&wp.phase_tag, &bp.phase_tag, &self.render_phase, U32S),
-            (&wp.concentration, &bp.concentration, &self.render_chem, VEC4),
+            (
+                &wp.concentration,
+                &bp.concentration,
+                &self.render_chem,
+                VEC4,
+            ),
         ];
         for (water_src, bed_src, dst, stride) in lanes {
             if wc > 0 {
@@ -206,8 +211,7 @@ impl SeamSolver {
     /// live and count on the water side; credit lands in the same transaction as removal,
     /// so nothing is ever double-counted at a frame boundary. Dev/test — stalls on readback.
     pub fn water_books(&self) -> (f32, f32) {
-        let emitted_vol =
-            self.water.total_emitted_water_mass() / self.particle_mass * self.v_w;
+        let emitted_vol = self.water.total_emitted_water_mass() / self.particle_mass * self.v_w;
         let live_vol = self.water.active_count() as f32 * self.v_w;
         let pos = self.bed.read_positions();
         let phases = self.bed.read_phases();
@@ -641,9 +645,11 @@ impl Solver for SeamSolver {
             self.queue.submit(Some(enc.finish()));
             self.seam_dispatches += 2;
             let (tx, rx) = std::sync::mpsc::channel();
-            self.marks_staging.slice(..).map_async(wgpu::MapMode::Read, move |r| {
-                let _ = tx.send(r);
-            });
+            self.marks_staging
+                .slice(..)
+                .map_async(wgpu::MapMode::Read, move |r| {
+                    let _ = tx.send(r);
+                });
             self.pending = Some(rx);
         }
 
@@ -681,7 +687,11 @@ impl Solver for SeamSolver {
         let w = self.water.profile();
         let b = self.bed.profile();
         let mut passes = Vec::with_capacity(w.passes.len() + b.passes.len());
-        passes.extend(w.passes.into_iter().map(|(l, us)| (format!("water/{l}"), us)));
+        passes.extend(
+            w.passes
+                .into_iter()
+                .map(|(l, us)| (format!("water/{l}"), us)),
+        );
         passes.extend(b.passes.into_iter().map(|(l, us)| (format!("bed/{l}"), us)));
         Profile {
             passes,

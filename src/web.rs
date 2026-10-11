@@ -304,6 +304,21 @@ impl CoffeeSimApp {
         self.solver.metrics().particle_count
     }
 
+    /// Actual compute dispatch count from the active solver, for browser verification.
+    #[wasm_bindgen(js_name = computeDispatches)]
+    pub fn compute_dispatches(&self) -> u32 {
+        self.solver.profile().dispatches_per_frame
+    }
+
+    #[wasm_bindgen(js_name = simulatedSeconds)]
+    pub fn simulated_seconds(&self) -> f32 {
+        self.solver.simulation_progress().map_or(-1.0, |p| p.0)
+    }
+    #[wasm_bindgen(js_name = pendingSeconds)]
+    pub fn pending_seconds(&self) -> f32 {
+        self.solver.simulation_progress().map_or(0.0, |p| p.1)
+    }
+
     // --- scorecard metrics (cached; refreshed by the async sample path, U4) ---
 
     #[wasm_bindgen(js_name = extractionYield)]
@@ -337,6 +352,10 @@ impl CoffeeSimApp {
         configure_renderer(&mut self.renderer, &mats);
         self.renderer.set_solids(&scene.solids); // refresh the cone / cup wireframe for the new scene
         self.camera = OrbitCamera::framing(Vec3::from(scene.box_min), Vec3::from(scene.box_max));
+        if self.solver_id == SolverId::MacGpu && !scene.solids.is_empty() {
+            self.camera.target.y = -2.0;
+            self.camera.distance *= 0.7;
+        }
         self.scene_kind = kind;
         self.scene = scene;
         self.mats = mats;
@@ -352,6 +371,36 @@ impl CoffeeSimApp {
 /// dynamic-pressure impact pass. The non-coffee debug scenes keep the lighter water-only presets.
 fn setup_for(kind: WebScene, solver_id: SolverId) -> (Scene, Materials, Config) {
     let scene = kind.build();
+    if solver_id == SolverId::MacGpu {
+        // Resolved coarse parcels for interactive WebGPU validation, with consistent
+        // water density and dry-grain masses (not the legacy XPBD mass scaling).
+        let mats = Materials {
+            particle_spacing: 0.4,
+            particle_mass: 0.4_f32.powi(3),
+            support_radius: 0.8,
+            grain_diameter: 0.8,
+            grain_mass: 0.4,
+            ..Materials::default()
+        };
+        let mut cfg = Config {
+            absorb_rate: 0.5,
+            extract_rate: 1.0,
+            drag_scale: 0.005,
+            nozzle_radius: 0.35,
+            seed_jitter: 0.0,
+            ..Config::default()
+        };
+        cfg.mac.cell_size = 0.8;
+        cfg.mac.contact_iterations = 24;
+        cfg.mac.gpu_particle_capacity = 4096;
+        if kind == WebScene::UniformBedSaturation {
+            cfg.mac.initial_moisture = 1.0;
+        }
+        if kind == WebScene::PermeabilityComparison {
+            cfg.drag_scale *= 4.0;
+        }
+        return (scene, mats, cfg);
+    }
     let twofield = solver_id == SolverId::Twofield;
     match kind {
         // --- main "Scenes" tab + filter/bed debug scenes (full V60 dripper, bed present) ---
@@ -529,6 +578,7 @@ fn v60_water_setup(twofield: bool) -> (Materials, Config) {
 
 /// Apply the per-material render look (grain radius scale + moisture tint).
 fn configure_renderer(renderer: &mut Renderer, mats: &Materials) {
+    renderer.set_particle_radius(0.5 * mats.particle_spacing);
     renderer.set_grain_radius_scale(mats.grain_diameter / mats.particle_spacing);
     let v_cap =
         mats.r_max * mats.rho_ratio * std::f32::consts::FRAC_PI_6 * mats.grain_diameter.powi(3);

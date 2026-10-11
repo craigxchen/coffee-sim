@@ -16,6 +16,73 @@ const SIZE: u32 = 256;
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 
 #[test]
+fn mac_reference_uses_the_existing_renderer() {
+    let Some(gpu) = GpuContext::new_headless() else {
+        eprintln!("MAC render smoke: no GPU adapter; skipping.");
+        return;
+    };
+    let scene = Scene {
+        box_max: [4.0; 3],
+        regions: vec![coffee_sim::engine::scene::SeedRegion {
+            min: [1.0; 3],
+            max: [3.0; 3],
+            species: coffee_sim::engine::scene::Species::Water,
+        }],
+        ..Scene::default()
+    };
+    let mut solver = coffee_sim::solvers::mac::MacSolver::build(
+        &scene,
+        &Materials::default(),
+        &Config::default(),
+        &gpu,
+    );
+    solver.step(1.0 / 60.0, &EmissionInput::default());
+    let mut renderer = Renderer::new(&gpu, FORMAT, (SIZE, SIZE), 0.3);
+    renderer.set_gizmo_enabled(false);
+    renderer.set_cross_section_enabled(false);
+    let camera = OrbitCamera::framing(Vec3::from(scene.box_min), Vec3::from(scene.box_max));
+    let drawn = render_and_count(&gpu, &renderer, &solver.particles(), &camera, SIZE);
+    assert!(drawn > 100, "MAC particles did not render: {drawn} pixels");
+}
+
+#[test]
+fn solver_moisture_tint_does_not_depend_on_a_global_absorption_capacity() {
+    let Some(gpu) = GpuContext::new_headless() else {
+        eprintln!("MAC moisture render smoke: no GPU adapter; skipping.");
+        return;
+    };
+    let scene = Scene {
+        box_max: [4.0; 3],
+        regions: vec![coffee_sim::engine::scene::SeedRegion {
+            min: [1.0; 3],
+            max: [3.0; 3],
+            species: coffee_sim::engine::scene::Species::Grain,
+        }],
+        ..Scene::default()
+    };
+    let mut cfg = Config::default();
+    let dry = coffee_sim::solvers::mac::MacSolver::build(&scene, &Materials::default(), &cfg, &gpu);
+    cfg.mac.initial_moisture = 1.0;
+    let wet = coffee_sim::solvers::mac::MacSolver::build(&scene, &Materials::default(), &cfg, &gpu);
+    let mut renderer = Renderer::new(&gpu, FORMAT, (SIZE, SIZE), 0.3);
+    renderer.set_gizmo_enabled(false);
+    renderer.set_cross_section_enabled(false);
+    renderer.set_moisture_scale(0.0); // explicit solver state must still show wet grains
+    let camera = OrbitCamera::framing(Vec3::from(scene.box_min), Vec3::from(scene.box_max));
+    let a = render_rgba(&gpu, &renderer, &dry.particles(), &camera, SIZE);
+    let b = render_rgba(&gpu, &renderer, &wet.particles(), &camera, SIZE);
+    let changed = a
+        .chunks_exact(4)
+        .zip(b.chunks_exact(4))
+        .filter(|(a, b)| a != b)
+        .count();
+    assert!(
+        changed > 100,
+        "normalized moisture did not change grain appearance"
+    );
+}
+
+#[test]
 fn renders_a_frame_offscreen() {
     let Some(gpu) = GpuContext::new_headless() else {
         eprintln!("render_smoke: no GPU adapter; skipping.");

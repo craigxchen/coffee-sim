@@ -66,6 +66,12 @@ pub trait Solver {
     /// Brew-outcome metrics (yield, TDS, drawdown, evenness).
     fn metrics(&self) -> Metrics;
 
+    /// Optional actual simulated time and queued time for an adaptive GPU scheduler.
+    /// The second value exposes overload without forcing a synchronous readback.
+    fn simulation_progress(&self) -> Option<(f32, f32)> {
+        None
+    }
+
     /// Per-pass GPU timestamps + dispatches-per-frame.
     fn profile(&self) -> Profile;
 }

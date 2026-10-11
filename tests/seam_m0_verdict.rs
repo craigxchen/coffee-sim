@@ -38,7 +38,8 @@ fn water_stats(seam: &SeamSolver) -> (f64, f32, f64) {
     let mut min_y = f32::INFINITY;
     for i in 0..live {
         py += vel[i][1] as f64;
-        ke += 0.5 * ((vel[i][0] * vel[i][0] + vel[i][1] * vel[i][1] + vel[i][2] * vel[i][2]) as f64);
+        ke +=
+            0.5 * ((vel[i][0] * vel[i][0] + vel[i][1] * vel[i][1] + vel[i][2] * vel[i][2]) as f64);
         min_y = min_y.min(pos[i][1]);
     }
     (py, min_y, ke / live.max(1) as f64)

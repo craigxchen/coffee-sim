@@ -88,7 +88,11 @@ fn pond_over_half_saturated_bed_transfers_exactly() {
 
     for frame in 0..900 {
         seam.step(DT, &EmissionInput::default());
-        assert_eq!(seam.bed_water_count(), 0, "cost-cliff invariant (frame {frame})");
+        assert_eq!(
+            seam.bed_water_count(),
+            0,
+            "cost-cliff invariant (frame {frame})"
+        );
         if frame % 150 == 149 {
             // Books hold at every sampled frame boundary, INCLUDING mid-transfer.
             let (_, t) = seam.water_books();
@@ -134,8 +138,7 @@ fn pond_over_half_saturated_bed_transfers_exactly() {
     );
     assert!(seam.absorbed_total() > 0.0);
     // The handoff ledger agrees with the particle count it consumed.
-    let consumed = (seed_water - seam.water_count()) as f32
-        * mats.particle_spacing.powi(3);
+    let consumed = (seed_water - seam.water_count()) as f32 * mats.particle_spacing.powi(3);
     assert!(
         (seam.absorbed_total() - consumed).abs() <= 1e-3 * consumed.max(1e-6),
         "absorbed_total {} != consumed particle volume {consumed}",

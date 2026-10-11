@@ -78,8 +78,8 @@ fn main() {
             // Vertical histogram over the bed band [-10, -7): 12 quarter-unit bins — shows
             // WHERE water sits (a plateau at the surface skin = blocked; uniform fill = leak).
             let mut bins = [0u32; 12];
-            for i in 0..live {
-                let y = pos[i][1];
+            for p in pos.iter().take(live) {
+                let y = p[1];
                 if (-10.0..-7.0).contains(&y) {
                     bins[(((y + 10.0) * 4.0) as usize).min(11)] += 1;
                 }

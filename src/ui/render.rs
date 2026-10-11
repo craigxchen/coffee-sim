@@ -35,7 +35,7 @@ struct CameraUniform {
     right: [f32; 4],
     up: [f32; 4],
     params: [f32; 4], // x = radius, y = inv color-max-speed
-    clip: [f32; 4],   // x = z_center, y = half_width, z = slab-enabled (>0.5), w = unused
+    clip: [f32; 4],   // x = z_center, y = half_width, z = slab-enabled, w = normalized moisture
 }
 
 #[repr(C)]
@@ -124,6 +124,7 @@ impl Renderer {
                 storage_read_entry(1, wgpu::ShaderStages::VERTEX),
                 storage_read_entry(2, wgpu::ShaderStages::VERTEX),
                 storage_read_entry(3, wgpu::ShaderStages::VERTEX),
+                storage_read_entry(4, wgpu::ShaderStages::VERTEX),
             ],
         });
         let particle_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -373,8 +374,12 @@ impl Renderer {
         (x, y, w, h)
     }
 
-    /// Set the render-radius multiplier for grain particles (1.0 = same as water). Use when grains
-    /// are coarser than the water (e.g. a porous sand wall) so they draw at their true size.
+    /// Update particle size when switching to a solver with a different parcel spacing.
+    pub fn set_particle_radius(&mut self, radius: f32) {
+        self.radius = radius.max(0.0);
+    }
+
+    /// Set the render-radius multiplier for grains relative to water.
     pub fn set_grain_radius_scale(&mut self, scale: f32) {
         self.grain_radius_scale = scale;
     }
@@ -414,7 +419,16 @@ impl Renderer {
                 self.grain_radius_scale,
                 self.moisture_inv_cap,
             ],
-            clip: [0.0; 4], // main pass: slab clip disabled
+            clip: [
+                0.0,
+                0.0,
+                0.0,
+                if particles.moisture.is_some() {
+                    1.0
+                } else {
+                    0.0
+                },
+            ],
         };
         self.queue
             .write_buffer(&self.camera_buf, 0, bytemuck::bytes_of(&cam_u));
@@ -456,7 +470,7 @@ impl Renderer {
             right: [1.0, 0.0, 0.0, 0.0],
             up: [0.0, 1.0, 0.0, 0.0],
             params: cam_u.params,
-            clip: [0.0, CROSS_HALF_WIDTH, 1.0, 0.0], // z_center=0, half_width, slab enabled
+            clip: [0.0, CROSS_HALF_WIDTH, 1.0, cam_u.clip[3]],
         };
         self.queue
             .write_buffer(&self.xsection_buf, 0, bytemuck::bytes_of(&xs_u));
@@ -489,6 +503,15 @@ impl Renderer {
                             wgpu::BindGroupEntry {
                                 binding: 3,
                                 resource: phase.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 4,
+                                // The fallback buffer is never sampled: clip.w is zero.
+                                resource: particles
+                                    .moisture
+                                    .as_ref()
+                                    .unwrap_or(pos)
+                                    .as_entire_binding(),
                             },
                         ],
                     })

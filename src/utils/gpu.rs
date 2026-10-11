@@ -8,11 +8,12 @@ use wgpu::{Adapter, Device, Instance, Queue};
 /// Wraps the `wgpu` device + queue and the data needed to create resources.
 ///
 /// Targets the WebGPU baseline limits except `max_storage_buffers_per_shader_stage`, which is raised
-/// to **9** — the count the boundary-force density passes bind (the spec baseline is 8; modern
-/// browsers and native both grant ≥9). Requested as a fixed value, not from `adapter.limits()` (which
+/// to **9**, within the repository
+/// ceiling of 16 (the WebGPU spec baseline is 8). Requested as a fixed value, not from `adapter.limits()` (which
 /// wgpu's web backend over-reports, breaking `request_device`). Requests `TIMESTAMP_QUERY` only when
 /// the adapter advertises it. Headless for now: no surface (rendering arrives with `ui`). The same
 /// request path compiles to WASM + WebGPU — native only wraps the async init in `pollster::block_on`.
+#[derive(Clone)]
 pub struct GpuContext {
     pub instance: Instance,
     pub adapter: Adapter,
@@ -105,12 +106,9 @@ impl GpuContext {
             wgpu::Features::empty()
         };
 
-        // The boundary-force density passes (compute_lambda / compute_dp) bind 9 storage buffers per
-        // stage — one above the WebGPU spec baseline of 8. Request EXACTLY that, as a fixed value:
-        // modern browsers grant ≥10 (confirmed via navigator.gpu) and native Metal grants 16+, so 9
-        // is always within range. NOTE: do NOT derive this from `adapter.limits()` — wgpu's web
-        // backend over-reports that field, so requesting it makes request_device fail in the browser
-        // ("Device failed at creation"). All other limits stay at the WebGPU baseline for portability.
+        // Existing XPBD passes need nine storage buffers; MAC uses at most seven.
+        // Request only what we use, within the repository ceiling of 16 and Chrome
+        // adapters that expose 10. All other limits stay at the WebGPU baseline.
         const NEEDED_STORAGE_BUFFERS: u32 = 9;
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {

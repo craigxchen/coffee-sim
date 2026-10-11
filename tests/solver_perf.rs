@@ -446,18 +446,30 @@ fn seam_m0_r5_perf_verdict() {
 
     // Arm A — anchor on the pinned original composition.
     let mut a = PbmpmSolver::build(&water_impact_scene(EDGE_200K), &mats, &cfg, &gpu);
-    let m_a = measure_arm(&gpu, &pour_a, &mut a, |s, d| s.step(DT, d), |s| {
-        s.sample_diagnostics();
-        s.profile().total_micros()
-    });
+    let m_a = measure_arm(
+        &gpu,
+        &pour_a,
+        &mut a,
+        |s, d| s.step(DT, d),
+        |s| {
+            s.sample_diagnostics();
+            s.profile().total_micros()
+        },
+    );
 
     // Arm A′ — pbmpm solo on the seam scene (it ignores the grain region; identical grid to C).
     let seam_scene = seam_perf_scene();
     let mut ap = PbmpmSolver::build(&seam_scene, &mats, &cfg, &gpu);
-    let m_ap = measure_arm(&gpu, &pour_seam, &mut ap, |s, d| s.step(DT, d), |s| {
-        s.sample_diagnostics();
-        s.profile().total_micros()
-    });
+    let m_ap = measure_arm(
+        &gpu,
+        &pour_seam,
+        &mut ap,
+        |s, d| s.step(DT, d),
+        |s| {
+            s.sample_diagnostics();
+            s.profile().total_micros()
+        },
+    );
     assert!(
         ap.active_count() >= 185_000,
         "composition guard: water N {} < 185k",
@@ -478,27 +490,38 @@ fn seam_m0_r5_perf_verdict() {
         b.active_count()
     );
     let quiet = EmissionInput::default();
-    let m_b = measure_arm(&gpu, &quiet, &mut b, |s, d| s.step(DT, d), move |s| {
-        s.sample_diagnostics();
-        s.profile().total_micros() * b_sub
-    });
+    let m_b = measure_arm(
+        &gpu,
+        &quiet,
+        &mut b,
+        |s, d| s.step(DT, d),
+        move |s| {
+            s.sample_diagnostics();
+            s.profile().total_micros() * b_sub
+        },
+    );
 
     // Arm C — the seam.
     let mut c = SeamSolver::build(&seam_scene, &mats, &cfg, &gpu);
     let c_sub = c.bed_substeps_for_dt(DT) as f32;
-    let m_c = measure_arm(&gpu, &pour_seam, &mut c, |s, d| s.step(DT, d), move |s| {
-        s.sample_diagnostics();
-        let prof = s.profile();
-        let mut us = 0.0;
-        for (l, v) in &prof.passes {
-            us += if l.starts_with("bed/") { v * c_sub } else { *v };
-        }
-        us
-    });
+    let m_c = measure_arm(
+        &gpu,
+        &pour_seam,
+        &mut c,
+        |s, d| s.step(DT, d),
+        move |s| {
+            s.sample_diagnostics();
+            let prof = s.profile();
+            let mut us = 0.0;
+            for (l, v) in &prof.passes {
+                us += if l.starts_with("bed/") { v * c_sub } else { *v };
+            }
+            us
+        },
+    );
 
     let coexist = m_c.gpu_ms - (m_ap.gpu_ms + m_b.gpu_ms);
-    let seam_extra =
-        ((m_c.wall_ms - m_c.gpu_ms) - (m_ap.wall_ms - m_ap.gpu_ms)).max(0.0);
+    let seam_extra = ((m_c.wall_ms - m_c.gpu_ms) - (m_ap.wall_ms - m_ap.gpu_ms)).max(0.0);
     let total = m_c.gpu_ms + seam_extra;
     println!(
         "R5: A(anchor) gpu {:.2} wall {:.2} | A' gpu {:.2} wall {:.2} | B gpu {:.2} wall {:.2} (sub {b_sub}) | C gpu {:.2} wall {:.2} (bed sub {c_sub})",
@@ -524,7 +547,13 @@ fn seam_m0_r5_perf_verdict() {
         coexist * 18.83 / m_a.gpu_ms,
         total * 18.83 / m_a.gpu_ms
     );
-    assert!(coexist <= 2.0, "R5 in-GPU coexistence {coexist:.2} ms > 2.0");
-    assert!(seam_extra <= 1.5, "R5 seam machinery {seam_extra:.2} ms > 1.5");
+    assert!(
+        coexist <= 2.0,
+        "R5 in-GPU coexistence {coexist:.2} ms > 2.0"
+    );
+    assert!(
+        seam_extra <= 1.5,
+        "R5 seam machinery {seam_extra:.2} ms > 1.5"
+    );
     assert!(total <= 22.5, "R5 total {total:.2} ms > 22.5");
 }
