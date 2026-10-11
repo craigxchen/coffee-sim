@@ -131,6 +131,8 @@ pub(crate) struct CommonMetrics {
     pub(crate) diagnostics_all_finite: bool,
     pub(crate) diagnostics_pending: bool,
     pub(crate) diagnostics_sample_age_s: f32,
+    pub(crate) diagnostics_sample_generation: u64,
+    pub(crate) diagnostics_sample_time_s: f32,
     pub(crate) dispatches_per_frame: u32,
     pub(crate) nonfinite_particle_count: u32,
     pub(crate) nonfinite_grid_node_count: u32,
@@ -143,6 +145,8 @@ pub(crate) struct CommonMetrics {
     pub(crate) mobile_carrier_mass_g: f32,
     pub(crate) paper_carrier_mass_g: f32,
     pub(crate) bound_carrier_mass_g: f32,
+    pub(crate) bed_pore_carrier_mass_g: f32,
+    pub(crate) dry_coffee_mass_g: f32,
     pub(crate) total_carrier_mass_g: f32,
     pub(crate) mobile_carrier_volume_ml: f32,
     pub(crate) paper_carrier_volume_ml: f32,
@@ -164,6 +168,16 @@ pub(crate) struct CommonMetrics {
     pub(crate) carrier_mass_residual_g: f32,
     pub(crate) solute_mass_residual_g: f32,
     pub(crate) mechanical_mass_residual_g: f32,
+    pub(crate) total_enthalpy: f32,
+    pub(crate) expected_enthalpy: f32,
+    pub(crate) enthalpy_residual: f32,
+    pub(crate) pressure_residual_pre_rms: f32,
+    pub(crate) pressure_residual_post_rms: f32,
+    pub(crate) pressure_residual_post_max: f32,
+    pub(crate) pressure_residual_ratio: f32,
+    pub(crate) pressure_residual_cell_count: u32,
+    pub(crate) outlet_evenness_valid: bool,
+    pub(crate) outlet_evenness: f32,
     /// Build-time whole-bed retention ledger. These are water-mass equivalents of the solver's
     /// reduced-volume allocation; filter-paper water is reported separately below.
     pub(crate) retention_target_carrier_mass_g: f32,
@@ -186,6 +200,36 @@ pub(crate) struct CommonMetrics {
     pub(crate) filter_errors: u32,
     pub(crate) filter_beta_max_per_s: f32,
     pub(crate) filter_pressure_mobility_min: f32,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct DiagnosticsTicket {
+    pub(crate) request_id: u64,
+    pub(crate) generation: u64,
+    pub(crate) sim_time_bits: u32,
+}
+
+impl DiagnosticsTicket {
+    pub(crate) fn new(request_id: u64, generation: u64, sim_time_s: f32) -> Self {
+        Self {
+            request_id,
+            generation,
+            sim_time_bits: sim_time_s.to_bits(),
+        }
+    }
+
+    pub(crate) fn sim_time_s(self) -> f32 {
+        f32::from_bits(self.sim_time_bits)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum DiagnosticsPoll {
+    #[default]
+    Unsupported,
+    Pending(DiagnosticsTicket),
+    Ready(DiagnosticsTicket),
+    Superseded(DiagnosticsTicket),
 }
 
 pub(crate) struct FrameSnapshot<'a> {
@@ -245,6 +289,15 @@ pub(crate) trait FrameSolver {
     }
     fn reset_calibration_defaults(&mut self, _ctx: ResetContext<'_>) -> Result<bool, String> {
         Err("active solver does not support calibration controls".to_string())
+    }
+    fn request_diagnostics_snapshot(
+        &mut self,
+        _ctx: ResetContext<'_>,
+    ) -> Result<DiagnosticsTicket, String> {
+        Err("active solver does not support explicit diagnostics".to_string())
+    }
+    fn poll_diagnostics(&mut self) -> DiagnosticsPoll {
+        DiagnosticsPoll::Unsupported
     }
     #[cfg(target_arch = "wasm32")]
     fn metrics_buffer(&self) -> Option<wgpu::Buffer> {

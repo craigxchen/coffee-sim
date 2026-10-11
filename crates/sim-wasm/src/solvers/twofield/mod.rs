@@ -774,9 +774,11 @@ const _: () = assert!(std::mem::size_of::<Params>() == 400);
 struct DiagnosticsConfig {
     cup0: [f32; 4], // (center x, center z, radius, minimum y)
     cup1: [f32; 4], // (maximum y, enabled, seeded bed top, reserved)
+    bed0: [f32; 4], // (minimum x, maximum x, minimum z, maximum z)
+    bed1: [f32; 4], // (minimum y, maximum y, outlet half-band in cell widths, valid)
 }
 
-const _: () = assert!(std::mem::size_of::<DiagnosticsConfig>() == 32);
+const _: () = assert!(std::mem::size_of::<DiagnosticsConfig>() == 64);
 
 /// Compact GPU result mirrored by `diagnostics.wgsl::DiagnosticsOutput`. These are primitive
 /// extensive sums; solution/grain totals and conservation residuals are derived on the CPU so
@@ -789,12 +791,20 @@ struct DiagnosticsGpu {
     grain: [f32; 4],
     cup: [f32; 4],
     grid: [f32; 4],
+    pressure: [f32; 4],
+    pressure_ext: [f32; 4],
+    even0: [f32; 4],
+    even1: [f32; 4],
+    even2: [f32; 4],
+    even3: [f32; 4],
     counts: [u32; 4],
     filter0: [u32; 4],
     filter1: [u32; 4],
+    meta: [u32; 4],
+    reserved: [f32; 4],
 }
 
-const _: () = assert!(std::mem::size_of::<DiagnosticsGpu>() == 128);
+const _: () = assert!(std::mem::size_of::<DiagnosticsGpu>() == 256);
 
 /// GPU record for one static SDF solid — byte-identical to the WGSL `Primitive` (64 bytes,
 /// vec4-aligned; mirrors the xpbd packing of `utils::sdf` primitives). Cone radii in `a` are
