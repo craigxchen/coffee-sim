@@ -57,10 +57,10 @@ struct Params {
                      //  (wall_coverage in pressure.wgsl — the embedded-boundary L1 path). (Formerly
                      //  a dropped relief dead-band; the settled-pool stirring fix is the G2P PIC
                      //  blend PIC_BLEND_DEFAULT.) .z = temper-K rate divisor for the uncapped path
-                     //  (0 ⇒ K=1 full uncap; legacy cap 30; sweet spot K∈(1,30)). .w = uncapped two-sided
-                     //  density-target mode (≤ 0.5 → legacy rate-limited two-sided relief, default
-                     //  & byte-identical; > 0.5 → relief uncapped to full strength, driving ρ→ρ₀
-                     //  — the over-pack fix; see cell_classify in pressure.wgsl / surface.wgsl).
+                     //  (0 ⇒ K=1 full uncap; legacy cap 30; sweet spot K∈(1,30)). .w = full two-sided
+                     //  density-target mode (≤ 0.5 → rate-limited relief for coupled beds;
+                     //  > 0.5 → full-strength relief for uncoupled open water, driving ρ→ρ₀;
+                     //  see cell_classify in pressure.wgsl / surface.wgsl).
     flip: vec4<f32>, // U1 surface-weighted dissipation knob (g2p_water, transfers.wgsl):
                      //  (c_surface, density_gate, div_scale, water_splash_cap). DISABLED default —
                      //  c_surface = 1.0 ⇒ v = v_grid = pure-PIC; div_scale ≤ 0 ⇒ merge discriminator
@@ -257,6 +257,10 @@ const FILTER_OVERFLOW: u32 = 3u;
 const FILTER_ERRORS: u32 = 4u;
 const FILTER_STATE_SLOTS: u32 = 5u;
 const FILTER_VOLUME_SCALE: f32 = 268435456.0; // 2^28, mirrored by Rust
+// Paper-held water is a sub-grid reservoir state, not a resolved free-water particle. Park its
+// canonical position below the render domain while cmat row 0 preserves the paper crossing point
+// used by filter_release. This is the same finite sentinel as Rust's dormant-pool initialization.
+const DORMANT_PARK_Y: f32 = -1.0e9;
 @group(0) @binding(30) var<storage, read_write> filter_state: array<atomic<u32>>;
 
 // Frame-start dry-solid reference grid (mass, pure APIC momentum.xyz). Unlike grid_sm this field

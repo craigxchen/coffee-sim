@@ -177,6 +177,12 @@ const DENSITY_TARGET_DEADBAND: f32 = 0.0;
 // Free-surface fill-fraction constants (header: FREE SURFACE; mirrored in twofield/mod.rs).
 const SURF_FULL_FRAC: f32 = 0.5;
 const SURF_MIN_CORNER: f32 = 0.1;
+// At h = 2*particle_spacing, one fully occupied cell represents 2^3 = 8 particles. The full
+// density-target path uses this geometry-derived occupancy to recover an incrementally poured
+// wall layer that is compressed below one cell before any ordinary min-corner row can form.
+// Sparse stream/droplet cells stay ballistic; the coupled rate-limited path is unchanged.
+const FULL_CELL_PARTICLE_COUNT: u32 = 8u;
+const CUT_CELL_CENTER_BAND_IN_CELLS: f32 = 0.5;
 const NODE_BC_EPS: f32 = 1.0e-4;     // box-face epsilon (matches grid_update)
 const SDF_NORMAL_MIN: f32 = 1.0e-3;  // degenerate orthogonalized-normal guard
 // WATER SDF no-penetration band in cell sizes: a fluid node within WALL_BAND·h on the cavity
@@ -628,9 +634,16 @@ fn classify_cell(c: u32) {
     let h3 = h * h * h;
     let rho = mass / (max(cnt, 1.0) * h3);
     var f = clamp(rho / (SURF_FULL_FRAC * params.extra.x), 0.0, 1.0);
-    if (cnt == 0.0 || mmin < SURF_MIN_CORNER * params.extra.x * h3
-        || atomicLoad(&cell_cnt[c]) == 0u) {
+    let direct_particles = atomicLoad(&cell_cnt[c]);
+    let full_density_occupied_cell = params.dbg.w > 0.5
+        && direct_particles >= FULL_CELL_PARTICLE_COUNT;
+    let min_corner_failed = mmin < SURF_MIN_CORNER * params.extra.x * h3;
+    if (cnt == 0.0 || direct_particles == 0u
+        || (min_corner_failed && !full_density_occupied_cell)) {
         f = 0.0;
+    } else if (min_corner_failed) {
+        // Preserve the old 1/f <= 5 operator bound when the occupancy rescue supplies the row.
+        f = max(f, 2.0 * SURF_MIN_CORNER);
     }
     let center = params.grid_origin.xyz + (vec3<f32>(cc) + vec3<f32>(0.5)) * h;
     var geom_blocked = false;
@@ -640,7 +653,14 @@ fn classify_cell(c: u32) {
     }
     if (!geom_blocked && params.num_solids > 0u) {
         let hit = solid_union(center, PHASE_WATER);
-        if (hit.dist < 0.0) {
+        // A particle exactly supported by a non-grid-aligned wall can census into the cell whose
+        // center lies just inside the solid. Treat that half-cell-thick, directly over-occupied
+        // region as a fluid cut cell on the full-density open-water path; masking it creates a
+        // pressure-dead floor sheet that can never build hydrostatic depth. Cells farther inside
+        // the solid, sparse surface particles, and every coupled-bed cell remain masked.
+        let occupied_cut_cell = full_density_occupied_cell
+            && hit.dist >= -CUT_CELL_CENTER_BAND_IN_CELLS * h;
+        if (hit.dist < 0.0 && !occupied_cut_cell) {
             f = 0.0;
             geom_blocked = true;
         }

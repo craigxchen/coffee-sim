@@ -402,9 +402,14 @@ fn g2p_water(@builtin(global_invocation_id) gid: vec3<u32>) {
                 clamp(pos[p].w, 0.0, 1.0) * params.wet0.z,
             );
             if (filter_try_reserve(parcel_counts)) {
-                x = mix(old_x, x, crossing_t);
+                let paper_x = mix(old_x, x, crossing_t);
+                // A held parcel represents unresolved water inside the paper reservoir. Keeping
+                // its material point at the crossing surface renders the finite paper capacity as
+                // a stationary droplet pile. Preserve the hydraulic coordinate in otherwise-idle
+                // APIC storage and park the canonical free-particle position until release.
+                x = vec3<f32>(params.box_min.x, DORMANT_PARK_Y, params.box_min.z);
                 v = vec3<f32>(0.0);
-                c0 = vec3<f32>(0.0);
+                c0 = paper_x;
                 c1 = vec3<f32>(0.0);
                 c2 = vec3<f32>(0.0);
                 chem[p] = vec4<f32>(chem[p].xy, 1.0, 0.0);

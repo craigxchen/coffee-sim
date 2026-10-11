@@ -1,4 +1,4 @@
-import init, { WasmSim3D } from "./pkg/coffee_sim_wasm.js?v=mpm-v2-retention-10";
+import init, { WasmSim3D } from "./pkg/coffee_sim_wasm.js?v=mpm-v2-paper-reservoir-4";
 
 const canvas = document.getElementById("sim-canvas");
 const viewCubeStage = document.getElementById("view-cube-stage");
@@ -264,7 +264,7 @@ async function bootstrap() {
   try {
     buildTimeseriesCharts();
     buildTimeseriesMenu();
-    await init(new URL("./pkg/coffee_sim_wasm_bg.wasm?v=mpm-v2-retention-10", import.meta.url));
+    await init(new URL("./pkg/coffee_sim_wasm_bg.wasm?v=mpm-v2-paper-reservoir-4", import.meta.url));
     app = await WasmSim3D.create(canvas);
     populateSolverSelect();
     app.loadBenchmarkCenterPour();

@@ -68,7 +68,7 @@ semantic flags; porous paper is never inferred from a generic grain-collision ma
 The production path batches dependent dispatches into one compute pass where the backend permits,
 while retaining individual dispatch accounting. Its logical order is:
 
-1. Emit declared pour parcels and upload physical `dt` and uniforms.
+1. Upload physical `dt` and uniforms for the live particles present at frame start.
 2. Clear transient water, solid, pressure, moisture, chemistry, and classification grids.
 3. When enabled, exchange mobile solvent and bound water conservatively at fixed positions.
 4. Scatter water solution mass/momentum plus a separate solvent census; scatter solid inertial
@@ -80,10 +80,16 @@ while retaining individual dispatch accounting. Its logical order is:
    V60 scenes use explicitly atmospheric gas; sealed diagnostic scenes retain pocket handling.
 8. Transfer dissolved solute and thermal energy with the shared fixed-point chemistry ledger.
 9. Advance/release whole paper-held parcels, then perform water G2P; paper admission is fused into
-   water G2P and uses an exact whole-parcel capacity reservation.
+   water G2P and uses an exact whole-parcel capacity reservation. Held parcels are unresolved
+   reservoir inventory: their canonical positions are parked outside the render domain while their
+   paper crossing coordinates remain in otherwise-idle APIC storage and are restored on release.
 10. Perform final solid G2P, consuming the signed chemistry mass/momentum bridge.
 11. At low cadence, schedule a compact nonblocking inventory reduction; normal frame/UI getters
     return only the latest completed cache and never wait for full particle readback.
+12. Append declared pour parcels at their volume-clocked sub-frame ages. Their initial position and
+    velocity include only the gravity/advection accrued since each particle-volume threshold crossed,
+    so the inlet is continuous across frame boundaries and newborn water is not advanced for a full
+    frame. The next frame's dispatches consume the enlarged live range.
 
 Filter resistance and storage are independent. Zero storage capacity disables admission but does
 not remove Darcy resistance. The whole-bed retention target contains bound and capillary pore water;
@@ -115,6 +121,13 @@ volume flux.
 Pressure uses cell-centered pressure and node-centered velocity with one adjoint family
 `G = -D^T`. The solve and projection use the same symmetric constrained mobility, including the
 rank-one porous-paper normal reduction; hand-written alternate pressure stencils are prohibited.
+Density restoration has two internal numerical closures. Uncoupled Water Only scenes use the full
+two-sided target so a confined pool restores its represented bulk volume instead of accumulating in
+a wall/floor shell. A full-cell occupancy census also admits the half-cell embedded-boundary band as
+cut cells when the ordinary corner-density test is under-resolved; sparse jet cells and deeper solid
+cells remain excluded. Coupled coffee-bed scenes retain the rate-limited target because full-strength
+restoration can inject energy into porous coupling. The selector is scene-owned and deliberately not
+exposed as a calibration control.
 
 Coffee compaction uses a bounded packing law in a semi-implicit scalar solve. A deliberately soft,
 CFL-bounded explicit shear predictor retains deviatoric shape without pretending to be the physical

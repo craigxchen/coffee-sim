@@ -60,6 +60,10 @@ pub struct Config {
     /// constraints. This is an explicit approximation for physically vented production geometry;
     /// `false` preserves the generic flood-fill + sealed-pocket model.
     pub tf_all_gas_atmospheric: bool,
+    /// Use the full two-sided density-restoration target instead of the rate-limited target.
+    /// This is an internal numerical-closure choice for uncoupled open water, not a material
+    /// calibration control. Coupled coffee-bed scenes keep the gentler rate-limited path.
+    pub tf_full_density_target: bool,
 
     // --- granular bed (grain phase) ---
     /// Iteration cap for the contact solve (contacts converge slower than the density solve).
@@ -269,6 +273,7 @@ impl Default for Config {
             seed_jitter: 0.1,
             tf_solid_sample_budget: 0,
             tf_all_gas_atmospheric: false,
+            tf_full_density_target: false,
             // Granular bed: contacts need more iterations + a tighter penetration tolerance than
             // the density solve, and a more frequent grid rebuild (contact-heavy).
             bed_max_iters: 24,

@@ -828,7 +828,10 @@ fn filter_release(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (state.z < 0.5 || state.z > 1.5) {
         return;
     }
-    let hit = filter_paper_hit(pos[p].xyz);
+    // Held water has no resolved free-particle position: g2p parked it outside the render domain
+    // and saved the paper crossing coordinate in the otherwise-idle first APIC row.
+    let paper_x = cmat[3u * p + 0u].xyz;
+    let hit = filter_paper_hit(paper_x);
     let downstream = -sdf_normalize3(hit.grad);
     let permeability = params.filter0.x;
     let viscosity = params.filter0.y;
@@ -839,7 +842,7 @@ fn filter_release(@builtin(global_invocation_id) gid: vec3<u32>) {
         atomicOr(&filter_state[FILTER_ERRORS], 1u);
         return;
     }
-    let sample = paper_flux_sample(pos[p].xyz);
+    let sample = paper_flux_sample(paper_x);
     var superficial_flux = max(dot(sample.superficial_flux, downstream), 0.0);
     if (sample.mobile_carrier_mass <= params.extra.z) {
         // A held parcel does not scatter. If it is the only local carrier there is no projected
@@ -862,7 +865,7 @@ fn filter_release(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     atomicAdd(&filter_state[FILTER_RELEASED], 1u);
     let offset = max(thickness, 2.0 * SDF_EPS * params.grid_origin.w);
-    pos[p] = vec4<f32>(pos[p].xyz + downstream * offset, pos[p].w);
+    pos[p] = vec4<f32>(paper_x + downstream * offset, pos[p].w);
     // Released free water leaves at the superficial flux represented by the solver grid. Dividing
     // by paper porosity here would inject an unphysical velocity jump at the phase handoff.
     vel[p] = vec4<f32>(downstream * superficial_flux, vel[p].w);

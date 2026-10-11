@@ -21,7 +21,7 @@
 //! is removed rather than shipped dormant.
 //!
 //! U4 (the L0 exit) adds pour emission and the pour-cavity machinery (`surface.wgsl`,
-//! KTD-6): `EmissionInput` drives the xpbd-shaped volume-consistent arclength-credit emitter
+//! KTD-6): `EmissionInput` drives the volume-clocked continuous inlet
 //! into a pre-allocated water pool (water live range `[0, water_count)` grows toward
 //! `water_capacity`; solids sit AFTER the full pool so the KTD-1 range layout survives
 //! emission — dormant slots are never dispatched); enclosed air pockets are detected by a
@@ -83,7 +83,8 @@ const DIAGNOSTICS_READBACK_SLOTS: usize = 2;
 
 /// Y-coordinate at which un-emitted (dormant) water-pool slots are parked: far below any scene so
 /// the renderer culls them (particles.wgsl matches this with `p.y <= -1.0e8`). Activated slots get
-/// a real position from `emit()`. Kept finite (not NaN) so any accidental read stays well-defined.
+/// a real position from `emit_at_frame_end()`. Kept finite (not NaN) so any accidental read stays
+/// well-defined.
 const DORMANT_PARK_Y: f32 = -1.0e9;
 
 /// Fine-cell tile shape shared with `active_tiles.wgsl`. One 256-thread workgroup processes
@@ -1059,7 +1060,7 @@ pub struct TwofieldSolver {
     solid_count: u32,
     num_nodes: u32,
     num_cells: u32,
-    /// Pour-emission state (xpbd-shaped volume-consistent emitter).
+    /// Pour-emission state (volume-clocked continuous inlet).
     inflow: Inflow,
 
     // U3 pressure knobs (KTD-9 grid points; sweep counts = dispatch counts, driven in step).
@@ -1201,10 +1202,10 @@ struct CupRegion {
 }
 
 /// Pour-emission state + spout parameters (host-side; mirrors the xpbd `Inflow`). Turns
-/// `EmissionInput` into activated water-pool particles via the volume-consistent
-/// arclength-credit emitter: the volume accumulator (flow/V_w·dt) is the master count budget;
-/// layers release one `particle_spacing` of stream travel apart, each filling a golden-angle
-/// disc, so the inlet packs to the fluid's rest density.
+/// `EmissionInput` into activated water-pool particles via a volume clock: the accumulator
+/// (flow/V_w·dt) is the exact count budget, and each whole-particle threshold supplies its own
+/// sub-frame emission age. Golden-angle aperture samples cycle over the number of particles in one
+/// axial spacing, producing a continuous 3-D inlet instead of frame-coherent planar slices.
 struct Inflow {
     // Static (from Config/Materials at build).
     nozzle_radius: f32,
@@ -1214,10 +1215,18 @@ struct Inflow {
     pour_t: f32,
     // State.
     accumulator: f32, // volume budget in particles (carries the sub-particle fraction)
-    axial: f32,       // arclength credit (scene units) toward the next layer
-    last_exit_speed: f32, // drains backlog at the last cadence when flow drops to 0
-    cursor: u64,      // golden-angle determinism across all emitted particles
+    cursor: u64,      // aperture determinism across all emitted particles
     emitted_mass: f32, // running total emitted water mass (conservation accounting)
+}
+
+fn emission_age(
+    accumulated_particles: f32,
+    emitted_particle_ordinal: u32,
+    particles_per_second: f32,
+) -> f32 {
+    debug_assert!(accumulated_particles >= emitted_particle_ordinal as f32);
+    debug_assert!(particles_per_second > 0.0);
+    (accumulated_particles - emitted_particle_ordinal as f32) / particles_per_second
 }
 
 /// Orthonormal disc basis perpendicular to a (unit) pour direction `dir` (mirrors xpbd).
@@ -1799,12 +1808,10 @@ impl TwofieldSolver {
         self.params.dbg[1] = mode;
     }
 
-    /// Select the uncapped two-sided density-target mode (dbg.w) — dev/test only. `false`
-    /// (default) keeps the legacy ∇·v projection + rate-limited (DENSITY_RELAX) two-sided relief,
-    /// byte-identical to pre-fix; `true` drops the rate cap so the density relief drives ρ→ρ₀ at
-    /// full strength (the calibration showed this is the over-pack fix; it is stable because it is
-    /// a bounded restoring target, not the one-sided expansion source that historically detonated).
-    /// Production default flips to `true` in U5.
+    /// Select the full two-sided density-target mode (dbg.w) — dev/test only. `false` keeps the
+    /// ∇·v projection + rate-limited (DENSITY_RELAX) two-sided relief used by coupled coffee-bed
+    /// scenes; `true` drops the rate cap so the density relief drives ρ→ρ₀ at full strength. The
+    /// uncoupled Water Only scene selects the full target through `Config`; tests can override it.
     pub fn set_density_target_mode_for_test(&mut self, on: bool) {
         self.params.dbg[3] = if on { 1.0 } else { 0.0 };
     }
@@ -1983,24 +1990,21 @@ impl TwofieldSolver {
         self.params.gravity = [g[0], g[1], g[2], 0.0];
     }
 
-    /// Activate pour-emitted water particles for this frame from `EmissionInput` — the
-    /// volume-consistent arclength-credit emitter, ported from the xpbd solver (see its
-    /// `emit` for the derivations): the volume accumulator (flow/V_w·dt) is the master count
-    /// budget; layers release one `particle_spacing` of stream travel apart, each filling a
-    /// golden-angle disc with up to `N_layer = ceil(A_eff·spacing/V_w)` particles, so the
-    /// inlet packs to rest density. Particles are written into the water pool's live range
-    /// and `water_count` grows. No-ops when not pouring and no backlog remains.
-    fn emit(&mut self, input: &EmissionInput, dt: f32) {
-        // A Reset event clears the emitter's backlog/credit (the emitter contract; a full
-        // sim restart is `reset()`). Done before the gate so a Reset with zero flow clears.
+    /// Activate pour-emitted water particles at the end of this frame from `EmissionInput` — the
+    /// volume-clocked emitter. `flow/V_w` determines both the whole-particle count and the exact
+    /// threshold-crossing time of every parcel. Aperture samples cycle over
+    /// `ceil(A_eff*spacing/V_w)` radial slots, so one particle-spacing of jet contains the correct
+    /// represented volume without forcing those samples onto a shared plane. Each parcel is
+    /// initialized at its sub-frame ballistic age; emitting after the compute submission prevents
+    /// a newborn parcel from receiving a full frame of gravity and advection. Particles are written
+    /// into the water pool's live range and `water_count` grows. No-ops when not pouring.
+    fn emit_at_frame_end(&mut self, input: &EmissionInput, dt: f32) {
+        // A Reset event clears the volume-clock phase. A full sim restart is `reset()`.
         if input.event == crate::emission::PourEvent::Reset {
             self.inflow.accumulator = 0.0;
-            self.inflow.axial = 0.0;
-            self.inflow.last_exit_speed = 0.0;
         }
         let flow = input.flow_rate.max(0.0);
-        // Gate: pour active, or a whole particle of backlog still to drain.
-        if flow <= 0.0 && self.inflow.accumulator < 1.0 {
+        if flow <= 0.0 {
             return;
         }
         let a_eff = std::f32::consts::PI
@@ -2008,21 +2012,15 @@ impl TwofieldSolver {
             * self.inflow.nozzle_radius
             * self.inflow.discharge_coeff;
         let a_eff = a_eff.max(1.0e-9);
-        // Orifice relation: exit speed from flow + effective area. While draining a backlog
-        // at zero flow, keep the last cadence so the stream tail stays correctly spaced.
-        let exit_speed = if flow > 0.0 {
-            let es = flow / a_eff;
-            self.inflow.last_exit_speed = es;
-            self.inflow.accumulator += flow / self.inflow.v_w * dt;
-            es
-        } else {
-            self.inflow.last_exit_speed
-        };
-        if exit_speed <= 0.0 {
+        let exit_speed = flow / a_eff;
+        let particles_per_second = flow / self.inflow.v_w;
+        self.inflow.accumulator += particles_per_second * dt;
+        let requested = self.inflow.accumulator.floor() as u32;
+        if requested == 0 {
             return;
         }
-        // Volume-consistent layer capacity (ceil ⇒ throughput ≥ flow/V_w, no backlog).
-        let n_layer = ((a_eff * self.inflow.spacing / self.inflow.v_w).ceil() as u32).max(1);
+        let particles_per_axial_spacing =
+            ((a_eff * self.inflow.spacing / self.inflow.v_w).ceil() as u32).max(1);
 
         // Pour direction (downward, tilted by pour_angle toward +x) + a disc basis.
         let a = input.pour_angle;
@@ -2031,61 +2029,59 @@ impl TwofieldSolver {
         let r_eff = self.inflow.nozzle_radius * self.inflow.discharge_coeff.sqrt();
         const GOLDEN: f32 = 2.399_963_2;
 
-        self.inflow.axial += exit_speed * dt;
         let kettle = input.kettle_pos;
-        let mut want = self.inflow.accumulator.floor() as u32;
-        let mut new_pos: Vec<[f32; 4]> = Vec::new();
-        let mut new_vel: Vec<[f32; 4]> = Vec::new();
-        let mut new_chem: Vec<[f32; 4]> = Vec::new();
-        let mut clamped = false;
-        while self.inflow.axial >= self.inflow.spacing && want > 0 {
-            // Capacity check BEFORE spending arclength credit, so a full pool doesn't
-            // silently consume a layer's axial.
-            let avail = self.water_capacity - (self.water_count + new_pos.len() as u32);
-            if avail == 0 {
-                clamped = true;
-                break;
-            }
-            self.inflow.axial -= self.inflow.spacing;
-            let depth = self.inflow.axial; // residual stream travel below the nozzle
-            let this_layer = n_layer.min(want).min(avail);
-            for _ in 0..this_layer {
-                // Radial shell cycles with the cursor (mod N_layer) so partial layers still
-                // cover the whole disc over time; golden angle fills it uniformly.
-                let ri = (self.inflow.cursor % n_layer as u64) as f32;
-                let r = r_eff * ((ri + 0.5) / n_layer as f32).sqrt();
-                let theta = self.inflow.cursor as f32 * GOLDEN;
-                self.inflow.cursor += 1;
-                let (ct, st) = (theta.cos(), theta.sin());
-                let off = [
-                    u[0] * r * ct + w[0] * r * st,
-                    u[1] * r * ct + w[1] * r * st,
-                    u[2] * r * ct + w[2] * r * st,
-                ];
-                new_pos.push([
-                    kettle[0] + dir[0] * depth + off[0],
-                    kettle[1] + dir[1] * depth + off[1],
-                    kettle[2] + dir[2] * depth + off[2],
-                    1.0, // moisture lane: full water
-                ]);
-                new_vel.push([
-                    dir[0] * exit_speed,
-                    dir[1] * exit_speed,
-                    dir[2] * exit_speed,
-                    0.0,
-                ]);
-                new_chem.push([0.0, self.inflow.pour_t, 0.0, 0.0]); // c = 0, T = pour temp
-            }
-            want -= this_layer;
+        let available = self.water_capacity - self.water_count;
+        let emit_n = requested.min(available);
+        let mut new_pos: Vec<[f32; 4]> = Vec::with_capacity(emit_n as usize);
+        let mut new_vel: Vec<[f32; 4]> = Vec::with_capacity(emit_n as usize);
+        let mut new_chem: Vec<[f32; 4]> = Vec::with_capacity(emit_n as usize);
+        for emitted_index in 0..emit_n {
+            let ordinal = emitted_index + 1;
+            let age = emission_age(self.inflow.accumulator, ordinal, particles_per_second);
+            debug_assert!(age >= 0.0 && age <= dt + f32::EPSILON);
+            let depth = exit_speed * age;
+            // The cursor cycles the radial quantile over the population carried by one axial
+            // spacing; golden-angle rotation prevents a repeated helical seam.
+            let radial_slot = (self.inflow.cursor % particles_per_axial_spacing as u64) as f32;
+            let r = r_eff * ((radial_slot + 0.5) / particles_per_axial_spacing as f32).sqrt();
+            let theta = self.inflow.cursor as f32 * GOLDEN;
+            self.inflow.cursor += 1;
+            let (ct, st) = (theta.cos(), theta.sin());
+            let off = [
+                u[0] * r * ct + w[0] * r * st,
+                u[1] * r * ct + w[1] * r * st,
+                u[2] * r * ct + w[2] * r * st,
+            ];
+            // Match the solver's semi-implicit free-flight recurrence over the fraction of this
+            // frame for which the parcel exists: v(a)=v_exit+g*a; x(a)=x0+v(a)*a. The volume-clock
+            // threshold guarantees age ∈ [0, dt]. This gives neighboring parcels continuous
+            // position and velocity across frame boundaries without substepping the whole solver.
+            let ballistic_velocity = [
+                dir[0] * exit_speed + self.params.gravity[0] * age,
+                dir[1] * exit_speed + self.params.gravity[1] * age,
+                dir[2] * exit_speed + self.params.gravity[2] * age,
+            ];
+            new_pos.push([
+                kettle[0] + dir[0] * depth + self.params.gravity[0] * age * age + off[0],
+                kettle[1] + dir[1] * depth + self.params.gravity[1] * age * age + off[1],
+                kettle[2] + dir[2] * depth + self.params.gravity[2] * age * age + off[2],
+                1.0, // moisture lane: full water
+            ]);
+            new_vel.push([
+                ballistic_velocity[0],
+                ballistic_velocity[1],
+                ballistic_velocity[2],
+                0.0,
+            ]);
+            new_chem.push([0.0, self.inflow.pour_t, 0.0, 0.0]); // c = 0, T = pour temp
         }
-        if clamped {
+        if emit_n < requested {
             eprintln!(
                 "twofield pour: water pool {} reached; emission clamped (a recipe scene must \
                  declare enough pour_water_ml to size the pool to its dose)",
                 self.water_capacity
             );
         }
-        let emit_n = new_pos.len() as u32;
         if emit_n == 0 {
             return;
         }
@@ -2957,7 +2953,7 @@ impl Solver for TwofieldSolver {
         // are never dispatched (the water kernels guard on the LIVE count) and are parked at
         // a far below-domain sentinel (y = DORMANT_PARK_Y) so the renderer can cull them when the
         // full pool is exposed (solids-present scenes) — otherwise the unused tail would draw as a
-        // clump at one point. emit() overwrites the slot's position when it activates it.
+        // clump at one point. emit_at_frame_end() overwrites the slot's position on activation.
         let v_w = mats.particle_spacing.powi(3);
         let retention_build = retention_state_for_build(
             cfg,
@@ -3207,8 +3203,15 @@ impl Solver for TwofieldSolver {
             // but flipping the default trips poured_cup_water_fills_not_corner — the dynamic pour
             // traps a spurious crushing pocket under multi (same failure mode a prior one-sided
             // wall BC hit). Resolve that before defaulting MULTI / retiring the selector.
-            // Tests override via set_relief_for_test / set_wall_bc_mode_for_test.
-            dbg: [1.0, WALL_BC_SINGLE, 0.0, 0.0],
+            // Tests override via set_relief_for_test / set_wall_bc_mode_for_test. Uncoupled open
+            // water opts into the full density target; coupled coffee-bed scenes retain the
+            // rate-limited target because the full path can pump energy into the porous coupling.
+            dbg: [
+                1.0,
+                WALL_BC_SINGLE,
+                0.0,
+                f32::from(cfg.tf_full_density_target),
+            ],
             // U1 surface-weighted dissipation knob: (c_surface, density_gate, div_scale,
             // water_splash_cap). Default DISABLED (c_surface = 1.0 ⇒ pure-PIC; div_scale = 0 ⇒
             // merge off; water_splash_cap = 0 ⇒ global max_speed), so g2p_water is byte-identical
@@ -4585,8 +4588,6 @@ impl Solver for TwofieldSolver {
                 v_w,
                 pour_t: mats.pour_t,
                 accumulator: 0.0,
-                axial: 0.0,
-                last_exit_speed: 0.0,
                 cursor: 0,
                 emitted_mass: 0.0,
             },
@@ -4709,8 +4710,8 @@ impl Solver for TwofieldSolver {
             );
         }
         // Bubble diagnostics/state are frame-local and must not survive a reset. This is
-        // especially visible in a poured CenterPour reset: its temporarily dry dynamic fast path
-        // does not execute the surface stack before the emitter activates its first water sample.
+        // especially visible in a poured CenterPour reset: its first dry compute frame is followed
+        // by end-of-frame emission, so no physics pass rewrites stale bubble state beforehand.
         self.queue
             .write_buffer(&self.bubble, 0, bytemuck::cast_slice(&[0.0f32; 3]));
         self.queue
@@ -4745,8 +4746,6 @@ impl Solver for TwofieldSolver {
         self.queue
             .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&self.params));
         self.inflow.accumulator = 0.0;
-        self.inflow.axial = 0.0;
-        self.inflow.last_exit_speed = 0.0;
         self.inflow.cursor = 0;
         self.inflow.emitted_mass = 0.0;
         self.cached_passes.clear();
@@ -4785,8 +4784,6 @@ impl Solver for TwofieldSolver {
     fn step(&mut self, dt: f32, input: &EmissionInput) {
         self.poll_periodic_diagnostics();
         self.state_generation = self.state_generation.wrapping_add(1);
-        // Pour emission first (grows water_count for this frame); no-op when not pouring.
-        self.emit(input, dt);
         self.sim_time += dt;
         // Browser-side diagnostics are explicitly ticketed by the UI/harness. Scheduling
         // autonomous readbacks while JavaScript is encoding a long batch can leave several
@@ -4968,6 +4965,10 @@ impl Solver for TwofieldSolver {
                 }
             }
             self.queue.submit(Some(enc.finish()));
+            // New inlet parcels represent events distributed over this completed frame. Append
+            // them after the compute work so they are not advanced by a full dt on birth.
+            self.emit_at_frame_end(input, dt);
+            debug_assert!(self.water_count <= self.water_capacity);
             if let Some(slot) = diagnostics_slot {
                 self.begin_periodic_diagnostics_map(slot, self.sim_time);
             }
@@ -5487,6 +5488,9 @@ impl Solver for TwofieldSolver {
             }
         }
         self.queue.submit(Some(enc.finish()));
+        // See the batched return path above: emission is an end-of-frame boundary condition.
+        self.emit_at_frame_end(input, dt);
+        debug_assert!(self.water_count <= self.water_capacity);
         if let Some(slot) = diagnostics_slot {
             self.begin_periodic_diagnostics_map(slot, self.sim_time);
         }
@@ -6173,6 +6177,10 @@ pub(crate) mod seed_tests {
         assert_eq!(admitted_chem[2], 1.0);
         assert_eq!(admitted_chem[3], 0.0);
         assert_eq!(admitted_pos[3], 1.0);
+        assert!(
+            admitted_pos[1] <= DORMANT_PARK_Y,
+            "paper-held reservoir water must not render as a stationary free-water particle"
+        );
 
         solver.write_grid_carrier_masses_for_test(&vec![1.0; solver.num_nodes as usize]);
         solver.run_dbg(

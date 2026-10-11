@@ -772,6 +772,7 @@ fn setup_for_scene_spec(
                 max_speed: DEFAULT_MAX_WATER_SPEED_M_S * sim_units_per_meter(),
                 xsph_viscosity_c: 0.02,
                 tf_all_gas_atmospheric: true,
+                tf_full_density_target: true,
                 tf_flip_c_surface: 0.1,
                 tf_flip_density_gate: 0.5,
                 tf_flip_div_scale: 1.0,
@@ -806,6 +807,71 @@ fn flow_rate_for_velocity(speed_m_s: f32, nozzle_radius: f32, discharge_coeff: f
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::sdf::SolidKind;
+
+    const TEST_SIMULATION_HZ: u32 = 60;
+    const POUR_TIMEOUT_SECONDS: u32 = 50;
+    const SETTLE_SECONDS: u32 = 10;
+    const RADIAL_SURFACE_BANDS: usize = 4;
+
+    #[derive(Clone, Copy, Debug)]
+    struct CupGeometry {
+        center_x: f32,
+        center_z: f32,
+        floor_y: f32,
+        rim_y: f32,
+        radius: f32,
+    }
+
+    impl CupGeometry {
+        fn radial_distance(self, position: [f32; 4]) -> f32 {
+            (position[0] - self.center_x).hypot(position[2] - self.center_z)
+        }
+    }
+
+    fn cup_geometry(scene: &Scene) -> CupGeometry {
+        scene
+            .solids
+            .iter()
+            .find_map(|solid| match solid.kind {
+                SolidKind::Cylinder {
+                    center,
+                    floor_y,
+                    rim_y,
+                    radius,
+                } => Some(CupGeometry {
+                    center_x: center.x,
+                    center_z: center.z,
+                    floor_y,
+                    rim_y,
+                    radius,
+                }),
+                _ => None,
+            })
+            .expect("Water Only production geometry must contain a catch cup")
+    }
+
+    fn radial_surface_heights(
+        cup: CupGeometry,
+        positions: &[[f32; 4]],
+        particle_indices: &[usize],
+    ) -> [f32; RADIAL_SURFACE_BANDS] {
+        std::array::from_fn(|band| {
+            let inner_radius = cup.radius * band as f32 / RADIAL_SURFACE_BANDS as f32;
+            let outer_radius = cup.radius * (band + 1) as f32 / RADIAL_SURFACE_BANDS as f32;
+            let mut heights: Vec<_> = particle_indices
+                .iter()
+                .filter_map(|&index| {
+                    let position = positions[index];
+                    let radius = cup.radial_distance(position);
+                    (radius >= inner_radius && radius < outer_radius).then_some(position[1])
+                })
+                .collect();
+            heights.sort_by(f32::total_cmp);
+            assert!(!heights.is_empty(), "radial pool band {band} is empty");
+            heights[((heights.len() - 1) as f32 * 0.95).round() as usize]
+        })
+    }
 
     #[test]
     fn shader_parses_with_naga() {
@@ -873,6 +939,193 @@ mod tests {
             f64::from(spacing).powi(3) * f64::from(TARGET_RECIPE_WATER_SAMPLES),
         );
         assert!((reconstructed - f64::from(volume_ml)).abs() < 1.0e-3);
+    }
+
+    #[test]
+    fn full_density_target_is_scoped_to_uncoupled_water() {
+        let calibration = CalibrationProfile::default();
+        let (_, _, water_config) =
+            setup_for_scene_spec(&SceneSpec::FreeStream, &calibration).unwrap();
+        let (_, _, bed_config) =
+            setup_for_scene_spec(&SceneSpec::CenterPour, &calibration).unwrap();
+
+        assert!(water_config.tf_full_density_target);
+        assert!(!bed_config.tf_full_density_target);
+    }
+
+    #[test]
+    fn poured_water_only_cup_builds_a_bulk_pool() {
+        let Some((device, queue)) = crate::solvers::twofield::seed_tests::create_test_device()
+        else {
+            eprintln!("no GPU adapter available; skipping poured Water Only cup test");
+            return;
+        };
+        let gpu = GpuContext::from_device_queue(&device, &queue);
+        let (scene, materials, config) =
+            setup_for_scene_spec(&SceneSpec::FreeStream, &CalibrationProfile::default()).unwrap();
+        let pour = EmissionInput {
+            kettle_pos: DEFAULT_SPOUT_UI,
+            flow_rate: flow_rate_for_velocity(
+                DEFAULT_WATER_VELOCITY_M_S,
+                config.nozzle_radius,
+                config.discharge_coeff,
+            ),
+            pour_angle: 0.0,
+            event: PourEvent::None,
+        };
+        let mut solver =
+            <TwofieldSolver as RewriteSolver>::build(&scene, &materials, &config, &gpu);
+        let capacity = solver.water_pool_capacity();
+        for _ in 0..POUR_TIMEOUT_SECONDS * TEST_SIMULATION_HZ {
+            if solver.phase_counts().0 >= capacity {
+                break;
+            }
+            RewriteSolver::step(&mut solver, 1.0 / TEST_SIMULATION_HZ as f32, &pour);
+        }
+        assert_eq!(
+            solver.phase_counts().0,
+            capacity,
+            "pour did not reach its declared dose"
+        );
+        for _ in 0..SETTLE_SECONDS * TEST_SIMULATION_HZ {
+            RewriteSolver::step(
+                &mut solver,
+                1.0 / TEST_SIMULATION_HZ as f32,
+                &EmissionInput::default(),
+            );
+        }
+
+        let cup = cup_geometry(&scene);
+        let water_count = solver.phase_counts().0 as usize;
+        let positions = solver.read_positions();
+        let resolved_floor = cup.floor_y - materials.support_radius;
+        let cup_indices: Vec<_> = (0..water_count)
+            .filter(|&index| {
+                let position = positions[index];
+                position[1] >= resolved_floor && position[1] <= cup.rim_y
+            })
+            .collect();
+        assert!(
+            cup_indices.len() as f32 >= 0.99 * water_count as f32,
+            "poured water did not remain in the cup: cup={} total={water_count}",
+            cup_indices.len()
+        );
+
+        // A uniform cylindrical pool places (r/R)^2 of its volume inside radius r. Requiring half
+        // that geometry-derived share at half-radius rejects the pressure-dead wall/floor shell
+        // while leaving broad freedom for transients and future calibration.
+        let inner_fraction = cup_indices
+            .iter()
+            .filter(|&&index| cup.radial_distance(positions[index]) <= 0.5 * cup.radius)
+            .count() as f32
+            / cup_indices.len() as f32;
+        let uniform_inner_fraction = (0.5_f32).powi(2);
+        assert!(
+            inner_fraction >= 0.5 * uniform_inner_fraction,
+            "water collapsed into a hollow radial shell: inner_fraction={inner_fraction:.4}"
+        );
+
+        let band_surfaces = radial_surface_heights(cup, &positions, &cup_indices);
+        let represented_volume = cup_indices.len() as f32 * materials.particle_spacing.powi(3);
+        let expected_depth = represented_volume / (std::f32::consts::PI * cup.radius.powi(2));
+        let expected_surface = cup.floor_y + expected_depth;
+        let mean_surface = band_surfaces.iter().sum::<f32>() / band_surfaces.len() as f32;
+        let min_surface = band_surfaces.iter().copied().fold(f32::INFINITY, f32::min);
+        let max_surface = band_surfaces
+            .iter()
+            .copied()
+            .fold(f32::NEG_INFINITY, f32::max);
+        assert!(
+            (mean_surface - expected_surface).abs() <= 0.35 * expected_depth,
+            "free surface does not close the conserved fill volume: radial_y95={band_surfaces:?}, expected={expected_surface:.4}"
+        );
+        assert!(
+            max_surface - min_surface <= 0.2 * expected_depth,
+            "free surface is not approximately horizontal: radial_y95={band_surfaces:?}"
+        );
+    }
+
+    #[test]
+    fn water_only_inlet_is_continuous_across_frame_boundaries() {
+        let Some((device, queue)) = crate::solvers::twofield::seed_tests::create_test_device()
+        else {
+            eprintln!("no GPU adapter available; skipping Water Only inlet continuity test");
+            return;
+        };
+        let gpu = GpuContext::from_device_queue(&device, &queue);
+        let (scene, materials, config) =
+            setup_for_scene_spec(&SceneSpec::FreeStream, &CalibrationProfile::default()).unwrap();
+        let flow_rate = flow_rate_for_velocity(
+            DEFAULT_WATER_VELOCITY_M_S,
+            config.nozzle_radius,
+            config.discharge_coeff,
+        );
+        let input = EmissionInput {
+            kettle_pos: DEFAULT_SPOUT_UI,
+            flow_rate,
+            pour_angle: 0.0,
+            event: PourEvent::None,
+        };
+        let mut solver =
+            <TwofieldSolver as RewriteSolver>::build(&scene, &materials, &config, &gpu);
+        let dt = 1.0 / TEST_SIMULATION_HZ as f32;
+        let effective_area =
+            std::f32::consts::PI * config.nozzle_radius.powi(2) * config.discharge_coeff;
+        let exit_speed = flow_rate / effective_area;
+        let ballistic_velocity_min = -exit_speed + scene.gravity[1] * dt;
+        let ballistic_velocity_max = -exit_speed;
+        let mut previous_count = 0usize;
+        let mut two_frame_start = 0usize;
+        const FRAMES: u32 = 8;
+        for frame in 0..FRAMES {
+            RewriteSolver::step(&mut solver, dt, &input);
+            let positions = solver.read_positions();
+            let velocities = solver.read_velocities();
+            let count = solver.phase_counts().0 as usize;
+            let new_positions = &positions[previous_count..count];
+            let new_velocities = &velocities[previous_count..count];
+            assert!(!new_positions.is_empty(), "default inlet emitted no water");
+            let newest_y = new_positions
+                .iter()
+                .map(|position| position[1])
+                .fold(f32::NEG_INFINITY, f32::max);
+            assert!(
+                newest_y >= input.kettle_pos[1] - materials.particle_spacing,
+                "newborn inlet packet was advanced for a whole frame: newest_y={newest_y:.4}"
+            );
+            for velocity in new_velocities {
+                assert!(
+                    velocity[1] >= ballistic_velocity_min - 1.0e-4
+                        && velocity[1] <= ballistic_velocity_max + 1.0e-4,
+                    "newborn velocity is outside its sub-frame ballistic interval: vy={:.4}, interval=[{ballistic_velocity_min:.4},{ballistic_velocity_max:.4}]",
+                    velocity[1]
+                );
+            }
+
+            let mut recent_y: Vec<_> = positions[two_frame_start..count]
+                .iter()
+                .map(|position| position[1])
+                .collect();
+            recent_y.sort_by(f32::total_cmp);
+            let max_gap = recent_y
+                .windows(2)
+                .map(|pair| pair[1] - pair[0])
+                .fold(0.0, f32::max);
+            assert!(
+                max_gap <= materials.particle_spacing,
+                "inlet split into frame packets at frame {frame}: max axial gap={max_gap:.4}, spacing={:.4}",
+                materials.particle_spacing
+            );
+            two_frame_start = previous_count;
+            previous_count = count;
+        }
+
+        let represented_particle_volume = materials.particle_spacing.powi(3);
+        let expected_particles = flow_rate * (FRAMES as f32 * dt) / represented_particle_volume;
+        assert!(
+            (previous_count as f32 - expected_particles).abs() < 1.0,
+            "volume clock drifted by at least one particle: emitted={previous_count}, expected={expected_particles:.4}"
+        );
     }
 
     #[test]
